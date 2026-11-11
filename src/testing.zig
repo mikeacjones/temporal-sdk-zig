@@ -630,6 +630,18 @@ const Fixtures = struct {
     }
     const Sleeper = workflow.Def("Sleeper", sleepFor);
 
+    /// Sleeps; when canceled, runs a cleanup activity and then ends canceled.
+    fn sleepThenCleanUp(ctx: *workflow.Context, seconds: i64) ![]const u8 {
+        ctx.io().sleep(.fromSeconds(seconds), .awake) catch |err| switch (err) {
+            error.Canceled => {
+                _ = try ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"cleanup"}).get();
+                return error.Canceled;
+            },
+        };
+        return "slept";
+    }
+    const CleanUpOnCancel = workflow.Def("CleanUpOnCancel", sleepThenCleanUp);
+
     /// Upserts the memo before and after an activity; returns the start memo's status and
     /// the memo keys at the end.
     fn memoUpdates(ctx: *workflow.Context, status: []const u8) ![]const u8 {
@@ -744,6 +756,67 @@ test "client: generated IDs, start delay, history, and terminate" {
     defer stuck.deinit();
     try env.client.terminateWorkflow(stuck.id, "", "test cleanup");
     try testing.expectError(error.WorkflowTerminated, stuck.get(a));
+}
+
+test "client: cancel ends a run canceled, after any cleanup the workflow does" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Sleeper);
+    try env.registerWorkflow(Fixtures.CleanUpOnCancel);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const timerStarted = struct {
+        fn wait(c: *client_mod.Client, id: []const u8, run_id: []const u8) !void {
+            while (true) {
+                var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+                defer scratch.deinit();
+                const history = try c.fetchHistory(scratch.allocator(), id, run_id);
+                for (history.events.items) |event| switch (event.attributes orelse continue) {
+                    .timer_started_event_attributes => return,
+                    else => {},
+                };
+                try testing.io.sleep(.fromMilliseconds(20), .awake);
+            }
+        }
+    }.wait;
+
+    // A workflow that doesn't catch the cancellation ends canceled at once.
+    var sleeper = try env.startWorkflow(Fixtures.Sleeper, .{ .task_queue = "" }, .{std.time.s_per_hour});
+    defer sleeper.deinit();
+    try timerStarted(&env.client, sleeper.id, sleeper.run_id);
+    try env.client.cancelWorkflow(sleeper.id, "", "no longer needed");
+    try testing.expectError(error.WorkflowCanceled, env.getResult(Fixtures.Sleeper, &sleeper, a, null));
+    const history = try env.client.fetchHistory(a, sleeper.id, sleeper.run_id);
+    var requested: ?proto.temporal.api.history.v1.WorkflowExecutionCancelRequestedEventAttributes = null;
+    for (history.events.items) |event| switch (event.attributes orelse continue) {
+        .workflow_execution_cancel_requested_event_attributes => |attrs| requested = attrs,
+        else => {},
+    };
+    try testing.expectEqualStrings("no longer needed", requested.?.cause);
+    try testing.expectEqualStrings(env.client.identity, requested.?.identity);
+    const last = history.events.items[history.events.items.len - 1].attributes.?;
+    try testing.expect(last == .workflow_execution_canceled_event_attributes);
+
+    // A workflow that catches it runs its cleanup activity, then ends canceled.
+    var cleaner = try env.startWorkflow(Fixtures.CleanUpOnCancel, .{ .task_queue = "" }, .{std.time.s_per_hour});
+    defer cleaner.deinit();
+    try timerStarted(&env.client, cleaner.id, cleaner.run_id);
+    try env.client.cancelWorkflow(cleaner.id, cleaner.run_id, "");
+    try testing.expectError(error.WorkflowCanceled, env.getResult(Fixtures.CleanUpOnCancel, &cleaner, a, null));
+    const cleaned = try env.client.fetchHistory(a, cleaner.id, cleaner.run_id);
+    var cleanup_completed = false;
+    for (cleaned.events.items) |event| switch (event.attributes orelse continue) {
+        .activity_task_completed_event_attributes => cleanup_completed = true,
+        else => {},
+    };
+    try testing.expect(cleanup_completed);
+    const cleaned_last = cleaned.events.items[cleaned.events.items.len - 1].attributes.?;
+    try testing.expect(cleaned_last == .workflow_execution_canceled_event_attributes);
+
+    try testing.expectError(error.NotFound, env.client.cancelWorkflow("no-such-workflow", "", "nothing to cancel"));
 }
 
 test "client: a memo set at start is recorded in the started event" {
