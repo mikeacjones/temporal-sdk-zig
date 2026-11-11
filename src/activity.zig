@@ -12,6 +12,15 @@
 //! Activities run on the worker's real `std.Io` and may do any I/O. Memory from
 //! `ctx.allocator()` lives until the activity's result has been reported.
 //!
+//! A running activity is canceled when its workflow cancels it, its timeout passes, or the
+//! worker shuts down. The cancel arrives as `std.Io` cancellation: the activity's next wait
+//! on `ctx.io()` returns `error.Canceled`, and `ctx.cancelReason()` says why. Returning
+//! `error.Canceled` reports the activity canceled; returning anything else reports that
+//! outcome as usual. A cancel from the workflow reaches the worker in the server's answer to
+//! a heartbeat, so an activity that should notice it must call `ctx.heartbeat`. Heartbeats
+//! are throttled to 80% of the heartbeat timeout (at most 60 seconds; 30 without one), which
+//! bounds how late the cancel arrives.
+//!
 //! Activities that share state (a client, a connection pool, configuration) are methods taking the state first and the context second. The worker binds them to an
 //! instance with `registerActivityWith`; workflows call them through the same `Def`:
 //!
@@ -42,6 +51,23 @@ pub const Info = struct {
     attempt: u32,
 };
 
+/// Why an activity was canceled.
+pub const CancelReason = enum(u8) {
+    /// The server no longer knows the activity (it already completed, timed out, or its
+    /// workflow closed).
+    not_found,
+    /// The workflow requested cancellation.
+    canceled,
+    /// The activity passed its heartbeat or start-to-close timeout.
+    timed_out,
+    /// The worker is shutting down and its graceful shutdown period has passed.
+    worker_shutdown,
+    paused,
+    reset,
+};
+
+/// An activity's context. The activity uses it from its own task; `cancelReason` is also
+/// safe to call from other threads.
 pub const Context = struct {
     arena: Allocator,
     io_: std.Io,
@@ -53,6 +79,10 @@ pub const Context = struct {
     heartbeat_details: []const converter.Payload = &.{},
     /// Where heartbeats go; null drops them (for example outside a worker).
     heartbeat_sink: ?HeartbeatSink = null,
+    /// Written once by the worker when a cancel arrives, possibly from another thread.
+    cancel_reason_: std.atomic.Value(u8) = .init(not_canceled),
+
+    const not_canceled = std.math.maxInt(u8);
 
     /// Receives an activity's heartbeats: the worker sends them to the server, and the test
     /// environment records them.
@@ -70,6 +100,20 @@ pub const Context = struct {
     /// The worker's Io. Activities may block, sleep, and do I/O on it.
     pub fn io(ctx: *Context) std.Io {
         return ctx.io_;
+    }
+
+    /// Why the activity was canceled, or null if it hasn't been. Set before the cancel
+    /// reaches the activity's `std.Io`, so after a wait returns `error.Canceled` because of a
+    /// cancel, this is not null.
+    pub fn cancelReason(ctx: *const Context) ?CancelReason {
+        const r = ctx.cancel_reason_.load(.acquire);
+        return if (r == not_canceled) null else @fromBackingInt(@intCast(r));
+    }
+
+    /// Records why the activity is being canceled, before its task is canceled. The first
+    /// reason wins; returns whether this call set it. Called by the worker (any thread).
+    pub fn setCancelReason(ctx: *Context, reason: CancelReason) bool {
+        return ctx.cancel_reason_.cmpxchgStrong(not_canceled, @backingInt(reason), .acq_rel, .acquire) == null;
     }
 
     pub fn info(ctx: *const Context) *const Info {
@@ -253,4 +297,19 @@ test "heartbeats reach the sink and details decode" {
     try std.testing.expectEqual(@as(i64, 5), try ctx.heartbeatDetails(i64));
     ctx.heartbeat(@as(i64, 6));
     try std.testing.expectEqualStrings("6", sink.last.?);
+}
+
+test "a cancel reaches the activity's Io and records the first reason" {
+    const S = struct {
+        fn sleepForever(ctx: *Context) !void {
+            while (true) try ctx.io().sleep(.fromSeconds(60), .awake);
+        }
+    };
+    var ctx: Context = .{ .arena = std.testing.allocator, .io_ = std.testing.io, .info_ = undefined, .logger_ = .{} };
+    try std.testing.expectEqual(null, ctx.cancelReason());
+    var task = try std.testing.io.concurrent(S.sleepForever, .{&ctx});
+    try std.testing.expect(ctx.setCancelReason(.timed_out));
+    try std.testing.expect(!ctx.setCancelReason(.canceled));
+    try std.testing.expectError(error.Canceled, task.cancel(std.testing.io));
+    try std.testing.expectEqual(CancelReason.timed_out, ctx.cancelReason().?);
 }
