@@ -1,0 +1,4 @@
+# rustup reads this from the working directory, so it applies when cargo runs from deps/.
+# Keep the channel equal to sdk-core/rust-toolchain.toml.
+[toolchain]
+channel = "1.95"

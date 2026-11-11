@@ -9,3 +9,5 @@
 # Zig
 .zig-cache/
 zig-out/
+deps/target/
+zig-pkg/

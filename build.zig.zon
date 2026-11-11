@@ -3,11 +3,44 @@
     .version = "0.0.0",
     .fingerprint = 0xd5dcf3f423e995a5,
     .minimum_zig_version = "0.17.1",
-    .dependencies = .{},
+    .dependencies = .{
+        // protoc for the build machine. Cargo needs it to compile sdk-core's protos crate,
+        // so nobody has to install protoc. Same pinned release as zig-protobuf uses.
+        .@"protoc-linux-x86_64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_64.zip",
+            .hash = "N-V-__8AAMtRpADAGtPCqgS57gPLl02TIK7HbJ1MkIm4Eq8F",
+            .lazy = true,
+        },
+        .@"protoc-linux-aarch_64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-aarch_64.zip",
+            .hash = "N-V-__8AAJtTpABBCU2sJAPkeqWvUtTttRQ-OsmdzFEIUSDi",
+            .lazy = true,
+        },
+        .@"protoc-osx-aarch_64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-osx-aarch_64.zip",
+            .hash = "N-V-__8AAEMzlwBZp20Y1DKVJqyV3AsG1IteRnb4aUF3gHSn",
+            .lazy = true,
+        },
+        .@"protoc-osx-x86_64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-osx-x86_64.zip",
+            .hash = "N-V-__8AADN7mAAz1e7gPxuQfAAIPUvhsh2xZqntvaO9KAi_",
+            .lazy = true,
+        },
+        .@"protoc-win64" = .{
+            .url = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-win64.zip",
+            .hash = "N-V-__8AABekzACgnTDmenHY7N0E55oHnTfOliLw8ReYHEDH",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "LICENSE",
+        "CORE_VERSION",
+        "deps/Cargo.toml",
+        "deps/Cargo.lock",
+        "deps/rust-toolchain.toml",
+        "deps/sdk-core",
     },
 }
