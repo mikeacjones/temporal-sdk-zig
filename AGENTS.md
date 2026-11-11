@@ -40,11 +40,12 @@ Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md).
 
 ## Samples are the parity bar
 
-Every sample in [temporalio/samples-go](https://github.com/temporalio/samples-go) gets a Zig port under `samples/<same-name>/`, validated against a dev server by `zig build samples-test`. Samples land from the simplest to the most complex as their SDK features land.
+Every sample in [temporalio/samples-go](https://github.com/temporalio/samples-go) gets a Zig port under `samples/<same-name>/` (or a Zig-named directory, see below), validated against a dev server by `zig build samples-test`. Samples land from the simplest to the most complex as their SDK features land.
 
 - Keep the Go sample's workflow, activity, signal, query, and update names and payload shapes, so a Go starter can drive the Zig worker and the other way round.
 - Port the Go sample's `*_test.go` tests where it has them.
 - A finished sample stays in the suite. A change that breaks a passing sample is a regression, even if the unit tests pass.
+- A sample named after a Go-only concept is renamed for its Zig equivalent (samples-go `goroutine` is `io-group`). The renamed sample keeps the Go sample's workflow, activity, and task queue names, and `samples/README.md` maps it to the Go sample.
 - A sample with no Zig equivalent is listed in `samples/README.md` with the reason.
 
 ## Zig SDK review and implementation focus

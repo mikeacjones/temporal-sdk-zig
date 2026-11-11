@@ -1,8 +1,8 @@
-//! Port of samples-go/goroutine/goroutine_workflow_test.go.
+//! Port of samples-go/goroutine/goroutine_workflow_test.go (this sample is its Zig rename).
 
 const std = @import("std");
 const temporal = @import("temporal");
-const goroutine = @import("goroutine_workflow.zig");
+const io_group = @import("io_group_workflow.zig");
 
 const testing = std.testing;
 
@@ -22,13 +22,13 @@ fn lessThan(_: void, x: []const u8, y: []const u8) bool {
 test "GoroutineWorkflow" {
     const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
-    try env.registerWorkflow(goroutine.SampleGoroutineWorkflow);
-    try env.registerActivityAs(goroutine.Step1, step1Test);
-    try env.registerActivityAs(goroutine.Step2, step2Test);
+    try env.registerWorkflow(io_group.SampleGoroutineWorkflow);
+    try env.registerActivityAs(io_group.Step1, step1Test);
+    try env.registerActivityAs(io_group.Step2, step2Test);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const result = try arena.allocator().dupe([]const u8, try env.executeWorkflow(goroutine.SampleGoroutineWorkflow, .{2}, arena.allocator(), null));
+    const result = try arena.allocator().dupe([]const u8, try env.executeWorkflow(io_group.SampleGoroutineWorkflow, .{2}, arena.allocator(), null));
     // The order the coroutines finish in is not defined.
     std.mem.sort([]const u8, result, {}, lessThan);
     try testing.expectEqual(@as(usize, 2), result.len);

@@ -1,6 +1,6 @@
 const std = @import("std");
 const temporal = @import("temporal");
-const goroutine = @import("goroutine_workflow.zig");
+const io_group = @import("io_group_workflow.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var run = client.executeWorkflow(goroutine.SampleGoroutineWorkflow, .{
+    var run = client.executeWorkflow(io_group.SampleGoroutineWorkflow, .{
         .id = try std.fmt.allocPrint(arena, "goroutine-{s}", .{try temporal.client.uuid(arena, io)}),
         .task_queue = "goroutine",
     }, .{5}) catch |err| {

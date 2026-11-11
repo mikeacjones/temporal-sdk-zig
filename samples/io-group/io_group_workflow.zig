@@ -1,6 +1,9 @@
-//! Port of samples-go/goroutine: process several sequences of activities in parallel. Go's
-//! `workflow.Go` coroutines become an `std.Io.Group` on the workflow's Io, and the workflow
-//! waits for them with `ctx.await` (Go `workflow.Await`).
+//! Run several sequences of activities in parallel as coroutines in an `std.Io.Group` on the
+//! workflow's deterministic Io, and wait for them with `ctx.await`.
+//!
+//! Port of samples-go/goroutine, renamed for its Zig equivalent: Go's `workflow.Go` coroutines
+//! are `Group.async` here, and `workflow.Await` is `ctx.await`. The workflow, activity, and task
+//! queue names stay the Go sample's, so the Go starter can drive this worker.
 
 const std = @import("std");
 const temporal = @import("temporal");

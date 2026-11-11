@@ -1,6 +1,6 @@
 const std = @import("std");
 const temporal = @import("temporal");
-const sample = @import("goroutine_workflow.zig");
+const sample = @import("io_group_workflow.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
