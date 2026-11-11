@@ -45,6 +45,7 @@ timers: std.AutoHashMapUnmanaged(u32, *WorkflowIo.Timer) = .empty,
 /// Coroutines blocked in `awaitCondition`, in the order they started waiting.
 conditions: std.ArrayList(*Condition) = .empty,
 args: []const converter.Payload = &.{},
+last_completion_result: ?converter.Payload = null,
 task_queue: []const u8 = "",
 namespace: []const u8 = "",
 root: ?*WorkflowIo.Task = null,
@@ -217,6 +218,15 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         .task_queue = inst.task_queue,
         .namespace = inst.namespace,
         .attempt = @intCast(@max(init.attempt, 0)),
+        .cron_schedule = try a.dupe(u8, init.cron_schedule),
+        .first_run_id = try a.dupe(u8, init.first_execution_run_id),
+        .continued_run_id = try a.dupe(u8, init.continued_from_execution_run_id),
+        .execution_timeout = zigDuration(init.workflow_execution_timeout),
+        .run_timeout = zigDuration(init.workflow_run_timeout),
+        .task_timeout = zigDuration(init.workflow_task_timeout),
+    };
+    if (init.last_completion_result) |r| if (r.payloads.items.len > 0) {
+        inst.last_completion_result = try r.payloads.items[0].dupe(a);
     };
     inst.logger = .{
         .context = try log.contextString(a, .{
@@ -356,6 +366,11 @@ fn dupeFailure(a: Allocator, f: ?Failure) !*const Failure {
     const out = try a.create(Failure);
     out.* = if (f) |v| try v.dupe(a) else .{ .message = "activity failed" };
     return out;
+}
+
+fn zigDuration(d: ?proto.google.protobuf.Duration) ?std.Io.Duration {
+    const v = d orelse return null;
+    return .{ .nanoseconds = @as(i96, v.seconds) * std.time.ns_per_s + v.nanos };
 }
 
 fn protoDuration(d: ?std.Io.Duration) ?proto.google.protobuf.Duration {
@@ -692,4 +707,35 @@ test "eviction while awaiting a condition frees everything" {
     const inst = try create(testing.allocator, GoroutinesWf.registered, .{});
     _ = try inst.activate(&try initActivation(a, "Goroutines", .{@as(usize, 2)}), a);
     inst.destroy();
+}
+
+const Cron = struct {
+    fn run(ctx: *workflow.Context) !i64 {
+        const last: i64 = if (ctx.hasLastCompletionResult()) try ctx.lastCompletionResult(i64) else 0;
+        _ = try ctx.executeActivityByName(void, "Tick", .{ .start_to_close_timeout = .fromSeconds(10) }, .{last}).get();
+        return last + 1;
+    }
+};
+const CronWf = workflow.Def("Cron", Cron.run);
+
+test "last completion result, cron info, and activities by name" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, CronWf.registered, .{});
+    defer inst.destroy();
+
+    var act = try initActivation(a, "Cron", .{});
+    var init = &act.jobs.items[0].variant.?.initialize_workflow;
+    init.cron_schedule = "* * * * *";
+    init.last_completion_result = .{};
+    try init.last_completion_result.?.payloads.append(a, try converter.toPayload(a, @as(i64, 41)));
+    const first = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqualStrings("* * * * *", inst.info.cron_schedule);
+    const sched = first[0].variant.?.schedule_activity;
+    try testing.expectEqualStrings("Tick", sched.activity_type);
+    try testing.expectEqualStrings("41", sched.arguments.items[0].data);
+
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .resolve_activity = .{ .seq = 1, .result = .{ .status = .{ .completed = .{} } } } }), a));
+    try testing.expectEqualStrings("42", done[0].variant.?.complete_workflow_execution.result.?.data);
 }

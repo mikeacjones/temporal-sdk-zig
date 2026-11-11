@@ -18,6 +18,7 @@ const client_mod = @import("client.zig");
 const worker_mod = @import("worker.zig");
 const workflow = @import("workflow.zig");
 const activity = @import("activity.zig");
+const converter = @import("converter.zig");
 const history_mod = @import("history.zig");
 const failure_mod = @import("failure.zig");
 const Allocator = std.mem.Allocator;
@@ -274,6 +275,11 @@ pub const ActivityEnvironment = struct {
         .workflow_namespace = "default",
         .attempt = 1,
     },
+    /// Heartbeat details the activity sees from a "previous attempt". Go
+    /// `SetHeartbeatDetails`.
+    heartbeat_details: []const converter.Payload = &.{},
+    /// Called with each heartbeat's details. Go `SetOnActivityHeartbeatListener`.
+    on_heartbeat: ?activity.Context.HeartbeatSink = null,
 
     pub fn init(io: Io) ActivityEnvironment {
         return .{ .io = io };
@@ -281,10 +287,22 @@ pub const ActivityEnvironment = struct {
 
     /// Calls the activity's function with `args`. The result is allocated from `arena`.
     pub fn executeActivity(env: *const ActivityEnvironment, comptime Activity: type, args: Activity.Args, arena: Allocator) !Activity.Result {
+        return env.executeActivityWith(Activity, null, args, arena);
+    }
+
+    /// Calls a method activity on `receiver` (null for plain functions).
+    pub fn executeActivityWith(env: *const ActivityEnvironment, comptime Activity: type, receiver: ?*Activity.Receiver, args: Activity.Args, arena: Allocator) !Activity.Result {
         var info = env.info;
         info.activity_type = Activity.activity_name;
-        var ctx: activity.Context = .{ .arena = arena, .io_ = env.io, .info_ = info, .logger_ = .{} };
-        return @call(.auto, Activity.function, .{&ctx} ++ args);
+        var ctx: activity.Context = .{
+            .arena = arena,
+            .io_ = env.io,
+            .info_ = info,
+            .logger_ = .{},
+            .heartbeat_details = env.heartbeat_details,
+            .heartbeat_sink = env.on_heartbeat,
+        };
+        return Activity.call(receiver, &ctx, args);
     }
 };
 
