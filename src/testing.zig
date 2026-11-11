@@ -629,6 +629,26 @@ const Fixtures = struct {
         return @intCast(@divFloor(ctx.now().nanoseconds - before.nanoseconds, std.time.ns_per_s));
     }
     const Sleeper = workflow.Def("Sleeper", sleepFor);
+
+    /// Upserts the memo before and after an activity; returns the start memo's status and
+    /// the memo keys at the end.
+    fn memoUpdates(ctx: *workflow.Context, status: []const u8) ![]const u8 {
+        const a = ctx.allocator();
+        const before = (try ctx.memoValue([]const u8, "status")) orelse "none";
+        try ctx.upsertMemo(.{ .status = status, .tags = @as([]const []const u8, &.{ "nightly", "import" }) });
+        _ = try ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{status}).get();
+        try ctx.upsertMemo(.{ .owner = @as(?[]const u8, null), .tags = @as([]const []const u8, &.{}), .done = true });
+        var keys: std.ArrayList([]const u8) = .empty;
+        for (ctx.memo()) |f| try keys.append(a, f.name);
+        return std.fmt.allocPrint(a, "{s}: {s}", .{ before, try std.mem.join(a, ",", keys.items) });
+    }
+    const MemoUpdates = workflow.Def("MemoUpdates", memoUpdates);
+
+    fn memoUpdatesWithoutUpserts(ctx: *workflow.Context, status: []const u8) ![]const u8 {
+        _ = try ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{status}).get();
+        return "queued: done,note,status";
+    }
+    const MemoUpdatesChanged = workflow.Def("MemoUpdates", memoUpdatesWithoutUpserts);
 };
 
 test "WorkflowEnvironment runs a workflow with a test double for its activity" {
@@ -682,6 +702,22 @@ test "WorkflowReplayer replays a matching history and catches a nondeterministic
     defer changed.deinit();
     try changed.registerWorkflow(Fixtures.Different);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(hello_history));
+}
+
+/// A dev-server run of `Fixtures.MemoUpdates` started with the memo
+/// `{status: "queued", owner: "data", note: "keep"}`, exported with `temporal workflow show`.
+const upsert_memo_history = @embedFile("testdata/upsert_memo_history.json");
+
+test "WorkflowReplayer replays memo upserts and catches a dropped upsert" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(Fixtures.MemoUpdates);
+    try ok.replayHistoryJson(upsert_memo_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(Fixtures.MemoUpdatesChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(upsert_memo_history));
 }
 
 test "client: generated IDs, start delay, history, and terminate" {
@@ -785,6 +821,35 @@ test "client: describe reads status and the memo set at start, while running and
     try testing.expect(done.raw.workflow_execution_info != null);
 
     try testing.expectError(error.NotFound, env.client.describeWorkflow(a, "no-such-workflow", ""));
+}
+
+test "an upserted memo reads back through describe; null and empty slices remove keys" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.MemoUpdates);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const memo = try converter.toFields(a, .{ .status = "queued", .owner = "data", .note = "keep" });
+    var run = try env.startWorkflow(Fixtures.MemoUpdates, .{ .task_queue = "", .memo = memo }, .{"shipped"});
+    defer run.deinit();
+    // getResult also replays the run's history.
+    try testing.expectEqualStrings("queued: done,note,status", try env.getResult(Fixtures.MemoUpdates, &run, a, null));
+
+    const d = try env.client.describeWorkflow(a, run.id, run.run_id);
+    var names: std.ArrayList([]const u8) = .empty;
+    for (d.memo) |f| try names.append(a, f.name);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    try testing.expectEqualStrings("done,note,status", try std.mem.join(a, ",", names.items));
+    try testing.expectEqualStrings("shipped", (try d.memoValue([]const u8, a, "status")).?);
+    try testing.expectEqualStrings("keep", (try d.memoValue([]const u8, a, "note")).?);
+    try testing.expect((try d.memoValue(bool, a, "done")).?);
 }
 
 test "time-skipping WorkflowEnvironment completes a 2h sleep in seconds" {
