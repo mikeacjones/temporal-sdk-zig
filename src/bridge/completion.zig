@@ -83,6 +83,26 @@ pub fn Completion(comptime T: type) type {
             return self.take();
         }
 
+        /// Waits for the result. If the waiting task is canceled, calls `cancel(ctx)` to ask
+        /// the core to stop (for example by canceling a core cancellation token), keeps
+        /// waiting for the callback, frees its result, and returns `error.Canceled`. Use this
+        /// instead of `wait` when the core reads caller memory until it calls back, so that
+        /// memory stays valid. Frees the cell.
+        pub fn waitCancelingWith(self: *Self, ctx: *anyopaque, cancel: *const fn (ctx: *anyopaque) void) Io.Cancelable!T {
+            while (self.state.load(.acquire) == pending) {
+                self.io.futexWait(u32, &self.state.raw, pending) catch |err| switch (err) {
+                    error.Canceled => {
+                        cancel(ctx);
+                        // waitUncancelable frees the cell, so read what is needed first.
+                        const free_result = self.free_result;
+                        free_result(self.waitUncancelable());
+                        return error.Canceled;
+                    },
+                };
+            }
+            return self.take();
+        }
+
         /// Waits for the result regardless of cancellation, and frees the cell.
         pub fn waitUncancelable(self: *Self) T {
             while (self.state.load(.acquire) == pending) {

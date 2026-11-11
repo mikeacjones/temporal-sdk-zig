@@ -58,6 +58,8 @@ pub const DevServerOptions = struct {
     extra_args: []const []const u8 = &.{},
     /// 0 uses the core default.
     startup_timeout_ms: u64 = 0,
+    /// Send the server's stdout (its startup banner and logs) to stderr. See `StdoutRedirect`.
+    stdout_to_stderr: bool = true,
 };
 
 pub const TestServerOptions = struct {
@@ -66,6 +68,7 @@ pub const TestServerOptions = struct {
     port: u16 = 0,
     extra_args: []const []const u8 = &.{},
     startup_timeout_ms: u64 = 0,
+    stdout_to_stderr: bool = true,
 };
 
 pub const StartError = error{ OutOfMemory, InvalidOptions, StartFailed };
@@ -100,6 +103,8 @@ pub fn startDevServer(gpa: Allocator, io: Io, runtime: Runtime, options: DevServ
         .log_level = bytes.ref(options.log_level),
     };
     const done = try Completion(StartResult).create(gpa, io, StartResult.free);
+    const redirect: StdoutRedirect = if (options.stdout_to_stderr) .begin() else .none;
+    defer redirect.end();
     c.temporal_core_ephemeral_server_start_dev_server(runtime.ptr, &dev, done, onStart);
     // Uncancelable: the core reads the options from `arena` until it calls back, and startup
     // is bounded by its timeout.
@@ -114,6 +119,8 @@ pub fn startTestServer(gpa: Allocator, io: Io, runtime: Runtime, options: TestSe
 
     const test_server = try testServerOptions(arena, options.executable, options.port, options.extra_args, options.startup_timeout_ms);
     const done = try Completion(StartResult).create(gpa, io, StartResult.free);
+    const redirect: StdoutRedirect = if (options.stdout_to_stderr) .begin() else .none;
+    defer redirect.end();
     c.temporal_core_ephemeral_server_start_test_server(runtime.ptr, test_server, done, onStart);
     return finishStart(gpa, runtime, done.waitUncancelable(), failure);
 }
@@ -136,6 +143,34 @@ pub fn deinit(s: *EphemeralServer) void {
     s.gpa.free(s.target);
     s.* = undefined;
 }
+
+/// The core starts server processes with this process's stdout and stderr, and the C API has
+/// no option to change that. The server prints a startup banner and logs to stdout, which
+/// breaks programs that use stdout for data (the Zig test runner uses it for its protocol with
+/// `zig build`, and a test hangs if the server writes into it). So while a server starts, fd 1
+/// points at stderr; the server inherits that, and fd 1 is restored once startup finishes.
+/// Other threads writing to stdout during that window also go to stderr.
+const StdoutRedirect = struct {
+    saved: c_int,
+
+    const none: StdoutRedirect = .{ .saved = -1 };
+
+    fn begin() StdoutRedirect {
+        const saved = std.c.dup(1);
+        if (saved < 0) return none;
+        if (std.c.dup2(2, 1) < 0) {
+            _ = std.c.close(saved);
+            return none;
+        }
+        return .{ .saved = saved };
+    }
+
+    fn end(r: StdoutRedirect) void {
+        if (r.saved < 0) return;
+        _ = std.c.dup2(r.saved, 1);
+        _ = std.c.close(r.saved);
+    }
+};
 
 const StartResult = struct {
     server: ?*c.TemporalCoreEphemeralServer,
