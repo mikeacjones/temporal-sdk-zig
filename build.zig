@@ -51,7 +51,8 @@ pub fn build(b: *std.Build) void {
     core_step.dependOn(&b.addInstallFile(core_lib, "lib/" ++ core_lib_name).step);
 
     // zig build test
-    const unit_tests = b.addTest(.{ .root_module = temporal });
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
+    const unit_tests = b.addTest(.{ .root_module = temporal, .filters = test_filters });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
@@ -61,13 +62,27 @@ pub fn build(b: *std.Build) void {
         b.path("build.zig.zon"),
         b.path("src"),
         b.path("samples"),
+        b.path("tools"),
     };
     const fmt_step = b.step("fmt", "Check formatting");
     fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_paths, .check = true }).step);
 
-    // zig build samples / zig build run-<sample>
+    // zig build samples / zig build run-<sample> / zig build samples-test
     const samples_step = b.step("samples", "Build all samples");
     const samples = [_][]const u8{"hello"};
+
+    const runner = b.addExecutable(.{
+        .name = "samples-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/samples_runner.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const samples_test = b.addRunArtifact(runner);
+    samples_test.addDirectoryArg(b.path("."));
+    samples_test.addArgs(&samples);
+    samples_test.step.dependOn(samples_step);
+    b.step("samples-test", "Build and validate every sample against a dev server").dependOn(&samples_test.step);
     for (samples) |name| {
         const exe = b.addExecutable(.{
             .name = name,
