@@ -147,7 +147,12 @@ const samples = [_]Sample{
     .{ .name = "timer", .tests = &.{"workflow_test.zig"} },
     .{ .name = "start-delay", .imports = &.{"helloworld"} },
     .{ .name = "retryactivity", .tests = &.{"retry_activity_workflow_test.zig"} },
-    .{ .name = "cron" },
+    .{ .name = "cron", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "greetingslocal", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "cancellation", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "child-workflow", .tests = &.{"parent_workflow_test.zig"} },
+    .{ .name = "query", .tests = &.{"query_workflow_test.zig"} },
+    .{ .name = "memo", .tests = &.{"memo_workflow_test.zig"} },
 };
 
 /// Runs cargo to build the C bridge as a static library for `target` and returns its path.

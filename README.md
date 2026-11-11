@@ -71,6 +71,11 @@ Where the Go SDK relies on machinery Temporal's Rust core doesn't have, this SDK
 | [start-delay](samples/start-delay) | start-delay |
 | [retryactivity](samples/retryactivity) | retryactivity |
 | [cron](samples/cron) | cron |
+| [greetingslocal](samples/greetingslocal) | greetingslocal |
+| [cancellation](samples/cancellation) | cancellation |
+| [child-workflow](samples/child-workflow) | child-workflow |
+| [query](samples/query) | query |
+| [memo](samples/memo) | memo |
 
 ## Development
 
