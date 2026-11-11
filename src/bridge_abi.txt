@@ -1,0 +1,65 @@
+TemporalCoreSlotInfo_TemporalCoreWorkflowSlotInfo_Body size=24 align=8 workflow_type@0 is_sticky@16
+TemporalCoreSlotInfo_TemporalCoreActivitySlotInfo_Body size=16 align=8 activity_type@0
+TemporalCoreSlotInfo_TemporalCoreLocalActivitySlotInfo_Body size=16 align=8 activity_type@0
+TemporalCoreSlotInfo_TemporalCoreNexusSlotInfo_Body size=32 align=8 operation@0 service@16
+TemporalCoreByteArrayRef size=16 align=8 data@0 size@8
+TemporalCoreByteArrayRefArray size=16 align=8 data@0 size@8
+TemporalCoreMetadataRef size=16 align=8 data@0 size@8
+TemporalCoreClientTlsOptions size=64 align=8 server_root_ca_cert@0 domain@16 client_cert@32 client_private_key@48
+TemporalCoreClientRetryOptions size=48 align=8 initial_interval_millis@0 randomization_factor@8 multiplier@16 max_interval_millis@24 max_elapsed_time_millis@32 max_retries@40
+TemporalCoreClientKeepAliveOptions size=16 align=8 interval_millis@0 timeout_millis@8
+TemporalCoreClientHttpConnectProxyOptions size=48 align=8 target_host@0 username@16 password@32
+TemporalCoreClientDnsLoadBalancingOptions size=8 align=8 resolution_interval_millis@0
+TemporalCoreConnectionOptions size=192 align=8 target_url@0 client_name@16 client_version@32 metadata@48 binary_metadata@64 api_key@80 identity@96 tls_options@112 retry_options@120 keep_alive_options@128 http_connect_proxy_options@136 grpc_override_callback@144 grpc_override_callback_user_data@152 dns_load_balancing_options@160 grpc_compression@168 payloads_warn_size@176 memo_warn_size@184
+TemporalCoreByteArray size=32 align=8 data@0 size@8 cap@16 disable_free@24
+TemporalCoreClientGrpcOverrideResponse size=72 align=8 status_code@0 headers@8 success_proto@24 fail_message@40 fail_details@56
+TemporalCoreRpcCallOptions size=96 align=8 service@0 rpc@8 req@24 retry@40 metadata@48 binary_metadata@64 timeout_millis@80 cancellation_token@88
+TemporalCoreClientEnvConfigOrFail size=16 align=8 success@0 fail@8
+TemporalCoreClientEnvConfigLoadOptions size=56 align=8 path@0 data@16 config_file_strict@32 env_vars@40
+TemporalCoreClientEnvConfigProfileOrFail size=16 align=8 success@0 fail@8
+TemporalCoreClientEnvConfigProfileLoadOptions size=72 align=8 profile@0 path@16 data@32 disable_file@48 disable_env@49 config_file_strict@50 env_vars@56
+TemporalCoreMetricAttributeValue size=16 align=8 string_value:16 int_value:8 float_value:8 bool_value:1
+TemporalCoreMetricAttribute size=40 align=8 key@0 value@16 value_type@32
+TemporalCoreMetricOptions size=56 align=8 name@0 description@16 unit@32 kind@48
+TemporalCoreRuntimeOrFail size=16 align=8 runtime@0 fail@8
+TemporalCoreLoggingOptions size=24 align=8 filter@0 forward_to@16
+TemporalCoreNewlineDelimitedMapRef size=16 align=8 data@0 size@8
+TemporalCoreOpenTelemetryOptions size=96 align=8 url@0 headers@16 metric_periodicity_millis@32 metric_temporality@36 durations_as_seconds@40 protocol@44 histogram_bucket_overrides@48 histogram_aggregation@64 exponential_histogram_max_size@68 exponential_histogram_max_scale@72 exponential_histogram_max_scale_set@73 exponential_histogram_name_suffix@80
+TemporalCorePrometheusOptions size=40 align=8 bind_address@0 counters_total_suffix@16 unit_suffix@17 durations_as_seconds@18 histogram_bucket_overrides@24
+TemporalCoreCustomMetricAttributeValueString size=16 align=8 data@0 size@8
+TemporalCoreCustomMetricAttributeValue size=16 align=8 string_value:16 int_value:8 float_value:8 bool_value:1
+TemporalCoreCustomMetricAttribute size=40 align=8 key@0 value@16 value_type@32
+TemporalCoreCustomMetricMeter size=64 align=8 metric_new@0 metric_free@8 metric_record_integer@16 metric_record_float@24 metric_record_duration@32 attributes_new@40 attributes_free@48 meter_free@56
+TemporalCoreMetricsOptions size=64 align=8 opentelemetry@0 prometheus@8 custom_meter@16 attach_service_name@24 global_tags@32 metric_prefix@48
+TemporalCoreTelemetryOptions size=16 align=8 logging@0 metrics@8
+TemporalCoreRuntimeInfo size=24 align=8 runtime_type@0 version@8
+TemporalCoreRuntimeInfoArray size=16 align=8 data@0 size@8
+TemporalCoreRuntimeOptions size=40 align=8 telemetry@0 worker_heartbeat_interval_millis@8 runtime_info@16 disable_environment_info@32
+TemporalCoreTestServerOptions size=120 align=8 existing_path@0 sdk_name@16 sdk_version@32 download_version@48 download_dest_dir@64 port@80 extra_args@88 download_ttl_seconds@104 startup_timeout_millis@112
+TemporalCoreDevServerOptions size=96 align=8 test_server@0 namespace_@8 ip@24 database_filename@40 ui@56 ui_port@58 log_format@64 log_level@80
+TemporalCoreWorkerOrFail size=16 align=8 worker@0 fail@8
+TemporalCoreWorkerVersioningNone size=16 align=8 build_id@0
+TemporalCoreWorkerDeploymentVersion size=32 align=8 deployment_name@0 build_id@16
+TemporalCoreWorkerDeploymentOptions size=40 align=8 version@0 use_worker_versioning@32 default_versioning_behavior@36
+TemporalCoreLegacyBuildIdBasedStrategy size=16 align=8 build_id@0
+TemporalCoreWorkerVersioningStrategy size=48 align=8 tag@0 unnamed_0@8
+TemporalCoreFixedSizeSlotSupplier size=8 align=8 num_slots@0
+TemporalCoreResourceBasedTunerOptions size=16 align=8 target_memory_usage@0 target_cpu_usage@8
+TemporalCoreResourceBasedSlotSupplier size=40 align=8 minimum_slots@0 maximum_slots@8 ramp_throttle_ms@16 tuner_options@24
+TemporalCoreSlotReserveCtx size=64 align=8 slot_type@0 task_queue@8 worker_identity@24 worker_build_id@40 is_sticky@56
+TemporalCoreSlotInfo size=40 align=8 tag@0 unnamed_0@8
+TemporalCoreSlotMarkUsedCtx size=48 align=8 slot_info@0 slot_permit@40
+TemporalCoreSlotReleaseCtx size=16 align=8 slot_info@0 slot_permit@8
+TemporalCoreCustomSlotSupplierCallbacks size=64 align=8 reserve@0 cancel_reserve@8 try_reserve@16 mark_used@24 release@32 available_slots@40 free@48 user_data@56
+TemporalCoreCustomSlotSupplierCallbacksImpl size=8 align=8 _0@0
+TemporalCoreSlotSupplier size=48 align=8 tag@0 unnamed_0@8
+TemporalCoreTunerHolder size=192 align=8 workflow_slot_supplier@0 activity_slot_supplier@48 local_activity_slot_supplier@96 nexus_task_slot_supplier@144
+TemporalCoreWorkerTaskTypes size=4 align=1 enable_workflows@0 enable_local_activities@1 enable_remote_activities@2 enable_nexus@3
+TemporalCorePollerBehaviorSimpleMaximum size=8 align=8 simple_maximum@0
+TemporalCorePollerBehaviorAutoscaling size=24 align=8 minimum@0 maximum@8 initial@16
+TemporalCorePollerBehavior size=16 align=8 simple_maximum@0 autoscaling@8
+TemporalCorePluginInfo size=32 align=8 name@0 version@16
+TemporalCorePluginInfoArray size=16 align=8 data@0 size@8
+TemporalCoreWorkerOptions size=472 align=8 namespace_@0 task_queue@16 versioning_strategy@32 identity_override@80 max_cached_workflows@96 tuner@104 task_types@296 sticky_queue_schedule_to_start_timeout_millis@304 max_heartbeat_throttle_interval_millis@312 default_heartbeat_throttle_interval_millis@320 max_activities_per_second@328 max_task_queue_activities_per_second@336 graceful_shutdown_period_millis@344 workflow_task_poller_behavior@352 nonsticky_to_sticky_poll_ratio@368 activity_task_poller_behavior@376 nexus_task_poller_behavior@392 nondeterminism_as_workflow_fail@408 nondeterminism_as_workflow_fail_for_types@416 plugins@432 storage_drivers@448 disable_payload_error_limit@464 max_eager_activity_reservations_per_workflow_task@468
+TemporalCoreWorkerReplayerOrFail size=24 align=8 worker@0 worker_replay_pusher@8 fail@16
+TemporalCoreWorkerReplayPushResult size=8 align=8 fail@0

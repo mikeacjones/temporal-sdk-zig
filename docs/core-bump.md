@@ -40,7 +40,13 @@ We pin release tags only, never a branch. The .NET SDK uses the same C bridge, s
 
    `list-protos.sh` refreshes `deps/protos.zig`, the list of .proto files to compile. `gen-proto` rewrites `src/proto/` and the `src/proto.zig` index. Review the diff: renamed or removed fields break SDK code that uses them, and the compiler will point at each one.
 
-4. Update `src/bridge/` for every header change from step 1, and update the struct size and alignment tests.
+4. Update `src/bridge/` for every header change from step 1. Then refresh the struct layout snapshot, which `zig build test` checks against the header:
+
+   ```sh
+   scripts/update-abi-snapshot.sh
+   ```
+
+   The `src/bridge_abi.txt` diff shows every struct whose size or field offsets moved. Each one needs a matching change in the code that builds or reads it.
 
 5. Run `zig build test` (it rebuilds the core with cargo) and the integration tests against a dev server.
 
