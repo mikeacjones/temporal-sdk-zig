@@ -8,7 +8,10 @@
 //!    including cache-eviction activations, or shutdown will not finish.
 //! 3. `initiateShutdown`. Keep polling each enabled task type until its poll returns null
 //!    (shut down), completing whatever arrives meanwhile.
-//! 4. `finalizeShutdown` once no poll or completion is in flight, then `deinit`.
+//! 4. `finalizeShutdown` once no poll, completion, or `initiateShutdown` call is in flight (on
+//!    any thread), then `deinit`. Finalizing moves the core worker out of its handle; a
+//!    concurrent `initiateShutdown` would use the moved-from worker and can leave the moved one
+//!    holding a lock forever, so finalizing never finishes. After it, call only `deinit`.
 //!
 //! Polls wait without cancellation: abandoning one could drop an activation the core then
 //! waits on forever. Stop polling with `initiateShutdown` instead.
@@ -326,7 +329,8 @@ pub fn initiateShutdown(w: Worker) void {
 }
 
 /// Waits for shutdown to finish. Every poll must have returned null and every completion must
-/// have finished first; otherwise this fails.
+/// have finished first; otherwise this fails. No `initiateShutdown` may be running or start on
+/// another thread (see the lifecycle above): the core does not guard against that, and it hangs.
 pub fn finalizeShutdown(w: Worker, gpa: Allocator, io: Io, failure: ?*?[]u8) error{ OutOfMemory, ShutdownFailed }!void {
     const done = try Completion(?bytes.Owned).create(gpa, io, freeOwned);
     c.temporal_core_worker_finalize_shutdown(w.ptr, done, onDone);
