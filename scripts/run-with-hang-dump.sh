@@ -16,6 +16,9 @@ while kill -0 "$cmd" 2>/dev/null; do
   if [ "$waited" -ge "$limit" ]; then
     echo "::error::'$*' still running after ${limit}s; dumping stacks"
     ps -eo pid,ppid,etime,args | grep -E '\.zig-cache|zig build|temporal' | grep -v grep
+    if [ "$(uname)" = Linux ] && ! command -v gdb >/dev/null; then
+      sudo -n apt-get install -y -qq gdb >/dev/null 2>&1 || echo "gdb is not installed and could not be installed"
+    fi
     for pid in $(pgrep -f '\.zig-cache/o/'); do
       echo "===== stacks of $pid: $(ps -o args= -p "$pid" | cut -c1-200)"
       case "$(uname)" in

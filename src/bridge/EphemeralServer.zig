@@ -58,8 +58,8 @@ pub const DevServerOptions = struct {
     extra_args: []const []const u8 = &.{},
     /// 0 uses the core default.
     startup_timeout_ms: u64 = 0,
-    /// Send the server's stdout (its startup banner and logs) to stderr. See `StdoutRedirect`.
-    stdout_to_stderr: bool = true,
+    /// Where the server's stdout and stderr go. See `ServerOutput`.
+    output: ServerOutput = .discard,
 };
 
 pub const TestServerOptions = struct {
@@ -68,7 +68,8 @@ pub const TestServerOptions = struct {
     port: u16 = 0,
     extra_args: []const []const u8 = &.{},
     startup_timeout_ms: u64 = 0,
-    stdout_to_stderr: bool = true,
+    /// Where the server's stdout and stderr go. See `ServerOutput`.
+    output: ServerOutput = .discard,
 };
 
 pub const StartError = error{ OutOfMemory, InvalidOptions, StartFailed };
@@ -103,7 +104,7 @@ pub fn startDevServer(gpa: Allocator, io: Io, runtime: Runtime, options: DevServ
         .log_level = bytes.ref(options.log_level),
     };
     const done = try Completion(StartResult).create(gpa, io, StartResult.free);
-    const redirect: StdoutRedirect = if (options.stdout_to_stderr) .begin() else .none;
+    const redirect: OutputRedirect = .begin(options.output);
     defer redirect.end();
     c.temporal_core_ephemeral_server_start_dev_server(runtime.ptr, &dev, done, onStart);
     // Uncancelable: the core reads the options from `arena` until it calls back, and startup
@@ -119,7 +120,7 @@ pub fn startTestServer(gpa: Allocator, io: Io, runtime: Runtime, options: TestSe
 
     const test_server = try testServerOptions(arena, options.executable, options.port, options.extra_args, options.startup_timeout_ms);
     const done = try Completion(StartResult).create(gpa, io, StartResult.free);
-    const redirect: StdoutRedirect = if (options.stdout_to_stderr) .begin() else .none;
+    const redirect: OutputRedirect = .begin(options.output);
     defer redirect.end();
     c.temporal_core_ephemeral_server_start_test_server(runtime.ptr, test_server, done, onStart);
     return finishStart(gpa, runtime, done.waitUncancelable(), failure);
@@ -144,31 +145,63 @@ pub fn deinit(s: *EphemeralServer) void {
     s.* = undefined;
 }
 
-/// The core starts server processes with this process's stdout and stderr, and the C API has
-/// no option to change that. The server prints a startup banner and logs to stdout, which
-/// breaks programs that use stdout for data (the Zig test runner uses it for its protocol with
-/// `zig build`, and a test hangs if the server writes into it). So while a server starts, fd 1
-/// points at stderr; the server inherits that, and fd 1 is restored once startup finishes.
-/// Other threads writing to stdout during that window also go to stderr.
-const StdoutRedirect = struct {
-    saved: c_int,
+/// Where a server's stdout and stderr go. The core starts server processes with this
+/// process's stdout and stderr, and the C API has no option to change that, so the server's
+/// output is chosen by pointing this process's fds 1 and 2 elsewhere while it starts (the
+/// server inherits them) and restoring them once startup finishes. Other threads writing to
+/// stdout or stderr during that window are redirected too.
+pub const ServerOutput = enum {
+    /// Drop it. A server that outlives this process (if the process crashes) then holds no
+    /// pipe of its parent's open; `zig build` waits for a test's output pipes to close, so an
+    /// inherited pipe turns a crashed test into a hung build.
+    discard,
+    /// Send the server's stdout (its startup banner and logs) to this process's stderr. Never
+    /// leave it on stdout when stdout carries data: the Zig test runner uses it for its
+    /// protocol with `zig build`.
+    stderr,
+    /// Leave both as they are.
+    inherit,
+};
 
-    const none: StdoutRedirect = .{ .saved = -1 };
+const OutputRedirect = struct {
+    saved_out: c_int = -1,
+    saved_err: c_int = -1,
 
-    fn begin() StdoutRedirect {
-        const saved = std.c.dup(1);
-        if (saved < 0) return none;
-        if (std.c.dup2(2, 1) < 0) {
-            _ = std.c.close(saved);
-            return none;
+    fn begin(mode: ServerOutput) OutputRedirect {
+        switch (mode) {
+            .inherit => return .{},
+            .stderr => {
+                const saved = std.c.dup(1);
+                if (saved < 0) return .{};
+                if (std.c.dup2(2, 1) < 0) {
+                    _ = std.c.close(saved);
+                    return .{};
+                }
+                return .{ .saved_out = saved };
+            },
+            .discard => {
+                const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+                if (null_fd < 0) return begin(.stderr);
+                defer _ = std.c.close(null_fd);
+                var r: OutputRedirect = .{ .saved_out = std.c.dup(1), .saved_err = std.c.dup(2) };
+                if (r.saved_out < 0 or r.saved_err < 0 or std.c.dup2(null_fd, 1) < 0 or std.c.dup2(null_fd, 2) < 0) {
+                    r.end();
+                    return begin(.stderr);
+                }
+                return r;
+            },
         }
-        return .{ .saved = saved };
     }
 
-    fn end(r: StdoutRedirect) void {
-        if (r.saved < 0) return;
-        _ = std.c.dup2(r.saved, 1);
-        _ = std.c.close(r.saved);
+    fn end(r: OutputRedirect) void {
+        if (r.saved_out >= 0) {
+            _ = std.c.dup2(r.saved_out, 1);
+            _ = std.c.close(r.saved_out);
+        }
+        if (r.saved_err >= 0) {
+            _ = std.c.dup2(r.saved_err, 2);
+            _ = std.c.close(r.saved_err);
+        }
     }
 };
 
