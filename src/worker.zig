@@ -154,15 +154,14 @@ pub const Worker = struct {
 // ---------------------------------------------------------------- workflows
 
 fn workflowLoop(w: *Worker, core: bridge.Worker) void {
-    var runs: std.StringHashMapUnmanaged(*Instance) = .empty;
-    defer {
-        var it = runs.iterator();
-        while (it.next()) |kv| {
-            kv.value_ptr.*.destroy();
-            w.gpa.free(kv.key_ptr.*);
-        }
-        runs.deinit(w.gpa);
-    }
+    var runner: WorkflowRunner = .{
+        .gpa = w.gpa,
+        .workflows = &w.workflows,
+        .task_queue = w.task_queue,
+        .namespace = w.client.namespace,
+        .stack_size = w.options.workflow_stack_size,
+    };
+    defer runner.deinit();
     var message: ?[]u8 = null;
     defer if (message) |m| w.gpa.free(m);
 
@@ -173,57 +172,88 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
             continue;
         } orelse break;
         defer polled.deinit();
-
-        var arena_state: std.heap.ArenaAllocator = .init(w.gpa);
-        defer arena_state.deinit();
-        const a = arena_state.allocator();
-        const completion = handleActivation(w, &runs, polled.bytes(), a) catch |err| blk: {
-            log.err("processing a workflow activation failed: {t}", .{err});
-            break :blk null;
-        } orelse continue;
-
-        var encoded: Io.Writer.Allocating = .init(a);
-        completion.encode(&encoded.writer, a) catch continue;
-        core.completeWorkflowActivation(w.gpa, w.io, encoded.written(), &message) catch |err| {
-            log.err("completing a workflow activation failed: {s}", .{message orelse @errorName(err)});
-        };
+        runner.process(core, w.io, polled.bytes());
     }
 }
 
-fn handleActivation(w: *Worker, runs: *std.StringHashMapUnmanaged(*Instance), bytes: []const u8, a: Allocator) !?done_pb.WorkflowActivationCompletion {
-    var reader: Io.Reader = .fixed(bytes);
-    const act = try act_pb.WorkflowActivation.decode(&reader, a);
+/// Turns workflow activations into completions for one worker (or replayer): keeps the cache
+/// of running workflow instances, creates them on InitializeWorkflow, and destroys them on
+/// eviction. Used from a single thread.
+pub const WorkflowRunner = struct {
+    gpa: Allocator,
+    workflows: *const std.StringHashMapUnmanaged(workflow.Registered),
+    task_queue: []const u8,
+    namespace: []const u8,
+    stack_size: usize,
+    runs: std.StringHashMapUnmanaged(*Instance) = .empty,
+    /// Called for each eviction with the core's reason and message (the replayer uses it to
+    /// detect nondeterminism).
+    on_evict: ?*const fn (ctx: *anyopaque, reason: act_pb.RemoveFromCache.EvictionReason, message: []const u8) void = null,
+    on_evict_ctx: *anyopaque = undefined,
 
-    // An eviction comes alone; complete it, then drop the run.
-    for (act.jobs.items) |job| if (job.variant) |v| if (v == .remove_from_cache) {
-        if (runs.fetchRemove(act.run_id)) |kv| {
-            kv.value.destroy();
-            w.gpa.free(kv.key);
+    pub fn deinit(r: *WorkflowRunner) void {
+        var it = r.runs.iterator();
+        while (it.next()) |kv| {
+            kv.value_ptr.*.destroy();
+            r.gpa.free(kv.key_ptr.*);
         }
-        return .{ .run_id = act.run_id, .status = .{ .successful = .{} } };
-    };
+        r.runs.deinit(r.gpa);
+    }
 
-    const inst = runs.get(act.run_id) orelse blk: {
-        const workflow_type = for (act.jobs.items) |job| {
-            if (job.variant) |v| if (v == .initialize_workflow) break v.initialize_workflow.workflow_type;
-        } else return try taskFailure(a, act.run_id, "activation for a workflow run that is not cached and has no InitializeWorkflow job");
-        const entry = w.workflows.get(workflow_type) orelse {
-            const known = try registeredNames(a, w.workflows);
-            return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow type \"{s}\" is not registered on this worker; registered: {s}", .{ workflow_type, known }));
+    /// Handles one serialized activation and sends its completion to `core`.
+    pub fn process(r: *WorkflowRunner, core: bridge.Worker, io: Io, bytes: []const u8) void {
+        var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const completion = r.handle(bytes, a) catch |err| {
+            log.err("processing a workflow activation failed: {t}", .{err});
+            return;
         };
-        const inst = try Instance.create(w.gpa, entry, .{
-            .task_queue = w.task_queue,
-            .namespace = w.client.namespace,
-            .stack_size = w.options.workflow_stack_size,
-        });
-        errdefer inst.destroy();
-        const key = try w.gpa.dupe(u8, act.run_id);
-        errdefer w.gpa.free(key);
-        try runs.put(w.gpa, key, inst);
-        break :blk inst;
-    };
-    return inst.activate(&act, a) catch |err| try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err}));
-}
+        var encoded: Io.Writer.Allocating = .init(a);
+        completion.encode(&encoded.writer, a) catch return;
+        var message: ?[]u8 = null;
+        defer if (message) |m| r.gpa.free(m);
+        core.completeWorkflowActivation(r.gpa, io, encoded.written(), &message) catch |err| {
+            log.err("completing a workflow activation failed: {s}", .{message orelse @errorName(err)});
+        };
+    }
+
+    fn handle(r: *WorkflowRunner, bytes: []const u8, a: Allocator) !done_pb.WorkflowActivationCompletion {
+        var reader: Io.Reader = .fixed(bytes);
+        const act = try act_pb.WorkflowActivation.decode(&reader, a);
+
+        // An eviction comes alone; complete it, then drop the run.
+        for (act.jobs.items) |job| if (job.variant) |v| if (v == .remove_from_cache) {
+            if (r.on_evict) |cb| cb(r.on_evict_ctx, v.remove_from_cache.reason, v.remove_from_cache.message);
+            if (r.runs.fetchRemove(act.run_id)) |kv| {
+                kv.value.destroy();
+                r.gpa.free(kv.key);
+            }
+            return .{ .run_id = act.run_id, .status = .{ .successful = .{} } };
+        };
+
+        const inst = r.runs.get(act.run_id) orelse blk: {
+            const workflow_type = for (act.jobs.items) |job| {
+                if (job.variant) |v| if (v == .initialize_workflow) break v.initialize_workflow.workflow_type;
+            } else return try taskFailure(a, act.run_id, "activation for a workflow run that is not cached and has no InitializeWorkflow job");
+            const entry = r.workflows.get(workflow_type) orelse {
+                const known = try registeredNames(a, r.workflows.*);
+                return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow type \"{s}\" is not registered on this worker; registered: {s}", .{ workflow_type, known }));
+            };
+            const inst = try Instance.create(r.gpa, entry, .{
+                .task_queue = r.task_queue,
+                .namespace = r.namespace,
+                .stack_size = r.stack_size,
+            });
+            errdefer inst.destroy();
+            const key = try r.gpa.dupe(u8, act.run_id);
+            errdefer r.gpa.free(key);
+            try r.runs.put(r.gpa, key, inst);
+            break :blk inst;
+        };
+        return inst.activate(&act, a) catch |err| try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err}));
+    }
+};
 
 fn taskFailure(a: Allocator, run_id: []const u8, message: []const u8) !done_pb.WorkflowActivationCompletion {
     log.warn("failing workflow task: {s}", .{message});

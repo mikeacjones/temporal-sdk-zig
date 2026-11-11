@@ -112,8 +112,61 @@ pub const InitError = error{ OutOfMemory, InvalidOptions, WorkerInitFailed };
 pub fn init(gpa: Allocator, connection: Connection, options: Options, failure: ?*?[]u8) InitError!Worker {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const core = try coreOptions(arena_state.allocator(), options);
 
+    const result = c.temporal_core_worker_new(connection.ptr, &core);
+    if (bytes.Owned.take(connection.runtime.ptr, result.fail)) |fail| {
+        defer fail.deinit();
+        if (result.worker) |w| c.temporal_core_worker_free(w);
+        if (failure) |f| f.* = fail.dupe(gpa) catch null;
+        return error.WorkerInitFailed;
+    }
+    return .{ .ptr = result.worker orelse return error.WorkerInitFailed, .runtime = connection.runtime };
+}
+
+/// A worker that replays histories instead of polling a server, plus the handle histories
+/// are pushed through. It shuts itself down once the pusher is freed and every pushed history
+/// has been replayed.
+pub const Replayer = struct {
+    worker: Worker,
+    pusher: ?*c.TemporalCoreWorkerReplayPusher,
+
+    /// Pushes a serialized temporal.api.history.v1.History to replay as `workflow_id`.
+    pub fn push(r: Replayer, gpa: Allocator, workflow_id: []const u8, history: []const u8, failure: ?*?[]u8) error{ReplayPushFailed}!void {
+        const result = c.temporal_core_worker_replay_push(r.worker.ptr, r.pusher, bytes.ref(workflow_id), bytes.ref(history));
+        const fail = bytes.Owned.take(r.worker.runtime.ptr, result.fail) orelse return;
+        defer fail.deinit();
+        if (failure) |f| f.* = fail.dupe(gpa) catch null;
+        return error.ReplayPushFailed;
+    }
+
+    /// Signals that no more histories will be pushed.
+    pub fn finishPushing(r: *Replayer) void {
+        if (r.pusher) |p| c.temporal_core_worker_replay_pusher_free(p);
+        r.pusher = null;
+    }
+};
+
+/// Creates a replay worker. Only workflow task options matter for replay.
+pub fn initReplayer(gpa: Allocator, runtime: Runtime, options: Options, failure: ?*?[]u8) InitError!Replayer {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const core = try coreOptions(arena_state.allocator(), options);
+    const result = c.temporal_core_worker_replayer_new(runtime.ptr, &core);
+    if (bytes.Owned.take(runtime.ptr, result.fail)) |fail| {
+        defer fail.deinit();
+        if (result.worker) |w| c.temporal_core_worker_free(w);
+        if (result.worker_replay_pusher) |p| c.temporal_core_worker_replay_pusher_free(p);
+        if (failure) |f| f.* = fail.dupe(gpa) catch null;
+        return error.WorkerInitFailed;
+    }
+    return .{
+        .worker = .{ .ptr = result.worker orelse return error.WorkerInitFailed, .runtime = runtime },
+        .pusher = result.worker_replay_pusher,
+    };
+}
+
+fn coreOptions(arena: Allocator, options: Options) error{OutOfMemory}!c.TemporalCoreWorkerOptions {
     var core: c.TemporalCoreWorkerOptions = std.mem.zeroes(c.TemporalCoreWorkerOptions);
     core.namespace_ = bytes.ref(options.namespace);
     core.task_queue = bytes.ref(options.task_queue);
@@ -167,15 +220,7 @@ pub fn init(gpa: Allocator, connection: Connection, options: Options, failure: ?
     core.storage_drivers = try refArray(arena, options.storage_drivers);
     core.disable_payload_error_limit = options.disable_payload_error_limit;
     core.max_eager_activity_reservations_per_workflow_task = options.max_eager_activity_reservations_per_workflow_task;
-
-    const result = c.temporal_core_worker_new(connection.ptr, &core);
-    if (bytes.Owned.take(connection.runtime.ptr, result.fail)) |fail| {
-        defer fail.deinit();
-        if (result.worker) |w| c.temporal_core_worker_free(w);
-        if (failure) |f| f.* = fail.dupe(gpa) catch null;
-        return error.WorkerInitFailed;
-    }
-    return .{ .ptr = result.worker orelse return error.WorkerInitFailed, .runtime = connection.runtime };
+    return core;
 }
 
 /// Frees the worker. Call `finalizeShutdown` first if it was used.
