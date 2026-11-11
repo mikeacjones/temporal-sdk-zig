@@ -9,7 +9,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
 
 ## Status
 
-The SDK runs its first end-to-end path: a client starts a workflow, a worker runs the workflow and its activity, and the client gets the result. The [helloworld](samples/helloworld) sample, a port of the Go sample, passes against a dev server along with its ported tests (a test environment with an activity test double, an in-process activity test, and replaying a history recorded from the Go SDK).
+Workflows can run activities (sequentially, in parallel, or chosen at run time), wait on timers, race activities against timers, run concurrent coroutines on the workflow's deterministic `std.Io`, and await conditions. Activities can share state, heartbeat, and resume from their last heartbeat on retry. Clients can start workflows with a start delay or a cron schedule, wait for results, and terminate workflows. Twelve samples-go ports pass against a dev server with their ported tests: helloworld, greetings, branch, splitmerge-future, splitmerge-selector, choice-exclusive, choice-multi, goroutine, timer, start-delay, retryactivity, and cron. Every test run through the test environment also replays the workflow's own history to check determinism.
 
 Signals, queries, updates, child workflows, local activities, Nexus, and most client and worker options are not implemented yet.
 

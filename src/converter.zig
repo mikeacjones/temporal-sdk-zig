@@ -122,6 +122,138 @@ fn payloadWith(arena: Allocator, enc: Encoding, data: []const u8) error{OutOfMem
 
 const testing = std.testing;
 
+/// A point in time that encodes the way Go's `time.Time` does in JSON: an RFC 3339 string with
+/// up to nanosecond precision, such as "2018-08-22T16:30:00Z". Use it for payload fields that
+/// are `time.Time` in Go. The default value is Go's zero time ("0001-01-01T00:00:00Z").
+pub const Time = struct {
+    /// Nanoseconds since the Unix epoch.
+    unix_ns: i96 = zero_unix_ns,
+
+    const zero_unix_ns: i96 = -62135596800 * std.time.ns_per_s;
+    pub const zero: Time = .{};
+    /// The longest text `format` writes: "-YYYYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ" fits easily.
+    pub const max_len = 40;
+
+    pub fn fromTimestamp(ts: std.Io.Timestamp) Time {
+        return .{ .unix_ns = ts.nanoseconds };
+    }
+
+    pub fn toTimestamp(t: Time) std.Io.Timestamp {
+        return .{ .nanoseconds = t.unix_ns };
+    }
+
+    pub fn isZero(t: Time) bool {
+        return t.unix_ns == zero_unix_ns;
+    }
+
+    /// Writes `t` in UTC as Go's RFC3339Nano does (trailing zeros of the fraction dropped).
+    pub fn format(t: Time, buf: *[max_len]u8) []const u8 {
+        const secs: i64 = @intCast(@divFloor(t.unix_ns, std.time.ns_per_s));
+        const nanos: u32 = @intCast(@mod(t.unix_ns, std.time.ns_per_s));
+        const days = @divFloor(secs, std.time.s_per_day);
+        const sod: u32 = @intCast(@mod(secs, std.time.s_per_day));
+        const date = civilFromDays(days);
+        var w: std.Io.Writer = .fixed(buf);
+        w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+            @as(u64, @intCast(@max(date.year, 0))), date.month, date.day, sod / 3600, sod / 60 % 60, sod % 60,
+        }) catch unreachable;
+        if (nanos != 0) {
+            var frac: [9]u8 = undefined;
+            _ = std.fmt.bufPrint(&frac, "{d:0>9}", .{nanos}) catch unreachable;
+            const digits = std.mem.trimEnd(u8, &frac, "0");
+            w.print(".{s}", .{digits}) catch unreachable;
+        }
+        w.writeByte('Z') catch unreachable;
+        return w.buffered();
+    }
+
+    /// Parses an RFC 3339 time ("2006-01-02T15:04:05.999999999Z07:00").
+    pub fn parse(text: []const u8) error{InvalidTime}!Time {
+        if (text.len < 20 or text[4] != '-' or text[7] != '-' or (text[10] != 'T' and text[10] != 't') or text[13] != ':' or text[16] != ':')
+            return error.InvalidTime;
+        const year = try digitsOf(text[0..4]);
+        const month = try digitsOf(text[5..7]);
+        const day = try digitsOf(text[8..10]);
+        const hour = try digitsOf(text[11..13]);
+        const minute = try digitsOf(text[14..16]);
+        const second = try digitsOf(text[17..19]);
+        if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60) return error.InvalidTime;
+        var i: usize = 19;
+        var nanos: i96 = 0;
+        if (text[i] == '.') {
+            i += 1;
+            var scale: i96 = 100_000_000;
+            const start = i;
+            while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) {
+                nanos += (text[i] - '0') * scale;
+                scale = @divTrunc(scale, 10);
+            }
+            if (i == start) return error.InvalidTime;
+        }
+        if (i >= text.len) return error.InvalidTime;
+        var offset_s: i64 = 0;
+        switch (text[i]) {
+            'Z', 'z' => i += 1,
+            '+', '-' => {
+                if (text.len < i + 6 or text[i + 3] != ':') return error.InvalidTime;
+                const off = @as(i64, try digitsOf(text[i + 1 .. i + 3])) * 3600 + @as(i64, try digitsOf(text[i + 4 .. i + 6])) * 60;
+                offset_s = if (text[i] == '-') -off else off;
+                i += 6;
+            },
+            else => return error.InvalidTime,
+        }
+        if (i != text.len) return error.InvalidTime;
+        const days = daysFromCivil(year, month, day);
+        const secs = days * std.time.s_per_day + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset_s;
+        return .{ .unix_ns = @as(i96, secs) * std.time.ns_per_s + nanos };
+    }
+
+    pub fn jsonStringify(t: Time, jws: anytype) !void {
+        var buf: [max_len]u8 = undefined;
+        try jws.write(t.format(&buf));
+    }
+
+    pub fn jsonParse(allocator: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Time {
+        const text = try std.json.innerParse([]const u8, allocator, source, options);
+        return parse(text) catch error.UnexpectedToken;
+    }
+
+    pub fn jsonParseFromValue(allocator: Allocator, source: std.json.Value, options: std.json.ParseOptions) std.json.ParseFromValueError!Time {
+        _ = allocator;
+        _ = options;
+        if (source != .string) return error.UnexpectedToken;
+        return parse(source.string) catch error.UnexpectedToken;
+    }
+
+    fn digitsOf(s: []const u8) error{InvalidTime}!u32 {
+        return std.fmt.parseUnsigned(u32, s, 10) catch error.InvalidTime;
+    }
+
+    // Howard Hinnant's days_from_civil / civil_from_days, valid for the proleptic Gregorian
+    // calendar in both directions from the epoch.
+    fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
+        const y = if (m <= 2) y0 - 1 else y0;
+        const era = @divFloor(y, 400);
+        const yoe = y - era * 400;
+        const mp: i64 = if (m > 2) m - 3 else m + 9;
+        const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+        const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+        return era * 146097 + doe - 719468;
+    }
+
+    fn civilFromDays(z0: i64) struct { year: i64, month: u32, day: u32 } {
+        const z = z0 + 719468;
+        const era = @divFloor(z, 146097);
+        const doe = z - era * 146097;
+        const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+        const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+        const mp = @divFloor(5 * doy + 2, 153);
+        const day: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
+        const month: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
+        return .{ .year = yoe + era * 400 + @intFromBool(month <= 2), .month = month, .day = day };
+    }
+};
+
 test "strings, structs and numbers encode as JSON like the Go SDK" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -179,4 +311,23 @@ test "bad payloads are reported, not crashed on" {
     var odd: Payload = .{ .data = "x" };
     try odd.metadata.append(a, .{ .key = "encoding", .value = "json/protobuf" });
     try testing.expectError(error.UnknownEncoding, fromPayload(u32, a, odd));
+}
+
+test "Time encodes like Go's time.Time" {
+    var buf: [Time.max_len]u8 = undefined;
+    try std.testing.expectEqualStrings("0001-01-01T00:00:00Z", Time.zero.format(&buf));
+    const t = try Time.parse("2018-08-22T16:30:00Z");
+    try std.testing.expectEqualStrings("2018-08-22T16:30:00Z", t.format(&buf));
+    try std.testing.expectEqual(@as(i96, 1534955400) * std.time.ns_per_s, t.unix_ns);
+    const frac = try Time.parse("2018-08-22T09:30:00.12-07:00");
+    try std.testing.expectEqualStrings("2018-08-22T16:30:00.12Z", frac.format(&buf));
+    try std.testing.expect((try Time.parse("0001-01-01T00:00:00Z")).isZero());
+    try std.testing.expectError(error.InvalidTime, Time.parse("2018-08-22 16:30:00"));
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const S = struct { RunTime: Time = .{} };
+    const p = try toPayload(arena.allocator(), S{ .RunTime = t });
+    try std.testing.expectEqualStrings("{\"RunTime\":\"2018-08-22T16:30:00Z\"}", p.data);
+    try std.testing.expectEqual(t, (try fromPayload(S, arena.allocator(), p)).RunTime);
 }
