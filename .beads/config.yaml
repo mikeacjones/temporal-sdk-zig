@@ -73,3 +73,5 @@
 
 export:
     auto: true
+sync:
+    remote: "git+https://github.com/mikeacjones/temporal-sdk-zig.git"
