@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "temporal_sdk_zig",
+  "project_id": "deb25d60-8bbe-4cd7-b166-3604ab2426a5"
+}
