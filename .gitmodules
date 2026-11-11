@@ -1,0 +1,4 @@
+[submodule "deps/sdk-core"]
+	path = deps/sdk-core
+	url = https://github.com/temporalio/sdk-core
+	shallow = true
