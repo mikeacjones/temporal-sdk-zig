@@ -76,6 +76,19 @@ pub const Worker = struct {
         return w.registerActivityImpl(Activity.registered);
     }
 
+    /// Registers an activity that is a method (see `temporal.activity.Def`), bound to
+    /// `receiver`. The receiver must outlive the worker and be safe to use from several
+    /// activities at once. Go `RegisterActivity(&Activities{...})`.
+    pub fn registerActivityWith(w: *Worker, comptime Activity: type, receiver: *Activity.Receiver) error{ OutOfMemory, AlreadyRegistered }!void {
+        return w.registerActivityImpl(Activity.with(receiver));
+    }
+
+    /// Registers several method activities bound to one receiver: `activities` is a tuple of
+    /// their `Def`s.
+    pub fn registerActivitiesWith(w: *Worker, receiver: anytype, comptime activities: anytype) error{ OutOfMemory, AlreadyRegistered }!void {
+        inline for (activities) |Activity| try w.registerActivityWith(Activity, receiver);
+    }
+
     /// Registers an activity implementation under another activity's name, for example a
     /// test double standing in for `Activity`.
     pub fn registerActivityImpl(w: *Worker, registered: activity.Registered) error{ OutOfMemory, AlreadyRegistered }!void {
@@ -306,7 +319,7 @@ fn runActivityTask(w: *Worker, core: bridge.Worker, polled: bridge.Worker.Polled
         .cancel => return,
     };
 
-    const result = executeActivity(w, a, &start) catch |err| result_pb.ActivityExecutionResult{
+    const result = executeActivity(w, core, a, task.task_token, &start) catch |err| result_pb.ActivityExecutionResult{
         .status = .{ .failed = .{ .failure = failure_mod.fromError(a, err) catch return } },
     };
     var encoded: Io.Writer.Allocating = .init(a);
@@ -318,7 +331,31 @@ fn runActivityTask(w: *Worker, core: bridge.Worker, polled: bridge.Worker.Polled
     };
 }
 
-fn executeActivity(w: *Worker, a: Allocator, start: *const task_pb.Start) !result_pb.ActivityExecutionResult {
+/// Sends an activity's heartbeats to the core, which throttles them and reports them to the
+/// server.
+const Heartbeats = struct {
+    w: *Worker,
+    core: bridge.Worker,
+    task_token: []const u8,
+
+    fn record(context: *anyopaque, details: []const proto.temporal.api.common.v1.Payload) void {
+        const h: *Heartbeats = @ptrCast(@alignCast(context));
+        var scratch: std.heap.ArenaAllocator = .init(h.w.gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var heartbeat: proto.coresdk.self.ActivityHeartbeat = .{ .task_token = h.task_token };
+        heartbeat.details.appendSlice(a, details) catch return;
+        var encoded: Io.Writer.Allocating = .init(a);
+        heartbeat.encode(&encoded.writer, a) catch return;
+        var message: ?[]u8 = null;
+        defer if (message) |m| h.w.gpa.free(m);
+        h.core.recordActivityHeartbeat(h.w.gpa, encoded.written(), &message) catch {
+            log.warn("recording an activity heartbeat failed: {s}", .{message orelse "unknown error"});
+        };
+    }
+};
+
+fn executeActivity(w: *Worker, core: bridge.Worker, a: Allocator, task_token: []const u8, start: *const task_pb.Start) !result_pb.ActivityExecutionResult {
     const entry = w.activities.get(start.activity_type) orelse {
         const known = try registeredNames(a, w.activities);
         return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
@@ -349,7 +386,10 @@ fn executeActivity(w: *Worker, a: Allocator, start: *const task_pb.Start) !resul
             .RunID = execution.run_id,
         }) },
     };
-    const payload = entry.invoke(&ctx, start.input.items) catch |err| {
+    var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = task_token };
+    ctx.heartbeat_details = start.heartbeat_details.items;
+    ctx.heartbeat_sink = .{ .gpa = w.gpa, .context = &heartbeats, .record = Heartbeats.record };
+    const payload = entry.invoke(entry.receiver, &ctx, start.input.items) catch |err| {
         const f = if (ctx.pending_failure) |p| try failure_mod.application(a, p) else try failure_mod.fromError(a, err);
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };

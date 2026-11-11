@@ -47,6 +47,15 @@ pub const Info = struct {
     task_queue: []const u8,
     namespace: []const u8,
     attempt: u32,
+    /// The cron schedule the workflow was started with, or empty.
+    cron_schedule: []const u8 = "",
+    /// The first run in this chain of runs (continue-as-new, cron, retries).
+    first_run_id: []const u8 = "",
+    /// The run this one continued from, or empty.
+    continued_run_id: []const u8 = "",
+    execution_timeout: ?Duration = null,
+    run_timeout: ?Duration = null,
+    task_timeout: ?Duration = null,
 };
 
 pub const RetryPolicy = struct {
@@ -147,6 +156,30 @@ pub const Context = struct {
     /// result. `args` is a tuple of the activity's parameters after its context.
     pub fn executeActivity(ctx: *Context, comptime Activity: type, options: ActivityOptions, args: Activity.Args) ActivityFuture(Activity.Result) {
         return .{ .ctx = ctx, .state = ctx.instance.scheduleActivity(Activity.activity_name, options, args) };
+    }
+
+    /// Schedules an activity by its type name, for activities this program has no `Def` for
+    /// (for example ones implemented in another language). `args` is a tuple of argument
+    /// values; `Result` is the type to decode the result as. Go `ExecuteActivity` with a
+    /// string.
+    pub fn executeActivityByName(ctx: *Context, comptime Result: type, activity_type: []const u8, options: ActivityOptions, args: anytype) ActivityFuture(Result) {
+        return .{ .ctx = ctx, .state = ctx.instance.scheduleActivity(activity_type, options, args) };
+    }
+
+    /// Whether the previous run of this cron (or retried) workflow completed with a result.
+    /// Go `workflow.HasLastCompletionResult`.
+    pub fn hasLastCompletionResult(ctx: *const Context) bool {
+        return ctx.instance.last_completion_result != null;
+    }
+
+    /// The result of the previous run of this cron (or retried) workflow, decoded as `T`.
+    /// Go `workflow.GetLastCompletionResult`.
+    pub fn lastCompletionResult(ctx: *Context, comptime T: type) error{ NoLastCompletionResult, OutOfMemory, InvalidPayload, UnknownEncoding }!T {
+        const p = ctx.instance.last_completion_result orelse return error.NoLastCompletionResult;
+        return converter.fromPayload(T, ctx.allocator(), p) catch |err| switch (err) {
+            error.WrongArgumentCount => error.InvalidPayload,
+            else => |e| e,
+        };
     }
 };
 
