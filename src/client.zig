@@ -244,11 +244,82 @@ pub const Client = struct {
         };
     }
 
+    /// Sends `Query` (a `workflow.QueryDef`) with `args` to a workflow and returns the
+    /// handler's result, decoded into `arena`. An empty `run_id` queries the latest run. A
+    /// closed workflow still answers: the server has a worker replay its history. The server
+    /// holds a query sent before the workflow's first workflow task completes until it does;
+    /// with no worker polling, the call fails with `error.RpcFailed` when its deadline passes.
+    pub fn queryWorkflow(c: *Client, comptime Query: type, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: Query.Args) QueryError!Query.Result {
+        return c.queryWorkflowWithOptions(Query, arena, workflow_id, run_id, args, .{});
+    }
+
+    /// `queryWorkflow` with options. Returns `error.QueryFailed` when the handler fails or
+    /// the workflow has no handler for the query type, and `error.QueryRejected` when
+    /// `options.reject_condition` matches the workflow's state.
+    pub fn queryWorkflowWithOptions(c: *Client, comptime Query: type, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: Query.Args, options: QueryOptions) QueryError!Query.Result {
+        var status: ?RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.QueryWorkflowResponse, "QueryWorkflow", wfs.QueryWorkflowRequest{
+            .namespace = c.namespace,
+            .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .query = .{ .query_type = Query.query_name, .query_args = .{ .payloads = try converter.toPayloads(arena, args) } },
+            .query_reject_condition = switch (options.reject_condition) {
+                .none => .QUERY_REJECT_CONDITION_NONE,
+                .not_open => .QUERY_REJECT_CONDITION_NOT_OPEN,
+                .not_completed_cleanly => .QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY,
+            },
+        }, arena, &status) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            error.RpcFailed => {
+                const s = status orelse return error.RpcFailed;
+                if (options.failure_message) |m| m.* = s.message;
+                // The server reports a failed query (a handler error or an unknown query
+                // type) as INVALID_ARGUMENT carrying a QueryFailedFailure detail.
+                if (s.code == 3 and s.hasDetail("temporal.api.errordetails.v1.QueryFailedFailure", arena)) return error.QueryFailed;
+                log.err("QueryWorkflow \"{s}\" on workflow {s} failed: {s} (gRPC status {d})", .{ Query.query_name, workflow_id, s.message, s.code });
+                return error.RpcFailed;
+            },
+            else => |e| return e,
+        };
+        if (response.query_rejected) |rejected| {
+            if (options.rejected_status) |st| st.* = @fromBackingInt(@intCast(@backingInt(rejected.status)));
+            return error.QueryRejected;
+        }
+        if (Query.Result == void) return;
+        const payloads = response.query_result orelse return error.InvalidPayload;
+        if (payloads.payloads.items.len == 0) return error.InvalidPayload;
+        return converter.fromPayload(Query.Result, arena, payloads.payloads.items[0]);
+    }
+
     const RpcError = error{ OutOfMemory, Canceled, RpcFailed, AlreadyExists, NotFound, InvalidResponse };
 
     /// Calls a WorkflowService method with a typed request and response. The response's
     /// memory comes from `arena`.
     fn rpc(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator) RpcError!Response {
+        return c.rpcWithStatus(Response, method, request, arena, null);
+    }
+
+    /// A failed call's gRPC status; its slices borrow the call's arena.
+    const RpcStatus = struct {
+        code: u32,
+        message: []const u8,
+        /// Serialized google.rpc.Status, possibly empty.
+        details: []const u8,
+
+        /// Whether the status carries a detail of the protobuf message type `full_name`.
+        fn hasDetail(s: RpcStatus, comptime full_name: []const u8, arena: Allocator) bool {
+            var reader: Io.Reader = .fixed(s.details);
+            const decoded = proto.google.rpc.Status.decode(&reader, arena) catch return false;
+            for (decoded.details.items) |any| {
+                if (std.mem.endsWith(u8, any.type_url, "/" ++ full_name)) return true;
+            }
+            return false;
+        }
+    };
+
+    /// `rpc`, except that when `status` is given, a failure other than ALREADY_EXISTS or
+    /// NOT_FOUND is stored there (allocated from `arena`) for the caller to report instead
+    /// of being logged.
+    fn rpcWithStatus(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus) RpcError!Response {
         var encoded: Io.Writer.Allocating = .init(arena);
         request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var failure: ?bridge.Connection.RpcFailure = null;
@@ -259,6 +330,10 @@ pub const Client = struct {
                 // gRPC ALREADY_EXISTS and NOT_FOUND are expected outcomes callers handle.
                 if (f.status_code == 6) return error.AlreadyExists;
                 if (f.status_code == 5) return error.NotFound;
+                if (status) |out| {
+                    out.* = .{ .code = f.status_code, .message = try arena.dupe(u8, f.message), .details = try arena.dupe(u8, f.details) };
+                    return error.RpcFailed;
+                }
                 log.err("{s} failed: {s} (gRPC status {d})", .{ method, f.message, f.status_code });
                 return error.RpcFailed;
             },
@@ -297,6 +372,41 @@ pub const StartWorkflowOptions = struct {
 pub const StartError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, WorkflowExecutionAlreadyStarted };
 
 pub const DescribeError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
+
+pub const QueryOptions = struct {
+    /// When the server rejects the query instead of sending it to the workflow.
+    reject_condition: QueryRejectCondition = .none,
+    /// On `error.QueryFailed` (or `error.RpcFailed`), receives the server's message, allocated
+    /// from the query's arena: the handler's error name, or for an unknown query type a
+    /// message listing the workflow's registered query types.
+    failure_message: ?*[]const u8 = null,
+    /// On `error.QueryRejected`, receives the workflow's status.
+    rejected_status: ?*WorkflowExecutionStatus = null,
+};
+
+pub const QueryRejectCondition = enum {
+    /// Never reject: closed workflows are queried too.
+    none,
+    /// Reject the query if the workflow is closed.
+    not_open,
+    /// Reject the query if the workflow closed other than by completing.
+    not_completed_cleanly,
+};
+
+pub const QueryError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    NotFound,
+    InvalidResponse,
+    InvalidPayload,
+    UnknownEncoding,
+    WrongArgumentCount,
+    /// The handler failed, or the workflow has no handler for the query type.
+    QueryFailed,
+    /// The workflow's state matched `QueryOptions.reject_condition`.
+    QueryRejected,
+};
 
 /// Where a workflow run is in its lifecycle. Values match the server's; the enum is open so
 /// a status added by a newer server is kept rather than rejected.
