@@ -102,25 +102,30 @@ pub const Client = struct {
     /// Starts a workflow defined with `temporal.workflow.Def` and returns a handle to its run.
     /// `args` is a tuple of the workflow's parameters after its context.
     pub fn executeWorkflow(c: *Client, comptime Workflow: type, options: StartWorkflowOptions, args: Workflow.Args) StartError!WorkflowRun(Workflow.Result) {
-        const run_id = try c.startWorkflow(Workflow.workflow_name, options, args);
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const id = if (options.id.len > 0) options.id else try uuid(arena_state.allocator(), c.io);
+        const run_id = try c.startWorkflow(Workflow.workflow_name, id, options, args);
         errdefer c.gpa.free(run_id);
-        return .{ .client = c, .id = try c.gpa.dupe(u8, options.id), .run_id = run_id };
+        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
     }
 
-    fn startWorkflow(c: *Client, workflow_type: []const u8, options: StartWorkflowOptions, args: anytype) StartError![]u8 {
+    fn startWorkflow(c: *Client, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) StartError![]u8 {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
 
         var request: wfs.StartWorkflowExecutionRequest = .{
             .namespace = c.namespace,
-            .workflow_id = options.id,
+            .workflow_id = id,
             .workflow_type = .{ .name = workflow_type },
             .task_queue = .{ .name = options.task_queue, .kind = .TASK_QUEUE_KIND_NORMAL },
             .input = .{ .payloads = try converter.toPayloads(a, args) },
             .workflow_execution_timeout = protoDuration(options.execution_timeout),
             .workflow_run_timeout = protoDuration(options.run_timeout),
             .workflow_task_timeout = protoDuration(options.task_timeout),
+            .workflow_start_delay = protoDuration(options.start_delay),
+            .cron_schedule = options.cron_schedule,
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
             .workflow_id_reuse_policy = switch (options.id_reuse_policy) {
@@ -142,6 +147,44 @@ pub const Client = struct {
             else => |e| return e,
         };
         return c.gpa.dupe(u8, response.run_id);
+    }
+
+    /// Terminates a workflow execution: it stops at once, with no chance to clean up. An empty
+    /// `run_id` targets the latest run. Go `Client.TerminateWorkflow`.
+    pub fn terminateWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!void {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = c.rpc(wfs.TerminateWorkflowExecutionResponse, "TerminateWorkflowExecution", wfs.TerminateWorkflowExecutionRequest{
+            .namespace = c.namespace,
+            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .reason = reason,
+            .identity = c.identity,
+        }, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+    }
+
+    /// Returns the full event history of a workflow run (all pages). An empty `run_id` reads
+    /// the latest run. Memory comes from `arena`. Go `Client.GetWorkflowHistory`.
+    pub fn fetchHistory(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!proto.temporal.api.history.v1.History {
+        var history: proto.temporal.api.history.v1.History = .{};
+        var token: []const u8 = "";
+        while (true) {
+            const response = c.rpc(wfs.GetWorkflowExecutionHistoryResponse, "GetWorkflowExecutionHistory", wfs.GetWorkflowExecutionHistoryRequest{
+                .namespace = c.namespace,
+                .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+                .skip_archival = true,
+                .next_page_token = token,
+            }, arena) catch |err| switch (err) {
+                error.AlreadyExists => return error.InvalidResponse,
+                else => |e| return e,
+            };
+            if (response.history) |page| try history.events.appendSlice(arena, page.events.items);
+            if (response.next_page_token.len == 0) return history;
+            token = response.next_page_token;
+        }
     }
 
     const RpcError = error{ OutOfMemory, Canceled, RpcFailed, AlreadyExists, NotFound, InvalidResponse };
@@ -176,12 +219,17 @@ pub const Client = struct {
 };
 
 pub const StartWorkflowOptions = struct {
-    /// Workflow ID. Required.
-    id: []const u8,
+    /// Workflow ID. Empty generates a random UUID, as Go's client does; read it from the run.
+    id: []const u8 = "",
     task_queue: []const u8,
     execution_timeout: ?Duration = null,
     run_timeout: ?Duration = null,
     task_timeout: ?Duration = null,
+    /// Delay before the first workflow task is dispatched. Go `StartDelay`.
+    start_delay: ?Duration = null,
+    /// Runs the workflow on a cron schedule ("* * * * *"); each run starts a new run of the
+    /// same workflow ID. Prefer Schedules for new code, as in Go.
+    cron_schedule: []const u8 = "",
     id_reuse_policy: enum { unspecified, allow_duplicate, allow_duplicate_failed_only, reject_duplicate } = .unspecified,
     id_conflict_policy: enum { unspecified, fail, use_existing, terminate_existing } = .unspecified,
 };
@@ -201,6 +249,7 @@ pub const ResultError = error{
     WorkflowCanceled,
     WorkflowTerminated,
     WorkflowTimedOut,
+    WorkflowContinuedAsNew,
 };
 
 /// A started workflow run. Go `client.WorkflowRun`.
@@ -220,9 +269,21 @@ pub fn WorkflowRun(comptime T: type) type {
             run.* = undefined;
         }
 
-        /// Waits for the workflow to close and returns its result, following continue-as-new.
-        /// The result and any failure are allocated from `arena`.
+        /// Waits for the workflow to close and returns its result, following continue-as-new
+        /// (and cron and retry runs). The result and any failure are allocated from `arena`.
         pub fn get(run: *Self, arena: Allocator) ResultError!T {
+            return run.getWithOptions(arena, .{});
+        }
+
+        pub const GetOptions = struct {
+            /// Return the result of this run instead of following it to the runs it starts
+            /// (continue-as-new, cron, retries). Go `DisableFollowingRuns`. A run that
+            /// continued as new returns `error.WorkflowContinuedAsNew`.
+            follow_runs: bool = true,
+        };
+
+        /// `get` with options. Go `WorkflowRun.GetWithOptions`.
+        pub fn getWithOptions(run: *Self, arena: Allocator, options: GetOptions) ResultError!T {
             const c = run.client;
             var token: []const u8 = "";
             while (true) {
@@ -247,6 +308,23 @@ pub fn WorkflowRun(comptime T: type) type {
                 }
                 const event = history.events.items[history.events.items.len - 1];
                 const attrs = event.attributes orelse return error.InvalidResponse;
+                // A cron or retry run that closes names the run it started; follow it.
+                const next_run: []const u8 = switch (attrs) {
+                    .workflow_execution_completed_event_attributes => |e| e.new_execution_run_id,
+                    .workflow_execution_failed_event_attributes => |e| e.new_execution_run_id,
+                    .workflow_execution_timed_out_event_attributes => |e| e.new_execution_run_id,
+                    .workflow_execution_continued_as_new_event_attributes => |e| e.new_execution_run_id,
+                    else => "",
+                };
+                if (attrs == .workflow_execution_continued_as_new_event_attributes and !options.follow_runs)
+                    return error.WorkflowContinuedAsNew;
+                if (options.follow_runs and next_run.len > 0) {
+                    const new_run = try c.gpa.dupe(u8, next_run);
+                    c.gpa.free(run.run_id);
+                    run.run_id = new_run;
+                    token = "";
+                    continue;
+                }
                 switch (attrs) {
                     .workflow_execution_completed_event_attributes => |done| {
                         if (T == void) return;
@@ -261,12 +339,6 @@ pub fn WorkflowRun(comptime T: type) type {
                     .workflow_execution_canceled_event_attributes => return error.WorkflowCanceled,
                     .workflow_execution_terminated_event_attributes => return error.WorkflowTerminated,
                     .workflow_execution_timed_out_event_attributes => return error.WorkflowTimedOut,
-                    .workflow_execution_continued_as_new_event_attributes => |next| {
-                        const new_run = try c.gpa.dupe(u8, next.new_execution_run_id);
-                        c.gpa.free(run.run_id);
-                        run.run_id = new_run;
-                        token = "";
-                    },
                     else => return error.InvalidResponse,
                 }
             }

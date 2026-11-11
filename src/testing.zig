@@ -204,6 +204,10 @@ pub const WorkflowEnvironment = struct {
     /// Runs a workflow to completion on the environment's worker and returns its result,
     /// allocated from `arena`. On `error.WorkflowFailed`, `failure` (if given) receives the
     /// workflow's failure.
+    ///
+    /// Once the workflow has closed, its history is replayed against the registered
+    /// workflows, so a test also fails (`error.Nondeterminism`) if the workflow can't replay
+    /// its own history.
     pub fn executeWorkflow(
         env: *WorkflowEnvironment,
         comptime Workflow: type,
@@ -211,15 +215,45 @@ pub const WorkflowEnvironment = struct {
         arena: Allocator,
         failure: ?*?failure_mod.Failure,
     ) !Workflow.Result {
+        return env.executeWorkflowWithOptions(Workflow, .{ .task_queue = "" }, args, arena, failure);
+    }
+
+    /// `executeWorkflow` with start options. `id` and `task_queue` default to a unique ID and
+    /// the environment's task queue.
+    pub fn executeWorkflowWithOptions(
+        env: *WorkflowEnvironment,
+        comptime Workflow: type,
+        options: client_mod.StartWorkflowOptions,
+        args: Workflow.Args,
+        arena: Allocator,
+        failure: ?*?failure_mod.Failure,
+    ) !Workflow.Result {
         if (env.running == null) env.running = try env.io.concurrent(runWorker, .{&env.worker});
         env.next_id += 1;
-        const id = try std.fmt.allocPrint(arena, "{s}-{s}-{d}", .{ Workflow.workflow_name, env.task_queue, env.next_id });
-        var run = try env.client.executeWorkflow(Workflow, .{ .id = id, .task_queue = env.task_queue }, args);
+        var opts = options;
+        if (opts.id.len == 0) opts.id = try std.fmt.allocPrint(arena, "{s}-{s}-{d}", .{ Workflow.workflow_name, env.task_queue, env.next_id });
+        if (opts.task_queue.len == 0) opts.task_queue = env.task_queue;
+        var run = try env.client.executeWorkflow(Workflow, opts, args);
         defer run.deinit();
-        return run.get(arena) catch |err| {
+        const result = run.get(arena);
+        if (result) |_| {} else |err| {
             if (failure) |f| f.* = if (run.failure()) |fl| fl.* else null;
-            return err;
-        };
+            switch (err) {
+                error.WorkflowFailed, error.WorkflowCanceled, error.WorkflowTimedOut => {},
+                else => return err,
+            }
+        }
+        try env.replayRun(run.id, run.run_id);
+        return result;
+    }
+
+    /// Replays a run's history (fetched from the server) against the registered workflows.
+    pub fn replayRun(env: *WorkflowEnvironment, workflow_id: []const u8, run_id: []const u8) !void {
+        var scratch: std.heap.ArenaAllocator = .init(env.gpa);
+        defer scratch.deinit();
+        const history = try env.client.fetchHistory(scratch.allocator(), workflow_id, run_id);
+        var replayer: WorkflowReplayer = .{ .gpa = env.gpa, .io = env.io, .workflows = env.worker.workflows };
+        return replayer.replayHistory(history);
     }
 
     fn runWorker(w: *worker_mod.Worker) worker_mod.Worker.RunError!void {
@@ -292,6 +326,15 @@ pub const WorkflowReplayer = struct {
         const h = try history_mod.fromJson(a, json);
         var encoded: Io.Writer.Allocating = .init(a);
         h.encode(&encoded.writer, a) catch return error.OutOfMemory;
+        return r.replayHistoryBytes(encoded.written());
+    }
+
+    /// Replays a history, for example one from `Client.fetchHistory`.
+    pub fn replayHistory(r: *WorkflowReplayer, history: history_mod.History) ReplayError!void {
+        var scratch: std.heap.ArenaAllocator = .init(r.gpa);
+        defer scratch.deinit();
+        var encoded: Io.Writer.Allocating = .init(scratch.allocator());
+        history.encode(&encoded.writer, scratch.allocator()) catch return error.OutOfMemory;
         return r.replayHistoryBytes(encoded.written());
     }
 
@@ -468,4 +511,30 @@ test "WorkflowReplayer replays a matching history and catches a nondeterministic
     defer changed.deinit();
     try changed.registerWorkflow(Fixtures.Different);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(hello_history));
+}
+
+test "client: generated IDs, start delay, history, and terminate" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A delayed start with a generated ID.
+    _ = try env.executeWorkflow(Fixtures.Hello, .{"warm-up"}, a, null); // starts the worker
+    var run = try env.client.executeWorkflow(Fixtures.Hello, .{ .task_queue = env.task_queue, .start_delay = .fromSeconds(1) }, .{"later"});
+    defer run.deinit();
+    try testing.expectEqual(@as(usize, 36), run.id.len);
+    try testing.expectEqualStrings("Hello later!", try run.get(a));
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    const started = history.events.items[0].attributes.?.workflow_execution_started_event_attributes;
+    try testing.expectEqual(@as(i64, 1), started.first_workflow_task_backoff.?.seconds);
+
+    // Terminate a workflow nobody runs (it waits on a task queue without a worker).
+    var stuck = try env.client.executeWorkflow(Fixtures.Hello, .{ .task_queue = "nobody-polls-this" }, .{"never"});
+    defer stuck.deinit();
+    try env.client.terminateWorkflow(stuck.id, "", "test cleanup");
+    try testing.expectError(error.WorkflowTerminated, stuck.get(a));
 }
