@@ -506,6 +506,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .workflow_type = start.workflow_type,
         .workflow_namespace = start.workflow_namespace,
         .attempt = start.attempt,
+        .is_local = start.is_local,
     };
     ctx.logger_ = .{ .context = try log_mod.contextString(a, .{
         .ActivityID = start.activity_id,
@@ -517,7 +518,8 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     }) };
     var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token };
     ctx.heartbeat_details = start.heartbeat_details.items;
-    ctx.heartbeat_sink = .{ .gpa = w.gpa, .context = &heartbeats, .record = Heartbeats.record };
+    // The core keeps no heartbeat state for local activities and warns on each heartbeat.
+    if (!start.is_local) ctx.heartbeat_sink = .{ .gpa = w.gpa, .context = &heartbeats, .record = Heartbeats.record };
     const payload = entry.invoke(entry.receiver, ctx, start.input.items) catch |err| {
         if (err == error.Canceled) if (ctx.cancelReason()) |reason| return .{ .status = .{ .cancelled = .{ .failure = .{
             .message = try std.fmt.allocPrint(a, "activity canceled: {t}", .{reason}),
