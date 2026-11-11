@@ -1,6 +1,9 @@
 // How samples-test validates this sample: start the worker, run the starter, and check that
 // the starter's output contains each `expect` line before `timeout_seconds`.
 .{
-    .expect = .{"memo sample is a placeholder"},
+    .expect = .{
+        "Workflow result memo: description=\"Test upsert memo workflow\"",
+        "Described memo: description=Test upsert memo workflow",
+    },
     .timeout_seconds = 60,
 }
