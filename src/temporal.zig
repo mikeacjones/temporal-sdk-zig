@@ -8,6 +8,10 @@ pub const nexus = @import("nexus.zig");
 pub const converter = @import("converter.zig");
 pub const testing = @import("testing.zig");
 
+/// Generated protobuf types for the Temporal API and the sdk-core interface
+/// (Go SDK parity: go.temporal.io/api).
+pub const proto = @import("proto.zig");
+
 const bridge = @import("bridge.zig");
 
 /// SDK version reported to the server. Keep in sync with build.zig.zon.
@@ -16,4 +20,5 @@ pub const version = "0.0.0";
 test {
     @import("std").testing.refAllDecls(@This());
     _ = bridge;
+    _ = @import("proto_test.zig");
 }

@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const protobuf = @import("protobuf");
+const protos = @import("deps/protos.zig");
 
 const core_header = "deps/sdk-core/crates/sdk-core-c-bridge/include/temporal-sdk-core-c-bridge.h";
 const core_lib_name = "libtemporalio_sdk_core_c_bridge.a";
@@ -21,13 +23,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).createModule();
 
+    const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
+
     const temporal = b.addModule("temporal", .{
         .root_source_file = b.path("src/temporal.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "core_c", .module = core_c }},
+        .imports = &.{
+            .{ .name = "core_c", .module = core_c },
+            .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
+        },
     });
+
+    // zig build gen-proto: regenerate src/proto from the sdk-core .proto files.
+    const gen_proto = b.step("gen-proto", "Regenerate src/proto from deps/sdk-core protos");
+    gen_proto.dependOn(genProto(b, protobuf_dep, protoc_opt));
 
     const core_lib: std.Build.LazyPath = if (core_lib_opt) |p|
         .{ .cwd_relative = p }
@@ -108,6 +119,31 @@ fn buildCoreLib(b: *std.Build, target: std.Build.ResolvedTarget, protoc_opt: ?[]
         .sub_path = b.fmt("cargo-target/{s}/release/{s}", .{ triple, core_lib_name }),
     } };
     return out.addCopyFile(built, core_lib_name);
+}
+
+/// Compiles the files listed in deps/protos.zig into Zig sources under src/proto.
+/// The generated code is committed, so normal builds never run protoc for Zig code.
+fn genProto(b: *std.Build, protobuf_dep: *std.Build.Dependency, protoc_opt: ?[]const u8) *std.Build.Step {
+    var sources: [protos.files.len]std.Build.LazyPath = undefined;
+    for (protos.files, &sources) |f, *src| src.* = b.path(b.pathJoin(&.{ protos.root, f }));
+    var includes: [protos.include_dirs.len]std.Build.LazyPath = undefined;
+    for (protos.include_dirs, &includes) |d, *inc| inc.* = b.path(b.pathJoin(&.{ protos.root, d }));
+
+    const step = protobuf.RunProtocStep.create(protobuf_dep.builder, b.graph.host, .{
+        .destination_directory = b.path("src/proto"),
+        .source_files = b.allocator.dupe(std.Build.LazyPath, &sources) catch @panic("OOM"),
+        .include_directories = b.allocator.dupe(std.Build.LazyPath, &includes) catch @panic("OOM"),
+        .protoc = if (protoc_opt) |p| .{ .cwd_relative = p } else pinnedProtoc(b),
+        // Keep fields a newer server sends that this SDK doesn't know yet.
+        .preserve_unknown_fields = true,
+    });
+
+    // Rebuild the src/proto.zig index over the generated packages.
+    const index = b.addSystemCommand(&.{ "bash", "scripts/gen-proto-index.sh" });
+    index.setCwd(b.path("."));
+    index.has_side_effects = true;
+    index.step.dependOn(step.step);
+    return &index.step;
 }
 
 /// The protoc release pinned in build.zig.zon for the machine running the build.
