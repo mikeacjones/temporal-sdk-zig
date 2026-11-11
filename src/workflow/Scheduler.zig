@@ -512,18 +512,13 @@ fn pingPong(s: *Scheduler, counter: *u64, n: u64) void {
     }
 }
 
-test "context switch cost" {
+test "two fibers can yield to each other many times" {
     var s: Scheduler = .init(testing.allocator, .{});
     defer s.deinit();
     var counter: u64 = 0;
     const n = 200_000;
     _ = try s.spawn("a", pingPong, .{ &s, &counter, n });
     _ = try s.spawn("b", pingPong, .{ &s, &counter, n });
-    const start = std.Io.Timestamp.now(testing.io, .awake);
     s.run();
-    const elapsed = start.durationTo(std.Io.Timestamp.now(testing.io, .awake));
     try testing.expectEqual(@as(u64, 2 * n), counter);
-    // Each yield is two switches: fiber -> scheduler -> next fiber.
-    const switches: i96 = 2 * 2 * n;
-    std.debug.print("\nfiber context switch: {d} ns\n", .{@divTrunc(elapsed.nanoseconds, switches)});
 }
