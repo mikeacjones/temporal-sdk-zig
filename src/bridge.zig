@@ -12,22 +12,13 @@ pub const bytes = @import("bridge/bytes.zig");
 /// Turns core callbacks into results std.Io code can wait for.
 pub const Completion = @import("bridge/completion.zig").Completion;
 
+/// The core runtime: threads, telemetry, and process-wide worker settings.
+pub const Runtime = @import("bridge/Runtime.zig");
+
 test {
     _ = bytes;
     _ = @import("bridge/completion.zig");
-}
-
-test "core runtime can be created and freed" {
-    var options = std.mem.zeroes(c.TemporalCoreRuntimeOptions);
-    options.telemetry = null;
-    const result = c.temporal_core_runtime_new(&options);
-    try std.testing.expect(result.runtime != null);
-    defer c.temporal_core_runtime_free(result.runtime);
-    if (result.fail) |fail| {
-        defer c.temporal_core_byte_array_free(result.runtime, fail);
-        std.debug.print("runtime_new failed: {s}\n", .{fail.*.data[0..fail.*.size]});
-        return error.RuntimeNewFailed;
-    }
+    _ = Runtime;
 }
 
 /// Writes one line per `TemporalCore*` struct and union in the C header: its size, alignment,
