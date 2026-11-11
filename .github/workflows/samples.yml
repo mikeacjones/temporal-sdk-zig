@@ -44,4 +44,5 @@ jobs:
       # Builds every sample, starts a dev server, runs each sample's worker and starter, and
       # checks the results.
       - name: Run the samples against a dev server
-        run: zig build samples-test
+        # A hang dumps every stuck process's stacks instead of waiting for the job timeout.
+        run: scripts/run-with-hang-dump.sh 1200 zig build samples-test --summary all
