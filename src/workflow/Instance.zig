@@ -55,6 +55,9 @@ namespace: []const u8 = "",
 root: ?*WorkflowIo.Task = null,
 root_outcome: ?RootOutcome = null,
 finished: bool = false,
+/// Set by `destroy`: waits that ignore workflow cancellation (an activity's cancellation
+/// completing) end with error.Canceled instead, so every coroutine can exit.
+evicting: bool = false,
 /// Set when an activation must fail the workflow task (it is retried) instead of producing
 /// commands, for example on an unsupported job.
 task_failure: ?[]const u8 = null,
@@ -66,6 +69,9 @@ pub const ActivityState = struct {
     waiter: ?*WorkflowIo.Wait = null,
     outcome: ?Outcome = null,
     cancel_requested: bool = false,
+    cancellation_type: CancellationType = .try_cancel,
+
+    pub const CancellationType = @FieldType(workflow.ActivityOptions, "cancellation_type");
 
     pub const Outcome = union(enum) {
         completed: ?converter.Payload,
@@ -103,10 +109,15 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
 
 /// Tears the run down: cancels its coroutines, lets them exit, and frees everything.
 pub fn destroy(inst: *Instance) void {
+    inst.evicting = true;
     if (!inst.finished) if (inst.root) |root| {
         inst.wio.cancelTask(root);
         inst.root = null;
     };
+    // Coroutines already waiting for an activity's cancellation to complete don't see the
+    // cancel above; wake them. The order doesn't matter: nothing they do is sent to the core.
+    var pending = inst.activities.valueIterator();
+    while (pending.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
     inst.wio.run();
     const gpa = inst.gpa;
     if (inst.sched.live == 0) {
@@ -350,7 +361,7 @@ fn scheduleActivityInner(inst: *Instance, activity_type: []const u8, options: wo
     const seq = inst.next_activity_seq;
     inst.next_activity_seq += 1;
     const state = try a.create(ActivityState);
-    state.* = .{ .seq = seq };
+    state.* = .{ .seq = seq, .cancellation_type = options.cancellation_type };
     try inst.activities.put(a, seq, state);
 
     var cmd: cmd_pb.ScheduleActivity = .{
@@ -384,17 +395,32 @@ fn scheduleActivityInner(inst: *Instance, activity_type: []const u8, options: wo
     return state;
 }
 
-/// Blocks the calling coroutine until the activity resolves. On workflow cancellation,
-/// requests the activity's cancellation and returns error.Canceled.
+/// Blocks the calling coroutine until the activity resolves. When the coroutine is canceled
+/// while waiting, requests the activity's cancellation and returns error.Canceled: at once
+/// for `try_cancel` and `abandon`, and for `wait_cancellation_completed` once the core
+/// resolves the activity (the server recorded its end). If the activity completed or failed
+/// instead of acknowledging the cancel, that outcome is kept for the caller and the cancel
+/// request is re-armed, so the coroutine's next cancelable wait returns error.Canceled.
+/// Eviction ends any of these waits with error.Canceled.
 pub fn awaitActivity(inst: *Instance, state: *ActivityState) error{Canceled}!void {
     if (state.outcome != null) return;
     var wait = inst.wio.newWaitPoint();
     state.waiter = &wait;
     defer state.waiter = null;
-    inst.wio.waitFor(&wait, true) catch |err| {
-        inst.cancelActivity(state);
-        return err;
-    };
+    var canceled = false;
+    while (state.outcome == null) {
+        if (inst.evicting) return error.Canceled;
+        // A cancel also wakes the wait point, so each block starts from a fresh one.
+        wait = inst.wio.newWaitPoint();
+        inst.wio.waitFor(&wait, !canceled) catch |err| {
+            inst.cancelActivity(state);
+            if (state.cancellation_type != .wait_cancellation_completed) return err;
+            canceled = true;
+        };
+    }
+    if (!canceled) return;
+    if (state.outcome.? == .cancelled) return error.Canceled;
+    inst.wio.io().recancel();
 }
 
 pub fn cancelActivity(inst: *Instance, state: *ActivityState) void {
@@ -767,6 +793,93 @@ test "eviction while awaiting a condition frees everything" {
     const inst = try create(testing.allocator, GoroutinesWf.registered, .{});
     _ = try inst.activate(&try initActivation(a, "Goroutines", .{@as(usize, 2)}), a);
     inst.destroy();
+}
+
+// Waits on an activity with the cancellation type named by `mode`. If the activity completes
+// despite a cancel, sleeps before returning, which a re-armed cancel interrupts.
+const WaitCancel = struct {
+    fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        const cancellation_type = std.meta.stringToEnum(ActivityState.CancellationType, mode) orelse return error.InvalidPayload;
+        const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10), .cancellation_type = cancellation_type };
+        const r = try ctx.executeActivity(Greet, opts, .{"x"}).get();
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        return r;
+    }
+};
+const WaitCancelWf = workflow.Def("WaitCancel", WaitCancel.run);
+
+fn resolveCancelled(a: Allocator, seq: u32) !act_pb.WorkflowActivation {
+    const f = try failure_mod.application(a, .{ .message = "activity canceled" });
+    return oneJob(a, .{ .resolve_activity = .{ .seq = seq, .result = .{ .status = .{ .cancelled = .{ .failure = f } } } } });
+}
+
+test "wait_cancellation_completed: a canceled get waits for the activity to resolve" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, WaitCancelWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "WaitCancel", .{@as([]const u8, "wait_cancellation_completed")}), a));
+    try testing.expect(first[0].variant.?.schedule_activity.cancellation_type == .WAIT_CANCELLATION_COMPLETED);
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.request_cancel_activity.seq);
+    try testing.expect(!inst.finished);
+
+    const resolved = commandsOf(try inst.activate(&try resolveCancelled(a, 1), a));
+    try testing.expectEqual(@as(usize, 1), resolved.len);
+    try testing.expect(resolved[0].variant.? == .cancel_workflow_execution);
+}
+
+test "wait_cancellation_completed: an activity that completes despite the cancel returns its result" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, WaitCancelWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "WaitCancel", .{@as([]const u8, "wait_cancellation_completed")}), a);
+    try testing.expectEqual(@as(usize, 1), commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a)).len);
+    // get returns the result; the re-armed cancel then ends the sleep, and the workflow.
+    const done = commandsOf(try inst.activate(&try resolveOk(a, 1, "finished anyway"), a));
+    try testing.expect(done[done.len - 1].variant.? == .cancel_workflow_execution);
+    for (done) |c| try testing.expect(c.variant.? != .complete_workflow_execution);
+}
+
+test "try_cancel and abandon: a canceled get returns at once" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "try_cancel", "abandon" }) |mode| {
+        const inst = try create(testing.allocator, WaitCancelWf.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "WaitCancel", .{mode}), a);
+        const cmds = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+        try testing.expectEqual(@as(usize, 2), cmds.len);
+        try testing.expectEqual(@as(u32, 1), cmds[0].variant.?.request_cancel_activity.seq);
+        try testing.expect(cmds[1].variant.? == .cancel_workflow_execution);
+        // The core's cancelled resolution that follows changes nothing.
+        try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try resolveCancelled(a, 1), a)).len);
+    }
+}
+
+test "eviction ends a wait for an activity's cancellation to complete" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const mode: []const u8 = "wait_cancellation_completed";
+
+    // Evicted while waiting for the cancellation to complete.
+    const waiting = try create(testing.allocator, WaitCancelWf.registered, .{});
+    _ = try waiting.activate(&try initActivation(a, "WaitCancel", .{mode}), a);
+    _ = try waiting.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a);
+    waiting.destroy();
+
+    // Evicted before any cancel: eviction's own cancel must not wait for the activity.
+    const running = try create(testing.allocator, WaitCancelWf.registered, .{});
+    _ = try running.activate(&try initActivation(a, "WaitCancel", .{mode}), a);
+    running.destroy();
 }
 
 const Cron = struct {
