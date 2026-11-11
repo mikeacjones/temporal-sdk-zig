@@ -21,12 +21,16 @@ pub const EphemeralServer = @import("bridge/EphemeralServer.zig");
 /// A connection to a Temporal server and raw gRPC calls over it.
 pub const Connection = @import("bridge/Connection.zig");
 
+/// A core worker: polls tasks and takes completions as serialized protobuf.
+pub const Worker = @import("bridge/Worker.zig");
+
 test {
     _ = bytes;
     _ = @import("bridge/completion.zig");
     _ = Runtime;
     _ = EphemeralServer;
     _ = Connection;
+    _ = Worker;
 }
 
 /// Writes one line per `TemporalCore*` struct and union in the C header: its size, alignment,
