@@ -24,6 +24,21 @@
 //!
 //! Canceling a future cancels what it is waiting on: a pending `io.sleep` cancels its timer and
 //! a pending `ActivityFuture.get` requests the activity's cancellation.
+//!
+//! Queries read a workflow's state from outside. Name one with `QueryDef` and answer it with
+//! `ctx.setQueryHandler`; the handler runs synchronously and must not change state or block:
+//!
+//!     pub const Greeting = temporal.workflow.QueryDef("greeting", fn () []const u8);
+//!
+//!     const State = struct {
+//!         greeting: []const u8 = "",
+//!         fn current(s: *State) []const u8 {
+//!             return s.greeting;
+//!         }
+//!     };
+//!     const state = try ctx.allocator().create(State); // outlives the workflow function
+//!     state.* = .{};
+//!     try ctx.setQueryHandler(Greeting, state, State.current);
 
 const std = @import("std");
 const converter = @import("converter.zig");
@@ -231,6 +246,51 @@ pub const Context = struct {
         return ctx.instance.upsertMemo(try converter.toFields(ctx.allocator(), values));
     }
 
+    pub const SetQueryHandlerError = error{
+        OutOfMemory,
+        /// `context` points into the calling coroutine's stack (logged with the query type).
+        QueryContextOnStack,
+    };
+
+    /// Answers queries of type `Query` (a `QueryDef`) with `handler(context, args...)`, which
+    /// returns `Query.Result` or an error union of it; an error fails the query with the
+    /// error's name. Registering the same query type again replaces its handler.
+    ///
+    /// Handlers run synchronously on the worker thread, outside any coroutine, possibly after
+    /// the workflow function has returned. They must only read workflow state: not change it,
+    /// not block, and not call into the workflow context. Arguments and the result use
+    /// memory that lives until the answer is sent.
+    ///
+    /// `context` is usually a pointer to the state the handler reads. It must outlive the run,
+    /// so allocate it with `ctx.allocator()` (or point to a global); a pointer into the calling
+    /// coroutine's stack returns `error.QueryContextOnStack`.
+    ///
+    ///     const state = try ctx.allocator().create(State);
+    ///     try ctx.setQueryHandler(GetStatus, state, State.status);
+    pub fn setQueryHandler(ctx: *Context, comptime Query: type, context: anytype, comptime handler: anytype) SetQueryHandlerError!void {
+        const C = @TypeOf(context);
+        comptime checkQueryHandler(Query, C, @TypeOf(handler));
+        const Erased = struct {
+            fn call(p: *const anyopaque, out: Allocator, payloads: []const converter.Payload) anyerror!converter.Payload {
+                const c: *const C = @ptrCast(@alignCast(p));
+                const args = try converter.fromPayloads(Query.Args, out, payloads);
+                const result = @call(.auto, handler, .{c.*} ++ args);
+                const value = if (@typeInfo(@TypeOf(result)) == .error_union) try result else result;
+                return converter.toPayload(out, value);
+            }
+        };
+        const addr: ?usize = switch (@typeInfo(C)) {
+            .pointer => |p| switch (p.size) {
+                .slice => if (context.len > 0) @intFromPtr(context.ptr) else null,
+                else => @intFromPtr(context),
+            },
+            else => null,
+        };
+        const stored = try ctx.allocator().create(C);
+        stored.* = context;
+        return ctx.instance.setQueryHandler(Query.query_name, .{ .context = @ptrCast(stored), .call = Erased.call }, addr);
+    }
+
     /// Whether the previous run of this cron (or retried) workflow completed with a result.
     ///
     pub fn hasLastCompletionResult(ctx: *const Context) bool {
@@ -339,6 +399,50 @@ pub fn Def(comptime name: []const u8, comptime func: anytype) type {
 
         pub const registered: Registered = .{ .name = name, .invoke = invoke };
     };
+}
+
+/// Names a query and its signature: `F` is a function type whose parameters are the query's
+/// arguments and whose return type is its result. Workflows answer it with
+/// `Context.setQueryHandler`; clients send it by the same type.
+///
+///     pub const Progress = temporal.workflow.QueryDef("progress", fn (step: u32) []const u8);
+pub fn QueryDef(comptime name: []const u8, comptime F: type) type {
+    if (@typeInfo(F) != .@"fn")
+        @compileError("QueryDef(\"" ++ name ++ "\", F): F must be a function type such as `fn (u32) []const u8`, not " ++ @typeName(F));
+    const Ret = @typeInfo(F).@"fn".return_type orelse
+        @compileError("QueryDef(\"" ++ name ++ "\", F): F must have a concrete return type");
+    return struct {
+        pub const query_name = name;
+        /// The query's arguments, as a tuple.
+        pub const Args = std.meta.ArgsTuple(F);
+        pub const Result = switch (@typeInfo(Ret)) {
+            .error_union => |eu| eu.payload,
+            else => Ret,
+        };
+    };
+}
+
+/// Compile error unless `H` is `fn (C, Query.Args...) Query.Result` or returns an error union
+/// of `Query.Result`.
+fn checkQueryHandler(comptime Query: type, comptime C: type, comptime H: type) void {
+    const arg_types = @typeInfo(Query.Args).@"struct".field_types;
+    var want: []const u8 = "fn (" ++ @typeName(C);
+    for (arg_types) |T| want = want ++ ", " ++ @typeName(T);
+    want = want ++ ") " ++ @typeName(Query.Result) ++ " (or an error union of it)";
+    const bad = "query handler for \"" ++ Query.query_name ++ "\" must be " ++ want ++ ", not " ++ @typeName(H);
+    const info = switch (@typeInfo(H)) {
+        .@"fn" => |f| f,
+        else => @compileError(bad),
+    };
+    if (info.param_types.len != 1 + arg_types.len) @compileError(bad);
+    if (info.param_types[0] != C) @compileError(bad);
+    for (arg_types, info.param_types[1..]) |want_t, got| if (got != want_t) @compileError(bad);
+    const Ret = info.return_type orelse @compileError(bad);
+    const payload = switch (@typeInfo(Ret)) {
+        .error_union => |eu| eu.payload,
+        else => Ret,
+    };
+    if (payload != Query.Result) @compileError(bad);
 }
 
 test {

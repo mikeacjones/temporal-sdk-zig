@@ -622,6 +622,23 @@ const Fixtures = struct {
     }
     const Different = workflow.Def("HelloWorld", other);
 
+    const Greeting = workflow.QueryDef("greeting", fn () []const u8);
+    const GreetingState = struct {
+        greeting: []const u8,
+        fn current(s: *GreetingState) []const u8 {
+            return s.greeting;
+        }
+    };
+    /// `hello` with a query handler for its greeting.
+    fn helloQueried(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const s = try ctx.allocator().create(GreetingState);
+        s.* = .{ .greeting = "waiting" };
+        try ctx.setQueryHandler(Greeting, s, GreetingState.current);
+        s.greeting = try ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get();
+        return s.greeting;
+    }
+    const HelloQueried = workflow.Def("HelloWorld", helloQueried);
+
     /// Sleeps, then returns how many seconds of workflow time passed.
     fn sleepFor(ctx: *workflow.Context, seconds: i64) !i64 {
         const before = ctx.now();
@@ -859,6 +876,15 @@ test "WorkflowReplayer replays a matching history and catches a nondeterministic
     defer changed.deinit();
     try changed.registerWorkflow(Fixtures.Different);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(hello_history));
+}
+
+// Queries leave no trace in history, so registering query handlers must not change the
+// commands a workflow produces: `Fixtures.HelloQueried` replays the hello history unchanged.
+test "WorkflowReplayer replays a workflow with query handlers" {
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    try r.registerWorkflow(Fixtures.HelloQueried);
+    try r.replayHistoryJson(hello_history);
 }
 
 /// A dev-server run of `Fixtures.MemoUpdates` started with the memo

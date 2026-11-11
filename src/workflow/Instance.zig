@@ -63,6 +63,16 @@ evicting: bool = false,
 /// Set when an activation must fail the workflow task (it is retried) instead of producing
 /// commands, for example on an unsupported job.
 task_failure: ?[]const u8 = null,
+/// Query handlers by query type, in registration order (the order an unknown query's failure
+/// lists them in). Arena memory; they outlive the workflow function.
+queries: std.array_hash_map.String(QueryHandler) = .empty,
+
+/// A type-erased query handler: decodes `args` into `out`, calls the handler with `context`,
+/// and encodes its result into `out`. Runs on the worker thread, outside any coroutine.
+pub const QueryHandler = struct {
+    context: *const anyopaque,
+    call: *const fn (context: *const anyopaque, out: Allocator, args: []const converter.Payload) anyerror!converter.Payload,
+};
 
 const RootOutcome = union(enum) { completed: converter.Payload, failed: anyerror };
 
@@ -154,15 +164,28 @@ pub fn arena(inst: *Instance) Allocator {
 /// Applies an activation and returns its completion. `out` holds the completion's memory
 /// until the caller has sent it. RemoveFromCache jobs are the caller's to handle (complete
 /// the activation, then `destroy`); they are ignored here.
+///
+/// The core sends queries in an activation of their own, after any jobs that change state. A
+/// query-only activation just answers: coroutines don't run, so it emits no other command and
+/// leaves workflow time and state as they were.
 pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: Allocator) !done_pb.WorkflowActivationCompletion {
-    if (act.timestamp) |ts| inst.now_ns = @as(i96, ts.seconds) * std.time.ns_per_s + ts.nanos;
+    const query_only = act.jobs.items.len > 0 and for (act.jobs.items) |job| {
+        const v = job.variant orelse break false;
+        if (v != .query_workflow) break false;
+    } else true;
+    if (!query_only) if (act.timestamp) |ts| {
+        inst.now_ns = @as(i96, ts.seconds) * std.time.ns_per_s + ts.nanos;
+    };
     inst.replaying = act.is_replaying;
     inst.commands = .empty;
     inst.task_failure = null;
+    // Query answers go to `out`, not the run's arena, so answering doesn't grow the run.
+    var answers: std.ArrayList(cmd_pb.WorkflowCommand) = .empty;
 
     for (act.jobs.items) |job| {
         const variant = job.variant orelse continue;
         switch (variant) {
+            .query_workflow => |q| try answers.append(out, .{ .variant = .{ .respond_to_query = try inst.answerQuery(&q, out) } }),
             .initialize_workflow => |init| try inst.initialize(&init, act.run_id),
             .fire_timer => |t| if (inst.timers.fetchRemove(t.seq)) |kv| {
                 inst.wio.fireTimer(kv.value);
@@ -179,7 +202,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         }
     }
 
-    if (inst.task_failure == null) {
+    if (inst.task_failure == null and !query_only) {
         inst.runUntilQuiet();
         try inst.finishIfDone();
     }
@@ -190,9 +213,39 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     } else {
         var success: done_pb.Success = .{};
         try success.commands.appendSlice(out, inst.commands.items);
+        try success.commands.appendSlice(out, answers.items);
         completion.status = .{ .successful = success };
     }
     return completion;
+}
+
+// ---------------------------------------------------------------- queries
+
+/// Registers `handler` for queries of type `name`, replacing any handler registered under it.
+/// `name` and the handler's context must outlive the run. `context_addr` is the address the
+/// context points to, if it is a pointer: one into the calling coroutine's stack is rejected,
+/// since that stack is reused once the coroutine returns and queries can arrive after that.
+pub fn setQueryHandler(inst: *Instance, name: []const u8, handler: QueryHandler, context_addr: ?usize) error{ OutOfMemory, QueryContextOnStack }!void {
+    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
+        inst.logger.warn("setQueryHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{ .QueryType = name });
+        return error.QueryContextOnStack;
+    };
+    try inst.queries.put(inst.arena(), name, handler);
+}
+
+/// The answer to one query: the handler's encoded result, or a failure for an unknown query
+/// type or a handler error. Memory comes from `out`.
+fn answerQuery(inst: *Instance, q: *const act_pb.QueryWorkflow, out: Allocator) !cmd_pb.QueryResult {
+    const handler = inst.queries.get(q.query_type) orelse {
+        const names = try std.mem.join(out, ", ", inst.queries.keys());
+        return .{ .query_id = q.query_id, .variant = .{ .failed = try failure_mod.application(out, .{
+            .message = try std.fmt.allocPrint(out, "query type \"{s}\" is not registered on workflow \"{s}\"; registered query types: [{s}]", .{ q.query_type, inst.info.workflow_type, names }),
+            .type = "QueryNotRegistered",
+        }) } };
+    };
+    const response = handler.call(handler.context, out, q.arguments.items) catch |err|
+        return .{ .query_id = q.query_id, .variant = .{ .failed = try failure_mod.fromError(out, err) } };
+    return .{ .query_id = q.query_id, .variant = .{ .succeeded = .{ .response = response } } };
 }
 
 /// Runs coroutines until all are blocked and no awaited condition holds. Conditions are
@@ -1238,4 +1291,160 @@ test "memo: the start memo is visible, sorted; an upsert emits ModifyWorkflowPro
 
     // Null and an empty slice remove keys (a missing key stays missing); others replace or add.
     try testing.expectEqualStrings("\"owner,status,tags,zeta|added,status,zeta|queued->shipped\"", cmds[1].variant.?.complete_workflow_execution.result.?.data);
+}
+
+const QueryWf = struct {
+    const Status = workflow.QueryDef("status", fn () []const u8);
+    const Add = workflow.QueryDef("add", fn (i64, i64) i64);
+    const Fails = workflow.QueryDef("fails", fn () i64);
+
+    const State = struct {
+        phase: []const u8 = "starting",
+        base: i64 = 0,
+
+        fn status(s: *State) []const u8 {
+            return s.phase;
+        }
+        fn add(s: *State, x: i64, y: i64) i64 {
+            return s.base + x + y;
+        }
+        fn fails(_: *State) error{NotReady}!i64 {
+            return error.NotReady;
+        }
+        fn replaced(_: *State) []const u8 {
+            return "replaced";
+        }
+    };
+
+    /// Registers the handlers, sleeps, and changes the queried phase around the sleep.
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .base = 100 };
+        try ctx.setQueryHandler(Status, s, State.status);
+        try ctx.setQueryHandler(Add, s, State.add);
+        try ctx.setQueryHandler(Fails, s, State.fails);
+        s.phase = "sleeping";
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        s.phase = "done";
+        return "finished";
+    }
+
+    fn reregister(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{};
+        try ctx.setQueryHandler(Status, s, State.status);
+        try ctx.setQueryHandler(Status, s, State.replaced);
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        return "finished";
+    }
+
+    fn onStack(ctx: *workflow.Context) ![]const u8 {
+        var s: State = .{};
+        ctx.setQueryHandler(Status, &s, State.status) catch |err| return @errorName(err);
+        return "accepted";
+    }
+};
+const QueryWfDef = workflow.Def("Queries", QueryWf.run);
+const ReregisterWf = workflow.Def("Reregister", QueryWf.reregister);
+const OnStackWf = workflow.Def("OnStack", QueryWf.onStack);
+
+fn queryActivation(a: Allocator, jobs: []const struct { []const u8, []const u8, []const converter.Payload }) !act_pb.WorkflowActivation {
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_999 } };
+    for (jobs) |j| {
+        var q: act_pb.QueryWorkflow = .{ .query_id = j[0], .query_type = j[1] };
+        try q.arguments.appendSlice(a, j[2]);
+        try act.jobs.append(a, .{ .variant = .{ .query_workflow = q } });
+    }
+    return act;
+}
+
+fn answer(c: done_pb.WorkflowActivationCompletion, i: usize) cmd_pb.QueryResult {
+    return commandsOf(c)[i].variant.?.respond_to_query;
+}
+
+test "query: answers with the handler's result, decodes arguments, and emits nothing else" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, QueryWfDef.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "Queries", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const now_before = inst.now_ns;
+
+    const c = try inst.activate(&try queryActivation(a, &.{
+        .{ "q1", "status", &.{} },
+        .{ "q2", "add", (try converter.toPayloads(a, .{ @as(i64, 2), @as(i64, 3) })).items },
+    }), a);
+    try testing.expectEqual(@as(usize, 2), commandsOf(c).len);
+    try testing.expectEqualStrings("q1", answer(c, 0).query_id);
+    try testing.expectEqualStrings("\"sleeping\"", answer(c, 0).variant.?.succeeded.response.?.data);
+    try testing.expectEqualStrings("q2", answer(c, 1).query_id);
+    try testing.expectEqualStrings("105", answer(c, 1).variant.?.succeeded.response.?.data);
+    try testing.expectEqual(now_before, inst.now_ns); // a query doesn't move workflow time
+
+    // Arguments that don't decode fail the query, not the task.
+    const bad = try inst.activate(&try queryActivation(a, &.{.{ "q3", "add", &.{} }}), a);
+    try testing.expectEqualStrings("WrongArgumentCount", answer(bad, 0).variant.?.failed.message);
+}
+
+test "query: an unknown query type fails naming the registered types; a failing handler fails the query" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, QueryWfDef.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "Queries", .{}), a);
+
+    const c = try inst.activate(&try queryActivation(a, &.{
+        .{ "q1", "nope", &.{} },
+        .{ "q2", "__stack_trace", &.{} },
+        .{ "q3", "fails", &.{} },
+    }), a);
+    const unknown = answer(c, 0).variant.?.failed;
+    try testing.expectEqualStrings("query type \"nope\" is not registered on workflow \"Queries\"; registered query types: [status, add, fails]", unknown.message);
+    try testing.expectEqualStrings("QueryNotRegistered", failure_mod.applicationType(unknown).?);
+    try testing.expect(answer(c, 1).variant.? == .failed);
+    const failed = answer(c, 2).variant.?.failed;
+    try testing.expectEqualStrings("NotReady", failed.message);
+    try testing.expectEqualStrings("NotReady", failure_mod.applicationType(failed).?);
+}
+
+test "query: answered after the workflow function returned, reading state that outlives it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, QueryWfDef.registered, .{});
+    defer inst.destroy();
+    const timer = commandsOf(try inst.activate(&try initActivation(a, "Queries", .{}), a))[0].variant.?.start_timer;
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a));
+    try testing.expectEqualStrings("\"finished\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+    try testing.expect(inst.finished);
+
+    const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "status", &.{} }}), a);
+    try testing.expectEqual(@as(usize, 1), commandsOf(c).len);
+    try testing.expectEqualStrings("\"done\"", answer(c, 0).variant.?.succeeded.response.?.data);
+}
+
+test "query: registering a query type again replaces its handler" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ReregisterWf.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "Reregister", .{}), a);
+    const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "status", &.{} }}), a);
+    try testing.expectEqualStrings("\"replaced\"", answer(c, 0).variant.?.succeeded.response.?.data);
+    try testing.expectEqual(@as(usize, 1), inst.queries.count());
+}
+
+test "query: a handler context on the workflow coroutine's stack is rejected" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, OnStackWf.registered, .{});
+    defer inst.destroy();
+    const done = commandsOf(try inst.activate(&try initActivation(a, "OnStack", .{}), a));
+    try testing.expectEqualStrings("\"QueryContextOnStack\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+    try testing.expectEqual(@as(usize, 0), inst.queries.count());
 }
