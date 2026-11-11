@@ -46,6 +46,10 @@ timers: std.AutoHashMapUnmanaged(u32, *WorkflowIo.Timer) = .empty,
 conditions: std.ArrayList(*Condition) = .empty,
 args: []const converter.Payload = &.{},
 last_completion_result: ?converter.Payload = null,
+/// The memo as the workflow sees it: the start memo with this run's upserts applied, sorted
+/// by name so its order doesn't depend on the wire order of the start memo's map. Each upsert
+/// replaces the slice, so a slice handed out earlier keeps its contents. Arena memory.
+memo: []const converter.Field = &.{},
 task_queue: []const u8 = "",
 namespace: []const u8 = "",
 root: ?*WorkflowIo.Task = null,
@@ -236,6 +240,15 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         }),
         .replaying = &inst.replaying,
     };
+    if (init.memo) |m| {
+        const fields = try a.alloc(converter.Field, m.fields.items.len);
+        for (m.fields.items, fields) |entry, *f| f.* = .{
+            .name = try a.dupe(u8, entry.key),
+            .value = if (entry.value) |v| try v.dupe(a) else .{},
+        };
+        std.mem.sort(converter.Field, fields, {}, fieldLessThan);
+        inst.memo = fields;
+    }
     const args = try a.alloc(converter.Payload, init.arguments.items.len);
     for (init.arguments.items, args) |p, *d| d.* = try p.dupe(a);
     inst.args = args;
@@ -277,6 +290,53 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
     if (inst.ctx.pending_failure) |p| return failure_mod.application(a, p);
     if (err == error.ActivityFailed) if (inst.ctx.last_failure) |f| return f.*;
     return failure_mod.fromError(a, err);
+}
+
+// ---------------------------------------------------------------- memo
+
+/// Emits one ModifyWorkflowProperties command upserting `fields` (in their order) and applies
+/// them to `inst.memo`. `fields` must stay valid for the run (arena memory). Upserting no
+/// fields does nothing.
+pub fn upsertMemo(inst: *Instance, fields: []const converter.Field) error{OutOfMemory}!void {
+    if (fields.len == 0) return;
+    const a = inst.arena();
+    var upserted: common.Memo = .{};
+    try upserted.fields.ensureTotalCapacity(a, fields.len);
+    for (fields) |f| upserted.fields.appendAssumeCapacity(.{ .key = f.name, .value = f.value });
+
+    var merged: std.ArrayList(converter.Field) = try .initCapacity(a, inst.memo.len + fields.len);
+    merged.appendSliceAssumeCapacity(inst.memo);
+    for (fields) |f| {
+        const i = std.sort.lowerBound(converter.Field, merged.items, f.name, fieldOrder);
+        const found = i < merged.items.len and std.mem.eql(u8, merged.items[i].name, f.name);
+        if (removesMemoKey(f.value)) {
+            if (found) _ = merged.orderedRemove(i);
+        } else if (found) {
+            merged.items[i] = f;
+        } else {
+            merged.insertAssumeCapacity(i, f);
+        }
+    }
+    try inst.commands.append(a, .{ .variant = .{ .modify_workflow_properties = .{ .upserted_memo = upserted } } });
+    inst.memo = merged.items;
+}
+
+/// Whether the server deletes a memo key upserted with this value: it does for a null and for
+/// an empty JSON array, compared with the whole payload.
+fn removesMemoKey(p: converter.Payload) bool {
+    if (p.metadata.items.len != 1 or p.external_payloads.items.len != 0) return false;
+    const enc = converter.encodingOf(p) orelse return false;
+    if (std.mem.eql(u8, enc, converter.Encoding.null.text())) return p.data.len == 0;
+    if (std.mem.eql(u8, enc, converter.Encoding.json.text())) return std.mem.eql(u8, p.data, "[]");
+    return false;
+}
+
+fn fieldLessThan(_: void, x: converter.Field, y: converter.Field) bool {
+    return std.mem.lessThan(u8, x.name, y.name);
+}
+
+fn fieldOrder(name: []const u8, f: converter.Field) std.math.Order {
+    return std.mem.order(u8, name, f.name);
 }
 
 // ---------------------------------------------------------------- activities
@@ -738,4 +798,55 @@ test "last completion result, cron info, and activities by name" {
 
     const done = commandsOf(try inst.activate(&try oneJob(a, .{ .resolve_activity = .{ .seq = 1, .result = .{ .status = .{ .completed = .{} } } } }), a));
     try testing.expectEqualStrings("42", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+const MemoWf = struct {
+    fn keys(ctx: *workflow.Context, fields: []const converter.Field) ![]const u8 {
+        var names: std.ArrayList([]const u8) = .empty;
+        for (fields) |f| try names.append(ctx.allocator(), f.name);
+        return std.mem.join(ctx.allocator(), ",", names.items);
+    }
+
+    /// Returns "<start keys>|<keys after the upsert>|<start status>-><status>".
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const start = ctx.memo();
+        const before = (try ctx.memoValue([]const u8, "status")).?;
+        try ctx.upsertMemo(.{
+            .status = "shipped",
+            .owner = @as(?[]const u8, null),
+            .missing = @as(?i64, null),
+            .tags = @as([]const []const u8, &.{}),
+            .added = @as(i64, 1),
+        });
+        try ctx.upsertMemo(.{});
+        const after = (try ctx.memoValue([]const u8, "status")).?;
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|{s}|{s}->{s}", .{ try keys(ctx, start), try keys(ctx, ctx.memo()), before, after });
+    }
+};
+const MemoWfDef = workflow.Def("Memo", MemoWf.run);
+
+test "memo: the start memo is visible, sorted; an upsert emits ModifyWorkflowProperties and updates the view" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, MemoWfDef.registered, .{});
+    defer inst.destroy();
+
+    var act = try initActivation(a, "Memo", .{});
+    var start_memo: common.Memo = .{};
+    for (try converter.toFields(a, .{ .zeta = "z", .status = "queued", .owner = "data", .tags = @as([]const []const u8, &.{"x"}) })) |f|
+        try start_memo.fields.append(a, .{ .key = f.name, .value = f.value });
+    act.jobs.items[0].variant.?.initialize_workflow.memo = start_memo;
+
+    const cmds = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 2), cmds.len); // upserting nothing emits no command
+    const upserted = cmds[0].variant.?.modify_workflow_properties.upserted_memo.?.fields.items;
+    const want = [_][]const u8{ "status", "owner", "missing", "tags", "added" };
+    try testing.expectEqual(want.len, upserted.len);
+    for (want, upserted) |name, entry| try testing.expectEqualStrings(name, entry.key);
+    try testing.expectEqualStrings("binary/null", converter.encodingOf(upserted[1].value.?).?);
+    try testing.expectEqualStrings("[]", upserted[3].value.?.data);
+
+    // Null and an empty slice remove keys (a missing key stays missing); others replace or add.
+    try testing.expectEqualStrings("\"owner,status,tags,zeta|added,status,zeta|queued->shipped\"", cmds[1].variant.?.complete_workflow_execution.result.?.data);
 }
