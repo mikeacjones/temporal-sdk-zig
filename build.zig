@@ -213,6 +213,9 @@ fn linkCoreLib(m: *std.Build.Module, target: std.Build.ResolvedTarget, lib: std.
             m.linkSystemLibrary("iconv", .{});
         },
         .linux => {
+            // Rust's std needs the _Unwind_* functions (libgcc_s on glibc). link_libcpp makes
+            // Zig build and link LLVM's libunwind, which provides them without a system lib.
+            m.link_libcpp = true;
             m.linkSystemLibrary("pthread", .{});
             m.linkSystemLibrary("dl", .{});
             m.linkSystemLibrary("m", .{});
