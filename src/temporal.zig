@@ -7,6 +7,7 @@ pub const activity = @import("activity.zig");
 pub const nexus = @import("nexus.zig");
 pub const converter = @import("converter.zig");
 pub const failure = @import("failure.zig");
+pub const log = @import("log.zig");
 pub const Failure = failure.Failure;
 pub const testing = @import("testing.zig");
 

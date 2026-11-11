@@ -82,7 +82,9 @@ pub fn run(w: *WorkflowIo) void {
 }
 
 /// Starts a top-level coroutine (the workflow function, a signal or update handler) that can
-/// be canceled with `cancelTask`. `func` must return `void`.
+/// be canceled with `cancelTask`. `func` must return `void`. The task frees itself when
+/// `func` returns, so the caller must track completion itself and never use the returned
+/// pointer after that.
 pub fn spawn(w: *WorkflowIo, name: []const u8, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !*Task {
     const Args = @TypeOf(args);
     const Erased = struct {
@@ -98,6 +100,23 @@ pub fn spawn(w: *WorkflowIo, name: []const u8, comptime func: anytype, args: std
 /// Requests cancellation of a task started with `spawn` (for example on CancelWorkflow).
 pub fn cancelTask(w: *WorkflowIo, task: *Task) void {
     w.requestCancel(task);
+}
+
+/// A blocking point for SDK code built on this Io (activity futures, signals): create it on
+/// the waiting coroutine with `newWait`, block with `waitFor`, and resume it with `wake`.
+pub fn newWaitPoint(w: *WorkflowIo) Wait {
+    return w.newWait();
+}
+
+/// Blocks the current coroutine until `wait` is woken, or until the task is canceled when
+/// `cancelable` is set.
+pub fn waitFor(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void {
+    return w.block(wait, cancelable);
+}
+
+/// Wakes a coroutine blocked in `waitFor`. Safe to call more than once.
+pub fn wake(w: *WorkflowIo, wait: *Wait) void {
+    w.wakeWait(wait);
 }
 
 /// Called by the host when a timer started with `Host.VTable.startTimer` fires.
