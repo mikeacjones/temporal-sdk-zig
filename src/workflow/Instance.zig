@@ -42,6 +42,8 @@ next_activity_seq: u32 = 1,
 next_timer_seq: u32 = 1,
 activities: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 timers: std.AutoHashMapUnmanaged(u32, *WorkflowIo.Timer) = .empty,
+/// Coroutines blocked in `awaitCondition`, in the order they started waiting.
+conditions: std.ArrayList(*Condition) = .empty,
 args: []const converter.Payload = &.{},
 task_queue: []const u8 = "",
 namespace: []const u8 = "",
@@ -142,7 +144,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     }
 
     if (inst.task_failure == null) {
-        inst.wio.run();
+        inst.runUntilQuiet();
         try inst.finishIfDone();
     }
 
@@ -155,6 +157,55 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         completion.status = .{ .successful = success };
     }
     return completion;
+}
+
+/// Runs coroutines until all are blocked and no awaited condition holds. Conditions are
+/// checked in the order they were awaited, one wake-up at a time, so a coroutine woken by
+/// its condition can change the state another condition reads before that one is checked.
+fn runUntilQuiet(inst: *Instance) void {
+    while (true) {
+        inst.wio.run();
+        const met = for (inst.conditions.items, 0..) |c, i| {
+            if (c.check(c.context)) break i;
+        } else return;
+        const c = inst.conditions.orderedRemove(met);
+        c.met = true;
+        inst.wio.wake(c.wait);
+    }
+}
+
+/// A coroutine blocked until a predicate over workflow state holds (Go `workflow.Await`).
+pub const Condition = struct {
+    check: *const fn (context: *const anyopaque) bool,
+    context: *const anyopaque,
+    wait: *WorkflowIo.Wait,
+    met: bool = false,
+};
+
+/// Blocks the calling coroutine until `check(context)` returns true. With a timeout, also
+/// returns when a durable timer fires; returns whether the condition was met.
+pub fn awaitCondition(inst: *Instance, check: *const fn (context: *const anyopaque) bool, context: *const anyopaque, timeout: ?std.Io.Duration) error{ Canceled, OutOfMemory }!bool {
+    if (check(context)) return true;
+    var wait = inst.wio.newWaitPoint();
+    var cond: Condition = .{ .check = check, .context = context, .wait = &wait };
+    try inst.conditions.append(inst.arena(), &cond);
+    defer if (!cond.met) inst.removeCondition(&cond);
+
+    var timer: WorkflowIo.Timer = .{ .wait = &wait };
+    const timed = if (timeout) |d| d.nanoseconds > 0 else false;
+    if (timeout != null and !timed) return false;
+    if (timed) hostStartTimer(inst, &timer, timeout.?);
+    defer if (timed and !timer.fired) hostCancelTimer(inst, &timer);
+
+    try inst.wio.waitFor(&wait, true);
+    return cond.met;
+}
+
+fn removeCondition(inst: *Instance, cond: *Condition) void {
+    for (inst.conditions.items, 0..) |c, i| if (c == cond) {
+        _ = inst.conditions.orderedRemove(i);
+        return;
+    };
 }
 
 fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: []const u8) !void {
@@ -487,4 +538,158 @@ test "unsupported jobs fail the workflow task" {
     _ = try inst.activate(&try initActivation(a, "Workflow", .{@as([]const u8, "Temporal")}), a);
     const c = try inst.activate(&try oneJob(a, .{ .signal_workflow = .{ .signal_name = "s" } }), a);
     try testing.expect(c.status.? == .failed);
+}
+
+// Port of the samples-go timer workflow's shape: an activity raced against a timer.
+const TimerRace = struct {
+    const Done = union(enum) { processed: workflow.ActivityError![]const u8, timer: std.Io.Cancelable!void };
+
+    fn run(ctx: *workflow.Context, threshold_s: i64) ![]const u8 {
+        const io = ctx.io();
+        const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+        const processing = ctx.executeActivity(Greet, opts, .{"order"});
+        var buf: [2]Done = undefined;
+        var select: std.Io.Select(Done) = .init(io, &buf);
+        select.async(.processed, workflow.ActivityFuture([]const u8).get, .{processing});
+        select.async(.timer, std.Io.sleep, .{ io, .fromSeconds(threshold_s), .awake });
+        switch (try select.await()) {
+            .processed => |r| {
+                select.cancelDiscard();
+                _ = try r;
+                return "fast";
+            },
+            .timer => {
+                _ = try ctx.executeActivity(Greet, opts, .{"email"}).get();
+                select.cancelDiscard(); // the activity is still pending: request its cancellation too
+                return "slow";
+            },
+        }
+    }
+};
+const TimerRaceWf = workflow.Def("TimerRace", TimerRace.run);
+
+fn resolveOk(a: Allocator, seq: u32, value: []const u8) !act_pb.WorkflowActivation {
+    return oneJob(a, .{ .resolve_activity = .{ .seq = seq, .result = .{ .status = .{ .completed = .{ .result = try converter.toPayload(a, value) } } } } });
+}
+
+test "an activity that wins the race cancels the timer" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, TimerRaceWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "TimerRace", .{@as(i64, 3)}), a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expect(first[0].variant.? == .schedule_activity);
+    try testing.expectEqual(@as(i64, 3), first[1].variant.?.start_timer.start_to_fire_timeout.?.seconds);
+
+    const second = commandsOf(try inst.activate(&try resolveOk(a, 1, "done"), a));
+    try testing.expectEqual(@as(usize, 2), second.len);
+    try testing.expectEqual(@as(u32, 1), second[0].variant.?.cancel_timer.seq);
+    try testing.expectEqualStrings("\"fast\"", second[1].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "a timer that wins the race runs the fallback activity" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, TimerRaceWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "TimerRace", .{@as(i64, 3)}), a);
+    const fired = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a));
+    try testing.expectEqual(@as(usize, 1), fired.len);
+    try testing.expectEqualStrings("\"email\"", fired[0].variant.?.schedule_activity.arguments.items[0].data);
+
+    const done = commandsOf(try inst.activate(&try resolveOk(a, 2, "sent"), a));
+    try testing.expectEqual(@as(usize, 2), done.len);
+    try testing.expectEqual(@as(u32, 1), done[0].variant.?.request_cancel_activity.seq);
+    try testing.expectEqualStrings("\"slow\"", done[1].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// Port of the samples-go goroutine workflow's shape: coroutines appending results, and the
+// workflow awaiting a condition over them.
+const Goroutines = struct {
+    const State = struct { results: std.ArrayList([]const u8) = .empty, err: ?anyerror = null, want: usize };
+
+    fn branch(ctx: *workflow.Context, state: *State, input: []const u8) void {
+        const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+        const r = ctx.executeActivity(Greet, opts, .{input}).get() catch |err| {
+            state.err = err;
+            return;
+        };
+        state.results.append(ctx.allocator(), r) catch |err| {
+            state.err = err;
+        };
+    }
+
+    fn done(state: *const State) bool {
+        return state.err != null or state.results.items.len == state.want;
+    }
+
+    fn run(ctx: *workflow.Context, n: usize) ![]const []const u8 {
+        var state: State = .{ .want = n };
+        var group: std.Io.Group = .init;
+        defer group.cancel(ctx.io());
+        for (0..n) |i| {
+            const input = try std.fmt.allocPrint(ctx.allocator(), "{d}", .{i});
+            group.async(ctx.io(), branch, .{ ctx, &state, input });
+        }
+        try ctx.await(&state, done);
+        if (state.err) |err| return err;
+        return state.results.items;
+    }
+
+    fn timesOut(ctx: *workflow.Context) !bool {
+        var never = false;
+        return ctx.awaitTimeout(.fromSeconds(5), &never, struct {
+            fn f(v: *bool) bool {
+                return v.*;
+            }
+        }.f);
+    }
+};
+const GoroutinesWf = workflow.Def("Goroutines", Goroutines.run);
+const AwaitTimeoutWf = workflow.Def("AwaitTimeout", Goroutines.timesOut);
+
+test "await wakes when coroutines make the condition true" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, GoroutinesWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "Goroutines", .{@as(usize, 3)}), a));
+    try testing.expectEqual(@as(usize, 3), first.len);
+    for (first, 0..) |c, i| try testing.expectEqual(@as(u32, @intCast(i + 1)), c.variant.?.schedule_activity.seq);
+
+    // Resolve out of order; the result order follows completion order.
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try resolveOk(a, 3, "c"), a)).len);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try resolveOk(a, 1, "a"), a)).len);
+    const done = commandsOf(try inst.activate(&try resolveOk(a, 2, "b"), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("[\"c\",\"a\",\"b\"]", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "awaitTimeout returns false when its timer fires first" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, AwaitTimeoutWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "AwaitTimeout", .{}), a));
+    try testing.expectEqual(@as(i64, 5), first[0].variant.?.start_timer.start_to_fire_timeout.?.seconds);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a));
+    try testing.expectEqualStrings("false", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "eviction while awaiting a condition frees everything" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, GoroutinesWf.registered, .{});
+    _ = try inst.activate(&try initActivation(a, "Goroutines", .{@as(usize, 2)}), a);
+    inst.destroy();
 }
