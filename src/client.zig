@@ -141,7 +141,12 @@ pub const Client = struct {
                 .terminate_existing => .WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING,
             },
         };
-        _ = &request;
+        if (options.memo.len > 0) {
+            var memo: proto.temporal.api.common.v1.Memo = .{};
+            try memo.fields.ensureTotalCapacity(a, options.memo.len);
+            for (options.memo) |field| memo.fields.appendAssumeCapacity(.{ .key = field.name, .value = field.value });
+            request.memo = memo;
+        }
         const response = c.rpc(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             else => |e| return e,
@@ -232,6 +237,9 @@ pub const StartWorkflowOptions = struct {
     cron_schedule: []const u8 = "",
     id_reuse_policy: enum { unspecified, allow_duplicate, allow_duplicate_failed_only, reject_duplicate } = .unspecified,
     id_conflict_policy: enum { unspecified, fail, use_existing, terminate_existing } = .unspecified,
+    /// Non-indexed values recorded with the workflow, such as a description. Build them with
+    /// `converter.toFields`; they are only read while starting.
+    memo: []const converter.Field = &.{},
 };
 
 pub const StartError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, WorkflowExecutionAlreadyStarted };

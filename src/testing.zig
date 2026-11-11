@@ -710,6 +710,35 @@ test "client: generated IDs, start delay, history, and terminate" {
     try testing.expectError(error.WorkflowTerminated, stuck.get(a));
 }
 
+test "client: a memo set at start is recorded in the started event" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Owner = struct { team: []const u8, oncall: bool };
+    const memo = try converter.toFields(a, .{
+        .description = "nightly import",
+        .owner = Owner{ .team = "data", .oncall = true },
+    });
+    // No worker polls this task queue: the started event is all the test needs.
+    var run = try env.client.executeWorkflow(Fixtures.Hello, .{ .task_queue = "nobody-polls-this", .memo = memo }, .{"memo"});
+    defer run.deinit();
+    defer env.client.terminateWorkflow(run.id, run.run_id, "test cleanup") catch {};
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    const started = history.events.items[0].attributes.?.workflow_execution_started_event_attributes;
+    const entries = started.memo.?.fields.items;
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    var fields: [2]converter.Field = undefined;
+    for (entries, &fields) |entry, *field| field.* = .{ .name = entry.key, .value = entry.value.? };
+    try testing.expectEqualStrings("nightly import", (try converter.fieldValue([]const u8, a, &fields, "description")).?);
+    const owner = (try converter.fieldValue(Owner, a, &fields, "owner")).?;
+    try testing.expectEqualStrings("data", owner.team);
+    try testing.expect(owner.oncall);
+}
+
 test "time-skipping WorkflowEnvironment completes a 2h sleep in seconds" {
     const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
     defer env.deinit();
