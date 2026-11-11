@@ -144,6 +144,16 @@ pub fn fieldValue(comptime T: type, arena: Allocator, fields: []const Field, nam
     return null;
 }
 
+/// Turns the entries of a proto map of payloads, such as `Memo.fields` or
+/// `SearchAttributes.indexed_fields` (each entry has `key` and `value: ?Payload`), into
+/// fields in wire order. An entry without a value becomes an empty payload. The slice comes
+/// from `arena`; names and payloads borrow the entries.
+pub fn fieldsFromMap(arena: Allocator, entries: anytype) error{OutOfMemory}![]Field {
+    const out = try arena.alloc(Field, entries.len);
+    for (entries, out) |entry, *field| field.* = .{ .name = entry.key, .value = entry.value orelse .{} };
+    return out;
+}
+
 fn payloadWith(arena: Allocator, enc: Encoding, data: []const u8) error{OutOfMemory}!Payload {
     var p: Payload = .{ .data = data };
     try p.metadata.append(arena, .{ .key = encoding_key, .value = enc.text() });
@@ -379,4 +389,21 @@ test "fields encode in declaration order and decode by name" {
     try testing.expectEqual(@as(?u8, null), try fieldValue(u8, a, fields, "missing"));
     try testing.expectError(error.InvalidPayload, fieldValue(u8, a, fields, "description"));
     try testing.expectEqual(@as(usize, 0), (try toFields(a, .{})).len);
+}
+
+test "fields from a proto map keep wire order and decode by name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var memo: proto.temporal.api.common.v1.Memo = .{};
+    try memo.fields.append(a, .{ .key = "description", .value = try toPayload(a, "nightly import") });
+    try memo.fields.append(a, .{ .key = "empty" });
+    const fields = try fieldsFromMap(a, memo.fields.items);
+    try testing.expectEqual(@as(usize, 2), fields.len);
+    try testing.expectEqualStrings("description", fields[0].name);
+    try testing.expectEqualStrings("nightly import", (try fieldValue([]const u8, a, fields, "description")).?);
+    try testing.expectEqualStrings("empty", fields[1].name);
+    try testing.expectEqual(@as(usize, 0), fields[1].value.data.len);
+    try testing.expectEqual(@as(usize, 0), (try fieldsFromMap(a, memo.fields.items[0..0])).len);
 }

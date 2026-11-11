@@ -739,6 +739,54 @@ test "client: a memo set at start is recorded in the started event" {
     try testing.expect(owner.oncall);
 }
 
+test "client: describe reads status and the memo set at start, while running and after" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Owner = struct { team: []const u8, oncall: bool };
+    const memo = try converter.toFields(a, .{
+        .description = "nightly import",
+        .owner = Owner{ .team = "data", .oncall = true },
+    });
+    // Started before the environment's worker runs, so it stays running until the worker starts.
+    var run = try env.client.executeWorkflow(Fixtures.Hello, .{ .id = "describe-memo", .task_queue = env.task_queue, .memo = memo }, .{"memo"});
+    defer run.deinit();
+
+    const running = try env.client.describeWorkflow(a, run.id, "");
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, running.status);
+    try testing.expectEqualStrings("describe-memo", running.workflow_id);
+    try testing.expectEqualStrings(run.run_id, running.run_id);
+    try testing.expectEqualStrings("HelloWorld", running.workflow_type);
+    try testing.expectEqualStrings(env.task_queue, running.task_queue);
+    try testing.expect(running.start_time != null);
+    try testing.expect(running.execution_time != null);
+    try testing.expectEqual(@as(?Io.Timestamp, null), running.close_time);
+    try testing.expectEqual(@as(usize, 2), running.memo.len);
+    try testing.expectEqualStrings("nightly import", (try running.memoValue([]const u8, a, "description")).?);
+    const owner = (try running.memoValue(Owner, a, "owner")).?;
+    try testing.expectEqualStrings("data", owner.team);
+    try testing.expect(owner.oncall);
+    try testing.expectEqual(@as(?[]const u8, null), try running.memoValue([]const u8, a, "missing"));
+
+    _ = try env.executeWorkflow(Fixtures.Hello, .{"warm-up"}, a, null); // starts the worker
+    try testing.expectEqualStrings("Hello memo!", try env.getResult(Fixtures.Hello, &run, a, null));
+
+    const done = try env.client.describeWorkflow(a, run.id, run.run_id);
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.completed, done.status);
+    try testing.expect(done.close_time.?.nanoseconds >= done.start_time.?.nanoseconds);
+    try testing.expect(done.history_length > running.history_length);
+    try testing.expectEqualStrings("nightly import", (try done.memoValue([]const u8, a, "description")).?);
+    try testing.expectEqualStrings("data", (try done.memoValue(Owner, a, "owner")).?.team);
+    try testing.expect(done.raw.workflow_execution_info != null);
+
+    try testing.expectError(error.NotFound, env.client.describeWorkflow(a, "no-such-workflow", ""));
+}
+
 test "time-skipping WorkflowEnvironment completes a 2h sleep in seconds" {
     const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
     defer env.deinit();
