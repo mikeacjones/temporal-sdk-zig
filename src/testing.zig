@@ -144,26 +144,65 @@ fn executable(existing_path: []const u8, version: []const u8) bridge.EphemeralSe
     return .{ .download = .{ .version = version } };
 }
 
-/// A dev server, client and worker for running workflows in tests.
+/// A server, client and worker for running workflows in tests.
+///
+/// `start` runs a dev server; `startTimeSkipping` runs the time-skipping test server. On the
+/// test server time is locked (it moves at wall-clock speed) except while the test waits on
+/// a workflow result through `getResult` or `executeWorkflow`, or calls `sleep`. Then it
+/// jumps ahead whenever every workflow is waiting on a timer, so a 2h sleep finishes at
+/// once, while a test can still look at a workflow it started with `startWorkflow` in the
+/// middle of a timer.
+///
+/// Not thread-safe: use an environment from one task at a time.
 pub const WorkflowEnvironment = struct {
     gpa: Allocator,
     io: Io,
-    server: DevServer,
+    server: Server,
     client: client_mod.Client,
     worker: worker_mod.Worker,
     task_queue: []u8,
     running: ?Io.Future(worker_mod.Worker.RunError!void) = null,
     next_id: u32 = 0,
 
-    /// Starts the environment. Allocated so the worker's pointer to the client stays valid.
+    pub const Server = union(enum) {
+        dev: DevServer,
+        time_skipping: TestServer,
+
+        fn clientOptions(s: *const Server) client_mod.Options {
+            return switch (s.*) {
+                inline else => |*server| server.clientOptions(),
+            };
+        }
+
+        fn stop(s: *Server, io: Io) void {
+            switch (s.*) {
+                inline else => |*server| server.stop(io),
+            }
+        }
+    };
+
+    /// Starts the environment on a dev server. Allocated so the worker's pointer to the
+    /// client stays valid. Free with `deinit`.
     pub fn start(gpa: Allocator, io: Io) !*WorkflowEnvironment {
+        return create(gpa, io, .dev);
+    }
+
+    /// Starts the environment on the time-skipping test server. Free with `deinit`.
+    pub fn startTimeSkipping(gpa: Allocator, io: Io) !*WorkflowEnvironment {
+        return create(gpa, io, .time_skipping);
+    }
+
+    fn create(gpa: Allocator, io: Io, kind: std.meta.Tag(Server)) !*WorkflowEnvironment {
         const env = try gpa.create(WorkflowEnvironment);
         errdefer gpa.destroy(env);
         env.gpa = gpa;
         env.io = io;
         env.running = null;
         env.next_id = 0;
-        env.server = try DevServer.start(gpa, io, .{});
+        env.server = switch (kind) {
+            .dev => .{ .dev = try DevServer.start(gpa, io, .{}) },
+            .time_skipping => .{ .time_skipping = try TestServer.start(gpa, io, .{}) },
+        };
         errdefer env.server.stop(io);
         env.client = try client_mod.Client.connect(gpa, io, env.server.clientOptions());
         errdefer env.client.close();
@@ -239,14 +278,49 @@ pub const WorkflowEnvironment = struct {
         arena: Allocator,
         failure: ?*?failure_mod.Failure,
     ) !Workflow.Result {
+        var run = try env.startWorkflow(Workflow, options, args);
+        defer run.deinit();
+        return env.getResult(Workflow, &run, arena, failure);
+    }
+
+    /// Starts a workflow on the environment's worker (starting the worker if needed) and
+    /// returns its run without waiting for it. `id` and `task_queue` default to a unique ID
+    /// and the environment's task queue. The caller owns the run (`run.deinit()`); wait for
+    /// it with `getResult` so time skips and the history is replayed.
+    pub fn startWorkflow(
+        env: *WorkflowEnvironment,
+        comptime Workflow: type,
+        options: client_mod.StartWorkflowOptions,
+        args: Workflow.Args,
+    ) !client_mod.WorkflowRun(Workflow.Result) {
         if (env.running == null) env.running = try env.io.concurrent(runWorker, .{&env.worker});
         env.next_id += 1;
         var opts = options;
-        if (opts.id.len == 0) opts.id = try std.fmt.allocPrint(arena, "{s}-{s}-{d}", .{ Workflow.workflow_name, env.task_queue, env.next_id });
+        var generated_id: ?[]u8 = null;
+        defer if (generated_id) |id| env.gpa.free(id);
+        if (opts.id.len == 0) {
+            generated_id = try std.fmt.allocPrint(env.gpa, "{s}-{s}-{d}", .{ Workflow.workflow_name, env.task_queue, env.next_id });
+            opts.id = generated_id.?;
+        }
         if (opts.task_queue.len == 0) opts.task_queue = env.task_queue;
-        var run = try env.client.executeWorkflow(Workflow, opts, args);
-        defer run.deinit();
+        return env.client.executeWorkflow(Workflow, opts, args);
+    }
+
+    /// Waits for a run from `startWorkflow` to close and returns its result, allocated from
+    /// `arena`, then replays its history as `executeWorkflow` does. On the time-skipping
+    /// server, time skipping is unlocked for the wait. On `error.WorkflowFailed`, `failure`
+    /// (if given) receives the workflow's failure. The run stays owned by the caller.
+    pub fn getResult(
+        env: *WorkflowEnvironment,
+        comptime Workflow: type,
+        run: *client_mod.WorkflowRun(Workflow.Result),
+        arena: Allocator,
+        failure: ?*?failure_mod.Failure,
+    ) !Workflow.Result {
+        const skipping = env.server == .time_skipping;
+        if (skipping) _ = try env.testService(ts.UnlockTimeSkippingResponse, "UnlockTimeSkipping", ts.UnlockTimeSkippingRequest{}, arena);
         const result = run.get(arena);
+        if (skipping) _ = try env.testService(ts.LockTimeSkippingResponse, "LockTimeSkipping", ts.LockTimeSkippingRequest{}, arena);
         if (result) |_| {} else |err| {
             if (failure) |f| f.* = if (run.failure()) |fl| fl.* else null;
             switch (err) {
@@ -256,6 +330,68 @@ pub const WorkflowEnvironment = struct {
         }
         try env.replayRun(run.id, run.run_id);
         return result;
+    }
+
+    /// Lets `duration` of server time pass. On the time-skipping server this skips time
+    /// (workflows see their timers fire) and returns as soon as server time has advanced; on
+    /// the dev server it is a real sleep.
+    pub fn sleep(env: *WorkflowEnvironment, duration: Io.Duration) !void {
+        switch (env.server) {
+            .dev => try env.io.sleep(duration, .awake),
+            .time_skipping => {
+                var scratch: std.heap.ArenaAllocator = .init(env.gpa);
+                defer scratch.deinit();
+                _ = try env.testService(ts.SleepResponse, "UnlockTimeSkippingWithSleep", ts.SleepRequest{ .duration = .{
+                    .seconds = @intCast(@divFloor(duration.nanoseconds, std.time.ns_per_s)),
+                    .nanos = @intCast(@mod(duration.nanoseconds, std.time.ns_per_s)),
+                } }, scratch.allocator());
+            },
+        }
+    }
+
+    /// The server's current time: skipped time included on the time-skipping server, the
+    /// wall clock on the dev server.
+    pub fn now(env: *WorkflowEnvironment) !Io.Timestamp {
+        switch (env.server) {
+            .dev => return Io.Timestamp.now(env.io, .real),
+            .time_skipping => {
+                var scratch: std.heap.ArenaAllocator = .init(env.gpa);
+                defer scratch.deinit();
+                const response = try env.testService(ts.GetCurrentTimeResponse, "GetCurrentTime", proto.google.protobuf.Empty{}, scratch.allocator());
+                const t = response.time orelse {
+                    log.err("GetCurrentTime returned no time", .{});
+                    return error.InvalidResponse;
+                };
+                return .fromNanoseconds(@as(i96, t.seconds) * std.time.ns_per_s + t.nanos);
+            },
+        }
+    }
+
+    const ts = proto.temporal.api.testservice.v1;
+
+    /// Calls a TestService method; the response's memory comes from `arena`. Not retried:
+    /// the server counts lock and unlock calls, so a retried call could unbalance them.
+    fn testService(env: *WorkflowEnvironment, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator) error{ OutOfMemory, Canceled, RpcFailed, InvalidResponse }!Response {
+        var encoded: Io.Writer.Allocating = .init(arena);
+        request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
+        var rpc_failure: ?bridge.Connection.RpcFailure = null;
+        defer if (rpc_failure) |f| f.deinit(env.gpa);
+        const bytes = env.client.connection.call(env.gpa, env.io, .test_service, method, encoded.written(), .{}, &rpc_failure) catch |err| switch (err) {
+            error.RpcFailed => {
+                const f = rpc_failure.?;
+                log.err("test server {s} failed: {s} (gRPC status {d})", .{ method, f.message, f.status_code });
+                return error.RpcFailed;
+            },
+            error.InvalidOptions => return error.RpcFailed,
+            else => |e| return e,
+        };
+        defer env.gpa.free(bytes);
+        const owned = try arena.dupe(u8, bytes);
+        var reader: Io.Reader = .fixed(owned);
+        return Response.decode(&reader, arena) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidResponse,
+        };
     }
 
     /// Replays a run's history (fetched from the server) against the registered workflows.
@@ -485,6 +621,14 @@ const Fixtures = struct {
         return "no activity here";
     }
     const Different = workflow.Def("HelloWorld", other);
+
+    /// Sleeps, then returns how many seconds of workflow time passed.
+    fn sleepFor(ctx: *workflow.Context, seconds: i64) !i64 {
+        const before = ctx.now();
+        try ctx.io().sleep(.fromSeconds(seconds), .awake);
+        return @intCast(@divFloor(ctx.now().nanoseconds - before.nanoseconds, std.time.ns_per_s));
+    }
+    const Sleeper = workflow.Def("Sleeper", sleepFor);
 };
 
 test "WorkflowEnvironment runs a workflow with a test double for its activity" {
@@ -564,4 +708,73 @@ test "client: generated IDs, start delay, history, and terminate" {
     defer stuck.deinit();
     try env.client.terminateWorkflow(stuck.id, "", "test cleanup");
     try testing.expectError(error.WorkflowTerminated, stuck.get(a));
+}
+
+test "time-skipping WorkflowEnvironment completes a 2h sleep in seconds" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Sleeper);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const wall_start = Io.Timestamp.now(testing.io, .awake);
+    const slept = try env.executeWorkflow(Fixtures.Sleeper, .{2 * std.time.s_per_hour}, arena.allocator(), null);
+    try testing.expect(slept >= 2 * std.time.s_per_hour);
+    const wall = wall_start.durationTo(Io.Timestamp.now(testing.io, .awake));
+    try testing.expect(wall.nanoseconds < 60 * std.time.ns_per_s);
+}
+
+test "time-skipping WorkflowEnvironment keeps time locked until a result is awaited" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Sleeper);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const start = try env.now();
+    var run = try env.startWorkflow(Fixtures.Sleeper, .{ .task_queue = "" }, .{2 * std.time.s_per_hour});
+    defer run.deinit();
+
+    // Wait for the timer to start; with time locked it must not have fired.
+    while (true) {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const history = try env.client.fetchHistory(scratch.allocator(), run.id, run.run_id);
+        var started = false;
+        for (history.events.items) |event| switch (event.attributes orelse continue) {
+            .timer_started_event_attributes => started = true,
+            .timer_fired_event_attributes => return error.TestUnexpectedResult,
+            else => {},
+        };
+        if (started) break;
+        try testing.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try testing.expect(start.durationTo(try env.now()).nanoseconds < std.time.ns_per_hour);
+
+    try testing.expectEqual(@as(i64, 2 * std.time.s_per_hour), try env.getResult(Fixtures.Sleeper, &run, a, null));
+    try testing.expect(start.durationTo(try env.now()).nanoseconds >= 2 * std.time.ns_per_hour);
+}
+
+test "time-skipping WorkflowEnvironment sleep advances server time" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    const before = try env.now();
+    try env.sleep(.fromSeconds(std.time.s_per_hour));
+    try testing.expect(before.durationTo(try env.now()).nanoseconds >= std.time.ns_per_hour);
+}
+
+test "dev-server WorkflowEnvironment starts a workflow and awaits its result" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const before = try env.now();
+    var run = try env.startWorkflow(Fixtures.Hello, .{ .task_queue = "" }, .{"later"});
+    defer run.deinit();
+    try testing.expect(std.mem.startsWith(u8, run.id, "HelloWorld-test-"));
+    try testing.expectEqualStrings("Hello later!", try env.getResult(Fixtures.Hello, &run, arena.allocator(), null));
+    try env.sleep(.fromMilliseconds(1));
+    try testing.expect(before.durationTo(try env.now()).nanoseconds > 0);
 }
