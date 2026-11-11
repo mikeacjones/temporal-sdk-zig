@@ -23,11 +23,19 @@ We pin release tags only, never a branch. The .NET SDK uses the same C bridge, s
    scripts/check-core-version.sh
    ```
 
+   If the check reports that `deps/Cargo.toml` drifted, copy sdk-core's `[workspace.*]` tables into it again. Our workspace exists to commit a `Cargo.lock`, and member crates inherit those tables from it. Copy a changed toolchain channel into `deps/rust-toolchain.toml` the same way. Then refresh the lockfile from `deps/`:
+
+   ```sh
+   cd deps && cargo update --workspace
+   ```
+
+   Review the `Cargo.lock` diff: it should only move the dependencies the new core release asks for.
+
 3. Regenerate the Zig protobuf code and review the diff of the generated files.
 
 4. Update `src/bridge/` for every header change from step 1, and update the struct size and alignment tests.
 
-5. Run `zig build test` and the integration tests against a dev server.
+5. Run `zig build test` (it rebuilds the core with cargo) and the integration tests against a dev server.
 
 6. Commit the submodule move, `CORE_VERSION`, the regenerated code and the bridge changes together, with the old and new tags in the commit message.
 

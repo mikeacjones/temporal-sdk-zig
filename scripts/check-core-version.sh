@@ -22,3 +22,18 @@ if [ "$want_sha" != "$have_sha" ]; then
   exit 1
 fi
 echo "deps/sdk-core matches CORE_VERSION ($want, ${have_sha:0:7})"
+
+# deps/Cargo.toml mirrors sdk-core's [workspace.*] tables because member crates inherit
+# them; deps/rust-toolchain.toml mirrors sdk-core's toolchain. Both must stay in sync.
+tables() { sed -n '/^\[workspace.dependencies\]/,$p' "$1"; }
+if ! diff <(tables "$root/deps/sdk-core/Cargo.toml") <(tables "$root/deps/Cargo.toml") >/dev/null; then
+  echo "deps/Cargo.toml [workspace.*] tables differ from deps/sdk-core/Cargo.toml:" >&2
+  diff <(tables "$root/deps/sdk-core/Cargo.toml") <(tables "$root/deps/Cargo.toml") >&2 || true
+  exit 1
+fi
+channel() { sed -n 's/^channel *= *"\(.*\)"/\1/p' "$1"; }
+if [ "$(channel "$root/deps/sdk-core/rust-toolchain.toml")" != "$(channel "$root/deps/rust-toolchain.toml")" ]; then
+  echo "deps/rust-toolchain.toml channel differs from deps/sdk-core/rust-toolchain.toml" >&2
+  exit 1
+fi
+echo "deps/Cargo.toml and deps/rust-toolchain.toml match sdk-core"
