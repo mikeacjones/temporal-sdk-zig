@@ -180,6 +180,7 @@ fn validate(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, work: Io.Dir
     std.posix.kill(worker_pid, .TERM) catch {};
     const worker_code = waitExit(io, worker_pid, stop_grace_seconds);
     worker_reaped = worker_code != null;
+    if (worker_code == null) dumpStacks(gpa, io, worker_pid);
 
     if (!starter_ok or missing != null or worker_code == null or worker_code.? != 0) {
         std.log.err("{s}: starter output:\n{s}", .{ sample.name, output });
@@ -214,4 +215,27 @@ fn showLog(io: Io, arena: Allocator, work: Io.Dir, work_path: []const u8, name: 
     const contents = work.readFileAlloc(io, name, arena, .limited(1024 * 1024)) catch return;
     const tail = contents[contents.len -| 8000..];
     std.log.err("worker log ({s}/{s}):\n{s}", .{ work_path, name, tail });
+}
+
+/// Logs the threads' stacks of a process that is stuck, with the platform's debugger, so a hang
+/// in CI can be diagnosed from its log. Best effort: does nothing if no debugger is installed.
+fn dumpStacks(gpa: Allocator, io: Io, pid: std.posix.pid_t) void {
+    var pid_buf: [16]u8 = undefined;
+    const pid_text = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
+    const argv: []const []const u8 = switch (@import("builtin").os.tag) {
+        // ptrace is usually limited to descendants, and gdb is not the worker's parent.
+        .linux => &.{ "sudo", "-n", "gdb", "-p", pid_text, "-batch", "-ex", "thread apply all bt" },
+        .macos => &.{ "sample", pid_text, "1" },
+        else => return,
+    };
+    const result = std.process.run(gpa, io, .{
+        .argv = argv,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } },
+    }) catch |err| {
+        std.log.err("could not dump the stuck worker's stacks with {s}: {t}", .{ argv[0], err });
+        return;
+    };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    std.log.err("stacks of the stuck worker (pid {d}):\n{s}\n{s}", .{ pid, result.stdout[0..@min(result.stdout.len, 64 * 1024)], result.stderr[0..@min(result.stderr.len, 4096)] });
 }
