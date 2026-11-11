@@ -295,7 +295,13 @@ fn activityLoop(w: *Worker, core: bridge.Worker) void {
             w.stop();
             continue;
         } orelse break;
-        group.async(w.io, runActivityTask, .{ w, core, polled });
+        // Each activity gets its own thread: `async` would run it inline in this loop once the
+        // Io has as many busy threads as CPUs, running activities one at a time. The core's
+        // activity slots bound how many run at once.
+        group.concurrent(w.io, runActivityTask, .{ w, core, polled }) catch {
+            log.warn("no thread available for an activity; running it on the polling thread", .{});
+            runActivityTask(w, core, polled);
+        };
     }
     group.await(w.io) catch {};
 }
@@ -509,4 +515,51 @@ test "a worker runs a workflow and its activity started by a client" {
     defer failed.deinit();
     try testing.expectError(error.WorkflowFailed, failed.get(arena.allocator()));
     try testing.expectEqualStrings("NotToday", failure_mod.applicationType(failed.failure().?.*).?);
+}
+
+// Small machines: std.Io.Threaded runs `async` work inline once it has as many busy threads
+// as CPUs. Activities must still run concurrently, and the worker must still stop.
+const SlowActivities = struct {
+    fn nap(ctx: *activity.Context, ms: i64) !void {
+        try ctx.io().sleep(.fromMilliseconds(ms), .awake);
+    }
+    const Nap = activity.Def("Nap", nap);
+
+    fn napsInParallel(ctx: *workflow.Context, n: usize) !void {
+        var futures: std.ArrayList(workflow.ActivityFuture(void)) = .empty;
+        for (0..n) |_| try futures.append(ctx.allocator(), ctx.executeActivity(Nap, .{ .start_to_close_timeout = .fromSeconds(30) }, .{@as(i64, 1000)}));
+        for (futures.items) |f| try f.get();
+    }
+    const Naps = workflow.Def("Naps", napsInParallel);
+};
+
+test "activities run concurrently and the worker stops when async work can't get a thread" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, io, rt, .{}, null);
+    defer server.shutdown(io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, io, &client, "naps", .{});
+    defer w.deinit();
+    try w.registerWorkflow(SlowActivities.Naps);
+    try w.registerActivity(SlowActivities.Nap);
+    var running = try io.concurrent(HelloTest.runWorker, .{&w});
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const start = std.Io.Timestamp.now(io, .awake);
+    var run = try client.executeWorkflow(SlowActivities.Naps, .{ .task_queue = "naps" }, .{5});
+    defer run.deinit();
+    try run.get(arena.allocator());
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake));
+    w.stop();
+    try running.await(io);
+    // Five one-second activities in parallel, not in sequence.
+    try testing.expect(elapsed.nanoseconds < 4 * std.time.ns_per_s);
 }
