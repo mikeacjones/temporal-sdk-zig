@@ -58,20 +58,8 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 
 
-## Build & Test
+## Build, test, and conventions
 
-_Add your build and test commands here_
+Build, test, review, and layout guidance for this repository lives in `AGENTS.md`, imported here so every agent reads the same file:
 
-```bash
-# Example:
-# npm install
-# npm test
-```
-
-## Architecture Overview
-
-_Add a brief overview of your project architecture_
-
-## Conventions & Patterns
-
-_Add your project-specific conventions here_
+@AGENTS.md
