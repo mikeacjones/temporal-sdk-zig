@@ -42,6 +42,8 @@ next_activity_seq: u32 = 1,
 next_timer_seq: u32 = 1,
 activities: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 timers: std.AutoHashMapUnmanaged(u32, *WorkflowIo.Timer) = .empty,
+/// Local activities waiting on a workflow timer before their next attempt, by timer seq.
+backoffs: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 /// Coroutines blocked in `awaitCondition`, in the order they started waiting.
 conditions: std.ArrayList(*Condition) = .empty,
 args: []const converter.Payload = &.{},
@@ -70,8 +72,20 @@ pub const ActivityState = struct {
     outcome: ?Outcome = null,
     cancel_requested: bool = false,
     cancellation_type: CancellationType = .try_cancel,
+    /// Set for a local activity; null for a remote one.
+    local: ?*Local = null,
 
-    pub const CancellationType = @FieldType(workflow.ActivityOptions, "cancellation_type");
+    pub const CancellationType = workflow.ActivityCancellationType;
+
+    /// A local activity's last ScheduleLocalActivity command (arena memory), sent again with
+    /// a new seq for each attempt that follows a backoff timer.
+    pub const Local = struct {
+        cmd: cmd_pb.ScheduleLocalActivity,
+        /// The activity ID is the attempt's seq, not one the workflow chose.
+        id_from_seq: bool,
+        /// The backoff timer's seq while the activity waits for its next attempt.
+        backoff_timer: ?u32 = null,
+    };
 
     pub const Outcome = union(enum) {
         completed: ?converter.Payload,
@@ -118,6 +132,8 @@ pub fn destroy(inst: *Instance) void {
     // cancel above; wake them. The order doesn't matter: nothing they do is sent to the core.
     var pending = inst.activities.valueIterator();
     while (pending.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
+    var backing_off = inst.backoffs.valueIterator();
+    while (backing_off.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
     inst.wio.run();
     const gpa = inst.gpa;
     if (inst.sched.live == 0) {
@@ -148,7 +164,11 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         const variant = job.variant orelse continue;
         switch (variant) {
             .initialize_workflow => |init| try inst.initialize(&init, act.run_id),
-            .fire_timer => |t| if (inst.timers.fetchRemove(t.seq)) |kv| inst.wio.fireTimer(kv.value),
+            .fire_timer => |t| if (inst.timers.fetchRemove(t.seq)) |kv| {
+                inst.wio.fireTimer(kv.value);
+            } else if (inst.backoffs.fetchRemove(t.seq)) |kv| {
+                try inst.retryLocalActivity(kv.value);
+            },
             .update_random_seed => |s| inst.wio.setRandomSeed(s.randomness_seed),
             .resolve_activity => |r| try inst.resolveActivity(&r),
             .cancel_workflow => if (!inst.finished) if (inst.root) |root| inst.wio.cancelTask(root),
@@ -352,17 +372,22 @@ fn fieldOrder(name: []const u8, f: converter.Field) std.math.Order {
 
 // ---------------------------------------------------------------- activities
 
-pub fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflow.ActivityOptions, args: anytype) ?*ActivityState {
-    return inst.scheduleActivityInner(activity_type, options, args) catch null;
+pub const ScheduleError = error{ OutOfMemory, InvalidOptions };
+
+/// Creates the state of a new activity, local or remote: both share one sequence space.
+fn newActivity(inst: *Instance, cancellation_type: ActivityState.CancellationType) !*ActivityState {
+    const a = inst.arena();
+    const state = try a.create(ActivityState);
+    state.* = .{ .seq = inst.next_activity_seq, .cancellation_type = cancellation_type };
+    try inst.activities.put(a, state.seq, state);
+    inst.next_activity_seq += 1;
+    return state;
 }
 
-fn scheduleActivityInner(inst: *Instance, activity_type: []const u8, options: workflow.ActivityOptions, args: anytype) !*ActivityState {
+pub fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflow.ActivityOptions, args: anytype) ScheduleError!*ActivityState {
     const a = inst.arena();
-    const seq = inst.next_activity_seq;
-    inst.next_activity_seq += 1;
-    const state = try a.create(ActivityState);
-    state.* = .{ .seq = seq, .cancellation_type = options.cancellation_type };
-    try inst.activities.put(a, seq, state);
+    const state = try inst.newActivity(options.cancellation_type);
+    const seq = state.seq;
 
     var cmd: cmd_pb.ScheduleActivity = .{
         .seq = seq,
@@ -374,25 +399,93 @@ fn scheduleActivityInner(inst: *Instance, activity_type: []const u8, options: wo
         .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
         .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
         .heartbeat_timeout = protoDuration(options.heartbeat_timeout),
-        .cancellation_type = switch (options.cancellation_type) {
-            .try_cancel => .TRY_CANCEL,
-            .wait_cancellation_completed => .WAIT_CANCELLATION_COMPLETED,
-            .abandon => .ABANDON,
-        },
+        .cancellation_type = protoCancellationType(options.cancellation_type),
         .do_not_eagerly_execute = options.disable_eager_execution,
     };
-    if (options.retry_policy) |rp| {
-        var p: common.RetryPolicy = .{
-            .initial_interval = protoDuration(rp.initial_interval),
-            .backoff_coefficient = rp.backoff_coefficient,
-            .maximum_interval = protoDuration(rp.maximum_interval),
-            .maximum_attempts = rp.maximum_attempts,
-        };
-        try p.non_retryable_error_types.appendSlice(a, rp.non_retryable_error_types);
-        cmd.retry_policy = p;
-    }
+    if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
     try inst.commands.append(a, .{ .variant = .{ .schedule_activity = cmd } });
     return state;
+}
+
+pub fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: workflow.LocalActivityOptions, args: anytype) ScheduleError!*ActivityState {
+    if (options.start_to_close_timeout == null and options.schedule_to_close_timeout == null) {
+        inst.logger.warn("local activity options need start_to_close_timeout or schedule_to_close_timeout", .{ .ActivityType = activity_type });
+        return error.InvalidOptions;
+    }
+    const a = inst.arena();
+    const state = try inst.newActivity(options.cancellation_type);
+    const local = try a.create(ActivityState.Local);
+    local.* = .{
+        .cmd = .{
+            .seq = state.seq,
+            .activity_id = if (options.activity_id.len > 0) options.activity_id else try std.fmt.allocPrint(a, "{d}", .{state.seq}),
+            .activity_type = activity_type,
+            .arguments = try converter.toPayloads(a, args),
+            .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
+            .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
+            .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
+            .local_retry_threshold = protoDuration(options.local_retry_threshold),
+            .cancellation_type = protoCancellationType(options.cancellation_type),
+        },
+        .id_from_seq = options.activity_id.len == 0,
+    };
+    if (options.retry_policy) |rp| local.cmd.retry_policy = try protoRetryPolicy(a, rp);
+    state.local = local;
+    try inst.commands.append(a, .{ .variant = .{ .schedule_local_activity = local.cmd } });
+    return state;
+}
+
+/// Handles a local activity's DoBackoff: the core gave up retrying it on the worker, so the
+/// workflow waits on a timer, then schedules the attempt the core named (`retryLocalActivity`).
+fn startLocalBackoff(inst: *Instance, state: *ActivityState, b: result_pb.DoBackoff) !void {
+    const a = inst.arena();
+    const local = state.local orelse {
+        inst.task_failure = "the core asked to back off a remote activity";
+        return;
+    };
+    local.cmd.attempt = b.attempt;
+    local.cmd.original_schedule_time = b.original_schedule_time;
+    const seq = inst.next_timer_seq;
+    inst.next_timer_seq += 1;
+    try inst.backoffs.put(a, seq, state);
+    local.backoff_timer = seq;
+    try inst.commands.append(a, .{ .variant = .{ .start_timer = .{
+        .seq = seq,
+        .start_to_fire_timeout = b.backoff_duration orelse .{},
+    } } });
+}
+
+/// Schedules a local activity's next attempt after its backoff timer fired. The attempt gets
+/// a new seq, as the core requires.
+fn retryLocalActivity(inst: *Instance, state: *ActivityState) !void {
+    const a = inst.arena();
+    const local = state.local.?;
+    local.backoff_timer = null;
+    state.seq = inst.next_activity_seq;
+    try inst.activities.put(a, state.seq, state);
+    inst.next_activity_seq += 1;
+    local.cmd.seq = state.seq;
+    if (local.id_from_seq) local.cmd.activity_id = try std.fmt.allocPrint(a, "{d}", .{state.seq});
+    try inst.commands.append(a, .{ .variant = .{ .schedule_local_activity = local.cmd } });
+}
+
+fn protoCancellationType(t: ActivityState.CancellationType) cmd_pb.ActivityCancellationType {
+    return switch (t) {
+        .try_cancel => .TRY_CANCEL,
+        .wait_cancellation_completed => .WAIT_CANCELLATION_COMPLETED,
+        .abandon => .ABANDON,
+    };
+}
+
+fn protoRetryPolicy(a: Allocator, rp: workflow.RetryPolicy) !common.RetryPolicy {
+    var p: common.RetryPolicy = .{
+        .initial_interval = protoDuration(rp.initial_interval),
+        .backoff_coefficient = rp.backoff_coefficient,
+        .maximum_interval = protoDuration(rp.maximum_interval),
+        .maximum_attempts = rp.maximum_attempts,
+    };
+    try p.non_retryable_error_types.appendSlice(a, rp.non_retryable_error_types);
+    return p;
 }
 
 /// Blocks the calling coroutine until the activity resolves. When the coroutine is canceled
@@ -426,9 +519,41 @@ pub fn awaitActivity(inst: *Instance, state: *ActivityState) error{Canceled}!voi
 pub fn cancelActivity(inst: *Instance, state: *ActivityState) void {
     if (state.outcome != null or state.cancel_requested) return;
     state.cancel_requested = true;
-    inst.commands.append(inst.arena(), .{ .variant = .{ .request_cancel_activity = .{ .seq = state.seq } } }) catch {
+    inst.requestCancel(state) catch {
         inst.task_failure = "out of memory requesting activity cancellation";
     };
+}
+
+fn requestCancel(inst: *Instance, state: *ActivityState) !void {
+    const a = inst.arena();
+    const local = state.local orelse
+        return inst.commands.append(a, .{ .variant = .{ .request_cancel_activity = .{ .seq = state.seq } } });
+    const timer = local.backoff_timer orelse
+        return inst.commands.append(a, .{ .variant = .{ .request_cancel_local_activity = .{ .seq = state.seq } } });
+    // Between attempts nothing runs: cancel the backoff timer and resolve here, whatever the
+    // cancellation type.
+    _ = inst.backoffs.remove(timer);
+    local.backoff_timer = null;
+    try inst.commands.append(a, .{ .variant = .{ .cancel_timer = .{ .seq = timer } } });
+    state.outcome = .{ .cancelled = try localCancelFailure(a, local) };
+    if (state.waiter) |w| inst.wio.wake(w);
+}
+
+fn localCancelFailure(a: Allocator, local: *const ActivityState.Local) !*const Failure {
+    const cause = try a.create(Failure);
+    cause.* = .{ .message = "local activity canceled while waiting to retry", .source = failure_mod.source, .failure_info = .{ .canceled_failure_info = .{} } };
+    const out = try a.create(Failure);
+    out.* = .{
+        .message = "Local Activity cancelled",
+        .source = failure_mod.source,
+        .cause = cause,
+        .failure_info = .{ .activity_failure_info = .{
+            .activity_type = .{ .name = local.cmd.activity_type },
+            .activity_id = local.cmd.activity_id,
+            .retry_state = .RETRY_STATE_CANCEL_REQUESTED,
+        } },
+    };
+    return out;
 }
 
 fn resolveActivity(inst: *Instance, r: *const act_pb.ResolveActivity) !void {
@@ -440,9 +565,14 @@ fn resolveActivity(inst: *Instance, r: *const act_pb.ResolveActivity) !void {
         .completed => |s| .{ .completed = if (s.result) |p| try p.dupe(a) else null },
         .failed => |f| .{ .failed = try dupeFailure(a, f.failure) },
         .cancelled => |c| .{ .cancelled = try dupeFailure(a, c.failure) },
-        .backoff => {
-            inst.task_failure = "local activity backoff is not supported by this SDK version yet";
-            return;
+        .backoff => |b| {
+            if (state.cancel_requested) if (state.local) |local| {
+                // Canceled while the attempt ran: don't start another.
+                state.outcome = .{ .cancelled = try localCancelFailure(a, local) };
+                if (state.waiter) |w| inst.wio.wake(w);
+                return;
+            };
+            return inst.startLocalBackoff(state, b);
         },
     };
     if (state.waiter) |w| inst.wio.wake(w);
@@ -880,6 +1010,152 @@ test "eviction ends a wait for an activity's cancellation to complete" {
     const running = try create(testing.allocator, WaitCancelWf.registered, .{});
     _ = try running.activate(&try initActivation(a, "WaitCancel", .{mode}), a);
     running.destroy();
+}
+
+// Runs `Greet` as a local activity with the cancellation type named by `mode`; "no_timeouts"
+// leaves out both close timeouts.
+const LocalGreet = struct {
+    fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        var opts: workflow.LocalActivityOptions = .{
+            .start_to_close_timeout = .fromSeconds(5),
+            .retry_policy = .{ .initial_interval = .fromSeconds(10), .maximum_attempts = 5 },
+            .local_retry_threshold = .fromSeconds(2),
+        };
+        if (std.mem.eql(u8, mode, "no_timeouts")) {
+            opts.start_to_close_timeout = null;
+        } else {
+            opts.cancellation_type = std.meta.stringToEnum(ActivityState.CancellationType, mode) orelse return error.InvalidPayload;
+        }
+        return ctx.executeLocalActivity(Greet, opts, .{"local"}).get();
+    }
+};
+const LocalGreetWf = workflow.Def("LocalGreet", LocalGreet.run);
+
+fn resolveLocal(a: Allocator, seq: u32, status: result_pb.ActivityResolution.status_union) !act_pb.WorkflowActivation {
+    return oneJob(a, .{ .resolve_activity = .{ .seq = seq, .is_local = true, .result = .{ .status = status } } });
+}
+
+fn localBackoff(a: Allocator, seq: u32) !act_pb.WorkflowActivation {
+    return resolveLocal(a, seq, .{ .backoff = .{
+        .attempt = 3,
+        .backoff_duration = .{ .seconds = 10 },
+        .original_schedule_time = .{ .seconds = 1_700_000_000 },
+    } });
+}
+
+test "local activity: ScheduleLocalActivity, then the result of its local resolution" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, LocalGreetWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "try_cancel")}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const sched = first[0].variant.?.schedule_local_activity;
+    try testing.expectEqual(@as(u32, 1), sched.seq);
+    try testing.expectEqualStrings("1", sched.activity_id);
+    try testing.expectEqualStrings("Activity", sched.activity_type);
+    try testing.expectEqualStrings("\"local\"", sched.arguments.items[0].data);
+    try testing.expectEqual(@as(i64, 5), sched.start_to_close_timeout.?.seconds);
+    try testing.expect(sched.schedule_to_close_timeout == null);
+    try testing.expectEqual(@as(i64, 2), sched.local_retry_threshold.?.seconds);
+    try testing.expectEqual(@as(i64, 10), sched.retry_policy.?.initial_interval.?.seconds);
+    try testing.expectEqual(@as(u32, 0), sched.attempt);
+    try testing.expect(sched.cancellation_type == .TRY_CANCEL);
+
+    const done = commandsOf(try inst.activate(&try resolveLocal(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, @as([]const u8, "Hello local!")) } }), a));
+    try testing.expectEqualStrings("\"Hello local!\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "local activity backoff: a timer, then the next attempt with a new seq" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, LocalGreetWf.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "try_cancel")}), a);
+
+    const backoff = commandsOf(try inst.activate(&try localBackoff(a, 1), a));
+    try testing.expectEqual(@as(usize, 1), backoff.len);
+    const timer = backoff[0].variant.?.start_timer;
+    try testing.expectEqual(@as(i64, 10), timer.start_to_fire_timeout.?.seconds);
+
+    const retry = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a));
+    try testing.expectEqual(@as(usize, 1), retry.len);
+    const sched = retry[0].variant.?.schedule_local_activity;
+    try testing.expectEqual(@as(u32, 2), sched.seq);
+    try testing.expectEqualStrings("2", sched.activity_id);
+    try testing.expectEqual(@as(u32, 3), sched.attempt);
+    try testing.expectEqual(@as(i64, 1_700_000_000), sched.original_schedule_time.?.seconds);
+    try testing.expectEqualStrings("\"local\"", sched.arguments.items[0].data);
+
+    // A resolution for the first attempt's seq is stale.
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try resolveLocal(a, 1, .{ .completed = .{} }), a)).len);
+    const done = commandsOf(try inst.activate(&try resolveLocal(a, 2, .{ .completed = .{ .result = try converter.toPayload(a, @as([]const u8, "third time")) } }), a));
+    try testing.expectEqualStrings("\"third time\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "local activity cancel: RequestCancelLocalActivity while it runs" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const try_cancel = try create(testing.allocator, LocalGreetWf.registered, .{});
+    defer try_cancel.destroy();
+    _ = try try_cancel.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "try_cancel")}), a);
+    const cmds = commandsOf(try try_cancel.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    try testing.expectEqual(@as(u32, 1), cmds[0].variant.?.request_cancel_local_activity.seq);
+    try testing.expect(cmds[1].variant.? == .cancel_workflow_execution);
+    const f = try failure_mod.application(a, .{ .message = "Local Activity cancelled" });
+    try testing.expectEqual(@as(usize, 0), commandsOf(try try_cancel.activate(&try resolveLocal(a, 1, .{ .cancelled = .{ .failure = f } }), a)).len);
+
+    const waiting = try create(testing.allocator, LocalGreetWf.registered, .{});
+    defer waiting.destroy();
+    _ = try waiting.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "wait_cancellation_completed")}), a);
+    const requested = commandsOf(try waiting.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), requested.len);
+    try testing.expectEqual(@as(u32, 1), requested[0].variant.?.request_cancel_local_activity.seq);
+    const ended = commandsOf(try waiting.activate(&try resolveLocal(a, 1, .{ .cancelled = .{ .failure = f } }), a));
+    try testing.expect(ended[0].variant.? == .cancel_workflow_execution);
+}
+
+test "local activity cancel during backoff cancels the timer and resolves at once" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "try_cancel", "wait_cancellation_completed", "abandon" }) |mode| {
+        const inst = try create(testing.allocator, LocalGreetWf.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "LocalGreet", .{mode}), a);
+        _ = try inst.activate(&try localBackoff(a, 1), a);
+        const cmds = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+        try testing.expectEqual(@as(usize, 2), cmds.len);
+        try testing.expectEqual(@as(u32, 1), cmds[0].variant.?.cancel_timer.seq);
+        try testing.expect(cmds[1].variant.? == .cancel_workflow_execution);
+    }
+}
+
+test "local activity without close timeouts: get returns error.InvalidOptions" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, LocalGreetWf.registered, .{});
+    defer inst.destroy();
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "no_timeouts")}), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expectEqualStrings("InvalidOptions", cmds[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+test "eviction while a local activity backs off frees everything" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, LocalGreetWf.registered, .{});
+    _ = try inst.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "wait_cancellation_completed")}), a);
+    _ = try inst.activate(&try localBackoff(a, 1), a);
+    inst.destroy();
 }
 
 const Cron = struct {
