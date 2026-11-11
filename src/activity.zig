@@ -19,7 +19,8 @@
 //! outcome as usual. A cancel from the workflow reaches the worker in the server's answer to
 //! a heartbeat, so an activity that should notice it must call `ctx.heartbeat`. Heartbeats
 //! are throttled to 80% of the heartbeat timeout (at most 60 seconds; 30 without one), which
-//! bounds how late the cancel arrives.
+//! bounds how late the cancel arrives. A local activity (`info().is_local`) gets its cancels
+//! straight from the worker, without heartbeating, and its heartbeats are dropped.
 //!
 //! Activities that share state (a client, a connection pool, configuration) are methods taking the state first and the context second. The worker binds them to an
 //! instance with `registerActivityWith`; workflows call them through the same `Def`:
@@ -49,6 +50,8 @@ pub const Info = struct {
     workflow_type: []const u8,
     workflow_namespace: []const u8,
     attempt: u32,
+    /// The activity runs as a local activity of its workflow, on this worker.
+    is_local: bool = false,
 };
 
 /// Why an activity was canceled.
