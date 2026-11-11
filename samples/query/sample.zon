@@ -1,6 +1,7 @@
 // How samples-test validates this sample: start the worker, run the starter, and check that
-// the starter's output contains each `expect` line before `timeout_seconds`.
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter
+// terminates the workflow after querying it rather than waiting out its two-minute timer.
 .{
-    .expect = .{"query sample is a placeholder"},
+    .expect = .{ "Query result: waiting on timer", "Terminated the query workflow" },
     .timeout_seconds = 60,
 }
