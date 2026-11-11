@@ -91,6 +91,16 @@ pub fn build(b: *std.Build) void {
     samples_test_step.dependOn(&run_samples.step);
 
     for (samples) |sample| {
+        // The temporal module, plus other samples' modules this sample shares code with.
+        var imports: std.ArrayList(std.Build.Module.Import) = .empty;
+        imports.append(b.allocator, .{ .name = "temporal", .module = temporal }) catch @panic("OOM");
+        for (sample.imports) |other| imports.append(b.allocator, .{ .name = other, .module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("samples/{s}/{s}.zig", .{ other, other })),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "temporal", .module = temporal }},
+        }) }) catch @panic("OOM");
+
         const programs = [_][]const u8{ "worker", "starter" };
         for (programs) |program| {
             const exe = b.addExecutable(.{
@@ -99,7 +109,7 @@ pub fn build(b: *std.Build) void {
                     .root_source_file = b.path(b.fmt("samples/{s}/{s}.zig", .{ sample.name, program })),
                     .target = target,
                     .optimize = optimize,
-                    .imports = &.{.{ .name = "temporal", .module = temporal }},
+                    .imports = imports.items,
                 }),
             });
             samples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
@@ -113,7 +123,7 @@ pub fn build(b: *std.Build) void {
                     .root_source_file = b.path(b.fmt("samples/{s}/{s}", .{ sample.name, test_file })),
                     .target = target,
                     .optimize = optimize,
-                    .imports = &.{.{ .name = "temporal", .module = temporal }},
+                    .imports = imports.items,
                 }),
             });
             samples_test_step.dependOn(&b.addRunArtifact(t).step);
@@ -122,10 +132,20 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Ported samples-go samples. Each has worker.zig, starter.zig and sample.zon in
-/// samples/<name>; `tests` are its ported Go tests.
-const Sample = struct { name: []const u8, tests: []const []const u8 = &.{} };
+/// samples/<name>; `tests` are its ported Go tests. `imports` names other samples whose
+/// samples/<other>/<other>.zig this sample uses (Go samples import each other's packages).
+const Sample = struct { name: []const u8, tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{} };
 const samples = [_]Sample{
     .{ .name = "helloworld", .tests = &.{ "helloworld_test.zig", "replay_test.zig" } },
+    .{ .name = "greetings", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "branch", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "splitmerge-future", .tests = &.{"splitmerge_workflow_test.zig"} },
+    .{ .name = "splitmerge-selector", .tests = &.{"splitmerge_workflow_test.zig"} },
+    .{ .name = "choice-exclusive", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "choice-multi", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "goroutine", .tests = &.{"goroutine_workflow_test.zig"} },
+    .{ .name = "timer", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "start-delay", .imports = &.{"helloworld"} },
 };
 
 /// Runs cargo to build the C bridge as a static library for `target` and returns its path.

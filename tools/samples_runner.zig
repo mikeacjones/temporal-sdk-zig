@@ -16,6 +16,9 @@ const Allocator = std.mem.Allocator;
 
 const Manifest = struct {
     expect: []const []const u8,
+    /// Arguments for the starter, for validating with shorter parameters than the sample's
+    /// defaults (which follow the Go sample).
+    starter_args: []const []const u8 = &.{},
     timeout_seconds: u32 = 60,
 };
 
@@ -147,8 +150,11 @@ fn validate(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, work: Io.Dir
         _ = waitExit(io, worker_pid, 5);
     };
 
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.append(arena, starter_exe) catch return "out of memory";
+    argv.appendSlice(arena, manifest.starter_args) catch return "out of memory";
     const starter = std.process.run(gpa, io, .{
-        .argv = &.{starter_exe},
+        .argv = argv.items,
         .environ_map = env,
         .timeout = .{ .duration = .{ .raw = .fromSeconds(manifest.timeout_seconds), .clock = .awake } },
     }) catch |err| {

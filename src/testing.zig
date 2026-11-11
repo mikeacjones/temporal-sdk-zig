@@ -196,6 +196,17 @@ pub const WorkflowEnvironment = struct {
         return env.worker.registerActivity(Activity);
     }
 
+    /// Registers a method activity bound to `receiver`. See `Worker.registerActivityWith`.
+    pub fn registerActivityWith(env: *WorkflowEnvironment, comptime Activity: type, receiver: *Activity.Receiver) !void {
+        return env.worker.registerActivityWith(Activity, receiver);
+    }
+
+    /// Registers several method activities bound to one receiver. See
+    /// `Worker.registerActivitiesWith`.
+    pub fn registerActivitiesWith(env: *WorkflowEnvironment, receiver: anytype, comptime activities: anytype) !void {
+        return env.worker.registerActivitiesWith(receiver, activities);
+    }
+
     /// Registers `impl` in place of `Activity`: workflows calling `Activity` run `impl`.
     /// `impl` takes the same parameters. Go `env.OnActivity(Activity, ...).Return(...)`.
     pub fn registerActivityAs(env: *WorkflowEnvironment, comptime Activity: type, comptime impl: anytype) !void {
