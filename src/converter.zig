@@ -112,6 +112,38 @@ pub fn fromPayloads(comptime Args: type, arena: Allocator, payloads: []const Pay
     return out;
 }
 
+/// A named value, such as one entry of a workflow memo.
+pub const Field = struct {
+    name: []const u8,
+    value: Payload,
+};
+
+/// Encodes each field of the struct `values` as a `Field`, in declaration order, so the
+/// result is deterministic and usable from workflow code:
+/// `toFields(arena, .{ .description = "nightly import", .owner = @as(?[]const u8, null) })`.
+/// Null optional fields encode as `binary/null`. The slice and payload memory come from
+/// `arena`, and the fields borrow it; names are the comptime field names.
+pub fn toFields(arena: Allocator, values: anytype) error{OutOfMemory}![]Field {
+    const info = @typeInfo(@TypeOf(values));
+    if (info != .@"struct" or (info.@"struct".is_tuple and info.@"struct".field_names.len > 0))
+        @compileError("toFields takes a struct with named fields, got " ++ @typeName(@TypeOf(values)));
+    const names = info.@"struct".field_names;
+    const out = try arena.alloc(Field, names.len);
+    inline for (names, 0..) |name, i| {
+        out[i] = .{ .name = name, .value = try toPayload(arena, @field(values, name)) };
+    }
+    return out;
+}
+
+/// Decodes the value of the field called `name` as `T`, or returns null if no field has that
+/// name. If several fields share the name, the first wins. Memory comes from `arena`.
+pub fn fieldValue(comptime T: type, arena: Allocator, fields: []const Field, name: []const u8) DecodeError!?T {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return try fromPayload(T, arena, field.value);
+    }
+    return null;
+}
+
 fn payloadWith(arena: Allocator, enc: Encoding, data: []const u8) error{OutOfMemory}!Payload {
     var p: Payload = .{ .data = data };
     try p.metadata.append(arena, .{ .key = encoding_key, .value = enc.text() });
@@ -322,4 +354,29 @@ test "Time encodes as RFC 3339 text" {
     const p = try toPayload(arena.allocator(), S{ .run_time = t });
     try std.testing.expectEqualStrings("{\"run_time\":\"2018-08-22T16:30:00Z\"}", p.data);
     try std.testing.expectEqual(t, (try fromPayload(S, arena.allocator(), p)).run_time);
+}
+
+test "fields encode in declaration order and decode by name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fields = try toFields(a, .{
+        .description = "nightly import",
+        .priority = 3,
+        .owner = @as(?[]const u8, null),
+        .raw = Bytes{ .data = "\x01" },
+    });
+    try testing.expectEqual(@as(usize, 4), fields.len);
+    for (fields, [_][]const u8{ "description", "priority", "owner", "raw" }) |f, name|
+        try testing.expectEqualStrings(name, f.name);
+    try testing.expectEqualStrings("binary/null", encodingOf(fields[2].value).?);
+
+    try testing.expectEqualStrings("nightly import", (try fieldValue([]const u8, a, fields, "description")).?);
+    try testing.expectEqual(@as(?u8, 3), try fieldValue(u8, a, fields, "priority"));
+    try testing.expectEqual(@as(??[]const u8, @as(?[]const u8, null)), try fieldValue(?[]const u8, a, fields, "owner"));
+    try testing.expectEqualSlices(u8, "\x01", (try fieldValue(Bytes, a, fields, "raw")).?.data);
+    try testing.expectEqual(@as(?u8, null), try fieldValue(u8, a, fields, "missing"));
+    try testing.expectError(error.InvalidPayload, fieldValue(u8, a, fields, "description"));
+    try testing.expectEqual(@as(usize, 0), (try toFields(a, .{})).len);
 }
