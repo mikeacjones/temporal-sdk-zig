@@ -710,6 +710,104 @@ const Fixtures = struct {
     const LocalGreetingsChanged = workflow.Def("LocalGreetings", remoteGreetings);
 };
 
+const LocalFixtures = struct {
+    var started: Io.Event = .unset;
+    /// Set once `block` has seen a cancel; `seen_reason` is written before.
+    var observed: Io.Event = .unset;
+    var seen_reason: ?activity.CancelReason = null;
+
+    fn reset() void {
+        started = .unset;
+        observed = .unset;
+        seen_reason = null;
+    }
+
+    fn isLocal(ctx: *activity.Context) !bool {
+        return ctx.info().is_local;
+    }
+    const IsLocal = activity.Def("IsLocal", isLocal);
+
+    fn localAndRemote(ctx: *workflow.Context) ![]const u8 {
+        const local = try ctx.executeLocalActivity(IsLocal, .{ .start_to_close_timeout = .fromSeconds(10) }, .{}).get();
+        const remote = try ctx.executeActivity(IsLocal, .{ .start_to_close_timeout = .fromSeconds(10) }, .{}).get();
+        return std.fmt.allocPrint(ctx.allocator(), "local={} remote={}", .{ local, remote });
+    }
+    const LocalAndRemote = workflow.Def("LocalAndRemote", localAndRemote);
+
+    /// Blocks on its `std.Io` until canceled.
+    fn block(ctx: *activity.Context) !void {
+        started.set(ctx.io());
+        ctx.io().sleep(.fromSeconds(600), .awake) catch |err| {
+            seen_reason = ctx.cancelReason();
+            observed.set(ctx.io());
+            return err;
+        };
+    }
+    const Block = activity.Def("Block", block);
+
+    fn waitBlocked(ctx: *activity.Context) !void {
+        try started.wait(ctx.io());
+    }
+    const WaitBlocked = activity.Def("WaitBlocked", waitBlocked);
+
+    /// Describes the root cause of an activity future's failure.
+    fn describe(ctx: *workflow.Context, f: *const failure_mod.Failure) ![]const u8 {
+        const root = failure_mod.rootCause(f);
+        return switch (root.failure_info orelse return "no failure info") {
+            .canceled_failure_info => "canceled",
+            .timeout_failure_info => |t| std.fmt.allocPrint(ctx.allocator(), "timeout {t}", .{t.timeout_type}),
+            else => std.fmt.allocPrint(ctx.allocator(), "unexpected failure: {s}", .{root.message}),
+        };
+    }
+
+    /// Cancels `Block` once it is running. The second local activity resolves inside the same
+    /// workflow task, so the cancel needs no new events from the server.
+    fn cancelLocal(ctx: *workflow.Context) ![]const u8 {
+        const blocked = ctx.executeLocalActivity(Block, .{
+            .start_to_close_timeout = .fromSeconds(60),
+            .cancellation_type = .wait_cancellation_completed,
+        }, .{});
+        try ctx.executeLocalActivity(WaitBlocked, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+        blocked.cancel();
+        blocked.get() catch |err| switch (err) {
+            error.ActivityFailed => return describe(ctx, blocked.failure().?),
+            else => return err,
+        };
+        return "not canceled";
+    }
+    const CancelLocal = workflow.Def("CancelLocal", cancelLocal);
+
+    /// Runs `Block` once with a half-second start-to-close (or, with `schedule_to_close`,
+    /// schedule-to-close) timeout.
+    fn timeOutLocal(ctx: *workflow.Context, schedule_to_close: bool) ![]const u8 {
+        const timeout: Io.Duration = .fromMilliseconds(500);
+        const blocked = ctx.executeLocalActivity(Block, .{
+            .start_to_close_timeout = if (schedule_to_close) null else timeout,
+            .schedule_to_close_timeout = if (schedule_to_close) timeout else null,
+            .retry_policy = .{ .maximum_attempts = 1 },
+        }, .{});
+        blocked.get() catch |err| switch (err) {
+            error.ActivityFailed => return describe(ctx, blocked.failure().?),
+            else => return err,
+        };
+        return "not timed out";
+    }
+    const TimeOutLocal = workflow.Def("TimeOutLocal", timeOutLocal);
+
+    fn start() !*WorkflowEnvironment {
+        reset();
+        const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+        errdefer env.deinit();
+        try env.registerWorkflow(LocalAndRemote);
+        try env.registerWorkflow(CancelLocal);
+        try env.registerWorkflow(TimeOutLocal);
+        try env.registerActivity(IsLocal);
+        try env.registerActivity(Block);
+        try env.registerActivity(WaitBlocked);
+        return env;
+    }
+};
+
 test "WorkflowEnvironment runs a workflow with a test double for its activity" {
     const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
@@ -798,8 +896,57 @@ test "WorkflowEnvironment runs local activities, retrying one after workflow tim
     try env.registerActivity(Fixtures.FlakyGreet);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const result = try env.executeWorkflow(Fixtures.LocalGreetings, .{"Temporal"}, arena.allocator(), null);
+    var run = try env.startWorkflow(Fixtures.LocalGreetings, .{ .task_queue = "" }, .{"Temporal"});
+    defer run.deinit();
+    const result = try env.getResult(Fixtures.LocalGreetings, &run, arena.allocator(), null);
     try testing.expectEqualStrings("Hello Temporal! Hello Temporal on attempt 3!", result);
+    // Both retries backed off past the local retry threshold, so each waited on a timer.
+    const history = try env.client.fetchHistory(arena.allocator(), run.id, run.run_id);
+    var timers: usize = 0;
+    for (history.events.items) |e| timers += @intFromBool(e.event_type == .EVENT_TYPE_TIMER_FIRED);
+    try testing.expectEqual(2, timers);
+}
+
+test "activity.Info.is_local is true for a local activity and false for a remote one" {
+    const env = try LocalFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(LocalFixtures.LocalAndRemote, .{}, arena.allocator(), null);
+    try testing.expectEqualStrings("local=true remote=false", result);
+}
+
+test "a canceled local activity sees the cancel on its Io and reports canceled" {
+    const env = try LocalFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(LocalFixtures.CancelLocal, .{}, arena.allocator(), null);
+    try testing.expectEqualStrings("canceled", result);
+    // wait_cancellation_completed resolved the future only after the activity returned.
+    try testing.expect(LocalFixtures.observed.isSet());
+    try testing.expectEqual(@as(?activity.CancelReason, .canceled), LocalFixtures.seen_reason);
+}
+
+test "a local activity past its start-to-close or schedule-to-close timeout is canceled and times out" {
+    const env = try LocalFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |schedule_to_close| {
+        LocalFixtures.reset();
+        const result = try env.executeWorkflow(LocalFixtures.TimeOutLocal, .{schedule_to_close}, arena.allocator(), null);
+        if (schedule_to_close) {
+            // Without a start-to-close timeout the attempt's timer also runs for the
+            // schedule-to-close time, so either may fire first.
+            try testing.expect(std.mem.startsWith(u8, result, "timeout TIMEOUT_TYPE_"));
+        } else {
+            try testing.expectEqualStrings("timeout TIMEOUT_TYPE_START_TO_CLOSE", result);
+        }
+        // The core times the activity out without waiting for it, then cancels it.
+        try LocalFixtures.observed.wait(testing.io);
+        try testing.expectEqual(@as(?activity.CancelReason, .timed_out), LocalFixtures.seen_reason);
+    }
 }
 
 test "client: generated IDs, start delay, history, and terminate" {
