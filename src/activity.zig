@@ -1,4 +1,4 @@
-//! Activities (Go `activity` package parity).
+//! Activities.
 //!
 //! An activity is a function `fn (ctx: *activity.Context, args...) !Result`, named with
 //! `Def` so workflows and workers refer to it by the same type:
@@ -12,8 +12,7 @@
 //! Activities run on the worker's real `std.Io` and may do any I/O. Memory from
 //! `ctx.allocator()` lives until the activity's result has been reported.
 //!
-//! Activities that share state (Go's activity structs, such as a client or configuration)
-//! are methods taking the state first and the context second. The worker binds them to an
+//! Activities that share state (a client, a connection pool, configuration) are methods taking the state first and the context second. The worker binds them to an
 //! instance with `registerActivityWith`; workflows call them through the same `Def`:
 //!
 //!     pub const Activities = struct {
@@ -90,7 +89,7 @@ pub const Context = struct {
     /// Reports that the activity is alive, with progress `details` (any value the converter
     /// encodes, or `{}` for none). A later attempt reads the last details with
     /// `heartbeatDetails`. Heartbeats are throttled by the worker, so calling this often is
-    /// cheap. Go `activity.RecordHeartbeat`; pass a struct where Go passes several values.
+    /// cheap. To report several values, pass a struct.
     pub fn heartbeat(ctx: *Context, details: anytype) void {
         const sink = ctx.heartbeat_sink orelse return;
         var scratch: std.heap.ArenaAllocator = .init(sink.gpa);
@@ -103,13 +102,13 @@ pub const Context = struct {
         sink.record(sink.context, &.{payload});
     }
 
-    /// Whether the previous attempt heartbeated with details. Go `activity.HasHeartbeatDetails`.
+    /// Whether the previous attempt heartbeated with details.
     pub fn hasHeartbeatDetails(ctx: *const Context) bool {
         return ctx.heartbeat_details.len > 0;
     }
 
     /// The previous attempt's last heartbeat details, decoded as `T` into the activity's
-    /// memory. Go `activity.GetHeartbeatDetails`.
+    /// memory.
     pub fn heartbeatDetails(ctx: *Context, comptime T: type) error{ NoHeartbeatDetails, OutOfMemory, InvalidPayload, UnknownEncoding }!T {
         if (ctx.heartbeat_details.len == 0) return error.NoHeartbeatDetails;
         return converter.fromPayload(T, ctx.arena, ctx.heartbeat_details[0]) catch |err| switch (err) {

@@ -1,4 +1,4 @@
-//! The order activities of samples-go/choice-exclusive.
+//! The order activities of the choice-exclusive sample.
 
 const std = @import("std");
 const temporal = @import("temporal");

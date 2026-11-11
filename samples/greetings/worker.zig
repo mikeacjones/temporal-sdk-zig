@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
     var w = try temporal.worker.Worker.init(gpa, io, &client, "greetings", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(greetings.GreetingSample);
+    try w.registerWorkflow(greetings.Greetings);
     var activities: greetings.Activities = .{ .name = "Temporal", .greeting = "Hello" };
     try w.registerActivitiesWith(&activities, .{ greetings.GetGreeting, greetings.GetName, greetings.SayGreeting });
 

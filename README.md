@@ -5,15 +5,13 @@
 
 [Temporal](https://github.com/temporalio/temporal) is a distributed, scalable, durable, and highly available orchestration engine used to execute asynchronous long-running business logic in a scalable and resilient way.
 
-The Temporal Zig SDK is a framework for authoring workflows and activities in Zig. It is built on Temporal's [Rust Core SDK](https://github.com/temporalio/sdk-core), the same core the TypeScript, Python, .NET, and Ruby SDKs use, and aims for feature parity with the [Go SDK](https://github.com/temporalio/sdk-go).
+The Temporal Zig SDK is a framework for authoring workflows and activities in Zig. It is built on Temporal's [Rust Core SDK](https://github.com/temporalio/sdk-core), the same core the TypeScript, Python, .NET, and Ruby SDKs use, It is a standalone, Zig-first SDK: it aims for feature parity with Temporal's other SDKs, with every feature designed the Zig way.
 
 ## Status
 
-Workflows can run activities (sequentially, in parallel, or chosen at run time), wait on timers, race activities against timers, run concurrent coroutines on the workflow's deterministic `std.Io`, and await conditions. Activities can share state, heartbeat, and resume from their last heartbeat on retry. Clients can start workflows with a start delay or a cron schedule, wait for results, and terminate workflows. Twelve samples-go ports pass against a dev server with their ported tests: helloworld, greetings, branch, splitmerge-future, splitmerge-selector, choice-exclusive, choice-multi, io-group (Go's goroutine), timer, start-delay, retryactivity, and cron. Every test run through the test environment also replays the workflow's own history to check determinism.
+Workflows can run activities (sequentially, in parallel, or chosen at run time), wait on timers, race activities against timers, run concurrent coroutines on the workflow's deterministic `std.Io`, and await conditions. Activities can share state, heartbeat, and resume from their last heartbeat on retry. Clients can start workflows with a start delay or a cron schedule, wait for results, and terminate workflows. Twelve [samples](samples) pass against a dev server with their tests (see [Parity](#parity)). Every test run through the test environment also replays the workflow's own history to check determinism.
 
 Signals, queries, updates, child workflows, local activities, Nexus, and most client and worker options are not implemented yet.
-
-Parity is measured by porting every sample in [samples-go](https://github.com/temporalio/samples-go) to Zig and running it against a Temporal dev server. The Samples badge shows whether the ported samples pass.
 
 ## Add the SDK to your project
 
@@ -44,14 +42,35 @@ Fetching by URL with prebuilt core libraries, so you don't need Rust, is planned
 
 ## Getting started
 
-See [samples](samples) for Zig ports of the Go samples as they land, and [Temporal's documentation](https://docs.temporal.io) for the concepts.
+See [samples](samples) for working examples, and [Temporal's documentation](https://docs.temporal.io) for the concepts.
 
-The API follows the Go SDK's feature set in Zig's style:
+The API is designed for Zig:
 
 - Functions that allocate or do I/O take an explicit `std.mem.Allocator` and `std.Io`.
 - Options are struct literals with defaults, not functional options or context derivation.
 - Workflows, signals, queries, updates, and activities have comptime-typed definitions shared by the client and the worker, so calls check argument and result types at compile time.
 - Workflow code runs on a deterministic `std.Io`: `io.sleep` is a durable timer, `io.now` is workflow time, and `std.Io` futures, `Select`, `Mutex`, and `Queue` work inside workflows unchanged.
+
+## Parity
+
+This SDK is not a port of another SDK, but it measures its feature coverage against the [Go SDK](https://github.com/temporalio/sdk-go), Temporal's most complete feature set, and its [samples](https://github.com/temporalio/samples-go). Every samples-go sample gets a Zig sample that demonstrates the same feature in idiomatic Zig, with its own names, payload shapes, and tests. `zig build samples-test` runs every sample against a dev server, and the Samples badge shows whether they pass.
+
+Where the Go SDK relies on machinery Temporal's Rust core doesn't have, this SDK behaves like the other core-based SDKs (.NET, Python, TypeScript, Ruby): a side effect is a local activity, version checks use patches, and tests run against the dev server and the time-skipping test server instead of an in-memory mock.
+
+| Zig sample | samples-go sample |
+|------------|-------------------|
+| [helloworld](samples/helloworld) | helloworld |
+| [greetings](samples/greetings) | greetings |
+| [branch](samples/branch) | branch |
+| [splitmerge-future](samples/splitmerge-future) | splitmerge-future |
+| [splitmerge-select](samples/splitmerge-select) | splitmerge-selector |
+| [choice-exclusive](samples/choice-exclusive) | choice-exclusive |
+| [choice-multi](samples/choice-multi) | choice-multi |
+| [io-group](samples/io-group) | goroutine |
+| [timer](samples/timer) | timer |
+| [start-delay](samples/start-delay) | start-delay |
+| [retryactivity](samples/retryactivity) | retryactivity |
+| [cron](samples/cron) | cron |
 
 ## Development
 

@@ -1,1 +1,1 @@
-//! Nexus service definitions, operation handlers, and callers (Go `temporalnexus` parity).
+//! Nexus service definitions, operation handlers, and callers.

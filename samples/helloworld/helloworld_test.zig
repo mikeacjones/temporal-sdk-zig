@@ -1,4 +1,5 @@
-//! Port of samples-go/helloworld/helloworld_test.go.
+//! Tests for the hello world sample: with a test double for the activity, the activity on
+//! its own, and the real worker against a dev server.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -11,24 +12,23 @@ fn activityDouble(ctx: *temporal.activity.Context, name: []const u8) ![]const u8
     return ctx.allocator().dupe(u8, "Hello Temporal!");
 }
 
-// Go: env.OnActivity(Activity, mock.Anything, "Temporal").Return("Hello Temporal!", nil)
-test "Workflow" {
+test "workflow with a test double for its activity" {
     const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
-    try env.registerWorkflow(helloworld.Workflow);
-    try env.registerActivityAs(helloworld.Activity, activityDouble);
+    try env.registerWorkflow(helloworld.HelloWorld);
+    try env.registerActivityAs(helloworld.Greet, activityDouble);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const result = try env.executeWorkflow(helloworld.Workflow, .{"Temporal"}, arena.allocator(), null);
+    const result = try env.executeWorkflow(helloworld.HelloWorld, .{"Temporal"}, arena.allocator(), null);
     try testing.expectEqualStrings("Hello Temporal!", result);
 }
 
-test "Activity" {
+test "activity" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const env: temporal.testing.ActivityEnvironment = .init(testing.io);
-    const result = try env.executeActivity(helloworld.Activity, .{"World"}, arena.allocator());
+    const result = try env.executeActivity(helloworld.Greet, .{"World"}, arena.allocator());
     try testing.expectEqualStrings("Hello World!", result);
 }
 
@@ -36,7 +36,7 @@ fn runWorker(w: *temporal.worker.Worker) temporal.worker.Worker.RunError!void {
     return w.run();
 }
 
-test "Using DevServer" {
+test "worker against a dev server" {
     var server = try temporal.testing.DevServer.start(testing.allocator, testing.io, .{});
     defer server.stop(testing.io);
 
@@ -45,8 +45,8 @@ test "Using DevServer" {
 
     var w = try temporal.worker.Worker.init(testing.allocator, testing.io, &client, "hello-world", .{});
     defer w.deinit();
-    try w.registerWorkflow(helloworld.Workflow);
-    try w.registerActivity(helloworld.Activity);
+    try w.registerWorkflow(helloworld.HelloWorld);
+    try w.registerActivity(helloworld.Greet);
     var running = try testing.io.concurrent(runWorker, .{&w});
     defer {
         w.stop();
@@ -55,7 +55,7 @@ test "Using DevServer" {
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var run = try client.executeWorkflow(helloworld.Workflow, .{ .id = "hello_world_workflowID", .task_queue = "hello-world" }, .{"Temporal"});
+    var run = try client.executeWorkflow(helloworld.HelloWorld, .{ .id = "hello-world", .task_queue = "hello-world" }, .{"Temporal"});
     defer run.deinit();
     try testing.expectEqualStrings("Hello Temporal!", try run.get(arena.allocator()));
 }

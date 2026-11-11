@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 const Manifest = struct {
     expect: []const []const u8,
     /// Arguments for the starter, for validating with shorter parameters than the sample's
-    /// defaults (which follow the Go sample).
+    /// defaults.
     starter_args: []const []const u8 = &.{},
     timeout_seconds: u32 = 60,
 };

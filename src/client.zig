@@ -1,4 +1,4 @@
-//! The Temporal client (Go `client` package parity): connect to a server, start workflows,
+//! The Temporal client: connect to a server, start workflows,
 //! and wait for their results.
 //!
 //!     var client = try temporal.client.Client.connect(gpa, io, try temporal.client.loadDefaultOptions(arena));
@@ -28,7 +28,7 @@ pub const Options = struct {
     /// host:port of the server's frontend.
     host_port: []const u8 = "localhost:7233",
     namespace: []const u8 = "default",
-    /// Empty uses "<pid>@<hostname>", as the Go SDK does.
+    /// Empty uses "<pid>@<hostname>".
     identity: []const u8 = "",
     api_key: []const u8 = "",
     tls: ?Tls = null,
@@ -150,7 +150,7 @@ pub const Client = struct {
     }
 
     /// Terminates a workflow execution: it stops at once, with no chance to clean up. An empty
-    /// `run_id` targets the latest run. Go `Client.TerminateWorkflow`.
+    /// `run_id` targets the latest run.
     pub fn terminateWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
@@ -167,7 +167,7 @@ pub const Client = struct {
     }
 
     /// Returns the full event history of a workflow run (all pages). An empty `run_id` reads
-    /// the latest run. Memory comes from `arena`. Go `Client.GetWorkflowHistory`.
+    /// the latest run. Memory comes from `arena`.
     pub fn fetchHistory(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!proto.temporal.api.history.v1.History {
         var history: proto.temporal.api.history.v1.History = .{};
         var token: []const u8 = "";
@@ -219,16 +219,16 @@ pub const Client = struct {
 };
 
 pub const StartWorkflowOptions = struct {
-    /// Workflow ID. Empty generates a random UUID, as Go's client does; read it from the run.
+    /// Workflow ID. Empty generates a random UUID; read it from the run.
     id: []const u8 = "",
     task_queue: []const u8,
     execution_timeout: ?Duration = null,
     run_timeout: ?Duration = null,
     task_timeout: ?Duration = null,
-    /// Delay before the first workflow task is dispatched. Go `StartDelay`.
+    /// Delay before the first workflow task is dispatched.
     start_delay: ?Duration = null,
     /// Runs the workflow on a cron schedule ("* * * * *"); each run starts a new run of the
-    /// same workflow ID. Prefer Schedules for new code, as in Go.
+    /// same workflow ID. Prefer Schedules for new code.
     cron_schedule: []const u8 = "",
     id_reuse_policy: enum { unspecified, allow_duplicate, allow_duplicate_failed_only, reject_duplicate } = .unspecified,
     id_conflict_policy: enum { unspecified, fail, use_existing, terminate_existing } = .unspecified,
@@ -252,7 +252,7 @@ pub const ResultError = error{
     WorkflowContinuedAsNew,
 };
 
-/// A started workflow run. Go `client.WorkflowRun`.
+/// A started workflow run.
 pub fn WorkflowRun(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -277,12 +277,12 @@ pub fn WorkflowRun(comptime T: type) type {
 
         pub const GetOptions = struct {
             /// Return the result of this run instead of following it to the runs it starts
-            /// (continue-as-new, cron, retries). Go `DisableFollowingRuns`. A run that
+            /// (continue-as-new, cron, retries). A run that
             /// continued as new returns `error.WorkflowContinuedAsNew`.
             follow_runs: bool = true,
         };
 
-        /// `get` with options. Go `WorkflowRun.GetWithOptions`.
+        /// `get` with options.
         pub fn getWithOptions(run: *Self, arena: Allocator, options: GetOptions) ResultError!T {
             const c = run.client;
             var token: []const u8 = "";
@@ -351,8 +351,8 @@ pub fn WorkflowRun(comptime T: type) type {
     };
 }
 
-/// Client options from the environment and the Temporal config file, as the Temporal CLI and
-/// Go's `envconfig.MustLoadDefaultClientOptions` read them: TEMPORAL_ADDRESS,
+/// Client options from the environment and the Temporal config file, as the Temporal CLI
+/// reads them: TEMPORAL_ADDRESS,
 /// TEMPORAL_NAMESPACE, TEMPORAL_API_KEY, TEMPORAL_PROFILE, TEMPORAL_CONFIG_FILE, and the
 /// default profile in the config file. Strings are allocated from `arena`.
 pub fn loadDefaultOptions(arena: Allocator) error{ OutOfMemory, InvalidConfig }!Options {
@@ -414,7 +414,7 @@ fn defaultIdentity(gpa: Allocator) error{OutOfMemory}![]u8 {
     return std.fmt.allocPrint(gpa, "{d}@{s}", .{ std.c.getpid(), host });
 }
 
-/// A random (version 4) UUID string, as Go samples use for workflow IDs (`uuid.New()`).
+/// A random (version 4) UUID string, for example to make unique workflow IDs.
 pub fn uuid(arena: Allocator, io: Io) error{OutOfMemory}![]const u8 {
     var b: [16]u8 = undefined;
     io.random(&b);

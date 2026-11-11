@@ -1,8 +1,7 @@
-//! Port of samples-go/choice-exclusive/workflow_test.go.
+//! Tests for the choice-exclusive sample.
 //!
-//! Go's mocked test environment doesn't retry a failing activity unless the activity options
-//! set a retry policy. These tests run on a real dev server, which applies the default retry
-//! policy (retry forever), so the failing test doubles return non-retryable failures.
+//! The tests run on a dev server, which retries failing activities with the default retry
+//! policy (forever), so the failing test doubles return non-retryable failures.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -11,32 +10,32 @@ const orders = @import("order_activities.zig");
 
 const testing = std.testing;
 
-test "ExclusiveChoiceWorkflowSucceeds" {
+test "succeeds" {
     const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
-    try env.registerWorkflow(choice.ExclusiveChoiceWorkflow);
+    try env.registerWorkflow(choice.ExclusiveChoice);
     var activities: orders.OrderActivities = .{ .order_choices = &.{ choice.OrderChoiceApple, choice.OrderChoiceOrange } };
     try env.registerActivitiesWith(&activities, orders.all);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    try env.executeWorkflow(choice.ExclusiveChoiceWorkflow, .{}, arena.allocator(), null);
+    try env.executeWorkflow(choice.ExclusiveChoice, .{}, arena.allocator(), null);
 }
 
 fn failingGetOrder(ctx: *temporal.activity.Context) ![]const u8 {
     return ctx.fail(.{ .message = "Get Order Error", .non_retryable = true });
 }
 
-test "ExclusiveChoiceWorkflowFailOnGetOrderFailure" {
+test "fails when getting the order fails" {
     const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
-    try env.registerWorkflow(choice.ExclusiveChoiceWorkflow);
+    try env.registerWorkflow(choice.ExclusiveChoice);
     try env.registerActivityAs(orders.GetOrder, failingGetOrder);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var failure: ?temporal.Failure = null;
-    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(choice.ExclusiveChoiceWorkflow, .{}, arena.allocator(), &failure));
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(choice.ExclusiveChoice, .{}, arena.allocator(), &failure));
     try testing.expectEqualStrings("Get Order Error", temporal.failure.rootCause(&failure.?).message);
 }
 
@@ -45,17 +44,16 @@ fn failingOrder(ctx: *temporal.activity.Context, choice_name: []const u8) !void 
     return ctx.fail(.{ .message = "Get Order Error", .non_retryable = true });
 }
 
-// Go registers only GetOrder (always "apple") and lets the unregistered OrderApple fail. A
-// real worker retries unregistered activities, so here OrderApple is a failing double.
-test "ExclusiveChoiceWorkflowFailOnOrdering" {
+// The only choice is "apple", and ordering apples fails.
+test "fails when placing the order fails" {
     const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
-    try env.registerWorkflow(choice.ExclusiveChoiceWorkflow);
+    try env.registerWorkflow(choice.ExclusiveChoice);
     var activities: orders.OrderActivities = .{ .order_choices = &.{choice.OrderChoiceApple} };
     try env.registerActivityWith(orders.GetOrder, &activities);
     try env.registerActivityAs(orders.OrderApple, failingOrder);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(choice.ExclusiveChoiceWorkflow, .{}, arena.allocator(), null));
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(choice.ExclusiveChoice, .{}, arena.allocator(), null));
 }

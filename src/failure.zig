@@ -72,8 +72,7 @@ pub fn rootCause(f: *const Failure) *const Failure {
     return it;
 }
 
-/// Writes `message` for each failure in the cause chain, joined by ": ", as in Go's error
-/// strings ("activity error (type: Activity, ...): Hello failed").
+/// Writes `message` for each failure in the cause chain, joined by ": " ("activity error (type: Activity, ...): Hello failed").
 pub fn format(f: Failure, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var it: ?*const Failure = &f;
     var first = true;

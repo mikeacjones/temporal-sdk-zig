@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var run = client.executeWorkflow(greetings.GreetingSample, .{
+    var run = client.executeWorkflow(greetings.Greetings, .{
         .id = try std.fmt.allocPrint(arena, "greetings_{s}", .{try temporal.client.uuid(arena, io)}),
         .task_queue = "greetings",
     }, .{}) catch |err| {

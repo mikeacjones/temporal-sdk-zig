@@ -12,8 +12,7 @@ pub const history = @import("history.zig");
 pub const Failure = failure.Failure;
 pub const testing = @import("testing.zig");
 
-/// Generated protobuf types for the Temporal API and the sdk-core interface
-/// (Go SDK parity: go.temporal.io/api).
+/// Generated protobuf types for the Temporal API and the sdk-core interface.
 pub const proto = @import("proto.zig");
 
 const bridge = @import("bridge.zig");

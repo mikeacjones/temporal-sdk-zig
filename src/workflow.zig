@@ -1,4 +1,4 @@
-//! Workflows (Go `workflow` package parity).
+//! Workflows.
 //!
 //! A workflow is a function `fn (ctx: *workflow.Context, args...) !Result`, named with `Def`:
 //!
@@ -13,19 +13,14 @@
 //! recorded or derived from history. Memory from `ctx.allocator()` lives as long as the
 //! workflow run stays cached on the worker.
 //!
-//! Go's workflow concurrency maps onto `std.Io`, which `ctx.io()` implements deterministically:
+//! Concurrency in a workflow uses `std.Io`, which `ctx.io()` implements deterministically:
 //!
-//! | Go                                   | Zig                                              |
-//! |--------------------------------------|--------------------------------------------------|
-//! | `workflow.Go(ctx, fn)`               | `io.async(fn, args)` or `std.Io.Group.async`     |
-//! | `workflow.Future`, `Future.Get`      | `ActivityFuture.get`, `std.Io.Future.await`      |
-//! | `workflow.NewSelector`, `Select`     | `std.Io.Select` (`async` per future, `await`)     |
-//! | `workflow.NewChannel`                | `std.Io.Queue`                                   |
-//! | `workflow.Sleep`, `NewTimer`         | `io.sleep`, or `io.async(std.Io.sleep, ...)`     |
-//! | `workflow.WithCancel` + `cancel()`   | `future.cancel(io)` / `Group.cancel`             |
-//! | `workflow.Await`, `AwaitWithTimeout` | `ctx.await`, `ctx.awaitTimeout`                  |
-//! | `workflow.NewMutex`, `NewSemaphore`  | `std.Io.Mutex`, `std.Io.Semaphore`               |
-//! | `workflow.Now`                       | `ctx.now()`                                      |
+//! - Coroutines: `io.async(fn, args)`, or `std.Io.Group.async` for a set of them.
+//! - Waiting for whichever result comes first: `std.Io.Select`.
+//! - Channels between coroutines: `std.Io.Queue`; locks: `std.Io.Mutex`, `std.Io.Semaphore`.
+//! - Timers: `io.sleep`, or `io.async(std.Io.sleep, ...)` for a timer to race or cancel.
+//! - Waiting for workflow state to change: `ctx.await`, `ctx.awaitTimeout`.
+//! - Time: `ctx.now()`.
 //!
 //! Canceling a future cancels what it is waiting on: a pending `io.sleep` cancels its timer and
 //! a pending `ActivityFuture.get` requests the activity's cancellation.
@@ -67,7 +62,7 @@ pub const RetryPolicy = struct {
     non_retryable_error_types: []const []const u8 = &.{},
 };
 
-/// Go `workflow.ActivityOptions`. At least one of `start_to_close_timeout` and
+/// How an activity is scheduled. At least one of `start_to_close_timeout` and
 /// `schedule_to_close_timeout` is required.
 pub const ActivityOptions = struct {
     /// Empty runs the activity on the workflow's task queue.
@@ -114,13 +109,13 @@ pub const Context = struct {
         return ctx.instance.replaying;
     }
 
-    /// Workflow time: the time of the current workflow task, the same on replay. Go
-    /// `workflow.Now`; equal to `ctx.io().now(...)`.
+    /// Workflow time: the time of the current workflow task, the same on replay. Equal to
+    /// `ctx.io().now(...)`.
     pub fn now(ctx: *const Context) std.Io.Timestamp {
         return .{ .nanoseconds = ctx.instance.now_ns };
     }
 
-    /// Blocks until `condition(state)` returns true. Go `workflow.Await`.
+    /// Blocks until `condition(state)` returns true.
     ///
     /// `state` is usually a pointer to the variables the condition reads; other coroutines,
     /// activity results, and timers change them. The condition is re-checked every time the
@@ -130,7 +125,7 @@ pub const Context = struct {
     }
 
     /// Like `await`, but gives up after `timeout` (a durable timer) and returns false if the
-    /// condition still doesn't hold. Go `workflow.AwaitWithTimeout`.
+    /// condition still doesn't hold.
     pub fn awaitTimeout(ctx: *Context, timeout: Duration, state: anytype, comptime condition: fn (@TypeOf(state)) bool) error{ Canceled, OutOfMemory }!bool {
         return ctx.awaitInner(state, condition, timeout);
     }
@@ -160,20 +155,19 @@ pub const Context = struct {
 
     /// Schedules an activity by its type name, for activities this program has no `Def` for
     /// (for example ones implemented in another language). `args` is a tuple of argument
-    /// values; `Result` is the type to decode the result as. Go `ExecuteActivity` with a
-    /// string.
+    /// values; `Result` is the type to decode the result as.
     pub fn executeActivityByName(ctx: *Context, comptime Result: type, activity_type: []const u8, options: ActivityOptions, args: anytype) ActivityFuture(Result) {
         return .{ .ctx = ctx, .state = ctx.instance.scheduleActivity(activity_type, options, args) };
     }
 
     /// Whether the previous run of this cron (or retried) workflow completed with a result.
-    /// Go `workflow.HasLastCompletionResult`.
+    ///
     pub fn hasLastCompletionResult(ctx: *const Context) bool {
         return ctx.instance.last_completion_result != null;
     }
 
     /// The result of the previous run of this cron (or retried) workflow, decoded as `T`.
-    /// Go `workflow.GetLastCompletionResult`.
+    ///
     pub fn lastCompletionResult(ctx: *Context, comptime T: type) error{ NoLastCompletionResult, OutOfMemory, InvalidPayload, UnknownEncoding }!T {
         const p = ctx.instance.last_completion_result orelse return error.NoLastCompletionResult;
         return converter.fromPayload(T, ctx.allocator(), p) catch |err| switch (err) {
@@ -185,7 +179,7 @@ pub const Context = struct {
 
 pub const ActivityError = error{ ActivityFailed, Canceled, OutOfMemory, InvalidPayload, UnknownEncoding, WrongArgumentCount };
 
-/// The pending result of an activity. Go `workflow.Future`.
+/// The pending result of an activity.
 pub fn ActivityFuture(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -223,7 +217,7 @@ pub fn ActivityFuture(comptime T: type) type {
             };
         }
 
-        /// Whether the activity has resolved, so `get` won't block. Go `Future.IsReady`.
+        /// Whether the activity has resolved, so `get` won't block.
         pub fn isReady(f: Self) bool {
             const state = f.state orelse return true;
             return state.outcome != null;

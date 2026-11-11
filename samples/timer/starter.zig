@@ -15,18 +15,17 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    // The processing time threshold, as a Go time.Duration (nanoseconds): 3 seconds.
-    var run = client.executeWorkflow(timer.SampleTimerWorkflow, .{
-        .id = try std.fmt.allocPrint(arena, "timer_{s}", .{try temporal.client.uuid(arena, io)}),
+    // Send the email if processing takes longer than 3 seconds.
+    var run = client.executeWorkflow(timer.Timer, .{
+        .id = try std.fmt.allocPrint(arena, "timer-{s}", .{try temporal.client.uuid(arena, io)}),
         .task_queue = "timer",
-    }, .{3 * std.time.ns_per_s}) catch |err| {
+    }, .{3000}) catch |err| {
         std.log.err("Unable to execute workflow: {t}", .{err});
         std.process.exit(1);
     };
     defer run.deinit();
     std.log.info("Started workflow WorkflowID={s} RunID={s}", .{ run.id, run.run_id });
 
-    // The Go sample only starts the workflow; waiting for it lets samples-test check it.
     run.get(arena) catch |err| {
         std.log.err("Unable get workflow result: {t}", .{err});
         std.process.exit(1);

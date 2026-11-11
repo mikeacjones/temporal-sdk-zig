@@ -1,8 +1,8 @@
-//! Port of samples-go/start-delay: start the helloworld workflow with a start delay, so its
-//! first workflow task runs only after the delay.
+//! Start delay: start the hello world workflow with a start delay, so its first workflow task
+//! runs only after the delay.
 //!
-//! Usage: starter [delay-seconds]. The delay defaults to the Go sample's 5 minutes; samples-test
-//! passes a few seconds and checks that the workflow didn't finish before the delay passed.
+//! Usage: starter [delay-seconds]. The delay defaults to 5 minutes; samples-test passes a few
+//! seconds and checks that the workflow didn't finish before the delay passed.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -29,9 +29,9 @@ pub fn main(init: std.process.Init) !void {
     defer client.close();
 
     const started = std.Io.Timestamp.now(io, .real);
-    var run = client.executeWorkflow(helloworld.Workflow, .{
-        .id = try std.fmt.allocPrint(arena, "startdelay_{s}", .{try temporal.client.uuid(arena, io)}),
-        .task_queue = "startdelay",
+    var run = client.executeWorkflow(helloworld.HelloWorld, .{
+        .id = try std.fmt.allocPrint(arena, "start-delay-{s}", .{try temporal.client.uuid(arena, io)}),
+        .task_queue = "start-delay",
         .start_delay = .fromSeconds(delay_seconds),
     }, .{"from a delayed workflow"}) catch |err| {
         std.log.err("Unable to execute workflow: {t}", .{err});
@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     defer run.deinit();
     std.log.info("Scheduled workflow WorkflowID={s} RunID={s}", .{ run.id, run.run_id });
 
-    // The Go sample only schedules the workflow; waiting for it lets samples-test check the delay.
+    // Wait for the result to check that the delay was honored.
     const result = run.get(arena) catch |err| {
         std.log.err("Unable get workflow result: {t}", .{err});
         std.process.exit(1);

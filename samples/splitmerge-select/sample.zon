@@ -1,6 +1,6 @@
 // How samples-test validates this sample: start the worker, run the starter, and check that
 // the starter's output contains each `expect` line before `timeout_seconds`.
 .{
-    .expect = .{"Workflow result: NumberOfItemsInChunk=15 SumInChunk=55"},
+    .expect = .{"Workflow result: items=15 sum=55"},
     .timeout_seconds = 60,
 }

@@ -15,9 +15,9 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var run = client.executeWorkflow(choice.ExclusiveChoiceWorkflow, .{
-        .id = try std.fmt.allocPrint(arena, "exclusive_{s}", .{try temporal.client.uuid(arena, io)}),
-        .task_queue = "choice",
+    var run = client.executeWorkflow(choice.ExclusiveChoice, .{
+        .id = try std.fmt.allocPrint(arena, "choice-exclusive-{s}", .{try temporal.client.uuid(arena, io)}),
+        .task_queue = "choice-exclusive",
     }, .{}) catch |err| {
         std.log.err("Unable to execute workflow: {t}", .{err});
         std.process.exit(1);
@@ -25,7 +25,6 @@ pub fn main(init: std.process.Init) !void {
     defer run.deinit();
     std.log.info("Started workflow WorkflowID={s} RunID={s}", .{ run.id, run.run_id });
 
-    // The Go sample only starts the workflow; waiting for it lets samples-test check it.
     run.get(arena) catch |err| {
         std.log.err("Unable get workflow result: {t}", .{err});
         std.process.exit(1);

@@ -175,7 +175,7 @@ fn runUntilQuiet(inst: *Instance) void {
     }
 }
 
-/// A coroutine blocked until a predicate over workflow state holds (Go `workflow.Await`).
+/// A coroutine blocked until a predicate over workflow state holds (`Context.await`).
 pub const Condition = struct {
     check: *const fn (context: *const anyopaque) bool,
     context: *const anyopaque,
@@ -555,7 +555,7 @@ test "unsupported jobs fail the workflow task" {
     try testing.expect(c.status.? == .failed);
 }
 
-// Port of the samples-go timer workflow's shape: an activity raced against a timer.
+// An activity raced against a timer.
 const TimerRace = struct {
     const Done = union(enum) { processed: workflow.ActivityError![]const u8, timer: std.Io.Cancelable!void };
 
@@ -623,7 +623,7 @@ test "a timer that wins the race runs the fallback activity" {
     try testing.expectEqualStrings("\"slow\"", done[1].variant.?.complete_workflow_execution.result.?.data);
 }
 
-// Port of the samples-go goroutine workflow's shape: coroutines appending results, and the
+// Coroutines appending results, and the
 // workflow awaiting a condition over them.
 const Goroutines = struct {
     const State = struct { results: std.ArrayList([]const u8) = .empty, err: ?anyerror = null, want: usize };

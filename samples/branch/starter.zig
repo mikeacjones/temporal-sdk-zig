@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var run = client.executeWorkflow(branch.SampleBranchWorkflow, .{ .task_queue = "branch" }, .{10}) catch |err| {
+    var run = client.executeWorkflow(branch.Branch, .{ .task_queue = "branch" }, .{10}) catch |err| {
         std.log.err("Failure starting workflow: {t}", .{err});
         std.process.exit(1);
     };

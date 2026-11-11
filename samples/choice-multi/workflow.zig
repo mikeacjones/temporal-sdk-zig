@@ -1,5 +1,5 @@
-//! Port of samples-go/choice-multi: run several activities in parallel, chosen by the result
-//! of a previous activity.
+//! Multi-choice: run several activities in parallel, chosen by the result of a previous
+//! activity.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -11,7 +11,7 @@ pub const OrderChoiceBanana = "banana";
 pub const OrderChoiceCherry = "cherry";
 pub const OrderChoiceOrange = "orange";
 
-fn multiChoiceWorkflow(ctx: *workflow.Context) !void {
+fn multiChoice(ctx: *workflow.Context) !void {
     const ao: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
 
     const choices = try ctx.executeActivity(orders.GetBasketOrder, ao, .{}).get();
@@ -29,16 +29,16 @@ fn multiChoiceWorkflow(ctx: *workflow.Context) !void {
         else if (eql(u8, item, OrderChoiceOrange))
             ctx.executeActivity(orders.OrderOrange, ao, .{item})
         else {
-            logger.err("Unexpected order.", .{ .Order = item });
-            return ctx.fail(.{ .message = "invalid choice-multi" });
+            logger.err("Unexpected order.", .{ .order = item });
+            return ctx.fail(.{ .message = "invalid order choice" });
         };
         try futures.append(ctx.allocator(), f);
     }
 
-    // As in the Go sample, wait for every order but ignore their errors.
+    // Wait for every order; a failed order doesn't fail the workflow.
     for (futures.items) |future| future.get() catch {};
 
     logger.info("Workflow completed.", .{});
 }
 
-pub const MultiChoiceWorkflow = workflow.Def("MultiChoiceWorkflow", multiChoiceWorkflow);
+pub const MultiChoice = workflow.Def("MultiChoice", multiChoice);

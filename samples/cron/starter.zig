@@ -1,6 +1,6 @@
-//! Starts the cron workflow, as the Go sample does. The Go starter leaves it running; this one
-//! waits for the first run's result and then terminates the workflow, so samples-test can
-//! check a run and leave nothing behind. Pass --leave-running to behave like the Go starter.
+//! Starts the cron workflow. By default it waits for the first run's result and then
+//! terminates the workflow, so samples-test can check a run and leave nothing behind. Pass
+//! --leave-running to leave the schedule running.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -23,8 +23,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    const workflow_id = try std.fmt.allocPrint(arena, "cron_{s}", .{try temporal.client.uuid(arena, io)});
-    var run = client.executeWorkflow(cron.SampleCronWorkflow, .{
+    const workflow_id = try std.fmt.allocPrint(arena, "cron-{s}", .{try temporal.client.uuid(arena, io)});
+    var run = client.executeWorkflow(cron.Cron, .{
         .id = workflow_id,
         .task_queue = "cron",
         .cron_schedule = "* * * * *",
@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
         },
     };
     var buf: [temporal.converter.Time.max_len]u8 = undefined;
-    std.log.info("First cron run completed: RunTime={s}", .{result.RunTime.format(&buf)});
+    std.log.info("First cron run completed: RunTime={s}", .{result.run_time.format(&buf)});
 
     client.terminateWorkflow(workflow_id, "", "cron sample finished") catch |err| {
         std.log.err("Unable to terminate the cron workflow: {t}", .{err});

@@ -1,5 +1,5 @@
-//! Port of samples-go/greetings: a workflow that runs three activities in sequence. The
-//! activities are methods of a struct holding their shared state, like Go's activity structs.
+//! Greetings: a workflow that runs three activities in sequence. The activities are methods
+//! of a struct holding their shared state, bound to an instance when the worker registers them.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -30,29 +30,29 @@ pub const GetGreeting = activity.Def("GetGreeting", Activities.getGreeting);
 pub const GetName = activity.Def("GetName", Activities.getName);
 pub const SayGreeting = activity.Def("SayGreeting", Activities.sayGreeting);
 
-fn greetingSample(ctx: *workflow.Context) ![]const u8 {
+fn greetings(ctx: *workflow.Context) ![]const u8 {
     const logger = ctx.logger();
     const ao: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
 
     const greet_result = ctx.executeActivity(GetGreeting, ao, .{}).get() catch |err| {
-        logger.err("Get greeting failed.", .{ .Error = err });
+        logger.err("Get greeting failed.", .{ .err = err });
         return err;
     };
 
     // Get Name.
     const name_result = ctx.executeActivity(GetName, ao, .{}).get() catch |err| {
-        logger.err("Get name failed.", .{ .Error = err });
+        logger.err("Get name failed.", .{ .err = err });
         return err;
     };
 
     // Say Greeting.
     const say_result = ctx.executeActivity(SayGreeting, ao, .{ greet_result, name_result }).get() catch |err| {
-        logger.err("Marshalling failed with error.", .{ .Error = err });
+        logger.err("Say greeting failed.", .{ .err = err });
         return err;
     };
 
-    logger.info("GreetingSample completed.", .{ .Result = say_result });
+    logger.info("Greetings completed.", .{ .result = say_result });
     return say_result;
 }
 
-pub const GreetingSample = workflow.Def("GreetingSample", greetingSample);
+pub const Greetings = workflow.Def("Greetings", greetings);

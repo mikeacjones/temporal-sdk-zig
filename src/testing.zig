@@ -1,11 +1,10 @@
-//! Testing workflows and activities (Go `testsuite` parity).
+//! Testing workflows and activities.
 //!
-//! The Go SDK tests workflows in an in-memory mock environment. This SDK, like the other
-//! SDKs built on sdk-core, tests against real local servers instead:
+//! Tests run against real local servers:
 //!
-//! - `DevServer`: a local Temporal dev server (Go `testsuite.StartDevServer`).
+//! - `DevServer`: a local Temporal dev server.
 //! - `WorkflowEnvironment`: a dev server, client and worker on a fresh task queue. Register
-//!   workflows and activities, replace activities with test doubles (Go's `OnActivity`), and
+//!   workflows and activities, replace activities with test doubles, and
 //!   execute workflows to their result.
 //! - `ActivityEnvironment`: calls an activity function directly with a test context.
 //! - `WorkflowReplayer`: replays recorded histories against current workflow code to catch
@@ -26,13 +25,13 @@ const Io = std.Io;
 
 const log = std.log.scoped(.temporal);
 
-/// A local dev server for tests. Go `testsuite.StartDevServer`.
+/// A local dev server for tests.
 pub const DevServer = struct {
     runtime: bridge.Runtime,
     server: bridge.EphemeralServer,
     namespace: []const u8,
 
-    /// Go `testsuite.DevServerOptions`.
+    ///
     pub const Options = struct {
         namespace: []const u8 = "default",
         search_attributes: []const bridge.EphemeralServer.SearchAttribute = &.{},
@@ -208,7 +207,7 @@ pub const WorkflowEnvironment = struct {
     }
 
     /// Registers `impl` in place of `Activity`: workflows calling `Activity` run `impl`.
-    /// `impl` takes the same parameters. Go `env.OnActivity(Activity, ...).Return(...)`.
+    /// `impl` takes the same parameters.
     pub fn registerActivityAs(env: *WorkflowEnvironment, comptime Activity: type, comptime impl: anytype) !void {
         return env.worker.registerActivityImpl(activity.Def(Activity.activity_name, impl).registered);
     }
@@ -273,7 +272,7 @@ pub const WorkflowEnvironment = struct {
     }
 };
 
-/// Runs activities directly, without a server. Go `TestActivityEnvironment`.
+/// Runs activities directly, without a server.
 pub const ActivityEnvironment = struct {
     io: Io,
     info: activity.Info = .{
@@ -286,10 +285,9 @@ pub const ActivityEnvironment = struct {
         .workflow_namespace = "default",
         .attempt = 1,
     },
-    /// Heartbeat details the activity sees from a "previous attempt". Go
-    /// `SetHeartbeatDetails`.
+    /// Heartbeat details the activity sees from a "previous attempt".
     heartbeat_details: []const converter.Payload = &.{},
-    /// Called with each heartbeat's details. Go `SetOnActivityHeartbeatListener`.
+    /// Called with each heartbeat's details.
     on_heartbeat: ?activity.Context.HeartbeatSink = null,
 
     pub fn init(io: Io) ActivityEnvironment {
@@ -317,7 +315,7 @@ pub const ActivityEnvironment = struct {
     }
 };
 
-/// Replays recorded histories against registered workflows. Go `worker.NewWorkflowReplayer`.
+/// Replays recorded histories against registered workflows.
 pub const WorkflowReplayer = struct {
     gpa: Allocator,
     io: Io,
@@ -468,7 +466,7 @@ const Fixtures = struct {
     fn greet(ctx: *activity.Context, name: []const u8) ![]const u8 {
         return std.fmt.allocPrint(ctx.allocator(), "Hello {s}!", .{name});
     }
-    const Greet = activity.Def("Activity", greet);
+    const Greet = activity.Def("Greet", greet);
 
     fn greetDouble(ctx: *activity.Context, name: []const u8) ![]const u8 {
         _ = name;
@@ -479,14 +477,14 @@ const Fixtures = struct {
         const greeting = ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name});
         return greeting.get();
     }
-    const Hello = workflow.Def("Workflow", hello);
+    const Hello = workflow.Def("HelloWorld", hello);
 
     fn other(ctx: *workflow.Context, name: []const u8) ![]const u8 {
         _ = ctx;
         _ = name;
         return "no activity here";
     }
-    const Different = workflow.Def("Workflow", other);
+    const Different = workflow.Def("HelloWorld", other);
 };
 
 test "WorkflowEnvironment runs a workflow with a test double for its activity" {
@@ -527,7 +525,7 @@ test "ActivityEnvironment calls the activity directly" {
     try testing.expectEqualStrings("Hello World!", try env.executeActivity(Fixtures.Greet, .{"World"}, arena.allocator()));
 }
 
-/// samples-go/helloworld/helloworld.json (MIT), a history recorded from the Go SDK.
+/// A history of samples/helloworld, whose workflow `Fixtures.Hello` matches.
 const hello_history = @embedFile("testdata/helloworld_history.json");
 
 test "WorkflowReplayer replays a matching history and catches a nondeterministic change" {
