@@ -50,8 +50,10 @@ pub const Worker = struct {
     workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty,
     activities: std.StringHashMapUnmanaged(activity.Registered) = .empty,
     /// The core worker while `run` is active, for `stop` on other threads.
-    core_ptr: std.atomic.Value(?*bridge.c.TemporalCoreWorker) = .init(null),
-    stop_requested: std.atomic.Value(bool) = .init(false),
+    /// Guards `core_ptr` and `stop_requested`, which `stop` (any thread) and `run` share.
+    stop_mutex: Io.Mutex = .init,
+    core_ptr: ?*bridge.c.TemporalCoreWorker = null,
+    stop_requested: bool = false,
 
     pub fn init(gpa: Allocator, io: Io, client: *client_mod.Client, task_queue: []const u8, options: Options) error{OutOfMemory}!Worker {
         return .{ .gpa = gpa, .io = io, .client = client, .task_queue = try gpa.dupe(u8, task_queue), .options = options };
@@ -132,9 +134,19 @@ pub const Worker = struct {
             return err;
         };
 
-        w.core_ptr.store(core.ptr, .release);
-        defer w.core_ptr.store(null, .release);
-        if (w.stop_requested.load(.acquire)) core.initiateShutdown();
+        {
+            w.stop_mutex.lockUncancelable(w.io);
+            defer w.stop_mutex.unlock(w.io);
+            w.core_ptr = core.ptr;
+            if (w.stop_requested) core.initiateShutdown();
+        }
+        // Clear the pointer before `core.deinit` (deferred above) so `stop` never uses a freed
+        // worker.
+        defer {
+            w.stop_mutex.lockUncancelable(w.io);
+            w.core_ptr = null;
+            w.stop_mutex.unlock(w.io);
+        }
         log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
 
         var workflows_done = if (w.workflows.count() > 0) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
@@ -152,8 +164,10 @@ pub const Worker = struct {
     /// Asks `run` to stop: polling ends, in-flight work finishes, then `run` returns. Safe to
     /// call from any thread, before or during `run`.
     pub fn stop(w: *Worker) void {
-        w.stop_requested.store(true, .release);
-        if (w.core_ptr.load(.acquire)) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
+        w.stop_mutex.lockUncancelable(w.io);
+        defer w.stop_mutex.unlock(w.io);
+        w.stop_requested = true;
+        if (w.core_ptr) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
     }
 
     /// Runs until the process receives SIGINT or SIGTERM.
