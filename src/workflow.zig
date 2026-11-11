@@ -160,6 +160,32 @@ pub const Context = struct {
         return .{ .ctx = ctx, .state = ctx.instance.scheduleActivity(activity_type, options, args) };
     }
 
+    /// The workflow's memo: the memo it started with, with this run's `upsertMemo` calls
+    /// applied, sorted by name. The slice lives in the run's arena; a later upsert leaves a
+    /// slice returned earlier unchanged.
+    pub fn memo(ctx: *const Context) []const converter.Field {
+        return ctx.instance.memo;
+    }
+
+    /// The memo value called `name` decoded as `T` into `ctx.allocator()`, or null if the
+    /// memo has no such key.
+    pub fn memoValue(ctx: *Context, comptime T: type, name: []const u8) error{ OutOfMemory, InvalidPayload, UnknownEncoding }!?T {
+        return converter.fieldValue(T, ctx.allocator(), ctx.instance.memo, name) catch |err| switch (err) {
+            error.WrongArgumentCount => error.InvalidPayload,
+            else => |e| e,
+        };
+    }
+
+    /// Adds or replaces memo keys: `values` is a struct literal, one field per key, encoded
+    /// like `converter.toFields`. A null value removes the key, and so does an empty slice,
+    /// which the server treats the same way. Records the change in history and updates
+    /// `memo()` right away, the same way on replay.
+    ///
+    ///     try ctx.upsertMemo(.{ .status = "shipped", .reviewer = @as(?[]const u8, null) });
+    pub fn upsertMemo(ctx: *Context, values: anytype) error{OutOfMemory}!void {
+        return ctx.instance.upsertMemo(try converter.toFields(ctx.allocator(), values));
+    }
+
     /// Whether the previous run of this cron (or retried) workflow completed with a result.
     ///
     pub fn hasLastCompletionResult(ctx: *const Context) bool {
