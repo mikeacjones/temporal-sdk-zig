@@ -9,9 +9,9 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
 
 ## Status
 
-Workflows can run activities (sequentially, in parallel, or chosen at run time), wait on timers, race activities against timers, run concurrent coroutines on the workflow's deterministic `std.Io`, and await conditions. Activities can share state, heartbeat, and resume from their last heartbeat on retry. Clients can start workflows with a start delay or a cron schedule, wait for results, and terminate workflows. Twelve [samples](samples) pass against a dev server with their tests (see [Parity](#parity)). Every test run through the test environment also replays the workflow's own history to check determinism.
+Workflows can run activities and local activities (sequentially, in parallel, or chosen at run time), start child workflows, wait on timers, race activities against timers, run concurrent coroutines on the workflow's deterministic `std.Io`, await conditions, answer typed queries, and read and upsert their memo. Cancellation reaches workflows, activities, and children as `std.Io` cancellation, honoring each activity's or child's cancellation type. Activities can share state, heartbeat, observe cancellation, and resume from their last heartbeat on retry. Clients can start workflows with a start delay, a cron schedule, or a memo, wait for results, query, describe, cancel, and terminate workflows. Tests run on a dev server or the time-skipping test server. Seventeen [samples](samples) pass against a dev server with their tests (see [Parity](#parity)). Every test run through the test environment also replays the workflow's own history to check determinism.
 
-Signals, queries, updates, child workflows, local activities, Nexus, and most client and worker options are not implemented yet.
+Signals, updates, continue-as-new, Nexus, search attributes, and most client and worker options are not implemented yet.
 
 ## Add the SDK to your project
 
