@@ -215,8 +215,13 @@ pub fn ActivityFuture(comptime T: type) type {
         state: ?*Instance.ActivityState,
 
         /// Waits for the activity and returns its result. On `error.ActivityFailed`, read the
-        /// failure with `failure`. If the workflow is canceled while waiting, the activity is
-        /// canceled too and this returns `error.Canceled`.
+        /// failure with `failure`. If the calling coroutine is canceled while waiting (the
+        /// workflow is canceled, or an enclosing future, `Select`, or `Group` is), the
+        /// activity's cancellation is requested and this returns `error.Canceled`: at once
+        /// for `try_cancel` and `abandon`, and once the activity has ended for
+        /// `wait_cancellation_completed`. If that activity completes or fails instead of
+        /// acknowledging the cancel, this returns its result or `error.ActivityFailed`, and
+        /// the next cancelable wait returns `error.Canceled`.
         pub fn get(f: Self) ActivityError!T {
             const state = f.state orelse return error.OutOfMemory;
             try f.ctx.instance.awaitActivity(state);

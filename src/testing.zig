@@ -661,6 +661,26 @@ const Fixtures = struct {
         return "queued: done,note,status";
     }
     const MemoUpdatesChanged = workflow.Def("MemoUpdates", memoUpdatesWithoutUpserts);
+
+    /// Heartbeats until canceled, then returns error.Canceled.
+    fn heartbeatUntilCanceled(ctx: *activity.Context) !void {
+        while (true) {
+            ctx.heartbeat({});
+            try ctx.io().sleep(.fromMilliseconds(100), .awake);
+        }
+    }
+    const HeartbeatUntilCanceled = activity.Def("HeartbeatUntilCanceled", heartbeatUntilCanceled);
+
+    /// Waits on `HeartbeatUntilCanceled`; a workflow cancel ends the run after the activity's.
+    fn waitCancellation(ctx: *workflow.Context) ![]const u8 {
+        try ctx.executeActivity(HeartbeatUntilCanceled, .{
+            .start_to_close_timeout = .fromSeconds(60),
+            .heartbeat_timeout = .fromSeconds(5),
+            .cancellation_type = .wait_cancellation_completed,
+        }, .{}).get();
+        return "not canceled";
+    }
+    const WaitCancellation = workflow.Def("WaitCancellation", waitCancellation);
 };
 
 test "WorkflowEnvironment runs a workflow with a test double for its activity" {
@@ -730,6 +750,17 @@ test "WorkflowReplayer replays memo upserts and catches a dropped upsert" {
     defer changed.deinit();
     try changed.registerWorkflow(Fixtures.MemoUpdatesChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(upsert_memo_history));
+}
+
+/// A dev-server run of `Fixtures.WaitCancellation` canceled with `Client.cancelWorkflow` while
+/// the activity heartbeated, exported with `temporal workflow show`.
+const wait_cancellation_history = @embedFile("testdata/wait_cancellation_history.json");
+
+test "WorkflowReplayer replays a workflow that waits for its activity's cancellation" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(Fixtures.WaitCancellation);
+    try ok.replayHistoryJson(wait_cancellation_history);
 }
 
 test "client: generated IDs, start delay, history, and terminate" {

@@ -773,17 +773,9 @@ const CancelTest = struct {
     }
     const CancelBeat = workflow.Def("CancelBeat", cancelBeat);
 
-    /// Runs `Beat`; when the workflow is canceled, waits for the activity's cancellation to
-    /// complete before closing canceled.
-    fn awaitBeat(ctx: *workflow.Context) ![]const u8 {
-        const beating = ctx.executeActivity(Beat, beat_options, .{false});
-        return beating.get() catch |err| {
-            if (err == error.Canceled) _ = beating.get() catch {};
-            return err;
-        };
-    }
-    const AwaitBeat = workflow.Def("AwaitBeat", awaitBeat);
-
+    /// Runs `Beat`. When the workflow is canceled, `get` waits for the activity's
+    /// cancellation to complete (`wait_cancellation_completed`), so the run closes canceled
+    /// after the activity does.
     fn runBeat(ctx: *workflow.Context) ![]const u8 {
         return ctx.executeActivity(Beat, beat_options, .{false}).get();
     }
@@ -809,7 +801,6 @@ const CancelTest = struct {
         const env = try Env.start(testing.allocator, testing.io);
         errdefer env.deinit();
         try env.registerWorkflow(CancelBeat);
-        try env.registerWorkflow(AwaitBeat);
         try env.registerWorkflow(RunBeat);
         try env.registerActivity(Beat);
         try env.registerActivity(WaitStarted);
@@ -850,11 +841,11 @@ test "canceling a workflow cancels its heartbeating activity" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    var run = try env.startWorkflow(CancelTest.AwaitBeat, .{ .task_queue = "" }, .{});
+    var run = try env.startWorkflow(CancelTest.RunBeat, .{ .task_queue = "" }, .{});
     defer run.deinit();
     try CancelTest.started.wait(testing.io);
     try env.client.cancelWorkflow(run.id, run.run_id, "testing activity cancellation");
-    try testing.expectError(error.WorkflowCanceled, env.getResult(CancelTest.AwaitBeat, &run, arena.allocator(), null));
+    try testing.expectError(error.WorkflowCanceled, env.getResult(CancelTest.RunBeat, &run, arena.allocator(), null));
     try testing.expectEqual(@as(?activity.CancelReason, .canceled), CancelTest.seen_reason);
     try testing.expectEqual(1, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_CANCELED));
 }
