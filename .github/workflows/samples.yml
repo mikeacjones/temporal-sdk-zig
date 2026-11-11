@@ -41,6 +41,11 @@ jobs:
             .zig-cache/cargo-target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CORE_VERSION', 'deps/Cargo.lock', 'deps/rust-toolchain.toml') }}
 
+      # The hang dumps attach gdb to stuck processes on Linux; the runner image lacks it.
+      - name: Install gdb for hang stack dumps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+
       # Builds every sample, starts a dev server, runs each sample's worker and starter, and
       # checks the results.
       - name: Run the samples against a dev server
