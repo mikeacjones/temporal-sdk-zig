@@ -9,7 +9,9 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
 
 ## Status
 
-The foundations are in place: the build compiles and links the Rust core, the Temporal API and core protobuf types are generated, and the deterministic scheduler that will run workflow code works. The client, worker, workflow, and activity APIs are not implemented yet, so the SDK cannot run a workflow today.
+The SDK runs its first end-to-end path: a client starts a workflow, a worker runs the workflow and its activity, and the client gets the result. The [helloworld](samples/helloworld) sample, a port of the Go sample, passes against a dev server along with its ported tests (a test environment with an activity test double, an in-process activity test, and replaying a history recorded from the Go SDK).
+
+Signals, queries, updates, child workflows, local activities, Nexus, and most client and worker options are not implemented yet.
 
 Parity is measured by porting every sample in [samples-go](https://github.com/temporalio/samples-go) to Zig and running it against a Temporal dev server. The Samples badge shows whether the ported samples pass.
 

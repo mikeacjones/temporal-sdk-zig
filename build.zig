@@ -67,37 +67,66 @@ pub fn build(b: *std.Build) void {
     const fmt_step = b.step("fmt", "Check formatting");
     fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_paths, .check = true }).step);
 
-    // zig build samples / zig build run-<sample> / zig build samples-test
+    // zig build samples / zig build samples-test
+    //
+    // Each sample in samples/<name> (a port of samples-go/<name>) builds a worker and a starter
+    // program; its tests and its run against a dev server make up samples-test. The runner
+    // runs natively (it starts processes), so samples-test is for the host target.
     const samples_step = b.step("samples", "Build all samples");
-    const samples = [_][]const u8{"hello"};
-
+    const samples_test_step = b.step("samples-test", "Build every sample, run its tests, and validate it against a dev server");
     const runner = b.addExecutable(.{
         .name = "samples-runner",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/samples_runner.zig"),
-            .target = b.graph.host,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "temporal", .module = temporal }},
         }),
     });
-    const samples_test = b.addRunArtifact(runner);
-    samples_test.addDirectoryArg(b.path("."));
-    samples_test.addArgs(&samples);
-    samples_test.step.dependOn(samples_step);
-    b.step("samples-test", "Build and validate every sample against a dev server").dependOn(&samples_test.step);
-    for (samples) |name| {
-        const exe = b.addExecutable(.{
-            .name = name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(b.fmt("samples/{s}/main.zig", .{name})),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{.{ .name = "temporal", .module = temporal }},
-            }),
-        });
-        samples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
-        const run = b.addRunArtifact(exe);
-        b.step(b.fmt("run-{s}", .{name}), b.fmt("Run the {s} sample", .{name})).dependOn(&run.step);
+    const run_samples = b.addRunArtifact(runner);
+    run_samples.addDirectoryArg(b.path("."));
+    run_samples.addDirectoryArg(b.addWriteFiles().getDirectory());
+    run_samples.has_side_effects = true;
+    if (b.option([]const u8, "sample", "Only validate this sample in samples-test")) |only| run_samples.addArgs(&.{ "--only", only });
+    samples_test_step.dependOn(&run_samples.step);
+
+    for (samples) |sample| {
+        const programs = [_][]const u8{ "worker", "starter" };
+        for (programs) |program| {
+            const exe = b.addExecutable(.{
+                .name = b.fmt("{s}-{s}", .{ sample.name, program }),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.fmt("samples/{s}/{s}.zig", .{ sample.name, program })),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "temporal", .module = temporal }},
+                }),
+            });
+            samples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+            run_samples.addArg(b.fmt("{s}:{s}", .{ sample.name, program }));
+            run_samples.addArtifactArg(exe);
+        }
+        for (sample.tests) |test_file| {
+            const t = b.addTest(.{
+                .name = b.fmt("{s}-{s}", .{ sample.name, test_file }),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.fmt("samples/{s}/{s}", .{ sample.name, test_file })),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "temporal", .module = temporal }},
+                }),
+            });
+            samples_test_step.dependOn(&b.addRunArtifact(t).step);
+        }
     }
 }
+
+/// Ported samples-go samples. Each has worker.zig, starter.zig and sample.zon in
+/// samples/<name>; `tests` are its ported Go tests.
+const Sample = struct { name: []const u8, tests: []const []const u8 = &.{} };
+const samples = [_]Sample{
+    .{ .name = "helloworld", .tests = &.{ "helloworld_test.zig", "replay_test.zig" } },
+};
 
 /// Runs cargo to build the C bridge as a static library for `target` and returns its path.
 ///
