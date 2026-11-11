@@ -772,6 +772,68 @@ const Fixtures = struct {
     const LocalGreetingsChanged = workflow.Def("LocalGreetings", remoteGreetings);
 };
 
+const ChildFixtures = struct {
+    fn greetChild(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "Hello {s} from a child!", .{name});
+    }
+    const GreetChild = workflow.Def("GreetChild", greetChild);
+
+    fn greetChildDouble(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        _ = ctx;
+        _ = name;
+        return "Hello from the child's test double!";
+    }
+
+    /// Runs `GreetChild` under a generated ID and returns its greeting once it started.
+    fn parent(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const child = ctx.executeChildWorkflow(GreetChild, .{}, .{name});
+        const exec = try child.started();
+        if (exec.workflow_id.len == 0 or exec.run_id.len == 0) return error.MissingChildExecution;
+        return child.get();
+    }
+    const Parent = workflow.Def("Parent", parent);
+
+    /// `parent` starting a different child type, which can't replay `Parent`'s history.
+    fn parentOfOther(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return ctx.executeChildWorkflowByName([]const u8, "OtherChild", .{}, .{name}).get();
+    }
+    const ParentChanged = workflow.Def("Parent", parentOfOther);
+
+    fn failChild(ctx: *workflow.Context) ![]const u8 {
+        return ctx.fail(.{ .message = "the child gave up", .type = "ChildGaveUp", .non_retryable = true });
+    }
+    const FailChild = workflow.Def("FailChild", failChild);
+
+    /// Runs `FailChild`; with `handle`, describes its failure, otherwise fails with it.
+    fn parentOfFailing(ctx: *workflow.Context, handle: bool) ![]const u8 {
+        const child = ctx.executeChildWorkflow(FailChild, .{}, .{});
+        const result = child.get() catch |err| switch (err) {
+            error.ChildWorkflowFailed => if (handle) {
+                const f = child.failure().?;
+                const root = failure_mod.rootCause(f);
+                return std.fmt.allocPrint(ctx.allocator(), "{t}: {s} ({s}) caused \"{s}\"", .{ err, f.message, failure_mod.applicationType(root.*).?, root.message });
+            } else return err,
+            else => return err,
+        };
+        return result;
+    }
+    const ParentOfFailing = workflow.Def("ParentOfFailing", parentOfFailing);
+
+    fn cronChild(ctx: *workflow.Context) !void {
+        _ = ctx;
+    }
+    const CronChild = workflow.Def("CronChild", cronChild);
+
+    /// Starts an hourly cron child, sleeps two hours, and returns whether the child's future
+    /// is still pending: a cron child resolves only when its schedule ends.
+    fn cronParent(ctx: *workflow.Context) !bool {
+        const child = ctx.executeChildWorkflow(CronChild, .{ .cron_schedule = "0 * * * *", .run_timeout = .fromSeconds(60) }, .{});
+        try ctx.io().sleep(.fromSeconds(2 * std.time.s_per_hour), .awake);
+        return !child.isReady();
+    }
+    const CronParent = workflow.Def("CronParent", cronParent);
+};
+
 const LocalFixtures = struct {
     var started: Io.Event = .unset;
     /// Set once `block` has seen a cancel; `seen_reason` is written before.
@@ -1365,4 +1427,70 @@ test "dev-server WorkflowEnvironment starts a workflow and awaits its result" {
     try testing.expectEqualStrings("Hello later!", try env.getResult(Fixtures.Hello, &run, arena.allocator(), null));
     try env.sleep(.fromMilliseconds(1));
     try testing.expect(before.durationTo(try env.now()).nanoseconds > 0);
+}
+
+test "WorkflowEnvironment runs a child workflow on the same worker, or a test double in its place" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    {
+        const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+        defer env.deinit();
+        try env.registerWorkflow(ChildFixtures.Parent);
+        try env.registerWorkflow(ChildFixtures.GreetChild);
+        const result = try env.executeWorkflow(ChildFixtures.Parent, .{"Temporal"}, arena.allocator(), null);
+        try testing.expectEqualStrings("Hello Temporal from a child!", result);
+    }
+    {
+        const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+        defer env.deinit();
+        try env.registerWorkflow(ChildFixtures.Parent);
+        try env.registerWorkflow(workflow.Def(ChildFixtures.GreetChild.workflow_name, ChildFixtures.greetChildDouble));
+        const result = try env.executeWorkflow(ChildFixtures.Parent, .{"Temporal"}, arena.allocator(), null);
+        try testing.expectEqualStrings("Hello from the child's test double!", result);
+    }
+}
+
+test "a failed child workflow surfaces error.ChildWorkflowFailed with its failure" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChildFixtures.ParentOfFailing);
+    try env.registerWorkflow(ChildFixtures.FailChild);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const handled = try env.executeWorkflow(ChildFixtures.ParentOfFailing, .{true}, a, null);
+    try testing.expectEqualStrings("ChildWorkflowFailed: Child Workflow execution failed (ChildGaveUp) caused \"the child gave up\"", handled);
+
+    // Returned unhandled, the error fails the parent with the child's failure.
+    var failure: ?failure_mod.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(ChildFixtures.ParentOfFailing, .{false}, a, &failure));
+    try testing.expect(failure.?.failure_info.? == .child_workflow_execution_failure_info);
+    try testing.expectEqualStrings("the child gave up", failure_mod.rootCause(&failure.?).message);
+}
+
+test "time-skipping WorkflowEnvironment: a cron child is still pending when its parent returns" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChildFixtures.CronParent);
+    try env.registerWorkflow(ChildFixtures.CronChild);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect(try env.executeWorkflow(ChildFixtures.CronParent, .{}, arena.allocator(), null));
+}
+
+/// A dev-server run of `ChildFixtures.Parent`, whose child ran on the same worker, exported
+/// with `temporal workflow show`.
+const child_workflow_history = @embedFile("testdata/child_workflow_history.json");
+
+test "WorkflowReplayer replays a parent's child workflow and catches a changed child type" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(ChildFixtures.Parent);
+    try ok.replayHistoryJson(child_workflow_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(ChildFixtures.ParentChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(child_workflow_history));
 }
