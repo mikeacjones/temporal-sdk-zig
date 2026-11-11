@@ -31,12 +31,24 @@ pub const DevServer = struct {
     server: bridge.EphemeralServer,
     namespace: []const u8,
 
+    /// Go `testsuite.DevServerOptions`.
     pub const Options = struct {
         namespace: []const u8 = "default",
         search_attributes: []const bridge.EphemeralServer.SearchAttribute = &.{},
         /// Path to a Temporal CLI binary; empty downloads one (cached).
         existing_path: []const u8 = "",
+        /// CLI version to download when `existing_path` is empty: "default" (the version
+        /// sdk-core recommends), "latest", or an exact version such as "1.10.0".
+        cli_version: []const u8 = "default",
+        ip: []const u8 = "127.0.0.1",
+        /// 0 picks a free port.
+        port: u16 = 0,
+        ui: bool = false,
+        /// Empty keeps the database in memory.
+        database_filename: []const u8 = "",
         log_level: []const u8 = "error",
+        /// Extra arguments for `temporal server start-dev`.
+        extra_args: []const []const u8 = &.{},
     };
 
     pub fn start(gpa: Allocator, io: Io, options: Options) !DevServer {
@@ -45,10 +57,15 @@ pub const DevServer = struct {
         const runtime = try bridge.Runtime.init(gpa, .{}, &message);
         errdefer runtime.deinit();
         const server = bridge.EphemeralServer.startDevServer(gpa, io, runtime, .{
-            .executable = if (options.existing_path.len > 0) .{ .existing_path = options.existing_path } else .{ .download = .{} },
+            .executable = executable(options.existing_path, options.cli_version),
             .namespace = options.namespace,
+            .ip = options.ip,
+            .port = options.port,
+            .ui = options.ui,
+            .database_filename = options.database_filename,
             .search_attributes = options.search_attributes,
             .log_level = options.log_level,
+            .extra_args = options.extra_args,
         }, &message) catch |err| {
             log.err("starting the dev server failed: {s}", .{message orelse @errorName(err)});
             return err;
@@ -72,6 +89,60 @@ pub const DevServer = struct {
         s.* = undefined;
     }
 };
+
+/// The time-skipping test server: time advances whenever every workflow is waiting on a
+/// timer, so tests of long sleeps finish quickly.
+pub const TestServer = struct {
+    runtime: bridge.Runtime,
+    server: bridge.EphemeralServer,
+
+    pub const Options = struct {
+        /// Path to a temporal-test-server binary; empty downloads one (cached).
+        existing_path: []const u8 = "",
+        /// Version to download when `existing_path` is empty: "default" or an exact version.
+        version: []const u8 = "default",
+        /// 0 picks a free port.
+        port: u16 = 0,
+        extra_args: []const []const u8 = &.{},
+    };
+
+    pub fn start(gpa: Allocator, io: Io, options: Options) !TestServer {
+        var message: ?[]u8 = null;
+        defer if (message) |m| gpa.free(m);
+        const runtime = try bridge.Runtime.init(gpa, .{}, &message);
+        errdefer runtime.deinit();
+        const server = bridge.EphemeralServer.startTestServer(gpa, io, runtime, .{
+            .executable = executable(options.existing_path, options.version),
+            .port = options.port,
+            .extra_args = options.extra_args,
+        }, &message) catch |err| {
+            log.err("starting the time-skipping test server failed: {s}", .{message orelse @errorName(err)});
+            return err;
+        };
+        return .{ .runtime = runtime, .server = server };
+    }
+
+    /// host:port of the server.
+    pub fn address(s: *const TestServer) []const u8 {
+        return s.server.target;
+    }
+
+    /// Options for a client of this server (namespace "default").
+    pub fn clientOptions(s: *const TestServer) client_mod.Options {
+        return .{ .host_port = s.server.target };
+    }
+
+    pub fn stop(s: *TestServer, io: Io) void {
+        s.server.shutdown(io, null) catch {};
+        s.runtime.deinit();
+        s.* = undefined;
+    }
+};
+
+fn executable(existing_path: []const u8, version: []const u8) bridge.EphemeralServer.Executable {
+    if (existing_path.len > 0) return .{ .existing_path = existing_path };
+    return .{ .download = .{ .version = version } };
+}
 
 /// A dev server, client and worker for running workflows in tests.
 pub const WorkflowEnvironment = struct {
@@ -355,6 +426,26 @@ test "WorkflowEnvironment runs a workflow with a test double for its activity" {
     defer arena.deinit();
     const result = try env.executeWorkflow(Fixtures.Hello, .{"Temporal"}, arena.allocator(), null);
     try testing.expectEqualStrings("Hello from the test double!", result);
+}
+
+test "DevServer honors namespace, port and search attribute options" {
+    var server = try DevServer.start(testing.allocator, testing.io, .{
+        .namespace = "zig-tests",
+        .port = 0,
+        .search_attributes = &.{.{ .name = "OrderId", .type = .Keyword }},
+    });
+    defer server.stop(testing.io);
+    try testing.expect(std.mem.startsWith(u8, server.address(), "127.0.0.1:"));
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer client.close();
+    try testing.expectEqualStrings("zig-tests", client.namespace);
+}
+
+test "TestServer starts a time-skipping server a client can connect to" {
+    var server = try TestServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, server.clientOptions());
+    client.close();
 }
 
 test "ActivityEnvironment calls the activity directly" {
