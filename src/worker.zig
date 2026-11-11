@@ -140,8 +140,8 @@ pub const Worker = struct {
             w.core_ptr = core.ptr;
             if (w.stop_requested) core.initiateShutdown();
         }
-        // Clear the pointer before `core.deinit` (deferred above) so `stop` never uses a freed
-        // worker.
+        // On early returns, clear the pointer before `core.deinit` (deferred above) so `stop`
+        // never uses a freed worker.
         defer {
             w.stop_mutex.lockUncancelable(w.io);
             w.core_ptr = null;
@@ -154,6 +154,15 @@ pub const Worker = struct {
         if (workflows_done) |*f| f.await(w.io);
         if (activities_done) |*f| f.await(w.io);
 
+        // Finalizing moves the core worker out of its handle, without waiting for an
+        // initiate_shutdown that `stop` may be running on another thread. A worker moved while
+        // that call holds one of its locks keeps the lock held forever, and finalizing then
+        // hangs. Taking the mutex waits for any such call; clearing the pointer stops new ones.
+        {
+            w.stop_mutex.lockUncancelable(w.io);
+            defer w.stop_mutex.unlock(w.io);
+            w.core_ptr = null;
+        }
         core.finalizeShutdown(w.gpa, w.io, &message) catch |err| {
             log.err("worker shutdown failed: {s}", .{message orelse @errorName(err)});
             return err;
@@ -576,4 +585,39 @@ test "activities run concurrently and the worker stops when async work can't get
     try running.await(io);
     // Five one-second activities in parallel, not in sequence.
     try testing.expect(elapsed.nanoseconds < 4 * std.time.ns_per_s);
+}
+
+const StopHammer = struct {
+    w: *Worker,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(h: *StopHammer) void {
+        while (!h.done.load(.acquire)) h.w.stop();
+    }
+};
+
+// finalizeShutdown moves the core worker out of its handle, so a `stop` racing with the end of
+// `run` must never reach the core worker once finalizing has begun (it used to abort the process
+// or hang finalizing).
+test "stop called repeatedly from another thread while the worker finishes shutting down" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    for (0..5) |_| {
+        var w = try Worker.init(testing.allocator, testing.io, &client, "stop-race", .{});
+        defer w.deinit();
+        try w.registerWorkflow(HelloTest.Hello);
+        try w.registerActivity(HelloTest.Greet);
+        var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+        var hammer: StopHammer = .{ .w = &w };
+        const thread = try std.Thread.spawn(.{}, StopHammer.run, .{&hammer});
+        const result = running.await(testing.io);
+        hammer.done.store(true, .release);
+        thread.join();
+        try result;
+    }
 }
