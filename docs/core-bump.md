@@ -31,7 +31,14 @@ We pin release tags only, never a branch. The .NET SDK uses the same C bridge, s
 
    Review the `Cargo.lock` diff: it should only move the dependencies the new core release asks for.
 
-3. Regenerate the Zig protobuf code and review the diff of the generated files.
+3. Regenerate the Zig protobuf code:
+
+   ```sh
+   scripts/list-protos.sh
+   zig build gen-proto
+   ```
+
+   `list-protos.sh` refreshes `deps/protos.zig`, the list of .proto files to compile. `gen-proto` rewrites `src/proto/` and the `src/proto.zig` index. Review the diff: renamed or removed fields break SDK code that uses them, and the compiler will point at each one.
 
 4. Update `src/bridge/` for every header change from step 1, and update the struct size and alignment tests.
 
@@ -39,4 +46,4 @@ We pin release tags only, never a branch. The .NET SDK uses the same C bridge, s
 
 6. Commit the submodule move, `CORE_VERSION`, the regenerated code and the bridge changes together, with the old and new tags in the commit message.
 
-Steps 3 and 4 refer to code that doesn't exist yet. Update this file when the proto generation and bridge tasks land.
+Step 4 refers to code that doesn't exist yet. Update this file when the bridge task lands.

@@ -37,3 +37,5 @@ if [ "$(channel "$root/deps/sdk-core/rust-toolchain.toml")" != "$(channel "$root
   exit 1
 fi
 echo "deps/Cargo.toml and deps/rust-toolchain.toml match sdk-core"
+
+"$root/scripts/list-protos.sh" --check

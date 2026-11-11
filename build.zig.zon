@@ -31,6 +31,10 @@
             .hash = "N-V-__8AABekzACgnTDmenHY7N0E55oHnTfOliLw8ReYHEDH",
             .lazy = true,
         },
+        .protobuf = .{
+            .url = "git+https://github.com/Arwalk/zig-protobuf#38ec95e38e136bfc93685b6549018285f5e722b2",
+            .hash = "protobuf-7.0.0-0e82aujcOwCmSdUIDrerIiWx8LAAxIYj20-i3tRkjOPz",
+        },
     },
     .paths = .{
         "build.zig",
@@ -38,6 +42,7 @@
         "src",
         "LICENSE",
         "CORE_VERSION",
+        "deps/protos.zig",
         "deps/Cargo.toml",
         "deps/Cargo.lock",
         "deps/rust-toolchain.toml",
