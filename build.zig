@@ -146,6 +146,7 @@ const samples = [_]Sample{
     .{ .name = "goroutine", .tests = &.{"goroutine_workflow_test.zig"} },
     .{ .name = "timer", .tests = &.{"workflow_test.zig"} },
     .{ .name = "start-delay", .imports = &.{"helloworld"} },
+    .{ .name = "retryactivity", .tests = &.{"retry_activity_workflow_test.zig"} },
 };
 
 /// Runs cargo to build the C bridge as a static library for `target` and returns its path.

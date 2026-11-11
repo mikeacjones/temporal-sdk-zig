@@ -1,0 +1,7 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The activity
+// processes 20 one-second tasks over four attempts with 1+2+4 seconds of retry backoff.
+.{
+    .expect = .{"Workflow completed"},
+    .timeout_seconds = 90,
+}
