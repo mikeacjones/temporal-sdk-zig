@@ -9,8 +9,12 @@ pub const c = @import("core_c");
 /// Byte buffers and metadata crossing the C boundary, and their ownership rules.
 pub const bytes = @import("bridge/bytes.zig");
 
+/// Turns core callbacks into results std.Io code can wait for.
+pub const Completion = @import("bridge/completion.zig").Completion;
+
 test {
     _ = bytes;
+    _ = @import("bridge/completion.zig");
 }
 
 test "core runtime can be created and freed" {
