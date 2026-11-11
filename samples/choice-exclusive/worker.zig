@@ -15,10 +15,10 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var w = try temporal.worker.Worker.init(gpa, io, &client, "choice", .{});
+    var w = try temporal.worker.Worker.init(gpa, io, &client, "choice-exclusive", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(choice.ExclusiveChoiceWorkflow);
+    try w.registerWorkflow(choice.ExclusiveChoice);
 
     var activities: orders.OrderActivities = .{ .order_choices = &.{
         choice.OrderChoiceApple,

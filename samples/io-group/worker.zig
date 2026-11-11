@@ -14,10 +14,10 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var w = try temporal.worker.Worker.init(gpa, io, &client, "goroutine", .{});
+    var w = try temporal.worker.Worker.init(gpa, io, &client, "io-group", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(sample.SampleGoroutineWorkflow);
+    try w.registerWorkflow(sample.IoGroup);
     try w.registerActivity(sample.Step1);
     try w.registerActivity(sample.Step2);
 

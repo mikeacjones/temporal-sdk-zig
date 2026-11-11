@@ -17,9 +17,9 @@ pub fn main(init: std.process.Init) !void {
     var w = try temporal.worker.Worker.init(gpa, io, &client, "timer", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(sample.SampleTimerWorkflow);
-    try w.registerActivity(sample.OrderProcessingActivity);
-    try w.registerActivity(sample.SendEmailActivity);
+    try w.registerWorkflow(sample.Timer);
+    try w.registerActivity(sample.ProcessOrder);
+    try w.registerActivity(sample.SendEmail);
 
     w.runUntilSignal() catch |err| {
         std.log.err("Unable to start worker: {t}", .{err});

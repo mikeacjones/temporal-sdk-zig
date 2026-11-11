@@ -15,9 +15,9 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var run = client.executeWorkflow(splitmerge.SampleSplitMergeFutureWorkflow, .{
-        .id = try std.fmt.allocPrint(arena, "split_merge_future_{s}", .{try temporal.client.uuid(arena, io)}),
-        .task_queue = "split-merge-future",
+    var run = client.executeWorkflow(splitmerge.SplitMergeFuture, .{
+        .id = try std.fmt.allocPrint(arena, "splitmerge-future-{s}", .{try temporal.client.uuid(arena, io)}),
+        .task_queue = "splitmerge-future",
     }, .{5}) catch |err| {
         std.log.err("Unable to execute workflow: {t}", .{err});
         std.process.exit(1);
@@ -25,10 +25,9 @@ pub fn main(init: std.process.Init) !void {
     defer run.deinit();
     std.log.info("Started workflow WorkflowID={s} RunID={s}", .{ run.id, run.run_id });
 
-    // The Go sample only starts the workflow; waiting for its result lets samples-test check it.
     const result = run.get(arena) catch |err| {
         std.log.err("Unable get workflow result: {t}", .{err});
         std.process.exit(1);
     };
-    std.log.info("Workflow result: NumberOfItemsInChunk={d} SumInChunk={d}", .{ result.NumberOfItemsInChunk, result.SumInChunk });
+    std.log.info("Workflow result: items={d} sum={d}", .{ result.items, result.sum });
 }

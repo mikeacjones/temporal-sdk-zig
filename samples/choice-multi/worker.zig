@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var w = try temporal.worker.Worker.init(gpa, io, &client, "choice-multi", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(choice.MultiChoiceWorkflow);
+    try w.registerWorkflow(choice.MultiChoice);
 
     var activities: orders.OrderActivities = .{ .order_choices = &.{
         choice.OrderChoiceApple,

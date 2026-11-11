@@ -1,9 +1,5 @@
-//! Run several sequences of activities in parallel as coroutines in an `std.Io.Group` on the
-//! workflow's deterministic Io, and wait for them with `ctx.await`.
-//!
-//! Port of samples-go/goroutine, renamed for its Zig equivalent: Go's `workflow.Go` coroutines
-//! are `Group.async` here, and `workflow.Await` is `ctx.await`. The workflow, activity, and task
-//! queue names stay the Go sample's, so the Go starter can drive this worker.
+//! Io group: run several sequences of activities in parallel as coroutines in an
+//! `std.Io.Group` on the workflow's deterministic Io, and wait for them with `ctx.await`.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -35,7 +31,7 @@ fn sequence(ctx: *workflow.Context, state: *State, input1: []const u8) void {
     };
 }
 
-fn sampleGoroutineWorkflow(ctx: *workflow.Context, parallelism: i64) ![]const []const u8 {
+fn ioGroup(ctx: *workflow.Context, parallelism: i64) ![]const []const u8 {
     var state: State = .{ .parallelism = @intCast(@max(parallelism, 0)) };
     var group: std.Io.Group = .init;
     defer group.cancel(ctx.io());
@@ -49,7 +45,7 @@ fn sampleGoroutineWorkflow(ctx: *workflow.Context, parallelism: i64) ![]const []
     return state.results.items;
 }
 
-pub const SampleGoroutineWorkflow = workflow.Def("SampleGoroutineWorkflow", sampleGoroutineWorkflow);
+pub const IoGroup = workflow.Def("IoGroup", ioGroup);
 
 fn randomSleep(ctx: *activity.Context) !void {
     const source: std.Random.IoSource = .{ .io = ctx.io() };

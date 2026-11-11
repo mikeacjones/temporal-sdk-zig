@@ -14,11 +14,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var w = try temporal.worker.Worker.init(gpa, io, &client, "startdelay", .{});
+    var w = try temporal.worker.Worker.init(gpa, io, &client, "start-delay", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(helloworld.Workflow);
-    try w.registerActivity(helloworld.Activity);
+    try w.registerWorkflow(helloworld.HelloWorld);
+    try w.registerActivity(helloworld.Greet);
 
     w.runUntilSignal() catch |err| {
         std.log.err("Unable to start worker: {t}", .{err});

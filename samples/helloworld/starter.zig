@@ -15,8 +15,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var run = client.executeWorkflow(helloworld.Workflow, .{
-        .id = "hello_world_workflowID",
+    var run = client.executeWorkflow(helloworld.HelloWorld, .{
+        .id = "hello-world",
         .task_queue = "hello-world",
     }, .{"Temporal"}) catch |err| {
         std.log.err("Unable to execute workflow: {t}", .{err});

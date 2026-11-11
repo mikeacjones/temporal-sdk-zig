@@ -1,4 +1,4 @@
-//! Port of samples-go/greetings/workflow_test.go.
+//! Tests for the greetings sample.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -23,18 +23,17 @@ const Doubles = struct {
     }
 };
 
-// Go: env.OnActivity(a.GetGreeting).Return("Hello", nil), and so on for each activity.
-test "SampleGreetingsWorkflow" {
+test "workflow with test doubles for its activities" {
     const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
-    try env.registerWorkflow(greetings.GreetingSample);
+    try env.registerWorkflow(greetings.Greetings);
     try env.registerActivityAs(greetings.GetGreeting, Doubles.getGreeting);
     try env.registerActivityAs(greetings.GetName, Doubles.getName);
     try env.registerActivityAs(greetings.SayGreeting, Doubles.sayGreeting);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const result = try env.executeWorkflow(greetings.GreetingSample, .{}, arena.allocator(), null);
+    const result = try env.executeWorkflow(greetings.Greetings, .{}, arena.allocator(), null);
     try testing.expectEqualStrings("Hello World!", result);
 }
 

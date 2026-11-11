@@ -17,8 +17,8 @@ pub fn main(init: std.process.Init) !void {
     var w = try temporal.worker.Worker.init(gpa, io, &client, "cron", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(cron.SampleCronWorkflow);
-    try w.registerActivity(cron.DoSomething);
+    try w.registerWorkflow(cron.Cron);
+    try w.registerActivity(cron.RunCronJob);
 
     w.runUntilSignal() catch |err| {
         std.log.err("Unable to start worker: {t}", .{err});

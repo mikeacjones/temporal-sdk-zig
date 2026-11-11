@@ -1,5 +1,4 @@
-//! Loggers handed to workflow and activity code (Go `workflow.GetLogger` /
-//! `activity.GetLogger`).
+//! Loggers handed to workflow and activity code.
 //!
 //! Messages go to `std.log` under the `temporal` scope, followed by the call's key-value
 //! fields and the logger's own context fields (workflow ID, run ID, and so on), in logfmt

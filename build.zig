@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
 
     // zig build samples / zig build samples-test
     //
-    // Each sample in samples/<name> (a port of samples-go/<name>) builds a worker and a starter
+    // Each sample in samples/<name> builds a worker and a starter
     // program; its tests and its run against a dev server make up samples-test. The runner
     // runs natively (it starts processes), so samples-test is for the host target.
     const samples_step = b.step("samples", "Build all samples");
@@ -131,16 +131,16 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-/// Ported samples-go samples. Each has worker.zig, starter.zig and sample.zon in
-/// samples/<name>; `tests` are its ported Go tests. `imports` names other samples whose
-/// samples/<other>/<other>.zig this sample uses (Go samples import each other's packages).
+/// The samples. Each has worker.zig, starter.zig and sample.zon in samples/<name>; `tests` are
+/// its test files. `imports` names other samples whose samples/<other>/<other>.zig this sample
+/// uses.
 const Sample = struct { name: []const u8, tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{} };
 const samples = [_]Sample{
     .{ .name = "helloworld", .tests = &.{ "helloworld_test.zig", "replay_test.zig" } },
     .{ .name = "greetings", .tests = &.{"workflow_test.zig"} },
     .{ .name = "branch", .tests = &.{"workflow_test.zig"} },
     .{ .name = "splitmerge-future", .tests = &.{"splitmerge_workflow_test.zig"} },
-    .{ .name = "splitmerge-selector", .tests = &.{"splitmerge_workflow_test.zig"} },
+    .{ .name = "splitmerge-select", .tests = &.{"splitmerge_workflow_test.zig"} },
     .{ .name = "choice-exclusive", .tests = &.{"workflow_test.zig"} },
     .{ .name = "choice-multi", .tests = &.{"workflow_test.zig"} },
     .{ .name = "io-group", .tests = &.{"io_group_workflow_test.zig"} },

@@ -1,4 +1,4 @@
-//! Port of samples-go/splitmerge-future/splitmerge_workflow_test.go.
+//! Tests for the splitmerge-future sample.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -6,23 +6,23 @@ const splitmerge = @import("splitmerge_workflow.zig");
 
 const testing = std.testing;
 
-test "Workflow" {
+test "merges every chunk" {
     const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
-    try env.registerWorkflow(splitmerge.SampleSplitMergeFutureWorkflow);
-    try env.registerActivity(splitmerge.ChunkProcessingActivity);
+    try env.registerWorkflow(splitmerge.SplitMergeFuture);
+    try env.registerActivity(splitmerge.ProcessChunk);
 
-    const worker_count = 5;
+    const activity_count = 5;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const result = try env.executeWorkflow(splitmerge.SampleSplitMergeFutureWorkflow, .{worker_count}, arena.allocator(), null);
+    const result = try env.executeWorkflow(splitmerge.SplitMergeFuture, .{activity_count}, arena.allocator(), null);
 
     var total_item: i64 = 0;
     var total_sum: i64 = 0;
-    for (1..worker_count + 1) |i| {
+    for (1..activity_count + 1) |i| {
         total_item += @intCast(i);
         total_sum += @intCast(i * i);
     }
-    try testing.expectEqual(total_item, result.NumberOfItemsInChunk);
-    try testing.expectEqual(total_sum, result.SumInChunk);
+    try testing.expectEqual(total_item, result.items);
+    try testing.expectEqual(total_sum, result.sum);
 }

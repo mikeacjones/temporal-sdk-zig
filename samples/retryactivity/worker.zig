@@ -17,8 +17,8 @@ pub fn main(init: std.process.Init) !void {
     var w = try temporal.worker.Worker.init(gpa, io, &client, "retry-activity", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(retryactivity.RetryWorkflow);
-    try w.registerActivity(retryactivity.BatchProcessingActivity);
+    try w.registerWorkflow(retryactivity.RetryActivity);
+    try w.registerActivity(retryactivity.ProcessBatch);
 
     w.runUntilSignal() catch |err| {
         std.log.err("Unable to start worker: {t}", .{err});

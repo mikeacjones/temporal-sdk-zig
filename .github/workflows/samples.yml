@@ -40,6 +40,6 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CORE_VERSION', 'deps/Cargo.lock', 'deps/rust-toolchain.toml') }}
 
       # Builds every sample, starts a dev server, runs each sample's worker and starter, and
-      # checks the results. See samples/README.md for which samples-go samples are ported.
+      # checks the results.
       - name: Run the samples against a dev server
         run: zig build samples-test

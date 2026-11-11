@@ -1,4 +1,4 @@
-//! The order activities of samples-go/choice-multi.
+//! The order activities of the choice-multi sample.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -28,7 +28,7 @@ pub const OrderActivities = struct {
         if (basket.items.len == 0) {
             try basket.append(ctx.allocator(), a.order_choices[rand.uintLessThan(usize, a.order_choices.len)]);
         }
-        ctx.logger().info("Get basket order.", .{ .Orders = basket.items });
+        ctx.logger().info("Get basket order.", .{ .orders = basket.items });
         return basket.items;
     }
 

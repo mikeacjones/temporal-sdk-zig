@@ -1,5 +1,5 @@
-//! Port of samples-go/choice-exclusive: run one of several activities, chosen by the result
-//! of a previous activity.
+//! Exclusive choice: run one of several activities, chosen by the result of a previous
+//! activity.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -11,7 +11,7 @@ pub const OrderChoiceBanana = "banana";
 pub const OrderChoiceCherry = "cherry";
 pub const OrderChoiceOrange = "orange";
 
-fn exclusiveChoiceWorkflow(ctx: *workflow.Context) !void {
+fn exclusiveChoice(ctx: *workflow.Context) !void {
     const ao: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
 
     // Get order.
@@ -37,4 +37,4 @@ fn exclusiveChoiceWorkflow(ctx: *workflow.Context) !void {
     logger.info("Workflow completed.", .{});
 }
 
-pub const ExclusiveChoiceWorkflow = workflow.Def("ExclusiveChoiceWorkflow", exclusiveChoiceWorkflow);
+pub const ExclusiveChoice = workflow.Def("ExclusiveChoice", exclusiveChoice);

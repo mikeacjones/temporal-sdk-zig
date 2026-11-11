@@ -17,8 +17,8 @@ pub fn main(init: std.process.Init) !void {
     var w = try temporal.worker.Worker.init(gpa, io, &client, "branch", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(branch.SampleBranchWorkflow);
-    try w.registerActivity(branch.SampleActivity);
+    try w.registerWorkflow(branch.Branch);
+    try w.registerActivity(branch.ProcessBranch);
 
     w.runUntilSignal() catch |err| {
         std.log.err("Unable to start worker: {t}", .{err});

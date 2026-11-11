@@ -14,11 +14,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.close();
 
-    var w = try temporal.worker.Worker.init(gpa, io, &client, "split-merge-selector", .{});
+    var w = try temporal.worker.Worker.init(gpa, io, &client, "splitmerge-select", .{});
     defer w.deinit();
 
-    try w.registerWorkflow(splitmerge.SampleSplitMergeSelectorWorkflow);
-    try w.registerActivity(splitmerge.ChunkProcessingActivity);
+    try w.registerWorkflow(splitmerge.SplitMergeSelect);
+    try w.registerActivity(splitmerge.ProcessChunk);
 
     w.runUntilSignal() catch |err| {
         std.log.err("Unable to start worker: {t}", .{err});

@@ -1,8 +1,8 @@
-//! Payload conversion (Go `converter` package parity).
+//! Payload conversion.
 //!
 //! Values cross the wire as `temporal.api.common.v1.Payload`: bytes plus an `encoding`
-//! metadata entry. The default converter matches the Go SDK's choices for the same values, so
-//! a Zig worker and a Go client (or the other way round) understand each other:
+//! metadata entry. The default converter uses Temporal's standard encodings, so workers and
+//! clients in any language understand each other:
 //!
 //! | Zig value                         | encoding      | data                    |
 //! |-----------------------------------|---------------|-------------------------|
@@ -10,7 +10,7 @@
 //! | `converter.Bytes`                 | `binary/plain`| the bytes               |
 //! | anything else (strings included)  | `json/plain`  | JSON from `std.json`    |
 //!
-//! Strings are JSON, as Go encodes `string`; use `Bytes` for raw binary data. Decoding
+//! Strings are JSON strings; use `Bytes` for raw binary data. Decoding
 //! accepts any of the three encodings into a compatible type. Decoded slices and strings are
 //! allocated from the arena passed in.
 
@@ -97,7 +97,7 @@ pub fn toPayloads(arena: Allocator, args: anytype) error{OutOfMemory}!std.ArrayL
 }
 
 /// Decodes payloads into a tuple of type `Args`. Missing trailing optional arguments decode
-/// as null; extra payloads are ignored, as in the Go SDK.
+/// as null; extra payloads are ignored.
 pub fn fromPayloads(comptime Args: type, arena: Allocator, payloads: []const Payload) DecodeError!Args {
     var out: Args = undefined;
     inline for (@typeInfo(Args).@"struct".field_types, 0..) |F, i| {
@@ -122,15 +122,12 @@ fn payloadWith(arena: Allocator, enc: Encoding, data: []const u8) error{OutOfMem
 
 const testing = std.testing;
 
-/// A point in time that encodes the way Go's `time.Time` does in JSON: an RFC 3339 string with
-/// up to nanosecond precision, such as "2018-08-22T16:30:00Z". Use it for payload fields that
-/// are `time.Time` in Go. The default value is Go's zero time ("0001-01-01T00:00:00Z").
+/// A point in time that encodes in JSON as an RFC 3339 string with up to nanosecond
+/// precision, such as "2018-08-22T16:30:00Z", the common form for times in payloads.
 pub const Time = struct {
     /// Nanoseconds since the Unix epoch.
-    unix_ns: i96 = zero_unix_ns,
+    unix_ns: i96,
 
-    const zero_unix_ns: i96 = -62135596800 * std.time.ns_per_s;
-    pub const zero: Time = .{};
     /// The longest text `format` writes: "-YYYYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ" fits easily.
     pub const max_len = 40;
 
@@ -142,11 +139,7 @@ pub const Time = struct {
         return .{ .nanoseconds = t.unix_ns };
     }
 
-    pub fn isZero(t: Time) bool {
-        return t.unix_ns == zero_unix_ns;
-    }
-
-    /// Writes `t` in UTC as Go's RFC3339Nano does (trailing zeros of the fraction dropped).
+    /// Writes `t` in UTC, with trailing zeros of the fraction dropped.
     pub fn format(t: Time, buf: *[max_len]u8) []const u8 {
         const secs: i64 = @intCast(@divFloor(t.unix_ns, std.time.ns_per_s));
         const nanos: u32 = @intCast(@mod(t.unix_ns, std.time.ns_per_s));
@@ -254,7 +247,7 @@ pub const Time = struct {
     }
 };
 
-test "strings, structs and numbers encode as JSON like the Go SDK" {
+test "strings, structs and numbers encode as JSON" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -313,21 +306,20 @@ test "bad payloads are reported, not crashed on" {
     try testing.expectError(error.UnknownEncoding, fromPayload(u32, a, odd));
 }
 
-test "Time encodes like Go's time.Time" {
+test "Time encodes as RFC 3339 text" {
     var buf: [Time.max_len]u8 = undefined;
-    try std.testing.expectEqualStrings("0001-01-01T00:00:00Z", Time.zero.format(&buf));
+    try std.testing.expectEqualStrings("0001-01-01T00:00:00Z", (try Time.parse("0001-01-01T00:00:00Z")).format(&buf));
     const t = try Time.parse("2018-08-22T16:30:00Z");
     try std.testing.expectEqualStrings("2018-08-22T16:30:00Z", t.format(&buf));
     try std.testing.expectEqual(@as(i96, 1534955400) * std.time.ns_per_s, t.unix_ns);
     const frac = try Time.parse("2018-08-22T09:30:00.12-07:00");
     try std.testing.expectEqualStrings("2018-08-22T16:30:00.12Z", frac.format(&buf));
-    try std.testing.expect((try Time.parse("0001-01-01T00:00:00Z")).isZero());
     try std.testing.expectError(error.InvalidTime, Time.parse("2018-08-22 16:30:00"));
 
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const S = struct { RunTime: Time = .{} };
-    const p = try toPayload(arena.allocator(), S{ .RunTime = t });
-    try std.testing.expectEqualStrings("{\"RunTime\":\"2018-08-22T16:30:00Z\"}", p.data);
-    try std.testing.expectEqual(t, (try fromPayload(S, arena.allocator(), p)).RunTime);
+    const S = struct { run_time: Time };
+    const p = try toPayload(arena.allocator(), S{ .run_time = t });
+    try std.testing.expectEqualStrings("{\"run_time\":\"2018-08-22T16:30:00Z\"}", p.data);
+    try std.testing.expectEqual(t, (try fromPayload(S, arena.allocator(), p)).run_time);
 }

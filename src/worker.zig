@@ -1,4 +1,4 @@
-//! Workers (Go `worker` package parity): poll a task queue and run the workflows and
+//! Workers: poll a task queue and run the workflows and
 //! activities registered on it.
 //!
 //!     var w = try temporal.worker.Worker.init(gpa, io, &client, "hello-world", .{});
@@ -78,7 +78,7 @@ pub const Worker = struct {
 
     /// Registers an activity that is a method (see `temporal.activity.Def`), bound to
     /// `receiver`. The receiver must outlive the worker and be safe to use from several
-    /// activities at once. Go `RegisterActivity(&Activities{...})`.
+    /// activities at once.
     pub fn registerActivityWith(w: *Worker, comptime Activity: type, receiver: *Activity.Receiver) error{ OutOfMemory, AlreadyRegistered }!void {
         return w.registerActivityImpl(Activity.with(receiver));
     }
@@ -156,7 +156,7 @@ pub const Worker = struct {
         if (w.core_ptr.load(.acquire)) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
     }
 
-    /// Runs until the process receives SIGINT or SIGTERM. Go `worker.Run(worker.InterruptCh())`.
+    /// Runs until the process receives SIGINT or SIGTERM.
     pub fn runUntilSignal(w: *Worker) RunError!void {
         const watcher = try SignalWatcher.start(w);
         defer watcher.finish();
