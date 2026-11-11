@@ -639,6 +639,51 @@ const Fixtures = struct {
     }
     const HelloQueried = workflow.Def("HelloWorld", helloQueried);
 
+    const Status = workflow.QueryDef("status", fn () []const u8);
+    const Add = workflow.QueryDef("add", fn (i64, i64) i64);
+    const FailingQuery = workflow.QueryDef("fails", fn () i64);
+    const QueryState = struct {
+        phase: []const u8 = "starting",
+        base: i64 = 100,
+
+        fn status(s: *QueryState) []const u8 {
+            return s.phase;
+        }
+        fn add(s: *QueryState, x: i64, y: i64) i64 {
+            return s.base + x + y;
+        }
+        fn fails(_: *QueryState) error{NotReady}!i64 {
+            return error.NotReady;
+        }
+    };
+    /// Answers `Status`, `Add` and `FailingQuery` while it sleeps for `seconds`.
+    fn queryable(ctx: *workflow.Context, seconds: i64) ![]const u8 {
+        const s = try ctx.allocator().create(QueryState);
+        s.* = .{};
+        try ctx.setQueryHandler(Status, s, QueryState.status);
+        try ctx.setQueryHandler(Add, s, QueryState.add);
+        try ctx.setQueryHandler(FailingQuery, s, QueryState.fails);
+        s.phase = "sleeping";
+        try ctx.io().sleep(.fromSeconds(seconds), .awake);
+        s.phase = "done";
+        return "finished";
+    }
+    const Queryable = workflow.Def("Queryable", queryable);
+
+    /// Waits until the run's history has a started timer (its first workflow task is done).
+    fn waitForTimer(c: *client_mod.Client, id: []const u8, run_id: []const u8) !void {
+        while (true) {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            const history = try c.fetchHistory(scratch.allocator(), id, run_id);
+            for (history.events.items) |event| switch (event.attributes orelse continue) {
+                .timer_started_event_attributes => return,
+                else => {},
+            };
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+    }
+
     /// Sleeps, then returns how many seconds of workflow time passed.
     fn sleepFor(ctx: *workflow.Context, seconds: i64) !i64 {
         const before = ctx.now();
@@ -1166,6 +1211,75 @@ test "an upserted memo reads back through describe; null and empty slices remove
     try testing.expectEqualStrings("shipped", (try d.memoValue([]const u8, a, "status")).?);
     try testing.expectEqualStrings("keep", (try d.memoValue([]const u8, a, "note")).?);
     try testing.expect((try d.memoValue(bool, a, "done")).?);
+}
+
+test "client: query a running, a canceled and a completed workflow" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Queryable);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(Fixtures.Queryable, .{ .task_queue = "" }, .{std.time.s_per_hour});
+    defer run.deinit();
+    // A query sent before the first workflow task completes is held by the server until it
+    // does (or until the call times out with no worker polling), so the handlers are set.
+    try testing.expectEqualStrings("sleeping", try env.client.queryWorkflow(Fixtures.Status, a, run.id, run.run_id, .{}));
+    try Fixtures.waitForTimer(&env.client, run.id, run.run_id);
+    try testing.expectEqual(@as(i64, 103), try env.client.queryWorkflow(Fixtures.Add, a, run.id, "", .{ 1, 2 }));
+    try testing.expectEqual(@as(i64, 103), try env.client.queryWorkflowWithOptions(Fixtures.Add, a, run.id, run.run_id, .{ 1, 2 }, .{ .reject_condition = .not_open }));
+
+    // An unknown query type and a failing handler fail the query with a message.
+    var message: []const u8 = "";
+    const Missing = workflow.QueryDef("missing", fn () u32);
+    try testing.expectError(error.QueryFailed, env.client.queryWorkflowWithOptions(Missing, a, run.id, "", .{}, .{ .failure_message = &message }));
+    try testing.expect(std.mem.indexOf(u8, message, "query type \"missing\" is not registered on workflow \"Queryable\"; registered query types: [status, add, fails]") != null);
+    message = "";
+    try testing.expectError(error.QueryFailed, env.client.queryWorkflowWithOptions(Fixtures.FailingQuery, a, run.id, "", .{}, .{ .failure_message = &message }));
+    try testing.expect(std.mem.indexOf(u8, message, "NotReady") != null);
+    try testing.expectError(error.QueryFailed, env.client.queryWorkflow(Fixtures.FailingQuery, a, run.id, "", .{}));
+
+    // A canceled run still answers unless the reject condition excludes it.
+    try env.client.cancelWorkflow(run.id, run.run_id, "");
+    try testing.expectError(error.WorkflowCanceled, env.getResult(Fixtures.Queryable, &run, a, null));
+    try testing.expectEqualStrings("sleeping", try env.client.queryWorkflow(Fixtures.Status, a, run.id, run.run_id, .{}));
+    var status: client_mod.WorkflowExecutionStatus = .unspecified;
+    try testing.expectError(error.QueryRejected, env.client.queryWorkflowWithOptions(Fixtures.Status, a, run.id, run.run_id, .{}, .{ .reject_condition = .not_completed_cleanly, .rejected_status = &status }));
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.canceled, status);
+
+    // A completed run answers from its final state: the server sends the query to a worker,
+    // which replays the history.
+    var done = try env.startWorkflow(Fixtures.Queryable, .{ .task_queue = "" }, .{1});
+    defer done.deinit();
+    try testing.expectEqualStrings("finished", try env.getResult(Fixtures.Queryable, &done, a, null));
+    try testing.expectEqualStrings("done", try env.client.queryWorkflow(Fixtures.Status, a, done.id, "", .{}));
+    try testing.expectEqualStrings("done", try env.client.queryWorkflowWithOptions(Fixtures.Status, a, done.id, "", .{}, .{ .reject_condition = .not_completed_cleanly }));
+    status = .unspecified;
+    try testing.expectError(error.QueryRejected, env.client.queryWorkflowWithOptions(Fixtures.Status, a, done.id, "", .{}, .{ .reject_condition = .not_open, .rejected_status = &status }));
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.completed, status);
+
+    try testing.expectError(error.NotFound, env.client.queryWorkflow(Fixtures.Status, a, "no-such-workflow", "", .{}));
+}
+
+test "time-skipping WorkflowEnvironment: a workflow mid-timer answers a query while time is locked" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Queryable);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const start = try env.now();
+    var run = try env.startWorkflow(Fixtures.Queryable, .{ .task_queue = "" }, .{2 * std.time.s_per_hour});
+    defer run.deinit();
+    try Fixtures.waitForTimer(&env.client, run.id, run.run_id);
+    try testing.expectEqualStrings("sleeping", try env.client.queryWorkflow(Fixtures.Status, a, run.id, run.run_id, .{}));
+    try testing.expectEqual(@as(i64, 105), try env.client.queryWorkflow(Fixtures.Add, a, run.id, run.run_id, .{ 2, 3 }));
+    try testing.expect(start.durationTo(try env.now()).nanoseconds < std.time.ns_per_hour);
+
+    try testing.expectEqualStrings("finished", try env.getResult(Fixtures.Queryable, &run, a, null));
+    try testing.expectEqualStrings("done", try env.client.queryWorkflow(Fixtures.Status, a, run.id, run.run_id, .{}));
 }
 
 test "time-skipping WorkflowEnvironment completes a 2h sleep in seconds" {
