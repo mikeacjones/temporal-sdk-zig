@@ -60,6 +60,8 @@ pub const Fiber = struct {
     name: []const u8,
     state: State,
     queue_next: ?*Fiber = null,
+    /// Owned by the layer that spawned the fiber (the workflow `std.Io` keeps its task here).
+    user: ?*anyopaque = null,
 
     pub const State = enum { ready, running, blocked, done };
 };
@@ -276,21 +278,24 @@ fn switchStackX86_64() callconv(.naked) void {
 
 /// Where a new fiber starts: `switchStack` "returns" here with the Fiber pointer in a
 /// callee-saved register (x19 / rbx) and the stack pointer just below the Fiber header.
+/// It enters `fiberMain` with a zero frame pointer and a zero return address, the usual
+/// end-of-stack marker, so stack unwinders (panics, debug allocators) stop at the fiber's
+/// base instead of walking into this function, which has no unwind information.
 fn fiberEntry() callconv(.naked) void {
     switch (builtin.cpu.arch) {
         .aarch64 => asm volatile (
             \\ mov x0, x19
             \\ mov x29, #0
-            \\ bl %[fiberMain]
-            \\ brk #1
+            \\ mov x30, #0
+            \\ b %[fiberMain]
             :
             : [fiberMain] "X" (&fiberMain),
         ),
         .x86_64 => asm volatile (
             \\ movq %%rbx, %%rdi
             \\ xorl %%ebp, %%ebp
-            \\ callq %[fiberMain:P]
-            \\ ud2
+            \\ pushq $0
+            \\ jmp %[fiberMain:P]
             :
             : [fiberMain] "X" (&fiberMain),
         ),
@@ -314,8 +319,9 @@ fn initialStack(f: *Fiber) usize {
         },
         .x86_64 => {
             // `switchStack` pops six registers and the return address (7 words), leaving
-            // rsp = sp + 56. The `call` in fiberEntry needs rsp 16-byte aligned, so sp must
-            // be 8 mod 16. top is 16-aligned: sp = top - 72 gives rsp = top - 16.
+            // rsp = sp + 56. fiberEntry then pushes a zero return address, and fiberMain
+            // must see rsp = 8 mod 16 on entry, as after a `call`. So rsp must be 16-byte
+            // aligned before that push: with top 16-aligned, sp = top - 72 gives top - 16.
             const sp = top - 72;
             const regs: [*]usize = @ptrFromInt(sp);
             @memset(regs[0..x86_64_frame_words], 0);
