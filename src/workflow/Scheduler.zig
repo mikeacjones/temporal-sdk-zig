@@ -142,6 +142,13 @@ pub fn currentFiber(s: *const Scheduler) ?*Fiber {
     return s.current;
 }
 
+/// Whether `addr` lies in the stack of the fiber currently executing. False outside a fiber.
+pub fn onCurrentStack(s: *const Scheduler, addr: usize) bool {
+    const f = s.current orelse return false;
+    const start = @intFromPtr(f.stack.memory.ptr);
+    return addr >= start and addr < start + f.stack.memory.len;
+}
+
 /// Suspends the calling fiber until another party calls `wake` on it.
 pub fn block(s: *Scheduler) void {
     const f = s.current orelse unreachable; // block called outside a fiber
@@ -468,6 +475,24 @@ fn recordStack(out: *usize) void {
     var local: u8 = 0;
     std.mem.doNotOptimizeAway(&local);
     out.* = @intFromPtr(&local);
+}
+
+fn checkOnStack(s: *const Scheduler, heap_addr: usize, out: *[2]bool) void {
+    var local: u8 = 0;
+    std.mem.doNotOptimizeAway(&local);
+    out.* = .{ s.onCurrentStack(@intFromPtr(&local)), s.onCurrentStack(heap_addr) };
+}
+
+test "onCurrentStack tells the running fiber's stack from other memory" {
+    var s: Scheduler = .init(testing.allocator, .{ .stack_size = 64 * 1024 });
+    defer s.deinit();
+    const heap = try testing.allocator.create(u8);
+    defer testing.allocator.destroy(heap);
+    var seen: [2]bool = .{ false, true };
+    _ = try s.spawn("check", checkOnStack, .{ &s, @intFromPtr(heap), &seen });
+    s.run();
+    try testing.expectEqual([2]bool{ true, false }, seen);
+    try testing.expect(!s.onCurrentStack(@intFromPtr(&seen))); // outside any fiber
 }
 
 test "finished fiber stacks are reused" {
