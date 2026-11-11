@@ -414,8 +414,8 @@ fn defaultIdentity(gpa: Allocator) error{OutOfMemory}![]u8 {
     return std.fmt.allocPrint(gpa, "{d}@{s}", .{ std.c.getpid(), host });
 }
 
-/// A random (version 4) UUID string, for request IDs.
-fn uuid(arena: Allocator, io: Io) error{OutOfMemory}![]const u8 {
+/// A random (version 4) UUID string, as Go samples use for workflow IDs (`uuid.New()`).
+pub fn uuid(arena: Allocator, io: Io) error{OutOfMemory}![]const u8 {
     var b: [16]u8 = undefined;
     io.random(&b);
     b[6] = (b[6] & 0x0f) | 0x40;

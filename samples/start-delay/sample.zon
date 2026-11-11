@@ -1,0 +1,8 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter
+// waits out a 3 second start delay instead of the Go sample's 5 minutes.
+.{
+    .expect = .{"Workflow result: Hello from a delayed workflow!"},
+    .starter_args = .{"3"},
+    .timeout_seconds = 60,
+}

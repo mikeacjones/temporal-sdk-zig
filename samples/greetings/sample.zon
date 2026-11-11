@@ -1,0 +1,6 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`.
+.{
+    .expect = .{"Workflow result: Greeting: Hello Temporal!"},
+    .timeout_seconds = 60,
+}
