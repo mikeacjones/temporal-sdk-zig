@@ -192,6 +192,38 @@ pub const Client = struct {
         }
     }
 
+    /// Describes a workflow run: its status, type, times, memo and search attributes. An
+    /// empty `run_id` describes the latest run. Returns `error.NotFound` if no such workflow
+    /// exists. The description and all its memory come from `arena`.
+    pub fn describeWorkflow(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8) DescribeError!WorkflowDescription {
+        const response = c.rpc(wfs.DescribeWorkflowExecutionResponse, "DescribeWorkflowExecution", wfs.DescribeWorkflowExecutionRequest{
+            .namespace = c.namespace,
+            .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+        }, arena) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+        const info = response.workflow_execution_info orelse {
+            log.err("DescribeWorkflowExecution for workflow {s} returned no execution info", .{workflow_id});
+            return error.InvalidResponse;
+        };
+        const execution = info.execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
+        return .{
+            .workflow_id = execution.workflow_id,
+            .run_id = execution.run_id,
+            .workflow_type = if (info.type) |t| t.name else "",
+            .task_queue = info.task_queue,
+            .status = @fromBackingInt(@intCast(@backingInt(info.status))),
+            .start_time = timestamp(info.start_time),
+            .execution_time = timestamp(info.execution_time),
+            .close_time = timestamp(info.close_time),
+            .history_length = info.history_length,
+            .memo = if (info.memo) |m| try converter.fieldsFromMap(arena, m.fields.items) else &.{},
+            .search_attributes = if (info.search_attributes) |s| try converter.fieldsFromMap(arena, s.indexed_fields.items) else &.{},
+            .raw = response,
+        };
+    }
+
     const RpcError = error{ OutOfMemory, Canceled, RpcFailed, AlreadyExists, NotFound, InvalidResponse };
 
     /// Calls a WorkflowService method with a typed request and response. The response's
@@ -243,6 +275,53 @@ pub const StartWorkflowOptions = struct {
 };
 
 pub const StartError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, WorkflowExecutionAlreadyStarted };
+
+pub const DescribeError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
+
+/// Where a workflow run is in its lifecycle. Values match the server's; the enum is open so
+/// a status added by a newer server is kept rather than rejected.
+pub const WorkflowExecutionStatus = enum(i32) {
+    unspecified = 0,
+    running = 1,
+    completed = 2,
+    failed = 3,
+    canceled = 4,
+    terminated = 5,
+    continued_as_new = 6,
+    timed_out = 7,
+    paused = 8,
+    _,
+};
+
+/// A workflow run as `Client.describeWorkflow` reports it. Every slice borrows the arena
+/// passed to `describeWorkflow`.
+pub const WorkflowDescription = struct {
+    workflow_id: []const u8,
+    run_id: []const u8,
+    workflow_type: []const u8,
+    task_queue: []const u8,
+    status: WorkflowExecutionStatus,
+    start_time: ?Io.Timestamp,
+    /// When the first workflow task was, or will be, scheduled: later than `start_time` for a
+    /// delayed start or a cron or retry backoff.
+    execution_time: ?Io.Timestamp,
+    /// Null while the run is open.
+    close_time: ?Io.Timestamp,
+    history_length: i64,
+    /// Decode a value with `memoValue` or `converter.fieldValue`.
+    memo: []const converter.Field,
+    /// Raw search attribute payloads, as the server returns them.
+    search_attributes: []const converter.Field,
+    /// The full server response, for anything not lifted into the fields above (pending
+    /// activities, children, versioning info, ...).
+    raw: wfs.DescribeWorkflowExecutionResponse,
+
+    /// Decodes the memo value called `name` as `T`, or returns null if the memo has no such
+    /// value. Memory comes from `arena`.
+    pub fn memoValue(d: *const WorkflowDescription, comptime T: type, arena: Allocator, name: []const u8) converter.DecodeError!?T {
+        return converter.fieldValue(T, arena, d.memo, name);
+    }
+};
 
 pub const ResultError = error{
     OutOfMemory,
@@ -432,6 +511,11 @@ pub fn uuid(arena: Allocator, io: Io) error{OutOfMemory}![]const u8 {
     return std.fmt.allocPrint(arena, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
 }
 
+fn timestamp(t: ?proto.google.protobuf.Timestamp) ?Io.Timestamp {
+    const v = t orelse return null;
+    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
+}
+
 fn protoDuration(d: ?Duration) ?proto.google.protobuf.Duration {
     const v = d orelse return null;
     return .{
@@ -446,4 +530,17 @@ test "uuids are version 4 and well formed" {
     const id = try uuid(arena.allocator(), std.testing.io);
     try std.testing.expectEqual(@as(usize, 36), id.len);
     try std.testing.expectEqual(@as(u8, '4'), id[14]);
+}
+
+test "workflow execution statuses match the server's values" {
+    const info = @typeInfo(WorkflowExecutionStatus).@"enum";
+    inline for (info.field_names, info.field_values) |name, value| {
+        const upper = comptime blk: {
+            var buf: [name.len]u8 = undefined;
+            _ = std.ascii.upperString(&buf, name);
+            break :blk buf;
+        };
+        const server = @field(enums.WorkflowExecutionStatus, "WORKFLOW_EXECUTION_STATUS_" ++ upper);
+        try std.testing.expectEqual(value, @backingInt(server));
+    }
 }
