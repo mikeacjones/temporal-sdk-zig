@@ -143,7 +143,7 @@ const samples = [_]Sample{
     .{ .name = "splitmerge-selector", .tests = &.{"splitmerge_workflow_test.zig"} },
     .{ .name = "choice-exclusive", .tests = &.{"workflow_test.zig"} },
     .{ .name = "choice-multi", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "goroutine", .tests = &.{"goroutine_workflow_test.zig"} },
+    .{ .name = "io-group", .tests = &.{"io_group_workflow_test.zig"} },
     .{ .name = "timer", .tests = &.{"workflow_test.zig"} },
     .{ .name = "start-delay", .imports = &.{"helloworld"} },
     .{ .name = "retryactivity", .tests = &.{"retry_activity_workflow_test.zig"} },
