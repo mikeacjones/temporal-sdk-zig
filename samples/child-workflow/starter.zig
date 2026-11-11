@@ -1,20 +1,35 @@
-//! Placeholder starter for the child-workflow sample, replaced by its implementation. It runs the
-//! placeholder workflow so the worker is known to be running when samples-test stops it.
-
 const std = @import("std");
 const temporal = @import("temporal");
-
-fn placeholder(ctx: *temporal.workflow.Context) !void {
-    _ = ctx;
-}
-const Placeholder = temporal.workflow.Def("Placeholder", placeholder);
+const child_workflow = @import("child_workflow.zig");
 
 pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
     const arena = init.arena.allocator();
-    var client = try temporal.client.Client.connect(init.gpa, init.io, try temporal.client.loadDefaultOptions(arena));
+
+    // The client is a heavyweight object that should be created once per process.
+    const options = try temporal.client.loadDefaultOptions(arena);
+    var client = temporal.client.Client.connect(gpa, io, options) catch |err| {
+        std.log.err("Unable to create client: {t}", .{err});
+        std.process.exit(1);
+    };
     defer client.close();
-    var run = try client.executeWorkflow(Placeholder, .{ .task_queue = "child-workflow" }, .{});
+
+    // This workflow ID can be a business identifier supplied by the caller.
+    var run = client.executeWorkflow(child_workflow.SampleParentWorkflow, .{
+        .id = try std.fmt.allocPrint(arena, "parent-workflow_{s}", .{try temporal.client.uuid(arena, io)}),
+        .task_queue = "child-workflow",
+    }, .{}) catch |err| {
+        std.log.err("Unable to execute workflow: {t}", .{err});
+        std.process.exit(1);
+    };
     defer run.deinit();
-    try run.get(arena);
-    std.log.info("child-workflow sample is a placeholder", .{});
+    std.log.info("Started workflow WorkflowID={s} RunID={s}", .{ run.id, run.run_id });
+
+    // Synchronously wait for the workflow completion.
+    const result = run.get(arena) catch |err| {
+        std.log.err("Failure getting workflow result: {t}", .{err});
+        std.process.exit(1);
+    };
+    std.log.info("Workflow result: {s}", .{result});
 }
