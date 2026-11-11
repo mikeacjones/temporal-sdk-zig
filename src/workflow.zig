@@ -62,6 +62,11 @@ pub const RetryPolicy = struct {
     non_retryable_error_types: []const []const u8 = &.{},
 };
 
+/// What canceling an activity's future does: `try_cancel` requests the cancellation and
+/// reports it at once, `wait_cancellation_completed` requests it and waits for the activity to
+/// end, and `abandon` reports it at once without telling the activity.
+pub const ActivityCancellationType = enum { try_cancel, wait_cancellation_completed, abandon };
+
 /// How an activity is scheduled. At least one of `start_to_close_timeout` and
 /// `schedule_to_close_timeout` is required.
 pub const ActivityOptions = struct {
@@ -74,8 +79,33 @@ pub const ActivityOptions = struct {
     start_to_close_timeout: ?Duration = null,
     heartbeat_timeout: ?Duration = null,
     retry_policy: ?RetryPolicy = null,
-    cancellation_type: enum { try_cancel, wait_cancellation_completed, abandon } = .try_cancel,
+    cancellation_type: ActivityCancellationType = .try_cancel,
     disable_eager_execution: bool = false,
+};
+
+/// How a local activity is scheduled. A local activity runs on the worker running the
+/// workflow, without a task queue round trip; its result is recorded in the workflow's
+/// history as a marker. At least one of `start_to_close_timeout` and
+/// `schedule_to_close_timeout` is required: without either, the future's `get` returns
+/// `error.InvalidOptions`.
+pub const LocalActivityOptions = struct {
+    /// Empty uses the activity's sequence number, which changes when a retry waits on a
+    /// workflow timer.
+    activity_id: []const u8 = "",
+    /// How long the workflow waits for the activity, retries included. Null means the
+    /// workflow's execution timeout, if any.
+    schedule_to_close_timeout: ?Duration = null,
+    /// How long the activity may wait for a free local activity slot on the worker. Not
+    /// retried.
+    schedule_to_start_timeout: ?Duration = null,
+    /// How long one attempt may run. Retried.
+    start_to_close_timeout: ?Duration = null,
+    /// Null retries indefinitely with the default backoff.
+    retry_policy: ?RetryPolicy = null,
+    /// Retries whose backoff is longer than this wait on a durable workflow timer instead of
+    /// on the worker, so the workflow task doesn't stay open. Null means one minute.
+    local_retry_threshold: ?Duration = null,
+    cancellation_type: ActivityCancellationType = .try_cancel,
 };
 
 pub const Context = struct {
@@ -160,6 +190,21 @@ pub const Context = struct {
         return .{ .ctx = ctx, .state = ctx.instance.scheduleActivity(activity_type, options, args) };
     }
 
+    /// Schedules a local activity: one the worker running this workflow executes itself, for
+    /// short activities where a task queue round trip costs more than the work. The activity
+    /// must be registered on this worker. Returns the same future as `executeActivity`.
+    /// A retry whose backoff exceeds `local_retry_threshold` waits on a workflow timer;
+    /// canceling the future then cancels the retry at once, whatever the cancellation type.
+    pub fn executeLocalActivity(ctx: *Context, comptime Activity: type, options: LocalActivityOptions, args: Activity.Args) ActivityFuture(Activity.Result) {
+        return .{ .ctx = ctx, .state = ctx.instance.scheduleLocalActivity(Activity.activity_name, options, args) };
+    }
+
+    /// Schedules a local activity by its type name, decoding its result as `Result`. `args`
+    /// is a tuple of argument values.
+    pub fn executeLocalActivityByName(ctx: *Context, comptime Result: type, activity_type: []const u8, options: LocalActivityOptions, args: anytype) ActivityFuture(Result) {
+        return .{ .ctx = ctx, .state = ctx.instance.scheduleLocalActivity(activity_type, options, args) };
+    }
+
     /// The workflow's memo: the memo it started with, with this run's `upsertMemo` calls
     /// applied, sorted by name. The slice lives in the run's arena; a later upsert leaves a
     /// slice returned earlier unchanged.
@@ -203,7 +248,8 @@ pub const Context = struct {
     }
 };
 
-pub const ActivityError = error{ ActivityFailed, Canceled, OutOfMemory, InvalidPayload, UnknownEncoding, WrongArgumentCount };
+/// `InvalidOptions`: the options were rejected before scheduling (the worker logs why).
+pub const ActivityError = error{ ActivityFailed, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
 
 /// The pending result of an activity.
 pub fn ActivityFuture(comptime T: type) type {
@@ -211,8 +257,8 @@ pub fn ActivityFuture(comptime T: type) type {
         const Self = @This();
 
         ctx: *Context,
-        /// Null if scheduling failed (out of memory); `get` then returns that error.
-        state: ?*Instance.ActivityState,
+        /// The scheduling error, if scheduling failed; `get` then returns it.
+        state: Instance.ScheduleError!*Instance.ActivityState,
 
         /// Waits for the activity and returns its result. On `error.ActivityFailed`, read the
         /// failure with `failure`. If the calling coroutine is canceled while waiting (the
@@ -223,7 +269,7 @@ pub fn ActivityFuture(comptime T: type) type {
         /// acknowledging the cancel, this returns its result or `error.ActivityFailed`, and
         /// the next cancelable wait returns `error.Canceled`.
         pub fn get(f: Self) ActivityError!T {
-            const state = f.state orelse return error.OutOfMemory;
+            const state = try f.state;
             try f.ctx.instance.awaitActivity(state);
             switch (state.outcome.?) {
                 .completed => |maybe| {
@@ -240,7 +286,7 @@ pub fn ActivityFuture(comptime T: type) type {
 
         /// The activity's failure, after `get` returned `error.ActivityFailed`.
         pub fn failure(f: Self) ?*const failure_mod.Failure {
-            const state = f.state orelse return null;
+            const state = f.state catch return null;
             const outcome = state.outcome orelse return null;
             return switch (outcome) {
                 .completed => null,
@@ -250,13 +296,13 @@ pub fn ActivityFuture(comptime T: type) type {
 
         /// Whether the activity has resolved, so `get` won't block.
         pub fn isReady(f: Self) bool {
-            const state = f.state orelse return true;
+            const state = f.state catch return true;
             return state.outcome != null;
         }
 
         /// Requests cancellation of the activity.
         pub fn cancel(f: Self) void {
-            if (f.state) |s| f.ctx.instance.cancelActivity(s);
+            if (f.state) |s| f.ctx.instance.cancelActivity(s) else |_| {}
         }
     };
 }

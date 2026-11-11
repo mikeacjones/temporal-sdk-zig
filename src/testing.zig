@@ -681,6 +681,33 @@ const Fixtures = struct {
         return "not canceled";
     }
     const WaitCancellation = workflow.Def("WaitCancellation", waitCancellation);
+
+    /// Fails its first two attempts, then greets.
+    fn flakyGreet(ctx: *activity.Context, name: []const u8) ![]const u8 {
+        if (ctx.info().attempt < 3) return error.NotYet;
+        return std.fmt.allocPrint(ctx.allocator(), "Hello {s} on attempt {d}!", .{ name, ctx.info().attempt });
+    }
+    const FlakyGreet = activity.Def("FlakyGreet", flakyGreet);
+
+    /// Runs `Greet` as a local activity, then `FlakyGreet` with a retry interval above its
+    /// local retry threshold, so each retry waits on a workflow timer.
+    fn localGreetings(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const first = try ctx.executeLocalActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get();
+        const second = try ctx.executeLocalActivity(FlakyGreet, .{
+            .start_to_close_timeout = .fromSeconds(10),
+            .retry_policy = .{ .initial_interval = .fromSeconds(1), .backoff_coefficient = 1 },
+            .local_retry_threshold = .fromMilliseconds(500),
+        }, .{name}).get();
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ first, second });
+    }
+    const LocalGreetings = workflow.Def("LocalGreetings", localGreetings);
+
+    fn remoteGreetings(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const first = try ctx.executeLocalActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get();
+        const second = try ctx.executeActivity(FlakyGreet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get();
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ first, second });
+    }
+    const LocalGreetingsChanged = workflow.Def("LocalGreetings", remoteGreetings);
 };
 
 test "WorkflowEnvironment runs a workflow with a test double for its activity" {
@@ -761,6 +788,18 @@ test "WorkflowReplayer replays a workflow that waits for its activity's cancella
     defer ok.deinit();
     try ok.registerWorkflow(Fixtures.WaitCancellation);
     try ok.replayHistoryJson(wait_cancellation_history);
+}
+
+test "WorkflowEnvironment runs local activities, retrying one after workflow timers" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.LocalGreetings);
+    try env.registerActivity(Fixtures.Greet);
+    try env.registerActivity(Fixtures.FlakyGreet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(Fixtures.LocalGreetings, .{"Temporal"}, arena.allocator(), null);
+    try testing.expectEqualStrings("Hello Temporal! Hello Temporal on attempt 3!", result);
 }
 
 test "client: generated IDs, start delay, history, and terminate" {
@@ -1007,6 +1046,22 @@ test "time-skipping WorkflowEnvironment sleep advances server time" {
     const before = try env.now();
     try env.sleep(.fromSeconds(std.time.s_per_hour));
     try testing.expect(before.durationTo(try env.now()).nanoseconds >= std.time.ns_per_hour);
+}
+
+/// A dev-server run of `Fixtures.LocalGreetings`, whose second local activity waited on two
+/// backoff timers, exported with `temporal workflow show`.
+const local_activity_history = @embedFile("testdata/local_activity_history.json");
+
+test "WorkflowReplayer replays local activities and their backoff timers" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(Fixtures.LocalGreetings);
+    try ok.replayHistoryJson(local_activity_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(Fixtures.LocalGreetingsChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(local_activity_history));
 }
 
 test "dev-server WorkflowEnvironment starts a workflow and awaits its result" {

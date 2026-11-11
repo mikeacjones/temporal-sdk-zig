@@ -123,7 +123,8 @@ pub const Worker = struct {
             .task_types = .{
                 .workflows = w.workflows.count() > 0,
                 .remote_activities = w.activities.count() > 0,
-                .local_activities = false,
+                // The core runs local activities only on a worker that also polls workflows.
+                .local_activities = w.workflows.count() > 0 and w.activities.count() > 0,
                 .nexus = false,
             },
             .workflow_task_pollers = .{ .simple_maximum = w.options.max_concurrent_workflow_task_pollers },
