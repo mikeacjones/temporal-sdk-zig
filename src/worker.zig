@@ -156,7 +156,22 @@ pub const Worker = struct {
         log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
 
         var workflows_done = if (w.workflows.count() > 0) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
-        var activities_done = if (w.activities.count() > 0) try w.io.concurrent(activityLoop, .{ w, core }) else null;
+        // Once a loop polls `core`, returning early would free the core worker under it: shut
+        // down like a normal stop, drain both pollers (finalizing waits for each to return
+        // null), finalize, then return the error.
+        var start_failed: ?RunError = null;
+        var activities_done = if (w.activities.count() > 0) w.io.concurrent(activityLoop, .{ w, core }) catch |err| blk: {
+            if (workflows_done == null) return err;
+            log.warn("starting the activity loop failed, stopping the worker: {t}", .{err});
+            start_failed = err;
+            {
+                w.stop_mutex.lockUncancelable(w.io);
+                defer w.stop_mutex.unlock(w.io);
+                core.initiateShutdown();
+            }
+            activityLoop(w, core);
+            break :blk null;
+        } else null;
         if (workflows_done) |*f| f.await(w.io);
         if (activities_done) |*f| f.await(w.io);
 
@@ -171,9 +186,10 @@ pub const Worker = struct {
         }
         core.finalizeShutdown(w.gpa, w.io, &message) catch |err| {
             log.err("worker shutdown failed: {s}", .{message orelse @errorName(err)});
-            return err;
+            return start_failed orelse err;
         };
         log.info("Stopped Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
+        if (start_failed) |err| return err;
     }
 
     /// Asks `run` to stop: polling ends, in-flight work finishes, then `run` returns. Running
@@ -727,6 +743,56 @@ test "stop called repeatedly from another thread while the worker finishes shutt
         thread.join();
         try result;
     }
+}
+
+/// An Io whose `concurrent` succeeds `allowed` times and then fails, standing in for a
+/// machine that runs out of threads between the worker's two poll loops.
+const ScarceConcurrency = struct {
+    var inner: Io = undefined;
+    var allowed: std.atomic.Value(usize) = .init(0);
+    var vtable: Io.VTable = undefined;
+
+    fn io(base: Io, n: usize) Io {
+        inner = base;
+        allowed.store(n, .release);
+        vtable = base.vtable.*;
+        vtable.concurrent = concurrent;
+        return .{ .userdata = base.userdata, .vtable = &vtable };
+    }
+
+    fn concurrent(
+        userdata: ?*anyopaque,
+        result_len: usize,
+        result_alignment: std.mem.Alignment,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    ) Io.ConcurrentError!*Io.AnyFuture {
+        var n = allowed.load(.acquire);
+        while (true) {
+            if (n == 0) return error.ConcurrencyUnavailable;
+            n = allowed.cmpxchgWeak(n, n - 1, .acq_rel, .acquire) orelse break;
+        }
+        return inner.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
+    }
+};
+
+// The workflow loop is already polling the core worker when the activity loop can't start, so
+// `run` must drain it before freeing the core worker.
+test "run shuts down the started workflow loop when the activity loop can't start" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, ScarceConcurrency.io(testing.io, 1), &client, "scarce-concurrency", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    try testing.expectError(error.ConcurrencyUnavailable, w.run());
+    try testing.expectEqual(0, ScarceConcurrency.allowed.load(.acquire));
 }
 
 const CancelTest = struct {
