@@ -6,6 +6,13 @@ const builtin = @import("builtin");
 /// The sdk-core C bridge API, translated from temporal-sdk-core-c-bridge.h.
 pub const c = @import("core_c");
 
+/// Byte buffers and metadata crossing the C boundary, and their ownership rules.
+pub const bytes = @import("bridge/bytes.zig");
+
+test {
+    _ = bytes;
+}
+
 test "core runtime can be created and freed" {
     var options = std.mem.zeroes(c.TemporalCoreRuntimeOptions);
     options.telemetry = null;
