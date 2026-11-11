@@ -399,7 +399,7 @@ pub const WorkflowEnvironment = struct {
         var scratch: std.heap.ArenaAllocator = .init(env.gpa);
         defer scratch.deinit();
         const history = try env.client.fetchHistory(scratch.allocator(), workflow_id, run_id);
-        var replayer: WorkflowReplayer = .{ .gpa = env.gpa, .io = env.io, .workflows = env.worker.workflows };
+        var replayer: WorkflowReplayer = .{ .gpa = env.gpa, .io = env.io, .workflows = env.worker.workflows, .workflow_id = workflow_id };
         return replayer.replayHistory(history);
     }
 
@@ -456,6 +456,11 @@ pub const WorkflowReplayer = struct {
     gpa: Allocator,
     io: Io,
     workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty,
+    /// The workflow ID replayed workflows see in `ctx.info().workflow_id`. A history doesn't
+    /// record its own workflow ID, so set this to the original run's ID when the workflow's
+    /// commands depend on it (a child or activity ID derived from it, for example), or
+    /// replay fails with `error.Nondeterminism`. Borrowed: it must outlive every replay call.
+    workflow_id: []const u8 = "replay",
 
     pub fn init(gpa: Allocator, io: Io) WorkflowReplayer {
         return .{ .gpa = gpa, .io = io };
@@ -534,7 +539,7 @@ pub const WorkflowReplayer = struct {
         // The core sends the history from a background task that uses the pusher, so the
         // pusher is freed only after the worker has shut down (as the .NET SDK does).
         defer replayer.finishPushing();
-        replayer.push(r.gpa, "replay", history_bytes, &message) catch {
+        replayer.push(r.gpa, r.workflow_id, history_bytes, &message) catch {
             log.err("pushing a history for replay failed: {s}", .{message orelse "unknown error"});
             return error.ReplayFailed;
         };
@@ -792,6 +797,13 @@ const ChildFixtures = struct {
         return child.get();
     }
     const Parent = workflow.Def("Parent", parent);
+
+    /// Runs `GreetChild` under an ID derived from its own, so replay needs the real ID.
+    fn parentOfNamed(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const child_id = try std.fmt.allocPrint(ctx.allocator(), "{s}-child", .{ctx.info().workflow_id});
+        return ctx.executeChildWorkflow(GreetChild, .{ .id = child_id }, .{name}).get();
+    }
+    const ParentOfNamed = workflow.Def("ParentOfNamed", parentOfNamed);
 
     /// `parent` starting a different child type, which can't replay `Parent`'s history.
     fn parentOfOther(ctx: *workflow.Context, name: []const u8) ![]const u8 {
@@ -1477,6 +1489,32 @@ test "time-skipping WorkflowEnvironment: a cron child is still pending when its 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try testing.expect(try env.executeWorkflow(ChildFixtures.CronParent, .{}, arena.allocator(), null));
+}
+
+test "replay runs a workflow under its real workflow ID" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChildFixtures.ParentOfNamed);
+    try env.registerWorkflow(ChildFixtures.GreetChild);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // getResult replays the run under its own ID.
+    var run = try env.startWorkflow(ChildFixtures.ParentOfNamed, .{ .task_queue = "" }, .{"Temporal"});
+    defer run.deinit();
+    try testing.expectEqualStrings("Hello Temporal from a child!", try env.getResult(ChildFixtures.ParentOfNamed, &run, a, null));
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var replayer: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(ChildFixtures.ParentOfNamed);
+    replayer.workflow_id = run.id;
+    try replayer.replayHistory(history);
+
+    // Under another ID the derived child ID differs from the recorded one.
+    replayer.workflow_id = "another-id";
+    try testing.expectError(error.Nondeterminism, replayer.replayHistory(history));
 }
 
 /// A dev-server run of `ChildFixtures.Parent`, whose child ran on the same worker, exported
