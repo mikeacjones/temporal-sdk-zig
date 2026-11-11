@@ -171,6 +171,26 @@ pub const Client = struct {
         };
     }
 
+    /// Requests cancellation of a workflow execution. The workflow sees it as `error.Canceled`
+    /// from its next cancelable wait and may clean up before it returns; the run ends
+    /// canceled when the workflow returns `error.Canceled`. An empty `run_id` targets the
+    /// latest run. Returns `error.NotFound` if no such workflow exists.
+    pub fn cancelWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!void {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = c.rpc(wfs.RequestCancelWorkflowExecutionResponse, "RequestCancelWorkflowExecution", wfs.RequestCancelWorkflowExecutionRequest{
+            .namespace = c.namespace,
+            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .identity = c.identity,
+            .request_id = try uuid(a, c.io),
+            .reason = reason,
+        }, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+    }
+
     /// Returns the full event history of a workflow run (all pages). An empty `run_id` reads
     /// the latest run. Memory comes from `arena`.
     pub fn fetchHistory(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!proto.temporal.api.history.v1.History {
