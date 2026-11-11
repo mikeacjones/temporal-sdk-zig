@@ -8,7 +8,8 @@
 //!     try w.runUntilSignal(); // stops on SIGINT or SIGTERM
 //!
 //! Workflow activations are processed one at a time on one thread, each on its run's
-//! deterministic Io. Activities run concurrently on the worker's Io.
+//! deterministic Io. Activities run concurrently on the worker's Io, each on its own task so
+//! a cancel from the core reaches it as `std.Io` cancellation.
 
 const std = @import("std");
 const bridge = @import("bridge.zig");
@@ -39,6 +40,9 @@ pub const Options = struct {
     identity: []const u8 = "",
     /// Stack size for each workflow coroutine.
     workflow_stack_size: usize = 256 * 1024,
+    /// How long running activities may keep running after `stop` before they are canceled
+    /// with reason `worker_shutdown`.
+    graceful_shutdown_period: Io.Duration = .zero,
 };
 
 pub const Worker = struct {
@@ -124,6 +128,7 @@ pub const Worker = struct {
             },
             .workflow_task_pollers = .{ .simple_maximum = w.options.max_concurrent_workflow_task_pollers },
             .activity_task_pollers = .{ .simple_maximum = w.options.max_concurrent_activity_task_pollers },
+            .graceful_shutdown_period_ms = std.math.cast(u64, w.options.graceful_shutdown_period.toMilliseconds()) orelse 0,
         }, &message) catch |err| {
             log.err("creating the worker failed: {s}", .{message orelse @errorName(err)});
             return err;
@@ -170,8 +175,9 @@ pub const Worker = struct {
         log.info("Stopped Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
     }
 
-    /// Asks `run` to stop: polling ends, in-flight work finishes, then `run` returns. Safe to
-    /// call from any thread, before or during `run`.
+    /// Asks `run` to stop: polling ends, in-flight work finishes, then `run` returns. Running
+    /// activities are canceled (reason `worker_shutdown`) once `graceful_shutdown_period`
+    /// has passed. Safe to call from any thread, before or during `run`.
     pub fn stop(w: *Worker) void {
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
@@ -310,6 +316,8 @@ fn registeredNames(a: Allocator, map: anytype) ![]const u8 {
 
 fn activityLoop(w: *Worker, core: bridge.Worker) void {
     var group: Io.Group = .init;
+    var running: RunningActivities = .{};
+    defer running.map.deinit(w.gpa);
     var message: ?[]u8 = null;
     defer if (message) |m| w.gpa.free(m);
     while (true) {
@@ -318,45 +326,135 @@ fn activityLoop(w: *Worker, core: bridge.Worker) void {
             w.stop();
             continue;
         } orelse break;
+        const run = receiveActivityTask(w, &running, polled) orelse continue;
         // Each activity gets its own thread: `async` would run it inline in this loop once the
         // Io has as many busy threads as CPUs, running activities one at a time. The core's
         // activity slots bound how many run at once.
-        group.concurrent(w.io, runActivityTask, .{ w, core, polled }) catch {
+        group.concurrent(w.io, superviseActivity, .{ w, core, &running, run }) catch {
             log.warn("no thread available for an activity; running it on the polling thread", .{});
-            runActivityTask(w, core, polled);
+            superviseActivity(w, core, &running, run);
         };
     }
     group.await(w.io) catch {};
 }
 
-fn runActivityTask(w: *Worker, core: bridge.Worker, polled: bridge.Worker.Polled) void {
-    defer polled.deinit();
-    var arena_state: std.heap.ArenaAllocator = .init(w.gpa);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
+/// The activities a worker is running, by task token, so the poll loop can deliver Cancel
+/// tasks to them. The poll loop adds runs; each run's supervisor removes and frees its own.
+/// A run is only touched by the poll loop while holding `mutex` and finding it in `map`.
+const RunningActivities = struct {
+    mutex: Io.Mutex = .init,
+    /// Keys are the runs' task tokens, owned by the runs.
+    map: std.StringHashMapUnmanaged(*RunningActivity) = .empty,
+};
+
+/// One activity, from its Start task until its result is reported.
+const RunningActivity = struct {
+    arena: std.heap.ArenaAllocator,
+    polled: bridge.Worker.Polled,
+    task_token: []const u8,
+    start: task_pb.Start,
+    ctx: activity.Context,
+    /// Set when the activity returns or a cancel arrives; wakes the supervisor.
+    wake: Io.Event = .unset,
+
+    fn destroy(run: *RunningActivity, gpa: Allocator) void {
+        run.arena.deinit();
+        run.polled.deinit();
+        gpa.destroy(run);
+    }
+};
+
+/// Decodes a polled activity task. Returns a new run for a Start task; delivers a Cancel
+/// task to its run and returns null.
+fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.Worker.Polled) ?*RunningActivity {
+    const run = w.gpa.create(RunningActivity) catch {
+        log.err("out of memory receiving an activity task; the core will time it out", .{});
+        polled.deinit();
+        return null;
+    };
+    run.* = .{
+        .arena = .init(w.gpa),
+        .polled = polled,
+        .task_token = &.{},
+        .start = .{},
+        .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = undefined, .logger_ = .{} },
+    };
+    var keep = false;
+    defer if (!keep) run.destroy(w.gpa);
 
     var reader: Io.Reader = .fixed(polled.bytes());
-    const task = task_pb.ActivityTask.decode(&reader, a) catch |err| {
+    const task = task_pb.ActivityTask.decode(&reader, run.arena.allocator()) catch |err| {
         log.err("decoding an activity task failed: {t}", .{err});
-        return;
+        return null;
     };
-    const variant = task.variant orelse return;
-    const start = switch (variant) {
-        .start => |s| s,
-        // Cancellation of running activities is not delivered yet in this version; the
-        // activity's own result completes the task.
-        .cancel => return,
-    };
+    switch (task.variant orelse return null) {
+        .start => |s| {
+            run.task_token = task.task_token;
+            run.start = s;
+            running.mutex.lockUncancelable(w.io);
+            defer running.mutex.unlock(w.io);
+            running.map.put(w.gpa, run.task_token, run) catch
+                log.warn("out of memory tracking activity {s}; it runs, but cancels won't reach it", .{s.activity_id});
+            keep = true;
+            return run;
+        },
+        .cancel => |c| {
+            running.mutex.lockUncancelable(w.io);
+            defer running.mutex.unlock(w.io);
+            // A run that already finished has nothing to cancel.
+            const target = running.map.get(task.task_token) orelse return null;
+            if (target.ctx.setCancelReason(cancelReason(c.reason))) target.wake.set(w.io);
+            return null;
+        },
+    }
+}
 
-    const result = executeActivity(w, core, a, task.task_token, &start) catch |err| result_pb.ActivityExecutionResult{
-        .status = .{ .failed = .{ .failure = failure_mod.fromError(a, err) catch return } },
+fn cancelReason(reason: task_pb.ActivityCancelReason) activity.CancelReason {
+    return switch (reason) {
+        .NOT_FOUND => .not_found,
+        .CANCELLED => .canceled,
+        .TIMED_OUT => .timed_out,
+        .WORKER_SHUTDOWN => .worker_shutdown,
+        .PAUSED => .paused,
+        .RESET => .reset,
+        _ => .canceled,
     };
+}
+
+/// Runs an activity on a task of its own, waits for it to return or for a cancel, cancels the
+/// task through its `std.Io` on a cancel, and reports the result. Reporting happens here, not
+/// on the activity's task, so a cancel arriving late can't interrupt the report.
+fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivities, run: *RunningActivity) void {
+    defer {
+        running.mutex.lockUncancelable(w.io);
+        _ = running.map.remove(run.task_token);
+        running.mutex.unlock(w.io);
+        run.destroy(w.gpa);
+    }
+    const outcome = blk: {
+        var task = w.io.concurrent(callActivity, .{ w, core, run }) catch {
+            log.warn("no thread available for activity {s}; running it here, where cancels can't reach it", .{run.start.activity_id});
+            break :blk callActivity(w, core, run);
+        };
+        run.wake.waitUncancelable(w.io);
+        break :blk if (run.ctx.cancelReason() != null) task.cancel(w.io) else task.await(w.io);
+    };
+    const a = run.arena.allocator();
+    const result = outcome catch return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
     var encoded: Io.Writer.Allocating = .init(a);
-    (proto.coresdk.self.ActivityTaskCompletion{ .task_token = task.task_token, .result = result }).encode(&encoded.writer, a) catch return;
+    (proto.coresdk.self.ActivityTaskCompletion{ .task_token = run.task_token, .result = result }).encode(&encoded.writer, a) catch return;
     var message: ?[]u8 = null;
     defer if (message) |m| w.gpa.free(m);
     core.completeActivityTask(w.gpa, w.io, encoded.written(), &message) catch |err| {
         log.err("completing an activity task failed: {s}", .{message orelse @errorName(err)});
+    };
+}
+
+fn callActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) error{OutOfMemory}!result_pb.ActivityExecutionResult {
+    defer run.wake.set(w.io);
+    const a = run.arena.allocator();
+    return executeActivity(w, core, run) catch |err| .{
+        .status = .{ .failed = .{ .failure = try failure_mod.fromError(a, err) } },
     };
 }
 
@@ -384,7 +482,9 @@ const Heartbeats = struct {
     }
 };
 
-fn executeActivity(w: *Worker, core: bridge.Worker, a: Allocator, task_token: []const u8, start: *const task_pb.Start) !result_pb.ActivityExecutionResult {
+fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !result_pb.ActivityExecutionResult {
+    const a = run.arena.allocator();
+    const start = &run.start;
     const entry = w.activities.get(start.activity_type) orelse {
         const known = try registeredNames(a, w.activities);
         return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
@@ -393,32 +493,36 @@ fn executeActivity(w: *Worker, core: bridge.Worker, a: Allocator, task_token: []
         }) } } };
     };
     const execution = start.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
-    var ctx: activity.Context = .{
-        .arena = a,
-        .io_ = w.io,
-        .info_ = .{
-            .activity_id = start.activity_id,
-            .activity_type = start.activity_type,
-            .task_queue = w.task_queue,
-            .workflow_id = execution.workflow_id,
-            .workflow_run_id = execution.run_id,
-            .workflow_type = start.workflow_type,
-            .workflow_namespace = start.workflow_namespace,
-            .attempt = start.attempt,
-        },
-        .logger_ = .{ .context = try log_mod.contextString(a, .{
-            .ActivityID = start.activity_id,
-            .ActivityType = start.activity_type,
-            .Attempt = start.attempt,
-            .WorkflowType = start.workflow_type,
-            .WorkflowID = execution.workflow_id,
-            .RunID = execution.run_id,
-        }) },
+    // The context already exists: a cancel may have set its reason.
+    const ctx = &run.ctx;
+    ctx.arena = a;
+    ctx.info_ = .{
+        .activity_id = start.activity_id,
+        .activity_type = start.activity_type,
+        .task_queue = w.task_queue,
+        .workflow_id = execution.workflow_id,
+        .workflow_run_id = execution.run_id,
+        .workflow_type = start.workflow_type,
+        .workflow_namespace = start.workflow_namespace,
+        .attempt = start.attempt,
     };
-    var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = task_token };
+    ctx.logger_ = .{ .context = try log_mod.contextString(a, .{
+        .ActivityID = start.activity_id,
+        .ActivityType = start.activity_type,
+        .Attempt = start.attempt,
+        .WorkflowType = start.workflow_type,
+        .WorkflowID = execution.workflow_id,
+        .RunID = execution.run_id,
+    }) };
+    var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token };
     ctx.heartbeat_details = start.heartbeat_details.items;
     ctx.heartbeat_sink = .{ .gpa = w.gpa, .context = &heartbeats, .record = Heartbeats.record };
-    const payload = entry.invoke(entry.receiver, &ctx, start.input.items) catch |err| {
+    const payload = entry.invoke(entry.receiver, ctx, start.input.items) catch |err| {
+        if (err == error.Canceled) if (ctx.cancelReason()) |reason| return .{ .status = .{ .cancelled = .{ .failure = .{
+            .message = try std.fmt.allocPrint(a, "activity canceled: {t}", .{reason}),
+            .source = failure_mod.source,
+            .failure_info = .{ .canceled_failure_info = .{} },
+        } } } };
         const f = if (ctx.pending_failure) |p| try failure_mod.application(a, p) else try failure_mod.fromError(a, err);
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };
@@ -620,4 +724,150 @@ test "stop called repeatedly from another thread while the worker finishes shutt
         thread.join();
         try result;
     }
+}
+
+const CancelTest = struct {
+    const Env = @import("testing.zig").WorkflowEnvironment;
+    const EventType = proto.temporal.api.enums.v1.EventType;
+
+    var started: Io.Event = .unset;
+    /// Set once `beat` has seen a cancel; `seen_reason` is written before.
+    var observed: Io.Event = .unset;
+    var seen_reason: ?activity.CancelReason = null;
+
+    /// Heartbeats until canceled. With `ignore`, swallows the cancel and returns a value.
+    fn beat(ctx: *activity.Context, ignore: bool) ![]const u8 {
+        started.set(ctx.io());
+        while (true) {
+            ctx.heartbeat({});
+            ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
+                seen_reason = ctx.cancelReason();
+                observed.set(ctx.io());
+                if (ignore) return "finished anyway";
+                return err;
+            };
+        }
+    }
+    const Beat = activity.Def("Beat", beat);
+
+    fn waitStarted(ctx: *activity.Context) !void {
+        try started.wait(ctx.io());
+    }
+    const WaitStarted = activity.Def("WaitStarted", waitStarted);
+
+    const beat_options: workflow.ActivityOptions = .{
+        .start_to_close_timeout = .fromSeconds(60),
+        .heartbeat_timeout = .fromSeconds(2),
+        .cancellation_type = .wait_cancellation_completed,
+    };
+
+    /// Cancels `Beat` once it is running and returns its result, or "canceled".
+    fn cancelBeat(ctx: *workflow.Context, ignore: bool) ![]const u8 {
+        const beating = ctx.executeActivity(Beat, beat_options, .{ignore});
+        try ctx.executeActivity(WaitStarted, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+        beating.cancel();
+        return beating.get() catch |err| switch (err) {
+            error.ActivityFailed => if (failure_mod.rootCause(beating.failure().?).failure_info.? == .canceled_failure_info) "canceled" else err,
+            else => err,
+        };
+    }
+    const CancelBeat = workflow.Def("CancelBeat", cancelBeat);
+
+    /// Runs `Beat`; when the workflow is canceled, waits for the activity's cancellation to
+    /// complete before closing canceled.
+    fn awaitBeat(ctx: *workflow.Context) ![]const u8 {
+        const beating = ctx.executeActivity(Beat, beat_options, .{false});
+        return beating.get() catch |err| {
+            if (err == error.Canceled) _ = beating.get() catch {};
+            return err;
+        };
+    }
+    const AwaitBeat = workflow.Def("AwaitBeat", awaitBeat);
+
+    fn runBeat(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(Beat, beat_options, .{false}).get();
+    }
+    const RunBeat = workflow.Def("RunBeat", runBeat);
+
+    fn reset() void {
+        started = .unset;
+        observed = .unset;
+        seen_reason = null;
+    }
+
+    fn countEvents(env: *Env, run: anytype, event_type: EventType) !usize {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const history = try env.client.fetchHistory(arena.allocator(), run.id, run.run_id);
+        var n: usize = 0;
+        for (history.events.items) |e| n += @intFromBool(e.event_type == event_type);
+        return n;
+    }
+
+    fn start() !*Env {
+        reset();
+        const env = try Env.start(testing.allocator, testing.io);
+        errdefer env.deinit();
+        try env.registerWorkflow(CancelBeat);
+        try env.registerWorkflow(AwaitBeat);
+        try env.registerWorkflow(RunBeat);
+        try env.registerActivity(Beat);
+        try env.registerActivity(WaitStarted);
+        return env;
+    }
+};
+
+test "a heartbeating activity canceled by its workflow sees the cancel and reports canceled" {
+    const env = try CancelTest.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var run = try env.startWorkflow(CancelTest.CancelBeat, .{ .task_queue = "" }, .{false});
+    defer run.deinit();
+    try testing.expectEqualStrings("canceled", try env.getResult(CancelTest.CancelBeat, &run, arena.allocator(), null));
+    try testing.expectEqual(@as(?activity.CancelReason, .canceled), CancelTest.seen_reason);
+    try testing.expectEqual(1, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_CANCELED));
+}
+
+test "an activity that ignores a cancel and returns a value completes normally" {
+    const env = try CancelTest.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var run = try env.startWorkflow(CancelTest.CancelBeat, .{ .task_queue = "" }, .{true});
+    defer run.deinit();
+    try testing.expectEqualStrings("finished anyway", try env.getResult(CancelTest.CancelBeat, &run, arena.allocator(), null));
+    try testing.expectEqual(@as(?activity.CancelReason, .canceled), CancelTest.seen_reason);
+    try testing.expectEqual(0, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_CANCELED));
+    try testing.expectEqual(2, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_COMPLETED));
+}
+
+test "canceling a workflow cancels its heartbeating activity" {
+    const env = try CancelTest.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var run = try env.startWorkflow(CancelTest.AwaitBeat, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try CancelTest.started.wait(testing.io);
+    try env.client.cancelWorkflow(run.id, run.run_id, "testing activity cancellation");
+    try testing.expectError(error.WorkflowCanceled, env.getResult(CancelTest.AwaitBeat, &run, arena.allocator(), null));
+    try testing.expectEqual(@as(?activity.CancelReason, .canceled), CancelTest.seen_reason);
+    try testing.expectEqual(1, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_CANCELED));
+}
+
+test "stopping the worker cancels running activities with reason worker_shutdown" {
+    const env = try CancelTest.start();
+    defer env.deinit();
+
+    var run = try env.startWorkflow(CancelTest.RunBeat, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try CancelTest.started.wait(testing.io);
+    env.worker.stop();
+    try env.running.?.await(testing.io);
+    env.running = null;
+    try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
 }
