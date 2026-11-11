@@ -23,7 +23,8 @@
 //! - Time: `ctx.now()`.
 //!
 //! Canceling a future cancels what it is waiting on: a pending `io.sleep` cancels its timer and
-//! a pending `ActivityFuture.get` requests the activity's cancellation.
+//! a pending `ActivityFuture.get` requests the activity's cancellation, and a pending
+//! `ChildWorkflowFuture.get` or `started` the child workflow's.
 //!
 //! Queries read a workflow's state from outside. Name one with `QueryDef` and answer it with
 //! `ctx.setQueryHandler`; the handler runs synchronously and must not change state or block:
@@ -123,12 +124,45 @@ pub const LocalActivityOptions = struct {
     cancellation_type: ActivityCancellationType = .try_cancel,
 };
 
+/// What canceling a child workflow's future does: `try_cancel` requests the child's
+/// cancellation and reports it at once, `wait_cancellation_completed` requests it and waits for
+/// the child to end, and `abandon` reports it at once and leaves the child running.
+pub const ChildWorkflowCancellationType = enum { try_cancel, wait_cancellation_completed, abandon };
+
+/// What the server does to a child workflow still running when its parent closes.
+pub const ParentClosePolicy = enum { terminate, abandon, request_cancel };
+
+/// How a child workflow is started.
+pub const ChildWorkflowOptions = struct {
+    /// Empty generates a UUID from the workflow's seeded randomness, the same on replay.
+    id: []const u8 = "",
+    /// Empty runs the child on the parent's task queue.
+    task_queue: []const u8 = "",
+    /// Limits the child's whole chain of runs (retries, cron runs, continue-as-new).
+    execution_timeout: ?Duration = null,
+    /// Limits one run of the child.
+    run_timeout: ?Duration = null,
+    /// Limits one workflow task of the child.
+    task_timeout: ?Duration = null,
+    /// Null runs the child once.
+    retry_policy: ?RetryPolicy = null,
+    /// Runs the child on a cron schedule, such as "0 * * * *": its future resolves only when
+    /// the schedule ends (it times out or is canceled or terminated).
+    cron_schedule: []const u8 = "",
+    parent_close_policy: ParentClosePolicy = .terminate,
+    id_reuse_policy: enum { unspecified, allow_duplicate, allow_duplicate_failed_only, reject_duplicate } = .unspecified,
+    cancellation_type: ChildWorkflowCancellationType = .try_cancel,
+    /// Non-indexed values recorded with the child, built with `converter.toFields`. Only read
+    /// while starting.
+    memo: []const converter.Field = &.{},
+};
+
 pub const Context = struct {
     instance: *Instance,
     /// Set by `fail` and reported instead of the returned error's name.
     pending_failure: ?failure_mod.Application = null,
-    /// The last activity failure a future returned; used as the workflow failure's cause when
-    /// the workflow returns error.ActivityFailed.
+    /// The last activity or child workflow failure a future returned; reported as the
+    /// workflow's failure when the workflow returns the future's error.
     last_failure: ?*const failure_mod.Failure = null,
 
     /// The deterministic Io for this workflow: concurrency, timers, time, randomness.
@@ -218,6 +252,19 @@ pub const Context = struct {
     /// is a tuple of argument values.
     pub fn executeLocalActivityByName(ctx: *Context, comptime Result: type, activity_type: []const u8, options: LocalActivityOptions, args: anytype) ActivityFuture(Result) {
         return .{ .ctx = ctx, .state = ctx.instance.scheduleLocalActivity(activity_type, options, args) };
+    }
+
+    /// Starts a child workflow defined with `Def` and returns a future for its start and its
+    /// result. `args` is a tuple of the child's parameters after its context. The child runs
+    /// on whichever worker polls its task queue, this one included.
+    pub fn executeChildWorkflow(ctx: *Context, comptime Workflow: type, options: ChildWorkflowOptions, args: Workflow.Args) ChildWorkflowFuture(Workflow.Result) {
+        return .{ .ctx = ctx, .state = ctx.instance.startChildWorkflow(Workflow.workflow_name, options, args) };
+    }
+
+    /// Starts a child workflow by its type name, decoding its result as `Result`. `args` is a
+    /// tuple of argument values.
+    pub fn executeChildWorkflowByName(ctx: *Context, comptime Result: type, workflow_type: []const u8, options: ChildWorkflowOptions, args: anytype) ChildWorkflowFuture(Result) {
+        return .{ .ctx = ctx, .state = ctx.instance.startChildWorkflow(workflow_type, options, args) };
     }
 
     /// The workflow's memo: the memo it started with, with this run's `upsertMemo` calls
@@ -363,6 +410,88 @@ pub fn ActivityFuture(comptime T: type) type {
         /// Requests cancellation of the activity.
         pub fn cancel(f: Self) void {
             if (f.state) |s| f.ctx.instance.cancelActivity(s) else |_| {}
+        }
+    };
+}
+
+/// `ChildWorkflowFailed`: read the failure with the future's `failure`.
+/// `ChildWorkflowAlreadyStarted`: a workflow with the child's ID is already running (or, per
+/// `id_reuse_policy`, has run); `failure` describes it too.
+/// `InvalidOptions`: the options were rejected before starting (the worker logs why).
+pub const ChildWorkflowError = error{ ChildWorkflowFailed, ChildWorkflowAlreadyStarted, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
+
+/// A started child workflow. Arena memory of the parent run.
+pub const ChildWorkflowExecution = struct {
+    workflow_id: []const u8,
+    run_id: []const u8,
+};
+
+/// The pending start and result of a child workflow.
+pub fn ChildWorkflowFuture(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        ctx: *Context,
+        /// The validation error, if the start was rejected; `started` and `get` return it.
+        state: Instance.ScheduleError!*Instance.ChildState,
+
+        /// Waits until the server has started the child and returns its IDs. Returns
+        /// `error.ChildWorkflowAlreadyStarted` if its ID is taken, and `error.ChildWorkflowFailed`
+        /// if it could not start for another reason or was canceled before it started.
+        /// Canceling the calling coroutine cancels the child as `get` does.
+        pub fn started(f: Self) ChildWorkflowError!ChildWorkflowExecution {
+            const state = try f.state;
+            try f.ctx.instance.awaitChild(state, .started);
+            if (state.run_id) |run_id| return .{ .workflow_id = state.workflow_id, .run_id = run_id };
+            return f.fail(state);
+        }
+
+        /// Waits for the child to close and returns its result. On `error.ChildWorkflowFailed`
+        /// (the child failed, timed out, was terminated or canceled, or never started), read
+        /// the failure with `failure`. If the calling coroutine is canceled while waiting (the
+        /// workflow is canceled, or an enclosing future, `Select`, or `Group` is), the child's
+        /// cancellation is requested and this returns `error.Canceled`: at once for
+        /// `try_cancel` and `abandon`, and once the child has closed for
+        /// `wait_cancellation_completed`. If that child completes or fails instead, this
+        /// returns its result or error, and the next cancelable wait returns `error.Canceled`.
+        pub fn get(f: Self) ChildWorkflowError!T {
+            const state = try f.state;
+            try f.ctx.instance.awaitChild(state, .result);
+            switch (state.outcome.?) {
+                .completed => |maybe| {
+                    if (T == void) return;
+                    const p = maybe orelse return error.InvalidPayload;
+                    return converter.fromPayload(T, f.ctx.allocator(), p);
+                },
+                .failed, .cancelled => return f.fail(state),
+            }
+        }
+
+        fn fail(f: Self, state: *const Instance.ChildState) ChildWorkflowError {
+            f.ctx.last_failure = f.failure();
+            return if (state.already_started) error.ChildWorkflowAlreadyStarted else error.ChildWorkflowFailed;
+        }
+
+        /// The child's failure, after `get` or `started` returned `error.ChildWorkflowFailed` or
+        /// `error.ChildWorkflowAlreadyStarted`.
+        pub fn failure(f: Self) ?*const failure_mod.Failure {
+            const state = f.state catch return null;
+            const outcome = state.outcome orelse return null;
+            return switch (outcome) {
+                .completed => null,
+                .failed, .cancelled => |fl| fl,
+            };
+        }
+
+        /// Whether the child has closed (or failed to start), so `get` won't block.
+        pub fn isReady(f: Self) bool {
+            const state = f.state catch return true;
+            return state.outcome != null;
+        }
+
+        /// Requests cancellation of the child, as its `cancellation_type` says.
+        pub fn cancel(f: Self) void {
+            if (f.state) |s| f.ctx.instance.cancelChild(s) else |_| {}
         }
     };
 }

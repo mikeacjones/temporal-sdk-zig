@@ -15,6 +15,7 @@ const converter = @import("../converter.zig");
 const failure_mod = @import("../failure.zig");
 const log = @import("../log.zig");
 const workflow = @import("../workflow.zig");
+const client = @import("../client.zig");
 const Scheduler = @import("Scheduler.zig");
 const WorkflowIo = @import("WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -40,8 +41,11 @@ replaying: bool = false,
 commands: std.ArrayList(cmd_pb.WorkflowCommand) = .empty,
 next_activity_seq: u32 = 1,
 next_timer_seq: u32 = 1,
+next_child_seq: u32 = 1,
 activities: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 timers: std.AutoHashMapUnmanaged(u32, *WorkflowIo.Timer) = .empty,
+/// Child workflows that have not closed, by seq.
+children: std.AutoHashMapUnmanaged(u32, *ChildState) = .empty,
 /// Local activities waiting on a workflow timer before their next attempt, by timer seq.
 backoffs: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 /// Coroutines blocked in `awaitCondition`, in the order they started waiting.
@@ -104,6 +108,38 @@ pub const ActivityState = struct {
     };
 };
 
+/// A child workflow, from its StartChildWorkflowExecution command until it closes. Arena
+/// memory; the future keeps pointing at it after it closes.
+pub const ChildState = struct {
+    seq: u32,
+    workflow_id: []const u8,
+    workflow_type: []const u8,
+    cancellation_type: workflow.ChildWorkflowCancellationType,
+    /// The coroutines blocked in `started` and in `get`.
+    start_waiter: ?*WorkflowIo.Wait = null,
+    result_waiter: ?*WorkflowIo.Wait = null,
+    /// Set once the server started the child.
+    run_id: ?[]const u8 = null,
+    /// Set once the child closed, or failed to start (or was canceled before it started).
+    outcome: ?Outcome = null,
+    /// The start failed because the workflow ID is taken.
+    already_started: bool = false,
+    cancel_requested: bool = false,
+
+    pub const Outcome = ActivityState.Outcome;
+
+    pub const Phase = enum { started, result };
+
+    fn reached(state: *const ChildState, phase: Phase) bool {
+        return state.outcome != null or (phase == .started and state.run_id != null);
+    }
+
+    fn wake(state: *ChildState, wio: *WorkflowIo) void {
+        if (state.start_waiter) |w| wio.wake(w);
+        if (state.result_waiter) |w| wio.wake(w);
+    }
+};
+
 pub const Options = struct {
     /// The worker's task queue and namespace, reported in `Info` and used as the default task
     /// queue for activities.
@@ -144,6 +180,8 @@ pub fn destroy(inst: *Instance) void {
     while (pending.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
     var backing_off = inst.backoffs.valueIterator();
     while (backing_off.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
+    var children = inst.children.valueIterator();
+    while (children.next()) |state| state.*.wake(&inst.wio);
     inst.wio.run();
     const gpa = inst.gpa;
     if (inst.sched.live == 0) {
@@ -194,6 +232,8 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
             },
             .update_random_seed => |s| inst.wio.setRandomSeed(s.randomness_seed),
             .resolve_activity => |r| try inst.resolveActivity(&r),
+            .resolve_child_workflow_execution_start => |r| try inst.resolveChildStart(&r),
+            .resolve_child_workflow_execution => |r| try inst.resolveChild(&r),
             .cancel_workflow => if (!inst.finished) if (inst.root) |root| inst.wio.cancelTask(root),
             .remove_from_cache => {},
             else => |other| {
@@ -372,7 +412,10 @@ fn finishIfDone(inst: *Instance) !void {
 fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
     const a = inst.arena();
     if (inst.ctx.pending_failure) |p| return failure_mod.application(a, p);
-    if (err == error.ActivityFailed) if (inst.ctx.last_failure) |f| return f.*;
+    switch (err) {
+        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted => if (inst.ctx.last_failure) |f| return f.*,
+        else => {},
+    }
     return failure_mod.fromError(a, err);
 }
 
@@ -631,9 +674,158 @@ fn resolveActivity(inst: *Instance, r: *const act_pb.ResolveActivity) !void {
     if (state.waiter) |w| inst.wio.wake(w);
 }
 
+// ---------------------------------------------------------------- child workflows
+
+/// Emits StartChildWorkflowExecution for `workflow_type`. A child without an ID gets a UUID
+/// drawn from the workflow's seeded randomness, so replay generates the same one.
+pub fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workflow.ChildWorkflowOptions, args: anytype) ScheduleError!*ChildState {
+    if (workflow_type.len == 0) {
+        inst.logger.warn("executeChildWorkflowByName: the child workflow type is empty", .{ .ChildWorkflowID = options.id });
+        return error.InvalidOptions;
+    }
+    const a = inst.arena();
+    const state = try a.create(ChildState);
+    state.* = .{
+        .seq = inst.next_child_seq,
+        .workflow_id = if (options.id.len > 0) try a.dupe(u8, options.id) else try client.uuid(a, inst.wio.io()),
+        .workflow_type = try a.dupe(u8, workflow_type),
+        .cancellation_type = options.cancellation_type,
+    };
+    var cmd: cmd_pb.StartChildWorkflowExecution = .{
+        .seq = state.seq,
+        .namespace = inst.namespace,
+        .workflow_id = state.workflow_id,
+        .workflow_type = workflow_type,
+        .task_queue = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue,
+        .input = try converter.toPayloads(a, args),
+        .workflow_execution_timeout = protoDuration(options.execution_timeout),
+        .workflow_run_timeout = protoDuration(options.run_timeout),
+        .workflow_task_timeout = protoDuration(options.task_timeout),
+        .parent_close_policy = switch (options.parent_close_policy) {
+            .terminate => .PARENT_CLOSE_POLICY_TERMINATE,
+            .abandon => .PARENT_CLOSE_POLICY_ABANDON,
+            .request_cancel => .PARENT_CLOSE_POLICY_REQUEST_CANCEL,
+        },
+        .workflow_id_reuse_policy = switch (options.id_reuse_policy) {
+            .unspecified => .WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED,
+            .allow_duplicate => .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+            .allow_duplicate_failed_only => .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+            .reject_duplicate => .WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+        },
+        .cron_schedule = options.cron_schedule,
+        .cancellation_type = switch (options.cancellation_type) {
+            .try_cancel => .TRY_CANCEL,
+            .wait_cancellation_completed => .WAIT_CANCELLATION_COMPLETED,
+            .abandon => .ABANDON,
+        },
+    };
+    if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
+    try cmd.memo.ensureTotalCapacity(a, options.memo.len);
+    for (options.memo) |f| cmd.memo.appendAssumeCapacity(.{ .key = f.name, .value = f.value });
+    try inst.children.put(a, state.seq, state);
+    inst.next_child_seq += 1;
+    try inst.commands.append(a, .{ .variant = .{ .start_child_workflow_execution = cmd } });
+    return state;
+}
+
+/// Blocks the calling coroutine until the child reaches `phase` (started, or closed), or
+/// can't: a child that fails to start or closes before it started reaches both. Cancellation
+/// works as in `awaitActivity`: it cancels the child, and with `wait_cancellation_completed`
+/// waits for the core to resolve it (the child closed, or never started). Eviction ends the
+/// wait with error.Canceled.
+pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) error{Canceled}!void {
+    if (state.reached(phase)) return;
+    var wait = inst.wio.newWaitPoint();
+    const waiter = switch (phase) {
+        .started => &state.start_waiter,
+        .result => &state.result_waiter,
+    };
+    waiter.* = &wait;
+    defer waiter.* = null;
+    var canceled = false;
+    while (!state.reached(phase)) {
+        if (inst.evicting) return error.Canceled;
+        wait = inst.wio.newWaitPoint();
+        inst.wio.waitFor(&wait, !canceled) catch |err| {
+            inst.cancelChild(state);
+            if (state.cancellation_type != .wait_cancellation_completed) return err;
+            canceled = true;
+        };
+    }
+    if (!canceled) return;
+    if (state.outcome) |o| if (o == .cancelled) return error.Canceled;
+    inst.wio.io().recancel();
+}
+
+/// Sends CancelChildWorkflowExecution; the core resolves the child as its cancellation type
+/// says (and resolves a child whose start it hasn't sent yet as canceled before starting).
+pub fn cancelChild(inst: *Instance, state: *ChildState) void {
+    if (state.outcome != null or state.cancel_requested) return;
+    state.cancel_requested = true;
+    inst.commands.append(inst.arena(), .{ .variant = .{ .cancel_child_workflow_execution = .{
+        .child_workflow_seq = state.seq,
+        .reason = "the parent canceled the child workflow",
+    } } }) catch {
+        inst.task_failure = "out of memory requesting child workflow cancellation";
+    };
+}
+
+fn resolveChildStart(inst: *Instance, r: *const act_pb.ResolveChildWorkflowExecutionStart) !void {
+    const state = inst.children.get(r.seq) orelse return;
+    const a = inst.arena();
+    switch (r.status orelse return) {
+        .succeeded => |s| state.run_id = try a.dupe(u8, s.run_id),
+        .failed => |f| {
+            _ = inst.children.remove(r.seq);
+            state.already_started = f.cause == .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS;
+            state.outcome = .{ .failed = try startFailure(inst, state, f.cause) };
+        },
+        .cancelled => |c| {
+            _ = inst.children.remove(r.seq);
+            state.outcome = .{ .cancelled = try dupeFailure(a, c.failure) };
+        },
+    }
+    state.wake(&inst.wio);
+}
+
+/// A failure for a child the server refused to start; the core reports only the cause.
+fn startFailure(inst: *Instance, state: *const ChildState, cause: proto.coresdk.child_workflow.StartChildWorkflowExecutionFailedCause) !*const Failure {
+    const a = inst.arena();
+    const reason = switch (cause) {
+        .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS => "a workflow with this ID already exists",
+        .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND => "the namespace was not found",
+        .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE => "the versioning override is invalid",
+        else => "the server gave no cause",
+    };
+    const out = try a.create(Failure);
+    out.* = .{
+        .message = try std.fmt.allocPrint(a, "starting child workflow \"{s}\" with ID \"{s}\" failed: {s}", .{ state.workflow_type, state.workflow_id, reason }),
+        .source = failure_mod.source,
+        .failure_info = .{ .child_workflow_execution_failure_info = .{
+            .namespace = inst.namespace,
+            .workflow_execution = .{ .workflow_id = state.workflow_id },
+            .workflow_type = .{ .name = state.workflow_type },
+        } },
+    };
+    return out;
+}
+
+fn resolveChild(inst: *Instance, r: *const act_pb.ResolveChildWorkflowExecution) !void {
+    const kv = inst.children.fetchRemove(r.seq) orelse return;
+    const state = kv.value;
+    const a = inst.arena();
+    const status = (r.result orelse return).status orelse return;
+    state.outcome = switch (status) {
+        .completed => |s| .{ .completed = if (s.result) |p| try p.dupe(a) else null },
+        .failed => |f| .{ .failed = try dupeFailure(a, f.failure) },
+        .cancelled => |c| .{ .cancelled = try dupeFailure(a, c.failure) },
+    };
+    state.wake(&inst.wio);
+}
+
 fn dupeFailure(a: Allocator, f: ?Failure) !*const Failure {
     const out = try a.create(Failure);
-    out.* = if (f) |v| try v.dupe(a) else .{ .message = "activity failed" };
+    out.* = if (f) |v| try v.dupe(a) else .{ .message = "failed without a failure from the core" };
     return out;
 }
 
@@ -1447,4 +1639,275 @@ test "query: a handler context on the workflow coroutine's stack is rejected" {
     const done = commandsOf(try inst.activate(&try initActivation(a, "OnStack", .{}), a));
     try testing.expectEqualStrings("\"QueryContextOnStack\"", done[0].variant.?.complete_workflow_execution.result.?.data);
     try testing.expectEqual(@as(usize, 0), inst.queries.count());
+}
+
+// Child workflows. `Kid` itself never runs here: the tests resolve it.
+const ChildWf = struct {
+    fn kid(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "hi {s}", .{name});
+    }
+    const Kid = workflow.Def("Kid", kid);
+
+    /// Starts `Kid` with every option set, waits for its start, then its result.
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const a = ctx.allocator();
+        const f = ctx.executeChildWorkflow(Kid, .{
+            .execution_timeout = .fromSeconds(60),
+            .run_timeout = .fromSeconds(30),
+            .task_timeout = .fromSeconds(5),
+            .retry_policy = .{ .maximum_attempts = 2 },
+            .cron_schedule = "0 * * * *",
+            .parent_close_policy = .abandon,
+            .id_reuse_policy = .reject_duplicate,
+            .memo = try converter.toFields(a, .{ .owner = "parent" }),
+        }, .{"kid"});
+        const exec = f.started() catch |err| switch (err) {
+            error.ChildWorkflowAlreadyStarted => return std.fmt.allocPrint(a, "already started: {s}", .{f.failure().?.message}),
+            else => return err,
+        };
+        if (!std.mem.eql(u8, exec.workflow_id, ctx.info().workflow_id) and f.isReady()) return error.ReadyTooSoon;
+        return std.fmt.allocPrint(a, "{s} {s}: {s}", .{ exec.workflow_id, exec.run_id, try f.get() });
+    }
+    const Run = workflow.Def("RunChild", run);
+
+    /// Waits on `Kid` with the cancellation type named by `mode`; if `mode` ends in "+future",
+    /// cancels it through the future once it started. Sleeps after a result, which a re-armed
+    /// cancel interrupts.
+    fn cancel(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        const via_future = std.mem.endsWith(u8, mode, "+future");
+        const name = if (via_future) mode[0 .. mode.len - "+future".len] else mode;
+        const cancellation_type = std.meta.stringToEnum(workflow.ChildWorkflowCancellationType, name) orelse return error.InvalidPayload;
+        const f = ctx.executeChildWorkflow(Kid, .{ .id = "kid-1", .cancellation_type = cancellation_type }, .{"kid"});
+        if (via_future) {
+            _ = try f.started();
+            f.cancel();
+        }
+        const r = f.get() catch |err| switch (err) {
+            error.ChildWorkflowFailed => return switch (failure_mod.rootCause(f.failure().?).failure_info.?) {
+                .canceled_failure_info => "child canceled",
+                else => "child failed",
+            },
+            else => return err,
+        };
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        return r;
+    }
+    const Cancel = workflow.Def("CancelChild", cancel);
+
+    fn byName(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeChildWorkflowByName([]const u8, "", .{}, .{}).get();
+    }
+    const ByName = workflow.Def("ByName", byName);
+};
+
+fn childStarted(a: Allocator, seq: u32, run_id: []const u8) !act_pb.WorkflowActivation {
+    return oneJob(a, .{ .resolve_child_workflow_execution_start = .{ .seq = seq, .status = .{ .succeeded = .{ .run_id = run_id } } } });
+}
+
+fn childResolved(a: Allocator, seq: u32, status: proto.coresdk.child_workflow.ChildWorkflowResult.status_union) !act_pb.WorkflowActivation {
+    return oneJob(a, .{ .resolve_child_workflow_execution = .{ .seq = seq, .result = .{ .status = status } } });
+}
+
+fn childCanceled(a: Allocator, seq: u32) !act_pb.WorkflowActivation {
+    const cause = try a.create(Failure);
+    cause.* = .{ .failure_info = .{ .canceled_failure_info = .{} } };
+    return childResolved(a, seq, .{ .cancelled = .{ .failure = .{ .message = "Child Workflow execution cancelled", .cause = cause } } });
+}
+
+test "child workflow: StartChildWorkflowExecution with the options, then the start and the result" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Run.registered, .{ .task_queue = "parent-tq", .namespace = "ns" });
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "RunChild", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const start = first[0].variant.?.start_child_workflow_execution;
+    try testing.expectEqual(@as(u32, 1), start.seq);
+    try testing.expectEqualStrings("Kid", start.workflow_type);
+    try testing.expectEqualStrings("parent-tq", start.task_queue);
+    try testing.expectEqualStrings("ns", start.namespace);
+    try testing.expectEqualStrings("\"kid\"", start.input.items[0].data);
+    try testing.expectEqual(@as(i64, 60), start.workflow_execution_timeout.?.seconds);
+    try testing.expectEqual(@as(i64, 30), start.workflow_run_timeout.?.seconds);
+    try testing.expectEqual(@as(i64, 5), start.workflow_task_timeout.?.seconds);
+    try testing.expectEqual(@as(i32, 2), start.retry_policy.?.maximum_attempts);
+    try testing.expectEqualStrings("0 * * * *", start.cron_schedule);
+    try testing.expect(start.parent_close_policy == .PARENT_CLOSE_POLICY_ABANDON);
+    try testing.expect(start.workflow_id_reuse_policy == .WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE);
+    try testing.expect(start.cancellation_type == .TRY_CANCEL);
+    try testing.expectEqualStrings("owner", start.memo.items[0].key);
+    try testing.expectEqualStrings("\"parent\"", start.memo.items[0].value.?.data);
+    // A version 4 UUID from the seeded randomness: the same seed generates the same ID.
+    try testing.expectEqual(@as(usize, 36), start.workflow_id.len);
+    try testing.expectEqual(@as(u8, '4'), start.workflow_id[14]);
+    {
+        const again = try create(testing.allocator, ChildWf.Run.registered, .{});
+        defer again.destroy();
+        const cmds = commandsOf(try again.activate(&try initActivation(a, "RunChild", .{}), a));
+        try testing.expectEqualStrings(start.workflow_id, cmds[0].variant.?.start_child_workflow_execution.workflow_id);
+    }
+
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try childStarted(a, 1, "kid-run"), a)).len);
+    const done = commandsOf(try inst.activate(&try childResolved(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, @as([]const u8, "hi kid")) } }), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    const want = try std.fmt.allocPrint(a, "\"{s} kid-run: hi kid\"", .{start.workflow_id});
+    try testing.expectEqualStrings(want, done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "child workflow: a start failure on a taken ID returns error.ChildWorkflowAlreadyStarted" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Run.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "RunChild", .{}), a);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .resolve_child_workflow_execution_start = .{ .seq = 1, .status = .{ .failed = .{
+        .workflow_type = "Kid",
+        .cause = .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS,
+    } } } }), a));
+    const result = done[0].variant.?.complete_workflow_execution.result.?.data;
+    try testing.expect(std.mem.startsWith(u8, result, "\"already started: starting child workflow \\\"Kid\\\" with ID"));
+    try testing.expect(std.mem.endsWith(u8, result, "failed: a workflow with this ID already exists\""));
+}
+
+test "child workflow: a failed child fails the parent with the child's failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "try_cancel")}), a);
+    _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+    const cause = try a.create(Failure);
+    cause.* = try failure_mod.application(a, .{ .message = "kid broke", .type = "Broken" });
+    const done = commandsOf(try inst.activate(&try childResolved(a, 1, .{ .failed = .{ .failure = .{ .message = "Child Workflow execution failed", .cause = cause } } }), a));
+    try testing.expectEqualStrings("\"child failed\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "child workflow: an unhandled child failure becomes the workflow's failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Run.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "RunChild", .{}), a);
+    _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+    const failed = try failure_mod.application(a, .{ .message = "kid broke", .type = "Broken" });
+    const done = commandsOf(try inst.activate(&try childResolved(a, 1, .{ .failed = .{ .failure = failed } }), a));
+    const fail = done[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expectEqualStrings("kid broke", fail.message);
+}
+
+test "child workflow: workflow cancellation with try_cancel and abandon returns at once" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "try_cancel", "abandon" }) |mode| for ([_]bool{ false, true }) |started| {
+        const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+        defer inst.destroy();
+        const first = commandsOf(try inst.activate(&try initActivation(a, "CancelChild", .{mode}), a));
+        try testing.expectEqualStrings("kid-1", first[0].variant.?.start_child_workflow_execution.workflow_id);
+        if (started) _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+        const cmds = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+        try testing.expectEqual(@as(usize, 2), cmds.len);
+        try testing.expectEqual(@as(u32, 1), cmds[0].variant.?.cancel_child_workflow_execution.child_workflow_seq);
+        try testing.expect(cmds[1].variant.? == .cancel_workflow_execution);
+        // The core's cancelled resolution that follows changes nothing.
+        try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try childCanceled(a, 1), a)).len);
+    };
+}
+
+test "child workflow: wait_cancellation_completed waits for the child to close canceled" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_completed")}), a));
+    try testing.expect(first[0].variant.?.start_child_workflow_execution.cancellation_type == .WAIT_CANCELLATION_COMPLETED);
+    _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expect(canceled[0].variant.? == .cancel_child_workflow_execution);
+    try testing.expect(!inst.finished);
+
+    const resolved = commandsOf(try inst.activate(&try childCanceled(a, 1), a));
+    try testing.expectEqual(@as(usize, 1), resolved.len);
+    try testing.expect(resolved[0].variant.? == .cancel_workflow_execution);
+}
+
+test "child workflow: wait_cancellation_completed, a child that completes anyway returns its result" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_completed")}), a);
+    _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+    _ = try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a);
+    // get returns the result; the re-armed cancel then ends the sleep, and the workflow.
+    const done = commandsOf(try inst.activate(&try childResolved(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, @as([]const u8, "hi")) } }), a));
+    try testing.expect(done[done.len - 1].variant.? == .cancel_workflow_execution);
+    for (done) |c| try testing.expect(c.variant.? != .complete_workflow_execution);
+}
+
+test "child workflow: wait_cancellation_completed canceled before it started ends on the start's cancellation" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_completed")}), a);
+    try testing.expectEqual(@as(usize, 1), commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a)).len);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .resolve_child_workflow_execution_start = .{ .seq = 1, .status = .{ .cancelled = .{
+        .failure = .{ .message = "Child Workflow Execution cancelled before scheduled" },
+    } } } }), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expect(done[0].variant.? == .cancel_workflow_execution);
+}
+
+test "child workflow: canceling the future cancels the child, and get reports the cancellation" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "try_cancel+future", "wait_cancellation_completed+future", "abandon+future" }) |mode| {
+        const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "CancelChild", .{mode}), a);
+        const cmds = commandsOf(try inst.activate(&try childStarted(a, 1, "kid-run"), a));
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqual(@as(u32, 1), cmds[0].variant.?.cancel_child_workflow_execution.child_workflow_seq);
+        const done = commandsOf(try inst.activate(&try childCanceled(a, 1), a));
+        try testing.expectEqualStrings("\"child canceled\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+    }
+}
+
+test "child workflow: eviction ends waits for the start and for the cancellation to complete" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const starting = try create(testing.allocator, ChildWf.Run.registered, .{});
+    _ = try starting.activate(&try initActivation(a, "RunChild", .{}), a);
+    starting.destroy();
+
+    const canceling = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+    _ = try canceling.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_completed")}), a);
+    _ = try canceling.activate(&try childStarted(a, 1, "kid-run"), a);
+    _ = try canceling.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a);
+    canceling.destroy();
+}
+
+test "child workflow: an empty workflow type returns error.InvalidOptions from get" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.ByName.registered, .{});
+    defer inst.destroy();
+    const done = commandsOf(try inst.activate(&try initActivation(a, "ByName", .{}), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("InvalidOptions", done[0].variant.?.fail_workflow_execution.failure.?.message);
 }
