@@ -1,0 +1,12 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter runs
+// its own worker on the same client, which is what lets the start be eager.
+.{
+    .expect = .{
+        "Eagerly started: true",
+        "Workflow result: Hello Temporal!",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"eager_test.zig"},
+    .imports = .{"helloworld"},
+}
