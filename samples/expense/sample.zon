@@ -8,4 +8,5 @@
     },
     .timeout_seconds = 60,
     .tests = .{ "workflow_test.zig", "expense_system_test.zig" },
+    .programs = .{"expense_system"},
 }
