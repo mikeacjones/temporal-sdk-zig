@@ -25,6 +25,7 @@ const workflow = @import("workflow.zig");
 const log_mod = @import("log.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
+const metrics_mod = @import("metrics.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Duration = Io.Duration;
@@ -69,6 +70,10 @@ pub const Options = struct {
     /// outermost); see `interceptor.Client`. Borrowed: the slice and the interceptors must
     /// outlive the client. Called concurrently from every thread using the client.
     interceptors: []const interceptor.Client = &.{},
+    /// Where metrics go: sdk-core's, from every worker on this client, and those recorded
+    /// through `Client.metrics()` and the workflow and activity contexts. Null records none.
+    /// See `temporal.metrics`.
+    metrics: ?metrics_mod.Options = null,
 
     pub const Tls = struct {
         /// PEM; empty uses the system roots.
@@ -131,6 +136,54 @@ fn coreLogFields(a: Allocator, json: []const u8, out: []log_mod.Field) usize {
     return n;
 }
 
+/// The runtime's metrics options for `options`. A custom handler is wrapped in a core custom
+/// meter, which `bridge.Runtime.init` owns from then on.
+fn runtimeMetrics(gpa: Allocator, options: metrics_mod.Options) ConnectError!bridge.Runtime.Metrics {
+    const exporter: bridge.Runtime.Metrics.Exporter = switch (options.exporter) {
+        .prometheus => |p| .{ .prometheus = .{
+            .bind_address = p.bind_address,
+            .counters_total_suffix = p.counters_total_suffix,
+            .unit_suffix = p.unit_suffix,
+            .durations_as_seconds = p.durations_as_seconds,
+            .histogram_bucket_overrides = p.histogram_bucket_overrides,
+        } },
+        .opentelemetry => |o| .{ .opentelemetry = .{
+            .url = o.url,
+            .headers = o.headers,
+            .metric_periodicity_ms = if (o.periodicity) |d| std.math.cast(u32, @max(d.toMilliseconds(), 1)) orelse std.math.maxInt(u32) else 0,
+            .temporality = switch (o.temporality) {
+                .cumulative => .cumulative,
+                .delta => .delta,
+            },
+            .protocol = switch (o.protocol) {
+                .grpc => .grpc,
+                .http => .http,
+            },
+            .durations_as_seconds = o.durations_as_seconds,
+            .histogram_bucket_overrides = o.histogram_bucket_overrides,
+        } },
+        .custom => |h| blk: {
+            if (options.global_tags.len > 0) {
+                log.err("client metrics: global_tags apply only to the prometheus and opentelemetry exporters; add them in the custom handler instead", .{});
+                return error.InvalidOptions;
+            }
+            break :blk .{ .custom = bridge.metric.CustomMeter.create(gpa, h.ptr, h.vtable) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.TooManyCustomMeters => {
+                    log.err("creating the core runtime failed: {d} clients in this process already have a custom metrics handler; close one", .{bridge.metric.max_custom_meters});
+                    return error.RuntimeInitFailed;
+                },
+            } };
+        },
+    };
+    return .{
+        .exporter = exporter,
+        .attach_service_name = options.attach_service_name,
+        .global_tags = options.global_tags,
+        .prefix = options.metric_prefix,
+    };
+}
+
 pub const ConnectError = error{ OutOfMemory, InvalidOptions, RuntimeInitFailed, ConnectFailed };
 
 pub const Client = struct {
@@ -153,6 +206,16 @@ pub const Client = struct {
     worker_interceptors: []const interceptor.Worker,
     /// `Options.interceptors`, borrowed.
     interceptors: []const interceptor.Client,
+    /// The runtime's meter; null without `Options.metrics`.
+    meter: ?*bridge.metric.Meter,
+
+    /// Records through this client's metrics exporter (`Options.metrics`) with the runtime's
+    /// default attributes, or records nothing without one. Valid until `close`; metrics
+    /// created from it, and handlers from its `with`, must be freed first. Thread-safe.
+    pub fn metrics(c: *const Client) metrics_mod.Handler {
+        const m = c.meter orelse return .noop;
+        return .{ .ptr = m, .vtable = &bridge.metric.Meter.vtable };
+    }
 
     /// Connects and checks the server. Close with `close`.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
@@ -172,18 +235,25 @@ pub const Client = struct {
                 .forward = .{ .ctx = core_log_sink.?, .func = forwardCoreLog },
             };
         }
-        const runtime = bridge.Runtime.init(gpa, .{ .logging = logging }, &message) catch |err| switch (err) {
+        const runtime_metrics = if (options.metrics) |m| try runtimeMetrics(gpa, m) else null;
+        const runtime = bridge.Runtime.init(gpa, .{ .logging = logging, .metrics = runtime_metrics }, &message) catch |err| switch (err) {
             error.TooManyLogForwarders => {
                 log.err("creating the core runtime failed: {d} clients in this process already forward sdk-core's logs; close one, or set Options.core_log_level to null", .{bridge.Runtime.max_forwarders});
                 return error.RuntimeInitFailed;
             },
-            error.OutOfMemory, error.InvalidOptions => |e| return e,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidOptions => {
+                log.err("creating the core runtime failed: an option is out of range, or a metrics global tag, OpenTelemetry header, or histogram bucket override contains a newline", .{});
+                return error.InvalidOptions;
+            },
             error.RuntimeInitFailed => {
                 if (message) |m| log.err("creating the core runtime failed: {s}", .{m});
                 return error.RuntimeInitFailed;
             },
         };
         errdefer runtime.deinit();
+        const meter = try bridge.metric.Meter.create(gpa, runtime);
+        errdefer if (meter) |m| m.destroy();
 
         const identity = if (options.identity.len > 0) try gpa.dupe(u8, options.identity) else try defaultIdentity(gpa);
         errdefer gpa.free(identity);
@@ -221,11 +291,13 @@ pub const Client = struct {
             .propagators = options.propagators,
             .worker_interceptors = options.worker_interceptors,
             .interceptors = options.interceptors,
+            .meter = meter,
         };
     }
 
     pub fn close(c: *Client) void {
         c.connection.deinit();
+        if (c.meter) |m| m.destroy();
         c.runtime.deinit();
         if (c.core_log_sink) |s| c.gpa.destroy(s);
         c.gpa.free(c.namespace);

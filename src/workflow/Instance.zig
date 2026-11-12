@@ -19,6 +19,7 @@ const client = @import("../client.zig");
 const sa = @import("../search_attributes.zig");
 const propagation = @import("../propagation.zig");
 const interceptor = @import("../interceptor.zig");
+const metrics_mod = @import("../metrics.zig");
 const Scheduler = @import("Scheduler.zig");
 const WorkflowIo = @import("WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -44,6 +45,9 @@ ctx: workflow.Context,
 entry: workflow.Registered,
 info: workflow.Info = undefined,
 logger: log.Logger = .{},
+/// The worker's handler until initialization, then one with the run's attributes that is
+/// silent while replaying, freed by `destroy`.
+metrics: metrics_mod.Handler = .noop,
 now_ns: i96 = 0,
 replaying: bool = false,
 /// Commands produced during the current activation.
@@ -290,6 +294,9 @@ pub const Options = struct {
     propagators: []const propagation.ContextPropagator = &.{},
     /// Supply the run's interceptors at initialization. Borrowed: must outlive the instance.
     interceptors: []const interceptor.Worker = &.{},
+    /// What the workflow's metrics handler records through. Borrowed: must outlive the
+    /// instance.
+    metrics: metrics_mod.Handler = .noop,
 };
 
 /// Creates the instance for a run. `entry` is the registered workflow named by the run's
@@ -311,6 +318,7 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
     inst.logger = .{ .sink = options.logger, .replaying = if (options.log_during_replay) null else &inst.replaying };
     inst.propagators = options.propagators;
     inst.interceptors = options.interceptors;
+    inst.metrics = options.metrics;
     inst.propagated = .init(inst.arena());
     return inst;
 }
@@ -339,6 +347,7 @@ pub fn destroy(inst: *Instance) void {
         // Its stack can't be reclaimed safely, so it is leaked rather than freed under it.
         inst.logger.warn("workflow coroutines did not exit on eviction; leaking their stacks", .{ .count = inst.sched.live });
     }
+    inst.metrics.deinit();
     inst.arena_state.deinit();
     gpa.destroy(inst);
 }
@@ -786,6 +795,12 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         .WorkflowID = inst.info.workflow_id,
         .RunID = inst.info.run_id,
     });
+    inst.metrics = try inst.metrics.with(.{
+        .namespace = inst.namespace,
+        .task_queue = inst.task_queue,
+        .workflow_type = inst.info.workflow_type,
+    });
+    inst.metrics.replaying = &inst.replaying;
     if (init.memo) |m| {
         const fields = try a.alloc(converter.Field, m.fields.items.len);
         for (m.fields.items, fields) |entry, *f| f.* = .{
