@@ -28,6 +28,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "dsl:starter")) return @import("dsl/starter.zig").main(init);
     if (std.mem.eql(u8, name, "dynamic:worker")) return @import("dynamic/worker.zig").main(init);
     if (std.mem.eql(u8, name, "dynamic:starter")) return @import("dynamic/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "dynamic-workflows:worker")) return @import("dynamic-workflows/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "dynamic-workflows:starter")) return @import("dynamic-workflows/starter.zig").main(init);
     if (std.mem.eql(u8, name, "early-return:worker")) return @import("early-return/worker.zig").main(init);
     if (std.mem.eql(u8, name, "early-return:starter")) return @import("early-return/starter.zig").main(init);
     if (std.mem.eql(u8, name, "expense:worker")) return @import("expense/worker.zig").main(init);
