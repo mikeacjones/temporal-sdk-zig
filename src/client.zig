@@ -108,9 +108,9 @@ pub const Client = struct {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const id = if (options.id.len > 0) options.id else try uuid(arena_state.allocator(), c.io);
-        const run_id = try c.startWorkflow(Workflow.workflow_name, id, options, args);
-        errdefer c.gpa.free(run_id);
-        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
+        const started = try c.startWorkflow(Workflow.workflow_name, id, options, args);
+        errdefer c.gpa.free(started.run_id);
+        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = started.run_id, .eagerly_started = started.eager };
     }
 
     /// Starts a workflow by its type name, for a workflow this program has no definition of.
@@ -120,21 +120,26 @@ pub const Client = struct {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const id = if (options.id.len > 0) options.id else try uuid(arena_state.allocator(), c.io);
-        const run_id = try c.startWorkflow(workflow_type, id, options, args);
-        errdefer c.gpa.free(run_id);
-        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
+        const started = try c.startWorkflow(workflow_type, id, options, args);
+        errdefer c.gpa.free(started.run_id);
+        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = started.run_id, .eagerly_started = started.eager };
     }
 
-    fn startWorkflow(c: *Client, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) StartError![]u8 {
+    /// The run ID is owned with the client's allocator.
+    fn startWorkflow(c: *Client, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) StartError!struct { run_id: []u8, eager: bool } {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        const request = try c.startRequest(a, workflow_type, id, options, args);
+        var request = try c.startRequest(a, workflow_type, id, options, args);
+        // Set here rather than in `startRequest`: the core reserves a workflow task slot only
+        // for a plain start, so signal-with-start and update-with-start never ask for it.
+        request.request_eager_execution = options.enable_eager_start;
         const response = c.rpc(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             else => |e| return e,
         };
-        return c.gpa.dupe(u8, response.run_id);
+        // The core has already handed the eager task to the worker; the response keeps a copy.
+        return .{ .run_id = try c.gpa.dupe(u8, response.run_id), .eager = response.eager_workflow_task != null };
     }
 
     /// The start request for `options`, allocated from `a`. Signal-with-start copies it.
@@ -829,6 +834,12 @@ pub const StartWorkflowOptions = struct {
     /// are ignored. Only read while starting. A value the server can't index fails the start
     /// with `error.InvalidSearchAttribute`.
     search_attributes: []const search_attributes.Update = &.{},
+    /// Asks the server to hand the first workflow task back in the start response, to a
+    /// worker for `task_queue` running on this same client, saving that worker a poll. The
+    /// client reserves a workflow task slot on such a worker first; with none (or none free)
+    /// the workflow starts normally. `WorkflowRun.eagerly_started` says which happened.
+    /// Only `executeWorkflow` and `executeWorkflowByName` use it.
+    enable_eager_start: bool = false,
 };
 
 /// Names an activity by its workflow and activity ID, for completing it without its task
@@ -1409,6 +1420,9 @@ pub fn WorkflowRun(comptime T: type) type {
         id: []u8,
         /// The run this handle follows. `get` moves it along continue-as-new chains.
         run_id: []u8,
+        /// The start handed the first workflow task straight to a worker on this client
+        /// (`StartWorkflowOptions.enable_eager_start`).
+        eagerly_started: bool = false,
         failure_: ?failure_mod.Failure = null,
 
         pub fn deinit(run: *Self) void {
