@@ -7,4 +7,5 @@
         "Transaction completed TxID=",
     },
     .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
 }

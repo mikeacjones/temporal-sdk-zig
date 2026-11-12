@@ -90,7 +90,7 @@ pub fn build(b: *std.Build) void {
     if (b.option([]const u8, "sample", "Only validate this sample in samples-test")) |only| run_samples.addArgs(&.{ "--only", only });
     samples_test_step.dependOn(&run_samples.step);
 
-    for (samples) |sample| {
+    for (findSamples(b)) |sample| {
         // The temporal module, plus other samples' modules this sample shares code with.
         var imports: std.ArrayList(std.Build.Module.Import) = .empty;
         imports.append(b.allocator, .{ .name = "temporal", .module = temporal }) catch @panic("OOM");
@@ -131,39 +131,42 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-/// The samples. Each has worker.zig, starter.zig and sample.zon in samples/<name>; `tests` are
-/// its test files. `imports` names other samples whose samples/<other>/<other>.zig this sample
-/// uses.
+/// A sample in samples/<name>: worker.zig, starter.zig, and sample.zon, whose `tests` are its
+/// test files and whose `imports` name other samples whose samples/<other>/<other>.zig it
+/// uses. The samples runner reads the rest of sample.zon.
 const Sample = struct { name: []const u8, tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{} };
-const samples = [_]Sample{
-    .{ .name = "helloworld", .tests = &.{ "helloworld_test.zig", "replay_test.zig" } },
-    .{ .name = "greetings", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "branch", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "splitmerge-future", .tests = &.{"splitmerge_workflow_test.zig"} },
-    .{ .name = "splitmerge-select", .tests = &.{"splitmerge_workflow_test.zig"} },
-    .{ .name = "choice-exclusive", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "choice-multi", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "io-group", .tests = &.{"io_group_workflow_test.zig"} },
-    .{ .name = "timer", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "start-delay", .imports = &.{"helloworld"} },
-    .{ .name = "retryactivity", .tests = &.{"retry_activity_workflow_test.zig"} },
-    .{ .name = "cron", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "greetingslocal", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "cancellation", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "child-workflow", .tests = &.{"parent_workflow_test.zig"} },
-    .{ .name = "query", .tests = &.{"query_workflow_test.zig"} },
-    .{ .name = "memo", .tests = &.{"memo_workflow_test.zig"} },
-    .{ .name = "await-signals", .tests = &.{"await_signals_workflow_test.zig"} },
-    .{ .name = "update", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "early-return", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "reqrespquery", .tests = &.{ "workflow_test.zig", "requester_test.zig" } },
-    .{ .name = "reqrespupdate", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "safe_message_handler", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "shoppingcart", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "updatabletimer", .tests = &.{"workflow_test.zig"} },
-    .{ .name = "sleep-for-days", .tests = &.{"sleep_for_days_workflow_test.zig"} },
-    .{ .name = "child-workflow-continue-as-new", .tests = &.{"parent_workflow_test.zig"} },
-};
+
+/// Every directory under samples/ with a sample.zon, by name.
+fn findSamples(b: *std.Build) []const Sample {
+    const io = b.graph.io;
+    var dir = b.root.openDir(io, "samples", .{ .iterate = true }) catch |err| std.debug.panic("cannot open samples/: {t}", .{err});
+    defer dir.close(io);
+    var found: std.ArrayList(Sample) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch |err| std.debug.panic("cannot list samples/: {t}", .{err})) |entry| {
+        if (entry.kind != .directory) continue;
+        const manifest_path = b.fmt("samples/{s}/sample.zon", .{entry.name});
+        const source = dir.readFileAllocOptions(io, manifest_path["samples/".len..], b.allocator, .limited(64 * 1024), .of(u8), 0) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => std.debug.panic("cannot read {s}: {t}", .{ manifest_path, err }),
+        };
+        var diag: std.zon.parse.Diagnostics = undefined;
+        const manifest = std.zon.parse.fromSlice(struct { tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{} }, .{
+            .gpa = b.allocator,
+            .arena = b.allocator,
+            .source = source,
+            .diagnostics = &diag,
+            .ignore_unknown_fields = true,
+        }) catch std.debug.panic("invalid {s}: {f}", .{ manifest_path, diag.fmt(manifest_path) });
+        found.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = manifest.tests, .imports = manifest.imports }) catch @panic("OOM");
+    }
+    std.mem.sort(Sample, found.items, {}, struct {
+        fn lessThan(_: void, a: Sample, c: Sample) bool {
+            return std.mem.lessThan(u8, a.name, c.name);
+        }
+    }.lessThan);
+    return found.items;
+}
 
 /// Runs cargo to build the C bridge as a static library for `target` and returns its path.
 ///

@@ -4,4 +4,5 @@
 .{
     .expect = .{ "First cron run completed: RunTime=", "Terminated the cron workflow" },
     .timeout_seconds = 120,
+    .tests = .{"workflow_test.zig"},
 }
