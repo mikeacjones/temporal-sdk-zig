@@ -1,6 +1,7 @@
 //! Greetings: a workflow that runs three activities in sequence. The activities are methods
-//! of a struct holding their shared state. The worker registers all of them at once, bound to
-//! an instance, and the workflow calls them through the matching Defs from `activity.defs`.
+//! of a struct holding their shared state. `activities` declares their Defs once: the workflow
+//! calls the activities through it, and the worker registers all of them from it, bound to an
+//! instance, so both sides use the same names.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -28,7 +29,7 @@ pub const Activities = struct {
 };
 
 /// One Def per activity method, named after the method: "getGreeting", "getName", and
-/// "sayGreeting".
+/// "sayGreeting". The worker registers this same value.
 pub const activities = activity.defs(Activities, .{});
 
 fn greetings(ctx: *workflow.Context) ![]const u8 {

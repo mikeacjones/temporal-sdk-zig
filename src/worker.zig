@@ -140,32 +140,44 @@ pub const Worker = struct {
 
     /// Registers an activity that is a method (see `temporal.activity.Def`), bound to
     /// `receiver`. The receiver must outlive the worker and be safe to use from several
-    /// activities at once.
+    /// activities at once. Naming rules: see `temporal.activity.Def`.
     pub fn registerActivityWith(w: *Worker, comptime Activity: type, receiver: *Activity.Receiver) RegisterActivityError!void {
         return w.registerActivityImpl(Activity.with(receiver));
     }
 
     /// Registers several method activities bound to one receiver: `activities` is a tuple of
-    /// their `Def`s.
+    /// their `Def`s. Naming rules: see `temporal.activity.Def`.
     pub fn registerActivitiesWith(w: *Worker, receiver: anytype, comptime activities: anytype) RegisterActivityError!void {
         inline for (activities) |Activity| try w.registerActivityWith(Activity, receiver);
     }
 
-    /// Registers every activity method of the struct `impl` points to, bound to `impl`, as
-    /// `options.prefix` plus the method name. Activity methods and the skipped declarations
-    /// are those of `temporal.activity.defs`, whose result with the same `options` gives
-    /// workflows the matching Defs. `impl` must outlive the worker and be safe to use from
-    /// several activities at once. On an error, the methods before the failing one stay
-    /// registered.
-    pub fn registerActivities(w: *Worker, impl: anytype, comptime options: activity.StructOptions) RegisterActivityError!void {
+    /// Registers every activity method of the struct `impl` points to, bound to `impl`.
+    /// `acts` is the value of `temporal.activity.defs(T, options)` for `impl`'s type `T`, the
+    /// same value workflows call the activities through, so the worker registers exactly the
+    /// names workflows schedule: `options.prefix` plus each method name. Declare it once, for
+    /// example as a pub constant next to the workflow, outside `T` or not pub (see `defs`).
+    /// Naming rules: see `temporal.activity.Def`. `impl` must outlive the worker and be safe
+    /// to use from several activities at once. On an error, the methods before the failing
+    /// one stay registered.
+    pub fn registerActivities(w: *Worker, impl: anytype, comptime acts: anytype) RegisterActivityError!void {
         const bad = "registerActivities takes a mutable pointer to a struct instance, not " ++ @typeName(@TypeOf(impl));
         const T = switch (@typeInfo(@TypeOf(impl))) {
             .pointer => |p| if (p.size == .one and !p.attrs.@"const") p.child else @compileError(bad),
             else => @compileError(bad),
         };
-        const defs = comptime activity.defs(T, options);
-        inline for (@typeInfo(@TypeOf(defs)).@"struct".field_names) |method|
-            try w.registerActivityImpl(@field(defs, method).with(impl));
+        const Acts = @TypeOf(acts);
+        const bad_acts = "registerActivities takes temporal.activity.defs(" ++ @typeName(T) ++ ", options) for its activities, not " ++ @typeName(Acts);
+        const methods = switch (@typeInfo(Acts)) {
+            .@"struct" => |s| s.field_names,
+            else => @compileError(bad_acts),
+        };
+        if (methods.len == 0) @compileError(bad_acts);
+        inline for (methods) |method| {
+            const Activity = @field(acts, method);
+            if (@TypeOf(Activity) != type) @compileError(bad_acts);
+            if (!@hasDecl(Activity, "Receiver") or Activity.Receiver != T) @compileError(bad_acts);
+            try w.registerActivityImpl(Activity.with(impl));
+        }
     }
 
     /// Registers an activity implementation under its `name`, for example a test double
@@ -177,7 +189,10 @@ pub const Worker = struct {
             return error.ReservedActivityName;
         }
         const gop = try w.activities.getOrPut(w.gpa, registered.name);
-        if (gop.found_existing) return error.AlreadyRegistered;
+        if (gop.found_existing) {
+            log.warn("registering activity type \"{s}\" failed: the worker already has an activity registered under that name; register each name once (registerActivities names each method as its prefix plus the method name)", .{registered.name});
+            return error.AlreadyRegistered;
+        }
         gop.value_ptr.* = registered;
     }
 
@@ -1130,6 +1145,13 @@ const Counter = struct {
     pub fn describe(c: *const Counter) u32 {
         return c.step;
     }
+
+    pub fn peek(c: *Counter, ctx: *activity.Context) u32 {
+        _ = ctx;
+        return c.step;
+    }
+
+    pub const advance = next;
 };
 
 fn invokeRegistered(w: *Worker, arena: Allocator, name: []const u8, args: anytype) ![]const u8 {
@@ -1144,10 +1166,10 @@ test "registerActivities registers each activity method under the prefix, bound 
     var w = try Worker.init(testing.allocator, testing.io, &client, "struct", .{});
     defer w.deinit();
     var counter: Counter = .{ .step = 3 };
-    try w.registerActivities(&counter, .{});
-    try w.registerActivities(&counter, .{ .prefix = "Counter." });
-    try testing.expectEqual(4, w.activities.count());
-    for ([_][]const u8{ "next", "reset", "Counter.next", "Counter.reset" }) |name|
+    try w.registerActivities(&counter, activity.defs(Counter, .{}));
+    try w.registerActivities(&counter, activity.defs(Counter, .{ .prefix = "Counter." }));
+    try testing.expectEqual(6, w.activities.count());
+    for ([_][]const u8{ "next", "reset", "advance", "Counter.next", "Counter.reset", "Counter.advance" }) |name|
         try testing.expect(w.activities.contains(name));
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -1155,6 +1177,7 @@ test "registerActivities registers each activity method under the prefix, bound 
     try testing.expectEqualStrings("10", try invokeRegistered(&w, arena.allocator(), "Counter.next", .{@as(u32, 7)}));
     counter.step = 4;
     try testing.expectEqualStrings("4", try invokeRegistered(&w, arena.allocator(), "reset", .{}));
+    try testing.expectEqualStrings("9", try invokeRegistered(&w, arena.allocator(), "advance", .{@as(u32, 5)}));
 }
 
 test "registerActivities rejects a prefix already registered or reserved for the SDK" {
@@ -1162,10 +1185,25 @@ test "registerActivities rejects a prefix already registered or reserved for the
     var w = try Worker.init(testing.allocator, testing.io, &client, "struct", .{});
     defer w.deinit();
     var counter: Counter = .{ .step = 1 };
-    try w.registerActivities(&counter, .{ .prefix = "Counter." });
-    try testing.expectError(error.AlreadyRegistered, w.registerActivities(&counter, .{ .prefix = "Counter." }));
-    try testing.expectError(error.ReservedActivityName, w.registerActivities(&counter, .{ .prefix = "__temporal_" }));
+    const acts = activity.defs(Counter, .{ .prefix = "Counter." });
+    try w.registerActivities(&counter, acts);
+    try testing.expectError(error.AlreadyRegistered, w.registerActivities(&counter, acts));
+    try testing.expectError(error.ReservedActivityName, w.registerActivities(&counter, activity.defs(Counter, .{ .prefix = "__temporal_" })));
+    try testing.expectEqual(3, w.activities.count());
+}
+
+test "registerActivities keeps the methods registered before a failing one" {
+    var client: client_mod.Client = undefined; // registration never touches the client
+    var w = try Worker.init(testing.allocator, testing.io, &client, "struct", .{});
+    defer w.deinit();
+    var counter: Counter = .{ .step = 1 };
+    const acts = activity.defs(Counter, .{ .prefix = "Counter." });
+    try w.registerActivity(activity.Def("Counter.reset", HelloTest.greet));
+    // Methods register in declaration order: next, reset, advance.
+    try testing.expectError(error.AlreadyRegistered, w.registerActivities(&counter, acts));
     try testing.expectEqual(2, w.activities.count());
+    try testing.expect(w.activities.contains("Counter.next"));
+    try testing.expect(!w.activities.contains("Counter.advance"));
 }
 
 test "one function registered under two names runs under each" {
