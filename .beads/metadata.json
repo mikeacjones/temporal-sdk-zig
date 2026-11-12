@@ -3,5 +3,5 @@
   "backend": "dolt",
   "dolt_mode": "proxied-server",
   "dolt_database": "temporal_sdk_zig",
-  "project_id": "fbbaf2bc-909e-4161-9e94-4f5d8aa07160"
+  "project_id": "deb25d60-8bbe-4cd7-b166-3604ab2426a5"
 }
