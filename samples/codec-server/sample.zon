@@ -1,0 +1,13 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter
+// also starts the codec server in-process and decodes the run's stored input through it.
+.{
+    .expect = .{
+        "Workflow result: Received Plain text input",
+        "Without the codec, the workflow input has encoding binary/snappy",
+        "Codec server decoded the workflow input: Plain text input",
+    },
+    .timeout_seconds = 60,
+    .tests = .{ "codec_test.zig", "workflow_test.zig", "server_test.zig" },
+    .programs = .{"server"},
+}
