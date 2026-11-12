@@ -76,6 +76,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "splitmerge-future:starter")) return @import("splitmerge-future/starter.zig").main(init);
     if (std.mem.eql(u8, name, "splitmerge-select:worker")) return @import("splitmerge-select/worker.zig").main(init);
     if (std.mem.eql(u8, name, "splitmerge-select:starter")) return @import("splitmerge-select/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "standalone-activity:worker")) return @import("standalone-activity/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "standalone-activity:starter")) return @import("standalone-activity/starter.zig").main(init);
     if (std.mem.eql(u8, name, "synchronous-proxy:worker")) return @import("synchronous-proxy/worker.zig").main(init);
     if (std.mem.eql(u8, name, "synchronous-proxy:starter")) return @import("synchronous-proxy/starter.zig").main(init);
     if (std.mem.eql(u8, name, "timer:worker")) return @import("timer/worker.zig").main(init);
