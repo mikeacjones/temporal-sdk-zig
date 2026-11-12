@@ -1,0 +1,15 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter
+// polls the infrequent service every second instead of every minute, and the periodic
+// sequence every 100ms instead of every second. The dev server fires sub-second timers after
+// about a second, so the periodic sequence's 50 polls still take about 50 seconds.
+.{
+    .expect = .{
+        "FrequentPolling result: OK",
+        "InfrequentPolling result: OK",
+        "PeriodicSequencePolling result: OK",
+    },
+    .starter_args = .{ "1000", "100" },
+    .timeout_seconds = 120,
+    .tests = .{ "frequent_test.zig", "infrequent_test.zig", "periodic_sequence_test.zig" },
+}
