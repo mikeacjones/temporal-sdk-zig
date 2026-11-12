@@ -86,7 +86,10 @@ task_failure: ?[]const u8 = null,
 queries: std.array_hash_map.String(QueryHandler) = .empty,
 /// Signal handlers by signal name, in registration order. Arena memory.
 signal_handlers: std.array_hash_map.String(SignalHandler) = .empty,
-/// Signals that arrived before a handler for their name, in arrival order. Arena memory.
+/// Handles signals with no handler registered for their name, if set. Arena memory.
+dynamic_signal_handler: ?SignalHandler = null,
+/// Signals that arrived before a handler for their name (or a dynamic handler), in arrival
+/// order. Arena memory.
 buffered_signals: std.ArrayList(*const Signal) = .empty,
 /// Update handlers by update name, in registration order (the order an unregistered update's
 /// rejection lists them in). Arena memory.
@@ -114,12 +117,12 @@ pub const QueryHandler = struct {
     call: *const fn (context: *const anyopaque, out: Allocator, args: []const converter.Payload) anyerror!converter.Payload,
 };
 
-/// A type-erased signal handler. `decode` turns a signal's payloads into the handler's
-/// argument tuple, allocated in `out`; `call` runs the handler with `context` and those
-/// arguments, inside the signal's coroutine.
+/// A type-erased signal handler. `decode` turns a signal's name and payloads (both arena
+/// memory of the run) into the handler's arguments, allocated in `out`; `call` runs the
+/// handler with `context` and those arguments, inside the signal's coroutine.
 pub const SignalHandler = struct {
     context: *const anyopaque,
-    decode: *const fn (out: Allocator, args: []const converter.Payload) anyerror!*const anyopaque,
+    decode: *const fn (out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque,
     call: *const fn (context: *const anyopaque, args: *const anyopaque) anyerror!void,
 };
 
@@ -452,6 +455,22 @@ pub fn setSignalHandler(inst: *Instance, name: []const u8, handler: SignalHandle
     }
 }
 
+/// Registers `handler` for signals with no handler registered for their name, replacing any
+/// earlier one, then starts a handler coroutine for each buffered signal, in arrival order.
+/// The handler's context must outlive the run; `context_addr` is checked as in
+/// `setSignalHandler`.
+pub fn setDynamicSignalHandler(inst: *Instance, handler: SignalHandler, context_addr: ?usize) error{ OutOfMemory, SignalContextOnStack }!void {
+    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
+        inst.logger.warn("setDynamicSignalHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{});
+        return error.SignalContextOnStack;
+    };
+    inst.dynamic_signal_handler = handler;
+    // Starting a handler only spawns its coroutine, so nothing is buffered meanwhile.
+    const buffered = inst.buffered_signals.items;
+    inst.buffered_signals = .empty;
+    for (buffered) |signal| try inst.startSignalHandler(handler, signal);
+}
+
 /// Copies a SignalWorkflow job into the arena and starts its handler, or buffers it until a
 /// handler for its name is registered.
 fn deliverSignal(inst: *Instance, job: *const act_pb.SignalWorkflow) !void {
@@ -462,6 +481,7 @@ fn deliverSignal(inst: *Instance, job: *const act_pb.SignalWorkflow) !void {
     const signal = try a.create(Signal);
     signal.* = .{ .name = try a.dupe(u8, job.signal_name), .args = args };
     if (inst.signal_handlers.get(signal.name)) |handler| return inst.startSignalHandler(handler, signal);
+    if (inst.dynamic_signal_handler) |handler| return inst.startSignalHandler(handler, signal);
     try inst.buffered_signals.append(a, signal);
 }
 
@@ -469,7 +489,7 @@ fn deliverSignal(inst: *Instance, job: *const act_pb.SignalWorkflow) !void {
 /// whose arguments don't decode is dropped, the same way on replay.
 fn startSignalHandler(inst: *Instance, handler: SignalHandler, signal: *const Signal) error{OutOfMemory}!void {
     const a = inst.arena();
-    const args = handler.decode(a, signal.args) catch |err| switch (err) {
+    const args = handler.decode(a, signal.name, signal.args) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             inst.logger.warn("dropping a signal whose arguments don't decode as its handler's parameters", .{ .SignalName = signal.name, .error_name = err });
@@ -1256,7 +1276,7 @@ pub const SignalTarget = union(enum) {
 };
 
 /// Emits SignalExternalWorkflowExecution sending `signal_name` with `args` (encoded here) to
-/// `target`. The IDs are copied into the arena.
+/// `target`. The name and IDs are copied into the arena.
 pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []const u8, args: anytype) ScheduleError!*ExternalState {
     const workflow_id = switch (target) {
         .execution => |e| e.workflow_id,
@@ -1270,7 +1290,7 @@ pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
     const state = try inst.newExternal(.signal, workflow_id);
     try inst.commands.append(a, .{ .variant = .{ .signal_external_workflow_execution = .{
         .seq = state.seq,
-        .signal_name = signal_name,
+        .signal_name = try a.dupe(u8, signal_name),
         .args = try converter.toPayloads(a, args),
         .target = switch (target) {
             .execution => |e| .{ .workflow_execution = .{
@@ -1790,6 +1810,79 @@ test "a signal handler context on the coroutine's stack is rejected" {
     const inst = try create(testing.allocator, SignalOnStackWf.registered, .{});
     defer inst.destroy();
     try testing.expectEqualStrings("\"SignalContextOnStack\"", completedWith(try inst.activate(&try initActivation(a, "SignalOnStack", .{}), a)));
+}
+
+// Signals named at run time, and the dynamic signal handler.
+const RuntimeSignals = struct {
+    /// Sleeps 10 s without handlers, then handles "unlock-<workflow ID>" by name and every
+    /// other signal dynamically, and returns the first `want` entries.
+    fn byName(ctx: *workflow.Context, want: usize) ![]const u8 {
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        const s = try Signals.State.create(ctx, want);
+        var buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "unlock-{s}", .{ctx.info().workflow_id});
+        try ctx.setSignalHandlerByName(name, struct { []const u8 }, s, Signals.State.approve);
+        @memset(&buf, 'x'); // the handler keeps its own copy of the name
+        try ctx.setDynamicSignalHandler(s, dynamic);
+        try ctx.await(s, Signals.State.enough);
+        return s.joined();
+    }
+    fn dynamic(s: *Signals.State, name: []const u8, args: converter.EncodedValues) !void {
+        const value = args.get([]const u8, s.ctx.allocator(), 0) catch |err| @errorName(err);
+        try s.add(try std.fmt.allocPrint(s.ctx.allocator(), "{s}={s}", .{ name, value }));
+    }
+
+    /// Sends "unlock-<target>" to `target`, with the name built at run time.
+    fn unlock(ctx: *workflow.Context, target: []const u8) !void {
+        var buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "unlock-{s}", .{target});
+        const future = ctx.signalExternalWorkflowByName(name, target, "", .{"releaser"});
+        @memset(&buf, 'x');
+        try future.get();
+    }
+};
+const ByNameWf = workflow.Def("ByName", RuntimeSignals.byName);
+const UnlockWf = workflow.Def("Unlock", RuntimeSignals.unlock);
+
+test "a handler named at run time takes buffered signals of its name, the dynamic handler the rest" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ByNameWf.registered, .{});
+    defer inst.destroy();
+
+    var start = try initActivation(a, "ByName", .{@as(usize, 6)});
+    try start.jobs.append(a, .{ .variant = try signalJob(a, "unlock-wf-1", .{@as([]const u8, "ann")}) });
+    try start.jobs.append(a, .{ .variant = try signalJob(a, "color", .{@as([]const u8, "red")}) });
+    _ = try inst.activate(&start, a);
+    _ = try inst.activate(&try oneJob(a, try signalJob(a, "unlock-wf-1", .{@as([]const u8, "bob")})), a);
+    try testing.expectEqual(@as(usize, 3), inst.buffered_signals.items.len);
+    // Registering by name starts ann and bob; the dynamic handler then takes color.
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)).len);
+    try testing.expectEqual(@as(usize, 0), inst.buffered_signals.items.len);
+    // A named handler wins over the dynamic one; an argument of the wrong type is an error
+    // the dynamic handler sees, not a dropped signal.
+    var last = try oneJob(a, try signalJob(a, "unlock-wf-1", .{@as([]const u8, "cy")}));
+    try last.jobs.append(a, .{ .variant = try signalJob(a, "size", .{@as(i64, 9)}) });
+    try last.jobs.append(a, .{ .variant = try signalJob(a, "empty", .{}) });
+    try testing.expectEqualStrings("\"ann,bob,color=red,cy,size=InvalidPayload,empty=WrongArgumentCount\"", completedWith(try inst.activate(&last, a)));
+}
+
+test "signal external by name: the command carries a copy of the name built at run time" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UnlockWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "Unlock", .{@as([]const u8, "holder")}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const cmd = first[0].variant.?.signal_external_workflow_execution;
+    try testing.expectEqualStrings("unlock-holder", cmd.signal_name);
+    try testing.expectEqualStrings("holder", cmd.target.?.workflow_execution.workflow_id);
+    try testing.expectEqualStrings("\"releaser\"", cmd.args.items[0].data);
+    const done = commandsOf(try inst.activate(&try signalResolved(a, 1, null, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a));
+    try testing.expect(done[done.len - 1].variant.? == .complete_workflow_execution);
 }
 
 // Update handlers. `State.value` is what `set` updates change; a `done` signal ends the run.

@@ -38,6 +38,19 @@
 //!     };
 //!     pub const GetGreeting = temporal.activity.Def("GetGreeting", Activities.getGreeting);
 //!     // worker: try w.registerActivityWith(GetGreeting, &activities);
+//!
+//! A dynamic activity runs every activity type the worker has no `Def` registered for, such
+//! as types a workflow calls with `executeActivityByName`. Define it with `DynamicDef`,
+//! register it with `Worker.registerDynamicActivity` (or `registerDynamicActivityWith` for a
+//! method), and read the type from `ctx.info().activity_type` and the arguments from
+//! `converter.EncodedValues`:
+//!
+//!     fn anyActivity(ctx: *temporal.activity.Context, args: temporal.converter.EncodedValues) ![]const u8 {
+//!         const name, const count = try args.decode(struct { []const u8, u32 }, ctx.allocator());
+//!         return std.fmt.allocPrint(ctx.allocator(), "{s}: {s} x{d}", .{ ctx.info().activity_type, name, count });
+//!     }
+//!     pub const AnyActivity = temporal.activity.DynamicDef(anyActivity);
+//!     // worker: try w.registerDynamicActivity(AnyActivity);
 
 const std = @import("std");
 const converter = @import("converter.zig");
@@ -244,6 +257,60 @@ pub fn Def(comptime name: []const u8, comptime func: anytype) type {
     };
 }
 
+/// Defines a dynamic activity: one function that runs every activity type the worker has no
+/// `Def` registered for. `func` is `fn (*Context, converter.EncodedValues) !Result`, or a
+/// method `fn (*Self, *Context, converter.EncodedValues) !Result` bound with
+/// `registerDynamicActivityWith`. It reads the type it runs as from `ctx.info().activity_type`
+/// and decodes its arguments itself. The result is a type workers pass to
+/// `registerDynamicActivity`.
+pub fn DynamicDef(comptime func: anytype) type {
+    const F = @TypeOf(func);
+    const bad = "a dynamic activity must be fn (*temporal.activity.Context, temporal.converter.EncodedValues) !Result, or a method taking a receiver pointer first, not " ++ @typeName(F);
+    const params = switch (@typeInfo(F)) {
+        .@"fn" => |f| f.param_types,
+        else => @compileError(bad),
+    };
+    const bound = params.len == 3 and params[0] != *Context and params[1] == *Context and params[2] == converter.EncodedValues;
+    if (!bound and !(params.len == 2 and params[0] == *Context and params[1] == converter.EncodedValues))
+        @compileError(bad);
+    const Ret = @typeInfo(F).@"fn".return_type.?;
+    return struct {
+        pub const function = func;
+        /// The type a dynamic activity that is a method is bound to; `void` for a plain
+        /// function.
+        pub const Receiver = if (bound) @typeInfo(params[0].?).pointer.child else void;
+        pub const Result = switch (@typeInfo(Ret)) {
+            .error_union => |eu| eu.payload,
+            else => Ret,
+        };
+
+        pub fn invoke(receiver: ?*anyopaque, ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
+            return converter.toPayload(ctx.arena, try call(receiver, ctx, .{ .payloads = payloads }));
+        }
+
+        /// Calls the function directly (receiver ignored for plain functions).
+        pub fn call(receiver: ?*anyopaque, ctx: *Context, args: converter.EncodedValues) Ret {
+            if (bound) {
+                const r: *Receiver = @ptrCast(@alignCast(receiver.?));
+                return func(r, ctx, args);
+            }
+            return func(ctx, args);
+        }
+
+        /// The registration for a plain function; its name is empty because it answers to
+        /// every unregistered type. A method is registered with `with`.
+        pub const registered: Registered = if (bound)
+            @compileError("this dynamic activity is a method; register it with registerDynamicActivityWith and an instance")
+        else
+            .{ .name = "", .invoke = invoke };
+
+        /// The registration binding a method to `receiver`, which must outlive the worker.
+        pub fn with(receiver: *Receiver) Registered {
+            return .{ .name = "", .invoke = invoke, .receiver = receiver };
+        }
+    };
+}
+
 /// The parameter types after the context, as a tuple type.
 pub fn ArgsOf(comptime F: type) type {
     return ArgsAfter(F, 1);
@@ -335,4 +402,35 @@ test "a cancel reaches the activity's Io and records the first reason" {
     try std.testing.expect(!ctx.setCancelReason(.canceled));
     try std.testing.expectError(error.Canceled, task.cancel(std.testing.io));
     try std.testing.expectEqual(CancelReason.timed_out, ctx.cancelReason().?);
+}
+
+test "DynamicDef hands the arguments over undecoded, to a function or a method" {
+    const S = struct {
+        fn echo(ctx: *Context, args: converter.EncodedValues) ![]const u8 {
+            const name = try args.get([]const u8, ctx.allocator(), 0);
+            return std.fmt.allocPrint(ctx.allocator(), "{s}: {s} ({d} args)", .{ ctx.info().activity_type, name, args.len() });
+        }
+        prefix: []const u8,
+        fn method(s: *@This(), ctx: *Context, args: converter.EncodedValues) ![]const u8 {
+            return std.fmt.allocPrint(ctx.allocator(), "{s}{d}", .{ s.prefix, try args.get(i64, ctx.allocator(), 0) });
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var info: Info = undefined;
+    info.activity_type = "Anything";
+    var ctx: Context = .{ .arena = a, .io_ = std.testing.io, .info_ = info, .logger_ = .{} };
+
+    const Echo = DynamicDef(S.echo);
+    const args = try converter.toPayloads(a, .{ @as([]const u8, "x"), @as(i64, 1) });
+    const out = try Echo.registered.invoke(null, &ctx, args.items);
+    try std.testing.expectEqualStrings("\"Anything: x (2 args)\"", out.data);
+
+    var impl: S = .{ .prefix = "n=" };
+    const reg = DynamicDef(S.method).with(&impl);
+    const wrong = try converter.toPayloads(a, .{@as([]const u8, "x")});
+    try std.testing.expectError(error.InvalidPayload, reg.invoke(reg.receiver, &ctx, wrong.items));
+    const right = try converter.toPayloads(a, .{@as(i64, 7)});
+    try std.testing.expectEqualStrings("\"n=7\"", (try reg.invoke(reg.receiver, &ctx, right.items)).data);
 }
