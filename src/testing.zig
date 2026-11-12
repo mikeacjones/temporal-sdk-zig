@@ -2137,6 +2137,37 @@ test "patches and versions take the new path on a first run, which then replays"
     try testing.expectEqualStrings("Goodbye Temporal! Goodbye Temporal!", try env.executeWorkflow(PatchFixtures.VersionedTwo, .{"Temporal"}, arena.allocator(), null));
 }
 
+const VersionFixtures = struct {
+    /// Reports the deployment version running its first workflow task.
+    fn whoRuns(ctx: *workflow.Context) ![]const u8 {
+        const v = ctx.currentDeploymentVersion() orelse return "none";
+        return std.fmt.allocPrint(ctx.allocator(), "{s}.{s}", .{ v.deployment_name, v.build_id });
+    }
+    const WhoRuns = workflow.DefWithOptions("WhoRuns", whoRuns, .{ .versioning_behavior = .pinned });
+};
+
+test "a worker that only reports its deployment version runs workflows that see it" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var w = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, "reports-version", .{
+        .deployment = .{ .deployment_name = "reporting", .build_id = "b1", .use_worker_versioning = false },
+    });
+    defer w.deinit();
+    try w.registerWorkflow(VersionFixtures.WhoRuns);
+    var running = try testing.io.concurrent(WorkflowEnvironment.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    var run = try env.client.executeWorkflow(VersionFixtures.WhoRuns, .{ .task_queue = "reports-version" }, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("reporting.b1", try run.get(arena.allocator()));
+    try env.registerWorkflow(VersionFixtures.WhoRuns);
+    try env.replayRun(run.id, run.run_id);
+}
+
 test "WorkflowReplayer replays a batch of histories through one worker and reports each outcome" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

@@ -178,6 +178,7 @@ const proto = @import("proto.zig");
 const propagation = @import("propagation.zig");
 const search_attributes = @import("search_attributes.zig");
 const metrics_mod = @import("metrics.zig");
+const deployment = @import("deployment.zig");
 const Instance = @import("workflow/Instance.zig");
 const WorkflowIo = @import("workflow/WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -454,6 +455,25 @@ pub const Context = struct {
     /// The size of the history in bytes, as of the current workflow task's start.
     pub fn historySizeBytes(ctx: *const Context) u64 {
         return ctx.instance.history_size_bytes;
+    }
+
+    /// Sets the versioning behavior this run's workflow task completions send from now on,
+    /// in place of its `Def`'s (see `VersioningBehavior`). A dynamic workflow, which has no
+    /// `Def` options, chooses one per workflow type here:
+    ///
+    ///     ctx.setVersioningBehavior(if (std.mem.startsWith(u8, ctx.info().workflow_type, "Long")) .pinned else .auto_upgrade);
+    ///
+    /// Set it before the workflow first blocks, so the run's first workflow task carries it.
+    pub fn setVersioningBehavior(ctx: *Context, behavior: VersioningBehavior) void {
+        ctx.instance.versioning_behavior = behavior;
+    }
+
+    /// The Worker Deployment Version that ran the current workflow task (on replay, the one
+    /// history recorded), or null when the worker had neither a deployment nor a build ID;
+    /// a worker with only `worker.Options.build_id` has an empty deployment name. Lives as
+    /// long as the run is cached.
+    pub fn currentDeploymentVersion(ctx: *const Context) ?deployment.Version {
+        return ctx.instance.deployment_version;
     }
 
     /// Whether this run takes the new code path of the change named `patch_id`, so a changed
@@ -1118,16 +1138,46 @@ const ExternalFuture = struct {
 /// the change existed.
 pub const default_version: i32 = -1;
 
-/// What a worker registers: a name and a type-erased call that decodes arguments, runs the
-/// workflow function, and encodes its result.
+/// What a worker registers: a name, a type-erased call that decodes arguments, runs the
+/// workflow function, and encodes its result, and the workflow's versioning behavior.
 pub const Registered = struct {
     name: []const u8,
     invoke: *const fn (ctx: *Context, args: []const converter.Payload) anyerror!converter.Payload,
+    versioning_behavior: VersioningBehavior = .unspecified,
+};
+
+/// How a workflow's runs move between the versions of a Worker Deployment (see
+/// `temporal.deployment`) when the deployment's current version changes. Only workers with
+/// `worker.Options.deployment` and `use_worker_versioning` send it.
+pub const VersioningBehavior = enum(i32) {
+    /// The worker's `default_versioning_behavior` applies. A versioned worker without one
+    /// refuses to run a workflow with this behavior.
+    unspecified = 0,
+    /// Each run stays on the version it started on, until it closes or continues as new.
+    /// Changing such a workflow's code needs no patches: each version keeps its own code.
+    pinned = 1,
+    /// Each run moves to the deployment's current (or ramping) version at its next workflow
+    /// task, and runs the new version's code from there: an incompatible change needs a
+    /// patch (`Context.patched`).
+    auto_upgrade = 2,
+};
+
+/// Options of a workflow definition, for `DefWithOptions`.
+pub const DefOptions = struct {
+    /// Sent with each of the run's workflow task completions; see `VersioningBehavior`.
+    versioning_behavior: VersioningBehavior = .unspecified,
 };
 
 /// Names a workflow function. The result is a type that clients pass to `executeWorkflow` and
 /// workers pass to `registerWorkflow`.
 pub fn Def(comptime name: []const u8, comptime func: anytype) type {
+    return DefWithOptions(name, func, .{});
+}
+
+/// `Def` with options, such as the workflow's versioning behavior on versioned workers:
+///
+///     pub const Checkout = temporal.workflow.DefWithOptions("Checkout", checkout, .{ .versioning_behavior = .pinned });
+pub fn DefWithOptions(comptime name: []const u8, comptime func: anytype, comptime options: DefOptions) type {
     const F = @TypeOf(func);
     const fn_info = @typeInfo(F).@"fn";
     if (fn_info.param_types.len == 0 or fn_info.param_types[0] != *Context)
@@ -1148,14 +1198,17 @@ pub fn Def(comptime name: []const u8, comptime func: anytype) type {
             return converter.toPayload(ctx.allocator(), result);
         }
 
-        pub const registered: Registered = .{ .name = name, .invoke = invoke };
+        pub const versioning_behavior = options.versioning_behavior;
+        pub const registered: Registered = .{ .name = name, .invoke = invoke, .versioning_behavior = options.versioning_behavior };
     };
 }
 
 /// Defines a dynamic workflow: one function that runs every workflow type the worker has no
 /// `Def` registered for. `func` is `fn (*Context, converter.EncodedValues) !Result`; it reads
 /// the type it runs as from `ctx.info().workflow_type` and decodes its arguments itself. The
-/// result is a type workers pass to `registerDynamicWorkflow`.
+/// result is a type workers pass to `registerDynamicWorkflow`. On a versioned worker it
+/// chooses each run's versioning behavior with `Context.setVersioningBehavior`, or the
+/// worker's default applies.
 pub fn DynamicDef(comptime func: anytype) type {
     const F = @TypeOf(func);
     const bad = "a dynamic workflow must be fn (*temporal.workflow.Context, temporal.converter.EncodedValues) !Result, not " ++ @typeName(F);

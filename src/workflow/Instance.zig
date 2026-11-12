@@ -20,6 +20,7 @@ const sa = @import("../search_attributes.zig");
 const propagation = @import("../propagation.zig");
 const interceptor = @import("../interceptor.zig");
 const metrics_mod = @import("../metrics.zig");
+const deployment = @import("../deployment.zig");
 const Scheduler = @import("Scheduler.zig");
 const WorkflowIo = @import("WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -140,6 +141,13 @@ notified_patches: std.array_hash_map.String(void) = .empty,
 patches: std.StringHashMapUnmanaged(bool) = .empty,
 /// What the run's first `getVersion` call returned for each change ID. Arena memory.
 versions: std.StringHashMapUnmanaged(i32) = .empty,
+/// Sent with each successful completion when `send_versioning_behavior`; starts as the
+/// registered workflow's.
+versioning_behavior: workflow.VersioningBehavior = .unspecified,
+send_versioning_behavior: bool = false,
+/// The deployment version of the latest activation that wasn't query-only. Arena memory,
+/// copied again only when it changes.
+deployment_version: ?deployment.Version = null,
 
 /// A type-erased query handler: decodes `args` into `out`, calls the handler with `context`,
 /// and encodes its result into `out`. Runs on the worker thread, outside any coroutine.
@@ -305,6 +313,9 @@ pub const Options = struct {
     /// What the workflow's metrics handler records through. Borrowed: must outlive the
     /// instance.
     metrics: metrics_mod.Handler = .noop,
+    /// Send the run's versioning behavior with its completions: only a worker whose
+    /// deployment uses worker versioning may (the server rejects it from any other).
+    send_versioning_behavior: bool = false,
 };
 
 /// Creates the instance for a run. `entry` is the registered workflow named by the run's
@@ -318,6 +329,8 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
         .wio = undefined,
         .ctx = undefined,
         .entry = entry,
+        .versioning_behavior = entry.versioning_behavior,
+        .send_versioning_behavior = options.send_versioning_behavior,
     };
     inst.wio = .init(gpa, &inst.sched, .{ .ctx = inst, .vtable = &host_vtable }, 0);
     inst.ctx = .{ .instance = inst };
@@ -385,6 +398,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         inst.history_length = act.history_length;
         inst.history_size_bytes = act.history_size_bytes;
         inst.continue_as_new_suggested = act.continue_as_new_suggested;
+        try inst.setDeploymentVersion(act.deployment_version_for_current_task);
     }
     inst.replaying = act.is_replaying;
     inst.commands = .empty;
@@ -446,11 +460,22 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         completion.status = .{ .failed = .{ .failure = try failure_mod.application(out, .{ .message = message, .type = "UnsupportedJob" }) } };
     } else {
         var success: done_pb.Success = .{};
+        if (inst.send_versioning_behavior) success.versioning_behavior = @fromBackingInt(@backingInt(inst.versioning_behavior));
         try success.commands.appendSlice(out, inst.commands.items);
         try success.commands.appendSlice(out, answers.items);
         completion.status = .{ .successful = success };
     }
     return completion;
+}
+
+fn setDeploymentVersion(inst: *Instance, v: ?proto.coresdk.common.WorkerDeploymentVersion) error{OutOfMemory}!void {
+    const next = v orelse {
+        inst.deployment_version = null;
+        return;
+    };
+    if (inst.deployment_version) |cur| if (std.mem.eql(u8, cur.deployment_name, next.deployment_name) and std.mem.eql(u8, cur.build_id, next.build_id)) return;
+    const a = inst.arena();
+    inst.deployment_version = .{ .deployment_name = try a.dupe(u8, next.deployment_name), .build_id = try a.dupe(u8, next.build_id) };
 }
 
 // ---------------------------------------------------------------- queries
@@ -2062,6 +2087,46 @@ test "patches: getVersion fails the task for a recorded version below min_suppor
     const older = try create(testing.allocator, PatchesWf.registered, .{});
     defer older.destroy();
     try testing.expect((try runPatches(older, a, true, &.{}, 2)).status.? == .failed);
+}
+
+// Versioning behavior: the Def's goes with every completion until the run sets another.
+const Versioning = struct {
+    fn run(ctx: *workflow.Context, switch_to: workflow.VersioningBehavior) ![]const u8 {
+        const before = ctx.currentDeploymentVersion();
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        ctx.setVersioningBehavior(switch_to);
+        const after = ctx.currentDeploymentVersion().?;
+        return std.fmt.allocPrint(ctx.allocator(), "{} {s}.{s}", .{ before == null, after.deployment_name, after.build_id });
+    }
+};
+const PinnedWf = workflow.DefWithOptions("Pinned", Versioning.run, .{ .versioning_behavior = .pinned });
+
+test "versioning: completions carry the Def's behavior, then the one the run sets, and the task's version" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try testing.expectEqual(workflow.VersioningBehavior.pinned, PinnedWf.versioning_behavior);
+    const inst = try create(testing.allocator, PinnedWf.registered, .{ .send_versioning_behavior = true });
+    defer inst.destroy();
+    const first = try inst.activate(&try initActivation(a, "Pinned", .{workflow.VersioningBehavior.auto_upgrade}), a);
+    try testing.expectEqual(proto.temporal.api.enums.v1.VersioningBehavior.VERSIONING_BEHAVIOR_PINNED, first.status.?.successful.versioning_behavior);
+    const timer = commandsOf(first)[0].variant.?.start_timer;
+
+    var fire = try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } });
+    fire.deployment_version_for_current_task = .{ .deployment_name = "shop", .build_id = "b2" };
+    const second = try inst.activate(&fire, a);
+    try testing.expectEqual(proto.temporal.api.enums.v1.VersioningBehavior.VERSIONING_BEHAVIOR_AUTO_UPGRADE, second.status.?.successful.versioning_behavior);
+    try testing.expectEqualStrings("\"true shop.b2\"", commandsOf(second)[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "versioning: a worker that doesn't use worker versioning sends no behavior" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, PinnedWf.registered, .{});
+    defer inst.destroy();
+    const first = try inst.activate(&try initActivation(a, "Pinned", .{workflow.VersioningBehavior.auto_upgrade}), a);
+    try testing.expectEqual(proto.temporal.api.enums.v1.VersioningBehavior.VERSIONING_BEHAVIOR_UNSPECIFIED, first.status.?.successful.versioning_behavior);
 }
 
 // Signal handlers. `State.log` records what handlers and the workflow function did, in order.
