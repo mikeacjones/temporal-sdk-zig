@@ -21,6 +21,7 @@ const search_attributes = @import("search_attributes.zig");
 const failure_mod = @import("failure.zig");
 const history_mod = @import("history.zig");
 const schedule = @import("schedule.zig");
+const deployment = @import("deployment.zig");
 const workflow = @import("workflow.zig");
 const log_mod = @import("log.zig");
 const propagation = @import("propagation.zig");
@@ -874,6 +875,19 @@ pub const Client = struct {
     /// Free it with `deinit`.
     pub fn listSchedules(c: *Client, options: schedule.ListOptions) error{OutOfMemory}!ScheduleIterator {
         return .{ .client = c, .query = try c.gpa.dupe(u8, options.query), .page_size = options.page_size, .page = .init(c.gpa) };
+    }
+
+    /// A handle to the Worker Deployment `name` in the client's namespace (see
+    /// `temporal.deployment`). Nothing is sent here: a deployment that doesn't exist makes
+    /// the handle's calls return `error.NotFound`. Free it with `deinit`.
+    pub fn workerDeployment(c: *Client, name: []const u8) error{OutOfMemory}!WorkerDeploymentHandle {
+        return .{ .client = c, .name = try c.gpa.dupe(u8, name) };
+    }
+
+    /// The client's namespace's Worker Deployments. The iterator fetches a page at a time as
+    /// `next` reaches it; nothing is fetched here. Free it with `deinit`.
+    pub fn listWorkerDeployments(c: *Client, options: ListWorkerDeploymentsOptions) WorkerDeploymentIterator {
+        return .{ .client = c, .page_size = options.page_size, .page = .init(c.gpa) };
     }
 
     /// Sends `Query` (a `workflow.QueryDef`) with `args` to a workflow and returns the
@@ -2032,6 +2046,243 @@ pub const ScheduleIterator = struct {
         c.gpa.free(it.next_page_token);
         it.next_page_token = token;
         it.entries = response.schedules.items;
+        it.fetched = true;
+    }
+};
+
+pub const WorkerDeploymentError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
+    OutOfMemory,
+    Canceled,
+    /// The server refused; its reason is logged with the deployment, such as a version
+    /// with no pollers or one still current, ramping, or draining.
+    RpcFailed,
+    /// No such deployment, or no such version of it.
+    NotFound,
+    InvalidResponse,
+};
+
+pub const ListWorkerDeploymentsOptions = struct {
+    /// Deployments per page; 0 lets the server choose.
+    page_size: u31 = 0,
+};
+
+/// A Worker Deployment on the server, from `Client.workerDeployment`. Owns its name with the
+/// client's allocator; free with `deinit`. Each method is one call to the server, so a
+/// handle can be used from several threads at once. Changes are recorded with the client's
+/// identity. Build IDs name the deployment's versions.
+pub const WorkerDeploymentHandle = struct {
+    client: *Client,
+    name: []u8,
+
+    pub fn deinit(h: *WorkerDeploymentHandle) void {
+        h.client.gpa.free(h.name);
+        h.* = undefined;
+    }
+
+    /// The deployment: its routing, its versions and their status. All memory comes from
+    /// `arena`.
+    pub fn describe(h: *const WorkerDeploymentHandle, arena: Allocator) WorkerDeploymentError!deployment.Description {
+        const c = h.client;
+        const response = try h.call(wfs.DescribeWorkerDeploymentResponse, "DescribeWorkerDeployment", wfs.DescribeWorkerDeploymentRequest{
+            .namespace = c.namespace,
+            .deployment_name = h.name,
+        }, arena, "");
+        const info = response.worker_deployment_info orelse return error.InvalidResponse;
+        return deployment.Description.fromProto(arena, response.conflict_token, info);
+    }
+
+    /// Routes the deployment's new workflows, and its auto-upgrade runs at their next
+    /// workflow task, to version `build_id`; null routes them to unversioned workers. A
+    /// version becomes known once one of its workers has polled. The change reaches the
+    /// task queues a moment after this returns (`Description.routing_update`). The result's
+    /// memory comes from `arena`.
+    pub fn setCurrentVersion(h: *const WorkerDeploymentHandle, arena: Allocator, build_id: ?[]const u8, options: deployment.RoutingOptions) WorkerDeploymentError!deployment.RoutingChange {
+        const c = h.client;
+        const response = try h.call(wfs.SetWorkerDeploymentCurrentVersionResponse, "SetWorkerDeploymentCurrentVersion", wfs.SetWorkerDeploymentCurrentVersionRequest{
+            .namespace = c.namespace,
+            .deployment_name = h.name,
+            .build_id = build_id orelse "",
+            .conflict_token = options.conflict_token,
+            .identity = c.identity,
+            .ignore_missing_task_queues = options.ignore_missing_task_queues,
+            .allow_no_pollers = options.allow_no_pollers,
+        }, arena, build_id orelse "");
+        return .fromVersion(response.conflict_token, response.previous_deployment_version, 0);
+    }
+
+    /// Routes `percentage` percent (0 to 100) of what goes to the current version to version
+    /// `build_id` instead; null ramps unversioned workers. A new ramping version replaces
+    /// the previous one. The result's memory comes from `arena`.
+    pub fn setRampingVersion(h: *const WorkerDeploymentHandle, arena: Allocator, build_id: ?[]const u8, percentage: f32, options: deployment.RoutingOptions) WorkerDeploymentError!deployment.RoutingChange {
+        return h.ramp(arena, build_id orelse "", percentage, options);
+    }
+
+    /// Stops ramping: everything goes to the current version. The result's memory comes
+    /// from `arena`.
+    pub fn unsetRampingVersion(h: *const WorkerDeploymentHandle, arena: Allocator, options: deployment.RoutingOptions) WorkerDeploymentError!deployment.RoutingChange {
+        return h.ramp(arena, "", 0, options);
+    }
+
+    fn ramp(h: *const WorkerDeploymentHandle, arena: Allocator, build_id: []const u8, percentage: f32, options: deployment.RoutingOptions) WorkerDeploymentError!deployment.RoutingChange {
+        const c = h.client;
+        const response = try h.call(wfs.SetWorkerDeploymentRampingVersionResponse, "SetWorkerDeploymentRampingVersion", wfs.SetWorkerDeploymentRampingVersionRequest{
+            .namespace = c.namespace,
+            .deployment_name = h.name,
+            .build_id = build_id,
+            .percentage = percentage,
+            .conflict_token = options.conflict_token,
+            .identity = c.identity,
+            .ignore_missing_task_queues = options.ignore_missing_task_queues,
+            .allow_no_pollers = options.allow_no_pollers,
+        }, arena, build_id);
+        return .fromVersion(response.conflict_token, response.previous_deployment_version, response.previous_percentage);
+    }
+
+    /// Version `build_id` of the deployment: its status, task queues, drainage and
+    /// metadata. All memory comes from `arena`.
+    pub fn describeVersion(h: *const WorkerDeploymentHandle, arena: Allocator, build_id: []const u8) WorkerDeploymentError!deployment.VersionDescription {
+        const c = h.client;
+        const response = try h.call(wfs.DescribeWorkerDeploymentVersionResponse, "DescribeWorkerDeploymentVersion", wfs.DescribeWorkerDeploymentVersionRequest{
+            .namespace = c.namespace,
+            .deployment_version = .{ .deployment_name = h.name, .build_id = build_id },
+        }, arena, build_id);
+        const info = response.worker_deployment_version_info orelse return error.InvalidResponse;
+        return deployment.VersionDescription.fromProto(arena, info);
+    }
+
+    /// Deletes version `build_id`. The server refuses (`error.RpcFailed`, logged) while
+    /// the version is current or ramping, while its workers poll, and while it drains,
+    /// unless `skip_drainage`.
+    pub fn deleteVersion(h: *const WorkerDeploymentHandle, build_id: []const u8, options: deployment.DeleteVersionOptions) WorkerDeploymentError!void {
+        const c = h.client;
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        _ = try h.call(wfs.DeleteWorkerDeploymentVersionResponse, "DeleteWorkerDeploymentVersion", wfs.DeleteWorkerDeploymentVersionRequest{
+            .namespace = c.namespace,
+            .deployment_version = .{ .deployment_name = h.name, .build_id = build_id },
+            .skip_drainage = options.skip_drainage,
+            .identity = c.identity,
+        }, arena_state.allocator(), build_id);
+    }
+
+    /// Sets and removes metadata of version `build_id`: `upserts` is a struct literal, one
+    /// field per key, encoded like `converter.toFields`; `removals` are keys to delete.
+    ///
+    ///     try shop.updateVersionMetadata("b2", .{ .release = "2026-11", .approved = true }, &.{"draft"});
+    pub fn updateVersionMetadata(h: *const WorkerDeploymentHandle, build_id: []const u8, upserts: anytype, removals: []const []const u8) WorkerDeploymentError!void {
+        const c = h.client;
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const fields = try converter.toFields(a, upserts);
+        var request: wfs.UpdateWorkerDeploymentVersionMetadataRequest = .{
+            .namespace = c.namespace,
+            .deployment_version = .{ .deployment_name = h.name, .build_id = build_id },
+            .identity = c.identity,
+        };
+        try request.upsert_entries.ensureTotalCapacity(a, fields.len);
+        for (fields) |f| request.upsert_entries.appendAssumeCapacity(.{ .key = f.name, .value = f.value });
+        try request.remove_entries.appendSlice(a, removals);
+        _ = try h.call(wfs.UpdateWorkerDeploymentVersionMetadataResponse, "UpdateWorkerDeploymentVersionMetadata", request, a, build_id);
+    }
+
+    /// Sets the deployment's manager identity, the only identity then allowed to change its
+    /// routing: `identity`, or this client's when null; an empty one lets anyone again.
+    /// Returns the previous manager identity, allocated from `arena`.
+    pub fn setManagerIdentity(h: *const WorkerDeploymentHandle, arena: Allocator, identity: ?[]const u8, options: deployment.ManagerOptions) WorkerDeploymentError![]const u8 {
+        const c = h.client;
+        const response = try h.call(wfs.SetWorkerDeploymentManagerResponse, "SetWorkerDeploymentManager", wfs.SetWorkerDeploymentManagerRequest{
+            .namespace = c.namespace,
+            .deployment_name = h.name,
+            .conflict_token = options.conflict_token,
+            .identity = c.identity,
+            .new_manager_identity = if (identity) |i| .{ .manager_identity = i } else .{ .self = true },
+        }, arena, "");
+        return response.previous_manager_identity;
+    }
+
+    /// Deletes the deployment. The server refuses (`error.RpcFailed`, logged) while it has
+    /// versions; delete them first.
+    pub fn delete(h: *const WorkerDeploymentHandle) WorkerDeploymentError!void {
+        const c = h.client;
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        _ = try h.call(wfs.DeleteWorkerDeploymentResponse, "DeleteWorkerDeployment", wfs.DeleteWorkerDeploymentRequest{
+            .namespace = c.namespace,
+            .deployment_name = h.name,
+            .identity = c.identity,
+        }, arena_state.allocator(), "");
+    }
+
+    /// Sends a request about the deployment (or its version `build_id`, when not empty),
+    /// logging the server's reason for a refusal.
+    fn call(h: *const WorkerDeploymentHandle, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, build_id: []const u8) WorkerDeploymentError!Response {
+        var status: ?Client.RpcStatus = null;
+        return h.client.rpcWithStatus(Response, method, request, arena, &status) catch |err| switch (err) {
+            error.AlreadyExists => error.InvalidResponse,
+            error.RpcFailed => {
+                const s = status orelse return error.RpcFailed;
+                log.warn("{s} for worker deployment {s}{s}{s} failed: {s} (gRPC status {d})", .{ method, h.name, if (build_id.len > 0) ", build ID " else "", build_id, s.message, s.code });
+                return error.RpcFailed;
+            },
+            else => |e| e,
+        };
+    }
+};
+
+/// The deployments from `Client.listWorkerDeployments`. Fetches a page from the server
+/// whenever `next` runs past the last one. Owns its memory with the client's allocator: free
+/// it with `deinit`. Not thread-safe.
+pub const WorkerDeploymentIterator = struct {
+    client: *Client,
+    page_size: u31,
+    /// Holds the current page.
+    page: std.heap.ArenaAllocator,
+    entries: []const wfs.ListWorkerDeploymentsResponse.WorkerDeploymentSummary = &.{},
+    index: usize = 0,
+    /// Where the next page starts; empty after the last page. Owned with the client's
+    /// allocator.
+    next_page_token: []u8 = &.{},
+    fetched: bool = false,
+
+    pub fn deinit(it: *WorkerDeploymentIterator) void {
+        it.page.deinit();
+        it.client.gpa.free(it.next_page_token);
+        it.* = undefined;
+    }
+
+    /// The next deployment, copied into `arena`, or null after the last one. A failed fetch
+    /// can be retried by calling `next` again.
+    pub fn next(it: *WorkerDeploymentIterator, arena: Allocator) ListError!?deployment.ListEntry {
+        while (it.index == it.entries.len) {
+            if (it.fetched and it.next_page_token.len == 0) return null;
+            try it.fetch();
+        }
+        const raw = try it.entries[it.index].dupe(arena);
+        it.index += 1;
+        return deployment.ListEntry.fromProto(raw);
+    }
+
+    fn fetch(it: *WorkerDeploymentIterator) ListError!void {
+        const c = it.client;
+        it.entries = &.{};
+        it.index = 0;
+        _ = it.page.reset(.retain_capacity);
+        const a = it.page.allocator();
+        const response = c.rpc(wfs.ListWorkerDeploymentsResponse, "ListWorkerDeployments", wfs.ListWorkerDeploymentsRequest{
+            .namespace = c.namespace,
+            .page_size = it.page_size,
+            .next_page_token = it.next_page_token,
+        }, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+        const token = try c.gpa.dupe(u8, response.next_page_token);
+        c.gpa.free(it.next_page_token);
+        it.next_page_token = token;
+        it.entries = response.worker_deployments.items;
         it.fetched = true;
     }
 };

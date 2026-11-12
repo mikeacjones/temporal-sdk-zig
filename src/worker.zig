@@ -57,6 +57,32 @@ pub const Options = struct {
     /// (`client.Options.worker_interceptors`); the first is the outermost. Borrowed: they
     /// must outlive the worker. Called concurrently from workflow and activity threads.
     interceptors: []const interceptor.Worker = &.{},
+    /// Makes this worker a version of a Worker Deployment (see `temporal.deployment`). Null
+    /// leaves it unversioned.
+    deployment: ?DeploymentOptions = null,
+    /// Identifies this build of the worker's code to the server, without a deployment. Must
+    /// be empty with `deployment`, which carries its own.
+    build_id: []const u8 = "",
+    /// Legacy build-ID versioning: the server routes tasks by `build_id` with the task
+    /// queue's build-ID compatibility or assignment rules, which the server must have
+    /// enabled. Superseded by `deployment`; requires `build_id`.
+    use_build_id_versioning: bool = false,
+};
+
+/// A worker's Worker Deployment Version and how the server uses it.
+pub const DeploymentOptions = struct {
+    deployment_name: []const u8,
+    /// This build of the worker's code; with `deployment_name`, the worker's version.
+    build_id: []const u8,
+    /// Whether the server routes workflow tasks by version: to the deployment's current or
+    /// ramping version, and pinned runs to their own. False only reports the version, and
+    /// sends no versioning behaviors.
+    use_worker_versioning: bool = true,
+    /// The behavior of workflows whose `Def` doesn't declare one (`workflow.DefOptions`).
+    /// With `use_worker_versioning` and no default, every registered `Def` must declare
+    /// one, or `run` returns `error.InvalidOptions`. Must be `.unspecified` without
+    /// `use_worker_versioning`.
+    default_versioning_behavior: workflow.VersioningBehavior = .unspecified,
 };
 
 pub const Worker = struct {
@@ -195,9 +221,11 @@ pub const Worker = struct {
         var message: ?[]u8 = null;
         defer if (message) |m| w.gpa.free(m);
 
+        const strategy = try w.versioningStrategy();
         const core = bridge.Worker.init(w.gpa, w.client.connection, .{
             .namespace = w.client.namespace,
             .task_queue = w.task_queue,
+            .versioning = strategy,
             .identity_override = w.options.identity,
             .max_cached_workflows = w.options.max_cached_workflows,
             .tuner = .{
@@ -281,6 +309,44 @@ pub const Worker = struct {
         if (start_failed) |err| return err;
     }
 
+    /// The core's versioning strategy for `options`, or `error.InvalidOptions` (logged) for
+    /// options that contradict each other or a versioned worker whose workflows lack a
+    /// behavior.
+    fn versioningStrategy(w: *const Worker) error{ OutOfMemory, InvalidOptions }!bridge.Worker.Options.Versioning {
+        const o = w.options;
+        const d = o.deployment orelse {
+            if (!o.use_build_id_versioning) return .{ .none = .{ .build_id = o.build_id } };
+            if (o.build_id.len == 0) {
+                log.warn("worker for task queue {s}: use_build_id_versioning requires a build_id", .{w.task_queue});
+                return error.InvalidOptions;
+            }
+            return .{ .legacy_build_id = .{ .build_id = o.build_id } };
+        };
+        if (o.build_id.len > 0 or o.use_build_id_versioning) {
+            log.warn("worker for task queue {s}: build_id and use_build_id_versioning must be unset with deployment; set the build ID in deployment.build_id", .{w.task_queue});
+            return error.InvalidOptions;
+        }
+        if (d.use_worker_versioning and d.default_versioning_behavior == .unspecified) {
+            var missing: std.ArrayList(u8) = .empty;
+            defer missing.deinit(w.gpa);
+            var it = w.workflows.iterator();
+            while (it.next()) |kv| if (kv.value_ptr.versioning_behavior == .unspecified) {
+                if (missing.items.len > 0) try missing.appendSlice(w.gpa, ", ");
+                try missing.appendSlice(w.gpa, kv.key_ptr.*);
+            };
+            if (missing.items.len > 0) {
+                log.warn("worker for task queue {s} in deployment {s}: workflows {s} declare no versioning behavior; declare one with temporal.workflow.DefWithOptions or set deployment.default_versioning_behavior", .{ w.task_queue, d.deployment_name, missing.items });
+                return error.InvalidOptions;
+            }
+        }
+        return .{ .deployment = .{
+            .deployment_name = d.deployment_name,
+            .build_id = d.build_id,
+            .use_worker_versioning = d.use_worker_versioning,
+            .default_versioning_behavior = @backingInt(d.default_versioning_behavior),
+        } };
+    }
+
     /// Asks `run` to stop: polling ends, in-flight work finishes, then `run` returns. Running
     /// activities are canceled (reason `worker_shutdown`) once `graceful_shutdown_period`
     /// has passed. Safe to call from any thread, before or during `run`.
@@ -332,6 +398,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .logger = w.logSink(),
         .log_during_replay = w.options.log_during_replay,
         .metrics = w.client.metrics(),
+        .send_versioning_behavior = if (w.options.deployment) |d| d.use_worker_versioning else false,
     };
     defer runner.deinit();
     var message: ?[]u8 = null;
@@ -371,6 +438,8 @@ pub const WorkflowRunner = struct {
     log_during_replay: bool = false,
     /// Borrowed; see `Client.metrics`.
     metrics: metrics_mod.Handler = .noop,
+    /// See `Instance.Options.send_versioning_behavior`.
+    send_versioning_behavior: bool = false,
     runs: std.StringHashMapUnmanaged(*Instance) = .empty,
     /// Called for each eviction with the core's reason and message (the replayer uses it to
     /// detect nondeterminism).
@@ -464,6 +533,7 @@ pub const WorkflowRunner = struct {
                 .propagators = r.propagators,
                 .interceptors = r.interceptors,
                 .metrics = r.metrics,
+                .send_versioning_behavior = r.send_versioning_behavior,
             });
             errdefer inst.destroy();
             const key = try r.gpa.dupe(u8, act.run_id);
@@ -1014,6 +1084,47 @@ test "registering an activity type with the SDK's reserved prefix is rejected" {
     try testing.expectError(error.ReservedActivityName, w.registerActivityImpl(activity.Def("__temporal_mine", HelloTest.greet).registered));
     try testing.expectEqual(0, w.activities.count());
     try w.registerActivity(HelloTest.Greet);
+}
+
+test "versioning options map to the core's strategy, and contradictions are rejected" {
+    var client: client_mod.Client = undefined; // the strategy never touches the client
+    const Pinned = workflow.DefWithOptions("Pinned", HelloTest.hello, .{ .versioning_behavior = .pinned });
+    const cases = .{
+        .{ Options{}, "none", "" },
+        .{ Options{ .build_id = "b1" }, "none", "b1" },
+        .{ Options{ .build_id = "b1", .use_build_id_versioning = true }, "legacy_build_id", "b1" },
+        .{ Options{ .deployment = .{ .deployment_name = "shop", .build_id = "b2" } }, "deployment", "b2" },
+        .{ Options{ .deployment = .{ .deployment_name = "shop", .build_id = "b2", .use_worker_versioning = false } }, "deployment", "b2" },
+    };
+    inline for (cases) |case| {
+        var w = try Worker.init(testing.allocator, testing.io, &client, "versioned", case[0]);
+        defer w.deinit();
+        try w.registerWorkflow(Pinned);
+        const strategy = try w.versioningStrategy();
+        try testing.expectEqualStrings(case[1], @tagName(strategy));
+        switch (strategy) {
+            inline else => |v| try testing.expectEqualStrings(case[2], v.build_id),
+        }
+    }
+
+    const invalid = [_]Options{
+        .{ .use_build_id_versioning = true },
+        .{ .build_id = "b1", .deployment = .{ .deployment_name = "shop", .build_id = "b2" } },
+        // HelloTest.Hello declares no behavior and the deployment has no default.
+        .{ .deployment = .{ .deployment_name = "shop", .build_id = "b2" } },
+    };
+    for (invalid) |options| {
+        var w = try Worker.init(testing.allocator, testing.io, &client, "versioned", options);
+        defer w.deinit();
+        try w.registerWorkflow(HelloTest.Hello);
+        try testing.expectError(error.InvalidOptions, w.versioningStrategy());
+    }
+
+    // A default behavior covers workflows that declare none.
+    var w = try Worker.init(testing.allocator, testing.io, &client, "versioned", .{ .deployment = .{ .deployment_name = "shop", .build_id = "b2", .default_versioning_behavior = .auto_upgrade } });
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try testing.expectEqual(@as(i32, 2), (try w.versioningStrategy()).deployment.default_versioning_behavior);
 }
 
 // Small machines: std.Io.Threaded runs `async` work inline once it has as many busy threads

@@ -14,6 +14,7 @@ pub const log = @import("log.zig");
 pub const history = @import("history.zig");
 pub const metrics = @import("metrics.zig");
 pub const schedule = @import("schedule.zig");
+pub const deployment = @import("deployment.zig");
 pub const Failure = failure.Failure;
 pub const Header = converter.Header;
 pub const testing = @import("testing.zig");

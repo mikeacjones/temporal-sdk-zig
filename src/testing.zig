@@ -21,6 +21,7 @@ const converter = @import("converter.zig");
 const search_attributes = @import("search_attributes.zig");
 const history_mod = @import("history.zig");
 const schedule = @import("schedule.zig");
+const deployment_mod = @import("deployment.zig");
 const failure_mod = @import("failure.zig");
 const log_mod = @import("log.zig");
 const propagation = @import("propagation.zig");
@@ -1755,6 +1756,66 @@ const ContinueFixtures = struct {
     const CountUpCompleting = workflow.Def("CountUp", countUpCompleting);
 };
 
+/// One workflow at each stage of a change from greeting to saying goodbye: before it, behind a
+/// patch, with the patch deprecated, and with it removed; and the same change made with
+/// version numbers.
+const PatchFixtures = struct {
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+
+    fn farewell(ctx: *activity.Context, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "Goodbye {s}!", .{name});
+    }
+    const Farewell = activity.Def("Farewell", farewell);
+
+    fn greet(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return ctx.executeActivity(Fixtures.Greet, opts, .{name}).get();
+    }
+    fn bid(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return ctx.executeActivity(Farewell, opts, .{name}).get();
+    }
+
+    const Original = workflow.Def("Patched", greet);
+
+    fn patched(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        if (ctx.patched("farewell")) return bid(ctx, name);
+        return greet(ctx, name);
+    }
+    const Patched = workflow.Def("Patched", patched);
+
+    fn deprecated(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        ctx.deprecatePatch("farewell");
+        return bid(ctx, name);
+    }
+    const Deprecated = workflow.Def("Patched", deprecated);
+
+    const Removed = workflow.Def("Patched", bid);
+
+    const VersionedOriginal = workflow.Def("Versioned", greet);
+
+    fn versionedOne(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const v = try ctx.getVersion("farewell", workflow.default_version, 1);
+        return if (v == workflow.default_version) greet(ctx, name) else bid(ctx, name);
+    }
+    const VersionedOne = workflow.Def("Versioned", versionedOne);
+
+    /// Version 2 says goodbye twice.
+    fn versionedTwo(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return switch (try ctx.getVersion("farewell", workflow.default_version, 2)) {
+            workflow.default_version => greet(ctx, name),
+            1 => bid(ctx, name),
+            else => std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ try bid(ctx, name), try bid(ctx, name) }),
+        };
+    }
+    const VersionedTwo = workflow.Def("Versioned", versionedTwo);
+
+    /// `versionedTwo` once no run uses an older version.
+    fn versionedTwoOnly(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        _ = try ctx.getVersion("farewell", 2, 2);
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ try bid(ctx, name), try bid(ctx, name) });
+    }
+    const VersionedTwoOnly = workflow.Def("Versioned", versionedTwoOnly);
+};
+
 const LocalFixtures = struct {
     var started: Io.Event = .unset;
     /// Set once `block` has seen a cancel; `seen_reason` is written before.
@@ -2013,6 +2074,280 @@ test "WorkflowReplayer replays a run that continued as new and catches one that 
     defer changed.deinit();
     try changed.registerWorkflow(ContinueFixtures.CountUpCompleting);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(continue_as_new_history));
+}
+
+/// Dev-server runs of the `PatchFixtures` stages with the argument "Temporal", each on a
+/// worker with only that stage registered, exported with `temporal workflow show`: before the
+/// change (`Original`), behind its patch (`Patched`, which recorded the "farewell" marker),
+/// and with the patch deprecated (`Deprecated`, a deprecated marker); and for the version
+/// numbers, before the change (`VersionedOriginal`) and at version 1 (`VersionedOne`, a
+/// "farewell@v1" marker).
+const patch_before_history = @embedFile("testdata/patch_before_history.json");
+const patch_marker_history = @embedFile("testdata/patch_marker_history.json");
+const patch_deprecated_history = @embedFile("testdata/patch_deprecated_history.json");
+const version_before_history = @embedFile("testdata/version_before_history.json");
+const version_one_history = @embedFile("testdata/version_one_history.json");
+
+/// Replays `json` with only `Workflow` registered.
+fn replayWith(comptime Workflow: type, json: []const u8) WorkflowReplayer.ReplayError!void {
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    try r.registerWorkflow(Workflow);
+    return r.replayHistoryJson(json);
+}
+
+test "WorkflowReplayer: a patch replays runs from before it and after it" {
+    try replayWith(PatchFixtures.Patched, patch_before_history);
+    try replayWith(PatchFixtures.Patched, patch_marker_history);
+    // Code from before the patch can't replay a run that took the new path.
+    try testing.expectError(error.Nondeterminism, replayWith(PatchFixtures.Original, patch_marker_history));
+}
+
+test "WorkflowReplayer: deprecatePatch replays patched runs, and only then can the call go" {
+    try replayWith(PatchFixtures.Deprecated, patch_marker_history);
+    try replayWith(PatchFixtures.Deprecated, patch_deprecated_history);
+    // The old path is gone.
+    try testing.expectError(error.Nondeterminism, replayWith(PatchFixtures.Deprecated, patch_before_history));
+    // Without the call, a deprecated marker replays but a plain one doesn't: removing the
+    // patch before deprecating it breaks the runs that recorded it.
+    try replayWith(PatchFixtures.Removed, patch_deprecated_history);
+    try testing.expectError(error.Nondeterminism, replayWith(PatchFixtures.Removed, patch_marker_history));
+}
+
+test "WorkflowReplayer: getVersion replays each run on the version it recorded" {
+    try replayWith(PatchFixtures.VersionedOne, version_before_history);
+    try replayWith(PatchFixtures.VersionedOne, version_one_history);
+    try replayWith(PatchFixtures.VersionedTwo, version_before_history);
+    try replayWith(PatchFixtures.VersionedTwo, version_one_history);
+    // Dropping support for the default version and version 1 fails the workflow task.
+    try testing.expectError(error.ReplayFailed, replayWith(PatchFixtures.VersionedTwoOnly, version_before_history));
+    try testing.expectError(error.ReplayFailed, replayWith(PatchFixtures.VersionedTwoOnly, version_one_history));
+}
+
+test "patches and versions take the new path on a first run, which then replays" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try env.registerWorkflow(PatchFixtures.Patched);
+    try env.registerWorkflow(PatchFixtures.VersionedTwo);
+    try env.registerActivity(Fixtures.Greet);
+    try env.registerActivity(PatchFixtures.Farewell);
+    // executeWorkflow replays each finished run's history too.
+    try testing.expectEqualStrings("Goodbye Temporal!", try env.executeWorkflow(PatchFixtures.Patched, .{"Temporal"}, arena.allocator(), null));
+    try testing.expectEqualStrings("Goodbye Temporal! Goodbye Temporal!", try env.executeWorkflow(PatchFixtures.VersionedTwo, .{"Temporal"}, arena.allocator(), null));
+}
+
+const VersionFixtures = struct {
+    /// Reports the deployment version running its first workflow task.
+    fn whoRuns(ctx: *workflow.Context) ![]const u8 {
+        const v = ctx.currentDeploymentVersion() orelse return "none";
+        return std.fmt.allocPrint(ctx.allocator(), "{s}.{s}", .{ v.deployment_name, v.build_id });
+    }
+    const WhoRuns = workflow.DefWithOptions("WhoRuns", whoRuns, .{ .versioning_behavior = .pinned });
+
+    const Release = workflow.SignalDef("release", fn () void);
+    const StartedOn = workflow.QueryDef("started_on", fn () []const u8);
+    const State = struct {
+        released: bool = false,
+        started_on: []const u8 = "",
+        fn release(s: *State) void {
+            s.released = true;
+        }
+        fn isReleased(s: *State) bool {
+            return s.released;
+        }
+        fn startedOn(s: *State) []const u8 {
+            return s.started_on;
+        }
+    };
+    /// Waits for `Release`, then returns the build IDs that started it and that finished it.
+    fn waitThenReport(ctx: *workflow.Context) ![]const u8 {
+        const state = try ctx.allocator().create(State);
+        state.* = .{ .started_on = if (ctx.currentDeploymentVersion()) |v| v.build_id else "none" };
+        try ctx.setSignalHandler(Release, state, State.release);
+        try ctx.setQueryHandler(StartedOn, state, State.startedOn);
+        try ctx.await(state, State.isReleased);
+        const finished_on = if (ctx.currentDeploymentVersion()) |v| v.build_id else "none";
+        return std.fmt.allocPrint(ctx.allocator(), "{s}->{s}", .{ state.started_on, finished_on });
+    }
+    const PinnedRollout = workflow.DefWithOptions("PinnedRollout", waitThenReport, .{ .versioning_behavior = .pinned });
+    const AutoRollout = workflow.DefWithOptions("AutoRollout", waitThenReport, .{ .versioning_behavior = .auto_upgrade });
+
+    /// Starts a worker of version `build_id` of the "rollout" deployment on `task_queue`.
+    const VersionWorker = struct {
+        w: worker_mod.Worker,
+        running: Io.Future(worker_mod.Worker.RunError!void) = undefined,
+
+        fn start(vw: *VersionWorker, c: *client_mod.Client, task_queue: []const u8, build_id: []const u8) !void {
+            vw.* = .{ .w = try .init(testing.allocator, testing.io, c, task_queue, .{
+                .deployment = .{ .deployment_name = "rollout", .build_id = build_id },
+            }) };
+            errdefer vw.w.deinit();
+            try vw.w.registerWorkflow(PinnedRollout);
+            try vw.w.registerWorkflow(AutoRollout);
+            vw.running = try testing.io.concurrent(WorkflowEnvironment.runWorker, .{&vw.w});
+        }
+
+        fn stop(vw: *VersionWorker) void {
+            vw.w.stop();
+            vw.running.await(testing.io) catch {};
+            vw.w.deinit();
+        }
+    };
+
+    /// Waits until `h`'s latest routing change has reached its task queues.
+    fn awaitRouting(h: *const client_mod.WorkerDeploymentHandle) !void {
+        while (true) {
+            var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena.deinit();
+            if ((try h.describe(arena.allocator())).routing_update != .in_progress) return;
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    }
+
+    /// Waits until the server knows version `build_id` of `h`'s deployment: its worker
+    /// has polled.
+    fn awaitVersion(h: *const client_mod.WorkerDeploymentHandle, build_id: []const u8) !void {
+        while (true) {
+            var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena.deinit();
+            const d = h.describe(arena.allocator()) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (d) |desc| for (desc.versions) |v| if (std.mem.eql(u8, v.version.build_id, build_id)) return;
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    }
+};
+
+test "a worker that only reports its deployment version runs workflows that see it" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var w = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, "reports-version", .{
+        .deployment = .{ .deployment_name = "reporting", .build_id = "b1", .use_worker_versioning = false },
+    });
+    defer w.deinit();
+    try w.registerWorkflow(VersionFixtures.WhoRuns);
+    var running = try testing.io.concurrent(WorkflowEnvironment.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    var run = try env.client.executeWorkflow(VersionFixtures.WhoRuns, .{ .task_queue = "reports-version" }, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("reporting.b1", try run.get(arena.allocator()));
+    try env.registerWorkflow(VersionFixtures.WhoRuns);
+    try env.replayRun(run.id, run.run_id);
+}
+
+test "worker deployment: a pinned run stays on its version across a rollout, an auto-upgrade run moves" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+    var rollout = try c.workerDeployment("rollout");
+    defer rollout.deinit();
+
+    var v1: VersionFixtures.VersionWorker = undefined;
+    try v1.start(c, "rollout", "v1");
+    defer v1.stop();
+    try VersionFixtures.awaitVersion(&rollout, "v1");
+    const first = try rollout.setCurrentVersion(a, "v1", .{});
+    try testing.expectEqual(@as(?deployment_mod.Version, null), first.previous);
+
+    var pinned = try c.executeWorkflow(VersionFixtures.PinnedRollout, .{ .task_queue = "rollout" }, .{});
+    defer pinned.deinit();
+    var auto = try c.executeWorkflow(VersionFixtures.AutoRollout, .{ .task_queue = "rollout" }, .{});
+    defer auto.deinit();
+    // A query is answered once the first workflow task has run.
+    try testing.expectEqualStrings("v1", try c.queryWorkflow(VersionFixtures.StartedOn, a, pinned.id, "", .{}));
+    try testing.expectEqualStrings("v1", try c.queryWorkflow(VersionFixtures.StartedOn, a, auto.id, "", .{}));
+
+    var v2: VersionFixtures.VersionWorker = undefined;
+    try v2.start(c, "rollout", "v2");
+    defer v2.stop();
+    try VersionFixtures.awaitVersion(&rollout, "v2");
+    const before = try rollout.describe(a);
+    try testing.expectEqualStrings("v1", before.routing.current.?.build_id);
+    const second = try rollout.setCurrentVersion(a, "v2", .{ .conflict_token = before.conflict_token });
+    try testing.expectEqualStrings("v1", second.previous.?.build_id);
+    // The token from before the change no longer applies.
+    try testing.expectError(error.RpcFailed, rollout.setCurrentVersion(a, "v1", .{ .conflict_token = before.conflict_token }));
+    try VersionFixtures.awaitRouting(&rollout);
+
+    try c.signalWorkflow(VersionFixtures.Release, pinned.id, "", .{});
+    try c.signalWorkflow(VersionFixtures.Release, auto.id, "", .{});
+    try testing.expectEqualStrings("v1->v1", try pinned.get(a));
+    try testing.expectEqualStrings("v1->v2", try auto.get(a));
+    try env.registerWorkflow(VersionFixtures.PinnedRollout);
+    try env.registerWorkflow(VersionFixtures.AutoRollout);
+    try env.replayRun(pinned.id, pinned.run_id);
+    try env.replayRun(auto.id, auto.run_id);
+
+    const after = try rollout.describe(a);
+    try testing.expectEqualStrings("rollout", after.name);
+    try testing.expectEqualStrings("v2", after.routing.current.?.build_id);
+    try testing.expectEqual(@as(usize, 2), after.versions.len);
+    for (after.versions) |v| {
+        const want: deployment_mod.VersionStatus = if (std.mem.eql(u8, v.version.build_id, "v2")) .current else .draining;
+        // v1 drains while the server checks for open pinned runs, then is drained.
+        if (want == .draining) {
+            try testing.expect(v.status == .draining or v.status == .drained);
+        } else try testing.expectEqual(want, v.status);
+    }
+
+    // Ramp a share back to v1, then stop ramping.
+    const ramped = try rollout.setRampingVersion(a, "v1", 25, .{});
+    try testing.expectEqual(@as(?deployment_mod.Version, null), ramped.previous);
+    const ramping = try rollout.describe(a);
+    try testing.expectEqualStrings("v1", ramping.routing.ramping.?.build_id);
+    try testing.expectEqual(@as(f32, 25), ramping.routing.ramping_percentage);
+    const unramped = try rollout.unsetRampingVersion(a, .{});
+    try testing.expectEqualStrings("v1", unramped.previous.?.build_id);
+    try testing.expectEqual(@as(f32, 25), unramped.previous_percentage);
+    try testing.expectEqual(@as(?deployment_mod.Version, null), (try rollout.describe(a)).routing.ramping);
+
+    try rollout.updateVersionMetadata("v2", .{ .release = "2026-11", .approved = true }, &.{});
+    try rollout.updateVersionMetadata("v2", .{}, &.{"approved"});
+    const described = try rollout.describeVersion(a, "v2");
+    try testing.expectEqual(deployment_mod.VersionStatus.current, described.status);
+    try testing.expectEqual(@as(usize, 1), described.metadata.len);
+    try testing.expectEqualStrings("2026-11", (try converter.fieldValue([]const u8, a, described.metadata, "release")).?);
+    var polled_workflows = false;
+    for (described.task_queues) |q| {
+        if (std.mem.eql(u8, q.name, "rollout") and q.type == .workflow) polled_workflows = true;
+    }
+    try testing.expect(polled_workflows);
+    try testing.expectError(error.NotFound, rollout.describeVersion(a, "v9"));
+
+    try testing.expectEqualStrings("", try rollout.setManagerIdentity(a, null, .{}));
+    try testing.expectEqualStrings(c.identity, (try rollout.describe(a)).manager_identity);
+    try testing.expectEqualStrings(c.identity, try rollout.setManagerIdentity(a, "", .{}));
+
+    // v1's worker still polls, and the deployment still has versions.
+    try testing.expectError(error.RpcFailed, rollout.deleteVersion("v1", .{ .skip_drainage = true }));
+    try testing.expectError(error.RpcFailed, rollout.delete());
+
+    var it = c.listWorkerDeployments(.{});
+    defer it.deinit();
+    var listed = false;
+    while (try it.next(a)) |entry| {
+        if (std.mem.eql(u8, entry.name, "rollout")) {
+            listed = true;
+            try testing.expectEqualStrings("v2", entry.routing.current.?.build_id);
+        }
+    }
+    try testing.expect(listed);
+
+    var missing = try c.workerDeployment("no-such-deployment");
+    defer missing.deinit();
+    try testing.expectError(error.NotFound, missing.describe(a));
 }
 
 test "WorkflowReplayer replays a batch of histories through one worker and reports each outcome" {
