@@ -15,6 +15,7 @@ const std = @import("std");
 const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
 const converter = @import("converter.zig");
+const search_attributes = @import("search_attributes.zig");
 const failure_mod = @import("failure.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -135,7 +136,7 @@ pub const Client = struct {
     }
 
     /// The start request for `options`, allocated from `a`. Signal-with-start copies it.
-    fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) error{OutOfMemory}!wfs.StartWorkflowExecutionRequest {
+    fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) search_attributes.EncodeError!wfs.StartWorkflowExecutionRequest {
         var request: wfs.StartWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_id = id,
@@ -168,6 +169,7 @@ pub const Client = struct {
             for (options.memo) |field| memo.fields.appendAssumeCapacity(.{ .key = field.name, .value = field.value });
             request.memo = memo;
         }
+        if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
         return request;
     }
 
@@ -465,7 +467,7 @@ pub const Client = struct {
             .close_time = timestamp(info.close_time),
             .history_length = info.history_length,
             .memo = if (info.memo) |m| try converter.fieldsFromMap(arena, m.fields.items) else &.{},
-            .search_attributes = if (info.search_attributes) |s| try converter.fieldsFromMap(arena, s.indexed_fields.items) else &.{},
+            .search_attributes = try .fromProto(arena, info.search_attributes),
             .raw = response,
         };
     }
@@ -740,6 +742,10 @@ pub const StartWorkflowOptions = struct {
     /// Non-indexed values recorded with the workflow, such as a description. Build them with
     /// `converter.toFields`; they are only read while starting.
     memo: []const converter.Field = &.{},
+    /// Indexed values for visibility queries, built with `search_attributes.Key.set`; unsets
+    /// are ignored. Only read while starting. A value the server can't index fails the start
+    /// with `error.InvalidSearchAttribute`.
+    search_attributes: []const search_attributes.Update = &.{},
 };
 
 /// Names an activity by its workflow and activity ID, for completing it without its task
@@ -760,7 +766,16 @@ pub const ActivityCompletionError = error{
     InvalidResponse,
 };
 
-pub const StartError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, WorkflowExecutionAlreadyStarted };
+pub const StartError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    NotFound,
+    InvalidResponse,
+    WorkflowExecutionAlreadyStarted,
+    /// `StartWorkflowOptions.search_attributes` holds a value the server can't index (logged).
+    InvalidSearchAttribute,
+};
 
 pub const SignalError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
 
@@ -833,8 +848,8 @@ pub const WorkflowDescription = struct {
     history_length: i64,
     /// Decode a value with `memoValue` or `converter.fieldValue`.
     memo: []const converter.Field,
-    /// Raw search attribute payloads, as the server returns them.
-    search_attributes: []const converter.Field,
+    /// Read a value with `search_attributes.get(arena, key)`.
+    search_attributes: search_attributes.View,
     /// The full server response, for anything not lifted into the fields above (pending
     /// activities, children, versioning info, ...).
     raw: wfs.DescribeWorkflowExecutionResponse,
@@ -996,6 +1011,8 @@ pub const UpdateWithStartError = error{
     InvalidOptions,
     /// The workflow is running and `id_conflict_policy` is `.fail`.
     WorkflowExecutionAlreadyStarted,
+    /// `StartWorkflowOptions.search_attributes` holds a value the server can't index (logged).
+    InvalidSearchAttribute,
 };
 
 pub const UpdateResultError = error{

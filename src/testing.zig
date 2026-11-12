@@ -18,6 +18,7 @@ const worker_mod = @import("worker.zig");
 const workflow = @import("workflow.zig");
 const activity = @import("activity.zig");
 const converter = @import("converter.zig");
+const search_attributes = @import("search_attributes.zig");
 const history_mod = @import("history.zig");
 const failure_mod = @import("failure.zig");
 const Allocator = std.mem.Allocator;
@@ -144,9 +145,21 @@ fn executable(existing_path: []const u8, version: []const u8) bridge.EphemeralSe
     return .{ .download = .{ .version = version } };
 }
 
+/// The custom search attributes a `WorkflowEnvironment` dev server registers, one of each
+/// type. The dev server has none of its own.
+pub const custom_search_attributes = [_]bridge.EphemeralServer.SearchAttribute{
+    .{ .name = "CustomKeywordField", .type = .Keyword },
+    .{ .name = "CustomTextField", .type = .Text },
+    .{ .name = "CustomIntField", .type = .Int },
+    .{ .name = "CustomDoubleField", .type = .Double },
+    .{ .name = "CustomBoolField", .type = .Bool },
+    .{ .name = "CustomDatetimeField", .type = .Datetime },
+    .{ .name = "CustomKeywordListField", .type = .KeywordList },
+};
+
 /// A server, client and worker for running workflows in tests.
 ///
-/// `start` runs a dev server; `startTimeSkipping` runs the time-skipping test server. On the
+/// `start` runs a dev server with `custom_search_attributes` registered; `startTimeSkipping` runs the time-skipping test server. On the
 /// test server time is locked (it moves at wall-clock speed) except while the test waits on
 /// a workflow result through `getResult` or `executeWorkflow`, or calls `sleep`. Then it
 /// jumps ahead whenever every workflow is waiting on a timer, so a 2h sleep finishes at
@@ -206,7 +219,7 @@ pub const WorkflowEnvironment = struct {
         env.running = null;
         env.next_id = 0;
         env.server = switch (kind) {
-            .dev => .{ .dev = try DevServer.start(gpa, io, .{}) },
+            .dev => .{ .dev = try DevServer.start(gpa, io, .{ .search_attributes = &custom_search_attributes }) },
             .time_skipping => .{ .time_skipping = try TestServer.start(gpa, io, .{}) },
         };
         errdefer env.server.stop(io);
@@ -908,6 +921,44 @@ const Fixtures = struct {
     }
     const MemoUpdatesChanged = workflow.Def("MemoUpdates", memoUpdatesWithoutUpserts);
 
+    const order_id = search_attributes.key(.keyword, "CustomKeywordField");
+    const priority = search_attributes.key(.int, "CustomIntField");
+    const tags = search_attributes.key(.keyword_list, "CustomKeywordListField");
+    const score = search_attributes.key(.double, "CustomDoubleField");
+    const flagged = search_attributes.key(.bool, "CustomBoolField");
+    const due = search_attributes.key(.datetime, "CustomDatetimeField");
+    const notes = search_attributes.key(.text, "CustomTextField");
+    const due_time = "2030-01-02T03:04:05.5Z";
+
+    /// Reads its start search attributes, then upserts before and after an activity: sets
+    /// every type, changes the priority, and unsets the order ID. Returns
+    /// "<start order ID> <start priority>: <names set at the end>".
+    fn searchAttributeUpdates(ctx: *workflow.Context, tag: []const u8) ![]const u8 {
+        const a = ctx.allocator();
+        const start = ctx.searchAttributes();
+        const id = (try start.get(a, order_id)) orelse "none";
+        const p = (try start.get(a, priority)) orelse 0;
+        try ctx.upsertSearchAttributes(&.{
+            priority.set(p + 1),
+            tags.set(&.{ tag, "nightly" }),
+            score.set(1.5),
+            flagged.set(true),
+            due.set(try converter.Time.parse(due_time)),
+        });
+        _ = try ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{tag}).get();
+        try ctx.upsertSearchAttributes(&.{ order_id.unset(), priority.set(p + 2), notes.set("all done") });
+        var names: std.ArrayList([]const u8) = .empty;
+        for (ctx.searchAttributes().fields) |f| try names.append(a, f.name);
+        return std.fmt.allocPrint(a, "{s} {d}: {s}", .{ id, p, try std.mem.join(a, ",", names.items) });
+    }
+    const SearchAttributeUpdates = workflow.Def("SearchAttributeUpdates", searchAttributeUpdates);
+
+    fn searchAttributeUpdatesWithoutUpserts(ctx: *workflow.Context, tag: []const u8) ![]const u8 {
+        _ = try ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{tag}).get();
+        return "unchanged";
+    }
+    const SearchAttributeUpdatesChanged = workflow.Def("SearchAttributeUpdates", searchAttributeUpdatesWithoutUpserts);
+
     /// Heartbeats until canceled, then returns error.Canceled.
     fn heartbeatUntilCanceled(ctx: *activity.Context) !void {
         while (true) {
@@ -1554,6 +1605,23 @@ test "WorkflowReplayer replays memo upserts and catches a dropped upsert" {
     defer changed.deinit();
     try changed.registerWorkflow(Fixtures.MemoUpdatesChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(upsert_memo_history));
+}
+
+/// A dev-server run of `Fixtures.SearchAttributeUpdates` with the argument "blue", started
+/// with CustomKeywordField "order-7" and CustomIntField 1, exported with
+/// `temporal workflow show`.
+const upsert_search_attributes_history = @embedFile("testdata/upsert_search_attributes_history.json");
+
+test "WorkflowReplayer replays search attribute upserts and catches a dropped upsert" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(Fixtures.SearchAttributeUpdates);
+    try ok.replayHistoryJson(upsert_search_attributes_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(Fixtures.SearchAttributeUpdatesChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(upsert_search_attributes_history));
 }
 
 /// A dev-server run of `Fixtures.WaitCancellation` canceled with `Client.cancelWorkflow` while
@@ -2291,6 +2359,50 @@ test "WorkflowEnvironment update-with-start starts the worker and defaults the I
         try testing.expectEqualStrings("7 ", try env.getResult(UpdateFixtures.HandleUpdates, &run, a, null));
         try testing.expectEqualStrings(env.task_queue, (try env.client.describeWorkflow(a, run.id, run.run_id)).task_queue);
     }
+}
+
+test "search attributes set at start are read and upserted by the workflow; describe shows the final values" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.SearchAttributeUpdates);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(Fixtures.SearchAttributeUpdates, .{
+        .task_queue = "",
+        // An unset at start has nothing to remove and is left out.
+        .search_attributes = &.{ Fixtures.order_id.set("order-7"), Fixtures.priority.set(1), Fixtures.notes.unset() },
+    }, .{"blue"});
+    defer run.deinit();
+    // getResult also replays the run's history.
+    try testing.expectEqualStrings(
+        "order-7 1: CustomBoolField,CustomDatetimeField,CustomDoubleField,CustomIntField,CustomKeywordListField,CustomTextField",
+        try env.getResult(Fixtures.SearchAttributeUpdates, &run, a, null),
+    );
+
+    const d = try env.client.describeWorkflow(a, run.id, run.run_id);
+    const sa = d.search_attributes;
+    try testing.expectEqual(@as(?[]const u8, null), try sa.get(a, Fixtures.order_id));
+    try testing.expectEqual(@as(?i64, 3), try sa.get(a, Fixtures.priority));
+    const tags = (try sa.get(a, Fixtures.tags)).?;
+    try testing.expectEqual(@as(usize, 2), tags.len);
+    try testing.expectEqualStrings("blue", tags[0]);
+    try testing.expectEqualStrings("nightly", tags[1]);
+    try testing.expectEqual(@as(?f64, 1.5), try sa.get(a, Fixtures.score));
+    try testing.expectEqual(@as(?bool, true), try sa.get(a, Fixtures.flagged));
+    try testing.expectEqual(try converter.Time.parse(Fixtures.due_time), (try sa.get(a, Fixtures.due)).?);
+    try testing.expectEqualStrings("all done", (try sa.get(a, Fixtures.notes)).?);
+    // Reading through a key of another type is an error, not a wrong value.
+    try testing.expectError(error.InvalidPayload, sa.get(a, search_attributes.key(.keyword, Fixtures.priority.name)));
+}
+
+test "client: a search attribute value the server can't index fails the start" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    const bad = [_]search_attributes.Update{Fixtures.score.set(std.math.inf(f64))};
+    try testing.expectError(error.InvalidSearchAttribute, env.client.executeWorkflow(Fixtures.Hello, .{ .task_queue = env.task_queue, .search_attributes = &bad }, .{"x"}));
 }
 
 test "time-skipping WorkflowEnvironment completes a 2h sleep in seconds" {
