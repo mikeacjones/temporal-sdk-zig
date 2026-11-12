@@ -23,8 +23,9 @@
 //! - Time: `ctx.now()`.
 //!
 //! Canceling a future cancels what it is waiting on: a pending `io.sleep` cancels its timer and
-//! a pending `ActivityFuture.get` requests the activity's cancellation, and a pending
-//! `ChildWorkflowFuture.get` or `started` the child workflow's.
+//! a pending `ActivityFuture.get` requests the activity's cancellation, a pending
+//! `ChildWorkflowFuture.get` or `started` the child workflow's, and a pending
+//! `SignalExternalFuture.get` withdraws its signal if the server hasn't recorded it yet.
 //!
 //! Queries read a workflow's state from outside. Name one with `QueryDef` and answer it with
 //! `ctx.setQueryHandler`; the handler runs synchronously and must not change state or block:
@@ -62,6 +63,22 @@
 //!     state.* = .{};
 //!     try ctx.setSignalHandler(Approve, state, State.approve);
 //!     try ctx.await(state, State.approved);
+//!
+//! A workflow signals another with `ctx.signalExternalWorkflow`, by workflow ID (and run ID,
+//! empty for the latest run), and its child with `ChildWorkflowFuture.signal`. The future's
+//! `get` waits until the server delivered the signal; it returns
+//! `error.ExternalWorkflowNotFound` if the target doesn't exist or has closed. A child finds its
+//! parent in `ctx.info().parent`:
+//!
+//!     const parent = ctx.info().parent orelse return error.NoParent;
+//!     try ctx.signalExternalWorkflow(Approve, parent.workflow_id, parent.run_id, .{"child"}).get();
+//!
+//! `ctx.cancelExternalWorkflow` requests another workflow's cancellation the same way:
+//!
+//!     ctx.cancelExternalWorkflow(other_id, "").get() catch |err| switch (err) {
+//!         error.ExternalWorkflowNotFound => {}, // it has already closed
+//!         else => return err,
+//!     };
 //!
 //! Updates change a workflow's state and return a result to their caller. Name one with
 //! `UpdateDef` and handle it with `ctx.setUpdateHandler`, or with
@@ -125,6 +142,13 @@ const WorkflowIo = @import("workflow/WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
 const Duration = std.Io.Duration;
 
+/// A run of a workflow: its namespace, workflow ID, and run ID.
+pub const WorkflowExecution = struct {
+    namespace: []const u8,
+    workflow_id: []const u8,
+    run_id: []const u8,
+};
+
 pub const Info = struct {
     workflow_id: []const u8,
     run_id: []const u8,
@@ -141,6 +165,11 @@ pub const Info = struct {
     execution_timeout: ?Duration = null,
     run_timeout: ?Duration = null,
     task_timeout: ?Duration = null,
+    /// The workflow that started this one as a child, or null for a top-level workflow.
+    parent: ?WorkflowExecution = null,
+    /// The top-level workflow at the root of this one's chain of parents, or null when this
+    /// workflow is the root. Its namespace is the parent's: a child runs in its parent's.
+    root: ?WorkflowExecution = null,
 };
 
 pub const RetryPolicy = struct {
@@ -387,6 +416,22 @@ pub const Context = struct {
     /// tuple of argument values.
     pub fn executeChildWorkflowByName(ctx: *Context, comptime Result: type, workflow_type: []const u8, options: ChildWorkflowOptions, args: anytype) ChildWorkflowFuture(Result) {
         return .{ .ctx = ctx, .state = ctx.instance.startChildWorkflow(workflow_type, options, args) };
+    }
+
+    /// Sends `Signal` (a `SignalDef`) with `args` to the workflow `workflow_id` and returns a
+    /// future for its delivery. An empty `run_id` targets the workflow's latest run. The
+    /// target runs in this workflow's namespace. `args` are encoded here; the IDs are copied.
+    pub fn signalExternalWorkflow(ctx: *Context, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args) SignalExternalFuture {
+        return .{ .ctx = ctx, .state = ctx.instance.signalExternal(.{ .execution = .{ .workflow_id = workflow_id, .run_id = run_id } }, Signal.signal_name, args) };
+    }
+
+    /// Requests cancellation of the workflow `workflow_id` and returns a future for the
+    /// request's delivery. An empty `run_id` targets the workflow's latest run. The target runs
+    /// in this workflow's namespace and decides what canceling means: its code sees the
+    /// cancellation and may clean up, or ignore it. To cancel a child, cancel its future
+    /// instead. The IDs are copied.
+    pub fn cancelExternalWorkflow(ctx: *Context, workflow_id: []const u8, run_id: []const u8) CancelExternalFuture {
+        return .{ .ctx = ctx, .state = ctx.instance.requestCancelExternal(workflow_id, run_id) };
     }
 
     /// The workflow's memo: the memo it started with, with this run's `upsertMemo` calls
@@ -668,12 +713,6 @@ pub fn ActivityFuture(comptime T: type) type {
 /// `InvalidOptions`: the options were rejected before starting (the worker logs why).
 pub const ChildWorkflowError = error{ ChildWorkflowFailed, ChildWorkflowAlreadyStarted, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
 
-/// A started child workflow. Arena memory of the parent run.
-pub const ChildWorkflowExecution = struct {
-    workflow_id: []const u8,
-    run_id: []const u8,
-};
-
 /// The pending start and result of a child workflow.
 pub fn ChildWorkflowFuture(comptime T: type) type {
     return struct {
@@ -683,14 +722,15 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// The validation error, if the start was rejected; `started` and `get` return it.
         state: Instance.ScheduleError!*Instance.ChildState,
 
-        /// Waits until the server has started the child and returns its IDs. Returns
+        /// Waits until the server has started the child and returns its execution (arena
+        /// memory of the parent run; the child runs in the parent's namespace). Returns
         /// `error.ChildWorkflowAlreadyStarted` if its ID is taken, and `error.ChildWorkflowFailed`
         /// if it could not start for another reason or was canceled before it started.
         /// Canceling the calling coroutine cancels the child as `get` does.
-        pub fn started(f: Self) ChildWorkflowError!ChildWorkflowExecution {
+        pub fn started(f: Self) ChildWorkflowError!WorkflowExecution {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .started);
-            if (state.run_id) |run_id| return .{ .workflow_id = state.workflow_id, .run_id = run_id };
+            if (state.run_id) |run_id| return .{ .namespace = f.ctx.instance.namespace, .workflow_id = state.workflow_id, .run_id = run_id };
             return f.fail(state);
         }
 
@@ -741,8 +781,78 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         pub fn cancel(f: Self) void {
             if (f.state) |s| f.ctx.instance.cancelChild(s) else |_| {}
         }
+
+        /// Sends `Signal` (a `SignalDef`) with `args` to the child and returns a future for its
+        /// delivery. Waits for the child to start first (see `started`, whose errors this
+        /// returns); the signal then goes to the child's run, and only to a child of this
+        /// workflow.
+        pub fn signal(f: Self, comptime Signal: type, args: Signal.Args) ChildWorkflowError!SignalExternalFuture {
+            const exec = try f.started();
+            return .{ .ctx = f.ctx, .state = f.ctx.instance.signalExternal(.{ .child = exec.workflow_id }, Signal.signal_name, args) };
+        }
     };
 }
+
+/// `ExternalWorkflowNotFound`: the target workflow (or its namespace) doesn't exist, or it has
+/// closed. `ExternalWorkflowRequestFailed`: the server refused for another reason, such as the
+/// target's signal limit. Read the failure with the future's `failure` after either.
+/// `InvalidOptions`: the target workflow ID is empty (the worker logs it).
+pub const ExternalWorkflowError = error{ ExternalWorkflowNotFound, ExternalWorkflowRequestFailed, Canceled, OutOfMemory, InvalidOptions };
+
+/// The pending delivery of a signal to another workflow, from `Context.signalExternalWorkflow`
+/// or `ChildWorkflowFuture.signal`.
+pub const SignalExternalFuture = ExternalFuture;
+
+/// The pending delivery of a cancellation request to another workflow, from
+/// `Context.cancelExternalWorkflow`.
+pub const CancelExternalFuture = ExternalFuture;
+
+const ExternalFuture = struct {
+    const Self = @This();
+
+    ctx: *Context,
+    /// The validation error, if the request was rejected before it was sent; `get`
+    /// returns it.
+    state: Instance.ScheduleError!*Instance.ExternalState,
+
+    /// Waits until the server has delivered the signal or cancellation request. If the
+    /// calling coroutine is canceled while waiting, this returns `error.Canceled` at once.
+    /// A signal is also withdrawn if the server hasn't recorded it yet; once recorded it is
+    /// delivered anyway. A cancellation request is never withdrawn.
+    pub fn get(f: Self) ExternalWorkflowError!void {
+        const state = try f.state;
+        try f.ctx.instance.awaitExternal(state);
+        switch (state.outcome.?) {
+            .delivered => {},
+            .not_found => |fl| {
+                f.ctx.instance.setLastFailure(fl);
+                return error.ExternalWorkflowNotFound;
+            },
+            .failed => |fl| {
+                f.ctx.instance.setLastFailure(fl);
+                return error.ExternalWorkflowRequestFailed;
+            },
+            .canceled => return error.Canceled,
+        }
+    }
+
+    /// Why the request failed, after `get` returned `error.ExternalWorkflowNotFound` or
+    /// `error.ExternalWorkflowRequestFailed`.
+    pub fn failure(f: Self) ?*const failure_mod.Failure {
+        const state = f.state catch return null;
+        const outcome = state.outcome orelse return null;
+        return switch (outcome) {
+            .delivered => null,
+            .not_found, .failed, .canceled => |fl| fl,
+        };
+    }
+
+    /// Whether the server has answered, so `get` won't block.
+    pub fn isReady(f: Self) bool {
+        const state = f.state catch return true;
+        return state.outcome != null;
+    }
+};
 
 /// What a worker registers: a name and a type-erased call that decodes arguments, runs the
 /// workflow function, and encodes its result.
