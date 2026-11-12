@@ -1,0 +1,11 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter's
+// tracer logs a span for the start request, whose header carries the propagated value.
+.{
+    .expect = .{
+        "span started method=StartWorkflowExecution propagated=true",
+        "Workflow completed. Check worker logs.",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
+}
