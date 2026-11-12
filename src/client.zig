@@ -85,20 +85,22 @@ pub const Options = struct {
         /// PEM client certificate and key for mutual TLS: both or neither.
         client_cert: []const u8 = "",
         client_private_key: []const u8 = "",
-        /// Files to read the PEM above from instead, when the client connects. Each path
-        /// excludes its PEM field.
+        /// Files to read the PEM above from instead, each time the client connects (`connect`
+        /// and `Client.reconnect`), so a reconnect picks up certificates rotated on disk. Each
+        /// path excludes its PEM field.
         server_root_ca_cert_path: []const u8 = "",
         client_cert_path: []const u8 = "",
         client_private_key_path: []const u8 = "",
     };
 
-    /// The options the connection is made with.
+    /// The options the connection uses, for `Client.reconnect`.
     pub fn connectionOptions(o: Options) ConnectionOptions {
         return .{ .host_port = o.host_port, .api_key = o.api_key, .tls = o.tls, .headers = o.headers };
     }
 };
 
-/// The `Options` fields the connection is made with.
+/// What `Client.reconnect` replaces: the `Options` fields the connection is made with. The
+/// others (namespace, identity, codecs, ...) stay as `connect` set them.
 pub const ConnectionOptions = struct {
     host_port: []const u8 = "localhost:7233",
     api_key: []const u8 = "",
@@ -107,8 +109,9 @@ pub const ConnectionOptions = struct {
 };
 
 /// Connects to the server `options` names, reading the TLS files it names, and checks it.
-/// Logs why on failure.
-fn openConnection(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []const u8, options: ConnectionOptions) ConnectError!bridge.Connection {
+/// Logs why on failure: as an error, or as a warning for a `reconnect`, after which the
+/// client still works.
+fn openConnection(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []const u8, options: ConnectionOptions, comptime reconnecting: bool) ConnectError!bridge.Connection {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -130,7 +133,11 @@ fn openConnection(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []c
         .metadata = options.headers,
         .tls = tls,
     }, &message) catch |err| {
-        log.err("connecting to {s} failed: {s}", .{ options.host_port, message orelse @errorName(err) });
+        const reason = message orelse @errorName(err);
+        if (reconnecting)
+            log.warn("reconnecting to {s} failed, keeping the current connection: {s}", .{ options.host_port, reason })
+        else
+            log.err("connecting to {s} failed: {s}", .{ options.host_port, reason });
         return err;
     };
 }
@@ -257,7 +264,16 @@ pub const Client = struct {
     gpa: Allocator,
     io: Io,
     runtime: bridge.Runtime,
+    /// Read it with `currentConnection`: `reconnect` replaces it.
     connection: bridge.Connection,
+    /// Guards `connection`, `retired_connections` and `running_workers`.
+    connection_mutex: Io.Mutex = .init,
+    /// Connections `reconnect` replaced, freed by `close`: calls already sent on one may
+    /// still be using it.
+    retired_connections: std.ArrayList(bridge.Connection) = .empty,
+    /// The core workers running on this client, which `reconnect` moves to the new
+    /// connection. Registered by `worker.Worker.run`.
+    running_workers: std.ArrayList(*bridge.c.TemporalCoreWorker) = .empty,
     namespace: []u8,
     identity: []u8,
     /// `Options.codecs`, borrowed.
@@ -327,7 +343,7 @@ pub const Client = struct {
         const namespace = try gpa.dupe(u8, options.namespace);
         errdefer gpa.free(namespace);
 
-        const connection = try openConnection(gpa, io, runtime, identity, options.connectionOptions());
+        const connection = try openConnection(gpa, io, runtime, identity, options.connectionOptions(), false);
         return .{
             .gpa = gpa,
             .io = io,
@@ -346,6 +362,9 @@ pub const Client = struct {
     }
 
     pub fn close(c: *Client) void {
+        c.running_workers.deinit(c.gpa);
+        for (c.retired_connections.items) |conn| conn.deinit();
+        c.retired_connections.deinit(c.gpa);
         c.connection.deinit();
         if (c.meter) |m| m.destroy();
         c.runtime.deinit();
@@ -355,10 +374,21 @@ pub const Client = struct {
         c.* = undefined;
     }
 
+    /// The connection calls go over now. It stays valid until `close`, even after a
+    /// `reconnect` replaces it. Thread-safe.
+    pub fn currentConnection(c: *Client) bridge.Connection {
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        return c.connection;
+    }
+
     /// Replaces the API key sent with every call from now on, by this client and every worker
     /// on it; empty sends none. Calls already sent keep the key they had. Use it to rotate a
-    /// key before it expires. Thread-safe.
+    /// key before it expires. A later `reconnect` sends its own `ConnectionOptions.api_key`
+    /// instead. Thread-safe.
     pub fn updateApiKey(c: *Client, api_key: []const u8) void {
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
         c.connection.setApiKey(api_key);
     }
 
@@ -366,13 +396,70 @@ pub const Client = struct {
     /// this client and every worker on it. Returns `error.InvalidOptions` (logged) for a key
     /// that isn't a valid header name or ends in "-bin" (binary headers aren't supported), or
     /// a value with characters other than visible ASCII, space and tab; the headers are then
-    /// unchanged. Thread-safe.
+    /// unchanged. A later `reconnect` sends its own `ConnectionOptions.headers` instead.
+    /// Thread-safe.
     pub fn updateHeaders(c: *Client, headers: []const bridge.bytes.MetadataEntry) error{ OutOfMemory, InvalidOptions }!void {
         for (headers) |h| try validateHeader(h);
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
         c.connection.setMetadata(c.gpa, headers) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // validateHeader already rejects newlines.
             error.NewlineInKey, error.NewlineInValue => unreachable,
+        };
+    }
+
+    /// Connects again with `options` (address, API key, TLS and headers) and sends every
+    /// later call over the new connection: this client's, and those of the workers running
+    /// on it, which move over without stopping (their polls already waiting finish on the old
+    /// connection). Workers started later use it too. TLS files named by `options.tls` are
+    /// read again, so this is how to rotate a client certificate: sdk-core can't change the
+    /// certificate of a live connection. The new connection is checked first; if that fails
+    /// (`ConnectError`, logged as a warning), the client keeps the current one. The old
+    /// connection is freed by `close`, since calls already sent may still be using it. A
+    /// worker that is already shutting down can't move and finishes on the old connection
+    /// (logged as a warning). Thread-safe.
+    pub fn reconnect(c: *Client, options: ConnectionOptions) ConnectError!void {
+        const next = try openConnection(c.gpa, c.io, c.runtime, c.identity, options, true);
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        c.retired_connections.append(c.gpa, c.connection) catch {
+            next.deinit();
+            return error.OutOfMemory;
+        };
+        c.connection = next;
+        for (c.running_workers.items) |ptr| replaceWorkerClient(c, ptr, next);
+    }
+
+    /// For `worker.Worker.run`: registers a core worker it created on `created_on`, so
+    /// `reconnect` moves it, and moves it at once if a `reconnect` came in between. Pair with
+    /// `untrackWorker` before the core worker is freed.
+    pub fn trackWorker(c: *Client, ptr: *bridge.c.TemporalCoreWorker, created_on: bridge.Connection) error{OutOfMemory}!void {
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        try c.running_workers.append(c.gpa, ptr);
+        if (created_on.ptr != c.connection.ptr) replaceWorkerClient(c, ptr, c.connection);
+    }
+
+    /// For `worker.Worker.run`: unregisters a core worker `trackWorker` registered; does
+    /// nothing if it isn't registered.
+    pub fn untrackWorker(c: *Client, ptr: *bridge.c.TemporalCoreWorker) void {
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        for (c.running_workers.items, 0..) |p, i| if (p == ptr) {
+            _ = c.running_workers.swapRemove(i);
+            return;
+        };
+    }
+
+    /// sdk-core refuses to move a worker that is shutting down: it finishes on the old
+    /// connection.
+    fn replaceWorkerClient(c: *Client, ptr: *bridge.c.TemporalCoreWorker, connection: bridge.Connection) void {
+        const w: bridge.Worker = .{ .ptr = ptr, .runtime = c.runtime };
+        var message: ?[]u8 = null;
+        defer if (message) |m| c.gpa.free(m);
+        w.replaceClient(c.gpa, connection, &message) catch {
+            log.warn("moving a running worker to the new connection failed; it keeps the old one until it stops: {s}", .{message orelse "no reason given"});
         };
     }
 
@@ -1297,7 +1384,7 @@ pub const Client = struct {
         coded.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var failure: ?bridge.Connection.RpcFailure = null;
         defer if (failure) |f| f.deinit(c.gpa);
-        const bytes = c.connection.call(c.gpa, c.io, .workflow, method, encoded.written(), .{ .retry = true }, &failure) catch |err| switch (err) {
+        const bytes = c.currentConnection().call(c.gpa, c.io, .workflow, method, encoded.written(), .{ .retry = true }, &failure) catch |err| switch (err) {
             error.RpcFailed => {
                 const f = failure.?;
                 // gRPC ALREADY_EXISTS and NOT_FOUND are expected outcomes callers handle.
