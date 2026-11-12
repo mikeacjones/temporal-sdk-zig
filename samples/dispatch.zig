@@ -36,6 +36,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "dynamic-workflows:starter")) return @import("dynamic-workflows/starter.zig").main(init);
     if (std.mem.eql(u8, name, "early-return:worker")) return @import("early-return/worker.zig").main(init);
     if (std.mem.eql(u8, name, "early-return:starter")) return @import("early-return/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "encryption:worker")) return @import("encryption/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "encryption:starter")) return @import("encryption/starter.zig").main(init);
     if (std.mem.eql(u8, name, "expense:worker")) return @import("expense/worker.zig").main(init);
     if (std.mem.eql(u8, name, "expense:starter")) return @import("expense/starter.zig").main(init);
     if (std.mem.eql(u8, name, "greetings:worker")) return @import("greetings/worker.zig").main(init);
@@ -48,6 +50,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "io-group:starter")) return @import("io-group/starter.zig").main(init);
     if (std.mem.eql(u8, name, "logadapter:worker")) return @import("logadapter/worker.zig").main(init);
     if (std.mem.eql(u8, name, "logadapter:starter")) return @import("logadapter/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "logger-interceptor:worker")) return @import("logger-interceptor/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "logger-interceptor:starter")) return @import("logger-interceptor/starter.zig").main(init);
     if (std.mem.eql(u8, name, "memo:worker")) return @import("memo/worker.zig").main(init);
     if (std.mem.eql(u8, name, "memo:starter")) return @import("memo/starter.zig").main(init);
     if (std.mem.eql(u8, name, "metrics:worker")) return @import("metrics/worker.zig").main(init);
