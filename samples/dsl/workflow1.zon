@@ -1,0 +1,15 @@
+// Three activities in sequence:
+// 1) SampleActivity1 takes arg1 and stores its result in result1.
+// 2) SampleActivity2 takes result1 and stores its result in result2.
+// 3) SampleActivity3 takes arg2 and result2 and stores its result in result3.
+.{
+    .variables = .{
+        .{ .name = "arg1", .value = "value1" },
+        .{ .name = "arg2", .value = "value2" },
+    },
+    .root = .{ .sequence = .{ .elements = .{
+        .{ .activity = .{ .name = "SampleActivity1", .arguments = .{"arg1"}, .result = "result1" } },
+        .{ .activity = .{ .name = "SampleActivity2", .arguments = .{"result1"}, .result = "result2" } },
+        .{ .activity = .{ .name = "SampleActivity3", .arguments = .{ "arg2", "result2" }, .result = "result3" } },
+    } } },
+}
