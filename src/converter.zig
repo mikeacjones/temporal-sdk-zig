@@ -4,15 +4,53 @@
 //! metadata entry. The default converter uses Temporal's standard encodings, so workers and
 //! clients in any language understand each other:
 //!
-//! | Zig value                         | encoding      | data                    |
-//! |-----------------------------------|---------------|-------------------------|
-//! | `void`, `null`                    | `binary/null` | empty                   |
-//! | `converter.Bytes`                 | `binary/plain`| the bytes               |
-//! | anything else (strings included)  | `json/plain`  | JSON from `std.json`    |
+//! | Zig value                         | encoding          | data                       |
+//! |-----------------------------------|-------------------|----------------------------|
+//! | `void`, `null`                    | `binary/null`     | empty                      |
+//! | `converter.Bytes`                 | `binary/plain`    | the bytes                  |
+//! | a generated protobuf message      | `json/protobuf`   | ProtoJSON                  |
+//! | `converter.ProtoBinary(T)`        | `binary/protobuf` | the message's wire format  |
+//! | anything else (strings included)  | `json/plain`      | JSON from `std.json`       |
 //!
 //! Strings are JSON strings; use `Bytes` for raw binary data. Decoding
-//! accepts any of the three encodings into a compatible type. Decoded slices and strings are
+//! accepts any of these encodings into a compatible type: a protobuf message decodes from
+//! `json/protobuf` and `binary/protobuf`. Protobuf payloads also carry a `messageType`
+//! metadata entry with the message's full name (see `Proto`). Decoded slices and strings are
 //! allocated from the arena passed in.
+//!
+//! A type converts itself by declaring both of
+//!
+//!     pub fn toPayload(self: T, arena: Allocator) error{OutOfMemory}!Payload
+//!     pub fn fromPayload(arena: Allocator, p: Payload) DecodeError!T
+//!
+//! which take precedence over the defaults, for the type and for optionals of it. For
+//! example, a point sent as 8 little-endian bytes:
+//!
+//!     const Point = struct {
+//!         x: i32,
+//!         y: i32,
+//!
+//!         pub fn toPayload(p: Point, arena: Allocator) error{OutOfMemory}!converter.Payload {
+//!             const data = try arena.alloc(u8, 8);
+//!             std.mem.writeInt(i32, data[0..4], p.x, .little);
+//!             std.mem.writeInt(i32, data[4..8], p.y, .little);
+//!             return converter.payloadWithEncoding(arena, "binary/point", data);
+//!         }
+//!
+//!         pub fn fromPayload(_: Allocator, p: converter.Payload) converter.DecodeError!Point {
+//!             const enc = converter.encodingOf(p) orelse return error.UnknownEncoding;
+//!             if (!std.mem.eql(u8, enc, "binary/point")) return error.UnknownEncoding;
+//!             if (p.data.len != 8) return error.InvalidPayload;
+//!             return .{
+//!                 .x = std.mem.readInt(i32, p.data[0..4], .little),
+//!                 .y = std.mem.readInt(i32, p.data[4..8], .little),
+//!             };
+//!         }
+//!     };
+//!
+//! Conversion turns values into payloads; payload codecs (`PayloadCodec`) then transform
+//! the payloads themselves, for example to compress or encrypt them. `codecHandler` serves
+//! codecs over HTTP, so the Web UI and CLI can show payloads only the codecs can decode.
 
 const std = @import("std");
 const proto = @import("proto.zig");
@@ -21,21 +59,42 @@ const Allocator = std.mem.Allocator;
 pub const Payload = proto.temporal.api.common.v1.Payload;
 pub const Payloads = proto.temporal.api.common.v1.Payloads;
 
+const codec = @import("converter/codec.zig");
+pub const CodecError = codec.CodecError;
+pub const PayloadCodec = codec.PayloadCodec;
+pub const ZlibCodec = codec.ZlibCodec;
+pub const encodePayloads = codec.encodePayloads;
+pub const decodePayloads = codec.decodePayloads;
+pub const encodeMessage = codec.encodeMessage;
+pub const decodeMessage = codec.decodeMessage;
+pub const visitPayloads = codec.visitPayloads;
+const codec_handler = @import("converter/codec_handler.zig");
+pub const CodecHandler = codec_handler.CodecHandler;
+pub const CodecHandlerOptions = codec_handler.CodecHandlerOptions;
+pub const codecHandler = codec_handler.codecHandler;
+
 /// Raw bytes, encoded as `binary/plain` instead of a JSON string.
 pub const Bytes = struct { data: []const u8 };
 
 pub const encoding_key = "encoding";
+/// Metadata key of a protobuf payload's full message name, such as
+/// "temporal.api.common.v1.WorkflowExecution".
+pub const message_type_key = "messageType";
 
 pub const Encoding = enum {
     null,
     binary,
     json,
+    proto_json,
+    proto_binary,
 
     pub fn text(e: Encoding) []const u8 {
         return switch (e) {
             .null => "binary/null",
             .binary => "binary/plain",
             .json => "json/plain",
+            .proto_json => "json/protobuf",
+            .proto_binary => "binary/protobuf",
         };
     }
 };
@@ -58,19 +117,27 @@ pub fn toPayload(arena: Allocator, value: anytype) error{OutOfMemory}!Payload {
         if (value) |v| return toPayload(arena, v);
         return payloadWith(arena, .null, "");
     }
+    if (comptime hasPayloadHooks(T)) return value.toPayload(arena);
     if (T == Bytes) return payloadWith(arena, .binary, value.data);
+    if (comptime isProtoMessage(T)) return Proto(T, .{}).encode(arena, value);
     const json = try std.json.Stringify.valueAlloc(arena, value, .{});
     return payloadWith(arena, .json, json);
 }
 
 /// Decodes one value of type `T`. Memory comes from `arena`.
 pub fn fromPayload(comptime T: type, arena: Allocator, p: Payload) DecodeError!T {
+    if (comptime hasPayloadHooks(T)) return T.fromPayload(arena, p);
     const enc = encodingOf(p) orelse return error.UnknownEncoding;
     if (std.mem.eql(u8, enc, Encoding.null.text())) {
         if (T == void) return {};
         if (@typeInfo(T) == .optional) return null;
         return error.InvalidPayload;
     }
+    if (@typeInfo(T) == .optional) {
+        const Child = @typeInfo(T).optional.child;
+        if (comptime hasPayloadHooks(Child) or isProtoMessage(Child)) return try fromPayload(Child, arena, p);
+    }
+    if (comptime isProtoMessage(T)) return Proto(T, .{}).decode(arena, p);
     if (std.mem.eql(u8, enc, Encoding.binary.text())) {
         if (T == Bytes) return .{ .data = try arena.dupe(u8, p.data) };
         if (T == []const u8 or T == []u8) return arena.dupe(u8, p.data);
@@ -182,14 +249,126 @@ pub fn fieldsFromMap(arena: Allocator, entries: anytype) error{OutOfMemory}![]Fi
 }
 
 fn payloadWith(arena: Allocator, enc: Encoding, data: []const u8) error{OutOfMemory}!Payload {
+    return payloadWithEncoding(arena, enc.text(), data);
+}
+
+/// A payload of `data` with the `encoding` metadata entry `encoding`, for `toPayload` hooks
+/// and payload codecs. Borrows `data` and `encoding`; the metadata list comes from `arena`.
+pub fn payloadWithEncoding(arena: Allocator, encoding: []const u8, data: []const u8) error{OutOfMemory}!Payload {
     var p: Payload = .{ .data = data };
-    try p.metadata.append(arena, .{ .key = encoding_key, .value = enc.text() });
+    try p.metadata.append(arena, .{ .key = encoding_key, .value = encoding });
     return p;
+}
+
+fn hasPayloadHooks(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => std.meta.hasFn(T, "toPayload") and std.meta.hasFn(T, "fromPayload"),
+        else => false,
+    };
+}
+
+/// Whether `T` is a message type generated by zig-protobuf (detected by its descriptor table
+/// and generated codec functions).
+pub fn isProtoMessage(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "_desc_table") and
+        std.meta.hasFn(T, "encode") and std.meta.hasFn(T, "decode") and std.meta.hasFn(T, "jsonEncode");
+}
+
+/// The full protobuf name of a generated message type, derived from where the generator put
+/// it: generated files mirror the proto package (`temporal/api/common/v1.pb.zig` for
+/// `temporal.api.common.v1`), so the name is the type's Zig name without its first segment
+/// (the module or directory the generated files are imported through) and without the file's
+/// `pb` segment: `proto.temporal.api.common.v1.pb.Payload` is
+/// "temporal.api.common.v1.Payload". When the generated files are imported some other way, set
+/// `ProtoOptions.message_type`.
+pub fn protoMessageType(comptime T: type) []const u8 {
+    return comptime blk: {
+        const name = @typeName(T);
+        const pb = std.mem.indexOf(u8, name, ".pb.") orelse break :blk name;
+        const first = std.mem.indexOfScalar(u8, name, '.').?;
+        if (first == pb) break :blk name[pb + ".pb.".len ..];
+        break :blk name[first + 1 .. pb] ++ name[pb + ".pb".len ..];
+    };
+}
+
+pub const ProtoOptions = struct {
+    encoding: enum { json, binary } = .json,
+    /// The `messageType` metadata value; null derives it with `protoMessageType`.
+    message_type: ?[]const u8 = null,
+};
+
+/// A protobuf message `T` converted with `options`: wrap a message to choose its encoding or
+/// name, `Proto(Order, .{ .encoding = .binary }){ .message = order }`, and take the wrapper
+/// type as a parameter or result to decode one. Decoding accepts both protobuf encodings
+/// whatever `options` says. Unwrapped messages convert as `Proto(T, .{})`.
+pub fn Proto(comptime T: type, comptime options: ProtoOptions) type {
+    if (!isProtoMessage(T)) @compileError("Proto takes a message type generated by zig-protobuf, not " ++ @typeName(T));
+    return struct {
+        message: T,
+
+        const Self = @This();
+        const message_type = options.message_type orelse protoMessageType(T);
+
+        pub fn toPayload(self: Self, arena: Allocator) error{OutOfMemory}!Payload {
+            return encode(arena, self.message);
+        }
+
+        pub fn fromPayload(arena: Allocator, p: Payload) DecodeError!Self {
+            return .{ .message = try decode(arena, p) };
+        }
+
+        fn encode(arena: Allocator, message: T) error{OutOfMemory}!Payload {
+            const enc: Encoding, const data = switch (options.encoding) {
+                // Standard ProtoJSON writes a oneof's fields flat, without the oneof's name.
+                .json => .{ .proto_json, message.jsonEncode(.{}, .{ .emit_oneof_field_name = false }, arena) catch return error.OutOfMemory },
+                .binary => blk: {
+                    var out: std.Io.Writer.Allocating = .init(arena);
+                    message.encode(&out.writer, arena) catch return error.OutOfMemory;
+                    break :blk .{ .proto_binary, out.written() };
+                },
+            };
+            var p = try payloadWith(arena, enc, data);
+            try p.metadata.append(arena, .{ .key = message_type_key, .value = message_type });
+            return p;
+        }
+
+        fn decode(arena: Allocator, p: Payload) DecodeError!T {
+            const enc = encodingOf(p) orelse return error.UnknownEncoding;
+            if (std.mem.eql(u8, enc, Encoding.proto_json.text())) {
+                return std.json.parseFromSliceLeaky(T, arena, p.data, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.InvalidPayload,
+                };
+            }
+            if (std.mem.eql(u8, enc, Encoding.proto_binary.text())) {
+                // Decoded messages may borrow the input, so it is copied into the arena.
+                var reader: std.Io.Reader = .fixed(try arena.dupe(u8, p.data));
+                return T.decode(&reader, arena) catch |err| switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.InvalidPayload,
+                };
+            }
+            return error.UnknownEncoding;
+        }
+    };
+}
+
+/// `Proto(T, .{ .encoding = .binary })`: the message encodes as `binary/protobuf`.
+pub fn ProtoBinary(comptime T: type) type {
+    return Proto(T, .{ .encoding = .binary });
 }
 
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
+
+test {
+    _ = codec;
+    _ = codec_handler;
+}
 
 /// A point in time that encodes in JSON as an RFC 3339 string with up to nanosecond
 /// precision, such as "2018-08-22T16:30:00Z", the common form for times in payloads.
@@ -451,4 +630,97 @@ test "EncodedValues decodes arguments one at a time or as a tuple" {
     const args = try values.decode(struct { []const u8, i64 }, a);
     try testing.expectEqual(@as(i64, 42), args[1]);
     try testing.expectError(error.InvalidPayload, values.decode(struct { i64, i64 }, a));
+}
+
+/// The example from the file's header: a type with its own payload conversion.
+const Point = struct {
+    x: i32,
+    y: i32,
+
+    pub fn toPayload(p: Point, arena: Allocator) error{OutOfMemory}!Payload {
+        const data = try arena.alloc(u8, 8);
+        std.mem.writeInt(i32, data[0..4], p.x, .little);
+        std.mem.writeInt(i32, data[4..8], p.y, .little);
+        return payloadWithEncoding(arena, "binary/point", data);
+    }
+
+    pub fn fromPayload(_: Allocator, p: Payload) DecodeError!Point {
+        const enc = encodingOf(p) orelse return error.UnknownEncoding;
+        if (!std.mem.eql(u8, enc, "binary/point")) return error.UnknownEncoding;
+        if (p.data.len != 8) return error.InvalidPayload;
+        return .{
+            .x = std.mem.readInt(i32, p.data[0..4], .little),
+            .y = std.mem.readInt(i32, p.data[4..8], .little),
+        };
+    }
+};
+
+test "a type's own toPayload and fromPayload take precedence" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const p = try toPayload(a, Point{ .x = -3, .y = 7 });
+    try testing.expectEqualStrings("binary/point", encodingOf(p).?);
+    try testing.expectEqualSlices(u8, &.{ 0xfd, 0xff, 0xff, 0xff, 7, 0, 0, 0 }, p.data);
+    try testing.expectEqual(Point{ .x = -3, .y = 7 }, try fromPayload(Point, a, p));
+
+    // Optionals of the type use the hooks too; null stays binary/null.
+    const some = try toPayload(a, @as(?Point, .{ .x = 1, .y = 2 }));
+    try testing.expectEqualStrings("binary/point", encodingOf(some).?);
+    try testing.expectEqual(@as(?Point, .{ .x = 1, .y = 2 }), try fromPayload(?Point, a, some));
+    try testing.expectEqual(@as(?Point, null), try fromPayload(?Point, a, try toPayload(a, @as(?Point, null))));
+
+    // A hook sees every payload, so it decides which encodings it accepts.
+    try testing.expectError(error.UnknownEncoding, fromPayload(Point, a, try toPayload(a, @as(u32, 1))));
+    const args = try fromPayloads(struct { Point, []const u8 }, a, (try toPayloads(a, .{ Point{ .x = 5, .y = 6 }, @as([]const u8, "z") })).items);
+    try testing.expectEqual(@as(i32, 6), args[0].y);
+}
+
+test "protobuf messages round-trip as json/protobuf and binary/protobuf" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Failure = proto.temporal.api.failure.v1.Failure;
+
+    var cause: Failure = .{ .message = "root cause" };
+    const f: Failure = .{
+        .message = "boom",
+        .cause = &cause,
+        .failure_info = .{ .application_failure_info = .{ .type = "Oops", .non_retryable = true } },
+    };
+
+    const json = try toPayload(a, f);
+    try testing.expectEqualStrings("json/protobuf", encodingOf(json).?);
+    try testing.expectEqualStrings("messageType", json.metadata.items[1].key);
+    try testing.expectEqualStrings("temporal.api.failure.v1.Failure", json.metadata.items[1].value);
+    // Standard ProtoJSON: camelCase names and the oneof's field written flat.
+    try testing.expectEqualStrings(
+        "{\"message\":\"boom\",\"cause\":{\"message\":\"root cause\"},\"applicationFailureInfo\":{\"type\":\"Oops\",\"nonRetryable\":true}}",
+        json.data,
+    );
+    const from_json = try fromPayload(Failure, a, json);
+    try testing.expectEqualStrings("boom", from_json.message);
+    try testing.expectEqualStrings("root cause", from_json.cause.?.message);
+    try testing.expectEqualStrings("Oops", from_json.failure_info.?.application_failure_info.type);
+
+    const binary = try toPayload(a, ProtoBinary(Failure){ .message = f });
+    try testing.expectEqualStrings("binary/protobuf", encodingOf(binary).?);
+    try testing.expectEqualStrings("temporal.api.failure.v1.Failure", binary.metadata.items[1].value);
+    // Either encoding decodes into the message or its wrapper.
+    for ([_]Payload{ json, binary }) |p| {
+        const back = try fromPayload(ProtoBinary(Failure), a, p);
+        try testing.expect(back.message.failure_info.?.application_failure_info.non_retryable);
+        try testing.expectEqualStrings("root cause", (try fromPayload(?Failure, a, p)).?.cause.?.message);
+    }
+    try testing.expectEqual(@as(?Failure, null), try fromPayload(?Failure, a, try toPayload(a, {})));
+
+    const named = try toPayload(a, Proto(Failure, .{ .message_type = "example.v1.Problem" }){ .message = f });
+    try testing.expectEqualStrings("example.v1.Problem", named.metadata.items[1].value);
+    try testing.expectEqualStrings("temporal.api.common.v1.Payload.MetadataEntry", protoMessageType(Payload.MetadataEntry));
+
+    try testing.expectError(error.UnknownEncoding, fromPayload(Failure, a, try toPayload(a, @as([]const u8, "x"))));
+    var corrupt = binary;
+    corrupt.data = "\x0a\x0aX"; // a 10-byte message field holding one byte
+    try testing.expectError(error.InvalidPayload, fromPayload(Failure, a, corrupt));
 }
