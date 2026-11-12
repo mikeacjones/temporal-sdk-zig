@@ -64,6 +64,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "safe_message_handler:starter")) return @import("safe_message_handler/starter.zig").main(init);
     if (std.mem.eql(u8, name, "saga:worker")) return @import("saga/worker.zig").main(init);
     if (std.mem.eql(u8, name, "saga:starter")) return @import("saga/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "schedule:worker")) return @import("schedule/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "schedule:starter")) return @import("schedule/starter.zig").main(init);
     if (std.mem.eql(u8, name, "searchattributes:worker")) return @import("searchattributes/worker.zig").main(init);
     if (std.mem.eql(u8, name, "searchattributes:starter")) return @import("searchattributes/starter.zig").main(init);
     if (std.mem.eql(u8, name, "shoppingcart:worker")) return @import("shoppingcart/worker.zig").main(init);
