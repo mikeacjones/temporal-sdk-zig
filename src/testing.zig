@@ -23,6 +23,8 @@ const history_mod = @import("history.zig");
 const schedule = @import("schedule.zig");
 const failure_mod = @import("failure.zig");
 const log_mod = @import("log.zig");
+const propagation = @import("propagation.zig");
+const interceptor = @import("interceptor.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -222,6 +224,16 @@ pub const WorkflowEnvironment = struct {
         /// Where the client's sdk-core logs and the worker's workflow and activity logs go
         /// (`client.Options.logger`). Borrowed: it must outlive the environment.
         logger: ?log_mod.Sink = null,
+        /// The client's context propagators (`client.Options.propagators`), which its worker
+        /// and replays use too. Borrowed: they must outlive the environment.
+        propagators: []const propagation.ContextPropagator = &.{},
+        /// Interceptors of the worker's workflows and activities
+        /// (`client.Options.worker_interceptors`), which replays use too. Borrowed: they must
+        /// outlive the environment.
+        worker_interceptors: []const interceptor.Worker = &.{},
+        /// Interceptors of the client's requests (`client.Options.interceptors`). Borrowed:
+        /// they must outlive the environment.
+        interceptors: []const interceptor.Client = &.{},
     };
 
     /// Starts the environment on a dev server. Allocated so the worker's pointer to the
@@ -255,6 +267,9 @@ pub const WorkflowEnvironment = struct {
         var client_options = env.server.clientOptions();
         client_options.codecs = options.codecs;
         client_options.logger = options.logger;
+        client_options.propagators = options.propagators;
+        client_options.worker_interceptors = options.worker_interceptors;
+        client_options.interceptors = options.interceptors;
         // The time-skipping test server reports an old server version, which makes the core
         // warn about heartbeat details on every worker start.
         if (kind == .time_skipping) client_options.core_log_level = .err;
@@ -627,7 +642,13 @@ pub const WorkflowEnvironment = struct {
             .workflows = env.worker.workflows,
             .dynamic_workflow = env.worker.dynamic_workflow,
             .workflow_id = workflow_id,
-            .options = .{ .namespace = env.client.namespace, .task_queue = env.task_queue, .codecs = env.client.codecs },
+            .options = .{
+                .namespace = env.client.namespace,
+                .task_queue = env.task_queue,
+                .codecs = env.client.codecs,
+                .propagators = env.client.propagators,
+                .interceptors = env.client.worker_interceptors,
+            },
         };
         return replayer.replayHistory(history);
     }
@@ -710,6 +731,14 @@ pub const WorkflowReplayer = struct {
         /// through a client with codecs is already decoded; codecs pass decoded payloads
         /// through.
         codecs: []const converter.PayloadCodec = &.{},
+        /// Context propagators that extract the values workflows read with
+        /// `ctx.propagated()`, as the original worker's client did
+        /// (`client.Options.propagators`).
+        propagators: []const propagation.ContextPropagator = &.{},
+        /// Worker interceptors of the replayed workflows, as the original worker had them
+        /// (`worker.Options.interceptors`): workflow interceptors run during replay, and
+        /// those that change commands must be present for the history to match.
+        interceptors: []const interceptor.Worker = &.{},
     };
 
     pub fn init(gpa: Allocator, io: Io) WorkflowReplayer {
@@ -903,6 +932,8 @@ pub const WorkflowReplayer = struct {
                     .namespace = r.options.namespace,
                     .stack_size = 256 * 1024,
                     .codecs = r.options.codecs,
+                    .propagators = r.options.propagators,
+                    .interceptors = r.options.interceptors,
                     .on_evict = Outcome.record,
                     .on_evict_ctx = undefined,
                 },
