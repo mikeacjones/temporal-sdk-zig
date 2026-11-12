@@ -49,7 +49,8 @@
 //!     };
 //!
 //! Conversion turns values into payloads; payload codecs (`PayloadCodec`) then transform
-//! the payloads themselves, for example to compress or encrypt them.
+//! the payloads themselves, for example to compress or encrypt them. `codecHandler` serves
+//! codecs over HTTP, so the Web UI and CLI can show payloads only the codecs can decode.
 
 const std = @import("std");
 const proto = @import("proto.zig");
@@ -67,6 +68,10 @@ pub const decodePayloads = codec.decodePayloads;
 pub const encodeMessage = codec.encodeMessage;
 pub const decodeMessage = codec.decodeMessage;
 pub const visitPayloads = codec.visitPayloads;
+const codec_handler = @import("converter/codec_handler.zig");
+pub const CodecHandler = codec_handler.CodecHandler;
+pub const CodecHandlerOptions = codec_handler.CodecHandlerOptions;
+pub const codecHandler = codec_handler.codecHandler;
 
 /// Raw bytes, encoded as `binary/plain` instead of a JSON string.
 pub const Bytes = struct { data: []const u8 };
@@ -362,6 +367,7 @@ const testing = std.testing;
 
 test {
     _ = codec;
+    _ = codec_handler;
 }
 
 /// A point in time that encodes in JSON as an RFC 3339 string with up to nanosecond
