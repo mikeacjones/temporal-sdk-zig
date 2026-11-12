@@ -2525,3 +2525,60 @@ test "WorkflowReplayer replays a parent's child workflow and catches a changed c
     try changed.registerWorkflow(ChildFixtures.ParentChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(child_workflow_history));
 }
+
+const RetryDelayFixtures = struct {
+    /// Fails its first attempt as an expected, benign failure that asks for a 2 s retry delay.
+    fn pollReady(ctx: *activity.Context) ![]const u8 {
+        if (ctx.info().attempt == 1) return ctx.fail(.{
+            .message = "not ready yet",
+            .type = "NotReady",
+            .category = .benign,
+            .next_retry_delay = .fromSeconds(2),
+        });
+        return "ready";
+    }
+    const PollReady = activity.Def("PollReady", pollReady);
+
+    fn waitReady(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(PollReady, .{
+            .start_to_close_timeout = .fromSeconds(10),
+            .retry_policy = .{ .initial_interval = .fromMilliseconds(100), .backoff_coefficient = 1 },
+        }, .{}).get();
+    }
+    const WaitReady = workflow.Def("WaitReady", waitReady);
+
+    fn nanos(t: ?proto.google.protobuf.Timestamp) i96 {
+        const v = t orelse return 0;
+        return @as(i96, v.seconds) * std.time.ns_per_s + v.nanos;
+    }
+};
+
+test "a benign failure's next retry delay overrides the retry policy, and its category reaches history" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(RetryDelayFixtures.WaitReady);
+    try env.registerActivity(RetryDelayFixtures.PollReady);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(RetryDelayFixtures.WaitReady, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("ready", try env.getResult(RetryDelayFixtures.WaitReady, &run, a, null));
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var scheduled_at: ?i96 = null;
+    var started: ?proto.temporal.api.history.v1.HistoryEvent = null;
+    for (history.events.items) |e| switch (e.attributes orelse continue) {
+        .activity_task_scheduled_event_attributes => scheduled_at = RetryDelayFixtures.nanos(e.event_time),
+        .activity_task_started_event_attributes => started = e,
+        else => {},
+    };
+    const attempt = started.?.attributes.?.activity_task_started_event_attributes;
+    try testing.expectEqual(@as(i32, 2), attempt.attempt);
+    // The second attempt waited for the failure's 2 s delay, not the policy's 100 ms.
+    try testing.expect(RetryDelayFixtures.nanos(started.?.event_time) - scheduled_at.? >= 2 * std.time.ns_per_s);
+    const last = attempt.last_failure.?;
+    try testing.expectEqual(failure_mod.Application.Category.benign, failure_mod.applicationCategory(last).?);
+    try testing.expectEqual(@as(i64, 2), last.failure_info.?.application_failure_info.next_retry_delay.?.seconds);
+}
