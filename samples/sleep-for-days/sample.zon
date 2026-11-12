@@ -1,6 +1,10 @@
 // How samples-test validates this sample: start the worker, run the starter, and check that
-// the starter's output contains each `expect` line before `timeout_seconds`.
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter
+// signals the workflow to complete after its first email rather than leaving it running.
 .{
-    .expect = .{"sleep-for-days sample is a placeholder"},
+    .expect = .{
+        "Sent the first email",
+        "Workflow result: done",
+    },
     .timeout_seconds = 60,
 }
