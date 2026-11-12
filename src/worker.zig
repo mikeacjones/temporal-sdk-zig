@@ -129,8 +129,11 @@ pub const Worker = struct {
         gop.value_ptr.* = Workflow.registered;
     }
 
-    /// Registers an activity defined with `temporal.activity.Def`. Activity types starting
-    /// with "__temporal_" belong to the SDK and return `error.ReservedActivityName`.
+    /// Registers an activity defined with `temporal.activity.Def`, under the Def's name.
+    /// Every activity registration follows the naming rules on `temporal.activity.Def`: a
+    /// name already registered returns `error.AlreadyRegistered`, names starting with
+    /// "__temporal_" return `error.ReservedActivityName`, and Defs naming one function under
+    /// different names register as separate activities.
     pub fn registerActivity(w: *Worker, comptime Activity: type) RegisterActivityError!void {
         return w.registerActivityImpl(Activity.registered);
     }
@@ -148,8 +151,26 @@ pub const Worker = struct {
         inline for (activities) |Activity| try w.registerActivityWith(Activity, receiver);
     }
 
-    /// Registers an activity implementation under another activity's name, for example a
-    /// test double standing in for `Activity`.
+    /// Registers every activity method of the struct `impl` points to, bound to `impl`, as
+    /// `options.prefix` plus the method name. Activity methods and the skipped declarations
+    /// are those of `temporal.activity.defs`, whose result with the same `options` gives
+    /// workflows the matching Defs. `impl` must outlive the worker and be safe to use from
+    /// several activities at once. On an error, the methods before the failing one stay
+    /// registered.
+    pub fn registerActivities(w: *Worker, impl: anytype, comptime options: activity.StructOptions) RegisterActivityError!void {
+        const bad = "registerActivities takes a mutable pointer to a struct instance, not " ++ @typeName(@TypeOf(impl));
+        const T = switch (@typeInfo(@TypeOf(impl))) {
+            .pointer => |p| if (p.size == .one and !p.attrs.@"const") p.child else @compileError(bad),
+            else => @compileError(bad),
+        };
+        const defs = comptime activity.defs(T, options);
+        inline for (@typeInfo(@TypeOf(defs)).@"struct".field_names) |method|
+            try w.registerActivityImpl(@field(defs, method).with(impl));
+    }
+
+    /// Registers an activity implementation under its `name`, for example a test double
+    /// standing in for another activity: build it with `temporal.activity.Def(name, impl)`
+    /// and pass `.registered` or `.with(receiver)`.
     pub fn registerActivityImpl(w: *Worker, registered: activity.Registered) RegisterActivityError!void {
         if (std.mem.startsWith(u8, registered.name, Instance.reserved_activity_prefix)) {
             log.warn("registering activity type \"{s}\" failed: activity types starting with \"{s}\" are reserved for the SDK; rename the activity", .{ registered.name, Instance.reserved_activity_prefix });
@@ -1089,6 +1110,79 @@ test "registering an activity type with the SDK's reserved prefix is rejected" {
     try testing.expectError(error.ReservedActivityName, w.registerActivityImpl(activity.Def("__temporal_mine", HelloTest.greet).registered));
     try testing.expectEqual(0, w.activities.count());
     try w.registerActivity(HelloTest.Greet);
+}
+
+const Counter = struct {
+    step: u32,
+
+    pub const unit = "count";
+
+    pub fn next(c: *Counter, ctx: *activity.Context, n: u32) !u32 {
+        _ = ctx;
+        return n + c.step;
+    }
+
+    pub fn reset(c: *Counter, ctx: *activity.Context) !u32 {
+        _ = ctx;
+        return c.step;
+    }
+
+    pub fn describe(c: *const Counter) u32 {
+        return c.step;
+    }
+};
+
+fn invokeRegistered(w: *Worker, arena: Allocator, name: []const u8, args: anytype) ![]const u8 {
+    const reg = w.activities.get(name) orelse return error.NotRegistered;
+    var ctx: activity.Context = .{ .arena = arena, .io_ = testing.io, .info_ = undefined, .logger_ = .{} };
+    const payloads = try converter.toPayloads(arena, args);
+    return (try reg.invoke(reg.receiver, &ctx, payloads.items)).data;
+}
+
+test "registerActivities registers each activity method under the prefix, bound to the instance" {
+    var client: client_mod.Client = undefined; // registration never touches the client
+    var w = try Worker.init(testing.allocator, testing.io, &client, "struct", .{});
+    defer w.deinit();
+    var counter: Counter = .{ .step = 3 };
+    try w.registerActivities(&counter, .{});
+    try w.registerActivities(&counter, .{ .prefix = "Counter." });
+    try testing.expectEqual(4, w.activities.count());
+    for ([_][]const u8{ "next", "reset", "Counter.next", "Counter.reset" }) |name|
+        try testing.expect(w.activities.contains(name));
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("10", try invokeRegistered(&w, arena.allocator(), "Counter.next", .{@as(u32, 7)}));
+    counter.step = 4;
+    try testing.expectEqualStrings("4", try invokeRegistered(&w, arena.allocator(), "reset", .{}));
+}
+
+test "registerActivities rejects a prefix already registered or reserved for the SDK" {
+    var client: client_mod.Client = undefined; // registration never touches the client
+    var w = try Worker.init(testing.allocator, testing.io, &client, "struct", .{});
+    defer w.deinit();
+    var counter: Counter = .{ .step = 1 };
+    try w.registerActivities(&counter, .{ .prefix = "Counter." });
+    try testing.expectError(error.AlreadyRegistered, w.registerActivities(&counter, .{ .prefix = "Counter." }));
+    try testing.expectError(error.ReservedActivityName, w.registerActivities(&counter, .{ .prefix = "__temporal_" }));
+    try testing.expectEqual(2, w.activities.count());
+}
+
+test "one function registered under two names runs under each" {
+    var client: client_mod.Client = undefined; // registration never touches the client
+    var w = try Worker.init(testing.allocator, testing.io, &client, "aliases", .{});
+    defer w.deinit();
+    const Current = activity.Def("Greet", HelloTest.greet);
+    const Legacy = activity.Def("LegacyGreet", HelloTest.greet);
+    try w.registerActivity(Current);
+    try w.registerActivity(Legacy);
+    try testing.expectError(error.AlreadyRegistered, w.registerActivity(activity.Def("Greet", HelloTest.greet)));
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const name: []const u8 = "Temporal";
+    try testing.expectEqualStrings("\"Hello Temporal!\"", try invokeRegistered(&w, arena.allocator(), "Greet", .{name}));
+    try testing.expectEqualStrings("\"Hello Temporal!\"", try invokeRegistered(&w, arena.allocator(), "LegacyGreet", .{name}));
 }
 
 test "versioning options map to the core's strategy, and contradictions are rejected" {

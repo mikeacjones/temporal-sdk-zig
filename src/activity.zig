@@ -290,6 +290,21 @@ pub const Registered = struct {
 /// `fn (*Self, *Context, args...) !Result` that the worker calls on an instance registered
 /// with `registerActivityWith`. The result is a type that workflows pass to
 /// `executeActivity` and workers pass to `registerActivity`.
+///
+/// Naming rules, enforced when a worker registers the activity:
+/// - `name` is the activity type. Several Defs may name one function; each name is an
+///   alias the worker registers and runs separately. There is no option to forbid this:
+///   workflows only call activities through a Def (or by an explicit name), so a second
+///   name exists only where code declares a second Def, for example to keep an old type
+///   running for workflows that still schedule it.
+/// - A worker holds each name once: registering a name again returns
+///   `error.AlreadyRegistered`.
+/// - Names starting with "__temporal_" belong to the SDK and return
+///   `error.ReservedActivityName`.
+/// - `Worker.registerActivityImpl` and `testing.WorkflowEnvironment.registerActivityAs`
+///   register another implementation under an existing Def's name, such as a test double.
+/// - `defs` and `Worker.registerActivities` name each method of a struct as the prefix
+///   plus the method name.
 pub fn Def(comptime name: []const u8, comptime func: anytype) type {
     const F = @TypeOf(func);
     const params = @typeInfo(F).@"fn".param_types;
@@ -335,6 +350,63 @@ pub fn Def(comptime name: []const u8, comptime func: anytype) type {
             return .{ .name = name, .invoke = invoke, .receiver = receiver };
         }
     };
+}
+
+/// How `defs` and `Worker.registerActivities` name a struct's activity methods.
+pub const StructOptions = struct {
+    /// Prepended to each method name to form its activity type, for example "Billing." to
+    /// register `charge` as "Billing.charge".
+    prefix: []const u8 = "",
+};
+
+/// The activity Defs for the activity methods of struct `T`, under the names
+/// `Worker.registerActivities` registers with the same `options`. Workflows call them as
+/// fields of the result:
+///
+///     const billing = activity.defs(Billing, .{ .prefix = "Billing." });
+///     _ = try ctx.executeActivity(billing.charge, options, .{order}).get();
+///
+/// An activity method is a pub fn shaped `fn (*T, *Context, args...) !Result` (or taking
+/// `*const T`). Other pub declarations, such as constants, `init`, or functions without a
+/// `*Context` second parameter, are skipped, so a struct can hold helpers next to its
+/// activities. A struct with no activity method is a compile error.
+pub fn defs(comptime T: type, comptime options: StructOptions) MethodDefs(T, options) {
+    return .{};
+}
+
+/// The type of `defs(T, options)`: one comptime field per activity method, holding its Def.
+pub fn MethodDefs(comptime T: type, comptime options: StructOptions) type {
+    const names = activityMethodNames(T);
+    var attrs: [names.len]std.lang.Type.Struct.FieldAttributes = undefined;
+    for (names, &attrs) |method, *attr| {
+        const D = Def(options.prefix ++ method, @field(T, method));
+        attr.* = .{ .@"comptime" = true, .default_value_ptr = &D };
+    }
+    return @Struct(.auto, null, names, &@splat(type), &attrs);
+}
+
+fn activityMethodNames(comptime T: type) []const []const u8 {
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => @compileError("activity.defs and registerActivities take a struct type, not " ++ @typeName(T)),
+    };
+    var names: []const []const u8 = &.{};
+    for (info.decl_names) |name| {
+        if (isActivityMethod(T, @TypeOf(@field(T, name)))) names = names ++ .{name};
+    }
+    if (names.len == 0)
+        @compileError(@typeName(T) ++ " has no activity methods: give it a pub fn (*" ++ @typeName(T) ++ ", *temporal.activity.Context, args...) !Result");
+    const array = names[0..names.len].*;
+    return &array;
+}
+
+fn isActivityMethod(comptime T: type, comptime F: type) bool {
+    const f = switch (@typeInfo(F)) {
+        .@"fn" => |f| f,
+        else => return false,
+    };
+    if (f.is_generic or f.param_types.len < 2) return false;
+    return (f.param_types[0] == *T or f.param_types[0] == *const T) and f.param_types[1] == *Context;
 }
 
 /// Defines a dynamic activity: one function that runs every activity type the worker has no
@@ -440,6 +512,58 @@ test "Def binds methods to a receiver" {
     const args = try converter.toPayloads(a, .{@as([]const u8, "World")});
     const out = try reg.invoke(reg.receiver, &ctx, args.items);
     try std.testing.expectEqualStrings("\"Hello World!\"", out.data);
+}
+
+test "defs names each activity method with the prefix and skips other pub declarations" {
+    const Billing = struct {
+        fee: u32,
+
+        pub const currency = "EUR";
+
+        pub fn init(fee: u32) @This() {
+            return .{ .fee = fee };
+        }
+
+        pub fn charge(b: *@This(), ctx: *Context, amount: u32) !u32 {
+            _ = ctx;
+            return amount + b.fee;
+        }
+
+        pub fn refund(b: *const @This(), ctx: *Context, amount: u32) !u32 {
+            _ = ctx;
+            return amount - b.fee;
+        }
+
+        pub fn total(b: *@This(), amount: u32) u32 {
+            return amount + b.fee;
+        }
+
+        fn audit(b: *@This(), ctx: *Context) !void {
+            _ = b;
+            _ = ctx;
+        }
+    };
+    const plain = defs(Billing, .{});
+    try std.testing.expectEqualStrings("charge", plain.charge.activity_name);
+    try std.testing.expectEqualStrings("refund", plain.refund.activity_name);
+    try std.testing.expectEqual(2, @typeInfo(@TypeOf(plain)).@"struct".field_names.len);
+
+    const acts = defs(Billing, .{ .prefix = "Billing." });
+    try std.testing.expectEqualStrings("Billing.charge", acts.charge.activity_name);
+    try std.testing.expectEqualStrings("Billing.refund", acts.refund.activity_name);
+    try std.testing.expect(acts.charge.Receiver == Billing);
+    try std.testing.expect(acts.refund.Receiver == Billing);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var impl: Billing = .init(5);
+    var ctx: Context = .{ .arena = a, .io_ = std.testing.io, .info_ = undefined, .logger_ = .{} };
+    const args = try converter.toPayloads(a, .{@as(u32, 10)});
+    const charged = acts.charge.with(&impl);
+    try std.testing.expectEqualStrings("15", (try charged.invoke(charged.receiver, &ctx, args.items)).data);
+    const refunded = acts.refund.with(&impl);
+    try std.testing.expectEqualStrings("5", (try refunded.invoke(refunded.receiver, &ctx, args.items)).data);
 }
 
 test "heartbeats reach the sink and details decode" {

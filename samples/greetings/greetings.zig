@@ -1,5 +1,6 @@
 //! Greetings: a workflow that runs three activities in sequence. The activities are methods
-//! of a struct holding their shared state, bound to an instance when the worker registers them.
+//! of a struct holding their shared state. The worker registers all of them at once, bound to
+//! an instance, and the workflow calls them through the matching Defs from `activity.defs`.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -26,27 +27,27 @@ pub const Activities = struct {
     }
 };
 
-pub const GetGreeting = activity.Def("GetGreeting", Activities.getGreeting);
-pub const GetName = activity.Def("GetName", Activities.getName);
-pub const SayGreeting = activity.Def("SayGreeting", Activities.sayGreeting);
+/// One Def per activity method, named after the method: "getGreeting", "getName", and
+/// "sayGreeting".
+pub const activities = activity.defs(Activities, .{});
 
 fn greetings(ctx: *workflow.Context) ![]const u8 {
     const logger = ctx.logger();
     const ao: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
 
-    const greet_result = ctx.executeActivity(GetGreeting, ao, .{}).get() catch |err| {
+    const greet_result = ctx.executeActivity(activities.getGreeting, ao, .{}).get() catch |err| {
         logger.err("Get greeting failed.", .{ .err = err });
         return err;
     };
 
     // Get Name.
-    const name_result = ctx.executeActivity(GetName, ao, .{}).get() catch |err| {
+    const name_result = ctx.executeActivity(activities.getName, ao, .{}).get() catch |err| {
         logger.err("Get name failed.", .{ .err = err });
         return err;
     };
 
     // Say Greeting.
-    const say_result = ctx.executeActivity(SayGreeting, ao, .{ greet_result, name_result }).get() catch |err| {
+    const say_result = ctx.executeActivity(activities.sayGreeting, ao, .{ greet_result, name_result }).get() catch |err| {
         logger.err("Say greeting failed.", .{ .err = err });
         return err;
     };

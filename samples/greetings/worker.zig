@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
 
     try w.registerWorkflow(greetings.Greetings);
     var activities: greetings.Activities = .{ .name = "Temporal", .greeting = "Hello" };
-    try w.registerActivitiesWith(&activities, .{ greetings.GetGreeting, greetings.GetName, greetings.SayGreeting });
+    try w.registerActivities(&activities, .{});
 
     w.runUntilSignal() catch |err| {
         std.log.err("Unable to start worker: {t}", .{err});
