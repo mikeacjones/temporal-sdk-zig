@@ -1,0 +1,14 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter runs
+// the requester's worker itself, and cancels the workflow after its requests rather than
+// leaving it taking requests.
+.{
+    .expect = .{
+        "Result: \"FOO0\"",
+        "Result: \"FOO1\"",
+        "Result: \"FOO2\"",
+        "Canceled the uppercase workflow",
+    },
+    .timeout_seconds = 60,
+    .tests = .{ "workflow_test.zig", "requester_test.zig" },
+}
