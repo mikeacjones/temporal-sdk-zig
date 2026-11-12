@@ -356,6 +356,12 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
                 => true,
                 else => false,
             }),
+            .resolve_request_cancel_external_workflow => |r| try inst.resolveExternal(r.seq, r.failure, switch (r.cause) {
+                .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND,
+                .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND,
+                => true,
+                else => false,
+            }),
             .cancel_workflow => if (!inst.finished) if (inst.root) |root| inst.wio.cancelTask(root),
             .remove_from_cache => {},
             else => |other| {
@@ -1267,6 +1273,26 @@ pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
                 .run_id = try a.dupe(u8, e.run_id),
             } },
             .child => .{ .child_workflow_id = state.workflow_id },
+        },
+    } } });
+    return state;
+}
+
+/// Emits RequestCancelExternalWorkflowExecution for the workflow `workflow_id` (`run_id` empty
+/// for its latest run). The IDs are copied into the arena.
+pub fn requestCancelExternal(inst: *Instance, workflow_id: []const u8, run_id: []const u8) ScheduleError!*ExternalState {
+    if (workflow_id.len == 0) {
+        inst.logger.warn("cancelExternalWorkflow: the target workflow ID is empty", .{});
+        return error.InvalidOptions;
+    }
+    const a = inst.arena();
+    const state = try inst.newExternal(.cancel, workflow_id);
+    try inst.commands.append(a, .{ .variant = .{ .request_cancel_external_workflow_execution = .{
+        .seq = state.seq,
+        .workflow_execution = .{
+            .namespace = inst.namespace,
+            .workflow_id = state.workflow_id,
+            .run_id = try a.dupe(u8, run_id),
         },
     } } });
     return state;
@@ -3124,6 +3150,12 @@ const ExternalWf = struct {
         return delivered;
     }
     const SignalChild = workflow.Def("SignalChild", signalChild);
+
+    /// Requests cancellation of the run "target-run" of the workflow `workflow_id`.
+    fn cancel(ctx: *workflow.Context, workflow_id: []const u8) ![]const u8 {
+        return outcome(ctx, ctx.cancelExternalWorkflow(workflow_id, "target-run"));
+    }
+    const Cancel = workflow.Def("CancelOther", cancel);
 };
 
 fn signalResolved(a: Allocator, seq: u32, failure: ?Failure, cause: proto.temporal.api.enums.v1.SignalExternalWorkflowExecutionFailedCause) !act_pb.WorkflowActivation {
@@ -3241,6 +3273,65 @@ test "signal external: eviction ends a wait for a delivery" {
     const inst = try create(testing.allocator, ExternalWf.Signal.registered, .{});
     _ = try inst.activate(&try initActivation(a, "SignalOther", .{ @as([]const u8, "target"), @as([]const u8, "") }), a);
     inst.destroy(); // testing.allocator reports leaks
+}
+
+fn cancelResolved(a: Allocator, seq: u32, failure: ?Failure, cause: proto.temporal.api.enums.v1.CancelExternalWorkflowExecutionFailedCause) !act_pb.WorkflowActivation {
+    return oneJob(a, .{ .resolve_request_cancel_external_workflow = .{ .seq = seq, .failure = failure, .cause = cause } });
+}
+
+test "cancel external: RequestCancelExternalWorkflowExecution to the workflow, then its delivery" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.Cancel.registered, .{ .namespace = "ns" });
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "CancelOther", .{@as([]const u8, "target")}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const cmd = first[0].variant.?.request_cancel_external_workflow_execution;
+    try testing.expectEqual(@as(u32, 1), cmd.seq);
+    try testing.expectEqualStrings("ns", cmd.workflow_execution.?.namespace);
+    try testing.expectEqualStrings("target", cmd.workflow_execution.?.workflow_id);
+    try testing.expectEqualStrings("target-run", cmd.workflow_execution.?.run_id);
+
+    const done = try inst.activate(&try cancelResolved(a, 1, null, .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a);
+    try testing.expectEqualStrings("\"delivered\"", completedWith(done));
+}
+
+test "cancel external: a workflow that isn't found returns error.ExternalWorkflowNotFound with the failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelOther", .{@as([]const u8, "missing")}), a);
+    const f = try failure_mod.application(a, .{ .message = "Unable to cancel external workflow because not found", .type = "ExternalWorkflowExecutionNotFound" });
+    const done = try inst.activate(&try cancelResolved(a, 1, f, .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND), a);
+    try testing.expectEqualStrings("\"ExternalWorkflowNotFound: Unable to cancel external workflow because not found (workflow ID \\\"missing\\\")\"", completedWith(done));
+}
+
+test "cancel external: canceling the waiting coroutine returns error.Canceled and leaves the request" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelOther", .{@as([]const u8, "target")}), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expect(cmds[0].variant.? == .cancel_workflow_execution);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try cancelResolved(a, 1, null, .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a)).len);
+}
+
+test "cancel external: an empty workflow ID returns error.InvalidOptions and sends nothing" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.Cancel.registered, .{});
+    defer inst.destroy();
+    const done = commandsOf(try inst.activate(&try initActivation(a, "CancelOther", .{@as([]const u8, "")}), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("InvalidOptions", done[0].variant.?.fail_workflow_execution.failure.?.message);
 }
 
 // Continue-as-new.
