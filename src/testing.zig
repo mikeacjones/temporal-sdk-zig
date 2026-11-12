@@ -1022,6 +1022,47 @@ const UpdateFixtures = struct {
     const Napper = workflow.Def("Napper", napper);
 };
 
+// An update handler whose local activity fails, and one that calls ctx.fail.
+const UpdateFailureFixtures = struct {
+    fn chargeActivity(ctx: *activity.Context, amount: i64) !i64 {
+        if (amount <= 0) return ctx.fail(.{ .message = "invalid Amount", .type = "InvalidAmount", .non_retryable = true });
+        return amount;
+    }
+    const ChargeActivity = activity.Def("Charge", chargeActivity);
+
+    const Charge = workflow.UpdateDef("charge", fn (amount: i64) i64);
+    const Refuse = workflow.UpdateDef("refuse", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        done: bool = false,
+
+        fn charge(s: *State, amount: i64) !i64 {
+            return s.ctx.executeLocalActivity(ChargeActivity, .{ .start_to_close_timeout = .fromSeconds(10) }, .{amount}).get();
+        }
+        fn refuse(s: *State) error{ApplicationFailure}!void {
+            return s.ctx.fail(.{ .message = "refused", .type = "Refusal", .non_retryable = true });
+        }
+        fn finish(s: *State) void {
+            s.done = true;
+        }
+        fn finished(s: *State) bool {
+            return s.done;
+        }
+    };
+
+    fn payments(ctx: *workflow.Context) !void {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandler(Charge, s, State.charge);
+        try ctx.setUpdateHandler(Refuse, s, State.refuse);
+        try ctx.setSignalHandler(UpdateFixtures.Done, s, State.finish);
+        try ctx.await(s, State.finished);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+    }
+    const Payments = workflow.Def("Payments", payments);
+};
+
 const ChildFixtures = struct {
     fn greetChild(ctx: *workflow.Context, name: []const u8) ![]const u8 {
         return std.fmt.allocPrint(ctx.allocator(), "Hello {s} from a child!", .{name});
@@ -1795,6 +1836,36 @@ test "client: update a running workflow; rejected and unregistered updates are U
     try env.client.signalWorkflow(UpdateFixtures.Done, run.id, run.run_id, .{});
     try testing.expectEqualStrings("5 Hello ann!", try env.getResult(UpdateFixtures.HandleUpdates, &run, a, null));
     try testing.expectError(error.NotFound, env.client.updateWorkflow(UpdateFixtures.Set, "no-such-workflow", "", .{1}, .{}));
+}
+
+test "client: an update handler's failed activity or ctx.fail is the update's failure" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFailureFixtures.Payments);
+    try env.registerActivity(UpdateFailureFixtures.ChargeActivity);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(UpdateFailureFixtures.Payments, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+
+    var charged = try env.client.updateWorkflow(UpdateFailureFixtures.Charge, run.id, run.run_id, .{-5}, .{});
+    defer charged.deinit();
+    try testing.expectError(error.UpdateFailed, charged.get(a));
+    const cause = failure_mod.rootCause(charged.failure().?);
+    try testing.expectEqualStrings("invalid Amount", cause.message);
+    try testing.expectEqualStrings("InvalidAmount", failure_mod.applicationType(cause.*).?);
+
+    var refused = try env.client.updateWorkflow(UpdateFailureFixtures.Refuse, run.id, run.run_id, .{}, .{});
+    defer refused.deinit();
+    try testing.expectError(error.UpdateFailed, refused.get(a));
+    try testing.expectEqualStrings("refused", refused.failure().?.message);
+    try testing.expectEqualStrings("Refusal", failure_mod.applicationType(refused.failure().?.*).?);
+
+    // Neither failure became the workflow's: it completes.
+    try env.client.signalWorkflow(UpdateFixtures.Done, run.id, run.run_id, .{});
+    try env.getResult(UpdateFailureFixtures.Payments, &run, a, null);
 }
 
 test "client: update-with-start starts a workflow, then updates the running one" {
