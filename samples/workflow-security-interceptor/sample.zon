@@ -1,0 +1,8 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The workflow is
+// meant to fail: its second child workflow has a type the interceptor refuses.
+.{
+    .expect = .{"Child workflow type \"ProhibitedChildWorkflow\" not allowed"},
+    .timeout_seconds = 60,
+    .tests = .{"security_interceptor_test.zig"},
+}
