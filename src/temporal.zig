@@ -12,6 +12,7 @@ pub const search_attributes = @import("search_attributes.zig");
 pub const failure = @import("failure.zig");
 pub const log = @import("log.zig");
 pub const history = @import("history.zig");
+pub const metrics = @import("metrics.zig");
 pub const schedule = @import("schedule.zig");
 pub const Failure = failure.Failure;
 pub const Header = converter.Header;
@@ -31,4 +32,5 @@ test {
     _ = @import("proto_test.zig");
     _ = @import("propagation_test.zig");
     _ = @import("interceptor_test.zig");
+    _ = @import("metrics_test.zig");
 }

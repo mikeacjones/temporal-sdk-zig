@@ -22,6 +22,7 @@ const activity = @import("activity.zig");
 const client_mod = @import("client.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
+const metrics_mod = @import("metrics.zig");
 const Instance = @import("workflow/Instance.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -330,6 +331,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .interceptors = w.interceptors,
         .logger = w.logSink(),
         .log_during_replay = w.options.log_during_replay,
+        .metrics = w.client.metrics(),
     };
     defer runner.deinit();
     var message: ?[]u8 = null;
@@ -367,6 +369,8 @@ pub const WorkflowRunner = struct {
     interceptors: []const interceptor.Worker = &.{},
     logger: log_mod.Sink = .std_log,
     log_during_replay: bool = false,
+    /// Borrowed; see `Client.metrics`.
+    metrics: metrics_mod.Handler = .noop,
     runs: std.StringHashMapUnmanaged(*Instance) = .empty,
     /// Called for each eviction with the core's reason and message (the replayer uses it to
     /// detect nondeterminism).
@@ -435,6 +439,7 @@ pub const WorkflowRunner = struct {
                 .log_during_replay = r.log_during_replay,
                 .propagators = r.propagators,
                 .interceptors = r.interceptors,
+                .metrics = r.metrics,
             });
             errdefer inst.destroy();
             const key = try r.gpa.dupe(u8, act.run_id);
@@ -690,6 +695,13 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .WorkflowID = execution.workflow_id,
         .RunID = execution.run_id,
     });
+    ctx.metrics_ = try w.client.metrics().with(.{
+        .namespace = w.client.namespace,
+        .task_queue = w.task_queue,
+        .activity_type = start.activity_type,
+        .workflow_type = start.workflow_type,
+    });
+    defer ctx.metrics_.deinit();
     ctx.header_ = try .fromEntries(a, start.header_fields.items);
     ctx.propagated_ = .init(a);
     try propagation.extractAll(w.client.propagators, a, ctx.header_, &ctx.propagated_, "an activity task");
