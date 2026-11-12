@@ -1,0 +1,13 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The schedule
+// runs every second for 10 actions, then the starter deletes it.
+.{
+    .expect = .{
+        "Manually triggering schedule ScheduleID=schedule_",
+        "Unpausing schedule ScheduleID=schedule_",
+        "Schedule completed its actions ScheduleID=schedule_",
+        "Deleted schedule ScheduleID=schedule_",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
+}
