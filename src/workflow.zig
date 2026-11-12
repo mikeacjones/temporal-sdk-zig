@@ -125,6 +125,13 @@ const WorkflowIo = @import("workflow/WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
 const Duration = std.Io.Duration;
 
+/// A run of a workflow: its namespace, workflow ID, and run ID.
+pub const WorkflowExecution = struct {
+    namespace: []const u8,
+    workflow_id: []const u8,
+    run_id: []const u8,
+};
+
 pub const Info = struct {
     workflow_id: []const u8,
     run_id: []const u8,
@@ -141,6 +148,11 @@ pub const Info = struct {
     execution_timeout: ?Duration = null,
     run_timeout: ?Duration = null,
     task_timeout: ?Duration = null,
+    /// The workflow that started this one as a child, or null for a top-level workflow.
+    parent: ?WorkflowExecution = null,
+    /// The top-level workflow at the root of this one's chain of parents, or null when this
+    /// workflow is the root. Its namespace is the parent's: a child runs in its parent's.
+    root: ?WorkflowExecution = null,
 };
 
 pub const RetryPolicy = struct {
@@ -668,12 +680,6 @@ pub fn ActivityFuture(comptime T: type) type {
 /// `InvalidOptions`: the options were rejected before starting (the worker logs why).
 pub const ChildWorkflowError = error{ ChildWorkflowFailed, ChildWorkflowAlreadyStarted, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
 
-/// A started child workflow. Arena memory of the parent run.
-pub const ChildWorkflowExecution = struct {
-    workflow_id: []const u8,
-    run_id: []const u8,
-};
-
 /// The pending start and result of a child workflow.
 pub fn ChildWorkflowFuture(comptime T: type) type {
     return struct {
@@ -683,14 +689,15 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// The validation error, if the start was rejected; `started` and `get` return it.
         state: Instance.ScheduleError!*Instance.ChildState,
 
-        /// Waits until the server has started the child and returns its IDs. Returns
+        /// Waits until the server has started the child and returns its execution (arena
+        /// memory of the parent run; the child runs in the parent's namespace). Returns
         /// `error.ChildWorkflowAlreadyStarted` if its ID is taken, and `error.ChildWorkflowFailed`
         /// if it could not start for another reason or was canceled before it started.
         /// Canceling the calling coroutine cancels the child as `get` does.
-        pub fn started(f: Self) ChildWorkflowError!ChildWorkflowExecution {
+        pub fn started(f: Self) ChildWorkflowError!WorkflowExecution {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .started);
-            if (state.run_id) |run_id| return .{ .workflow_id = state.workflow_id, .run_id = run_id };
+            if (state.run_id) |run_id| return .{ .namespace = f.ctx.instance.namespace, .workflow_id = state.workflow_id, .run_id = run_id };
             return f.fail(state);
         }
 

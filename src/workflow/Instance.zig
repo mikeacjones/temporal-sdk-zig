@@ -671,6 +671,16 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         .run_timeout = zigDuration(init.workflow_run_timeout),
         .task_timeout = zigDuration(init.workflow_task_timeout),
     };
+    if (init.parent_workflow_info) |p| inst.info.parent = .{
+        .namespace = try a.dupe(u8, p.namespace),
+        .workflow_id = try a.dupe(u8, p.workflow_id),
+        .run_id = try a.dupe(u8, p.run_id),
+    };
+    if (init.root_workflow) |r| inst.info.root = .{
+        .namespace = if (inst.info.parent) |p| p.namespace else inst.namespace,
+        .workflow_id = try a.dupe(u8, r.workflow_id),
+        .run_id = try a.dupe(u8, r.run_id),
+    };
     if (init.last_completion_result) |r| if (r.payloads.items.len > 0) {
         inst.last_completion_result = try r.payloads.items[0].dupe(a);
     };
@@ -2435,6 +2445,34 @@ test "last completion result, cron info, and activities by name" {
 
     const done = commandsOf(try inst.activate(&try oneJob(a, .{ .resolve_activity = .{ .seq = 1, .result = .{ .status = .{ .completed = .{} } } } }), a));
     try testing.expectEqualStrings("42", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "info: parent and root are null for a top-level workflow and set for a child" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    {
+        const inst = try create(testing.allocator, Nap.registered, .{ .namespace = "ns" });
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "Nap", .{}), a);
+        try testing.expect(inst.info.parent == null);
+        try testing.expect(inst.info.root == null);
+    }
+    const inst = try create(testing.allocator, Nap.registered, .{ .namespace = "ns" });
+    defer inst.destroy();
+    var act = try initActivation(a, "Nap", .{});
+    const init = &act.jobs.items[0].variant.?.initialize_workflow;
+    init.parent_workflow_info = .{ .namespace = "parent-ns", .workflow_id = "parent-id", .run_id = "parent-run" };
+    init.root_workflow = .{ .workflow_id = "root-id", .run_id = "root-run" };
+    _ = try inst.activate(&act, a);
+    const parent = inst.ctx.info().parent.?;
+    try testing.expectEqualStrings("parent-ns", parent.namespace);
+    try testing.expectEqualStrings("parent-id", parent.workflow_id);
+    try testing.expectEqualStrings("parent-run", parent.run_id);
+    const root = inst.ctx.info().root.?;
+    try testing.expectEqualStrings("parent-ns", root.namespace);
+    try testing.expectEqualStrings("root-id", root.workflow_id);
+    try testing.expectEqualStrings("root-run", root.run_id);
 }
 
 const MemoWf = struct {
