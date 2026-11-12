@@ -13,6 +13,15 @@
 //! recorded or derived from history. Memory from `ctx.allocator()` lives as long as the
 //! workflow run stays cached on the worker.
 //!
+//! A value the workflow can't derive deterministically, such as an ID from an outside
+//! generator, is computed once with `ctx.sideEffect`, recorded in history, and read back from
+//! history on replay:
+//!
+//!     fn newOrderId(_: void) u64 {
+//!         return order_ids.next();
+//!     }
+//!     const order_id = try ctx.sideEffect(u64, {}, newOrderId);
+//!
 //! Concurrency in a workflow uses `std.Io`, which `ctx.io()` implements deterministically:
 //!
 //! - Coroutines: `io.async(fn, args)`, or `std.Io.Group.async` for a set of them.
@@ -403,6 +412,44 @@ pub const Context = struct {
     /// is a tuple of argument values.
     pub fn executeLocalActivityByName(ctx: *Context, comptime Result: type, activity_type: []const u8, options: LocalActivityOptions, args: anytype) ActivityFuture(Result) {
         return .{ .ctx = ctx, .state = ctx.instance.scheduleLocalActivity(activity_type, options, args) };
+    }
+
+    /// `SideEffectFailed`: the worker couldn't record the value (it shut down first, or a
+    /// replay found no recorded value). Returned from the workflow, it fails the workflow with
+    /// the recording's failure.
+    /// `Canceled`: the calling coroutine was canceled before the value was recorded.
+    pub const SideEffectError = error{ SideEffectFailed, Canceled, OutOfMemory, InvalidPayload, UnknownEncoding };
+
+    /// Runs `func(context)` once and records its result in history, so a value the workflow
+    /// can't derive deterministically stays the same on replay:
+    ///
+    ///     const id = try ctx.sideEffect([]const u8, generator, Generator.newId);
+    ///
+    /// The first time, `func` runs in the workflow and a local activity that every worker
+    /// runs records its value; this returns the recorded value, decoded as `T` into
+    /// `ctx.allocator()`. On replay `func` is not called and the value comes from history.
+    /// `func` must be quick, must not block or touch the workflow context, and returns `T`,
+    /// not an error union: a call that failed the first time and was skipped on replay would
+    /// change the workflow's commands. Return failures as values (an optional or a union).
+    ///
+    /// For a value that changes over the run, keep it in workflow state and record each new
+    /// reading with another `sideEffect`.
+    pub fn sideEffect(ctx: *Context, comptime T: type, context: anytype, comptime func: fn (@TypeOf(context)) T) SideEffectError!T {
+        const options: LocalActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+        const state = if (ctx.instance.replaying)
+            ctx.instance.scheduleLocalActivity(Instance.side_effect_activity_type, options, .{})
+        else
+            ctx.instance.scheduleLocalActivity(Instance.side_effect_activity_type, options, .{func(context)});
+        const future: ActivityFuture(T) = .{ .ctx = ctx, .state = state };
+        return future.get() catch |err| switch (err) {
+            error.ActivityFailed => error.SideEffectFailed,
+            error.InvalidOptions => {
+                ctx.instance.setLastFailure(null);
+                return error.SideEffectFailed;
+            },
+            error.WrongArgumentCount => error.InvalidPayload,
+            else => |e| e,
+        };
     }
 
     /// Starts a child workflow defined with `Def` and returns a future for its start and its
