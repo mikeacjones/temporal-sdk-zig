@@ -618,7 +618,7 @@ pub const WorkflowEnvironment = struct {
         request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var rpc_failure: ?bridge.Connection.RpcFailure = null;
         defer if (rpc_failure) |f| f.deinit(env.gpa);
-        const bytes = env.client.connection.call(env.gpa, env.io, .test_service, method, encoded.written(), .{}, &rpc_failure) catch |err| switch (err) {
+        const bytes = env.client.currentConnection().call(env.gpa, env.io, .test_service, method, encoded.written(), .{}, &rpc_failure) catch |err| switch (err) {
             error.RpcFailed => {
                 const f = rpc_failure.?;
                 log.err("test server {s} failed: {s} (gRPC status {d})", .{ method, f.message, f.status_code });
