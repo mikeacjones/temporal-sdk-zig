@@ -522,6 +522,7 @@ pub const ActivityEnvironment = struct {
         .workflow_type = "TestWorkflow",
         .workflow_namespace = "default",
         .attempt = 1,
+        .task_token = "test-task-token",
     },
     /// Heartbeat details the activity sees from a "previous attempt".
     heartbeat_details: []const converter.Payload = &.{},
@@ -2581,4 +2582,93 @@ test "a benign failure's next retry delay overrides the retry policy, and its ca
     const last = attempt.last_failure.?;
     try testing.expectEqual(failure_mod.Application.Category.benign, failure_mod.applicationCategory(last).?);
     try testing.expectEqual(@as(i64, 2), last.failure_info.?.application_failure_info.next_retry_delay.?.seconds);
+}
+
+const AsyncFixtures = struct {
+    /// Set once `awaitApproval` has handed off its task token and activity ID.
+    var started: Io.Event = .unset;
+    var token_buf: [1024]u8 = undefined;
+    var token: []const u8 = "";
+    var activity_id_buf: [64]u8 = undefined;
+    var activity_id: []const u8 = "";
+
+    fn reset() void {
+        started = .unset;
+        token = "";
+        activity_id = "";
+    }
+
+    fn keep(buf: []u8, value: []const u8) error{ValueTooLong}![]const u8 {
+        if (value.len > buf.len) return error.ValueTooLong;
+        @memcpy(buf[0..value.len], value);
+        return buf[0..value.len];
+    }
+
+    /// Hands its task token to the test and leaves the activity running for the client to
+    /// complete.
+    fn awaitApproval(ctx: *activity.Context) ![]const u8 {
+        token = try keep(&token_buf, ctx.info().task_token);
+        activity_id = try keep(&activity_id_buf, ctx.info().activity_id);
+        started.set(ctx.io());
+        return ctx.completeAsync();
+    }
+    const AwaitApproval = activity.Def("AwaitApproval", awaitApproval);
+
+    /// Returns the approval, "failed: <type> <message>" when it fails, or ends canceled when
+    /// the run is canceled (after the activity reports its cancellation).
+    fn approve(ctx: *workflow.Context) ![]const u8 {
+        const approval = ctx.executeActivity(AwaitApproval, .{
+            .start_to_close_timeout = .fromSeconds(60),
+            .retry_policy = .{ .maximum_attempts = 1 },
+            .cancellation_type = .wait_cancellation_completed,
+        }, .{});
+        return approval.get() catch |err| switch (err) {
+            error.ActivityFailed => {
+                const root = failure_mod.rootCause(approval.failure().?);
+                if (root.failure_info != null and root.failure_info.? == .canceled_failure_info) return error.Canceled;
+                return std.fmt.allocPrint(ctx.allocator(), "failed: {s} {s}", .{ failure_mod.applicationType(root.*) orelse "", root.message });
+            },
+            else => err,
+        };
+    }
+    const Approve = workflow.Def("Approve", approve);
+
+    fn approveLocally(ctx: *workflow.Context) ![]const u8 {
+        const approval = ctx.executeLocalActivity(AwaitApproval, .{ .start_to_close_timeout = .fromSeconds(60) }, .{});
+        return approval.get() catch |err| switch (err) {
+            error.ActivityFailed => failure_mod.applicationType(failure_mod.rootCause(approval.failure().?).*) orelse "no type",
+            else => err,
+        };
+    }
+    const ApproveLocally = workflow.Def("ApproveLocally", approveLocally);
+
+    fn start() !*WorkflowEnvironment {
+        reset();
+        const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+        errdefer env.deinit();
+        try env.registerWorkflow(Approve);
+        try env.registerWorkflow(ApproveLocally);
+        try env.registerActivity(AwaitApproval);
+        return env;
+    }
+};
+
+test "an activity that completes async stays started on the server; a local one fails" {
+    const env = try AsyncFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    try testing.expect(AsyncFixtures.token.len > 0);
+    const description = try env.client.describeWorkflow(a, run.id, run.run_id);
+    const pending = description.raw.pending_activities.items;
+    try testing.expectEqual(1, pending.len);
+    try testing.expectEqual(.PENDING_ACTIVITY_STATE_STARTED, pending[0].state);
+    try env.client.terminateWorkflow(run.id, run.run_id, "test cleanup");
+
+    try testing.expectEqualStrings("LocalActivityCompleteAsync", try env.executeWorkflow(AsyncFixtures.ApproveLocally, .{}, a, null));
 }
