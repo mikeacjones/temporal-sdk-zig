@@ -168,6 +168,7 @@ const converter = @import("converter.zig");
 const failure_mod = @import("failure.zig");
 const log = @import("log.zig");
 const proto = @import("proto.zig");
+const propagation = @import("propagation.zig");
 const search_attributes = @import("search_attributes.zig");
 const Instance = @import("workflow/Instance.zig");
 const WorkflowIo = @import("workflow/WorkflowIo.zig");
@@ -341,6 +342,19 @@ pub const Context = struct {
     /// workflow replays unless `worker.Options.log_during_replay` is set.
     pub fn logger(ctx: *const Context) log.Logger {
         return ctx.instance.logger;
+    }
+
+    /// The header the workflow was started with, as sent by its client's interceptors and
+    /// propagators. Lives as long as the run is cached.
+    pub fn headers(ctx: *const Context) converter.Header {
+        return ctx.instance.header;
+    }
+
+    /// The values the client's propagators (`client.Options.propagators`) extracted from the
+    /// start header. They are injected again into the header of every activity, local
+    /// activity, child workflow, external signal, and continue-as-new this workflow sends.
+    pub fn propagated(ctx: *const Context) *const propagation.Values {
+        return &ctx.instance.propagated;
     }
 
     pub fn isReplaying(ctx: *const Context) bool {

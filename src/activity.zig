@@ -57,6 +57,7 @@ const converter = @import("converter.zig");
 const client_mod = @import("client.zig");
 const failure_mod = @import("failure.zig");
 const log = @import("log.zig");
+const propagation = @import("propagation.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Info = struct {
@@ -106,6 +107,10 @@ pub const Context = struct {
     heartbeat_sink: ?HeartbeatSink = null,
     /// The worker's client; null outside a worker unless the test environment sets one.
     client_: ?*client_mod.Client = null,
+    /// The activity's header, sorted by name.
+    header_: converter.Header = .{},
+    /// What the client's propagators extracted from `header_`.
+    propagated_: propagation.Values = .empty,
     /// Written once by the worker when a cancel arrives, possibly from another thread.
     cancel_reason_: std.atomic.Value(u8) = .init(not_canceled),
 
@@ -159,6 +164,18 @@ pub const Context = struct {
 
     pub fn info(ctx: *const Context) *const Info {
         return &ctx.info_;
+    }
+
+    /// The header the activity was scheduled with, written by its workflow's (or client's)
+    /// interceptors and propagators. Lives as long as `allocator()` memory.
+    pub fn headers(ctx: *const Context) converter.Header {
+        return ctx.header_;
+    }
+
+    /// The values the client's propagators (`client.Options.propagators`) extracted from the
+    /// activity's header.
+    pub fn propagated(ctx: *const Context) *const propagation.Values {
+        return &ctx.propagated_;
     }
 
     /// A logger carrying the activity's ID, type, and attempt and its workflow's type, ID, and

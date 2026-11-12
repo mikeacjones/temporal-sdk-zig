@@ -17,6 +17,7 @@ const log = @import("../log.zig");
 const workflow = @import("../workflow.zig");
 const client = @import("../client.zig");
 const sa = @import("../search_attributes.zig");
+const propagation = @import("../propagation.zig");
 const Scheduler = @import("Scheduler.zig");
 const WorkflowIo = @import("WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -63,6 +64,12 @@ backoffs: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 /// Coroutines blocked in `awaitCondition`, in the order they started waiting.
 conditions: std.ArrayList(*Condition) = .empty,
 args: []const converter.Payload = &.{},
+/// The start header (InitializeWorkflow's headers), sorted by name. Arena memory.
+header: converter.Header = .{},
+propagators: []const propagation.ContextPropagator = &.{},
+/// What the propagators extracted from `header`, injected again into outgoing commands.
+/// Arena memory.
+propagated: propagation.Values = .empty,
 last_completion_result: ?converter.Payload = null,
 /// The memo as the workflow sees it: the start memo with this run's upserts applied, sorted
 /// by name so its order doesn't depend on the wire order of the start memo's map. Each upsert
@@ -270,6 +277,9 @@ pub const Options = struct {
     logger: log.Sink = .std_log,
     /// Keep the workflow's logger on while it replays history.
     log_during_replay: bool = false,
+    /// Extract `Context.propagated` from the start header and inject it into outgoing
+    /// commands. Borrowed: must outlive the instance.
+    propagators: []const propagation.ContextPropagator = &.{},
 };
 
 /// Creates the instance for a run. `entry` is the registered workflow named by the run's
@@ -289,6 +299,8 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
     inst.task_queue = try inst.arena().dupe(u8, options.task_queue);
     inst.namespace = try inst.arena().dupe(u8, options.namespace);
     inst.logger = .{ .sink = options.logger, .replaying = if (options.log_during_replay) null else &inst.replaying };
+    inst.propagators = options.propagators;
+    inst.propagated = .init(inst.arena());
     return inst;
 }
 
@@ -778,6 +790,8 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
     const args = try a.alloc(converter.Payload, init.arguments.items.len);
     for (init.arguments.items, args) |p, *d| d.* = try p.dupe(a);
     inst.args = args;
+    inst.header = try .fromEntries(a, init.headers.items);
+    try propagation.extractAll(inst.propagators, a, inst.header, &inst.propagated, "the workflow start");
     inst.wio.setRandomSeed(init.randomness_seed);
     inst.root = try inst.wio.spawn("workflow", rootMain, .{inst});
 }
@@ -858,6 +872,7 @@ pub fn requestContinueAsNew(inst: *Instance, workflow_type: []const u8, options:
         // Empty: core and the server keep this run's task queue.
         .task_queue = try a.dupe(u8, options.task_queue),
         .arguments = try converter.toPayloads(a, args),
+        .headers = try inst.outgoingHeaders(cmd_pb.ContinueAsNewWorkflowExecution.HeadersEntry),
         .workflow_run_timeout = protoDuration(options.run_timeout),
         .workflow_task_timeout = protoDuration(options.task_timeout),
     };
@@ -936,6 +951,16 @@ pub fn upsertSearchAttributes(inst: *Instance, updates: []const sa.Update) sa.En
     inst.search_attributes = view;
 }
 
+/// The header of an outgoing command as protobuf map entries of type `Entry`: what the
+/// propagators write for `propagated`. Arena memory.
+fn outgoingHeaders(inst: *Instance, comptime Entry: type) error{OutOfMemory}!std.ArrayList(Entry) {
+    if (inst.propagators.len == 0) return .empty;
+    const a = inst.arena();
+    var w: converter.HeaderWriter = .init(a);
+    try propagation.injectAll(inst.propagators, a, &inst.propagated, &w);
+    return w.header().toEntries(Entry, a);
+}
+
 // ---------------------------------------------------------------- activities
 
 pub const ScheduleError = error{ OutOfMemory, InvalidOptions };
@@ -961,6 +986,7 @@ pub fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: wor
         .activity_type = activity_type,
         .task_queue = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue,
         .arguments = try converter.toPayloads(a, args),
+        .headers = try inst.outgoingHeaders(cmd_pb.ScheduleActivity.HeadersEntry),
         .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
         .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
         .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
@@ -987,6 +1013,7 @@ pub fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options
             .activity_id = if (options.activity_id.len > 0) options.activity_id else try std.fmt.allocPrint(a, "{d}", .{state.seq}),
             .activity_type = activity_type,
             .arguments = try converter.toPayloads(a, args),
+            .headers = try inst.outgoingHeaders(cmd_pb.ScheduleLocalActivity.HeadersEntry),
             .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
             .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
             .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
@@ -1168,6 +1195,7 @@ pub fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: w
         .workflow_type = workflow_type,
         .task_queue = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue,
         .input = try converter.toPayloads(a, args),
+        .headers = try inst.outgoingHeaders(cmd_pb.StartChildWorkflowExecution.HeadersEntry),
         .workflow_execution_timeout = protoDuration(options.execution_timeout),
         .workflow_run_timeout = protoDuration(options.run_timeout),
         .workflow_task_timeout = protoDuration(options.task_timeout),
@@ -1323,6 +1351,7 @@ pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
         .seq = state.seq,
         .signal_name = try a.dupe(u8, signal_name),
         .args = try converter.toPayloads(a, args),
+        .headers = try inst.outgoingHeaders(cmd_pb.SignalExternalWorkflowExecution.HeadersEntry),
         .target = switch (target) {
             .execution => |e| .{ .workflow_execution = .{
                 .namespace = inst.namespace,

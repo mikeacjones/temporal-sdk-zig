@@ -23,6 +23,7 @@ const history_mod = @import("history.zig");
 const schedule = @import("schedule.zig");
 const workflow = @import("workflow.zig");
 const log_mod = @import("log.zig");
+const propagation = @import("propagation.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Duration = Io.Duration;
@@ -54,6 +55,11 @@ pub const Options = struct {
     /// The least severe sdk-core log level forwarded to `logger`; null leaves sdk-core's logs
     /// off. Logs from libraries sdk-core uses are forwarded from `warn` up.
     core_log_level: ?log_mod.Level = .warn,
+    /// Context propagators, run in order: they write the `.context` values of each call that
+    /// carries a header into that header, and every worker on this client reads them back out
+    /// for its workflows and activities (see `temporal.propagation`). Borrowed: the slice and
+    /// the propagators must outlive the client and its workers.
+    propagators: []const propagation.ContextPropagator = &.{},
 
     pub const Tls = struct {
         /// PEM; empty uses the system roots.
@@ -132,6 +138,8 @@ pub const Client = struct {
     /// A copy of `logger` that the runtime's core log forwarding points at, freed after the
     /// runtime.
     core_log_sink: ?*log_mod.Sink,
+    /// `Options.propagators`, borrowed; workers on this client use them too.
+    propagators: []const propagation.ContextPropagator,
 
     /// Connects and checks the server. Close with `close`.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
@@ -197,6 +205,7 @@ pub const Client = struct {
             .codecs = options.codecs,
             .logger = logger,
             .core_log_sink = core_log_sink,
+            .propagators = options.propagators,
         };
     }
 
@@ -262,6 +271,7 @@ pub const Client = struct {
             .workflow_task_timeout = protoDuration(options.task_timeout),
             .workflow_start_delay = protoDuration(options.start_delay),
             .cron_schedule = options.cron_schedule,
+            .header = try c.outgoingHeader(a, options.context),
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
             .workflow_id_reuse_policy = switch (options.id_reuse_policy) {
@@ -292,6 +302,11 @@ pub const Client = struct {
     /// run has closed. The call returns once the server has recorded the signal, not once a
     /// handler has run it.
     pub fn signalWorkflow(c: *Client, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args) SignalError!void {
+        return c.signalWorkflowWithOptions(Signal, workflow_id, run_id, args, .{});
+    }
+
+    /// `signalWorkflow` with options.
+    pub fn signalWorkflowWithOptions(c: *Client, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args, options: SignalOptions) SignalError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
@@ -300,6 +315,7 @@ pub const Client = struct {
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .signal_name = Signal.signal_name,
             .input = .{ .payloads = try converter.toPayloads(a, args) },
+            .header = try c.outgoingHeader(a, options.context),
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
         }, a) catch |err| switch (err) {
@@ -649,6 +665,7 @@ pub const Client = struct {
             .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
             .heartbeat_timeout = protoDuration(options.heartbeat_timeout),
             .input = .{ .payloads = try converter.toPayloads(a, args) },
+            .header = try c.outgoingHeader(a, options.context),
             .id_reuse_policy = switch (options.id_reuse_policy) {
                 .unspecified => .ACTIVITY_ID_REUSE_POLICY_UNSPECIFIED,
                 .allow_duplicate => .ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE,
@@ -786,7 +803,11 @@ pub const Client = struct {
         const response = c.rpcWithStatus(wfs.QueryWorkflowResponse, "QueryWorkflow", wfs.QueryWorkflowRequest{
             .namespace = c.namespace,
             .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
-            .query = .{ .query_type = Query.query_name, .query_args = .{ .payloads = try converter.toPayloads(arena, args) } },
+            .query = .{
+                .query_type = Query.query_name,
+                .query_args = .{ .payloads = try converter.toPayloads(arena, args) },
+                .header = try c.outgoingHeader(arena, options.context),
+            },
             .query_reject_condition = switch (options.reject_condition) {
                 .none => .QUERY_REJECT_CONDITION_NONE,
                 .not_open => .QUERY_REJECT_CONDITION_NOT_OPEN,
@@ -940,7 +961,11 @@ pub const Client = struct {
             .wait_policy = .{ .lifecycle_stage = options.wait_for_stage.toProto() },
             .request = .{
                 .meta = .{ .update_id = if (options.update_id.len > 0) options.update_id else try uuid(a, c.io), .identity = c.identity },
-                .input = .{ .name = name, .args = .{ .payloads = try converter.toPayloads(a, args) } },
+                .input = .{
+                    .name = name,
+                    .args = .{ .payloads = try converter.toPayloads(a, args) },
+                    .header = try c.outgoingHeader(a, options.context),
+                },
             },
         };
     }
@@ -960,6 +985,16 @@ pub const Client = struct {
 
     fn reachedStage(response: wfs.UpdateWorkflowExecutionResponse, want: UpdateStage) bool {
         return response.outcome != null or @backingInt(response.stage) >= @backingInt(want.toProto());
+    }
+
+    /// The header of an outgoing call: what the client's propagators write for `context` (no
+    /// values when null), or null when they write nothing. Allocated from `a`.
+    fn outgoingHeader(c: *Client, a: Allocator, context: ?*const propagation.Values) error{OutOfMemory}!?proto.temporal.api.common.v1.Header {
+        if (c.propagators.len == 0) return null;
+        var w: converter.HeaderWriter = .init(a);
+        try propagation.injectAll(c.propagators, a, context orelse &propagation.Values.empty, &w);
+        if (w.fields.items.len == 0) return null;
+        return .{ .fields = try w.header().toEntries(proto.temporal.api.common.v1.Header.FieldsEntry, a) };
     }
 
     const RpcError = error{ OutOfMemory, Canceled, RpcFailed, AlreadyExists, NotFound, InvalidResponse, CodecFailed };
@@ -1059,6 +1094,17 @@ pub const StartWorkflowOptions = struct {
     /// the workflow starts normally. `WorkflowRun.eagerly_started` says which happened.
     /// Only `executeWorkflow` and `executeWorkflowByName` use it.
     enable_eager_start: bool = false,
+    /// Values the client's propagators (`Options.propagators`) write into the start's header;
+    /// the workflow reads them with `ctx.propagated()`. Signal-with-start and update-with-start
+    /// send them with the start. Only read during the call.
+    context: ?*const propagation.Values = null,
+};
+
+/// How `Client.signalWorkflowWithOptions` sends a signal.
+pub const SignalOptions = struct {
+    /// Values the client's propagators write into the signal's header. Only read during the
+    /// call.
+    context: ?*const propagation.Values = null,
 };
 
 /// Names an activity by its workflow and activity ID, for completing it without its task
@@ -1247,6 +1293,9 @@ pub const StartActivityOptions = struct {
     /// Indexed values for `Client.listActivities` queries, built with
     /// `search_attributes.Key.set`; unsets are ignored. Only read while starting.
     search_attributes: []const search_attributes.Update = &.{},
+    /// Values the client's propagators write into the activity's header; the activity reads
+    /// them with `ctx.propagated()`. Only read during the call.
+    context: ?*const propagation.Values = null,
 };
 
 pub const StartActivityError = error{
@@ -1915,6 +1964,9 @@ pub const QueryOptions = struct {
     failure_message: ?*[]const u8 = null,
     /// On `error.QueryRejected`, receives the workflow's status.
     rejected_status: ?*WorkflowExecutionStatus = null,
+    /// Values the client's propagators write into the query's header. Only read during the
+    /// call.
+    context: ?*const propagation.Values = null,
 };
 
 pub const QueryRejectCondition = enum {
@@ -2129,6 +2181,9 @@ pub const UpdateOptions = struct {
     /// update's outcome instead of running it twice. Empty generates a UUID.
     update_id: []const u8 = "",
     wait_for_stage: UpdateStage = .completed,
+    /// Values the client's propagators write into the update's header. Only read during the
+    /// call.
+    context: ?*const propagation.Values = null,
 };
 
 pub const UpdateError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };
