@@ -3,4 +3,5 @@
 .{
     .expect = .{"Workflow result: Hello World!"},
     .timeout_seconds = 60,
+    .tests = .{"parent_workflow_test.zig"},
 }

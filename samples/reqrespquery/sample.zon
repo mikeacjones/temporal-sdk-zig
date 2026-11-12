@@ -9,4 +9,5 @@
         "Canceled the uppercase workflow",
     },
     .timeout_seconds = 60,
+    .tests = .{ "workflow_test.zig", "requester_test.zig" },
 }

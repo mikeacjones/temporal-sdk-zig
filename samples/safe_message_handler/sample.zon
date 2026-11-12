@@ -3,4 +3,5 @@
 .{
     .expect = .{"Cluster shut down successfully: num_currently_assigned_nodes=20 num_bad_nodes=5"},
     .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
 }

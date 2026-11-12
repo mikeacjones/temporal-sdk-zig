@@ -5,4 +5,5 @@
     .expect = .{"Workflow result: Hello from a delayed workflow!"},
     .starter_args = .{"3"},
     .timeout_seconds = 60,
+    .imports = .{"helloworld"},
 }
