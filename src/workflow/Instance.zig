@@ -70,12 +70,40 @@ task_failure: ?[]const u8 = null,
 /// Query handlers by query type, in registration order (the order an unknown query's failure
 /// lists them in). Arena memory; they outlive the workflow function.
 queries: std.array_hash_map.String(QueryHandler) = .empty,
+/// Signal handlers by signal name, in registration order. Arena memory.
+signal_handlers: std.array_hash_map.String(SignalHandler) = .empty,
+/// Signals that arrived before a handler for their name, in arrival order. Arena memory.
+buffered_signals: std.ArrayList(*const Signal) = .empty,
+/// Handler coroutines that have not returned, in start order. Each removes itself when its
+/// handler returns; `destroy` cancels the rest.
+handlers: std.ArrayList(*HandlerRun) = .empty,
 
 /// A type-erased query handler: decodes `args` into `out`, calls the handler with `context`,
 /// and encodes its result into `out`. Runs on the worker thread, outside any coroutine.
 pub const QueryHandler = struct {
     context: *const anyopaque,
     call: *const fn (context: *const anyopaque, out: Allocator, args: []const converter.Payload) anyerror!converter.Payload,
+};
+
+/// A type-erased signal handler. `decode` turns a signal's payloads into the handler's
+/// argument tuple, allocated in `out`; `call` runs the handler with `context` and those
+/// arguments, inside the signal's coroutine.
+pub const SignalHandler = struct {
+    context: *const anyopaque,
+    decode: *const fn (out: Allocator, args: []const converter.Payload) anyerror!*const anyopaque,
+    call: *const fn (context: *const anyopaque, args: *const anyopaque) anyerror!void,
+};
+
+/// A delivered signal, copied into the arena so it outlives its activation.
+const Signal = struct { name: []const u8, args: []const converter.Payload };
+
+/// A running signal handler coroutine. Arena memory.
+const HandlerRun = struct {
+    name: []const u8,
+    handler: SignalHandler,
+    args: *const anyopaque,
+    /// Set after spawning, before the coroutine first runs; freed when it returns.
+    task: *WorkflowIo.Task = undefined,
 };
 
 const RootOutcome = union(enum) { completed: converter.Payload, failed: anyerror };
@@ -170,10 +198,10 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
 /// Tears the run down: cancels its coroutines, lets them exit, and frees everything.
 pub fn destroy(inst: *Instance) void {
     inst.evicting = true;
-    if (!inst.finished) if (inst.root) |root| {
-        inst.wio.cancelTask(root);
-        inst.root = null;
-    };
+    // The root and handler coroutines may still be blocked even after the workflow finished
+    // (a handler's error finishes it, and handlers outlive the root).
+    if (inst.root) |root| inst.wio.cancelTask(root);
+    for (inst.handlers.items) |run| inst.wio.cancelTask(run.task);
     // Coroutines already waiting for an activity's cancellation to complete don't see the
     // cancel above; wake them. The order doesn't matter: nothing they do is sent to the core.
     var pending = inst.activities.valueIterator();
@@ -231,6 +259,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
                 try inst.retryLocalActivity(kv.value);
             },
             .update_random_seed => |s| inst.wio.setRandomSeed(s.randomness_seed),
+            .signal_workflow => |s| try inst.deliverSignal(&s),
             .resolve_activity => |r| try inst.resolveActivity(&r),
             .resolve_child_workflow_execution_start => |r| try inst.resolveChildStart(&r),
             .resolve_child_workflow_execution => |r| try inst.resolveChild(&r),
@@ -242,7 +271,9 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         }
     }
 
-    if (inst.task_failure == null and !query_only) {
+    // Once the workflow has finished, coroutines that are still blocked (handlers, or the root
+    // after a handler failed it) never run again: their commands would follow the completion.
+    if (inst.task_failure == null and !query_only and !inst.finished) {
         inst.runUntilQuiet();
         try inst.finishIfDone();
     }
@@ -286,6 +317,80 @@ fn answerQuery(inst: *Instance, q: *const act_pb.QueryWorkflow, out: Allocator) 
     const response = handler.call(handler.context, out, q.arguments.items) catch |err|
         return .{ .query_id = q.query_id, .variant = .{ .failed = try failure_mod.fromError(out, err) } };
     return .{ .query_id = q.query_id, .variant = .{ .succeeded = .{ .response = response } } };
+}
+
+// ---------------------------------------------------------------- signals
+
+/// Registers `handler` for signals called `name`, replacing any handler registered under it,
+/// then starts a handler coroutine for each buffered signal of that name, in arrival order.
+/// `name` and the handler's context must outlive the run. `context_addr` is checked as in
+/// `setQueryHandler`: a handler coroutine can run after the registering coroutine returned.
+pub fn setSignalHandler(inst: *Instance, name: []const u8, handler: SignalHandler, context_addr: ?usize) error{ OutOfMemory, SignalContextOnStack }!void {
+    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
+        inst.logger.warn("setSignalHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{ .SignalName = name });
+        return error.SignalContextOnStack;
+    };
+    try inst.signal_handlers.put(inst.arena(), name, handler);
+    var i: usize = 0;
+    while (i < inst.buffered_signals.items.len) {
+        const signal = inst.buffered_signals.items[i];
+        if (!std.mem.eql(u8, signal.name, name)) {
+            i += 1;
+            continue;
+        }
+        _ = inst.buffered_signals.orderedRemove(i);
+        try inst.startSignalHandler(handler, signal);
+    }
+}
+
+/// Copies a SignalWorkflow job into the arena and starts its handler, or buffers it until a
+/// handler for its name is registered.
+fn deliverSignal(inst: *Instance, job: *const act_pb.SignalWorkflow) !void {
+    if (inst.finished) return;
+    const a = inst.arena();
+    const args = try a.alloc(converter.Payload, job.input.items.len);
+    for (job.input.items, args) |p, *d| d.* = try p.dupe(a);
+    const signal = try a.create(Signal);
+    signal.* = .{ .name = try a.dupe(u8, job.signal_name), .args = args };
+    if (inst.signal_handlers.get(signal.name)) |handler| return inst.startSignalHandler(handler, signal);
+    try inst.buffered_signals.append(a, signal);
+}
+
+/// Decodes the signal's arguments into the arena and spawns its handler coroutine. A signal
+/// whose arguments don't decode is dropped, the same way on replay.
+fn startSignalHandler(inst: *Instance, handler: SignalHandler, signal: *const Signal) error{OutOfMemory}!void {
+    const a = inst.arena();
+    const args = handler.decode(a, signal.args) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            inst.logger.warn("dropping a signal whose arguments don't decode as its handler's parameters", .{ .SignalName = signal.name, .error_name = err });
+            return;
+        },
+    };
+    const run = try a.create(HandlerRun);
+    run.* = .{ .name = signal.name, .handler = handler, .args = args };
+    try inst.handlers.ensureUnusedCapacity(a, 1);
+    run.task = inst.wio.spawn("signal", handlerMain, .{ inst, run }) catch |err| {
+        inst.logger.warn("starting a signal handler coroutine failed", .{ .SignalName = signal.name, .error_name = err });
+        return error.OutOfMemory;
+    };
+    inst.handlers.appendAssumeCapacity(run);
+}
+
+fn handlerMain(inst: *Instance, run: *HandlerRun) void {
+    const result = run.handler.call(run.handler.context, run.args);
+    for (inst.handlers.items, 0..) |r, i| if (r == run) {
+        _ = inst.handlers.orderedRemove(i);
+        break;
+    };
+    result catch |err| {
+        if (inst.evicting) return;
+        if (inst.root_outcome == null) {
+            inst.root_outcome = .{ .failed = err };
+        } else {
+            inst.logger.warn("a signal handler failed after the workflow finished; its error is ignored", .{ .SignalName = run.name, .error_name = err });
+        }
+    };
 }
 
 /// Runs coroutines until all are blocked and no awaited condition holds. Conditions are
@@ -381,19 +486,28 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
 }
 
 fn rootMain(inst: *Instance) void {
-    if (inst.entry.invoke(&inst.ctx, inst.args)) |result| {
-        inst.root_outcome = .{ .completed = result };
-    } else |err| {
-        inst.root_outcome = .{ .failed = err };
-    }
+    const outcome: RootOutcome = if (inst.entry.invoke(&inst.ctx, inst.args)) |result|
+        .{ .completed = result }
+    else |err|
+        .{ .failed = err };
+    // A signal handler's error may have finished the workflow first.
+    if (inst.root_outcome == null) inst.root_outcome = outcome;
+    inst.root = null; // the task frees itself when this returns
 }
 
 fn finishIfDone(inst: *Instance) !void {
     if (inst.finished) return;
     const outcome = inst.root_outcome orelse return;
     inst.finished = true;
-    inst.root = null; // the task freed itself
     const a = inst.arena();
+    if (inst.buffered_signals.items.len > 0) {
+        var names: std.ArrayList(u8) = .empty;
+        for (inst.buffered_signals.items, 0..) |signal, i| {
+            if (i > 0) try names.appendSlice(a, ", ");
+            try names.appendSlice(a, signal.name);
+        }
+        inst.logger.warn("the workflow finished with signals no handler was registered for; they are dropped", .{ .count = inst.buffered_signals.items.len, .SignalNames = names.items });
+    }
     switch (outcome) {
         .completed => |result| try inst.commands.append(a, .{ .variant = .{
             .complete_workflow_execution = .{ .result = result },
@@ -1012,8 +1126,243 @@ test "unsupported jobs fail the workflow task" {
     const inst = try create(testing.allocator, Hello.registered, .{});
     defer inst.destroy();
     _ = try inst.activate(&try initActivation(a, "Workflow", .{@as([]const u8, "Temporal")}), a);
-    const c = try inst.activate(&try oneJob(a, .{ .signal_workflow = .{ .signal_name = "s" } }), a);
+    const c = try inst.activate(&try oneJob(a, .{ .notify_has_patch = .{ .patch_id = "p" } }), a);
     try testing.expect(c.status.? == .failed);
+}
+
+// Signal handlers. `State.log` records what handlers and the workflow function did, in order.
+const Signals = struct {
+    const Approve = workflow.SignalDef("approve", fn (approver: []const u8) void);
+    const Reject = workflow.SignalDef("reject", fn () void);
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+
+    const State = struct {
+        ctx: *workflow.Context,
+        log: std.ArrayList([]const u8) = .empty,
+        want: usize,
+
+        fn create(ctx: *workflow.Context, want: usize) !*State {
+            const s = try ctx.allocator().create(State);
+            s.* = .{ .ctx = ctx, .want = want };
+            return s;
+        }
+        fn add(s: *State, entry: []const u8) !void {
+            try s.log.append(s.ctx.allocator(), entry);
+        }
+        fn approve(s: *State, approver: []const u8) !void {
+            try s.add(approver);
+        }
+        /// Records the approver, then greets it with an activity.
+        fn approveSlowly(s: *State, approver: []const u8) !void {
+            try s.add(approver);
+            try s.add(try s.ctx.executeActivity(Greet, opts, .{approver}).get());
+        }
+        /// Records the approver, then sleeps past the workflow's end.
+        fn approveThenNap(s: *State, approver: []const u8) !void {
+            try s.add(approver);
+            try s.ctx.io().sleep(.fromSeconds(60), .awake);
+        }
+        fn reject(_: *State) error{Rejected}!void {
+            return error.Rejected;
+        }
+        fn enough(s: *State) bool {
+            return s.log.items.len >= s.want;
+        }
+        fn joined(s: *State) ![]const u8 {
+            return std.mem.join(s.ctx.allocator(), ",", s.log.items);
+        }
+    };
+
+    /// Waits for `want` approvals and returns them in order.
+    fn collect(ctx: *workflow.Context, want: usize) ![]const u8 {
+        const s = try State.create(ctx, want);
+        try ctx.setSignalHandler(Approve, s, State.approve);
+        try ctx.await(s, State.enough);
+        return s.joined();
+    }
+
+    /// `collect`, after sleeping 10 s without a handler.
+    fn collectLate(ctx: *workflow.Context, want: usize) ![]const u8 {
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        return collect(ctx, want);
+    }
+
+    /// Waits for a handler to start, then for every handler to finish.
+    fn drain(ctx: *workflow.Context) ![]const u8 {
+        const s = try State.create(ctx, 1);
+        try ctx.setSignalHandler(Approve, s, State.approveSlowly);
+        try ctx.await(s, State.enough);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return s.joined();
+    }
+
+    /// Returns as soon as one approval arrived, while its handler sleeps on.
+    fn returnEarly(ctx: *workflow.Context) ![]const u8 {
+        const s = try State.create(ctx, 1);
+        try ctx.setSignalHandler(Approve, s, State.approveThenNap);
+        try ctx.await(s, State.enough);
+        return s.joined();
+    }
+
+    /// Records the activity's result after waiting for it.
+    fn ordered(ctx: *workflow.Context) ![]const u8 {
+        const s = try State.create(ctx, 0);
+        try ctx.setSignalHandler(Approve, s, State.approve);
+        _ = try ctx.executeActivity(Greet, opts, .{"x"}).get();
+        try s.add("activity");
+        return s.joined();
+    }
+
+    /// Sleeps for an hour; a `reject` signal fails it.
+    fn rejectable(ctx: *workflow.Context) ![]const u8 {
+        const s = try State.create(ctx, 0);
+        try ctx.setSignalHandler(Reject, s, State.reject);
+        try ctx.io().sleep(.fromSeconds(3600), .awake);
+        return "slept";
+    }
+
+    fn onStack(ctx: *workflow.Context) ![]const u8 {
+        var s: State = .{ .ctx = ctx, .want = 0 };
+        ctx.setSignalHandler(Approve, &s, State.approve) catch |err| return @errorName(err);
+        return "registered";
+    }
+};
+const CollectWf = workflow.Def("Collect", Signals.collect);
+const CollectLateWf = workflow.Def("CollectLate", Signals.collectLate);
+const DrainWf = workflow.Def("Drain", Signals.drain);
+const ReturnEarlyWf = workflow.Def("ReturnEarly", Signals.returnEarly);
+const OrderedWf = workflow.Def("Ordered", Signals.ordered);
+const RejectableWf = workflow.Def("Rejectable", Signals.rejectable);
+const SignalOnStackWf = workflow.Def("SignalOnStack", Signals.onStack);
+
+fn signalJob(a: Allocator, name: []const u8, args: anytype) !act_pb.WorkflowActivationJob.variant_union {
+    var job: act_pb.SignalWorkflow = .{ .signal_name = name };
+    job.input = try converter.toPayloads(a, args);
+    return .{ .signal_workflow = job };
+}
+
+fn completedWith(c: done_pb.WorkflowActivationCompletion) []const u8 {
+    const cmds = commandsOf(c);
+    return cmds[cmds.len - 1].variant.?.complete_workflow_execution.result.?.data;
+}
+
+test "a signal runs its handler, in arrival order, and wakes awaiting code" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, CollectWf.registered, .{});
+    defer inst.destroy();
+
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try initActivation(a, "Collect", .{@as(usize, 3)}), a)).len);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a)).len);
+    // Two in one activation, and one whose argument doesn't decode, which is dropped.
+    var act = try oneJob(a, try signalJob(a, "approve", .{@as(i64, 5)}));
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "approve", .{@as([]const u8, "bob")}) });
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "approve", .{@as([]const u8, "cy")}) });
+    try testing.expectEqualStrings("\"ann,bob,cy\"", completedWith(try inst.activate(&act, a)));
+}
+
+test "signals before their handler is registered are buffered until it is" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, CollectLateWf.registered, .{});
+    defer inst.destroy();
+
+    // The first signal arrives with the start, the second while the workflow sleeps; a third
+    // with no handler is dropped (with a warning) when the workflow finishes.
+    var start = try initActivation(a, "CollectLate", .{@as(usize, 2)});
+    try start.jobs.append(a, .{ .variant = try signalJob(a, "approve", .{@as([]const u8, "ann")}) });
+    const first = commandsOf(try inst.activate(&start, a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expect(first[0].variant.? == .start_timer);
+    var later = try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "bob")}));
+    try later.jobs.append(a, .{ .variant = try signalJob(a, "unknown", .{}) });
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&later, a)).len);
+    try testing.expectEqual(@as(usize, 3), inst.buffered_signals.items.len);
+    try testing.expectEqualStrings("\"ann,bob\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)));
+    try testing.expectEqual(@as(usize, 1), inst.buffered_signals.items.len);
+}
+
+test "a handler may block, and allHandlersFinished waits for it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, DrainWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Drain", .{}), a);
+    try testing.expect(inst.ctx.allHandlersFinished());
+    const blocked = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a));
+    try testing.expectEqual(@as(usize, 1), blocked.len);
+    try testing.expectEqualStrings("\"ann\"", blocked[0].variant.?.schedule_activity.arguments.items[0].data);
+    try testing.expect(!inst.ctx.allHandlersFinished());
+    try testing.expectEqualStrings("\"ann,Hello ann!\"", completedWith(try inst.activate(&try resolveOk(a, 1, "Hello ann!"), a)));
+    try testing.expect(inst.ctx.allHandlersFinished());
+}
+
+test "the workflow completes while a handler is still blocked, and eviction frees it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ReturnEarlyWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "ReturnEarly", .{}), a);
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a));
+    try testing.expectEqual(@as(usize, 2), done.len);
+    try testing.expect(done[0].variant.? == .start_timer);
+    try testing.expectEqualStrings("\"ann\"", done[1].variant.?.complete_workflow_execution.result.?.data);
+    try testing.expect(!inst.ctx.allHandlersFinished());
+    // Nothing runs after the workflow finished: the handler's timer firing emits nothing.
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)).len);
+}
+
+test "eviction cancels a handler blocked on an activity" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, DrainWf.registered, .{});
+    _ = try inst.activate(&try initActivation(a, "Drain", .{}), a);
+    _ = try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a);
+    inst.destroy(); // testing.allocator reports leaks
+}
+
+test "handlers start before coroutines woken by the same activation's other jobs" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, OrderedWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Ordered", .{}), a);
+    var act = try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")}));
+    try act.jobs.append(a, (try resolveOk(a, 1, "Hello x!")).jobs.items[0]);
+    try testing.expectEqualStrings("\"ann,activity\"", completedWith(try inst.activate(&act, a)));
+}
+
+test "a handler's error fails the workflow" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, RejectableWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Rejectable", .{}), a);
+    const failed = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "reject", .{})), a));
+    try testing.expectEqual(@as(usize, 1), failed.len);
+    try testing.expectEqualStrings("Rejected", failed[0].variant.?.fail_workflow_execution.failure.?.message);
+    // The workflow function, still sleeping, never runs again.
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)).len);
+}
+
+test "a signal handler context on the coroutine's stack is rejected" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SignalOnStackWf.registered, .{});
+    defer inst.destroy();
+    try testing.expectEqualStrings("\"SignalContextOnStack\"", completedWith(try inst.activate(&try initActivation(a, "SignalOnStack", .{}), a)));
 }
 
 // An activity raced against a timer.
