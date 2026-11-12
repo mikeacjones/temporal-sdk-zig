@@ -98,6 +98,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "update:starter")) return @import("update/starter.zig").main(init);
     if (std.mem.eql(u8, name, "worker-specific-task-queues:worker")) return @import("worker-specific-task-queues/worker.zig").main(init);
     if (std.mem.eql(u8, name, "worker-specific-task-queues:starter")) return @import("worker-specific-task-queues/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "workflow-security-interceptor:worker")) return @import("workflow-security-interceptor/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "workflow-security-interceptor:starter")) return @import("workflow-security-interceptor/starter.zig").main(init);
     std.log.err("unknown SAMPLE_PROGRAM {s}", .{name});
     return error.UnknownSampleProgram;
 }
