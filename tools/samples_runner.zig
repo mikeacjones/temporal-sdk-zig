@@ -301,6 +301,11 @@ fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path
         _ = waitExit(io, worker_pid, 5);
     };
 
+    // A starter that finishes quickly (one that runs its own worker) would otherwise let the
+    // runner send SIGTERM before the worker has installed its handler, killing it.
+    if (!waitForWorkerStart(io, arena, work, log_name, worker_pid))
+        std.log.warn("{s}: the worker never logged \"Started Worker\"; running the starter anyway", .{sample.name});
+
     var argv: std.ArrayList([]const u8) = .empty;
     argv.append(arena, starter_exe) catch return "out of memory";
     argv.appendSlice(arena, manifest.starter_args) catch return "out of memory";
@@ -360,6 +365,21 @@ fn waitExit(io: Io, pid: std.posix.pid_t, seconds: u32) ?u8 {
         io.sleep(.fromMilliseconds(100), .awake) catch return null;
     }
     return null;
+}
+
+/// Waits up to 30s for the worker's log to contain "Started Worker" (logged once it polls,
+/// after `runUntilSignal` has installed its signal handler). Returns false on timeout or if
+/// the worker exits first.
+fn waitForWorkerStart(io: Io, arena: Allocator, work: Io.Dir, log_name: []const u8, pid: std.posix.pid_t) bool {
+    var waited_ms: u32 = 0;
+    while (waited_ms < 30_000) : (waited_ms += 50) {
+        const contents = work.readFileAlloc(io, log_name, arena, .limited(1024 * 1024)) catch "";
+        if (std.mem.indexOf(u8, contents, "Started Worker") != null) return true;
+        // Signal 0 checks that the worker is still alive.
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch return false;
+        io.sleep(.fromMilliseconds(50), .awake) catch return false;
+    }
+    return false;
 }
 
 fn showLog(io: Io, arena: Allocator, work: Io.Dir, work_path: []const u8, name: []const u8) void {
