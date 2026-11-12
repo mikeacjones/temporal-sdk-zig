@@ -1562,6 +1562,84 @@ test "client: signal-with-start starts a workflow with the signal, then only sig
     try testing.expectEqualStrings("cy", try env.getResult(SignalFixtures.AwaitApprovals, &fresh, a, null));
 }
 
+test "client: update a running workflow; rejected and unregistered updates are UpdateFailed" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFixtures.HandleUpdates);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(UpdateFixtures.HandleUpdates, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+
+    var set = try env.client.updateWorkflow(UpdateFixtures.Set, run.id, run.run_id, .{5}, .{});
+    defer set.deinit();
+    try testing.expectEqual(@as(i64, 0), try set.get(a));
+    try testing.expectEqualStrings(run.run_id, set.run_id);
+
+    var rejected = try env.client.updateWorkflow(UpdateFixtures.Set, run.id, "", .{-1}, .{});
+    defer rejected.deinit();
+    try testing.expectError(error.UpdateFailed, rejected.get(a));
+    try testing.expectEqualStrings("NotPositive", rejected.failure().?.message);
+
+    const Unregistered = workflow.UpdateDef("unregistered", fn () void);
+    var unknown = try env.client.updateWorkflow(Unregistered, run.id, run.run_id, .{}, .{});
+    defer unknown.deinit();
+    try testing.expectError(error.UpdateFailed, unknown.get(a));
+    try testing.expectEqualStrings("UpdateNotRegistered", failure_mod.applicationType(unknown.failure().?.*).?);
+
+    // Accepted returns once the handler started; `get` waits for its activity.
+    var greet = try env.client.updateWorkflow(UpdateFixtures.Greet, run.id, run.run_id, .{"ann"}, .{ .update_id = "greet-ann", .wait_for_stage = .accepted });
+    defer greet.deinit();
+    try testing.expectEqualStrings("greet-ann", greet.update_id);
+    try testing.expectEqualStrings("Hello ann!", try greet.get(a));
+
+    var again = try env.client.getWorkflowUpdateHandle([]const u8, run.id, run.run_id, "greet-ann");
+    defer again.deinit();
+    try testing.expectEqualStrings("Hello ann!", try again.get(a));
+
+    try env.client.signalWorkflow(UpdateFixtures.Done, run.id, run.run_id, .{});
+    try testing.expectEqualStrings("5 Hello ann!", try env.getResult(UpdateFixtures.HandleUpdates, &run, a, null));
+    try testing.expectError(error.NotFound, env.client.updateWorkflow(UpdateFixtures.Set, "no-such-workflow", "", .{1}, .{}));
+}
+
+test "client: update-with-start starts a workflow, then updates the running one" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFixtures.HandleUpdates);
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try env.executeWorkflow(Fixtures.Hello, .{"warm-up"}, a, null); // starts the worker
+
+    var options: client_mod.StartWorkflowOptions = .{ .id = "update-with-start", .task_queue = env.task_queue };
+    try testing.expectError(error.InvalidOptions, env.client.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, options, .{}, UpdateFixtures.Set, .{3}, .{}));
+
+    options.id_conflict_policy = .use_existing;
+    var first = try env.client.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, options, .{}, UpdateFixtures.Set, .{3}, .{});
+    defer first.deinit();
+    try testing.expectEqual(@as(i64, 0), try first.get(a));
+    try testing.expect(first.run_id.len > 0);
+
+    var second = try env.client.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, options, .{}, UpdateFixtures.Set, .{7}, .{ .wait_for_stage = .accepted });
+    defer second.deinit();
+    try testing.expectEqual(@as(i64, 3), try second.get(a));
+    try testing.expectEqualStrings(first.run_id, second.run_id);
+
+    var failing = options;
+    failing.id_conflict_policy = .fail;
+    try testing.expectError(error.WorkflowExecutionAlreadyStarted, env.client.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, failing, .{}, UpdateFixtures.Set, .{9}, .{}));
+
+    try env.client.signalWorkflow(UpdateFixtures.Done, options.id, "", .{});
+    var run = try env.client.getWorkflow([]const u8, options.id, first.run_id);
+    defer run.deinit();
+    try testing.expectEqualStrings("7 ", try env.getResult(UpdateFixtures.HandleUpdates, &run, a, null));
+}
+
 test "time-skipping WorkflowEnvironment: a workflow mid-timer answers a query while time is locked" {
     const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
     defer env.deinit();

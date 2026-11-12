@@ -358,6 +358,153 @@ pub const Client = struct {
         return converter.fromPayload(Query.Result, arena, payloads.payloads.items[0]);
     }
 
+    /// Sends `Update` (a `workflow.UpdateDef`) with `args` to a workflow and waits until the
+    /// update reaches `options.wait_for_stage`. An empty `run_id` targets the latest run.
+    /// Read the result with `get` on the returned handle; a rejected update (by its
+    /// validator, its handler, or because the workflow has no handler for it) is
+    /// `error.UpdateFailed` from `get`, not an error here. Returns `error.NotFound` if no
+    /// such workflow exists.
+    pub fn updateWorkflow(c: *Client, comptime Update: type, workflow_id: []const u8, run_id: []const u8, args: Update.Args, options: UpdateOptions) UpdateError!WorkflowUpdateHandle(Update.Result) {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const request = try c.updateRequest(a, Update.update_name, workflow_id, run_id, args, options);
+        const response = try c.updateUntilStage(a, request);
+        const ref_run_id = if (response.update_ref) |r| if (r.workflow_execution) |e| e.run_id else "" else "";
+        return .init(c, workflow_id, if (ref_run_id.len > 0) ref_run_id else run_id, request.request.?.meta.?.update_id, response.outcome);
+    }
+
+    /// A handle to the update `update_id` already sent to a workflow, for example by another
+    /// process. `get` waits for its outcome. An empty `run_id` targets the latest run.
+    pub fn getWorkflowUpdateHandle(c: *Client, comptime Result: type, workflow_id: []const u8, run_id: []const u8, update_id: []const u8) error{OutOfMemory}!WorkflowUpdateHandle(Result) {
+        return .init(c, workflow_id, run_id, update_id, null);
+    }
+
+    /// A handle to an existing workflow, for waiting for its result with `get`. An empty
+    /// `run_id` follows the latest run. No call is made, so a missing workflow shows up as
+    /// `error.NotFound` from `get`.
+    pub fn getWorkflow(c: *Client, comptime T: type, workflow_id: []const u8, run_id: []const u8) error{OutOfMemory}!WorkflowRun(T) {
+        const id = try c.gpa.dupe(u8, workflow_id);
+        errdefer c.gpa.free(id);
+        return .{ .client = c, .id = id, .run_id = try c.gpa.dupe(u8, run_id) };
+    }
+
+    /// Sends `Update` with `update_args` to the workflow `start_options.id`, first starting it
+    /// with `args` if it isn't running, in one atomic call. `start_options.id_conflict_policy`
+    /// is required: `.use_existing` updates a running workflow, `.fail` returns
+    /// `error.WorkflowExecutionAlreadyStarted` for one. The handle's `run_id` is the run that
+    /// was started or updated; wait for the workflow's result with `getWorkflow`. An empty
+    /// `start_options.id` generates a UUID, so the call always starts a new workflow.
+    pub fn updateWithStartWorkflow(
+        c: *Client,
+        comptime Workflow: type,
+        start_options: StartWorkflowOptions,
+        args: Workflow.Args,
+        comptime Update: type,
+        update_args: Update.Args,
+        update_options: UpdateOptions,
+    ) UpdateWithStartError!WorkflowUpdateHandle(Update.Result) {
+        if (start_options.id_conflict_policy == .unspecified) {
+            log.warn("updateWithStartWorkflow for update \"{s}\" on workflow type \"{s}\": StartWorkflowOptions.id_conflict_policy must be set (for example .use_existing), the server requires it for update-with-start", .{ Update.update_name, Workflow.workflow_name });
+            return error.InvalidOptions;
+        }
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const id = if (start_options.id.len > 0) start_options.id else try uuid(a, c.io);
+
+        var update = try c.updateRequest(a, Update.update_name, id, "", update_args, update_options);
+        const Operation = wfs.ExecuteMultiOperationRequest.Operation;
+        var operations: std.ArrayList(Operation) = .empty;
+        try operations.appendSlice(a, &.{
+            .{ .operation = .{ .start_workflow = try c.startRequest(a, Workflow.workflow_name, id, start_options, args) } },
+            .{ .operation = .{ .update_workflow = update } },
+        });
+
+        var status: ?RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.ExecuteMultiOperationResponse, "ExecuteMultiOperation", wfs.ExecuteMultiOperationRequest{
+            .namespace = c.namespace,
+            .operations = operations,
+        }, a, &status) catch |err| switch (err) {
+            // The call fails with the failing operation's status code, and only the start
+            // operation can fail with ALREADY_EXISTS.
+            error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
+            error.RpcFailed => {
+                const s = status orelse return error.RpcFailed;
+                return multiOperationError(s, a, id, Update.update_name);
+            },
+            else => |e| return e,
+        };
+
+        const responses = response.responses.items;
+        if (responses.len != 2 or responses[0].response == null or responses[0].response.? != .start_workflow or
+            responses[1].response == null or responses[1].response.? != .update_workflow)
+        {
+            log.err("ExecuteMultiOperation for workflow {s} returned {d} responses, want a start and an update response", .{ id, responses.len });
+            return error.InvalidResponse;
+        }
+        const started = responses[0].response.?.start_workflow;
+        var updated = responses[1].response.?.update_workflow;
+        // The workflow exists now, so a wait the server cut short continues as a plain update
+        // with the same update ID, which the server deduplicates.
+        if (!reachedStage(updated, update_options.wait_for_stage)) {
+            update.workflow_execution.?.run_id = started.run_id;
+            updated = try c.updateUntilStage(a, update);
+        }
+        return .init(c, id, started.run_id, update.request.?.meta.?.update_id, updated.outcome);
+    }
+
+    /// Maps a failed ExecuteMultiOperation to an error, logging which operation failed.
+    fn multiOperationError(s: RpcStatus, arena: Allocator, workflow_id: []const u8, update_name: []const u8) UpdateWithStartError {
+        const detail_name = "temporal.api.errordetails.v1.MultiOperationExecutionFailure";
+        var reader: Io.Reader = .fixed(s.details);
+        const decoded = proto.google.rpc.Status.decode(&reader, arena) catch proto.google.rpc.Status{};
+        for (decoded.details.items) |any| {
+            if (!std.mem.endsWith(u8, any.type_url, "/" ++ detail_name)) continue;
+            var detail_reader: Io.Reader = .fixed(any.value);
+            const detail = proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure.decode(&detail_reader, arena) catch break;
+            for (detail.statuses.items, 0..) |op, i| {
+                // The server marks the operations it didn't run because another failed as
+                // ABORTED; only the failing one says why.
+                if (op.code == 0 or op.code == 10) continue;
+                const what = if (i == 0) "starting the workflow" else "the update";
+                log.err("update-with-start of update \"{s}\" on workflow {s} failed: {s} failed: {s} (gRPC status {d})", .{ update_name, workflow_id, what, op.message, op.code });
+            }
+            return error.RpcFailed;
+        }
+        log.err("update-with-start of update \"{s}\" on workflow {s} failed: {s} (gRPC status {d})", .{ update_name, workflow_id, s.message, s.code });
+        return error.RpcFailed;
+    }
+
+    fn updateRequest(c: *Client, a: Allocator, name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype, options: UpdateOptions) error{OutOfMemory}!wfs.UpdateWorkflowExecutionRequest {
+        return .{
+            .namespace = c.namespace,
+            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .wait_policy = .{ .lifecycle_stage = options.wait_for_stage.toProto() },
+            .request = .{
+                .meta = .{ .update_id = if (options.update_id.len > 0) options.update_id else try uuid(a, c.io), .identity = c.identity },
+                .input = .{ .name = name, .args = .{ .payloads = try converter.toPayloads(a, args) } },
+            },
+        };
+    }
+
+    /// Sends `request` until the update reaches the stage it waits for: the server returns
+    /// early, below that stage, when its long poll times out.
+    fn updateUntilStage(c: *Client, a: Allocator, request: wfs.UpdateWorkflowExecutionRequest) UpdateError!wfs.UpdateWorkflowExecutionResponse {
+        const want: UpdateStage = if (request.wait_policy.?.lifecycle_stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED) .accepted else .completed;
+        while (true) {
+            const response = c.rpc(wfs.UpdateWorkflowExecutionResponse, "UpdateWorkflowExecution", request, a) catch |err| switch (err) {
+                error.AlreadyExists => return error.InvalidResponse,
+                else => |e| return e,
+            };
+            if (reachedStage(response, want)) return response;
+        }
+    }
+
+    fn reachedStage(response: wfs.UpdateWorkflowExecutionResponse, want: UpdateStage) bool {
+        return response.outcome != null or @backingInt(response.stage) >= @backingInt(want.toProto());
+    }
+
     const RpcError = error{ OutOfMemory, Canceled, RpcFailed, AlreadyExists, NotFound, InvalidResponse };
 
     /// Calls a WorkflowService method with a typed request and response. The response's
@@ -634,6 +781,145 @@ pub fn WorkflowRun(comptime T: type) type {
         /// The workflow's failure after `get` returned `error.WorkflowFailed`.
         pub fn failure(run: *const Self) ?*const failure_mod.Failure {
             return if (run.failure_) |*f| f else null;
+        }
+    };
+}
+
+/// How far an update must get before `Client.updateWorkflow` returns. (The server can't wait
+/// for an update only to be admitted.)
+pub const UpdateStage = enum {
+    /// The workflow's validator accepted the update and its handler started.
+    accepted,
+    /// The handler finished, or the update was rejected.
+    completed,
+
+    fn toProto(s: UpdateStage) enums.UpdateWorkflowExecutionLifecycleStage {
+        return switch (s) {
+            .accepted => .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED,
+            .completed => .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED,
+        };
+    }
+};
+
+pub const UpdateOptions = struct {
+    /// Identifies the update in the workflow; an update ID sent again returns the first
+    /// update's outcome instead of running it twice. Empty generates a UUID.
+    update_id: []const u8 = "",
+    wait_for_stage: UpdateStage = .completed,
+};
+
+pub const UpdateError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
+
+pub const UpdateWithStartError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    NotFound,
+    InvalidResponse,
+    /// `StartWorkflowOptions.id_conflict_policy` is unspecified.
+    InvalidOptions,
+    /// The workflow is running and `id_conflict_policy` is `.fail`.
+    WorkflowExecutionAlreadyStarted,
+};
+
+pub const UpdateResultError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    NotFound,
+    InvalidResponse,
+    InvalidPayload,
+    UnknownEncoding,
+    WrongArgumentCount,
+    /// The update was rejected or its handler failed; read why with `failure()`.
+    UpdateFailed,
+};
+
+/// An update sent to a workflow. Owns its IDs with the client's allocator; free with
+/// `deinit`. Not thread-safe.
+pub fn WorkflowUpdateHandle(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        client: *Client,
+        workflow_id: []u8,
+        /// Empty when the handle was made for the latest run.
+        run_id: []u8,
+        update_id: []u8,
+        /// The encoded outcome when the update call already returned one.
+        outcome: ?[]u8,
+        failure_: ?failure_mod.Failure = null,
+
+        fn init(c: *Client, workflow_id: []const u8, run_id: []const u8, update_id: []const u8, outcome: ?proto.temporal.api.update.v1.Outcome) error{OutOfMemory}!Self {
+            const wid = try c.gpa.dupe(u8, workflow_id);
+            errdefer c.gpa.free(wid);
+            const rid = try c.gpa.dupe(u8, run_id);
+            errdefer c.gpa.free(rid);
+            const uid = try c.gpa.dupe(u8, update_id);
+            errdefer c.gpa.free(uid);
+            var encoded: ?[]u8 = null;
+            if (outcome) |o| {
+                var w: Io.Writer.Allocating = .init(c.gpa);
+                errdefer w.deinit();
+                // The encoder allocates its scratch from the same allocator; an arena keeps
+                // that out of the handle.
+                var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+                defer scratch.deinit();
+                o.encode(&w.writer, scratch.allocator()) catch return error.OutOfMemory;
+                encoded = try w.toOwnedSlice();
+            }
+            return .{ .client = c, .workflow_id = wid, .run_id = rid, .update_id = uid, .outcome = encoded };
+        }
+
+        pub fn deinit(h: *Self) void {
+            const gpa = h.client.gpa;
+            gpa.free(h.workflow_id);
+            gpa.free(h.run_id);
+            gpa.free(h.update_id);
+            if (h.outcome) |o| gpa.free(o);
+            h.* = undefined;
+        }
+
+        /// Waits for the update to complete and returns its result. The result and any failure
+        /// are allocated from `arena`.
+        pub fn get(h: *Self, arena: Allocator) UpdateResultError!T {
+            const c = h.client;
+            const outcome: proto.temporal.api.update.v1.Outcome = if (h.outcome) |bytes| blk: {
+                var reader: Io.Reader = .fixed(try arena.dupe(u8, bytes));
+                break :blk proto.temporal.api.update.v1.Outcome.decode(&reader, arena) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.InvalidResponse,
+                };
+            } else while (true) {
+                // Each call is a long poll the server may end before the update completes.
+                const response = c.rpc(wfs.PollWorkflowExecutionUpdateResponse, "PollWorkflowExecutionUpdate", wfs.PollWorkflowExecutionUpdateRequest{
+                    .namespace = c.namespace,
+                    .update_ref = .{ .workflow_execution = .{ .workflow_id = h.workflow_id, .run_id = h.run_id }, .update_id = h.update_id },
+                    .identity = c.identity,
+                    .wait_policy = .{ .lifecycle_stage = .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED },
+                }, arena) catch |err| switch (err) {
+                    error.AlreadyExists => return error.InvalidResponse,
+                    else => |e| return e,
+                };
+                if (response.outcome) |o| break o;
+            };
+            switch (outcome.value orelse return error.InvalidResponse) {
+                .success => |payloads| {
+                    if (T == void) return;
+                    if (payloads.payloads.items.len == 0) return error.InvalidPayload;
+                    return converter.fromPayload(T, arena, payloads.payloads.items[0]);
+                },
+                .failure => |f| {
+                    h.failure_ = f;
+                    return error.UpdateFailed;
+                },
+            }
+        }
+
+        /// Why the update failed, after `get` returned `error.UpdateFailed`. Borrows the arena
+        /// passed to `get`.
+        pub fn failure(h: *const Self) ?*const failure_mod.Failure {
+            return if (h.failure_) |*f| f else null;
         }
     };
 }
