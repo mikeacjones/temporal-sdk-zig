@@ -2398,6 +2398,79 @@ test "search attributes set at start are read and upserted by the workflow; desc
     try testing.expectError(error.InvalidPayload, sa.get(a, search_attributes.key(.keyword, Fixtures.priority.name)));
 }
 
+/// Polls `countWorkflows(query)` until it reports `want`, for at most 30 s: visibility
+/// catches up with starts and upserts a moment later.
+fn waitForCount(c: *client_mod.Client, query: []const u8, want: u64) !void {
+    var tries: usize = 0;
+    while (try c.countWorkflows(query) != want) : (tries += 1) {
+        if (tries == 300) {
+            log.err("countWorkflows(\"{s}\") never reached {d}", .{ query, want });
+            return error.TestUnexpectedResult;
+        }
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+}
+
+test "client: list and count workflows by a visibility query on search attributes, a page at a time" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.SearchAttributeUpdates);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two runs nobody works on, tagged at start, and one that upserts its own tag.
+    for ([_][]const u8{ "idle-1", "idle-2" }) |id| {
+        var idle = try env.client.executeWorkflow(Fixtures.Hello, .{
+            .id = id,
+            .task_queue = "nobody-polls-this",
+            .search_attributes = &.{Fixtures.tags.set(&.{env.task_queue})},
+            .memo = try converter.toFields(a, .{ .owner = "lister" }),
+        }, .{"x"});
+        idle.deinit();
+    }
+    var run = try env.startWorkflow(Fixtures.SearchAttributeUpdates, .{ .id = "upserts-tag", .task_queue = "" }, .{env.task_queue});
+    defer run.deinit();
+    _ = try env.getResult(Fixtures.SearchAttributeUpdates, &run, a, null);
+
+    const tagged = try std.fmt.allocPrint(a, "CustomKeywordListField = '{s}'", .{env.task_queue});
+    try waitForCount(&env.client, tagged, 3);
+    const upserted = try std.fmt.allocPrint(a, "{s} AND CustomIntField = 2 AND ExecutionStatus = 'Completed'", .{tagged});
+    try waitForCount(&env.client, upserted, 1);
+
+    var it = try env.client.listWorkflows(tagged, .{ .page_size = 2 });
+    defer it.deinit();
+    var ids: std.ArrayList([]const u8) = .empty;
+    while (try it.next(a)) |info| {
+        try ids.append(a, info.workflow_id);
+        try testing.expectEqualStrings(env.task_queue, (try info.search_attributes.get(a, Fixtures.tags)).?[0]);
+        if (std.mem.eql(u8, info.workflow_id, "upserts-tag")) {
+            try testing.expectEqual(client_mod.WorkflowExecutionStatus.completed, info.status);
+            try testing.expectEqualStrings("SearchAttributeUpdates", info.workflow_type);
+            try testing.expectEqualStrings(env.task_queue, info.task_queue);
+            try testing.expectEqualStrings(run.run_id, info.run_id);
+            try testing.expect(info.close_time != null and info.start_time != null);
+            try testing.expect(info.history_length > 0);
+            try testing.expectEqual(@as(?i64, 2), try info.search_attributes.get(a, Fixtures.priority));
+        } else {
+            try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, info.status);
+            try testing.expectEqualStrings("lister", (try info.memoValue([]const u8, a, "owner")).?);
+        }
+    }
+    std.mem.sort([]const u8, ids.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    try testing.expectEqualStrings("idle-1,idle-2,upserts-tag", try std.mem.join(a, ",", ids.items));
+    try testing.expectEqual(@as(?client_mod.WorkflowExecutionInfo, null), try it.next(a));
+
+    var none = try env.client.listWorkflows("CustomKeywordListField = 'no-such-tag'", .{});
+    defer none.deinit();
+    try testing.expect(try none.next(a) == null);
+}
+
 test "client: a search attribute value the server can't index fails the start" {
     const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
