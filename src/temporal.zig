@@ -6,6 +6,7 @@ pub const workflow = @import("workflow.zig");
 pub const activity = @import("activity.zig");
 pub const nexus = @import("nexus.zig");
 pub const converter = @import("converter.zig");
+pub const search_attributes = @import("search_attributes.zig");
 pub const failure = @import("failure.zig");
 pub const log = @import("log.zig");
 pub const history = @import("history.zig");

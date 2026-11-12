@@ -458,7 +458,7 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
         .polled = polled,
         .task_token = &.{},
         .start = .{},
-        .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = undefined, .logger_ = .{} },
+        .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = undefined, .logger_ = .{}, .client_ = w.client },
     };
     var keep = false;
     defer if (!keep) run.destroy(w.gpa);
