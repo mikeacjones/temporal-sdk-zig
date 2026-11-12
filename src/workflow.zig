@@ -73,6 +73,16 @@
 //!     try ctx.setSignalHandler(Approve, state, State.approve);
 //!     try ctx.await(state, State.approved);
 //!
+//! A signal whose name is only known at run time, such as one that includes a workflow ID,
+//! is handled with `ctx.setSignalHandlerByName`, which takes the argument tuple type in place
+//! of a `SignalDef`, and sent with `ctx.signalExternalWorkflowByName`. A handler from
+//! `ctx.setDynamicSignalHandler` receives every signal with no handler of its own, with its
+//! name and its arguments still encoded (`converter.EncodedValues`):
+//!
+//!     const name = try std.fmt.allocPrint(ctx.allocator(), "release-{s}", .{ctx.info().workflow_id});
+//!     try ctx.setSignalHandlerByName(name, struct { []const u8 }, state, State.approve);
+//!     try ctx.setDynamicSignalHandler(state, State.other); // fn (*State, []const u8, EncodedValues) void
+//!
 //! A workflow signals another with `ctx.signalExternalWorkflow`, by workflow ID (and run ID,
 //! empty for the latest run), and its child with `ChildWorkflowFuture.signal`. The future's
 //! `get` waits until the server delivered the signal; it returns
@@ -140,6 +150,18 @@
 //!         return count;
 //!     }
 //!     pub const Counter = temporal.workflow.Def("Counter", counter);
+//!
+//! A dynamic workflow runs every workflow type the worker has no `Def` registered for:
+//! define it with `DynamicDef`, register it with `Worker.registerDynamicWorkflow`, and read
+//! the type from `ctx.info().workflow_type` and the arguments from `converter.EncodedValues`.
+//! Clients start it with `executeWorkflowByName`:
+//!
+//!     fn anyWorkflow(ctx: *temporal.workflow.Context, args: temporal.converter.EncodedValues) ![]const u8 {
+//!         const name = try args.get([]const u8, ctx.allocator(), 0);
+//!         return std.fmt.allocPrint(ctx.allocator(), "{s} greets {s}", .{ ctx.info().workflow_type, name });
+//!     }
+//!     pub const AnyWorkflow = temporal.workflow.DynamicDef(anyWorkflow);
+//!     // worker: try w.registerDynamicWorkflow(AnyWorkflow);
 
 const std = @import("std");
 const converter = @import("converter.zig");
@@ -469,7 +491,14 @@ pub const Context = struct {
     /// future for its delivery. An empty `run_id` targets the workflow's latest run. The
     /// target runs in this workflow's namespace. `args` are encoded here; the IDs are copied.
     pub fn signalExternalWorkflow(ctx: *Context, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args) SignalExternalFuture {
-        return .{ .ctx = ctx, .state = ctx.instance.signalExternal(.{ .execution = .{ .workflow_id = workflow_id, .run_id = run_id } }, Signal.signal_name, args) };
+        return ctx.signalExternalWorkflowByName(Signal.signal_name, workflow_id, run_id, args);
+    }
+
+    /// Sends the signal called `signal_name`, named at run time, with `args` (a tuple of
+    /// argument values) to the workflow `workflow_id`, like `signalExternalWorkflow`. The
+    /// name and IDs are copied; `args` are encoded here.
+    pub fn signalExternalWorkflowByName(ctx: *Context, signal_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype) SignalExternalFuture {
+        return .{ .ctx = ctx, .state = ctx.instance.signalExternal(.{ .execution = .{ .workflow_id = workflow_id, .run_id = run_id } }, signal_name, args) };
     }
 
     /// Requests cancellation of the workflow `workflow_id` and returns a future for the
@@ -572,24 +601,78 @@ pub const Context = struct {
     ///     const state = try ctx.allocator().create(State);
     ///     try ctx.setSignalHandler(Approve, state, State.approve);
     pub fn setSignalHandler(ctx: *Context, comptime Signal: type, context: anytype, comptime handler: anytype) SetSignalHandlerError!void {
+        comptime checkHandler("signal handler for \"" ++ Signal.signal_name ++ "\"", Signal.Args, @TypeOf(context), @TypeOf(handler), void);
+        return ctx.setSignalHandlerInner(Signal.signal_name, Signal.Args, context, handler);
+    }
+
+    /// `setSignalHandler` for a signal named at run time, such as one whose name includes a
+    /// workflow ID: handles signals called `name`, whose arguments are the tuple type `Args`,
+    /// with `handler(context, args...)`. `name` is copied into `ctx.allocator()`. Buffering,
+    /// replacement, and errors work as in `setSignalHandler`.
+    ///
+    ///     const name = try std.fmt.allocPrint(ctx.allocator(), "unlock-{s}", .{holder_id});
+    ///     try ctx.setSignalHandlerByName(name, struct { []const u8 }, state, State.unlock);
+    pub fn setSignalHandlerByName(ctx: *Context, name: []const u8, comptime Args: type, context: anytype, comptime handler: anytype) SetSignalHandlerError!void {
+        comptime checkHandler("signal handler for a signal named at run time", Args, @TypeOf(context), @TypeOf(handler), void);
+        return ctx.setSignalHandlerInner(try ctx.allocator().dupe(u8, name), Args, context, handler);
+    }
+
+    fn setSignalHandlerInner(ctx: *Context, name: []const u8, comptime Args: type, context: anytype, comptime handler: anytype) SetSignalHandlerError!void {
         const C = @TypeOf(context);
-        comptime checkHandler("signal handler for \"" ++ Signal.signal_name ++ "\"", Signal.Args, C, @TypeOf(handler), void);
         const Erased = struct {
-            fn decode(out: Allocator, payloads: []const converter.Payload) anyerror!*const anyopaque {
-                const args = try out.create(Signal.Args);
-                args.* = try converter.fromPayloads(Signal.Args, out, payloads);
+            fn decode(out: Allocator, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
+                const args = try out.create(Args);
+                args.* = try converter.fromPayloads(Args, out, payloads);
                 return @ptrCast(args);
             }
             fn call(p: *const anyopaque, a: *const anyopaque) anyerror!void {
                 const c: *const C = @ptrCast(@alignCast(p));
-                const args: *const Signal.Args = @ptrCast(@alignCast(a));
+                const args: *const Args = @ptrCast(@alignCast(a));
                 const result = @call(.auto, handler, .{c.*} ++ args.*);
                 if (@typeInfo(@TypeOf(result)) == .error_union) try result;
             }
         };
         const stored = try ctx.allocator().create(C);
         stored.* = context;
-        return ctx.instance.setSignalHandler(Signal.signal_name, .{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call }, contextAddress(context));
+        return ctx.instance.setSignalHandler(name, .{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call }, contextAddress(context));
+    }
+
+    /// Handles every signal that has no handler registered for its name with
+    /// `handler(context, name, args)`, where `name` is the signal's name and `args` its
+    /// undecoded arguments (`converter.EncodedValues`); it returns `void` or `!void`. Both
+    /// live in `ctx.allocator()`, so the handler may keep them. Registering again replaces
+    /// the dynamic handler for the signals that arrive afterwards.
+    ///
+    /// Signals buffered before this call, of any name, start the handler here in arrival
+    /// order. A handler registered for a signal's name later still takes that name's later
+    /// signals. Coroutines, errors, and `context` work as in `setSignalHandler`; an argument
+    /// that doesn't decode is the handler's error to handle or return.
+    ///
+    ///     fn onSignal(s: *State, name: []const u8, args: temporal.converter.EncodedValues) !void {
+    ///         const amount = try args.get(i64, s.ctx.allocator(), 0);
+    ///         try s.record(name, amount);
+    ///     }
+    ///     try ctx.setDynamicSignalHandler(state, State.onSignal);
+    pub fn setDynamicSignalHandler(ctx: *Context, context: anytype, comptime handler: anytype) SetSignalHandlerError!void {
+        const C = @TypeOf(context);
+        const Args = struct { []const u8, converter.EncodedValues };
+        comptime checkHandler("dynamic signal handler", Args, C, @TypeOf(handler), void);
+        const Erased = struct {
+            fn decode(out: Allocator, name: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
+                const args = try out.create(Args);
+                args.* = .{ name, .{ .payloads = payloads } };
+                return @ptrCast(args);
+            }
+            fn call(p: *const anyopaque, a: *const anyopaque) anyerror!void {
+                const c: *const C = @ptrCast(@alignCast(p));
+                const args: *const Args = @ptrCast(@alignCast(a));
+                const result = @call(.auto, handler, .{c.*} ++ args.*);
+                if (@typeInfo(@TypeOf(result)) == .error_union) try result;
+            }
+        };
+        const stored = try ctx.allocator().create(C);
+        stored.* = context;
+        return ctx.instance.setDynamicSignalHandler(.{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call }, contextAddress(context));
     }
 
     pub const SetUpdateHandlerError = error{
@@ -932,6 +1015,37 @@ pub fn Def(comptime name: []const u8, comptime func: anytype) type {
         }
 
         pub const registered: Registered = .{ .name = name, .invoke = invoke };
+    };
+}
+
+/// Defines a dynamic workflow: one function that runs every workflow type the worker has no
+/// `Def` registered for. `func` is `fn (*Context, converter.EncodedValues) !Result`; it reads
+/// the type it runs as from `ctx.info().workflow_type` and decodes its arguments itself. The
+/// result is a type workers pass to `registerDynamicWorkflow`.
+pub fn DynamicDef(comptime func: anytype) type {
+    const F = @TypeOf(func);
+    const bad = "a dynamic workflow must be fn (*temporal.workflow.Context, temporal.converter.EncodedValues) !Result, not " ++ @typeName(F);
+    const fn_info = switch (@typeInfo(F)) {
+        .@"fn" => |f| f,
+        else => @compileError(bad),
+    };
+    if (fn_info.param_types.len != 2 or fn_info.param_types[0] != *Context or fn_info.param_types[1] != converter.EncodedValues)
+        @compileError(bad);
+    const Ret = fn_info.return_type.?;
+    return struct {
+        pub const function = func;
+        pub const Result = switch (@typeInfo(Ret)) {
+            .error_union => |eu| eu.payload,
+            else => Ret,
+        };
+
+        pub fn invoke(ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
+            const result = try func(ctx, .{ .payloads = payloads });
+            return converter.toPayload(ctx.allocator(), result);
+        }
+
+        /// The registration. Its name is empty: it answers to every unregistered type.
+        pub const registered: Registered = .{ .name = "", .invoke = invoke };
     };
 }
 

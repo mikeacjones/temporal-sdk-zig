@@ -257,6 +257,22 @@ pub const WorkflowEnvironment = struct {
         return env.worker.registerActivityImpl(activity.Def(Activity.activity_name, impl).registered);
     }
 
+    /// Registers a dynamic workflow. See `Worker.registerDynamicWorkflow`.
+    pub fn registerDynamicWorkflow(env: *WorkflowEnvironment, comptime Dynamic: type) !void {
+        return env.worker.registerDynamicWorkflow(Dynamic);
+    }
+
+    /// Registers a dynamic activity. See `Worker.registerDynamicActivity`.
+    pub fn registerDynamicActivity(env: *WorkflowEnvironment, comptime Dynamic: type) !void {
+        return env.worker.registerDynamicActivity(Dynamic);
+    }
+
+    /// Registers a dynamic activity that is a method, bound to `receiver`. See
+    /// `Worker.registerDynamicActivityWith`.
+    pub fn registerDynamicActivityWith(env: *WorkflowEnvironment, comptime Dynamic: type, receiver: *Dynamic.Receiver) !void {
+        return env.worker.registerDynamicActivityWith(Dynamic, receiver);
+    }
+
     /// Runs a workflow to completion on the environment's worker and returns its result,
     /// allocated from `arena`. On `error.WorkflowFailed`, `failure` (if given) receives the
     /// workflow's failure.
@@ -302,7 +318,39 @@ pub const WorkflowEnvironment = struct {
         try env.ensureWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
-        return env.client.executeWorkflow(Workflow, try env.startOptions(Workflow, options, &generated_id), args);
+        return env.client.executeWorkflow(Workflow, try env.startOptions(Workflow.workflow_name, options, &generated_id), args);
+    }
+
+    /// `executeWorkflowWithOptions` for a workflow started by its type name, such as one a
+    /// dynamic workflow runs: `args` is a tuple of argument values, and the result is decoded
+    /// as `Result`.
+    pub fn executeWorkflowByName(
+        env: *WorkflowEnvironment,
+        comptime Result: type,
+        workflow_type: []const u8,
+        options: client_mod.StartWorkflowOptions,
+        args: anytype,
+        arena: Allocator,
+        failure: ?*?failure_mod.Failure,
+    ) !Result {
+        var run = try env.startWorkflowByName(Result, workflow_type, options, args);
+        defer run.deinit();
+        return env.getResultByName(Result, &run, arena, failure);
+    }
+
+    /// `startWorkflow` for a workflow started by its type name; `args` is a tuple of argument
+    /// values. Wait for the run with `getResultByName`.
+    pub fn startWorkflowByName(
+        env: *WorkflowEnvironment,
+        comptime Result: type,
+        workflow_type: []const u8,
+        options: client_mod.StartWorkflowOptions,
+        args: anytype,
+    ) !client_mod.WorkflowRun(Result) {
+        try env.ensureWorker();
+        var generated_id: ?[]u8 = null;
+        defer if (generated_id) |id| env.gpa.free(id);
+        return env.client.executeWorkflowByName(Result, workflow_type, try env.startOptions(workflow_type, options, &generated_id), args);
     }
 
     /// Sends `Signal` with `args` to the latest run of `workflow_id`. Returns once the server
@@ -365,7 +413,7 @@ pub const WorkflowEnvironment = struct {
         try env.ensureWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
-        return env.client.signalWithStartWorkflow(Workflow, try env.startOptions(Workflow, options, &generated_id), args, Signal, signal_args);
+        return env.client.signalWithStartWorkflow(Workflow, try env.startOptions(Workflow.workflow_name, options, &generated_id), args, Signal, signal_args);
     }
 
     /// Starts `Workflow` with `args` and sends it `Update` with `update_args` in one call, or
@@ -387,7 +435,7 @@ pub const WorkflowEnvironment = struct {
         try env.ensureWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
-        return env.client.updateWithStartWorkflow(Workflow, try env.startOptions(Workflow, options, &generated_id), args, Update, update_args, update_options);
+        return env.client.updateWithStartWorkflow(Workflow, try env.startOptions(Workflow.workflow_name, options, &generated_id), args, Update, update_args, update_options);
     }
 
     fn ensureWorker(env: *WorkflowEnvironment) !void {
@@ -397,11 +445,11 @@ pub const WorkflowEnvironment = struct {
     /// `options` with `id` and `task_queue` defaulted to a unique ID and the environment's
     /// task queue. A generated ID is allocated with `env.gpa` and stored in `generated_id`,
     /// which the caller frees once the start call returns.
-    fn startOptions(env: *WorkflowEnvironment, comptime Workflow: type, options: client_mod.StartWorkflowOptions, generated_id: *?[]u8) !client_mod.StartWorkflowOptions {
+    fn startOptions(env: *WorkflowEnvironment, workflow_type: []const u8, options: client_mod.StartWorkflowOptions, generated_id: *?[]u8) !client_mod.StartWorkflowOptions {
         env.next_id += 1;
         var opts = options;
         if (opts.id.len == 0) {
-            generated_id.* = try std.fmt.allocPrint(env.gpa, "{s}-{s}-{d}", .{ Workflow.workflow_name, env.task_queue, env.next_id });
+            generated_id.* = try std.fmt.allocPrint(env.gpa, "{s}-{s}-{d}", .{ workflow_type, env.task_queue, env.next_id });
             opts.id = generated_id.*.?;
         }
         if (opts.task_queue.len == 0) opts.task_queue = env.task_queue;
@@ -419,6 +467,18 @@ pub const WorkflowEnvironment = struct {
         arena: Allocator,
         failure: ?*?failure_mod.Failure,
     ) !Workflow.Result {
+        return env.getResultByName(Workflow.Result, run, arena, failure);
+    }
+
+    /// `getResult` for a run from `startWorkflowByName`: `Result` is the type its result
+    /// decodes as.
+    pub fn getResultByName(
+        env: *WorkflowEnvironment,
+        comptime Result: type,
+        run: *client_mod.WorkflowRun(Result),
+        arena: Allocator,
+        failure: ?*?failure_mod.Failure,
+    ) !Result {
         const skipping = env.server == .time_skipping;
         if (skipping) _ = try env.testService(ts.UnlockTimeSkippingResponse, "UnlockTimeSkipping", ts.UnlockTimeSkippingRequest{}, arena);
         const result = run.get(arena);
@@ -501,7 +561,13 @@ pub const WorkflowEnvironment = struct {
         var scratch: std.heap.ArenaAllocator = .init(env.gpa);
         defer scratch.deinit();
         const history = try env.client.fetchHistory(scratch.allocator(), workflow_id, run_id);
-        var replayer: WorkflowReplayer = .{ .gpa = env.gpa, .io = env.io, .workflows = env.worker.workflows, .workflow_id = workflow_id };
+        var replayer: WorkflowReplayer = .{
+            .gpa = env.gpa,
+            .io = env.io,
+            .workflows = env.worker.workflows,
+            .dynamic_workflow = env.worker.dynamic_workflow,
+            .workflow_id = workflow_id,
+        };
         return replayer.replayHistory(history);
     }
 
@@ -559,6 +625,8 @@ pub const WorkflowReplayer = struct {
     gpa: Allocator,
     io: Io,
     workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty,
+    /// Replays workflow types with no entry in `workflows`, if set.
+    dynamic_workflow: ?workflow.Registered = null,
     /// The workflow ID replayed workflows see in `ctx.info().workflow_id`. A history doesn't
     /// record its own workflow ID, so set this to the original run's ID when the workflow's
     /// commands depend on it (a child or activity ID derived from it, for example), or
@@ -575,6 +643,13 @@ pub const WorkflowReplayer = struct {
 
     pub fn registerWorkflow(r: *WorkflowReplayer, comptime Workflow: type) !void {
         try r.workflows.put(r.gpa, Workflow.workflow_name, Workflow.registered);
+    }
+
+    /// Registers a dynamic workflow for the histories of types with no registered `Def`.
+    /// At most one; a second returns `error.AlreadyRegistered`.
+    pub fn registerDynamicWorkflow(r: *WorkflowReplayer, comptime Dynamic: type) error{AlreadyRegistered}!void {
+        if (r.dynamic_workflow != null) return error.AlreadyRegistered;
+        r.dynamic_workflow = Dynamic.registered;
     }
 
     pub const ReplayError = error{ OutOfMemory, InvalidHistoryJson, ReplayFailed, Nondeterminism };
@@ -631,6 +706,7 @@ pub const WorkflowReplayer = struct {
         var runner: worker_mod.WorkflowRunner = .{
             .gpa = r.gpa,
             .workflows = &r.workflows,
+            .dynamic_workflow = r.dynamic_workflow,
             .task_queue = "replay",
             .namespace = "default",
             .stack_size = 256 * 1024,
@@ -2743,4 +2819,197 @@ test "client: heartbeating an async activity reports its cancellation once the w
     try testing.expectError(error.WorkflowCanceled, env.getResult(AsyncFixtures.Approve, &run, a, null));
     try testing.expectError(error.NotFound, env.client.reportActivityCancellation(token, {}));
     try testing.expectError(error.NotFound, env.client.recordActivityHeartbeat(token, {}));
+}
+
+const DynamicFixtures = struct {
+    /// Runs any workflow type: reads a name and a count, calls the activity "<type>.greet" by
+    /// name with them, and names the workflow type in its result.
+    fn anyWorkflow(ctx: *workflow.Context, args: converter.EncodedValues) ![]const u8 {
+        const a = ctx.allocator();
+        const name = try args.get([]const u8, a, 0);
+        const count = try args.get(u32, a, 1);
+        const activity_type = try std.fmt.allocPrint(a, "{s}.greet", .{ctx.info().workflow_type});
+        const greeting = try ctx.executeActivityByName([]const u8, activity_type, .{ .start_to_close_timeout = .fromSeconds(10) }, .{ name, count }).get();
+        return std.fmt.allocPrint(a, "workflow {s} ran {s}", .{ ctx.info().workflow_type, greeting });
+    }
+    const AnyWorkflow = workflow.DynamicDef(anyWorkflow);
+
+    fn anyWorkflowWithoutActivity(ctx: *workflow.Context, args: converter.EncodedValues) ![]const u8 {
+        _ = args;
+        return ctx.info().workflow_type;
+    }
+    const AnyWorkflowChanged = workflow.DynamicDef(anyWorkflowWithoutActivity);
+
+    const Greeter = struct {
+        punctuation: []const u8,
+        /// Runs any activity type with a name and a count, and names the type it ran as.
+        fn anyActivity(g: *Greeter, ctx: *activity.Context, args: converter.EncodedValues) ![]const u8 {
+            const name, const count = try args.decode(struct { []const u8, u32 }, ctx.allocator());
+            return std.fmt.allocPrint(ctx.allocator(), "activity {s} greeting {s} x{d}{s}", .{ ctx.info().activity_type, name, count, g.punctuation });
+        }
+    };
+    const AnyActivity = activity.DynamicDef(Greeter.anyActivity);
+
+    fn plainActivity(ctx: *activity.Context, args: converter.EncodedValues) !usize {
+        _ = ctx;
+        return args.len();
+    }
+    const PlainActivity = activity.DynamicDef(plainActivity);
+};
+
+test "a dynamic workflow started by name reads its arguments and calls a dynamic activity by name" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var greeter: DynamicFixtures.Greeter = .{ .punctuation = "!" };
+    try env.registerDynamicWorkflow(DynamicFixtures.AnyWorkflow);
+    try env.registerDynamicActivityWith(DynamicFixtures.AnyActivity, &greeter);
+    try testing.expectError(error.AlreadyRegistered, env.registerDynamicWorkflow(DynamicFixtures.AnyWorkflowChanged));
+    try testing.expectError(error.AlreadyRegistered, env.registerDynamicActivity(DynamicFixtures.PlainActivity));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Started (and replayed) through the environment, which starts its worker.
+    try testing.expectEqualStrings(
+        "workflow Onboarding ran activity Onboarding.greet greeting ann x2!",
+        try env.executeWorkflowByName([]const u8, "Onboarding", .{ .task_queue = "" }, .{ "ann", @as(u32, 2) }, a, null),
+    );
+    // Any other type runs the same code; once the worker runs, the client can start it too.
+    var run = try env.client.executeWorkflowByName([]const u8, "Offboarding", .{ .id = "offboarding", .task_queue = env.task_queue }, .{ "bob", @as(u32, 1) });
+    defer run.deinit();
+    try testing.expectEqualStrings("workflow Offboarding ran activity Offboarding.greet greeting bob x1!", try env.getResultByName([]const u8, &run, a, null));
+
+    // An argument of the wrong type is an error the workflow returns, failing it.
+    var failure: ?failure_mod.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflowByName([]const u8, "Onboarding", .{ .task_queue = "" }, .{ "ann", "two" }, a, &failure));
+    try testing.expectEqualStrings("InvalidPayload", failure.?.message);
+}
+
+test "registered workflows and activities win over the dynamic ones" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    try env.registerDynamicWorkflow(DynamicFixtures.AnyWorkflowChanged);
+    try env.registerDynamicActivity(DynamicFixtures.PlainActivity);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("Hello Temporal!", try env.executeWorkflow(Fixtures.Hello, .{"Temporal"}, a, null));
+    try testing.expectEqualStrings("Other", try env.executeWorkflowByName([]const u8, "Other", .{ .task_queue = "" }, .{}, a, null));
+}
+
+const dynamic_history = @embedFile("testdata/dynamic_history.json");
+
+test "WorkflowReplayer replays a dynamic workflow and catches a changed one" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerDynamicWorkflow(DynamicFixtures.AnyWorkflow);
+    try testing.expectError(error.AlreadyRegistered, ok.registerDynamicWorkflow(DynamicFixtures.AnyWorkflow));
+    try ok.replayHistoryJson(dynamic_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerDynamicWorkflow(DynamicFixtures.AnyWorkflowChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(dynamic_history));
+}
+
+const RuntimeSignalFixtures = struct {
+    /// Holds a lock until a release signal "unlock-event-<its workflow ID>" arrives, named at
+    /// run time, and returns who released it.
+    fn holdLock(ctx: *workflow.Context) ![]const u8 {
+        const Lock = struct {
+            releaser: ?[]const u8 = null,
+            fn release(l: *@This(), releaser: []const u8) void {
+                l.releaser = releaser;
+            }
+            fn released(l: *@This()) bool {
+                return l.releaser != null;
+            }
+        };
+        const lock = try ctx.allocator().create(Lock);
+        lock.* = .{};
+        const name = try std.fmt.allocPrint(ctx.allocator(), "unlock-event-{s}", .{ctx.info().workflow_id});
+        try ctx.setSignalHandlerByName(name, struct { []const u8 }, lock, Lock.release);
+        try ctx.await(lock, Lock.released);
+        return std.fmt.allocPrint(ctx.allocator(), "released by {s}", .{lock.releaser.?});
+    }
+    const HoldLock = workflow.Def("HoldLock", holdLock);
+
+    /// Releases the lock `holder_id` holds with a signal named after it.
+    fn releaseLock(ctx: *workflow.Context, holder_id: []const u8) !void {
+        const name = try std.fmt.allocPrint(ctx.allocator(), "unlock-event-{s}", .{holder_id});
+        try ctx.signalExternalWorkflowByName(name, holder_id, "", .{"releaser"}).get();
+    }
+    const ReleaseLock = workflow.Def("ReleaseLock", releaseLock);
+
+    const UnlockEarly = workflow.SignalDef("unlock-event-early-holder", fn (releaser: []const u8) void);
+
+    const Inbox = struct {
+        ctx: *workflow.Context,
+        entries: std.ArrayList([]const u8) = .empty,
+
+        fn approve(s: *Inbox, approver: []const u8) !void {
+            try s.entries.append(s.ctx.allocator(), try std.fmt.allocPrint(s.ctx.allocator(), "approved by {s}", .{approver}));
+        }
+        fn other(s: *Inbox, name: []const u8, args: converter.EncodedValues) !void {
+            const value = try args.get([]const u8, s.ctx.allocator(), 0);
+            try s.entries.append(s.ctx.allocator(), try std.fmt.allocPrint(s.ctx.allocator(), "{s}={s}", .{ name, value }));
+        }
+        fn full(s: *Inbox) bool {
+            return s.entries.items.len >= 3;
+        }
+    };
+    /// Handles "approve" with its own handler and every other signal with the dynamic one,
+    /// until three have arrived.
+    fn inbox(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(Inbox);
+        s.* = .{ .ctx = ctx };
+        try ctx.setSignalHandler(SignalFixtures.Approve, s, Inbox.approve);
+        try ctx.setDynamicSignalHandler(s, Inbox.other);
+        try ctx.await(s, Inbox.full);
+        return std.mem.join(ctx.allocator(), ", ", s.entries.items);
+    }
+    const InboxWf = workflow.Def("Inbox", inbox);
+    const Color = workflow.SignalDef("color", fn (value: []const u8) void);
+    const Size = workflow.SignalDef("size", fn (value: []const u8) void);
+};
+
+test "signals named at run time: an early one waits for its handler, and a workflow sends one" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(RuntimeSignalFixtures.HoldLock);
+    try env.registerWorkflow(RuntimeSignalFixtures.ReleaseLock);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Signal-with-start delivers the signal with the start, before the handler registers.
+    var early = try env.signalWithStartWorkflow(RuntimeSignalFixtures.HoldLock, .{ .id = "early-holder", .task_queue = "" }, .{}, RuntimeSignalFixtures.UnlockEarly, .{"starter"});
+    defer early.deinit();
+    try testing.expectEqualStrings("released by starter", try env.getResult(RuntimeSignalFixtures.HoldLock, &early, a, null));
+
+    var holder = try env.startWorkflow(RuntimeSignalFixtures.HoldLock, .{ .id = "holder", .task_queue = "" }, .{});
+    defer holder.deinit();
+    try env.executeWorkflow(RuntimeSignalFixtures.ReleaseLock, .{"holder"}, a, null);
+    try testing.expectEqualStrings("released by releaser", try env.getResult(RuntimeSignalFixtures.HoldLock, &holder, a, null));
+}
+
+test "a dynamic signal handler receives the signals no handler is registered for" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(RuntimeSignalFixtures.InboxWf);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(RuntimeSignalFixtures.InboxWf, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    // Signals that arrive before the handlers register start in registration order, ones
+    // that arrive after in arrival order; sending "approve" first makes both orders agree.
+    try env.signalWorkflow(SignalFixtures.Approve, run.id, .{"ann"});
+    try env.signalWorkflow(RuntimeSignalFixtures.Color, run.id, .{"red"});
+    try env.signalWorkflow(RuntimeSignalFixtures.Size, run.id, .{"large"});
+    try testing.expectEqualStrings("approved by ann, color=red, size=large", try env.getResult(RuntimeSignalFixtures.InboxWf, &run, a, null));
 }
