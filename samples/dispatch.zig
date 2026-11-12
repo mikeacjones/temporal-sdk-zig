@@ -22,6 +22,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "choice-exclusive:starter")) return @import("choice-exclusive/starter.zig").main(init);
     if (std.mem.eql(u8, name, "choice-multi:worker")) return @import("choice-multi/worker.zig").main(init);
     if (std.mem.eql(u8, name, "choice-multi:starter")) return @import("choice-multi/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "codec-server:worker")) return @import("codec-server/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "codec-server:starter")) return @import("codec-server/starter.zig").main(init);
     if (std.mem.eql(u8, name, "cron:worker")) return @import("cron/worker.zig").main(init);
     if (std.mem.eql(u8, name, "cron:starter")) return @import("cron/starter.zig").main(init);
     if (std.mem.eql(u8, name, "dsl:worker")) return @import("dsl/worker.zig").main(init);
