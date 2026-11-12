@@ -4207,6 +4207,102 @@ test "codecs encode every payload the client and worker send and decode what the
     try replayer.replayHistory(raw);
 }
 
+/// Tags every payload it encodes with the propagated key ID in its context, as an encryption
+/// codec picking its key per tenant would, and on decode accepts only payloads tagged with a
+/// known key ID. Counts encodes that had no key ID, and those for the Greet activity.
+const KeyIdCodec = struct {
+    const key_id = propagation.key([]const u8, "key-id");
+    const metadata_key = "test-key-id";
+    const known_key = "key-1";
+    without_key: std.atomic.Value(u32) = .init(0),
+    greet_encodes: std.atomic.Value(u32) = .init(0),
+
+    fn codec(k: *KeyIdCodec) converter.PayloadCodec {
+        return .{ .ptr = k, .vtable = &.{ .encode = encode, .decode = decode, .encodeWithContext = encodeWithContext, .decodeWithContext = decodeWithContext } };
+    }
+
+    fn encode(ptr: *anyopaque, arena: Allocator, io: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return encodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn decode(ptr: *anyopaque, arena: Allocator, io: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return decodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn encodeWithContext(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const k: *KeyIdCodec = @ptrCast(@alignCast(ptr));
+        const id = context.values.get(key_id) orelse {
+            _ = k.without_key.fetchAdd(1, .monotonic);
+            return arena.dupe(converter.Payload, payloads);
+        };
+        if (std.mem.eql(u8, context.activity_type, Fixtures.Greet.activity_name)) _ = k.greet_encodes.fetchAdd(1, .monotonic);
+        const out = try arena.dupe(converter.Payload, payloads);
+        for (out) |*p| {
+            var metadata = try p.metadata.clone(arena);
+            try metadata.append(arena, .{ .key = metadata_key, .value = id });
+            p.metadata = metadata;
+        }
+        return out;
+    }
+
+    fn decodeWithContext(_: *anyopaque, arena: Allocator, _: Io, _: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const out = try arena.dupe(converter.Payload, payloads);
+        for (out) |*p| {
+            const id = keyIdOf(p.*) orelse continue;
+            if (!std.mem.eql(u8, id, known_key)) return error.CodecFailed;
+            var metadata: std.ArrayList(converter.Payload.MetadataEntry) = .empty;
+            for (p.metadata.items) |m| if (!std.mem.eql(u8, m.key, metadata_key)) try metadata.append(arena, m);
+            p.metadata = metadata;
+        }
+        return out;
+    }
+
+    fn keyIdOf(p: converter.Payload) ?[]const u8 {
+        for (p.metadata.items) |m| if (std.mem.eql(u8, m.key, metadata_key)) return m.value;
+        return null;
+    }
+};
+
+test "codecs see the propagated key ID of the client call, the workflow run, and the activity" {
+    var key_ids: KeyIdCodec = .{};
+    const codecs = [_]converter.PayloadCodec{key_ids.codec()};
+    const propagators = [_]propagation.ContextPropagator{propagation.HeaderPropagator(KeyIdCodec.key_id).propagator};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs, .propagators = &propagators });
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var values: propagation.Values = .init(a);
+    try values.put(KeyIdCodec.key_id, KeyIdCodec.known_key);
+    var run = try env.startWorkflow(Fixtures.Hello, .{ .task_queue = "", .context = &values }, .{"keyed"});
+    defer run.deinit();
+    // Waiting for the result also replays the history with the codecs.
+    try testing.expectEqualStrings("Hello keyed!", try env.getResult(Fixtures.Hello, &run, a, null));
+    try testing.expectEqual(@as(u32, 0), key_ids.without_key.load(.monotonic));
+    try testing.expect(key_ids.greet_encodes.load(.monotonic) > 0);
+
+    // The server stored each payload tagged with the key ID.
+    var plain = try client_mod.Client.connect(testing.allocator, testing.io, env.server.clientOptions());
+    defer plain.close();
+    const raw = try plain.fetchHistory(a, run.id, run.run_id);
+    var tagged: usize = 0;
+    for (raw.events.items) |event| {
+        const payload = switch (event.attributes orelse continue) {
+            .workflow_execution_started_event_attributes => |e| e.input.?.payloads.items[0],
+            .activity_task_scheduled_event_attributes => |e| e.input.?.payloads.items[0],
+            .activity_task_completed_event_attributes => |e| e.result.?.payloads.items[0],
+            .workflow_execution_completed_event_attributes => |e| e.result.?.payloads.items[0],
+            else => continue,
+        };
+        try testing.expectEqualStrings(KeyIdCodec.known_key, KeyIdCodec.keyIdOf(payload).?);
+        tagged += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), tagged);
+}
+
 /// A history of `Fixtures.Hello` run with `ReversingCodec`: every payload in it is encoded.
 const codec_history = @embedFile("testdata/codec_history.json");
 
