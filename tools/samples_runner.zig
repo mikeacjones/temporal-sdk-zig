@@ -22,6 +22,9 @@ const Manifest = struct {
     /// defaults.
     starter_args: []const []const u8 = &.{},
     timeout_seconds: u32 = 60,
+    /// The sample's test files and the other samples it imports; read by build.zig.
+    tests: []const []const u8 = &.{},
+    imports: []const []const u8 = &.{},
 };
 
 const Sample = struct {

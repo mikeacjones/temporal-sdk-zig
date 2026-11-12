@@ -9,4 +9,5 @@
         "Workflow completed",
     },
     .timeout_seconds = 60,
+    .tests = .{"await_signals_workflow_test.zig"},
 }

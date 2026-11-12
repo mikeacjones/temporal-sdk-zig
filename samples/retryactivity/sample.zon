@@ -4,4 +4,5 @@
 .{
     .expect = .{"Workflow completed"},
     .timeout_seconds = 90,
+    .tests = .{"retry_activity_workflow_test.zig"},
 }
