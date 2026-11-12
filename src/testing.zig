@@ -1512,6 +1512,27 @@ test "client: generated IDs, start delay, history, and terminate" {
     try testing.expectError(error.WorkflowTerminated, stuck.get(a));
 }
 
+test "client: start a workflow by its type name" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    _ = try env.executeWorkflow(Fixtures.Hello, .{"warm-up"}, a, null); // starts the worker
+    var run = try env.client.executeWorkflowByName([]const u8, Fixtures.Hello.workflow_name, .{ .task_queue = env.task_queue }, .{"by name"});
+    defer run.deinit();
+    try testing.expectEqualStrings("Hello by name!", try run.get(a));
+
+    // An unregistered type fails its workflow task until the run is ended.
+    var unknown = try env.client.executeWorkflowByName(void, "NoSuchWorkflow", .{ .task_queue = env.task_queue }, .{});
+    defer unknown.deinit();
+    try env.client.terminateWorkflow(unknown.id, "", "test cleanup");
+    try testing.expectError(error.WorkflowTerminated, unknown.get(a));
+}
+
 test "client: cancel ends a run canceled, after any cleanup the workflow does" {
     const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();

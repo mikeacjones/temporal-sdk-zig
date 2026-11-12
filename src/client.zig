@@ -110,6 +110,18 @@ pub const Client = struct {
         return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
     }
 
+    /// Starts a workflow by its type name, for a workflow this program has no definition of.
+    /// `args` is a tuple of its arguments and `Result` the type its result decodes to (`void`
+    /// to ignore it).
+    pub fn executeWorkflowByName(c: *Client, comptime Result: type, workflow_type: []const u8, options: StartWorkflowOptions, args: anytype) StartError!WorkflowRun(Result) {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const id = if (options.id.len > 0) options.id else try uuid(arena_state.allocator(), c.io);
+        const run_id = try c.startWorkflow(workflow_type, id, options, args);
+        errdefer c.gpa.free(run_id);
+        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
+    }
+
     fn startWorkflow(c: *Client, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) StartError![]u8 {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
