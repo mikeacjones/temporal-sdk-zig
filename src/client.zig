@@ -82,10 +82,81 @@ pub const Options = struct {
         /// PEM; empty uses the system roots.
         server_root_ca_cert: []const u8 = "",
         server_name: []const u8 = "",
+        /// PEM client certificate and key for mutual TLS: both or neither.
         client_cert: []const u8 = "",
         client_private_key: []const u8 = "",
+        /// Files to read the PEM above from instead, each time the client connects (`connect`
+        /// and `Client.reconnect`), so a reconnect picks up certificates rotated on disk. Each
+        /// path excludes its PEM field.
+        server_root_ca_cert_path: []const u8 = "",
+        client_cert_path: []const u8 = "",
+        client_private_key_path: []const u8 = "",
     };
+
+    /// The options the connection uses, for `Client.reconnect`.
+    pub fn connectionOptions(o: Options) ConnectionOptions {
+        return .{ .host_port = o.host_port, .api_key = o.api_key, .tls = o.tls, .headers = o.headers };
+    }
 };
+
+/// What `Client.reconnect` replaces: the `Options` fields the connection is made with. The
+/// others (namespace, identity, codecs, ...) stay as `connect` set them.
+pub const ConnectionOptions = struct {
+    host_port: []const u8 = "localhost:7233",
+    api_key: []const u8 = "",
+    tls: ?Options.Tls = null,
+    headers: []const bridge.bytes.MetadataEntry = &.{},
+};
+
+/// Connects to the server `options` names, reading the TLS files it names, and checks it.
+/// Logs why on failure: as an error, or as a warning for a `reconnect`, after which the
+/// client still works.
+fn openConnection(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []const u8, options: ConnectionOptions, comptime reconnecting: bool) ConnectError!bridge.Connection {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tls: ?bridge.Connection.Options.Tls = null;
+    if (options.tls) |t| tls = .{
+        .server_root_ca_cert = try tlsFile(arena, io, t.server_root_ca_cert, t.server_root_ca_cert_path, "server_root_ca_cert"),
+        .domain = t.server_name,
+        .client_cert = try tlsFile(arena, io, t.client_cert, t.client_cert_path, "client_cert"),
+        .client_private_key = try tlsFile(arena, io, t.client_private_key, t.client_private_key_path, "client_private_key"),
+    };
+    const scheme = if (options.tls != null) "https" else "http";
+    const url = try std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, options.host_port });
+    var message: ?[]u8 = null;
+    defer if (message) |m| gpa.free(m);
+    return bridge.Connection.connect(gpa, io, runtime, .{
+        .target_url = url,
+        .identity = identity,
+        .api_key = options.api_key,
+        .metadata = options.headers,
+        .tls = tls,
+    }, &message) catch |err| {
+        const reason = message orelse @errorName(err);
+        if (reconnecting)
+            log.warn("reconnecting to {s} failed, keeping the current connection: {s}", .{ options.host_port, reason })
+        else
+            log.err("connecting to {s} failed: {s}", .{ options.host_port, reason });
+        return err;
+    };
+}
+
+/// The PEM in `pem`, or else read from `path` into `arena`.
+fn tlsFile(arena: Allocator, io: Io, pem: []const u8, path: []const u8, comptime field: []const u8) ConnectError![]const u8 {
+    if (path.len == 0) return pem;
+    if (pem.len > 0) {
+        log.err("client options: set Options.tls." ++ field ++ " or Options.tls." ++ field ++ "_path ({s}), not both", .{path});
+        return error.InvalidOptions;
+    }
+    return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => {
+            log.err("client options: reading Options.tls." ++ field ++ "_path {s} failed: {t}", .{ path, err });
+            return error.InvalidOptions;
+        },
+    };
+}
 
 /// sdk-core's crates log at `level`; the libraries they use at `level` or `warn`, whichever is
 /// less verbose.
@@ -193,7 +264,16 @@ pub const Client = struct {
     gpa: Allocator,
     io: Io,
     runtime: bridge.Runtime,
+    /// Read it with `currentConnection`: `reconnect` replaces it.
     connection: bridge.Connection,
+    /// Guards `connection`, `retired_connections` and `running_workers`.
+    connection_mutex: Io.Mutex = .init,
+    /// Connections `reconnect` replaced, freed by `close`: calls already sent on one may
+    /// still be using it.
+    retired_connections: std.ArrayList(bridge.Connection) = .empty,
+    /// The core workers running on this client, which `reconnect` moves to the new
+    /// connection. Registered by `worker.Worker.run`.
+    running_workers: std.ArrayList(*bridge.c.TemporalCoreWorker) = .empty,
     namespace: []u8,
     identity: []u8,
     /// `Options.codecs`, borrowed.
@@ -263,24 +343,7 @@ pub const Client = struct {
         const namespace = try gpa.dupe(u8, options.namespace);
         errdefer gpa.free(namespace);
 
-        const scheme = if (options.tls != null) "https" else "http";
-        const url = try std.fmt.allocPrint(gpa, "{s}://{s}", .{ scheme, options.host_port });
-        defer gpa.free(url);
-        const connection = bridge.Connection.connect(gpa, io, runtime, .{
-            .target_url = url,
-            .identity = identity,
-            .api_key = options.api_key,
-            .metadata = options.headers,
-            .tls = if (options.tls) |t| .{
-                .server_root_ca_cert = t.server_root_ca_cert,
-                .domain = t.server_name,
-                .client_cert = t.client_cert,
-                .client_private_key = t.client_private_key,
-            } else null,
-        }, &message) catch |err| {
-            log.err("connecting to {s} failed: {s}", .{ options.host_port, message orelse @errorName(err) });
-            return err;
-        };
+        const connection = try openConnection(gpa, io, runtime, identity, options.connectionOptions(), false);
         return .{
             .gpa = gpa,
             .io = io,
@@ -299,6 +362,9 @@ pub const Client = struct {
     }
 
     pub fn close(c: *Client) void {
+        c.running_workers.deinit(c.gpa);
+        for (c.retired_connections.items) |conn| conn.deinit();
+        c.retired_connections.deinit(c.gpa);
         c.connection.deinit();
         if (c.meter) |m| m.destroy();
         c.runtime.deinit();
@@ -306,6 +372,95 @@ pub const Client = struct {
         c.gpa.free(c.namespace);
         c.gpa.free(c.identity);
         c.* = undefined;
+    }
+
+    /// The connection calls go over now. It stays valid until `close`, even after a
+    /// `reconnect` replaces it. Thread-safe.
+    pub fn currentConnection(c: *Client) bridge.Connection {
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        return c.connection;
+    }
+
+    /// Replaces the API key sent with every call from now on, by this client and every worker
+    /// on it; empty sends none. Calls already sent keep the key they had. Use it to rotate a
+    /// key before it expires. A later `reconnect` sends its own `ConnectionOptions.api_key`
+    /// instead. Thread-safe.
+    pub fn updateApiKey(c: *Client, api_key: []const u8) void {
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        c.connection.setApiKey(api_key);
+    }
+
+    /// Replaces the gRPC headers (`Options.headers`) sent with every call from now on, by
+    /// this client and every worker on it. Returns `error.InvalidOptions` (logged) for a key
+    /// that isn't a valid header name or ends in "-bin" (binary headers aren't supported), or
+    /// a value with characters other than visible ASCII, space and tab; the headers are then
+    /// unchanged. A later `reconnect` sends its own `ConnectionOptions.headers` instead.
+    /// Thread-safe.
+    pub fn updateHeaders(c: *Client, headers: []const bridge.bytes.MetadataEntry) error{ OutOfMemory, InvalidOptions }!void {
+        for (headers) |h| try validateHeader(h);
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        c.connection.setMetadata(c.gpa, headers) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // validateHeader already rejects newlines.
+            error.NewlineInKey, error.NewlineInValue => unreachable,
+        };
+    }
+
+    /// Connects again with `options` (address, API key, TLS and headers) and sends every
+    /// later call over the new connection: this client's, and those of the workers running
+    /// on it, which move over without stopping (their polls already waiting finish on the old
+    /// connection). Workers started later use it too. TLS files named by `options.tls` are
+    /// read again, so this is how to rotate a client certificate: sdk-core can't change the
+    /// certificate of a live connection. The new connection is checked first; if that fails
+    /// (`ConnectError`, logged as a warning), the client keeps the current one. The old
+    /// connection is freed by `close`, since calls already sent may still be using it. A
+    /// worker that is already shutting down can't move and finishes on the old connection
+    /// (logged as a warning). Thread-safe.
+    pub fn reconnect(c: *Client, options: ConnectionOptions) ConnectError!void {
+        const next = try openConnection(c.gpa, c.io, c.runtime, c.identity, options, true);
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        c.retired_connections.append(c.gpa, c.connection) catch {
+            next.deinit();
+            return error.OutOfMemory;
+        };
+        c.connection = next;
+        for (c.running_workers.items) |ptr| replaceWorkerClient(c, ptr, next);
+    }
+
+    /// For `worker.Worker.run`: registers a core worker it created on `created_on`, so
+    /// `reconnect` moves it, and moves it at once if a `reconnect` came in between. Pair with
+    /// `untrackWorker` before the core worker is freed.
+    pub fn trackWorker(c: *Client, ptr: *bridge.c.TemporalCoreWorker, created_on: bridge.Connection) error{OutOfMemory}!void {
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        try c.running_workers.append(c.gpa, ptr);
+        if (created_on.ptr != c.connection.ptr) replaceWorkerClient(c, ptr, c.connection);
+    }
+
+    /// For `worker.Worker.run`: unregisters a core worker `trackWorker` registered; does
+    /// nothing if it isn't registered.
+    pub fn untrackWorker(c: *Client, ptr: *bridge.c.TemporalCoreWorker) void {
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        for (c.running_workers.items, 0..) |p, i| if (p == ptr) {
+            _ = c.running_workers.swapRemove(i);
+            return;
+        };
+    }
+
+    /// sdk-core refuses to move a worker that is shutting down: it finishes on the old
+    /// connection.
+    fn replaceWorkerClient(c: *Client, ptr: *bridge.c.TemporalCoreWorker, connection: bridge.Connection) void {
+        const w: bridge.Worker = .{ .ptr = ptr, .runtime = c.runtime };
+        var message: ?[]u8 = null;
+        defer if (message) |m| c.gpa.free(m);
+        w.replaceClient(c.gpa, connection, &message) catch {
+            log.warn("moving a running worker to the new connection failed; it keeps the old one until it stops: {s}", .{message orelse "no reason given"});
+        };
     }
 
     /// Starts a workflow defined with `temporal.workflow.Def` and returns a handle to its run.
@@ -1229,7 +1384,7 @@ pub const Client = struct {
         coded.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var failure: ?bridge.Connection.RpcFailure = null;
         defer if (failure) |f| f.deinit(c.gpa);
-        const bytes = c.connection.call(c.gpa, c.io, .workflow, method, encoded.written(), .{ .retry = true }, &failure) catch |err| switch (err) {
+        const bytes = c.currentConnection().call(c.gpa, c.io, .workflow, method, encoded.written(), .{ .retry = true }, &failure) catch |err| switch (err) {
             error.RpcFailed => {
                 const f = failure.?;
                 // gRPC ALREADY_EXISTS and NOT_FOUND are expected outcomes callers handle.
@@ -2738,41 +2893,105 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
     };
 }
 
-/// Client options from the environment and the Temporal config file, as the Temporal CLI
-/// reads them: TEMPORAL_ADDRESS,
-/// TEMPORAL_NAMESPACE, TEMPORAL_API_KEY, TEMPORAL_PROFILE, TEMPORAL_CONFIG_FILE, and the
-/// default profile in the config file. Strings are allocated from `arena`.
-pub fn loadDefaultOptions(arena: Allocator) error{ OutOfMemory, InvalidConfig }!Options {
+/// Where `loadOptions` reads a client profile from. The config file is TOML with one table
+/// per profile, `[profile.<name>]`, holding `address`, `namespace`, `api_key`, `grpc_meta`,
+/// and a `tls` table (`disabled`, `server_name`, and `server_ca_cert`, `client_cert` and
+/// `client_key`, each as `_path` or `_data`). The environment variables TEMPORAL_ADDRESS,
+/// TEMPORAL_NAMESPACE, TEMPORAL_API_KEY, TEMPORAL_TLS, TEMPORAL_TLS_SERVER_NAME,
+/// TEMPORAL_TLS_SERVER_CA_CERT_PATH (or `_DATA`), TEMPORAL_TLS_CLIENT_CERT_PATH (or `_DATA`),
+/// TEMPORAL_TLS_CLIENT_KEY_PATH (or `_DATA`) and TEMPORAL_GRPC_META_<NAME> override the
+/// profile's values.
+pub const LoadOptions = struct {
+    /// The profile to read from the config file. Empty uses TEMPORAL_PROFILE, then "default";
+    /// a profile named here or by TEMPORAL_PROFILE must exist, "default" need not.
+    profile: []const u8 = "",
+    /// The config file. Empty uses `config_data`, then TEMPORAL_CONFIG_FILE, then
+    /// `temporal/temporal.toml` in the user's config directory. A file that doesn't exist
+    /// reads as empty, as sdk-core does, so only the environment applies.
+    config_file: []const u8 = "",
+    /// The config file's contents (TOML), instead of reading a file.
+    config_data: []const u8 = "",
+    /// Don't read a config file: only the environment.
+    disable_file: bool = false,
+    /// Don't read the environment: only the config file. Can't be set with `disable_file`.
+    disable_env: bool = false,
+    /// Reject keys the config file format doesn't define, instead of ignoring them.
+    strict: bool = false,
+    /// The environment variables to read instead of the process's.
+    env: ?*const std.process.Environ.Map = null,
+};
+
+pub const LoadError = error{ OutOfMemory, InvalidConfig };
+
+/// Client options from the Temporal config file and environment variables, as `options`
+/// says (see `LoadOptions`). A profile with an API key, or with TLS settings, uses TLS unless
+/// its `tls.disabled` (or TEMPORAL_TLS=false) says not to. Certificate paths are kept as
+/// paths (`Options.Tls.client_cert_path`, ...) and read when the client connects. A config
+/// that can't be read or parsed, a missing named profile, a key `strict` rejects, or `path`
+/// and `data` both set for one certificate return `error.InvalidConfig`, with the reason
+/// logged. Strings are allocated from `arena`.
+pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
+    var env_json: Io.Writer.Allocating = .init(arena);
+    if (options.env) |env| {
+        var json: std.json.Stringify = .{ .writer = &env_json.writer };
+        json.beginObject() catch return error.OutOfMemory;
+        for (env.keys(), env.values()) |k, v| {
+            json.objectField(k) catch return error.OutOfMemory;
+            json.write(v) catch return error.OutOfMemory;
+        }
+        json.endObject() catch return error.OutOfMemory;
+    }
     const result = bridge.c.temporal_core_client_env_config_profile_load(&.{
-        .profile = bridge.bytes.ref(""),
-        .path = bridge.bytes.ref(""),
-        .data = bridge.bytes.ref(""),
-        .disable_file = false,
-        .disable_env = false,
-        .config_file_strict = false,
-        .env_vars = bridge.bytes.ref(""),
+        .profile = bridge.bytes.ref(options.profile),
+        .path = bridge.bytes.ref(options.config_file),
+        .data = bridge.bytes.ref(options.config_data),
+        .disable_file = options.disable_file,
+        .disable_env = options.disable_env,
+        .config_file_strict = options.strict,
+        .env_vars = bridge.bytes.ref(env_json.written()),
     });
     if (bridge.bytes.Owned.take(null, result.fail)) |fail| {
         defer fail.deinit();
-        log.err("loading client configuration failed: {s}", .{fail.bytes()});
+        log.warn("loading client configuration failed: {s}", .{fail.bytes()});
         return error.InvalidConfig;
     }
     const json = bridge.bytes.Owned.take(null, result.success) orelse return .{};
     defer json.deinit();
+    return profileOptions(arena, json.bytes());
+}
 
+/// `loadOptions` with the default `LoadOptions`: the process's environment and the config
+/// file it names, or the default one.
+pub fn loadDefaultOptions(arena: Allocator) LoadError!Options {
+    return loadOptions(arena, .{});
+}
+
+/// Options from sdk-core's JSON for a profile. A certificate's `data` is a JSON array of
+/// bytes.
+fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
+    const Source = struct { path: ?[]const u8 = null, data: ?[]const u8 = null };
     const Profile = struct {
         address: ?[]const u8 = null,
         namespace: ?[]const u8 = null,
         api_key: ?[]const u8 = null,
-        tls: ?struct { disabled: ?bool = null, server_name: ?[]const u8 = null } = null,
+        tls: ?struct {
+            disabled: ?bool = null,
+            server_name: ?[]const u8 = null,
+            server_ca_cert: ?Source = null,
+            client_cert: ?Source = null,
+            client_key: ?Source = null,
+        } = null,
         grpc_meta: ?std.json.ArrayHashMap([]const u8) = null,
     };
-    const profile = std.json.parseFromSliceLeaky(Profile, arena, json.bytes(), .{
+    const profile = std.json.parseFromSliceLeaky(Profile, arena, json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidConfig,
+        else => {
+            log.warn("loading client configuration failed: sdk-core returned a profile that doesn't parse ({t}): {s}", .{ err, json });
+            return error.InvalidConfig;
+        },
     };
 
     var options: Options = .{};
@@ -2780,19 +2999,47 @@ pub fn loadDefaultOptions(arena: Allocator) error{ OutOfMemory, InvalidConfig }!
     if (profile.namespace) |v| options.namespace = v;
     if (profile.api_key) |v| options.api_key = v;
     if (profile.tls) |t| {
-        if (!(t.disabled orelse false)) options.tls = .{ .server_name = t.server_name orelse "" };
+        if (!(t.disabled orelse false)) {
+            const none: Source = .{};
+            const ca = t.server_ca_cert orelse none;
+            const cert = t.client_cert orelse none;
+            const key = t.client_key orelse none;
+            options.tls = .{
+                .server_name = t.server_name orelse "",
+                .server_root_ca_cert = ca.data orelse "",
+                .server_root_ca_cert_path = ca.path orelse "",
+                .client_cert = cert.data orelse "",
+                .client_cert_path = cert.path orelse "",
+                .client_private_key = key.data orelse "",
+                .client_private_key_path = key.path orelse "",
+            };
+        }
     } else if (options.api_key.len > 0) {
-        // An API key implies TLS, as in the other SDKs.
         options.tls = .{};
     }
     if (profile.grpc_meta) |meta| {
         const headers = try arena.alloc(bridge.bytes.MetadataEntry, meta.map.count());
-        var it = meta.map.iterator();
-        var i: usize = 0;
-        while (it.next()) |kv| : (i += 1) headers[i] = .{ .key = kv.key_ptr.*, .value = kv.value_ptr.* };
+        for (headers, meta.map.keys(), meta.map.values()) |*h, k, v| h.* = .{ .key = k, .value = v };
         options.headers = headers;
     }
     return options;
+}
+
+/// Rejects what sdk-core would silently drop from `Client.updateHeaders`: gRPC ASCII headers
+/// only.
+fn validateHeader(h: bridge.bytes.MetadataEntry) error{InvalidOptions}!void {
+    const token_symbols = "!#$%&'*+-.^_`|~";
+    const key_ok = h.key.len > 0 and !std.ascii.endsWithIgnoreCase(h.key, "-bin") and for (h.key) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, token_symbols, ch) == null) break false;
+    } else true;
+    if (!key_ok) {
+        log.warn("updating the client's headers failed: \"{s}\" is not a valid header name (letters, digits and {s}, not ending in -bin)", .{ h.key, token_symbols });
+        return error.InvalidOptions;
+    }
+    for (h.value) |ch| if (ch != '\t' and (ch < ' ' or ch > '~')) {
+        log.warn("updating the client's headers failed: the value of header {s} has a byte (0x{x:0>2}) other than visible ASCII, space or tab", .{ h.key, ch });
+        return error.InvalidOptions;
+    };
 }
 
 fn defaultIdentity(gpa: Allocator) error{OutOfMemory}![]u8 {
@@ -2912,4 +3159,155 @@ test "codec contexts name the workflow or activity a request names" {
     Client.requestIdentity(wfs.ExecuteMultiOperationRequest, &multi, &context);
     try testing.expectEqualStrings("uws", context.workflow_id);
     try testing.expectEqualStrings("Cart", context.workflow_type);
+}
+
+test "a named profile from inline TOML maps to client options" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const toml =
+        \\[profile.default]
+        \\address = "localhost:7233"
+        \\
+        \\[profile.prod]
+        \\address = "prod.example.com:7233"
+        \\namespace = "orders"
+        \\[profile.prod.grpc_meta]
+        \\Team_Name = "payments"
+    ;
+    const prod = try loadOptions(arena.allocator(), .{ .profile = "prod", .config_data = toml, .disable_env = true });
+    try testing.expectEqualStrings("prod.example.com:7233", prod.host_port);
+    try testing.expectEqualStrings("orders", prod.namespace);
+    try testing.expect(prod.tls == null);
+    try testing.expectEqual(1, prod.headers.len);
+    try testing.expectEqualStrings("team-name", prod.headers[0].key);
+    try testing.expectEqualStrings("payments", prod.headers[0].value);
+
+    const default = try loadOptions(arena.allocator(), .{ .config_data = toml, .disable_env = true });
+    try testing.expectEqualStrings("localhost:7233", default.host_port);
+    try testing.expectEqualStrings("default", default.namespace);
+}
+
+test "profile TLS certificates map to paths or PEM data" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const options = try loadOptions(arena.allocator(), .{ .disable_env = true, .config_data =
+        \\[profile.default]
+        \\address = "secure.example.com:7233"
+        \\[profile.default.tls]
+        \\server_name = "secure.example.com"
+        \\server_ca_cert_path = "/etc/temporal/ca.pem"
+        \\client_cert_data = "-----BEGIN CERTIFICATE-----"
+        \\client_key_path = "/etc/temporal/client.key"
+    });
+    const tls = options.tls.?;
+    try testing.expectEqualStrings("secure.example.com", tls.server_name);
+    try testing.expectEqualStrings("/etc/temporal/ca.pem", tls.server_root_ca_cert_path);
+    try testing.expectEqualStrings("", tls.server_root_ca_cert);
+    try testing.expectEqualStrings("-----BEGIN CERTIFICATE-----", tls.client_cert);
+    try testing.expectEqualStrings("", tls.client_cert_path);
+    try testing.expectEqualStrings("/etc/temporal/client.key", tls.client_private_key_path);
+}
+
+test "environment variables override the profile, including TLS certificate paths" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_PROFILE", "staging");
+    try env.put("TEMPORAL_NAMESPACE", "from-env");
+    try env.put("TEMPORAL_TLS_SERVER_CA_CERT_PATH", "/certs/ca.pem");
+    try env.put("TEMPORAL_TLS_CLIENT_CERT_PATH", "/certs/client.pem");
+    try env.put("TEMPORAL_TLS_CLIENT_KEY_PATH", "/certs/client.key");
+    try env.put("TEMPORAL_TLS_SERVER_NAME", "localhost");
+    try env.put("TEMPORAL_GRPC_META_REGION", "eu");
+    const options = try loadOptions(arena.allocator(), .{ .env = &env, .config_data =
+        \\[profile.staging]
+        \\address = "staging:7233"
+        \\namespace = "from-file"
+    });
+    try testing.expectEqualStrings("staging:7233", options.host_port);
+    try testing.expectEqualStrings("from-env", options.namespace);
+    const tls = options.tls.?;
+    try testing.expectEqualStrings("/certs/ca.pem", tls.server_root_ca_cert_path);
+    try testing.expectEqualStrings("/certs/client.pem", tls.client_cert_path);
+    try testing.expectEqualStrings("/certs/client.key", tls.client_private_key_path);
+    try testing.expectEqualStrings("localhost", tls.server_name);
+    try testing.expectEqualStrings("region", options.headers[0].key);
+
+    // Only the environment: an empty map sets nothing.
+    var empty: std.process.Environ.Map = .init(testing.allocator);
+    defer empty.deinit();
+    const defaults = try loadOptions(arena.allocator(), .{ .env = &empty, .disable_file = true });
+    try testing.expectEqualStrings("localhost:7233", defaults.host_port);
+    try testing.expect(defaults.tls == null);
+}
+
+test "an API key implies TLS unless the profile disables it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const keyed = try loadOptions(arena.allocator(), .{ .disable_env = true, .config_data =
+        \\[profile.default]
+        \\api_key = "secret"
+    });
+    try testing.expectEqualStrings("secret", keyed.api_key);
+    try testing.expect(keyed.tls != null);
+
+    const plain = try loadOptions(arena.allocator(), .{ .disable_env = true, .config_data =
+        \\[profile.default]
+        \\api_key = "secret"
+        \\tls = { disabled = true }
+    });
+    try testing.expect(plain.tls == null);
+
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_API_KEY", "from-env");
+    try env.put("TEMPORAL_TLS", "false");
+    const env_plain = try loadOptions(arena.allocator(), .{ .env = &env, .disable_file = true });
+    try testing.expectEqualStrings("from-env", env_plain.api_key);
+    try testing.expect(env_plain.tls == null);
+}
+
+test "invalid configs fail: strict keys, missing profiles, conflicting sources, bad TOML, no source" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const unknown_key =
+        \\[profile.default]
+        \\address = "localhost:7233"
+        \\adress = "typo:7233"
+    ;
+    _ = try loadOptions(a, .{ .config_data = unknown_key, .disable_env = true });
+    try testing.expectError(error.InvalidConfig, loadOptions(a, .{ .config_data = unknown_key, .disable_env = true, .strict = true }));
+    try testing.expectError(error.InvalidConfig, loadOptions(a, .{ .profile = "missing", .config_data = unknown_key, .disable_env = true }));
+    try testing.expectError(error.InvalidConfig, loadOptions(a, .{ .disable_env = true, .config_data =
+        \\[profile.default.tls]
+        \\client_cert_path = "/a.pem"
+        \\client_cert_data = "PEM"
+    }));
+    try testing.expectError(error.InvalidConfig, loadOptions(a, .{ .config_data = "[profile.default", .disable_env = true }));
+    try testing.expectError(error.InvalidConfig, loadOptions(a, .{ .disable_env = true, .disable_file = true }));
+    // A missing file is no error; a named profile in it is.
+    try testing.expectEqualStrings("localhost:7233", (try loadOptions(a, .{ .config_file = "/does/not/exist.toml", .disable_env = true })).host_port);
+    try testing.expectError(error.InvalidConfig, loadOptions(a, .{ .profile = "prod", .config_file = "/does/not/exist.toml", .disable_env = true }));
+}
+
+test "TLS PEM is read from the paths when connecting" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "ca.pem", .data = "PEM BYTES" });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path, "ca.pem" });
+    try testing.expectEqualStrings("PEM BYTES", try tlsFile(arena.allocator(), testing.io, "", path, "server_root_ca_cert"));
+    try testing.expectEqualStrings("inline", try tlsFile(arena.allocator(), testing.io, "inline", "", "server_root_ca_cert"));
+}
+
+test "header updates accept gRPC ASCII headers only" {
+    try validateHeader(.{ .key = "X-Tenant_ID", .value = "a b\tc~" });
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "", .value = "v" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "bad key", .value = "v" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "blob-bin", .value = "v" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k", .value = "caf\xc3\xa9" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k", .value = "a\nb" }));
 }

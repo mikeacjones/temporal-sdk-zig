@@ -222,7 +222,8 @@ pub const Worker = struct {
         defer if (message) |m| w.gpa.free(m);
 
         const strategy = try w.versioningStrategy();
-        const core = bridge.Worker.init(w.gpa, w.client.connection, .{
+        const created_on = w.client.currentConnection();
+        const core = bridge.Worker.init(w.gpa, created_on, .{
             .namespace = w.client.namespace,
             .task_queue = w.task_queue,
             .versioning = strategy,
@@ -253,6 +254,9 @@ pub const Worker = struct {
             return err;
         };
 
+        // `Client.reconnect` moves the worker to its new connection while it is tracked.
+        try w.client.trackWorker(core.ptr, created_on);
+        defer w.client.untrackWorker(core.ptr);
         {
             w.stop_mutex.lockUncancelable(w.io);
             defer w.stop_mutex.unlock(w.io);
@@ -301,6 +305,7 @@ pub const Worker = struct {
             defer w.stop_mutex.unlock(w.io);
             w.core_ptr = null;
         }
+        w.client.untrackWorker(core.ptr);
         core.finalizeShutdown(w.gpa, w.io, &message) catch |err| {
             log.err("worker shutdown failed: {s}", .{message orelse @errorName(err)});
             return start_failed orelse err;
