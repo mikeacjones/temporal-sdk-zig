@@ -26,6 +26,10 @@
 //! `ActivityInbound` and `ActivityOutbound` likewise for an activity. The first interceptor in
 //! a list is the outermost.
 //!
+//! Clients take `Client` interceptors (`client.Options.interceptors`), which wrap every request
+//! the client sends to the server (`ClientCall`): they see each operation's method and its
+//! typed request and response, change the header of calls that carry one, or refuse a call.
+//!
 //! Inputs are type-erased, since workflows, activities, and their handlers are typed at
 //! compile time: names, `converter.EncodedValues` arguments, a `converter.Header`, and
 //! options. Results are encoded payloads.
@@ -383,6 +387,76 @@ pub const ActivityOutbound = struct {
 
     pub fn from(comptime T: type, impl: *T) ActivityOutbound {
         return build(ActivityOutbound, T, impl);
+    }
+};
+
+// ---------------------------------------------------------------- client
+
+/// What a client call can fail with; an interceptor refuses a call by returning one of these
+/// (`error.RpcFailed` is reported as the server refusing it). See the client's operations
+/// for what each means to its caller.
+pub const ClientError = error{ OutOfMemory, Canceled, RpcFailed, AlreadyExists, NotFound, InvalidResponse, CodecFailed };
+
+/// One request a client sends to the server. Every client operation is made of these: one
+/// per operation (start, signal, query, describe, ...), or several for one that pages (list,
+/// history) or long-polls (a workflow's result, an update's outcome).
+pub const ClientCall = struct {
+    /// The WorkflowService method, such as "StartWorkflowExecution" or "QueryWorkflow".
+    method: []const u8,
+    /// The request's header, for the methods whose request carries one
+    /// (StartWorkflowExecution, SignalWorkflowExecution, SignalWithStartWorkflowExecution,
+    /// QueryWorkflow, UpdateWorkflowExecution, StartActivityExecution), holding what the
+    /// client's propagators wrote; change it in place. Null for other methods (an
+    /// ExecuteMultiOperation request carries a header in each operation: change those through
+    /// `request`).
+    header: ?*HeaderWriter,
+    /// Memory that lives until the operation returns, for anything an interceptor adds.
+    arena: Allocator,
+    request_ptr: *anyopaque,
+    request_type: []const u8,
+    response_ptr: *anyopaque,
+    response_type: []const u8,
+
+    /// The request as its generated message type, such as
+    /// `proto.temporal.api.workflowservice.v1.StartWorkflowExecutionRequest`, or null if it
+    /// is another type. Changes are sent; the header is replaced by `header`'s fields.
+    pub fn request(c: *const ClientCall, comptime T: type) ?*T {
+        if (!std.mem.eql(u8, c.request_type, @typeName(T))) return null;
+        return @ptrCast(@alignCast(c.request_ptr));
+    }
+
+    /// The response as its generated message type, or null if it is another type. Filled in
+    /// once `next` returns; an interceptor that answers without calling `next` fills it in.
+    pub fn response(c: *const ClientCall, comptime T: type) ?*T {
+        if (!std.mem.eql(u8, c.response_type, @typeName(T))) return null;
+        return @ptrCast(@alignCast(c.response_ptr));
+    }
+};
+
+/// Wraps every request a client sends (`client.Options.interceptors`). Runs on whichever
+/// thread makes the call, so it must be thread-safe.
+pub const Client = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        call: ?*const fn (ptr: *anyopaque, input: *ClientCall, next: Next) ClientError!void = null,
+    };
+
+    /// The interceptors after this one, ending in the request sent to the server.
+    pub const Next = struct {
+        chain: []const Client,
+        root: Client,
+
+        pub fn call(n: Next, input: *ClientCall) ClientError!void {
+            return dispatch(Client, "call", n, input);
+        }
+    };
+
+    /// The interceptor of `impl`, from `call` if `T` declares it as
+    /// `fn (*T, *ClientCall, Next) ClientError!void`.
+    pub fn from(comptime T: type, impl: *T) Client {
+        return build(Client, T, impl);
     }
 };
 

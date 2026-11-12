@@ -231,6 +231,9 @@ pub const WorkflowEnvironment = struct {
         /// (`client.Options.worker_interceptors`), which replays use too. Borrowed: they must
         /// outlive the environment.
         worker_interceptors: []const interceptor.Worker = &.{},
+        /// Interceptors of the client's requests (`client.Options.interceptors`). Borrowed:
+        /// they must outlive the environment.
+        interceptors: []const interceptor.Client = &.{},
     };
 
     /// Starts the environment on a dev server. Allocated so the worker's pointer to the
@@ -266,6 +269,7 @@ pub const WorkflowEnvironment = struct {
         client_options.logger = options.logger;
         client_options.propagators = options.propagators;
         client_options.worker_interceptors = options.worker_interceptors;
+        client_options.interceptors = options.interceptors;
         // The time-skipping test server reports an old server version, which makes the core
         // warn about heartbeat details on every worker start.
         if (kind == .time_skipping) client_options.core_log_level = .err;
