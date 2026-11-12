@@ -49,8 +49,17 @@ pub const DevServer = struct {
         /// Empty keeps the database in memory.
         database_filename: []const u8 = "",
         log_level: []const u8 = "error",
-        /// Extra arguments for `temporal server start-dev`.
+        /// Extra arguments for `temporal server start-dev`, such as
+        /// `standalone_activity_args`.
         extra_args: []const []const u8 = &.{},
+    };
+
+    /// `extra_args` that enable standalone activities (`Client.executeActivity`), which the
+    /// dev server leaves off by default. Needs Temporal CLI 1.10.0 or later.
+    pub const standalone_activity_args = [_][]const u8{
+        "--dynamic-config-value", "activity.enableStandalone=true",
+        "--dynamic-config-value", "history.enableChasm=true",
+        "--dynamic-config-value", "history.enableTransitionHistory=true",
     };
 
     pub fn start(gpa: Allocator, io: Io, options: Options) !DevServer {
@@ -201,18 +210,29 @@ pub const WorkflowEnvironment = struct {
         }
     };
 
+    pub const Options = struct {
+        /// Extra arguments for the dev server's `temporal server start-dev`, such as
+        /// `DevServer.standalone_activity_args`.
+        dev_server_extra_args: []const []const u8 = &.{},
+    };
+
     /// Starts the environment on a dev server. Allocated so the worker's pointer to the
     /// client stays valid. Free with `deinit`.
     pub fn start(gpa: Allocator, io: Io) !*WorkflowEnvironment {
-        return create(gpa, io, .dev);
+        return create(gpa, io, .dev, .{});
+    }
+
+    /// `start` with options.
+    pub fn startWithOptions(gpa: Allocator, io: Io, options: Options) !*WorkflowEnvironment {
+        return create(gpa, io, .dev, options);
     }
 
     /// Starts the environment on the time-skipping test server. Free with `deinit`.
     pub fn startTimeSkipping(gpa: Allocator, io: Io) !*WorkflowEnvironment {
-        return create(gpa, io, .time_skipping);
+        return create(gpa, io, .time_skipping, .{});
     }
 
-    fn create(gpa: Allocator, io: Io, kind: std.meta.Tag(Server)) !*WorkflowEnvironment {
+    fn create(gpa: Allocator, io: Io, kind: std.meta.Tag(Server), options: Options) !*WorkflowEnvironment {
         const env = try gpa.create(WorkflowEnvironment);
         errdefer gpa.destroy(env);
         env.gpa = gpa;
@@ -220,7 +240,7 @@ pub const WorkflowEnvironment = struct {
         env.running = null;
         env.next_id = 0;
         env.server = switch (kind) {
-            .dev => .{ .dev = try DevServer.start(gpa, io, .{ .search_attributes = &custom_search_attributes }) },
+            .dev => .{ .dev = try DevServer.start(gpa, io, .{ .search_attributes = &custom_search_attributes, .extra_args = options.dev_server_extra_args }) },
             .time_skipping => .{ .time_skipping = try TestServer.start(gpa, io, .{}) },
         };
         errdefer env.server.stop(io);
@@ -2652,7 +2672,7 @@ test "time-skipping WorkflowEnvironment: a workflow mid-timer answers a query wh
 const env_kinds = [_]std.meta.Tag(WorkflowEnvironment.Server){ .dev, .time_skipping };
 
 fn startEnv(kind: std.meta.Tag(WorkflowEnvironment.Server)) !*WorkflowEnvironment {
-    return WorkflowEnvironment.create(testing.allocator, testing.io, kind);
+    return WorkflowEnvironment.create(testing.allocator, testing.io, kind, .{});
 }
 
 /// Whether the run's history has a fired timer.
@@ -3207,6 +3227,163 @@ test "dev-server WorkflowEnvironment starts a workflow and awaits its result" {
     try testing.expectEqualStrings("Hello later!", try env.getResult(Fixtures.Hello, &run, arena.allocator(), null));
     try env.sleep(.fromMilliseconds(1));
     try testing.expect(before.durationTo(try env.now()).nanoseconds > 0);
+}
+
+test "client: an eager start hands the first workflow task to the worker on the same client" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The worker registers with the client when it starts running; a first workflow run to
+    // completion waits for that.
+    try testing.expectEqualStrings("Hello first!", try env.executeWorkflow(Fixtures.Hello, .{"first"}, a, null));
+
+    var eager = try env.startWorkflow(Fixtures.Hello, .{ .task_queue = "", .enable_eager_start = true }, .{"eager"});
+    defer eager.deinit();
+    try testing.expect(eager.eagerly_started);
+    try testing.expectEqualStrings("Hello eager!", try env.getResult(Fixtures.Hello, &eager, a, null));
+    // The worker took the eager task: had it rejected it, the task would have timed out.
+    const history = try env.client.fetchHistory(a, eager.id, eager.run_id);
+    for (history.events.items) |event| try testing.expect(event.attributes.? != .workflow_task_timed_out_event_attributes);
+
+    // Another client has no worker to take the task, so the workflow starts normally and the
+    // worker polls for it.
+    var other = try client_mod.Client.connect(testing.allocator, testing.io, env.server.clientOptions());
+    defer other.close();
+    var polled = try other.executeWorkflow(Fixtures.Hello, .{ .task_queue = env.task_queue, .enable_eager_start = true }, .{"polled"});
+    defer polled.deinit();
+    try testing.expect(!polled.eagerly_started);
+    try testing.expectEqualStrings("Hello polled!", try env.getResult(Fixtures.Hello, &polled, a, null));
+}
+
+const StandaloneFixtures = struct {
+    fn charge(ctx: *activity.Context, customer: []const u8, cents: u32) ![]const u8 {
+        if (cents == 0) return ctx.fail(.{ .message = "nothing to charge", .type = "EmptyCharge", .non_retryable = true });
+        return std.fmt.allocPrint(ctx.allocator(), "charged {s} {d}", .{ customer, cents });
+    }
+    const Charge = activity.Def("Charge", charge);
+
+    /// Heartbeats until it is canceled.
+    fn hold(ctx: *activity.Context) !void {
+        while (true) {
+            ctx.heartbeat({});
+            try ctx.io().sleep(.fromMilliseconds(50), .awake);
+        }
+    }
+    const Hold = activity.Def("Hold", hold);
+
+    /// Waits until a worker has started the activity, for at most 30 s.
+    fn waitUntilStarted(handle: anytype, arena: Allocator) !void {
+        var tries: usize = 0;
+        while ((try handle.describe(arena)).last_started_time == null) : (tries += 1) {
+            if (tries == 300) return error.TestUnexpectedResult;
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    }
+
+    fn waitForCount(c: *client_mod.Client, query: []const u8, want: u64) !void {
+        var tries: usize = 0;
+        while (try c.countActivities(query) != want) : (tries += 1) {
+            if (tries == 300) {
+                log.err("countActivities(\"{s}\") never reached {d}", .{ query, want });
+                return error.TestUnexpectedResult;
+            }
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    }
+};
+
+test "client: standalone activities run without a workflow; get, describe, cancel, terminate, list and count them" {
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args });
+    defer env.deinit();
+    try env.registerActivity(StandaloneFixtures.Charge);
+    try env.registerActivity(StandaloneFixtures.Hold);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var charged = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "charge-1", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{ "c-42", 1250 });
+    defer charged.deinit();
+    try testing.expect(charged.run_id.len > 0);
+    try testing.expectEqualStrings("charged c-42 1250", try charged.get(a));
+    const done = try charged.describe(a);
+    try testing.expectEqual(client_mod.ActivityExecutionStatus.completed, done.status);
+    try testing.expectEqualStrings("charge-1", done.activity_id);
+    try testing.expectEqualStrings(charged.run_id, done.run_id);
+    try testing.expectEqualStrings("Charge", done.activity_type);
+    try testing.expectEqualStrings(env.task_queue, done.task_queue);
+    try testing.expectEqual(@as(i32, 1), done.attempt);
+    try testing.expect(done.schedule_time != null and done.close_time != null);
+    // A handle made from the ID alone follows the latest run.
+    var by_id = try c.getActivityHandle([]const u8, "charge-1", "");
+    defer by_id.deinit();
+    try testing.expectEqualStrings("charged c-42 1250", try by_id.get(a));
+
+    var empty = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "charge-0", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{ "c-42", 0 });
+    defer empty.deinit();
+    try testing.expectError(error.ActivityFailed, empty.get(a));
+    try testing.expectEqualStrings("nothing to charge", empty.failure().?.message);
+    try testing.expectEqualStrings("EmptyCharge", failure_mod.applicationType(empty.failure().?.*).?);
+
+    const hold: client_mod.StartActivityOptions = .{ .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(2), .id_conflict_policy = .fail };
+    var canceled = try c.executeActivity(StandaloneFixtures.Hold, blk: {
+        var o = hold;
+        o.id = "hold-cancel";
+        break :blk o;
+    }, .{});
+    defer canceled.deinit();
+    try StandaloneFixtures.waitUntilStarted(&canceled, a);
+    try canceled.cancel("no longer needed");
+    try testing.expectError(error.ActivityCanceled, canceled.get(a));
+    try testing.expectEqual(client_mod.ActivityExecutionStatus.canceled, (try canceled.describe(a)).status);
+
+    var terminated = try c.executeActivity(StandaloneFixtures.Hold, blk: {
+        var o = hold;
+        o.id = "hold-terminate";
+        break :blk o;
+    }, .{});
+    defer terminated.deinit();
+    try testing.expectError(error.ActivityExecutionAlreadyStarted, c.executeActivity(StandaloneFixtures.Hold, blk: {
+        var o = hold;
+        o.id = "hold-terminate";
+        break :blk o;
+    }, .{}));
+    try StandaloneFixtures.waitUntilStarted(&terminated, a);
+    try terminated.terminate("stopping it");
+    try testing.expectError(error.ActivityTerminated, terminated.get(a));
+    try testing.expectEqual(client_mod.ActivityExecutionStatus.terminated, (try terminated.describe(a)).status);
+    try testing.expectError(error.ActivityClosed, terminated.cancel("too late"));
+    var missing = try c.getActivityHandle(void, "no-such-activity", "");
+    defer missing.deinit();
+    try testing.expectError(error.NotFound, missing.describe(a));
+
+    const query = try std.fmt.allocPrint(a, "TaskQueue = '{s}'", .{env.task_queue});
+    try StandaloneFixtures.waitForCount(c, query, 4);
+    const charges = try std.fmt.allocPrint(a, "{s} AND ActivityType = 'Charge' AND ExecutionStatus = 'Completed'", .{query});
+    try testing.expectEqual(@as(u64, 1), try c.countActivities(charges));
+    var it = try c.listActivities(query, .{ .page_size = 3 });
+    defer it.deinit();
+    var ids: std.ArrayList([]const u8) = .empty;
+    while (try it.next(a)) |info| {
+        try ids.append(a, info.activity_id);
+        try testing.expectEqualStrings(env.task_queue, info.task_queue);
+        if (std.mem.eql(u8, info.activity_id, "charge-1")) {
+            try testing.expectEqual(client_mod.ActivityExecutionStatus.completed, info.status);
+            try testing.expectEqualStrings("Charge", info.activity_type);
+            try testing.expectEqualStrings(charged.run_id, info.run_id);
+        }
+    }
+    std.mem.sort([]const u8, ids.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    try testing.expectEqualStrings("charge-0,charge-1,hold-cancel,hold-terminate", try std.mem.join(a, ",", ids.items));
 }
 
 test "WorkflowEnvironment runs a child workflow on the same worker, or a test double in its place" {

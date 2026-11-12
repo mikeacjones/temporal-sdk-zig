@@ -19,6 +19,7 @@ const search_attributes = @import("search_attributes.zig");
 const failure_mod = @import("failure.zig");
 const history_mod = @import("history.zig");
 const schedule = @import("schedule.zig");
+const workflow = @import("workflow.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Duration = Io.Duration;
@@ -108,9 +109,9 @@ pub const Client = struct {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const id = if (options.id.len > 0) options.id else try uuid(arena_state.allocator(), c.io);
-        const run_id = try c.startWorkflow(Workflow.workflow_name, id, options, args);
-        errdefer c.gpa.free(run_id);
-        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
+        const started = try c.startWorkflow(Workflow.workflow_name, id, options, args);
+        errdefer c.gpa.free(started.run_id);
+        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = started.run_id, .eagerly_started = started.eager };
     }
 
     /// Starts a workflow by its type name, for a workflow this program has no definition of.
@@ -120,21 +121,26 @@ pub const Client = struct {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const id = if (options.id.len > 0) options.id else try uuid(arena_state.allocator(), c.io);
-        const run_id = try c.startWorkflow(workflow_type, id, options, args);
-        errdefer c.gpa.free(run_id);
-        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
+        const started = try c.startWorkflow(workflow_type, id, options, args);
+        errdefer c.gpa.free(started.run_id);
+        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = started.run_id, .eagerly_started = started.eager };
     }
 
-    fn startWorkflow(c: *Client, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) StartError![]u8 {
+    /// The run ID is owned with the client's allocator.
+    fn startWorkflow(c: *Client, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) StartError!struct { run_id: []u8, eager: bool } {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        const request = try c.startRequest(a, workflow_type, id, options, args);
+        var request = try c.startRequest(a, workflow_type, id, options, args);
+        // Set here rather than in `startRequest`: the core reserves a workflow task slot only
+        // for a plain start, so signal-with-start and update-with-start never ask for it.
+        request.request_eager_execution = options.enable_eager_start;
         const response = c.rpc(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             else => |e| return e,
         };
-        return c.gpa.dupe(u8, response.run_id);
+        // The core has already handed the eager task to the worker; the response keeps a copy.
+        return .{ .run_id = try c.gpa.dupe(u8, response.run_id), .eager = response.eager_workflow_task != null };
     }
 
     /// The start request for `options`, allocated from `a`. Signal-with-start copies it.
@@ -487,7 +493,7 @@ pub const Client = struct {
         const response = c.rpcWithStatus(wfs.CountWorkflowExecutionsResponse, "CountWorkflowExecutions", wfs.CountWorkflowExecutionsRequest{
             .namespace = c.namespace,
             .query = query,
-        }, a, &status) catch |err| return visibilityError(err, status, "counting", query);
+        }, a, &status) catch |err| return visibilityError(err, status, "counting workflows", query);
         return std.math.cast(u64, response.count) orelse {
             log.err("CountWorkflowExecutions for query \"{s}\" returned the count {d}", .{ query, response.count });
             return error.InvalidResponse;
@@ -499,11 +505,113 @@ pub const Client = struct {
             error.AlreadyExists => return error.InvalidResponse,
             error.RpcFailed => {
                 const s = status orelse return error.RpcFailed;
-                log.err(what ++ " workflows with the query \"{s}\" failed: {s} (gRPC status {d})", .{ query, s.message, s.code });
+                log.err(what ++ " with the query \"{s}\" failed: {s} (gRPC status {d})", .{ query, s.message, s.code });
                 return error.RpcFailed;
             },
             else => |e| return e,
         }
+    }
+
+    /// Starts `Activity` (a `temporal.activity.Def`) on its own, without a workflow, and
+    /// returns a handle to it: a worker polling `options.task_queue` runs it, and the server
+    /// applies its timeouts and retry policy. `args` is a tuple of the activity's parameters
+    /// after its context. The server must have standalone activities enabled (see
+    /// `testing.DevServer.standalone_activity_args`); otherwise, and for options it rejects
+    /// (it requires `start_to_close_timeout` or `schedule_to_close_timeout`), the call fails
+    /// with `error.RpcFailed`, logging the server's reason.
+    pub fn executeActivity(c: *Client, comptime Activity: type, options: StartActivityOptions, args: Activity.Args) StartActivityError!ActivityHandle(Activity.Result) {
+        return c.executeActivityByName(Activity.Result, Activity.activity_name, options, args);
+    }
+
+    /// `executeActivity` for an activity this program has no definition of, by its type
+    /// name. `args` is a tuple of its arguments and `Result` the type its result decodes to
+    /// (`void` to ignore it).
+    pub fn executeActivityByName(c: *Client, comptime Result: type, activity_type: []const u8, options: StartActivityOptions, args: anytype) StartActivityError!ActivityHandle(Result) {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const id = if (options.id.len > 0) options.id else try uuid(a, c.io);
+        var request: wfs.StartActivityExecutionRequest = .{
+            .namespace = c.namespace,
+            .identity = c.identity,
+            .request_id = try uuid(a, c.io),
+            .activity_id = id,
+            .activity_type = .{ .name = activity_type },
+            .task_queue = .{ .name = options.task_queue, .kind = .TASK_QUEUE_KIND_NORMAL },
+            .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
+            .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
+            .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
+            .heartbeat_timeout = protoDuration(options.heartbeat_timeout),
+            .input = .{ .payloads = try converter.toPayloads(a, args) },
+            .id_reuse_policy = switch (options.id_reuse_policy) {
+                .unspecified => .ACTIVITY_ID_REUSE_POLICY_UNSPECIFIED,
+                .allow_duplicate => .ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+                .allow_duplicate_failed_only => .ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+                .reject_duplicate => .ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE,
+            },
+            .id_conflict_policy = switch (options.id_conflict_policy) {
+                .unspecified => .ACTIVITY_ID_CONFLICT_POLICY_UNSPECIFIED,
+                .fail => .ACTIVITY_ID_CONFLICT_POLICY_FAIL,
+                .use_existing => .ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING,
+            },
+        };
+        if (options.retry_policy) |rp| {
+            var p: proto.temporal.api.common.v1.RetryPolicy = .{
+                .initial_interval = protoDuration(rp.initial_interval),
+                .backoff_coefficient = rp.backoff_coefficient,
+                .maximum_interval = protoDuration(rp.maximum_interval),
+                .maximum_attempts = rp.maximum_attempts,
+            };
+            try p.non_retryable_error_types.appendSlice(a, rp.non_retryable_error_types);
+            request.retry_policy = p;
+        }
+        if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
+        var status: ?RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status) catch |err| switch (err) {
+            error.AlreadyExists => return error.ActivityExecutionAlreadyStarted,
+            error.RpcFailed => {
+                const st = status orelse return error.RpcFailed;
+                log.err("starting activity {s} of type \"{s}\" on task queue \"{s}\" failed: {s} (gRPC status {d})", .{ id, activity_type, options.task_queue, st.message, st.code });
+                return error.RpcFailed;
+            },
+            else => |e| return e,
+        };
+        return c.getActivityHandle(Result, id, response.run_id);
+    }
+
+    /// A handle to an activity started with `executeActivity`, for example by another
+    /// process. An empty `run_id` follows the latest run of `activity_id`. No call is made,
+    /// so a missing activity shows up as `error.NotFound` from the handle's methods.
+    pub fn getActivityHandle(c: *Client, comptime Result: type, activity_id: []const u8, run_id: []const u8) error{OutOfMemory}!ActivityHandle(Result) {
+        const id = try c.gpa.dupe(u8, activity_id);
+        errdefer c.gpa.free(id);
+        return .{ .client = c, .id = id, .run_id = try c.gpa.dupe(u8, run_id) };
+    }
+
+    /// Lists the activities started with `executeActivity` that match the visibility
+    /// `query`, such as `ActivityType = 'Charge' AND ExecutionStatus = 'Running'`; an empty
+    /// query lists them all. Activities run by workflows aren't listed. Eventually
+    /// consistent, like `listWorkflows`. The iterator fetches a page at a time as `next`
+    /// reaches it; nothing is fetched here. Free it with `deinit`.
+    pub fn listActivities(c: *Client, query: []const u8, options: ListActivitiesOptions) error{OutOfMemory}!ActivityExecutionIterator {
+        return .{ .client = c, .query = try c.gpa.dupe(u8, query), .page_size = options.page_size, .page = .init(c.gpa) };
+    }
+
+    /// The number of activities started with `executeActivity` that match the visibility
+    /// `query` (see `listActivities`); an empty query counts them all.
+    pub fn countActivities(c: *Client, query: []const u8) ListError!u64 {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var status: ?RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.CountActivityExecutionsResponse, "CountActivityExecutions", wfs.CountActivityExecutionsRequest{
+            .namespace = c.namespace,
+            .query = query,
+        }, a, &status) catch |err| return visibilityError(err, status, "counting activities", query);
+        return std.math.cast(u64, response.count) orelse {
+            log.err("CountActivityExecutions for query \"{s}\" returned the count {d}", .{ query, response.count });
+            return error.InvalidResponse;
+        };
     }
 
     /// Creates the schedule `id` and returns a handle to it. Returns
@@ -829,6 +937,12 @@ pub const StartWorkflowOptions = struct {
     /// are ignored. Only read while starting. A value the server can't index fails the start
     /// with `error.InvalidSearchAttribute`.
     search_attributes: []const search_attributes.Update = &.{},
+    /// Asks the server to hand the first workflow task back in the start response, to a
+    /// worker for `task_queue` running on this same client, saving that worker a poll. The
+    /// client reserves a workflow task slot on such a worker first; with none (or none free)
+    /// the workflow starts normally. `WorkflowRun.eagerly_started` says which happened.
+    /// Only `executeWorkflow` and `executeWorkflowByName` use it.
+    enable_eager_start: bool = false,
 };
 
 /// Names an activity by its workflow and activity ID, for completing it without its task
@@ -975,7 +1089,361 @@ pub const WorkflowExecutionIterator = struct {
             .page_size = it.page_size,
             .next_page_token = it.next_page_token,
             .query = it.query,
-        }, a, &status) catch |err| return Client.visibilityError(err, status, "listing", it.query);
+        }, a, &status) catch |err| return Client.visibilityError(err, status, "listing workflows", it.query);
+        const token = try c.gpa.dupe(u8, response.next_page_token);
+        c.gpa.free(it.next_page_token);
+        it.next_page_token = token;
+        it.executions = response.executions.items;
+        it.fetched = true;
+    }
+};
+
+/// How `Client.executeActivity` starts an activity. At least one of
+/// `start_to_close_timeout` and `schedule_to_close_timeout` is required.
+pub const StartActivityOptions = struct {
+    /// Activity ID, unique among the namespace's running standalone activities. Empty
+    /// generates a random UUID; read it from the handle.
+    id: []const u8 = "",
+    task_queue: []const u8,
+    /// How long the activity may take, retries included.
+    schedule_to_close_timeout: ?Duration = null,
+    /// How long an attempt may wait for a worker to pick it up. Not retried.
+    schedule_to_start_timeout: ?Duration = null,
+    /// How long one attempt may run. Retried.
+    start_to_close_timeout: ?Duration = null,
+    /// The longest gap between heartbeats before an attempt times out. Also how soon a
+    /// running activity learns of `cancel`, which reaches it through a heartbeat.
+    heartbeat_timeout: ?Duration = null,
+    /// Null retries with the server's default policy.
+    retry_policy: ?workflow.RetryPolicy = null,
+    /// Whether an ID of an activity that has closed may be reused.
+    id_reuse_policy: enum { unspecified, allow_duplicate, allow_duplicate_failed_only, reject_duplicate } = .unspecified,
+    /// What starting an ID that is still running does: `.fail` returns
+    /// `error.ActivityExecutionAlreadyStarted`, `.use_existing` returns a handle to the
+    /// running activity.
+    id_conflict_policy: enum { unspecified, fail, use_existing } = .unspecified,
+    /// Indexed values for `Client.listActivities` queries, built with
+    /// `search_attributes.Key.set`; unsets are ignored. Only read while starting.
+    search_attributes: []const search_attributes.Update = &.{},
+};
+
+pub const StartActivityError = error{
+    OutOfMemory,
+    Canceled,
+    /// Also options or a server the call can't work with; the server's reason is logged.
+    RpcFailed,
+    /// The client's namespace doesn't exist.
+    NotFound,
+    InvalidResponse,
+    /// An activity with this ID is running and `id_conflict_policy` isn't `.use_existing`.
+    ActivityExecutionAlreadyStarted,
+    /// `StartActivityOptions.search_attributes` holds a value the server can't index (logged).
+    InvalidSearchAttribute,
+};
+
+pub const ActivityResultError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    /// No such activity.
+    NotFound,
+    InvalidResponse,
+    InvalidPayload,
+    UnknownEncoding,
+    WrongArgumentCount,
+    /// The activity failed, retries exhausted or not retryable; read why with `failure()`.
+    ActivityFailed,
+    /// The activity was canceled after `ActivityHandle.cancel`.
+    ActivityCanceled,
+    ActivityTerminated,
+    /// A timeout of `StartActivityOptions` passed.
+    ActivityTimedOut,
+};
+
+pub const ActivityError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    /// No such activity.
+    NotFound,
+    InvalidResponse,
+    /// `cancel` or `terminate` of an activity that has already closed.
+    ActivityClosed,
+};
+
+/// Where a standalone activity is in its lifecycle. Values match the server's; the enum is
+/// open so a status added by a newer server is kept rather than rejected.
+pub const ActivityExecutionStatus = enum(i32) {
+    unspecified = 0,
+    running = 1,
+    completed = 2,
+    failed = 3,
+    canceled = 4,
+    terminated = 5,
+    timed_out = 6,
+    paused = 7,
+    _,
+};
+
+/// A standalone activity as `ActivityHandle.describe` reports it. Every slice borrows the
+/// arena passed to `describe`.
+pub const ActivityDescription = struct {
+    activity_id: []const u8,
+    run_id: []const u8,
+    activity_type: []const u8,
+    task_queue: []const u8,
+    status: ActivityExecutionStatus,
+    /// The current attempt, from 1.
+    attempt: i32,
+    schedule_time: ?Io.Timestamp,
+    /// When the latest attempt started; null before a worker picked up the first.
+    last_started_time: ?Io.Timestamp,
+    /// Null while the activity is running.
+    close_time: ?Io.Timestamp,
+    /// Read a value with `search_attributes.get(arena, key)`.
+    search_attributes: search_attributes.View,
+    /// The server's record, with the last heartbeat's details and the last attempt's
+    /// failure, for anything not lifted into the fields above.
+    raw: proto.temporal.api.activity.v1.ActivityExecutionInfo,
+};
+
+pub const ListActivitiesOptions = struct {
+    /// Activities per page; 0 uses the server's default.
+    page_size: u31 = 0,
+};
+
+/// A standalone activity as a visibility query (`Client.listActivities`) reports it. Every
+/// slice borrows the arena passed to `ActivityExecutionIterator.next`.
+pub const ActivityExecutionInfo = struct {
+    activity_id: []const u8,
+    run_id: []const u8,
+    activity_type: []const u8,
+    task_queue: []const u8,
+    status: ActivityExecutionStatus,
+    schedule_time: ?Io.Timestamp,
+    /// Null while the activity is running.
+    close_time: ?Io.Timestamp,
+    /// Read a value with `search_attributes.get(arena, key)`.
+    search_attributes: search_attributes.View,
+    /// The server's record, for anything not lifted into the fields above.
+    raw: proto.temporal.api.activity.v1.ActivityExecutionListInfo,
+};
+
+/// A standalone activity, from `Client.executeActivity` or `Client.getActivityHandle`.
+/// Owns its IDs with the client's allocator; free with `deinit`. Not thread-safe.
+pub fn ActivityHandle(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        client: *Client,
+        id: []u8,
+        /// Empty when the handle follows the latest run of `id`.
+        run_id: []u8,
+        failure_: ?failure_mod.Failure = null,
+
+        pub fn deinit(h: *Self) void {
+            h.client.gpa.free(h.id);
+            h.client.gpa.free(h.run_id);
+            h.* = undefined;
+        }
+
+        /// Waits for the activity to close and returns its result. The result and any
+        /// failure are allocated from `arena`.
+        pub fn get(h: *Self, arena: Allocator) ActivityResultError!T {
+            const c = h.client;
+            const outcome = while (true) {
+                // Each call is a long poll the server may end before the activity closes.
+                var status: ?Client.RpcStatus = null;
+                const response = c.rpcWithStatus(wfs.PollActivityExecutionResponse, "PollActivityExecution", wfs.PollActivityExecutionRequest{
+                    .namespace = c.namespace,
+                    .activity_id = h.id,
+                    .run_id = h.run_id,
+                }, arena, &status) catch |err| switch (err) {
+                    error.AlreadyExists => return error.InvalidResponse,
+                    error.RpcFailed => {
+                        const s = status orelse return error.RpcFailed;
+                        // DEADLINE_EXCEEDED: the long poll ran out of time.
+                        if (s.code == 4) continue;
+                        log.err("waiting for the result of activity {s} failed: {s} (gRPC status {d})", .{ h.id, s.message, s.code });
+                        return error.RpcFailed;
+                    },
+                    else => |e| return e,
+                };
+                if (response.outcome) |o| break o;
+            };
+            switch (outcome.value orelse return error.InvalidResponse) {
+                .result => |payloads| {
+                    if (T == void) return;
+                    if (payloads.payloads.items.len == 0) return error.InvalidPayload;
+                    return converter.fromPayload(T, arena, payloads.payloads.items[0]);
+                },
+                .failure => |f| {
+                    h.failure_ = f;
+                    const info = f.failure_info orelse return error.ActivityFailed;
+                    return switch (info) {
+                        .canceled_failure_info => error.ActivityCanceled,
+                        .terminated_failure_info => error.ActivityTerminated,
+                        .timeout_failure_info => error.ActivityTimedOut,
+                        else => error.ActivityFailed,
+                    };
+                },
+            }
+        }
+
+        /// Why the activity didn't complete, after `get` returned `error.ActivityFailed`,
+        /// `ActivityCanceled`, `ActivityTerminated` or `ActivityTimedOut`. Borrows the arena
+        /// passed to `get`.
+        pub fn failure(h: *const Self) ?*const failure_mod.Failure {
+            return if (h.failure_) |*f| f else null;
+        }
+
+        /// The activity's status, type, attempt and times. The description and all its
+        /// memory come from `arena`.
+        pub fn describe(h: *const Self, arena: Allocator) ActivityError!ActivityDescription {
+            const c = h.client;
+            const response = c.rpc(wfs.DescribeActivityExecutionResponse, "DescribeActivityExecution", wfs.DescribeActivityExecutionRequest{
+                .namespace = c.namespace,
+                .activity_id = h.id,
+                .run_id = h.run_id,
+                .include_heartbeat_details = true,
+                .include_last_failure = true,
+            }, arena) catch |err| switch (err) {
+                error.AlreadyExists => return error.InvalidResponse,
+                else => |e| return e,
+            };
+            const info = response.info orelse {
+                log.err("DescribeActivityExecution for activity {s} returned no activity info", .{h.id});
+                return error.InvalidResponse;
+            };
+            return .{
+                .activity_id = info.activity_id,
+                .run_id = info.run_id,
+                .activity_type = if (info.activity_type) |t| t.name else "",
+                .task_queue = info.task_queue,
+                .status = @fromBackingInt(@intCast(@backingInt(info.status))),
+                .attempt = info.attempt,
+                .schedule_time = timestamp(info.schedule_time),
+                .last_started_time = timestamp(info.last_started_time),
+                .close_time = timestamp(info.close_time),
+                .search_attributes = try .fromProto(arena, info.search_attributes),
+                .raw = info,
+            };
+        }
+
+        /// Requests the activity's cancellation. A running attempt learns of it from its
+        /// next heartbeat (see `StartActivityOptions.heartbeat_timeout`) as `std.Io`
+        /// cancellation, and the activity ends canceled once it returns `error.Canceled`.
+        /// `reason` is recorded with the request. Returns `error.ActivityClosed` if the
+        /// activity has already closed.
+        pub fn cancel(h: *const Self, reason: []const u8) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.RequestCancelActivityExecutionResponse, "RequestCancelActivityExecution", wfs.RequestCancelActivityExecutionRequest{
+                .namespace = c.namespace,
+                .activity_id = h.id,
+                .run_id = h.run_id,
+                .identity = c.identity,
+                .request_id = try uuid(a, c.io),
+                .reason = reason,
+            }, a, &status) catch |err| return h.controlError(err, status, "canceling");
+        }
+
+        fn controlError(h: *const Self, err: Client.RpcError, status: ?Client.RpcStatus, comptime what: []const u8) ActivityError {
+            switch (err) {
+                error.AlreadyExists => return error.InvalidResponse,
+                error.RpcFailed => {
+                    const s = status orelse return error.RpcFailed;
+                    // FAILED_PRECONDITION: the activity is in a terminal state.
+                    if (s.code == 9) return error.ActivityClosed;
+                    log.err(what ++ " activity {s} failed: {s} (gRPC status {d})", .{ h.id, s.message, s.code });
+                    return error.RpcFailed;
+                },
+                else => |e| return e,
+            }
+        }
+
+        /// Terminates the activity: it closes at once, and a running attempt's result is
+        /// discarded. Returns `error.ActivityClosed` if the activity has already closed.
+        pub fn terminate(h: *const Self, reason: []const u8) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.TerminateActivityExecutionResponse, "TerminateActivityExecution", wfs.TerminateActivityExecutionRequest{
+                .namespace = c.namespace,
+                .activity_id = h.id,
+                .run_id = h.run_id,
+                .identity = c.identity,
+                .request_id = try uuid(a, c.io),
+                .reason = reason,
+            }, a, &status) catch |err| return h.controlError(err, status, "terminating");
+        }
+    };
+}
+
+/// The standalone activities matching a visibility query, from `Client.listActivities`.
+/// Fetches a page from the server whenever `next` runs past the last one. Owns its memory
+/// with the client's allocator: free it with `deinit`. Not thread-safe.
+pub const ActivityExecutionIterator = struct {
+    client: *Client,
+    query: []u8,
+    page_size: u31,
+    /// Holds the current page.
+    page: std.heap.ArenaAllocator,
+    executions: []const proto.temporal.api.activity.v1.ActivityExecutionListInfo = &.{},
+    index: usize = 0,
+    /// Where the next page starts; empty after the last page. Owned with the client's
+    /// allocator.
+    next_page_token: []u8 = &.{},
+    fetched: bool = false,
+
+    pub fn deinit(it: *ActivityExecutionIterator) void {
+        it.page.deinit();
+        it.client.gpa.free(it.query);
+        it.client.gpa.free(it.next_page_token);
+        it.* = undefined;
+    }
+
+    /// The next matching activity, copied into `arena`, or null after the last one. A
+    /// failed fetch can be retried by calling `next` again.
+    pub fn next(it: *ActivityExecutionIterator, arena: Allocator) ListError!?ActivityExecutionInfo {
+        // The server may return an empty page that still has a token.
+        while (it.index == it.executions.len) {
+            if (it.fetched and it.next_page_token.len == 0) return null;
+            try it.fetch();
+        }
+        const raw = try it.executions[it.index].dupe(arena);
+        it.index += 1;
+        return .{
+            .activity_id = raw.activity_id,
+            .run_id = raw.run_id,
+            .activity_type = if (raw.activity_type) |t| t.name else "",
+            .task_queue = raw.task_queue,
+            .status = @fromBackingInt(@intCast(@backingInt(raw.status))),
+            .schedule_time = timestamp(raw.schedule_time),
+            .close_time = timestamp(raw.close_time),
+            .search_attributes = try .fromProto(arena, raw.search_attributes),
+            .raw = raw,
+        };
+    }
+
+    fn fetch(it: *ActivityExecutionIterator) ListError!void {
+        const c = it.client;
+        it.executions = &.{};
+        it.index = 0;
+        _ = it.page.reset(.retain_capacity);
+        const a = it.page.allocator();
+        var status: ?Client.RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.ListActivityExecutionsResponse, "ListActivityExecutions", wfs.ListActivityExecutionsRequest{
+            .namespace = c.namespace,
+            .page_size = it.page_size,
+            .next_page_token = it.next_page_token,
+            .query = it.query,
+        }, a, &status) catch |err| return Client.visibilityError(err, status, "listing activities", it.query);
         const token = try c.gpa.dupe(u8, response.next_page_token);
         c.gpa.free(it.next_page_token);
         it.next_page_token = token;
@@ -1409,6 +1877,9 @@ pub fn WorkflowRun(comptime T: type) type {
         id: []u8,
         /// The run this handle follows. `get` moves it along continue-as-new chains.
         run_id: []u8,
+        /// The start handed the first workflow task straight to a worker on this client
+        /// (`StartWorkflowOptions.enable_eager_start`).
+        eagerly_started: bool = false,
         failure_: ?failure_mod.Failure = null,
 
         pub fn deinit(run: *Self) void {
@@ -1743,6 +2214,19 @@ test "workflow execution statuses match the server's values" {
             break :blk buf;
         };
         const server = @field(enums.WorkflowExecutionStatus, "WORKFLOW_EXECUTION_STATUS_" ++ upper);
+        try std.testing.expectEqual(value, @backingInt(server));
+    }
+}
+
+test "activity execution statuses match the server's values" {
+    const info = @typeInfo(ActivityExecutionStatus).@"enum";
+    inline for (info.field_names, info.field_values) |name, value| {
+        const upper = comptime blk: {
+            var buf: [name.len]u8 = undefined;
+            _ = std.ascii.upperString(&buf, name);
+            break :blk buf;
+        };
+        const server = @field(enums.ActivityExecutionStatus, "ACTIVITY_EXECUTION_STATUS_" ++ upper);
         try std.testing.expectEqual(value, @backingInt(server));
     }
 }
