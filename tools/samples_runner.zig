@@ -9,6 +9,10 @@
 //! and none of the caller's TEMPORAL_* settings, so a developer's default profile (which may
 //! point at Temporal Cloud) is never used.
 //!
+//! Most samples' workers and starters come from one program, samples/dispatch.zig, which runs
+//! the program named in the SAMPLE_PROGRAM environment variable ("<sample>:worker"); the runner
+//! sets it for every program it starts.
+//!
 //! Usage: samples_runner <build-root> <work-dir> [--only <sample>] [--jobs <n>] (<sample>:<program> <exe>)...
 
 const std = @import("std");
@@ -167,9 +171,13 @@ fn usage() noreturn {
 }
 
 /// Runs one sample. Returns null on success or a short reason on failure (details are logged).
-fn validate(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, work: Io.Dir, work_path: []const u8, env: *const std.process.Environ.Map, sample: Sample) ?[]const u8 {
+fn validate(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, work: Io.Dir, work_path: []const u8, base_env: *const std.process.Environ.Map, sample: Sample) ?[]const u8 {
     const worker_exe = sample.worker orelse return "no worker program";
     const starter_exe = sample.starter orelse return "no starter program";
+    var worker_env = base_env.clone(arena) catch return "out of memory";
+    worker_env.put("SAMPLE_PROGRAM", std.fmt.allocPrint(arena, "{s}:worker", .{sample.name}) catch return "out of memory") catch return "out of memory";
+    var starter_env = base_env.clone(arena) catch return "out of memory";
+    starter_env.put("SAMPLE_PROGRAM", std.fmt.allocPrint(arena, "{s}:starter", .{sample.name}) catch return "out of memory") catch return "out of memory";
 
     const manifest_path = std.fmt.allocPrint(arena, "samples/{s}/sample.zon", .{sample.name}) catch return "out of memory";
     const manifest_src = root.readFileAllocOptions(io, manifest_path, arena, .limited(64 * 1024), .of(u8), 0) catch return "missing sample.zon";
@@ -185,7 +193,7 @@ fn validate(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, work: Io.Dir
 
     const worker = std.process.spawn(io, .{
         .argv = &.{worker_exe},
-        .environ_map = env,
+        .environ_map = &worker_env,
         .stdin = .ignore,
         .stdout = .{ .file = log_file },
         .stderr = .{ .file = log_file },
@@ -202,7 +210,7 @@ fn validate(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, work: Io.Dir
     argv.appendSlice(arena, manifest.starter_args) catch return "out of memory";
     const starter = std.process.run(gpa, io, .{
         .argv = argv.items,
-        .environ_map = env,
+        .environ_map = &starter_env,
         .timeout = .{ .duration = .{ .raw = .fromSeconds(manifest.timeout_seconds), .clock = .awake } },
     }) catch |err| {
         std.log.err("{s}: starter did not finish: {t}", .{ sample.name, err });
