@@ -13,6 +13,10 @@
 //! the program named in the SAMPLE_PROGRAM environment variable ("<sample>:worker"); the runner
 //! sets it for every program it starts.
 //!
+//! A sample whose sample.zon sets `.docker_server` runs against its own Temporal server in a
+//! Docker container instead (see `DockerServer`), and is reported as skipped when Docker isn't
+//! available.
+//!
 //! Usage: samples_runner <build-root> <work-dir> [--only <sample>] [--jobs <n>] (<sample>:<program> <exe>)...
 
 const std = @import("std");
@@ -34,19 +38,45 @@ const Manifest = struct {
     tests: []const []const u8 = &.{},
     imports: []const []const u8 = &.{},
     programs: []const []const u8 = &.{},
+    /// Run against a server in Docker with TLS rather than the shared dev server.
+    docker_server: ?DockerServer = null,
+};
+
+/// A temporalio/server container for one sample: in-memory SQLite and frontend TLS with the
+/// test certificates in tools/fixtures/tls, configured by tools/fixtures/server/config.yaml.
+/// The worker and starter get, besides TEMPORAL_ADDRESS and TEMPORAL_NAMESPACE ("default"):
+/// TEMPORAL_TLS=true, TEMPORAL_TLS_SERVER_CA_CERT_PATH, TEMPORAL_TLS_SERVER_NAME, and
+/// TEMPORAL_TLS_CLIENT_CERT_PATH and TEMPORAL_TLS_CLIENT_KEY_PATH (a client certificate the
+/// server trusts). With `jwt` they also get TEMPORAL_API_KEY, a token with the "default:admin"
+/// permission, and SAMPLE_JWT_KEY, the path of the ES256 private key (a JWK) the server trusts,
+/// for samples that mint their own tokens.
+const DockerServer = struct {
+    /// Refuse connections without a client certificate signed by the test CA.
+    require_client_cert: bool = false,
+    /// Require a JWT (`authorization: Bearer <token>`) with the permissions for each call.
+    jwt: bool = false,
 };
 
 const Sample = struct {
     name: []const u8,
     worker: ?[]const u8 = null,
     starter: ?[]const u8 = null,
+    manifest: ?Manifest = null,
 };
+
+const Status = enum { pass, fail, skip };
 
 const Result = struct {
     name: []const u8,
-    ok: bool,
+    status: Status,
     detail: []const u8,
     seconds: f64,
+};
+
+const Outcome = union(Status) {
+    pass,
+    fail: []const u8,
+    skip: []const u8,
 };
 
 const stop_grace_seconds = 20;
@@ -89,6 +119,9 @@ pub fn main(init: std.process.Init) !void {
 
     const root = try Io.Dir.cwd().openDir(io, root_path, .{});
     const work = try Io.Dir.cwd().openDir(io, work_path, .{});
+    // Docker mounts need absolute paths.
+    const root_abs = try Io.Dir.cwd().realPathFileAlloc(io, root_path, arena);
+    const work_abs = try Io.Dir.cwd().realPathFileAlloc(io, work_path, arena);
 
     // The custom search attributes tests get, and standalone activities, so samples can use
     // them too.
@@ -118,7 +151,15 @@ pub fn main(init: std.process.Init) !void {
     const arenas = try arena.alloc(std.heap.ArenaAllocator, selected.items.len);
     for (arenas) |*a| a.* = .init(gpa);
     defer for (arenas) |*a| a.deinit();
-    var queue: Queue = .{ .samples = selected.items, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env };
+    var needs_docker = false;
+    for (selected.items, arenas) |*sample, *a| {
+        sample.manifest = readManifest(gpa, io, a.allocator(), root, sample.name);
+        if (sample.manifest) |m| if (m.docker_server != null) {
+            needs_docker = true;
+        };
+    }
+    const docker: Docker = if (needs_docker) prepareDocker(gpa, io, arena) else .unused;
+    var queue: Queue = .{ .samples = selected.items, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env, .docker = docker, .root_abs = root_abs, .work_abs = work_abs };
     var lanes: Io.Group = .init;
     for (0..@min(jobs, selected.items.len)) |_| lanes.concurrent(io, runLane, .{ gpa, io, &queue }) catch {
         // No thread for another lane: this one and any started before it share the queue.
@@ -130,13 +171,19 @@ pub fn main(init: std.process.Init) !void {
     var buf: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writer(io, &buf);
     const out = &stdout.interface;
-    var failures: usize = 0;
+    var counts: std.EnumArray(Status, usize) = .initFill(0);
     try out.print("\n{s:<32} {s:<6} {s:>7}  detail\n", .{ "sample", "result", "seconds" });
     for (results) |r| {
-        if (!r.ok) failures += 1;
-        try out.print("{s:<32} {s:<6} {d:>7.1}  {s}\n", .{ r.name, if (r.ok) "pass" else "FAIL", r.seconds, r.detail });
+        counts.getPtr(r.status).* += 1;
+        const label = switch (r.status) {
+            .pass => "pass",
+            .fail => "FAIL",
+            .skip => "skip",
+        };
+        try out.print("{s:<32} {s:<6} {d:>7.1}  {s}\n", .{ r.name, label, r.seconds, r.detail });
     }
-    try out.print("\n{d} samples, {d} passed, {d} failed\n", .{ results.len, results.len - failures, failures });
+    const failures = counts.get(.fail);
+    try out.print("\n{d} samples, {d} passed, {d} failed, {d} skipped\n", .{ results.len, counts.get(.pass), failures, counts.get(.skip) });
     try out.flush();
     // Stop the server before exiting: std.process.exit skips defers, and a dev server left
     // running would hold zig build's output pipe open.
@@ -157,6 +204,9 @@ const Queue = struct {
     work: Io.Dir,
     work_path: []const u8,
     env: *const std.process.Environ.Map,
+    docker: Docker,
+    root_abs: []const u8,
+    work_abs: []const u8,
 };
 
 /// Validates samples from `queue` until none are left.
@@ -167,9 +217,12 @@ fn runLane(gpa: Allocator, io: Io, queue: *Queue) void {
         const sample = queue.samples[i];
         const arena = queue.arenas[i].allocator();
         const start = Io.Timestamp.now(io, .awake);
-        const outcome = validate(gpa, io, arena, queue.root, queue.work, queue.work_path, queue.env, sample);
+        const outcome = validate(gpa, io, arena, queue, sample);
         const seconds = @as(f64, @floatFromInt(start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds)) / std.time.ns_per_s;
-        queue.results[i] = .{ .name = sample.name, .ok = outcome == null, .detail = outcome orelse "", .seconds = seconds };
+        queue.results[i] = .{ .name = sample.name, .status = outcome, .detail = switch (outcome) {
+            .pass => "",
+            .fail, .skip => |detail| detail,
+        }, .seconds = seconds };
     }
 }
 
@@ -178,22 +231,53 @@ fn usage() noreturn {
     std.process.exit(2);
 }
 
-/// Runs one sample. Returns null on success or a short reason on failure (details are logged).
-fn validate(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, work: Io.Dir, work_path: []const u8, base_env: *const std.process.Environ.Map, sample: Sample) ?[]const u8 {
+/// Reads samples/<name>/sample.zon; null (with the problem logged) if it is missing or invalid.
+fn readManifest(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, name: []const u8) ?Manifest {
+    const manifest_path = std.fmt.allocPrint(arena, "samples/{s}/sample.zon", .{name}) catch return null;
+    const manifest_src = root.readFileAllocOptions(io, manifest_path, arena, .limited(64 * 1024), .of(u8), 0) catch |err| {
+        std.log.err("{s}: cannot read {s}: {t}", .{ name, manifest_path, err });
+        return null;
+    };
+    var diag: std.zon.parse.Diagnostics = undefined;
+    return std.zon.parse.fromSlice(Manifest, .{ .gpa = gpa, .arena = arena, .source = manifest_src, .diagnostics = &diag }) catch {
+        diag.log(manifest_path);
+        return null;
+    };
+}
+
+/// Runs one sample, against its own Docker server if its manifest asks for one.
+fn validate(gpa: Allocator, io: Io, arena: Allocator, queue: *const Queue, sample: Sample) Outcome {
+    const manifest = sample.manifest orelse return .{ .fail = "missing or invalid sample.zon" };
+    const options = manifest.docker_server orelse
+        return failure(runPrograms(gpa, io, arena, queue.work, queue.work_path, queue.env, sample, manifest));
+    switch (queue.docker) {
+        .unused => unreachable,
+        .ready => {},
+        .unavailable => |reason| return .{ .skip = reason },
+        .failed => |reason| return .{ .fail = reason },
+    }
+    var env = queue.env.clone(arena) catch return .{ .fail = "out of memory" };
+    var detail: []const u8 = "";
+    const container = startServer(gpa, io, arena, queue, sample.name, options, &env, &detail) catch return .{ .fail = detail };
+    defer stopServer(gpa, io, container);
+    const result = runPrograms(gpa, io, arena, queue.work, queue.work_path, &env, sample, manifest);
+    if (result != null) showServerLog(gpa, io, container);
+    return failure(result);
+}
+
+fn failure(reason: ?[]const u8) Outcome {
+    return if (reason) |r| .{ .fail = r } else .pass;
+}
+
+/// Runs a sample's worker and starter with `base_env`. Returns null on success or a short reason
+/// on failure (details are logged).
+fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path: []const u8, base_env: *const std.process.Environ.Map, sample: Sample, manifest: Manifest) ?[]const u8 {
     const worker_exe = sample.worker orelse return "no worker program";
     const starter_exe = sample.starter orelse return "no starter program";
     var worker_env = base_env.clone(arena) catch return "out of memory";
     worker_env.put("SAMPLE_PROGRAM", std.fmt.allocPrint(arena, "{s}:worker", .{sample.name}) catch return "out of memory") catch return "out of memory";
     var starter_env = base_env.clone(arena) catch return "out of memory";
     starter_env.put("SAMPLE_PROGRAM", std.fmt.allocPrint(arena, "{s}:starter", .{sample.name}) catch return "out of memory") catch return "out of memory";
-
-    const manifest_path = std.fmt.allocPrint(arena, "samples/{s}/sample.zon", .{sample.name}) catch return "out of memory";
-    const manifest_src = root.readFileAllocOptions(io, manifest_path, arena, .limited(64 * 1024), .of(u8), 0) catch return "missing sample.zon";
-    var diag: std.zon.parse.Diagnostics = undefined;
-    const manifest = std.zon.parse.fromSlice(Manifest, .{ .gpa = gpa, .arena = arena, .source = manifest_src, .diagnostics = &diag }) catch {
-        diag.log(manifest_path);
-        return "invalid sample.zon";
-    };
 
     const log_name = std.fmt.allocPrint(arena, "{s}-worker.log", .{sample.name}) catch return "out of memory";
     const log_file = work.createFile(io, log_name, .{}) catch return "cannot create worker log";
@@ -305,4 +389,232 @@ fn dumpStacks(gpa: Allocator, io: Io, pid: std.posix.pid_t) void {
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
     std.log.err("stacks of the stuck worker (pid {d}):\n{s}\n{s}", .{ pid, result.stdout[0..@min(result.stdout.len, 64 * 1024)], result.stderr[0..@min(result.stderr.len, 4096)] });
+}
+
+const server_image = "temporalio/server:1.32.2";
+const jwt_key_id = "samples-runner";
+const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+/// Whether samples with a `docker_server` can run: checked once, before any sample runs.
+const Docker = union(enum) {
+    unused,
+    ready,
+    /// Docker isn't installed or its daemon isn't running: the samples are skipped.
+    unavailable: []const u8,
+    /// Docker runs but the server image can't be pulled: the samples fail.
+    failed: []const u8,
+};
+
+/// Checks that the Docker daemon answers and pulls the server image, so the samples' timeouts
+/// don't include the download.
+fn prepareDocker(gpa: Allocator, io: Io, arena: Allocator) Docker {
+    const info = std.process.run(gpa, io, .{
+        .argv = &.{ "docker", "info", "--format", "{{.ServerVersion}}" },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+    }) catch |err| return .{ .unavailable = switch (err) {
+        error.FileNotFound => "docker is not installed",
+        else => std.fmt.allocPrint(arena, "docker info failed: {t}", .{err}) catch "docker info failed",
+    } };
+    defer gpa.free(info.stdout);
+    defer gpa.free(info.stderr);
+    if (!succeeded(info.term)) return .{ .unavailable = std.fmt.allocPrint(arena, "docker is not running: {s}", .{firstLine(info.stderr)}) catch "docker is not running" };
+
+    const pull = std.process.run(gpa, io, .{
+        .argv = &.{ "docker", "pull", "--quiet", server_image },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(600), .clock = .awake } },
+    }) catch |err| return .{ .failed = std.fmt.allocPrint(arena, "docker pull {s} failed: {t}", .{ server_image, err }) catch "docker pull failed" };
+    defer gpa.free(pull.stdout);
+    defer gpa.free(pull.stderr);
+    if (!succeeded(pull.term)) return .{ .failed = std.fmt.allocPrint(arena, "docker pull {s} failed: {s}", .{ server_image, firstLine(pull.stderr) }) catch "docker pull failed" };
+    return .ready;
+}
+
+/// Starts a server container for `sample`, waits until its frontend serves the "default"
+/// namespace, and points `env` at it (see `DockerServer`). Returns the container's name; on
+/// failure, `detail` says why.
+fn startServer(gpa: Allocator, io: Io, arena: Allocator, queue: *const Queue, sample: []const u8, options: DockerServer, env: *std.process.Environ.Map, detail: *[]const u8) error{ServerFailed}![]const u8 {
+    const fail = struct {
+        fn f(d: *[]const u8, reason: []const u8) error{ServerFailed} {
+            d.* = reason;
+            return error.ServerFailed;
+        }
+    }.f;
+    const oom = "out of memory";
+    const tls_dir = std.fs.path.join(arena, &.{ queue.root_abs, "tools", "fixtures", "tls" }) catch return fail(detail, oom);
+    const config = std.fs.path.join(arena, &.{ queue.root_abs, "tools", "fixtures", "server", "config.yaml" }) catch return fail(detail, oom);
+    const name = std.fmt.allocPrint(arena, "samples-{s}-{d}", .{ sample, std.c.getpid() }) catch return fail(detail, oom);
+
+    const config_mount = std.fmt.allocPrint(arena, "{s}:/etc/temporal/config.yaml:ro", .{config}) catch return fail(detail, oom);
+    const tls_mount = std.fmt.allocPrint(arena, "{s}:/etc/temporal/tls:ro", .{tls_dir}) catch return fail(detail, oom);
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(arena, &.{ "docker", "run", "--detach", "--rm", "--name", name }) catch return fail(detail, oom);
+    // The frontend's gRPC and HTTP ports, published on random loopback ports.
+    argv.appendSlice(arena, &.{ "--publish", "127.0.0.1::7233", "--publish", "127.0.0.1::7243" }) catch return fail(detail, oom);
+    argv.appendSlice(arena, &.{ "--volume", config_mount, "--volume", tls_mount }) catch return fail(detail, oom);
+    argv.appendSlice(arena, &.{
+        "--env", "TEMPORAL_SERVER_CONFIG_FILE_PATH=/etc/temporal/config.yaml",
+        "--env", "TEMPORAL_SERVICES=frontend,internal-frontend,history,matching,worker",
+        "--env", if (options.require_client_cert) "FIXTURE_REQUIRE_CLIENT_CERT=true" else "FIXTURE_REQUIRE_CLIENT_CERT=false",
+    }) catch return fail(detail, oom);
+
+    var admin_token: ?[]const u8 = null;
+    if (options.jwt) {
+        const key = Ecdsa.KeyPair.generate(io);
+        const jwks_name = std.fmt.allocPrint(arena, "{s}-jwks.json", .{sample}) catch return fail(detail, oom);
+        const key_name = std.fmt.allocPrint(arena, "{s}-jwt-key.json", .{sample}) catch return fail(detail, oom);
+        const public_jwk = publicJwk(arena, key) catch return fail(detail, oom);
+        const jwks = std.fmt.allocPrint(arena, "{{\"keys\":[{s}]}}", .{public_jwk}) catch return fail(detail, oom);
+        const d = base64Url(arena, &key.secret_key.toBytes()) catch return fail(detail, oom);
+        const private_jwk = std.fmt.allocPrint(arena, "{s},\"d\":\"{s}\"}}", .{ public_jwk[0 .. public_jwk.len - 1], d }) catch return fail(detail, oom);
+        queue.work.writeFile(io, .{ .sub_path = jwks_name, .data = jwks }) catch return fail(detail, "cannot write the JWKS file");
+        queue.work.writeFile(io, .{ .sub_path = key_name, .data = private_jwk }) catch return fail(detail, "cannot write the JWT key file");
+        const jwks_path = std.fs.path.join(arena, &.{ queue.work_abs, jwks_name }) catch return fail(detail, oom);
+        argv.appendSlice(arena, &.{
+            "--volume", std.fmt.allocPrint(arena, "{s}:/etc/temporal/jwks.json:ro", .{jwks_path}) catch return fail(detail, oom),
+            "--env",    "FIXTURE_JWKS=file:///etc/temporal/jwks.json",
+        }) catch return fail(detail, oom);
+        admin_token = mintJwt(arena, io, key, "temporal-system:admin") catch return fail(detail, "cannot sign a JWT");
+        const token = mintJwt(arena, io, key, "default:admin") catch return fail(detail, "cannot sign a JWT");
+        env.put("TEMPORAL_API_KEY", token) catch return fail(detail, oom);
+        env.put("SAMPLE_JWT_KEY", std.fs.path.join(arena, &.{ queue.work_abs, key_name }) catch return fail(detail, oom)) catch return fail(detail, oom);
+    } else {
+        argv.appendSlice(arena, &.{ "--env", "TEMPORAL_ALLOW_NO_AUTH=true" }) catch return fail(detail, oom);
+    }
+    argv.append(arena, server_image) catch return fail(detail, oom);
+
+    // Also after a failed or timed-out `docker run`, which may have started the container.
+    errdefer stopServer(gpa, io, name);
+    const run = std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } },
+    }) catch |err| return fail(detail, std.fmt.allocPrint(arena, "docker run failed: {t}", .{err}) catch oom);
+    defer gpa.free(run.stdout);
+    defer gpa.free(run.stderr);
+    if (!succeeded(run.term)) return fail(detail, std.fmt.allocPrint(arena, "docker run {s} failed: {s}", .{ server_image, firstLine(run.stderr) }) catch oom);
+
+    const grpc_port = publishedPort(gpa, io, arena, name, "7233/tcp") orelse return fail(detail, "cannot read the server container's published gRPC port");
+    const http_port = publishedPort(gpa, io, arena, name, "7243/tcp") orelse return fail(detail, "cannot read the server container's published HTTP port");
+    const ca = std.fs.path.join(arena, &.{ tls_dir, "ca.pem" }) catch return fail(detail, oom);
+    const client_cert = std.fs.path.join(arena, &.{ tls_dir, "client.pem" }) catch return fail(detail, oom);
+    const client_key = std.fs.path.join(arena, &.{ tls_dir, "client.key" }) catch return fail(detail, oom);
+
+    // The server starts without namespaces. Registering one also tells that the frontend is
+    // up; the new namespace is usable at once. curl does it because the HTTP API needs a client
+    // certificate, which std.crypto.tls.Client can't send.
+    var curl: std.ArrayList([]const u8) = .empty;
+    const namespaces_url = std.fmt.allocPrint(arena, "https://localhost:{s}/api/v1/namespaces", .{http_port}) catch return fail(detail, oom);
+    const register = "{\"namespace\":\"default\",\"workflowExecutionRetentionPeriod\":\"86400s\"}";
+    curl.appendSlice(arena, &.{ "curl", "--silent", "--show-error", "--fail-with-body", "--max-time", "5" }) catch return fail(detail, oom);
+    curl.appendSlice(arena, &.{ "--cacert", ca, "--cert", client_cert, "--key", client_key }) catch return fail(detail, oom);
+    curl.appendSlice(arena, &.{ "--header", "Content-Type: application/json", "--data", register, namespaces_url }) catch return fail(detail, oom);
+    if (admin_token) |t| curl.appendSlice(arena, &.{ "--header", std.fmt.allocPrint(arena, "Authorization: Bearer {s}", .{t}) catch return fail(detail, oom) }) catch return fail(detail, oom);
+    const deadline = Io.Timestamp.now(io, .awake).addDuration(.fromSeconds(60));
+    var last_error: []const u8 = "";
+    while (true) {
+        const r = std.process.run(gpa, io, .{
+            .argv = curl.items,
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+        }) catch |err| return fail(detail, std.fmt.allocPrint(arena, "registering the default namespace with curl failed: {t}", .{err}) catch oom);
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        if (succeeded(r.term)) break;
+        // curl's error, then the server's response body.
+        last_error = std.fmt.allocPrint(arena, "{s} {s}", .{ firstLine(r.stderr), firstLine(r.stdout) }) catch return fail(detail, oom);
+        if (Io.Timestamp.now(io, .awake).nanoseconds > deadline.nanoseconds) {
+            showServerLog(gpa, io, name);
+            return fail(detail, std.fmt.allocPrint(arena, "the server container did not register the default namespace within 60s: {s}", .{last_error}) catch oom);
+        }
+        io.sleep(.fromMilliseconds(250), .awake) catch return fail(detail, "canceled");
+    }
+
+    const put = struct {
+        fn f(e: *std.process.Environ.Map, key: []const u8, value: []const u8, d: *[]const u8) error{ServerFailed}!void {
+            e.put(key, value) catch return fail(d, oom);
+        }
+    }.f;
+    try put(env, "TEMPORAL_ADDRESS", std.fmt.allocPrint(arena, "127.0.0.1:{s}", .{grpc_port}) catch return fail(detail, oom), detail);
+    try put(env, "TEMPORAL_NAMESPACE", "default", detail);
+    try put(env, "TEMPORAL_TLS", "true", detail);
+    try put(env, "TEMPORAL_TLS_SERVER_CA_CERT_PATH", ca, detail);
+    try put(env, "TEMPORAL_TLS_SERVER_NAME", "localhost", detail);
+    try put(env, "TEMPORAL_TLS_CLIENT_CERT_PATH", client_cert, detail);
+    try put(env, "TEMPORAL_TLS_CLIENT_KEY_PATH", client_key, detail);
+    return name;
+}
+
+fn stopServer(gpa: Allocator, io: Io, name: []const u8) void {
+    const r = std.process.run(gpa, io, .{
+        .argv = &.{ "docker", "rm", "--force", name },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } },
+    }) catch |err| {
+        std.log.err("could not remove the server container {s}: {t}", .{ name, err });
+        return;
+    };
+    gpa.free(r.stdout);
+    gpa.free(r.stderr);
+}
+
+fn showServerLog(gpa: Allocator, io: Io, name: []const u8) void {
+    const r = std.process.run(gpa, io, .{
+        .argv = &.{ "docker", "logs", "--tail", "40", name },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+    }) catch return;
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    std.log.err("server container {s} log:\n{s}{s}", .{ name, r.stdout, r.stderr });
+}
+
+/// The loopback port Docker published for the container's `port` ("7233/tcp").
+fn publishedPort(gpa: Allocator, io: Io, arena: Allocator, name: []const u8, port: []const u8) ?[]const u8 {
+    const r = std.process.run(gpa, io, .{
+        .argv = &.{ "docker", "port", name, port },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+    }) catch return null;
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    if (!succeeded(r.term)) return null;
+    // "127.0.0.1:50685"
+    const line = firstLine(r.stdout);
+    const colon = std.mem.lastIndexOfScalar(u8, line, ':') orelse return null;
+    _ = std.fmt.parseInt(u16, line[colon + 1 ..], 10) catch return null;
+    return arena.dupe(u8, line[colon + 1 ..]) catch null;
+}
+
+/// The public half of `key` as a JWK object.
+fn publicJwk(arena: Allocator, key: Ecdsa.KeyPair) error{OutOfMemory}![]const u8 {
+    const point = key.public_key.toUncompressedSec1();
+    return std.fmt.allocPrint(arena, "{{\"kty\":\"EC\",\"crv\":\"P-256\",\"alg\":\"ES256\",\"use\":\"sig\",\"kid\":\"{s}\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{
+        jwt_key_id,
+        try base64Url(arena, point[1..33]),
+        try base64Url(arena, point[33..65]),
+    });
+}
+
+/// An ES256 JWT for `key` granting `permission`: "<namespace>:<role>", or
+/// "temporal-system:<role>" for every namespace and the cluster APIs. Valid for a day.
+fn mintJwt(arena: Allocator, io: Io, key: Ecdsa.KeyPair, permission: []const u8) ![]const u8 {
+    const now = Io.Clock.real.now(io).toSeconds();
+    const header = try base64Url(arena, "{\"alg\":\"ES256\",\"typ\":\"JWT\",\"kid\":\"" ++ jwt_key_id ++ "\"}");
+    const claims = try base64Url(arena, try std.fmt.allocPrint(arena, "{{\"sub\":\"samples-runner\",\"permissions\":[\"{s}\"],\"iat\":{d},\"exp\":{d}}}", .{ permission, now, now + std.time.s_per_day }));
+    const signed = try std.fmt.allocPrint(arena, "{s}.{s}", .{ header, claims });
+    const signature = try key.sign(signed, null);
+    return std.fmt.allocPrint(arena, "{s}.{s}", .{ signed, try base64Url(arena, &signature.toBytes()) });
+}
+
+fn base64Url(arena: Allocator, bytes: []const u8) error{OutOfMemory}![]const u8 {
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const out = try arena.alloc(u8, encoder.calcSize(bytes.len));
+    return encoder.encode(out, bytes);
+}
+
+fn succeeded(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len];
 }

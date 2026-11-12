@@ -1,0 +1,94 @@
+# enable-template
+#
+# Server config for the samples runner's Docker fixture (temporalio/server): in-memory SQLite,
+# frontend TLS with the certificates in ../tls, and optionally required client certificates
+# (FIXTURE_REQUIRE_CLIENT_CERT=true) and JWT authorization against a JWKS file
+# (FIXTURE_JWKS=file:///...). The image's entrypoint sets BIND_ON_IP to the container's address.
+log:
+  stdout: true
+  level: warn
+persistence:
+  numHistoryShards: 1
+  defaultStore: sqlite
+  visibilityStore: sqlite
+  datastores:
+    sqlite:
+      sql:
+        pluginName: sqlite
+        databaseName: temporal
+        connectAddr: localhost
+        connectProtocol: tcp
+        connectAttributes:
+          mode: memory
+          cache: shared
+        maxConns: 1
+        maxIdleConns: 1
+global:
+  membership:
+    maxJoinDuration: 30s
+    broadcastAddress: "{{ env "BIND_ON_IP" }}"
+  tls:
+    frontend:
+      server:
+        certFile: /etc/temporal/tls/server.pem
+        keyFile: /etc/temporal/tls/server.key
+        requireClientAuth: {{ default "false" (env "FIXTURE_REQUIRE_CLIENT_CERT") }}
+        clientCaFiles:
+          - /etc/temporal/tls/ca.pem
+      client:
+        serverName: localhost
+        rootCaFiles:
+          - /etc/temporal/tls/ca.pem
+{{- if env "FIXTURE_JWKS" }}
+  authorization:
+    jwtKeyProvider:
+      keySourceURIs:
+        - {{ env "FIXTURE_JWKS" }}
+    permissionsClaimName: permissions
+    authorizer: default
+    claimMapper: default
+{{- end }}
+services:
+  frontend:
+    rpc:
+      grpcPort: 7233
+      membershipPort: 6933
+      httpPort: 7243
+      bindOnIP: "{{ env "BIND_ON_IP" }}"
+  # The system worker calls this frontend, which has no TLS or authorization, so it needs
+  # neither a client certificate nor a token.
+  internal-frontend:
+    rpc:
+      grpcPort: 7236
+      membershipPort: 6936
+      httpPort: 7246
+      bindOnIP: "{{ env "BIND_ON_IP" }}"
+  history:
+    rpc:
+      grpcPort: 7234
+      membershipPort: 6934
+      bindOnIP: "{{ env "BIND_ON_IP" }}"
+  matching:
+    rpc:
+      grpcPort: 7235
+      membershipPort: 6935
+      bindOnIP: "{{ env "BIND_ON_IP" }}"
+  worker:
+    rpc:
+      grpcPort: 7239
+      membershipPort: 6939
+      bindOnIP: "{{ env "BIND_ON_IP" }}"
+clusterMetadata:
+  enableGlobalNamespace: false
+  failoverVersionIncrement: 10
+  masterClusterName: active
+  currentClusterName: active
+  clusterInformation:
+    active:
+      enabled: true
+      initialFailoverVersion: 1
+      rpcName: frontend
+      rpcAddress: "{{ env "BIND_ON_IP" }}:7233"
+      httpAddress: "{{ env "BIND_ON_IP" }}:7243"
+dcRedirectionPolicy:
+  policy: noop
