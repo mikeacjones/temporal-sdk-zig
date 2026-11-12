@@ -58,6 +58,16 @@ const Allocator = std.mem.Allocator;
 pub const Payload = proto.temporal.api.common.v1.Payload;
 pub const Payloads = proto.temporal.api.common.v1.Payloads;
 
+const codec = @import("converter/codec.zig");
+pub const CodecError = codec.CodecError;
+pub const PayloadCodec = codec.PayloadCodec;
+pub const ZlibCodec = codec.ZlibCodec;
+pub const encodePayloads = codec.encodePayloads;
+pub const decodePayloads = codec.decodePayloads;
+pub const encodeMessage = codec.encodeMessage;
+pub const decodeMessage = codec.decodeMessage;
+pub const visitPayloads = codec.visitPayloads;
+
 /// Raw bytes, encoded as `binary/plain` instead of a JSON string.
 pub const Bytes = struct { data: []const u8 };
 
@@ -349,6 +359,10 @@ pub fn ProtoBinary(comptime T: type) type {
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
+
+test {
+    _ = codec;
+}
 
 /// A point in time that encodes in JSON as an RFC 3339 string with up to nanosecond
 /// precision, such as "2018-08-22T16:30:00Z", the common form for times in payloads.
