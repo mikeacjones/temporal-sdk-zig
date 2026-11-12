@@ -20,6 +20,7 @@ const log_mod = @import("log.zig");
 const workflow = @import("workflow.zig");
 const activity = @import("activity.zig");
 const client_mod = @import("client.zig");
+const propagation = @import("propagation.zig");
 const Instance = @import("workflow/Instance.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -314,6 +315,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .namespace = w.client.namespace,
         .stack_size = w.options.workflow_stack_size,
         .codecs = w.client.codecs,
+        .propagators = w.client.propagators,
         .logger = w.logSink(),
         .log_during_replay = w.options.log_during_replay,
     };
@@ -347,6 +349,8 @@ pub const WorkflowRunner = struct {
     stack_size: usize,
     /// Borrowed; see `client.Options.codecs`.
     codecs: []const converter.PayloadCodec = &.{},
+    /// Borrowed; see `client.Options.propagators`.
+    propagators: []const propagation.ContextPropagator = &.{},
     logger: log_mod.Sink = .std_log,
     log_during_replay: bool = false,
     runs: std.StringHashMapUnmanaged(*Instance) = .empty,
@@ -415,6 +419,7 @@ pub const WorkflowRunner = struct {
                 .stack_size = r.stack_size,
                 .logger = r.logger,
                 .log_during_replay = r.log_during_replay,
+                .propagators = r.propagators,
             });
             errdefer inst.destroy();
             const key = try r.gpa.dupe(u8, act.run_id);
@@ -670,6 +675,9 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .WorkflowID = execution.workflow_id,
         .RunID = execution.run_id,
     });
+    ctx.header_ = try .fromEntries(a, start.header_fields.items);
+    ctx.propagated_ = .init(a);
+    try propagation.extractAll(w.client.propagators, a, ctx.header_, &ctx.propagated_, "an activity task");
     var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token };
     ctx.heartbeat_details = start.heartbeat_details.items;
     // The core keeps no heartbeat state for local activities and warns on each heartbeat.

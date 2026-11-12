@@ -6,12 +6,14 @@ pub const workflow = @import("workflow.zig");
 pub const activity = @import("activity.zig");
 pub const nexus = @import("nexus.zig");
 pub const converter = @import("converter.zig");
+pub const propagation = @import("propagation.zig");
 pub const search_attributes = @import("search_attributes.zig");
 pub const failure = @import("failure.zig");
 pub const log = @import("log.zig");
 pub const history = @import("history.zig");
 pub const schedule = @import("schedule.zig");
 pub const Failure = failure.Failure;
+pub const Header = converter.Header;
 pub const testing = @import("testing.zig");
 
 /// Generated protobuf types for the Temporal API and the sdk-core interface.
@@ -26,4 +28,5 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = bridge;
     _ = @import("proto_test.zig");
+    _ = @import("propagation_test.zig");
 }

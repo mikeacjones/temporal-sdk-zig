@@ -238,6 +238,94 @@ pub fn fieldValue(comptime T: type, arena: Allocator, fields: []const Field, nam
     return null;
 }
 
+/// The header of an operation: named payloads sent alongside its arguments (a workflow
+/// start, a signal, an activity, ...) for interceptors and context propagators to read.
+/// Workflow code reads its start header with `ctx.headers()`, an activity its own with
+/// `ctx.headers()`. Fields are sorted by name, each name once, so a header read from history
+/// reads the same on replay whatever order the server sent it in. A view: the fields borrow
+/// the memory they were built from (the run's or the task's).
+pub const Header = struct {
+    fields: []const Field = &.{},
+
+    /// The payload of the field called `name`, or null.
+    pub fn get(h: Header, name: []const u8) ?Payload {
+        const i = std.sort.binarySearch(Field, h.fields, name, fieldOrder) orelse return null;
+        return h.fields[i].value;
+    }
+
+    /// The field called `name` decoded as `T` into `arena`, or null if the header has none.
+    pub fn value(h: Header, comptime T: type, arena: Allocator, name: []const u8) DecodeError!?T {
+        const p = h.get(name) orelse return null;
+        return try fromPayload(T, arena, p);
+    }
+
+    /// Copies the entries of a protobuf map of payloads (each with `key` and
+    /// `value: ?Payload`, such as `temporal.api.common.v1.Header.fields` or an activation
+    /// job's `headers`) into a header allocated from `arena`. A repeated key keeps its last
+    /// value; an entry without a value becomes an empty payload.
+    pub fn fromEntries(arena: Allocator, entries: anytype) error{OutOfMemory}!Header {
+        var w: HeaderWriter = .init(arena);
+        for (entries) |e| try w.put(try arena.dupe(u8, e.key), if (e.value) |v| try v.dupe(arena) else .{});
+        return w.header();
+    }
+
+    /// The fields as protobuf map entries of type `Entry` (with `key` and `value`), in name
+    /// order. The list comes from `arena`; the entries borrow the header.
+    pub fn toEntries(h: Header, comptime Entry: type, arena: Allocator) error{OutOfMemory}!std.ArrayList(Entry) {
+        var out: std.ArrayList(Entry) = try .initCapacity(arena, h.fields.len);
+        for (h.fields) |f| out.appendAssumeCapacity(.{ .key = f.name, .value = f.value });
+        return out;
+    }
+};
+
+/// Builds a `Header`: fields stay sorted by name, and putting a name again replaces its
+/// value. Names and payloads are borrowed; the list and encoded values come from `arena`.
+/// Not thread-safe.
+pub const HeaderWriter = struct {
+    arena: Allocator,
+    fields: std.ArrayList(Field) = .empty,
+
+    pub fn init(arena: Allocator) HeaderWriter {
+        return .{ .arena = arena };
+    }
+
+    /// Sets the field `name` to `payload`.
+    pub fn put(w: *HeaderWriter, name: []const u8, payload: Payload) error{OutOfMemory}!void {
+        const i = std.sort.lowerBound(Field, w.fields.items, name, fieldOrder);
+        if (i < w.fields.items.len and std.mem.eql(u8, w.fields.items[i].name, name)) {
+            w.fields.items[i].value = payload;
+        } else {
+            try w.fields.insert(w.arena, i, .{ .name = name, .value = payload });
+        }
+    }
+
+    /// Sets the field `name` to `v` encoded with `toPayload`.
+    pub fn set(w: *HeaderWriter, name: []const u8, v: anytype) error{OutOfMemory}!void {
+        return w.put(name, try toPayload(w.arena, v));
+    }
+
+    /// Sets every field of `h`, replacing fields of the same name.
+    pub fn merge(w: *HeaderWriter, h: Header) error{OutOfMemory}!void {
+        for (h.fields) |f| try w.put(f.name, f.value);
+    }
+
+    /// Removes the field `name`, if present.
+    pub fn remove(w: *HeaderWriter, name: []const u8) void {
+        const i = std.sort.binarySearch(Field, w.fields.items, name, fieldOrder) orelse return;
+        _ = w.fields.orderedRemove(i);
+    }
+
+    /// The fields written so far; a later write leaves the view's slice as it is only until
+    /// the writer reallocates.
+    pub fn header(w: *const HeaderWriter) Header {
+        return .{ .fields = w.fields.items };
+    }
+};
+
+fn fieldOrder(name: []const u8, f: Field) std.math.Order {
+    return std.mem.order(u8, name, f.name);
+}
+
 /// Turns the entries of a proto map of payloads, such as `Memo.fields` or
 /// `SearchAttributes.indexed_fields` (each entry has `key` and `value: ?Payload`), into
 /// fields in wire order. An entry without a value becomes an empty payload. The slice comes
@@ -612,6 +700,38 @@ test "fields from a proto map keep wire order and decode by name" {
     try testing.expectEqualStrings("empty", fields[1].name);
     try testing.expectEqual(@as(usize, 0), fields[1].value.data.len);
     try testing.expectEqual(@as(usize, 0), (try fieldsFromMap(a, memo.fields.items[0..0])).len);
+}
+
+test "a header writes sorted fields that survive the wire and decode by name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var w: HeaderWriter = .init(a);
+    try w.set("tenant", @as([]const u8, "acme"));
+    try w.set("attempt", @as(u32, 1));
+    try w.set("attempt", @as(u32, 2));
+    try w.set("gone", true);
+    w.remove("gone");
+    try testing.expectEqual(@as(usize, 2), w.header().fields.len);
+    try testing.expectEqualStrings("attempt", w.header().fields[0].name);
+
+    // Through the wire format of a proto header and back.
+    const ProtoHeader = proto.temporal.api.common.v1.Header;
+    const sent: ProtoHeader = .{ .fields = try w.header().toEntries(ProtoHeader.FieldsEntry, a) };
+    var bytes: std.Io.Writer.Allocating = .init(a);
+    try sent.encode(&bytes.writer, a);
+    var reader: std.Io.Reader = .fixed(bytes.written());
+    const received = try ProtoHeader.decode(&reader, a);
+    std.mem.reverse(ProtoHeader.FieldsEntry, received.fields.items); // wire order doesn't matter
+    const h = try Header.fromEntries(a, received.fields.items);
+
+    try testing.expectEqualStrings("acme", (try h.value([]const u8, a, "tenant")).?);
+    try testing.expectEqual(@as(?u32, 2), try h.value(u32, a, "attempt"));
+    try testing.expectEqual(@as(?u32, null), try h.value(u32, a, "missing"));
+    try testing.expectEqual(@as(?Payload, null), h.get("gone"));
+    try testing.expectError(error.InvalidPayload, h.value(u32, a, "tenant"));
+    try testing.expectEqualStrings("attempt", h.fields[0].name);
 }
 
 test "EncodedValues decodes arguments one at a time or as a tuple" {
