@@ -44,6 +44,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "io-group:starter")) return @import("io-group/starter.zig").main(init);
     if (std.mem.eql(u8, name, "memo:worker")) return @import("memo/worker.zig").main(init);
     if (std.mem.eql(u8, name, "memo:starter")) return @import("memo/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "mutex:worker")) return @import("mutex/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "mutex:starter")) return @import("mutex/starter.zig").main(init);
     if (std.mem.eql(u8, name, "polling:worker")) return @import("polling/worker.zig").main(init);
     if (std.mem.eql(u8, name, "polling:starter")) return @import("polling/starter.zig").main(init);
     if (std.mem.eql(u8, name, "query:worker")) return @import("query/worker.zig").main(init);
