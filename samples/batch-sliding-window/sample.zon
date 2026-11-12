@@ -1,0 +1,10 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter runs
+// the worker's 90 records with a window of 30 instead of 10, so each record waits less for a
+// slot and the batch finishes in about 20 seconds.
+.{
+    .expect = .{"Result=90"},
+    .starter_args = .{ "5", "30", "3" },
+    .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
+}
