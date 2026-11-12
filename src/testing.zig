@@ -153,6 +153,12 @@ fn executable(existing_path: []const u8, version: []const u8) bridge.EphemeralSe
 /// once, while a test can still look at a workflow it started with `startWorkflow` in the
 /// middle of a timer.
 ///
+/// Tests drive a running workflow by its ID with `signalWorkflow`, `queryWorkflow` and
+/// `updateWorkflow`, or start one together with a signal or an update with
+/// `signalWithStartWorkflow` and `updateWithStartWorkflow`. These leave time locked: a
+/// workflow waiting for a signal or an update would otherwise skip straight to its execution
+/// timeout. Let an update handler's sleep pass with `sleep` (see `updateWorkflow`).
+///
 /// Not thread-safe: use an environment from one task at a time.
 pub const WorkflowEnvironment = struct {
     gpa: Allocator,
@@ -293,17 +299,113 @@ pub const WorkflowEnvironment = struct {
         options: client_mod.StartWorkflowOptions,
         args: Workflow.Args,
     ) !client_mod.WorkflowRun(Workflow.Result) {
-        if (env.running == null) env.running = try env.io.concurrent(runWorker, .{&env.worker});
-        env.next_id += 1;
-        var opts = options;
+        try env.ensureWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
+        return env.client.executeWorkflow(Workflow, try env.startOptions(Workflow, options, &generated_id), args);
+    }
+
+    /// Sends `Signal` with `args` to the latest run of `workflow_id`. Returns once the server
+    /// has recorded the signal; time stays locked on the time-skipping server.
+    pub fn signalWorkflow(env: *WorkflowEnvironment, comptime Signal: type, workflow_id: []const u8, args: Signal.Args) !void {
+        return env.client.signalWorkflow(Signal, workflow_id, "", args);
+    }
+
+    /// Sends `Query` with `args` to the latest run of `workflow_id` (starting the worker if
+    /// needed, so it can answer) and returns the result, allocated from `arena`. Time stays
+    /// locked on the time-skipping server, so a workflow in the middle of a timer answers
+    /// without the timer firing.
+    pub fn queryWorkflow(env: *WorkflowEnvironment, comptime Query: type, arena: Allocator, workflow_id: []const u8, args: Query.Args) !Query.Result {
+        try env.ensureWorker();
+        return env.client.queryWorkflow(Query, arena, workflow_id, "", args);
+    }
+
+    /// Sends `Update` with `args` to the latest run of `workflow_id` (starting the worker if
+    /// needed), waits for it to complete, and returns the result, allocated from `arena`. On
+    /// `error.UpdateFailed` (rejected by the validator, failed in the handler, or no handler
+    /// for it), `failure` (if given) receives why; it borrows `arena`.
+    ///
+    /// Time stays locked on the time-skipping server. Unlocked, the server skips ahead to the
+    /// next deadline as soon as the workflow is idle, and a workflow waiting for a signal or
+    /// an update has only its execution timeout left, so it would time out before the update
+    /// arrived or right after it completed. To let a handler that sleeps finish, send the
+    /// update with `env.client.updateWorkflow` and `.wait_for_stage = .accepted`, call
+    /// `env.sleep` for the handler's sleep, then `get` the handle.
+    pub fn updateWorkflow(
+        env: *WorkflowEnvironment,
+        comptime Update: type,
+        arena: Allocator,
+        workflow_id: []const u8,
+        args: Update.Args,
+        failure: ?*?failure_mod.Failure,
+    ) !Update.Result {
+        try env.ensureWorker();
+        var handle = try env.client.updateWorkflow(Update, workflow_id, "", args, .{});
+        defer handle.deinit();
+        return handle.get(arena) catch |err| {
+            if (err == error.UpdateFailed) if (failure) |f| {
+                f.* = if (handle.failure()) |fl| fl.* else null;
+            };
+            return err;
+        };
+    }
+
+    /// Starts `Workflow` with `args` and signals it with `Signal` and `signal_args` in one
+    /// call, or only signals it if a workflow with that ID is running (see
+    /// `Client.signalWithStartWorkflow`). Starts the worker if needed and defaults `id` and
+    /// `task_queue` as `startWorkflow` does. The caller owns the run (`run.deinit()`).
+    pub fn signalWithStartWorkflow(
+        env: *WorkflowEnvironment,
+        comptime Workflow: type,
+        options: client_mod.StartWorkflowOptions,
+        args: Workflow.Args,
+        comptime Signal: type,
+        signal_args: Signal.Args,
+    ) !client_mod.WorkflowRun(Workflow.Result) {
+        try env.ensureWorker();
+        var generated_id: ?[]u8 = null;
+        defer if (generated_id) |id| env.gpa.free(id);
+        return env.client.signalWithStartWorkflow(Workflow, try env.startOptions(Workflow, options, &generated_id), args, Signal, signal_args);
+    }
+
+    /// Starts `Workflow` with `args` and sends it `Update` with `update_args` in one call, or
+    /// only updates it if a workflow with that ID is running (see
+    /// `Client.updateWithStartWorkflow`; `options.id_conflict_policy` is required). Starts
+    /// the worker if needed and defaults `id` and `task_queue` as `startWorkflow` does. Time
+    /// stays locked on the time-skipping server, as in `updateWorkflow`. The caller owns the
+    /// handle (`deinit`); wait for the workflow with `getResult` on
+    /// `env.client.getWorkflow(handle.workflow_id, handle.run_id)`.
+    pub fn updateWithStartWorkflow(
+        env: *WorkflowEnvironment,
+        comptime Workflow: type,
+        options: client_mod.StartWorkflowOptions,
+        args: Workflow.Args,
+        comptime Update: type,
+        update_args: Update.Args,
+        update_options: client_mod.UpdateOptions,
+    ) !client_mod.WorkflowUpdateHandle(Update.Result) {
+        try env.ensureWorker();
+        var generated_id: ?[]u8 = null;
+        defer if (generated_id) |id| env.gpa.free(id);
+        return env.client.updateWithStartWorkflow(Workflow, try env.startOptions(Workflow, options, &generated_id), args, Update, update_args, update_options);
+    }
+
+    fn ensureWorker(env: *WorkflowEnvironment) !void {
+        if (env.running == null) env.running = try env.io.concurrent(runWorker, .{&env.worker});
+    }
+
+    /// `options` with `id` and `task_queue` defaulted to a unique ID and the environment's
+    /// task queue. A generated ID is allocated with `env.gpa` and stored in `generated_id`,
+    /// which the caller frees once the start call returns.
+    fn startOptions(env: *WorkflowEnvironment, comptime Workflow: type, options: client_mod.StartWorkflowOptions, generated_id: *?[]u8) !client_mod.StartWorkflowOptions {
+        env.next_id += 1;
+        var opts = options;
         if (opts.id.len == 0) {
-            generated_id = try std.fmt.allocPrint(env.gpa, "{s}-{s}-{d}", .{ Workflow.workflow_name, env.task_queue, env.next_id });
-            opts.id = generated_id.?;
+            generated_id.* = try std.fmt.allocPrint(env.gpa, "{s}-{s}-{d}", .{ Workflow.workflow_name, env.task_queue, env.next_id });
+            opts.id = generated_id.*.?;
         }
         if (opts.task_queue.len == 0) opts.task_queue = env.task_queue;
-        return env.client.executeWorkflow(Workflow, opts, args);
+        return opts;
     }
 
     /// Waits for a run from `startWorkflow` to close and returns its result, allocated from
@@ -900,6 +1002,24 @@ const UpdateFixtures = struct {
         return handle(ctx, State.greetWithoutActivity);
     }
     const HandleUpdatesChanged = workflow.Def("HandleUpdates", handleUpdatesWithoutActivity);
+
+    const Nap = workflow.UpdateDef("nap", fn (seconds: i64) i64);
+    /// Sleeps in the handler; returns how many seconds of workflow time passed.
+    fn nap(s: *State, seconds: i64) !i64 {
+        const before = s.ctx.now();
+        try s.ctx.io().sleep(.fromSeconds(seconds), .awake);
+        return @intCast(@divFloor(s.ctx.now().nanoseconds - before.nanoseconds, std.time.ns_per_s));
+    }
+    /// Handles `Nap` updates until a `done` signal and their handlers have finished.
+    fn napper(ctx: *workflow.Context) !void {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandler(Nap, s, nap);
+        try ctx.setSignalHandler(Done, s, State.finish);
+        try ctx.await(s, State.finished);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+    }
+    const Napper = workflow.Def("Napper", napper);
 };
 
 const ChildFixtures = struct {
@@ -1730,6 +1850,137 @@ test "time-skipping WorkflowEnvironment: a workflow mid-timer answers a query wh
 
     try testing.expectEqualStrings("finished", try env.getResult(Fixtures.Queryable, &run, a, null));
     try testing.expectEqualStrings("done", try env.client.queryWorkflow(Fixtures.Status, a, run.id, run.run_id, .{}));
+}
+
+/// Both kinds of `WorkflowEnvironment`, for tests that run on each.
+const env_kinds = [_]std.meta.Tag(WorkflowEnvironment.Server){ .dev, .time_skipping };
+
+fn startEnv(kind: std.meta.Tag(WorkflowEnvironment.Server)) !*WorkflowEnvironment {
+    return WorkflowEnvironment.create(testing.allocator, testing.io, kind);
+}
+
+/// Whether the run's history has a fired timer.
+fn timerFired(c: *client_mod.Client, id: []const u8, run_id: []const u8) !bool {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const history = try c.fetchHistory(scratch.allocator(), id, run_id);
+    for (history.events.items) |event| switch (event.attributes orelse continue) {
+        .timer_fired_event_attributes => return true,
+        else => {},
+    };
+    return false;
+}
+
+test "WorkflowEnvironment signals, queries and updates a running workflow by its ID" {
+    for (env_kinds) |kind| {
+        const env = try startEnv(kind);
+        defer env.deinit();
+        try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+        try env.registerWorkflow(Fixtures.Queryable);
+        try env.registerWorkflow(UpdateFixtures.HandleUpdates);
+        try env.registerActivity(Fixtures.Greet);
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var approvals = try env.startWorkflow(SignalFixtures.AwaitApprovals, .{ .task_queue = "" }, .{2});
+        defer approvals.deinit();
+        try env.signalWorkflow(SignalFixtures.Approve, approvals.id, .{"ann"});
+        try env.signalWorkflow(SignalFixtures.Approve, approvals.id, .{"bob"});
+        try testing.expectEqualStrings("ann bob", try env.getResult(SignalFixtures.AwaitApprovals, &approvals, a, null));
+
+        // A query to a workflow in the middle of a 2h timer answers at once; with time
+        // locked, the timer hasn't fired.
+        const start = try env.now();
+        var sleeping = try env.startWorkflow(Fixtures.Queryable, .{ .task_queue = "" }, .{2 * std.time.s_per_hour});
+        defer sleeping.deinit();
+        try Fixtures.waitForTimer(&env.client, sleeping.id, sleeping.run_id);
+        try testing.expectEqualStrings("sleeping", try env.queryWorkflow(Fixtures.Status, a, sleeping.id, .{}));
+        try testing.expectEqual(@as(i64, 105), try env.queryWorkflow(Fixtures.Add, a, sleeping.id, .{ 2, 3 }));
+        try testing.expect(!try timerFired(&env.client, sleeping.id, sleeping.run_id));
+        try testing.expect(start.durationTo(try env.now()).nanoseconds < std.time.ns_per_hour);
+        try env.client.terminateWorkflow(sleeping.id, "", "test done");
+
+        var updates = try env.startWorkflow(UpdateFixtures.HandleUpdates, .{ .task_queue = "" }, .{});
+        defer updates.deinit();
+        try testing.expectEqual(@as(i64, 0), try env.updateWorkflow(UpdateFixtures.Set, a, updates.id, .{5}, null));
+        var failure: ?failure_mod.Failure = null;
+        try testing.expectError(error.UpdateFailed, env.updateWorkflow(UpdateFixtures.Set, a, updates.id, .{-1}, &failure));
+        try testing.expectEqualStrings("NotPositive", failure.?.message);
+        try testing.expectEqualStrings("Hello ann!", try env.updateWorkflow(UpdateFixtures.Greet, a, updates.id, .{"ann"}, null));
+        try env.signalWorkflow(UpdateFixtures.Done, updates.id, .{});
+        try testing.expectEqualStrings("5 Hello ann!", try env.getResult(UpdateFixtures.HandleUpdates, &updates, a, null));
+    }
+}
+
+test "time-skipping WorkflowEnvironment: an update handler's hour-long sleep passes with env.sleep" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFixtures.Napper);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(UpdateFixtures.Napper, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    const wall_start = Io.Timestamp.now(testing.io, .awake);
+    var nap = try env.client.updateWorkflow(UpdateFixtures.Nap, run.id, "", .{std.time.s_per_hour}, .{ .wait_for_stage = .accepted });
+    defer nap.deinit();
+    try env.sleep(.fromSeconds(std.time.s_per_hour));
+    try testing.expect(try nap.get(a) >= std.time.s_per_hour);
+    try testing.expect(wall_start.durationTo(Io.Timestamp.now(testing.io, .awake)).nanoseconds < 60 * std.time.ns_per_s);
+
+    // The workflow outlived the skip: it still handles updates and finishes on its signal.
+    try testing.expectEqual(@as(i64, 0), try env.updateWorkflow(UpdateFixtures.Nap, a, run.id, .{0}, null));
+    try env.signalWorkflow(UpdateFixtures.Done, run.id, .{});
+    try env.getResult(UpdateFixtures.Napper, &run, a, null);
+}
+
+test "WorkflowEnvironment signal-with-start starts the worker and defaults the ID and task queue" {
+    for (env_kinds) |kind| {
+        const env = try startEnv(kind);
+        defer env.deinit();
+        try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var run = try env.signalWithStartWorkflow(SignalFixtures.AwaitApprovals, .{ .task_queue = "" }, .{2}, SignalFixtures.Approve, .{"ann"});
+        defer run.deinit();
+        try testing.expect(std.mem.startsWith(u8, run.id, "AwaitApprovals-"));
+        var again = try env.signalWithStartWorkflow(SignalFixtures.AwaitApprovals, .{ .id = run.id, .task_queue = "" }, .{99}, SignalFixtures.Approve, .{"bob"});
+        defer again.deinit();
+        try testing.expectEqualStrings(run.run_id, again.run_id);
+        try testing.expectEqualStrings("ann bob", try env.getResult(SignalFixtures.AwaitApprovals, &run, a, null));
+        try testing.expectEqualStrings(env.task_queue, (try env.client.describeWorkflow(a, run.id, run.run_id)).task_queue);
+    }
+}
+
+test "WorkflowEnvironment update-with-start starts the worker and defaults the ID and task queue" {
+    for (env_kinds) |kind| {
+        const env = try startEnv(kind);
+        defer env.deinit();
+        try env.registerWorkflow(UpdateFixtures.HandleUpdates);
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var first = try env.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, .{ .task_queue = "", .id_conflict_policy = .use_existing }, .{}, UpdateFixtures.Set, .{3}, .{});
+        defer first.deinit();
+        try testing.expectEqual(@as(i64, 0), try first.get(a));
+        try testing.expect(std.mem.startsWith(u8, first.workflow_id, "HandleUpdates-"));
+
+        var second = try env.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, .{ .id = first.workflow_id, .task_queue = "", .id_conflict_policy = .use_existing }, .{}, UpdateFixtures.Set, .{7}, .{});
+        defer second.deinit();
+        try testing.expectEqual(@as(i64, 3), try second.get(a));
+        try testing.expectEqualStrings(first.run_id, second.run_id);
+
+        try env.signalWorkflow(UpdateFixtures.Done, first.workflow_id, .{});
+        var run = try env.client.getWorkflow([]const u8, first.workflow_id, first.run_id);
+        defer run.deinit();
+        try testing.expectEqualStrings("7 ", try env.getResult(UpdateFixtures.HandleUpdates, &run, a, null));
+        try testing.expectEqualStrings(env.task_queue, (try env.client.describeWorkflow(a, run.id, run.run_id)).task_queue);
+    }
 }
 
 test "time-skipping WorkflowEnvironment completes a 2h sleep in seconds" {
