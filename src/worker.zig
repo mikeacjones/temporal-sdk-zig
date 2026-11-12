@@ -77,31 +77,38 @@ pub const Worker = struct {
         gop.value_ptr.* = Workflow.registered;
     }
 
-    /// Registers an activity defined with `temporal.activity.Def`.
-    pub fn registerActivity(w: *Worker, comptime Activity: type) error{ OutOfMemory, AlreadyRegistered }!void {
+    /// Registers an activity defined with `temporal.activity.Def`. Activity types starting
+    /// with "__temporal_" belong to the SDK and return `error.ReservedActivityName`.
+    pub fn registerActivity(w: *Worker, comptime Activity: type) RegisterActivityError!void {
         return w.registerActivityImpl(Activity.registered);
     }
 
     /// Registers an activity that is a method (see `temporal.activity.Def`), bound to
     /// `receiver`. The receiver must outlive the worker and be safe to use from several
     /// activities at once.
-    pub fn registerActivityWith(w: *Worker, comptime Activity: type, receiver: *Activity.Receiver) error{ OutOfMemory, AlreadyRegistered }!void {
+    pub fn registerActivityWith(w: *Worker, comptime Activity: type, receiver: *Activity.Receiver) RegisterActivityError!void {
         return w.registerActivityImpl(Activity.with(receiver));
     }
 
     /// Registers several method activities bound to one receiver: `activities` is a tuple of
     /// their `Def`s.
-    pub fn registerActivitiesWith(w: *Worker, receiver: anytype, comptime activities: anytype) error{ OutOfMemory, AlreadyRegistered }!void {
+    pub fn registerActivitiesWith(w: *Worker, receiver: anytype, comptime activities: anytype) RegisterActivityError!void {
         inline for (activities) |Activity| try w.registerActivityWith(Activity, receiver);
     }
 
     /// Registers an activity implementation under another activity's name, for example a
     /// test double standing in for `Activity`.
-    pub fn registerActivityImpl(w: *Worker, registered: activity.Registered) error{ OutOfMemory, AlreadyRegistered }!void {
+    pub fn registerActivityImpl(w: *Worker, registered: activity.Registered) RegisterActivityError!void {
+        if (std.mem.startsWith(u8, registered.name, Instance.reserved_activity_prefix)) {
+            log.warn("registering activity type \"{s}\" failed: activity types starting with \"{s}\" are reserved for the SDK; rename the activity", .{ registered.name, Instance.reserved_activity_prefix });
+            return error.ReservedActivityName;
+        }
         const gop = try w.activities.getOrPut(w.gpa, registered.name);
         if (gop.found_existing) return error.AlreadyRegistered;
         gop.value_ptr.* = registered;
     }
+
+    pub const RegisterActivityError = error{ OutOfMemory, AlreadyRegistered, ReservedActivityName };
 
     pub const RunError = error{ OutOfMemory, NothingRegistered, WorkerInitFailed, InvalidOptions, ValidationFailed, ShutdownFailed, ConcurrencyUnavailable };
 
@@ -124,7 +131,8 @@ pub const Worker = struct {
                 .workflows = w.workflows.count() > 0,
                 .remote_activities = w.activities.count() > 0,
                 // The core runs local activities only on a worker that also polls workflows.
-                .local_activities = w.workflows.count() > 0 and w.activities.count() > 0,
+                // Every workflow worker runs them: side effects are recorded by one.
+                .local_activities = w.workflows.count() > 0,
                 .nexus = false,
             },
             .workflow_task_pollers = .{ .simple_maximum = w.options.max_concurrent_workflow_task_pollers },
@@ -160,7 +168,9 @@ pub const Worker = struct {
         // down like a normal stop, drain both pollers (finalizing waits for each to return
         // null), finalize, then return the error.
         var start_failed: ?RunError = null;
-        var activities_done = if (w.activities.count() > 0) w.io.concurrent(activityLoop, .{ w, core }) catch |err| blk: {
+        // Polled even without registered activities: a workflow's side effects run as local
+        // activities.
+        var activities_done: ?Io.Future(void) = w.io.concurrent(activityLoop, .{ w, core }) catch |err| blk: {
             if (workflows_done == null) return err;
             log.warn("starting the activity loop failed, stopping the worker: {t}", .{err});
             start_failed = err;
@@ -171,7 +181,7 @@ pub const Worker = struct {
             }
             activityLoop(w, core);
             break :blk null;
-        } else null;
+        };
         if (workflows_done) |*f| f.await(w.io);
         if (activities_done) |*f| f.await(w.io);
 
@@ -505,7 +515,8 @@ const Heartbeats = struct {
 fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !result_pb.ActivityExecutionResult {
     const a = run.arena.allocator();
     const start = &run.start;
-    const entry = w.activities.get(start.activity_type) orelse {
+    const side_effect = start.is_local and std.mem.eql(u8, start.activity_type, Instance.side_effect_activity_type);
+    const entry = if (side_effect) side_effect_activity else w.activities.get(start.activity_type) orelse {
         const known = try registeredNames(a, w.activities);
         return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
             .message = try std.fmt.allocPrint(a, "activity type \"{s}\" is not registered on this worker; registered: {s}", .{ start.activity_type, known }),
@@ -550,6 +561,23 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };
 }
+
+/// Every worker's implementation of `Instance.side_effect_activity_type`: returns the value the
+/// workflow computed, so the core records it in history. A replayed side effect is scheduled
+/// with no input; it reaches here only if history has no recorded value.
+const side_effect_activity: activity.Registered = .{
+    .name = Instance.side_effect_activity_type,
+    .invoke = struct {
+        fn echo(_: ?*anyopaque, ctx: *activity.Context, payloads: []const converter.Payload) anyerror!converter.Payload {
+            if (payloads.len == 1) return payloads[0];
+            return ctx.fail(.{
+                .message = "the side effect has no recorded value: the workflow replayed it, but history holds no result for it",
+                .type = "SideEffectNotRecorded",
+                .non_retryable = true,
+            });
+        }
+    }.echo,
+};
 
 // ---------------------------------------------------------------- signals
 
@@ -712,6 +740,17 @@ test "a worker runs a workflow and its activity started by a client" {
     defer failed.deinit();
     try testing.expectError(error.WorkflowFailed, failed.get(arena.allocator()));
     try testing.expectEqualStrings("NotToday", failure_mod.applicationType(failed.failure().?.*).?);
+}
+
+test "registering an activity type with the SDK's reserved prefix is rejected" {
+    var client: client_mod.Client = undefined; // registration never touches the client
+    var w = try Worker.init(testing.allocator, testing.io, &client, "reserved", .{});
+    defer w.deinit();
+    const Impostor = activity.Def(Instance.side_effect_activity_type, HelloTest.greet);
+    try testing.expectError(error.ReservedActivityName, w.registerActivity(Impostor));
+    try testing.expectError(error.ReservedActivityName, w.registerActivityImpl(activity.Def("__temporal_mine", HelloTest.greet).registered));
+    try testing.expectEqual(0, w.activities.count());
+    try w.registerActivity(HelloTest.Greet);
 }
 
 // Small machines: std.Io.Threaded runs `async` work inline once it has as many busy threads
