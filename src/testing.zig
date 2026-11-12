@@ -843,6 +843,65 @@ const SignalFixtures = struct {
     const AwaitApprovals = workflow.Def("AwaitApprovals", awaitApprovals);
 };
 
+const UpdateFixtures = struct {
+    const Set = workflow.UpdateDef("set", fn (value: i64) i64);
+    const Greet = workflow.UpdateDef("greet", fn (name: []const u8) []const u8);
+    const Done = workflow.SignalDef("done", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        value: i64 = 0,
+        greetings: std.ArrayList([]const u8) = .empty,
+        done: bool = false,
+
+        /// Returns the previous value.
+        fn set(s: *State, value: i64) i64 {
+            defer s.value = value;
+            return s.value;
+        }
+        fn positive(_: *State, value: i64) error{NotPositive}!void {
+            if (value <= 0) return error.NotPositive;
+        }
+        /// Greets with an activity, so the handler's commands are in history.
+        fn greet(s: *State, name: []const u8) ![]const u8 {
+            const greeting = try s.ctx.executeActivity(Fixtures.Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get();
+            try s.greetings.append(s.ctx.allocator(), greeting);
+            return greeting;
+        }
+        fn greetWithoutActivity(s: *State, name: []const u8) ![]const u8 {
+            try s.greetings.append(s.ctx.allocator(), name);
+            return name;
+        }
+        fn finish(s: *State) void {
+            s.done = true;
+        }
+        fn finished(s: *State) bool {
+            return s.done;
+        }
+    };
+
+    /// Handles updates until a `done` signal and their handlers have finished; returns the
+    /// value and the greetings.
+    fn handle(ctx: *workflow.Context, comptime greet: anytype) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandlerWithValidator(Set, s, State.set, State.positive);
+        try ctx.setUpdateHandler(Greet, s, greet);
+        try ctx.setSignalHandler(Done, s, State.finish);
+        try ctx.await(s, State.finished);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return std.fmt.allocPrint(ctx.allocator(), "{d} {s}", .{ s.value, try std.mem.join(ctx.allocator(), " ", s.greetings.items) });
+    }
+    fn handleUpdates(ctx: *workflow.Context) ![]const u8 {
+        return handle(ctx, State.greet);
+    }
+    const HandleUpdates = workflow.Def("HandleUpdates", handleUpdates);
+    fn handleUpdatesWithoutActivity(ctx: *workflow.Context) ![]const u8 {
+        return handle(ctx, State.greetWithoutActivity);
+    }
+    const HandleUpdatesChanged = workflow.Def("HandleUpdates", handleUpdatesWithoutActivity);
+};
+
 const ChildFixtures = struct {
     fn greetChild(ctx: *workflow.Context, name: []const u8) ![]const u8 {
         return std.fmt.allocPrint(ctx.allocator(), "Hello {s} from a child!", .{name});
@@ -1113,6 +1172,24 @@ test "WorkflowReplayer replays signal handlers and catches a handler that change
     defer changed.deinit();
     try changed.registerWorkflow(SignalFixtures.CollectApprovalsChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(signal_history));
+}
+
+/// A dev-server run of `UpdateFixtures.HandleUpdates` sent, with `temporal workflow update
+/// execute`, `set 5` (accepted), `set -1` (rejected by the validator), an unregistered update
+/// (rejected), and `greet "ann"` (whose handler waits for an activity), then signaled `done`;
+/// exported with `temporal workflow show`. The rejected updates left no events.
+const update_history = @embedFile("testdata/update_history.json");
+
+test "WorkflowReplayer replays update handlers and catches a handler that changed" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(UpdateFixtures.HandleUpdates);
+    try ok.replayHistoryJson(update_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(UpdateFixtures.HandleUpdatesChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(update_history));
 }
 
 test "WorkflowEnvironment runs local activities, retrying one after workflow timers" {
