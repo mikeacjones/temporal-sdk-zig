@@ -17,6 +17,13 @@ const Allocator = std.mem.Allocator;
 
 pub const History = proto.temporal.api.history.v1.History;
 pub const HistoryEvent = proto.temporal.api.history.v1.HistoryEvent;
+
+/// A history with the workflow ID it ran under, which the history itself doesn't record.
+/// Both are borrowed.
+pub const WorkflowHistory = struct {
+    workflow_id: []const u8,
+    history: History,
+};
 const Payload = proto.temporal.api.common.v1.Payload;
 
 pub const Error = error{ OutOfMemory, InvalidHistoryJson };
