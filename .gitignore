@@ -16,3 +16,5 @@ zig-pkg/
 .beads/*
 !.beads/identity.toml
 .claude/skills/
+.gc/
+worktrees/
