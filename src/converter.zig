@@ -195,48 +195,67 @@ pub fn unconvertibleType(comptime T: type, comptime direction: Direction) ?type 
     if (T == Payload or T == void or T == @TypeOf(null) or T == Bytes) return null;
     if (comptime hasPayloadHooks(T) or isProtoMessage(T)) return null;
     if (@typeInfo(T) == .optional) return unconvertibleType(@typeInfo(T).optional.child, direction);
-    return jsonUnconvertible(T, direction, &.{});
+    return jsonUnconvertible(T, direction);
 }
 
-// Mirrors the type switches of std.json's Stringify.write and innerParse. `seen` stops the
-// walk at types it is already inside, so recursive types terminate.
-fn jsonUnconvertible(comptime T: type, comptime direction: Direction, comptime seen: []const type) ?type {
-    for (seen) |S| if (S == T) return null;
-    const inside = seen ++ .{T};
-    const hook = if (direction == .encode) "jsonStringify" else "jsonParse";
-    switch (@typeInfo(T)) {
-        .bool, .int, .float, .@"enum" => return null,
-        .optional => |o| return jsonUnconvertible(o.child, direction, inside),
-        .error_set => return if (direction == .encode) null else T,
-        .array => |a| return jsonUnconvertible(a.child, direction, inside),
-        .vector => |v| return jsonUnconvertible(v.child, direction, inside),
-        .pointer => |p| return switch (p.size) {
-            .one, .slice => jsonUnconvertible(p.child, direction, inside),
-            .many => if (direction == .encode and p.sentinel_ptr != null) jsonUnconvertible(p.child, direction, inside) else T,
-            .c => T,
-        },
-        .@"union" => |u| {
-            if (std.meta.hasFn(T, hook)) return null;
-            if (u.tag_type == null) return T;
-            for (u.field_types) |F| {
-                if (F == void) continue;
-                if (jsonUnconvertible(F, direction, inside)) |bad| return bad;
+// Mirrors the type switches of std.json's Stringify.write and innerParse. A depth-first
+// worklist that visits each type once, so shared subtypes are walked once and recursive types
+// terminate. Callers check many methods in one comptime evaluation, so the quota is raised
+// with a wide base plus the walk's own work rather than left at the default 1000.
+fn jsonUnconvertible(comptime Root: type, comptime direction: Direction) ?type {
+    comptime {
+        const hook = if (direction == .encode) "jsonStringify" else "jsonParse";
+        var visited: []const type = &.{};
+        var stack: []const type = &.{Root};
+        var work: usize = 0;
+        while (stack.len > 0) {
+            work += visited.len + 8;
+            @setEvalBranchQuota(100_000 + 8 * work);
+            const T = stack[stack.len - 1];
+            stack = stack[0 .. stack.len - 1];
+            if (std.mem.indexOfScalar(type, visited, T) != null) continue;
+            visited = visited ++ .{T};
+            var children: []const type = &.{};
+            switch (@typeInfo(T)) {
+                .bool, .int, .float, .@"enum" => {},
+                .optional => |o| children = &.{o.child},
+                .error_set => if (direction == .decode) return T,
+                .array => |a| children = &.{a.child},
+                .vector => |v| children = &.{v.child},
+                .pointer => |p| switch (p.size) {
+                    .one, .slice => children = &.{p.child},
+                    .many => if (direction == .encode and p.sentinel_ptr != null) {
+                        children = &.{p.child};
+                    } else return T,
+                    .c => return T,
+                },
+                .@"union" => |u| if (!std.meta.hasFn(T, hook)) {
+                    if (u.tag_type == null) return T;
+                    for (u.field_types) |F| {
+                        if (F != void) children = children ++ .{F};
+                    }
+                },
+                .@"struct" => |s| if (!std.meta.hasFn(T, hook)) {
+                    for (s.field_types, s.field_attrs) |F, attrs| {
+                        if (direction == .decode and attrs.@"comptime" and !s.is_tuple) return T;
+                        if (F == void) {
+                            if (direction == .decode) return F;
+                            continue;
+                        }
+                        children = children ++ .{F};
+                    }
+                },
+                else => return T,
             }
-            return null;
-        },
-        .@"struct" => |s| {
-            if (std.meta.hasFn(T, hook)) return null;
-            for (s.field_types, s.field_attrs) |F, attrs| {
-                if (direction == .decode and attrs.@"comptime" and !s.is_tuple) return T;
-                if (F == void) {
-                    if (direction == .decode) return F;
-                    continue;
-                }
-                if (jsonUnconvertible(F, direction, inside)) |bad| return bad;
+            work += children.len;
+            // Pushed in reverse so the first field is walked first, as a recursive walk would.
+            var i = children.len;
+            while (i > 0) {
+                i -= 1;
+                stack = stack ++ .{children[i]};
             }
-            return null;
-        },
-        else => return T,
+        }
+        return null;
     }
 }
 

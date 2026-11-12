@@ -651,6 +651,113 @@ test "defs skips the dynamic activity shape and non-pub helpers that take the co
     try std.testing.expectEqualStrings("\"Totals\\n1\\n2\\n\"", (try rendered.invoke(rendered.receiver, &ctx, args.items)).data);
 }
 
+test "defs checks methods sharing a large nested record without raising the branch quota" {
+    const Address = struct {
+        line1: []const u8,
+        line2: ?[]const u8 = null,
+        city: []const u8,
+        region: ?[]const u8 = null,
+        postal_code: []const u8,
+        country: enum { de, fr, nl, us },
+    };
+    const Money = struct { amount_minor: i64, currency: [3]u8 };
+    const Item = struct {
+        sku: []const u8,
+        name: []const u8,
+        quantity: u32,
+        unit_price: Money,
+        discount: ?Money = null,
+        tags: []const []const u8 = &.{},
+    };
+    const Order = struct {
+        id: []const u8,
+        customer_id: []const u8,
+        customer_email: []const u8,
+        status: enum { draft, placed, paid, shipped, delivered, cancelled },
+        billing: Address,
+        shipping: Address,
+        return_to: ?Address = null,
+        items: []const Item,
+        subtotal: Money,
+        tax: Money,
+        shipping_fee: Money,
+        total: Money,
+        coupon: ?[]const u8 = null,
+        notes: ?[]const u8 = null,
+        gift: bool = false,
+        placed_at_unix_ms: ?i64 = null,
+        paid_at_unix_ms: ?i64 = null,
+        priority: u8 = 0,
+        weight_grams: u32 = 0,
+        history: []const struct { status: []const u8, at_unix_ms: i64 } = &.{},
+    };
+    const Shop = struct {
+        pub fn place(s: *@This(), ctx: *Context, o: Order) !Order {
+            _ = s;
+            _ = ctx;
+            return o;
+        }
+        pub fn pay(s: *@This(), ctx: *Context, o: Order, by: Money) !Order {
+            _ = s;
+            _ = ctx;
+            var paid = o;
+            paid.status = .paid;
+            paid.total = by;
+            return paid;
+        }
+        pub fn ship(s: *@This(), ctx: *Context, o: Order, to: ?Address) !Order {
+            _ = s;
+            _ = ctx;
+            var shipped = o;
+            shipped.status = .shipped;
+            if (to) |a| shipped.shipping = a;
+            return shipped;
+        }
+        pub fn cancel(s: *@This(), ctx: *Context, o: Order, reason: []const u8) !Order {
+            _ = s;
+            _ = ctx;
+            _ = reason;
+            var cancelled = o;
+            cancelled.status = .cancelled;
+            return cancelled;
+        }
+        pub fn lines(s: *@This(), ctx: *Context, orders: []const Order) ![]const Item {
+            _ = s;
+            _ = ctx;
+            return if (orders.len > 0) orders[0].items else &.{};
+        }
+    };
+    const acts = defs(Shop, .{ .prefix = "Shop." });
+    try std.testing.expectEqual(5, @typeInfo(@TypeOf(acts)).@"struct".field_names.len);
+    try std.testing.expectEqualStrings("Shop.ship", acts.ship.activity_name);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var impl: Shop = .{};
+    var ctx: Context = .{ .arena = a, .io_ = std.testing.io, .info_ = undefined, .logger_ = .{} };
+    const home: Address = .{ .line1 = "1 Main St", .city = "Springfield", .postal_code = "12345", .country = .us };
+    const zero: Money = .{ .amount_minor = 0, .currency = "USD".* };
+    const order: Order = .{
+        .id = "o-1",
+        .customer_id = "c-1",
+        .customer_email = "c@example.com",
+        .status = .placed,
+        .billing = home,
+        .shipping = home,
+        .items = &.{.{ .sku = "s-1", .name = "Widget", .quantity = 2, .unit_price = zero }},
+        .subtotal = zero,
+        .tax = zero,
+        .shipping_fee = zero,
+        .total = zero,
+    };
+    const args = try converter.toPayloads(a, .{ order, @as(?Address, null) });
+    const shipping = acts.ship.with(&impl);
+    const shipped = try converter.fromPayload(Order, a, try shipping.invoke(shipping.receiver, &ctx, args.items));
+    try std.testing.expectEqual(.shipped, shipped.status);
+    try std.testing.expectEqualStrings("Widget", shipped.items[0].name);
+}
+
 test "heartbeats reach the sink and details decode" {
     const Sink = struct {
         last: ?[]const u8 = null,
