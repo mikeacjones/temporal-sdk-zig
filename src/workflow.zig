@@ -168,6 +168,7 @@ const converter = @import("converter.zig");
 const failure_mod = @import("failure.zig");
 const log = @import("log.zig");
 const proto = @import("proto.zig");
+const search_attributes = @import("search_attributes.zig");
 const Instance = @import("workflow/Instance.zig");
 const WorkflowIo = @import("workflow/WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -289,6 +290,9 @@ pub const ChildWorkflowOptions = struct {
     /// Non-indexed values recorded with the child, built with `converter.toFields`. Only read
     /// while starting.
     memo: []const converter.Field = &.{},
+    /// The child's search attributes, built with `search_attributes.Key.set`; unsets are
+    /// ignored. A value the server can't index fails the start with `error.InvalidOptions`.
+    search_attributes: []const search_attributes.Update = &.{},
 };
 
 /// How `Context.continueAsNew` starts the next run.
@@ -302,6 +306,9 @@ pub const ContinueAsNewOptions = struct {
     /// The new run's memo, built with `converter.toFields`. Null (or an empty slice, which the
     /// command can't tell apart from null) keeps this run's memo, `upsertMemo` changes included.
     memo: ?[]const converter.Field = null,
+    /// The new run's search attributes, built with `search_attributes.Key.set` (unsets are
+    /// ignored). Null keeps this run's current search attributes, upserts included.
+    search_attributes: ?[]const search_attributes.Update = null,
     /// Null keeps this run's retry policy.
     retry_policy: ?RetryPolicy = null,
 };
@@ -387,7 +394,10 @@ pub const Context = struct {
     /// Only the workflow function's return continues as new. Calling this again replaces the
     /// earlier request. The error from a signal handler fails the workflow and from an update
     /// handler rejects the update, like any other error.
-    pub fn continueAsNew(ctx: *Context, comptime Workflow: type, options: ContinueAsNewOptions, args: Workflow.Args) error{ ContinueAsNew, OutOfMemory } {
+    ///
+    /// `error.InvalidSearchAttribute` means `options.search_attributes` holds a value the
+    /// server can't index; the run doesn't continue as new.
+    pub fn continueAsNew(ctx: *Context, comptime Workflow: type, options: ContinueAsNewOptions, args: Workflow.Args) error{ ContinueAsNew, OutOfMemory, InvalidSearchAttribute } {
         try ctx.instance.requestContinueAsNew(Workflow.workflow_name, options, args);
         return error.ContinueAsNew;
     }
@@ -534,6 +544,26 @@ pub const Context = struct {
     ///     try ctx.upsertMemo(.{ .status = "shipped", .reviewer = @as(?[]const u8, null) });
     pub fn upsertMemo(ctx: *Context, values: anytype) error{OutOfMemory}!void {
         return ctx.instance.upsertMemo(try converter.toFields(ctx.allocator(), values));
+    }
+
+    /// The workflow's search attributes: those it started with, with this run's
+    /// `upsertSearchAttributes` calls applied, sorted by name. Read a value with
+    /// `get(ctx.allocator(), key)`. The view lives in the run's arena; a later upsert leaves a
+    /// view returned earlier unchanged.
+    pub fn searchAttributes(ctx: *const Context) search_attributes.View {
+        return ctx.instance.search_attributes;
+    }
+
+    /// Sets and removes search attributes, in order: `updates` come from
+    /// `search_attributes.Key.set` and `unset`. Records the change in history and updates
+    /// `searchAttributes()` right away, the same way on replay. The attributes must exist on
+    /// the server; an unknown one fails the workflow task, which retries until it is
+    /// registered. `error.InvalidSearchAttribute` (logged) means a value the server can't
+    /// index, such as a NaN Double; nothing is recorded then.
+    ///
+    ///     try ctx.upsertSearchAttributes(&.{ status.set("shipped"), reviewer.unset() });
+    pub fn upsertSearchAttributes(ctx: *Context, updates: []const search_attributes.Update) search_attributes.EncodeError!void {
+        return ctx.instance.upsertSearchAttributes(updates);
     }
 
     pub const SetQueryHandlerError = error{
