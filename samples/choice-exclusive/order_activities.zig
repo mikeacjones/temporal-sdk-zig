@@ -11,24 +11,24 @@ pub const OrderActivities = struct {
         if (a.order_choices.len == 0) return error.NoOrderChoices;
         const source: std.Random.IoSource = .{ .io = ctx.io() };
         const order = a.order_choices[source.interface().uintLessThan(usize, a.order_choices.len)];
-        std.debug.print("Order is for {s}\n", .{order});
+        ctx.logger().info("Order is for", .{ .order = order });
         return order;
     }
 
-    pub fn orderApple(_: *OrderActivities, _: *activity.Context, choice: []const u8) !void {
-        std.debug.print("Order choice: {s}\n", .{choice});
+    pub fn orderApple(_: *OrderActivities, ctx: *activity.Context, choice: []const u8) !void {
+        ctx.logger().info("Order choice", .{ .choice = choice });
     }
 
-    pub fn orderBanana(_: *OrderActivities, _: *activity.Context, choice: []const u8) !void {
-        std.debug.print("Order choice: {s}\n", .{choice});
+    pub fn orderBanana(_: *OrderActivities, ctx: *activity.Context, choice: []const u8) !void {
+        ctx.logger().info("Order choice", .{ .choice = choice });
     }
 
-    pub fn orderCherry(_: *OrderActivities, _: *activity.Context, choice: []const u8) !void {
-        std.debug.print("Order choice: {s}\n", .{choice});
+    pub fn orderCherry(_: *OrderActivities, ctx: *activity.Context, choice: []const u8) !void {
+        ctx.logger().info("Order choice", .{ .choice = choice });
     }
 
-    pub fn orderOrange(_: *OrderActivities, _: *activity.Context, choice: []const u8) !void {
-        std.debug.print("Order choice: {s}\n", .{choice});
+    pub fn orderOrange(_: *OrderActivities, ctx: *activity.Context, choice: []const u8) !void {
+        ctx.logger().info("Order choice", .{ .choice = choice });
     }
 };
 

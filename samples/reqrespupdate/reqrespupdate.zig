@@ -40,53 +40,62 @@ fn uppercaseActivity(ctx: *activity.Context, input: []const u8) ![]const u8 {
 
 pub const UppercaseActivity = activity.Def("UppercaseActivity", uppercaseActivity);
 
-/// The workflow's state, shared by the workflow function, the update handler and its
-/// validator. It lives in `ctx.allocator()` memory so the handlers can outlive the function's
-/// stack frame.
-const Uppercaser = struct {
-    ctx: *workflow.Context,
-    request_count: u32 = 0,
+/// The workflow, continuing as new after `limit` requests. `UppercaseWorkflow` is the sample's
+/// version; tests use a smaller limit to reach continue-as-new quickly. Every version
+/// registers as "UppercaseWorkflow".
+pub fn UppercaseWorkflowWithLimit(comptime limit: u32) type {
+    return struct {
+        /// The workflow's state, shared by the workflow function, the update handler and its
+        /// validator. It lives in `ctx.allocator()` memory so the handlers can outlive the
+        /// function's stack frame.
+        const Uppercaser = struct {
+            ctx: *workflow.Context,
+            request_count: u32 = 0,
 
-    // Only one retry within five seconds. The timeout and retries decide how long a request
-    // can keep the workflow from continuing as new.
-    const activity_options: workflow.ActivityOptions = .{
-        .schedule_to_close_timeout = .fromSeconds(5),
-        .retry_policy = .{ .maximum_attempts = 2 },
+            // Only one retry within five seconds. The timeout and retries decide how long a
+            // request can keep the workflow from continuing as new.
+            const activity_options: workflow.ActivityOptions = .{
+                .schedule_to_close_timeout = .fromSeconds(5),
+                .retry_policy = .{ .maximum_attempts = 2 },
+            };
+
+            fn uppercase(u: *Uppercaser, request: Request) !Response {
+                u.request_count += 1;
+                const output = try u.ctx.executeActivity(UppercaseActivity, activity_options, .{request.input}).get();
+                return .{ .output = output };
+            }
+
+            /// Rejecting here keeps the update out of history, which matters when history is
+            /// what the workflow is trying to shed.
+            fn rejectWhileContinuingAsNew(u: *Uppercaser, request: Request) BackoffError!void {
+                _ = request;
+                if (u.request_count >= limit) return error.TryingToContinueAsNew;
+            }
+
+            fn readyToContinueAsNew(u: *Uppercaser) bool {
+                return u.request_count >= limit and u.ctx.allHandlersFinished();
+            }
+        };
+
+        fn run(ctx: *workflow.Context, reject_update_on_pending_continue_as_new: bool) !void {
+            const u = try ctx.allocator().create(Uppercaser);
+            u.* = .{ .ctx = ctx };
+            if (reject_update_on_pending_continue_as_new) {
+                try ctx.setUpdateHandlerWithValidator(Uppercase, u, Uppercaser.uppercase, Uppercaser.rejectWhileContinuingAsNew);
+            } else {
+                try ctx.setUpdateHandler(Uppercase, u, Uppercaser.uppercase);
+            }
+
+            // If requests arrive faster than they are handled, there is never a moment with no
+            // handler running and the workflow never gets past this.
+            try ctx.await(u, Uppercaser.readyToContinueAsNew);
+            return ctx.continueAsNew(Def, .{}, .{reject_update_on_pending_continue_as_new});
+        }
+
+        pub const Def = workflow.Def("UppercaseWorkflow", run);
     };
-
-    fn uppercase(u: *Uppercaser, request: Request) !Response {
-        u.request_count += 1;
-        const output = try u.ctx.executeActivity(UppercaseActivity, activity_options, .{request.input}).get();
-        return .{ .output = output };
-    }
-
-    /// Rejecting here keeps the update out of history, which matters when history is what
-    /// the workflow is trying to shed.
-    fn rejectWhileContinuingAsNew(u: *Uppercaser, request: Request) BackoffError!void {
-        _ = request;
-        if (u.request_count >= requests_before_continue_as_new) return error.TryingToContinueAsNew;
-    }
-
-    fn readyToContinueAsNew(u: *Uppercaser) bool {
-        return u.request_count >= requests_before_continue_as_new and u.ctx.allHandlersFinished();
-    }
-};
-
-fn uppercaseWorkflow(ctx: *workflow.Context, reject_update_on_pending_continue_as_new: bool) !void {
-    const u = try ctx.allocator().create(Uppercaser);
-    u.* = .{ .ctx = ctx };
-    if (reject_update_on_pending_continue_as_new) {
-        try ctx.setUpdateHandlerWithValidator(Uppercase, u, Uppercaser.uppercase, Uppercaser.rejectWhileContinuingAsNew);
-    } else {
-        try ctx.setUpdateHandler(Uppercase, u, Uppercaser.uppercase);
-    }
-
-    // If requests arrive faster than they are handled, there is never a moment with no
-    // handler running and the workflow never gets past this.
-    try ctx.await(u, Uppercaser.readyToContinueAsNew);
-    return ctx.continueAsNew(UppercaseWorkflow, .{}, .{reject_update_on_pending_continue_as_new});
 }
 
 /// Uppercases strings sent as "update" requests until it continues as new. Its argument is
 /// whether to reject requests once it is waiting to continue as new.
-pub const UppercaseWorkflow = workflow.Def("UppercaseWorkflow", uppercaseWorkflow);
+pub const UppercaseWorkflow = UppercaseWorkflowWithLimit(requests_before_continue_as_new).Def;
