@@ -15,8 +15,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # A clean build and the full suite take about ten minutes; anything longer is a hang.
-    timeout-minutes: 30
+    # A clean build and the full suite take about ten minutes on Linux and over twenty on
+    # macOS runners; the hang dump below fires first.
+    timeout-minutes: 50
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,4 +51,4 @@ jobs:
       # checks the results.
       - name: Run the samples against a dev server
         # A hang dumps every stuck process's stacks instead of waiting for the job timeout.
-        run: scripts/run-with-hang-dump.sh 1200 zig build samples-test --summary all
+        run: scripts/run-with-hang-dump.sh 2400 zig build samples-test --summary all
