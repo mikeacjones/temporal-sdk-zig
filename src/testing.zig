@@ -3209,6 +3209,36 @@ test "dev-server WorkflowEnvironment starts a workflow and awaits its result" {
     try testing.expect(before.durationTo(try env.now()).nanoseconds > 0);
 }
 
+test "client: an eager start hands the first workflow task to the worker on the same client" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The worker registers with the client when it starts running; a first workflow run to
+    // completion waits for that.
+    try testing.expectEqualStrings("Hello first!", try env.executeWorkflow(Fixtures.Hello, .{"first"}, a, null));
+
+    var eager = try env.startWorkflow(Fixtures.Hello, .{ .task_queue = "", .enable_eager_start = true }, .{"eager"});
+    defer eager.deinit();
+    try testing.expect(eager.eagerly_started);
+    try testing.expectEqualStrings("Hello eager!", try env.getResult(Fixtures.Hello, &eager, a, null));
+    // The worker took the eager task: had it rejected it, the task would have timed out.
+    const history = try env.client.fetchHistory(a, eager.id, eager.run_id);
+    for (history.events.items) |event| try testing.expect(event.attributes.? != .workflow_task_timed_out_event_attributes);
+
+    // Another client has no worker to take the task, so the workflow starts normally and the
+    // worker polls for it.
+    var other = try client_mod.Client.connect(testing.allocator, testing.io, env.server.clientOptions());
+    defer other.close();
+    var polled = try other.executeWorkflow(Fixtures.Hello, .{ .task_queue = env.task_queue, .enable_eager_start = true }, .{"polled"});
+    defer polled.deinit();
+    try testing.expect(!polled.eagerly_started);
+    try testing.expectEqualStrings("Hello polled!", try env.getResult(Fixtures.Hello, &polled, a, null));
+}
+
 test "WorkflowEnvironment runs a child workflow on the same worker, or a test double in its place" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
