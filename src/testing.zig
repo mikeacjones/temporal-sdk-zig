@@ -472,8 +472,20 @@ pub const WorkflowEnvironment = struct {
         return env.client.updateWithStartWorkflow(Workflow, try env.startOptions(Workflow.workflow_name, options, &generated_id), args, Update, update_args, update_options);
     }
 
+    /// Starts the worker if it isn't running, and waits until it polls (so an eager start
+    /// reaches it). A worker that fails to start returns its error here.
     fn ensureWorker(env: *WorkflowEnvironment) !void {
-        if (env.running == null) env.running = try env.io.concurrent(runWorker, .{&env.worker});
+        if (env.running != null) return;
+        env.running = try env.io.concurrent(runWorker, .{&env.worker});
+        env.worker.waitUntilRunning() catch |err| switch (err) {
+            error.WorkerFailedToStart => {
+                const result = env.running.?.await(env.io);
+                env.running = null;
+                try result;
+                return err;
+            },
+            else => |e| return e,
+        };
     }
 
     /// `options` with `id` and `task_queue` defaulted to a unique ID and the environment's
@@ -3237,10 +3249,8 @@ test "client: an eager start hands the first workflow task to the worker on the 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // The worker registers with the client when it starts running; a first workflow run to
-    // completion waits for that.
-    try testing.expectEqualStrings("Hello first!", try env.executeWorkflow(Fixtures.Hello, .{"first"}, a, null));
-
+    // startWorkflow starts the worker and waits until it is running, which is when it
+    // registers with the client.
     var eager = try env.startWorkflow(Fixtures.Hello, .{ .task_queue = "", .enable_eager_start = true }, .{"eager"});
     defer eager.deinit();
     try testing.expect(eager.eagerly_started);
