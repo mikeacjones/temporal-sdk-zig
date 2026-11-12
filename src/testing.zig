@@ -309,20 +309,22 @@ pub const WorkflowEnvironment = struct {
     }
 
     /// Registers a method activity bound to `receiver`. See `Worker.registerActivityWith`.
+    /// Naming rules: see `temporal.activity.Def`.
     pub fn registerActivityWith(env: *WorkflowEnvironment, comptime Activity: type, receiver: *Activity.Receiver) !void {
         return env.worker.registerActivityWith(Activity, receiver);
     }
 
     /// Registers several method activities bound to one receiver. See
-    /// `Worker.registerActivitiesWith`.
+    /// `Worker.registerActivitiesWith`. Naming rules: see `temporal.activity.Def`.
     pub fn registerActivitiesWith(env: *WorkflowEnvironment, receiver: anytype, comptime activities: anytype) !void {
         return env.worker.registerActivitiesWith(receiver, activities);
     }
 
-    /// Registers every activity method of the struct `impl` points to. See
+    /// Registers every activity method of the struct `impl` points to, under the names of
+    /// `acts`, the `temporal.activity.defs` value workflows call them through. See
     /// `Worker.registerActivities`.
-    pub fn registerActivities(env: *WorkflowEnvironment, impl: anytype, comptime options: activity.StructOptions) !void {
-        return env.worker.registerActivities(impl, options);
+    pub fn registerActivities(env: *WorkflowEnvironment, impl: anytype, comptime acts: anytype) !void {
+        return env.worker.registerActivities(impl, acts);
     }
 
     /// Registers `impl` in place of `Activity`: workflows calling `Activity` run `impl`.
@@ -1964,7 +1966,7 @@ test "WorkflowEnvironment registers a struct's activities, and workflows call th
     defer env.deinit();
     var shop: StructActivities.Shop = .{ .fee = 2 };
     try env.registerWorkflow(StructActivities.Order);
-    try env.registerActivities(&shop, .{ .prefix = "Shop." });
+    try env.registerActivities(&shop, StructActivities.acts);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const result = try env.executeWorkflow(StructActivities.Order, .{@as(u32, 10)}, arena.allocator(), null);

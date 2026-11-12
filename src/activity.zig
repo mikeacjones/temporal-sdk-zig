@@ -292,19 +292,20 @@ pub const Registered = struct {
 /// `executeActivity` and workers pass to `registerActivity`.
 ///
 /// Naming rules, enforced when a worker registers the activity:
-/// - `name` is the activity type. Several Defs may name one function; each name is an
-///   alias the worker registers and runs separately. There is no option to forbid this:
-///   workflows only call activities through a Def (or by an explicit name), so a second
-///   name exists only where code declares a second Def, for example to keep an old type
-///   running for workflows that still schedule it.
+/// - `name` is the activity type. One function may run under several names; the worker
+///   registers and runs each separately. There is no option to forbid this, because each
+///   extra name is written in code: a second Def, a pub alias in a struct passed to
+///   `Worker.registerActivities` (`pub const legacyCharge = charge;` registers both names),
+///   or one struct registered twice under different prefixes. A typical use keeps an old
+///   type running for workflows that still schedule it.
 /// - A worker holds each name once: registering a name again returns
 ///   `error.AlreadyRegistered`.
 /// - Names starting with "__temporal_" belong to the SDK and return
 ///   `error.ReservedActivityName`.
 /// - `Worker.registerActivityImpl` and `testing.WorkflowEnvironment.registerActivityAs`
 ///   register another implementation under an existing Def's name, such as a test double.
-/// - `defs` and `Worker.registerActivities` name each method of a struct as the prefix
-///   plus the method name.
+/// - `defs` names each activity method of a struct as the prefix plus the method name, and
+///   `Worker.registerActivities` registers the names of that same `defs` value.
 pub fn Def(comptime name: []const u8, comptime func: anytype) type {
     const F = @TypeOf(func);
     const params = @typeInfo(F).@"fn".param_types;
@@ -352,24 +353,32 @@ pub fn Def(comptime name: []const u8, comptime func: anytype) type {
     };
 }
 
-/// How `defs` and `Worker.registerActivities` name a struct's activity methods.
+/// How `defs` names a struct's activity methods.
 pub const StructOptions = struct {
     /// Prepended to each method name to form its activity type, for example "Billing." to
     /// register `charge` as "Billing.charge".
     prefix: []const u8 = "",
 };
 
-/// The activity Defs for the activity methods of struct `T`, under the names
-/// `Worker.registerActivities` registers with the same `options`. Workflows call them as
-/// fields of the result:
+/// The activity Defs for the activity methods of struct `T`, each named `options.prefix`
+/// plus the method name. Workflows call them as fields of the result, and workers register
+/// the same value with `Worker.registerActivities`, so both sides use the same names:
 ///
-///     const billing = activity.defs(Billing, .{ .prefix = "Billing." });
+///     pub const billing = activity.defs(Billing, .{ .prefix = "Billing." });
 ///     _ = try ctx.executeActivity(billing.charge, options, .{order}).get();
+///     try worker.registerActivities(&billing_impl, billing);
 ///
 /// An activity method is a pub fn shaped `fn (*T, *Context, args...) !Result` (or taking
-/// `*const T`). Other pub declarations, such as constants, `init`, or functions without a
-/// `*Context` second parameter, are skipped, so a struct can hold helpers next to its
-/// activities. A struct with no activity method is a compile error.
+/// `*const T`) that returns an error union. Other pub declarations, such as constants,
+/// `init`, functions without a `*Context` second parameter, or functions that can't fail,
+/// are skipped, so a struct can hold helpers next to its activities. A pub alias of an
+/// activity method is an activity under the alias's name too. A struct with no activity
+/// method is a compile error.
+///
+/// Declare the result outside `T`, or inside it without `pub`: finding `T`'s methods reads
+/// the type of each pub declaration of `T`, so a pub declaration of `defs(T, ...)` inside
+/// `T` depends on itself and fails to compile with a dependency loop. A file used as the
+/// struct follows the same rule at its top level.
 pub fn defs(comptime T: type, comptime options: StructOptions) MethodDefs(T, options) {
     return .{};
 }
@@ -406,7 +415,8 @@ fn isActivityMethod(comptime T: type, comptime F: type) bool {
         else => return false,
     };
     if (f.is_generic or f.param_types.len < 2) return false;
-    return (f.param_types[0] == *T or f.param_types[0] == *const T) and f.param_types[1] == *Context;
+    const fallible = if (f.return_type) |R| @typeInfo(R) == .error_union else false;
+    return fallible and (f.param_types[0] == *T or f.param_types[0] == *const T) and f.param_types[1] == *Context;
 }
 
 /// Defines a dynamic activity: one function that runs every activity type the worker has no
@@ -519,6 +529,8 @@ test "defs names each activity method with the prefix and skips other pub declar
         fee: u32,
 
         pub const currency = "EUR";
+        // Not pub, so finding the activity methods doesn't read it (see `defs`).
+        const own = defs(@This(), .{ .prefix = "Own." });
 
         pub fn init(fee: u32) @This() {
             return .{ .fee = fee };
@@ -538,6 +550,13 @@ test "defs names each activity method with the prefix and skips other pub declar
             return amount + b.fee;
         }
 
+        pub fn feeFor(b: *@This(), ctx: *Context, amount: u32) u32 {
+            _ = ctx;
+            return amount * b.fee;
+        }
+
+        pub const bill = charge;
+
         fn audit(b: *@This(), ctx: *Context) !void {
             _ = b;
             _ = ctx;
@@ -546,7 +565,10 @@ test "defs names each activity method with the prefix and skips other pub declar
     const plain = defs(Billing, .{});
     try std.testing.expectEqualStrings("charge", plain.charge.activity_name);
     try std.testing.expectEqualStrings("refund", plain.refund.activity_name);
-    try std.testing.expectEqual(2, @typeInfo(@TypeOf(plain)).@"struct".field_names.len);
+    try std.testing.expectEqualStrings("bill", plain.bill.activity_name);
+    try std.testing.expect(!@hasField(@TypeOf(plain), "feeFor"));
+    try std.testing.expectEqual(3, @typeInfo(@TypeOf(plain)).@"struct".field_names.len);
+    try std.testing.expectEqualStrings("Own.charge", Billing.own.charge.activity_name);
 
     const acts = defs(Billing, .{ .prefix = "Billing." });
     try std.testing.expectEqualStrings("Billing.charge", acts.charge.activity_name);
