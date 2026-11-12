@@ -2,12 +2,14 @@
 //! worker and starter and runs this.
 //!
 //! For each sample it starts the worker, runs the starter, checks the starter's output against
-//! the sample's sample.zon, then sends the worker SIGTERM and requires a clean exit. Workers and
+//! the sample's sample.zon, then sends the worker SIGTERM and requires a clean exit. Samples
+//! run `--jobs` at a time (default 4) against one dev server; each uses its own task queue and
+//! workflow IDs, and most of a run is spent waiting on timers. Workers and
 //! starters get the server's address through TEMPORAL_ADDRESS, an empty Temporal config file,
 //! and none of the caller's TEMPORAL_* settings, so a developer's default profile (which may
 //! point at Temporal Cloud) is never used.
 //!
-//! Usage: samples_runner <build-root> <work-dir> [--only <sample>] (<sample>:<program> <exe>)...
+//! Usage: samples_runner <build-root> <work-dir> [--only <sample>] [--jobs <n>] (<sample>:<program> <exe>)...
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -47,10 +49,17 @@ pub fn main(init: std.process.Init) !void {
     const root_path = args.next() orelse return usage();
     const work_path = args.next() orelse return usage();
     var only: ?[]const u8 = null;
+    var jobs: usize = 4;
     var samples: std.ArrayList(Sample) = .empty;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--only")) {
             only = args.next() orelse return usage();
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--jobs")) {
+            const text = args.next() orelse return usage();
+            jobs = std.fmt.parseInt(usize, text, 10) catch return usage();
+            if (jobs == 0) return usage();
             continue;
         }
         const exe = args.next() orelse return usage();
@@ -83,30 +92,34 @@ pub fn main(init: std.process.Init) !void {
     try env.put("TEMPORAL_NAMESPACE", "default");
     try env.put("TEMPORAL_CONFIG_FILE", config_path);
 
-    var results: std.ArrayList(Result) = .empty;
+    var selected: std.ArrayList(Sample) = .empty;
     for (samples.items) |sample| {
         if (only) |o| if (!std.mem.eql(u8, o, sample.name)) continue;
-        const start = Io.Timestamp.now(io, .awake);
-        const outcome = validate(gpa, io, arena, root, work, work_path, &env, sample);
-        const seconds = @as(f64, @floatFromInt(start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds)) / std.time.ns_per_s;
-        try results.append(arena, .{
-            .name = sample.name,
-            .ok = outcome == null,
-            .detail = outcome orelse "",
-            .seconds = seconds,
-        });
+        try selected.append(arena, sample);
     }
+    const results = try arena.alloc(Result, selected.items.len);
+    const arenas = try arena.alloc(std.heap.ArenaAllocator, selected.items.len);
+    for (arenas) |*a| a.* = .init(gpa);
+    defer for (arenas) |*a| a.deinit();
+    var queue: Queue = .{ .samples = selected.items, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env };
+    var lanes: Io.Group = .init;
+    for (0..@min(jobs, selected.items.len)) |_| lanes.concurrent(io, runLane, .{ gpa, io, &queue }) catch {
+        // No thread for another lane: this one and any started before it share the queue.
+        runLane(gpa, io, &queue);
+        break;
+    };
+    try lanes.await(io);
 
     var buf: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writer(io, &buf);
     const out = &stdout.interface;
     var failures: usize = 0;
     try out.print("\n{s:<32} {s:<6} {s:>7}  detail\n", .{ "sample", "result", "seconds" });
-    for (results.items) |r| {
+    for (results) |r| {
         if (!r.ok) failures += 1;
         try out.print("{s:<32} {s:<6} {d:>7.1}  {s}\n", .{ r.name, if (r.ok) "pass" else "FAIL", r.seconds, r.detail });
     }
-    try out.print("\n{d} samples, {d} passed, {d} failed\n", .{ results.items.len, results.items.len - failures, failures });
+    try out.print("\n{d} samples, {d} passed, {d} failed\n", .{ results.len, results.len - failures, failures });
     try out.flush();
     // Stop the server before exiting: std.process.exit skips defers, and a dev server left
     // running would hold zig build's output pipe open.
@@ -114,8 +127,37 @@ pub fn main(init: std.process.Init) !void {
     if (failures > 0) std.process.exit(1);
 }
 
+/// The samples left to validate, shared by the lanes that validate them concurrently.
+const Queue = struct {
+    samples: []const Sample,
+    /// Indexed like `samples`; each lane writes only the results of the samples it took.
+    results: []Result,
+    /// Indexed like `samples`: each sample's memory, results included. One per sample because
+    /// `std.heap.ArenaAllocator` is not thread-safe.
+    arenas: []std.heap.ArenaAllocator,
+    next: std.atomic.Value(usize) = .init(0),
+    root: Io.Dir,
+    work: Io.Dir,
+    work_path: []const u8,
+    env: *const std.process.Environ.Map,
+};
+
+/// Validates samples from `queue` until none are left.
+fn runLane(gpa: Allocator, io: Io, queue: *Queue) void {
+    while (true) {
+        const i = queue.next.fetchAdd(1, .monotonic);
+        if (i >= queue.samples.len) return;
+        const sample = queue.samples[i];
+        const arena = queue.arenas[i].allocator();
+        const start = Io.Timestamp.now(io, .awake);
+        const outcome = validate(gpa, io, arena, queue.root, queue.work, queue.work_path, queue.env, sample);
+        const seconds = @as(f64, @floatFromInt(start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds)) / std.time.ns_per_s;
+        queue.results[i] = .{ .name = sample.name, .ok = outcome == null, .detail = outcome orelse "", .seconds = seconds };
+    }
+}
+
 fn usage() noreturn {
-    std.log.err("usage: samples_runner <build-root> <work-dir> [--only <sample>] (<sample>:<program> <exe>)...", .{});
+    std.log.err("usage: samples_runner <build-root> <work-dir> [--only <sample>] [--jobs <n>] (<sample>:<program> <exe>)...", .{});
     std.process.exit(2);
 }
 
