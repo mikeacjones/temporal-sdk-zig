@@ -1289,12 +1289,35 @@ pub const Client = struct {
     /// the workflow has no handler for the query type, and `error.QueryRejected` when
     /// `options.reject_condition` matches the workflow's state.
     pub fn queryWorkflowWithOptions(c: *Client, comptime Query: type, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: Query.Args, options: QueryOptions) QueryError!Query.Result {
+        const result = try c.sendQuery(Query.query_name, arena, workflow_id, run_id, try converter.toPayloads(arena, args), options);
+        if (Query.Result == void) return;
+        return converter.fromPayload(Query.Result, arena, result orelse return error.InvalidPayload);
+    }
+
+    /// Sends the query named `query_type` with the tuple `args` to a workflow, for a caller
+    /// with no `workflow.QueryDef`, and returns the handler's result undecoded: decode it
+    /// with `get(T, arena)`. The value is absent when the server returns no result payload,
+    /// as for a handler that returns nothing. The payload lives in `arena`. Otherwise
+    /// behaves as `queryWorkflow`.
+    pub fn queryWorkflowByName(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: anytype) QueryError!converter.EncodedValue {
+        return c.queryWorkflowByNameWithOptions(query_type, arena, workflow_id, run_id, args, .{});
+    }
+
+    /// `queryWorkflowByName` with options, which behave as in `queryWorkflowWithOptions`:
+    /// `error.QueryFailed` when the handler fails or the workflow has no handler named
+    /// `query_type`, and `error.QueryRejected` when `options.reject_condition` matches.
+    pub fn queryWorkflowByNameWithOptions(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: anytype, options: QueryOptions) QueryError!converter.EncodedValue {
+        return .{ .payload = try c.sendQuery(query_type, arena, workflow_id, run_id, try converter.toPayloads(arena, args), options) };
+    }
+
+    /// Sends a query and returns its first result payload, or null when there is none.
+    fn sendQuery(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, query_args: std.ArrayList(converter.Payload), options: QueryOptions) QueryError!?converter.Payload {
         var status: ?RpcStatus = null;
         var header = try c.outgoingHeader(arena, options.context);
         const response = c.rpcCall(wfs.QueryWorkflowResponse, "QueryWorkflow", wfs.QueryWorkflowRequest{
             .namespace = c.namespace,
             .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
-            .query = .{ .query_type = Query.query_name, .query_args = .{ .payloads = try converter.toPayloads(arena, args) } },
+            .query = .{ .query_type = query_type, .query_args = .{ .payloads = query_args } },
             .query_reject_condition = switch (options.reject_condition) {
                 .none => .QUERY_REJECT_CONDITION_NONE,
                 .not_open => .QUERY_REJECT_CONDITION_NOT_OPEN,
@@ -1308,7 +1331,7 @@ pub const Client = struct {
                 // The server reports a failed query (a handler error or an unknown query
                 // type) as INVALID_ARGUMENT carrying a QueryFailedFailure detail.
                 if (s.code == 3 and s.hasDetail("temporal.api.errordetails.v1.QueryFailedFailure", arena)) return error.QueryFailed;
-                log.err("QueryWorkflow \"{s}\" on workflow {s} failed: {s} (gRPC status {d})", .{ Query.query_name, workflow_id, s.message, s.code });
+                log.err("QueryWorkflow \"{s}\" on workflow {s} failed: {s} (gRPC status {d})", .{ query_type, workflow_id, s.message, s.code });
                 return error.RpcFailed;
             },
             else => |e| return e,
@@ -1317,10 +1340,9 @@ pub const Client = struct {
             if (options.rejected_status) |st| st.* = @fromBackingInt(@intCast(@backingInt(rejected.status)));
             return error.QueryRejected;
         }
-        if (Query.Result == void) return;
-        const payloads = response.query_result orelse return error.InvalidPayload;
-        if (payloads.payloads.items.len == 0) return error.InvalidPayload;
-        return converter.fromPayload(Query.Result, arena, payloads.payloads.items[0]);
+        const payloads = response.query_result orelse return null;
+        if (payloads.payloads.items.len == 0) return null;
+        return payloads.payloads.items[0];
     }
 
     /// Sends `Update` (a `workflow.UpdateDef`) with `args` to a workflow and waits until the
