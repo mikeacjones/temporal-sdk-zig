@@ -77,6 +77,14 @@ pub const Info = struct {
     /// after `completeAsync`; like the other fields, it is freed once the activity's result
     /// has been reported.
     task_token: []const u8 = "",
+    /// When the activity was first scheduled. Null when the core didn't send it.
+    scheduled_time: ?std.Io.Timestamp = null,
+    /// When this attempt was scheduled: after a retry's backoff, later than `scheduled_time`.
+    /// Null when the core didn't send it.
+    current_attempt_scheduled_time: ?std.Io.Timestamp = null,
+    /// When this attempt started, as the server recorded it. Null when the core didn't send
+    /// it.
+    started_time: ?std.Io.Timestamp = null,
 };
 
 /// Why an activity was canceled.

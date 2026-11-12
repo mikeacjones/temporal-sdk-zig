@@ -686,8 +686,14 @@ pub const ActivityEnvironment = struct {
     /// records. Borrowed.
     metrics: metrics_mod.Handler = .noop,
 
+    /// An environment whose `info` says the activity was scheduled and started now.
     pub fn init(io: Io) ActivityEnvironment {
-        return .{ .io = io };
+        var env: ActivityEnvironment = .{ .io = io };
+        const now: Io.Timestamp = .now(io, .real);
+        env.info.scheduled_time = now;
+        env.info.current_attempt_scheduled_time = now;
+        env.info.started_time = now;
+        return env;
     }
 
     /// Calls the activity's function with `args`. The result is allocated from `arena`.
@@ -1881,8 +1887,13 @@ test "TestServer starts a time-skipping server a client can connect to" {
 test "ActivityEnvironment calls the activity directly" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
+    const before: Io.Timestamp = .now(testing.io, .real);
     const env: ActivityEnvironment = .init(testing.io);
     try testing.expectEqualStrings("Hello World!", try env.executeActivity(Fixtures.Greet, .{"World"}, arena.allocator()));
+    // The default info was scheduled and started when the environment was made.
+    try testing.expect(env.info.started_time.?.nanoseconds >= before.nanoseconds);
+    try testing.expectEqual(env.info.started_time.?, env.info.scheduled_time.?);
+    try testing.expectEqual(env.info.started_time.?, env.info.current_attempt_scheduled_time.?);
 }
 
 /// A history of samples/helloworld, whose workflow `Fixtures.Hello` matches.
@@ -4301,6 +4312,67 @@ test "codecs see the propagated key ID of the client call, the workflow run, and
         tagged += 1;
     }
     try testing.expectEqual(@as(usize, 4), tagged);
+}
+
+const InfoTimeFixtures = struct {
+    const Times = struct { workflow_start: i64, activity_scheduled: i64, activity_attempt_scheduled: i64, activity_started: i64 };
+
+    fn startedAt(ctx: *activity.Context) ![3]i64 {
+        const info = ctx.info();
+        return .{ nanos(info.scheduled_time), nanos(info.current_attempt_scheduled_time), nanos(info.started_time) };
+    }
+    const StartedAt = activity.Def("StartedAt", startedAt);
+
+    fn times(ctx: *workflow.Context) !Times {
+        const activity_times = try ctx.executeActivity(StartedAt, .{ .start_to_close_timeout = .fromSeconds(10) }, .{}).get();
+        return .{
+            .workflow_start = nanos(ctx.info().start_time),
+            .activity_scheduled = activity_times[0],
+            .activity_attempt_scheduled = activity_times[1],
+            .activity_started = activity_times[2],
+        };
+    }
+    const TimesWf = workflow.Def("InfoTimes", times);
+
+    /// Nanoseconds since the epoch, or -1 for null.
+    fn nanos(t: ?Io.Timestamp) i64 {
+        return if (t) |v| @intCast(v.nanoseconds) else -1;
+    }
+};
+
+test "workflow and activity info carry the start and schedule times the server recorded" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(InfoTimeFixtures.TimesWf);
+    try env.registerActivity(InfoTimeFixtures.StartedAt);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(InfoTimeFixtures.TimesWf, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    const times = try env.getResult(InfoTimeFixtures.TimesWf, &run, a, null);
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var started: ?i64 = null;
+    var scheduled: ?i64 = null;
+    var activity_started: ?i64 = null;
+    for (history.events.items) |event| {
+        const t = event.event_time orelse continue;
+        const ns: i64 = t.seconds * std.time.ns_per_s + t.nanos;
+        switch (event.attributes orelse continue) {
+            .workflow_execution_started_event_attributes => started = ns,
+            .activity_task_scheduled_event_attributes => scheduled = ns,
+            .activity_task_started_event_attributes => activity_started = ns,
+            else => {},
+        }
+    }
+    // Close, not equal: the server and the core may each stamp a time of their own.
+    const tolerance = std.time.ns_per_s;
+    try testing.expect(@abs(times.workflow_start - started.?) < tolerance);
+    try testing.expect(@abs(times.activity_scheduled - scheduled.?) < tolerance);
+    try testing.expect(@abs(times.activity_attempt_scheduled - scheduled.?) < tolerance);
+    try testing.expect(@abs(times.activity_started - activity_started.?) < tolerance);
+    try testing.expect(times.activity_started >= times.activity_scheduled);
 }
 
 /// A history of `Fixtures.Hello` run with `ReversingCodec`: every payload in it is encoded.
