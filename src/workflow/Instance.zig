@@ -60,6 +60,9 @@ task_queue: []const u8 = "",
 namespace: []const u8 = "",
 root: ?*WorkflowIo.Task = null,
 root_outcome: ?RootOutcome = null,
+/// The signal handler whose error failed the workflow, if one did; its failure details
+/// describe the workflow's failure. Arena memory.
+failed_handler: ?*HandlerRun = null,
 finished: bool = false,
 /// Set by `destroy`: waits that ignore workflow cancellation (an activity's cancellation
 /// completing) end with error.Canceled instead, so every coroutine can exit.
@@ -145,6 +148,10 @@ const HandlerRun = struct {
     },
     /// Set after spawning, before the coroutine first runs; freed when it returns.
     task: *WorkflowIo.Task = undefined,
+    /// This handler's `Context.fail` and the failure of the last activity or child future it
+    /// awaited; the workflow function's are in `Context`.
+    pending_failure: ?failure_mod.Application = null,
+    last_failure: ?*const Failure = null,
 };
 
 /// `continued_as_new`: the workflow function returned error.ContinueAsNew after
@@ -535,6 +542,7 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
                 if (inst.evicting) return;
                 if (inst.root_outcome == null) {
                     inst.root_outcome = .{ .failed = err };
+                    inst.failed_handler = run;
                 } else {
                     inst.logger.warn("a signal handler failed after the workflow finished; its error is ignored", .{ .SignalName = run.name, .error_name = err });
                 }
@@ -548,7 +556,7 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
             const response: cmd_pb.UpdateResponse.response_union = if (result) |payload|
                 .{ .completed = payload }
             else |err|
-                .{ .rejected = failure_mod.fromError(a, err) catch {
+                .{ .rejected = updateFailure(a, run, err) catch {
                     inst.task_failure = "out of memory rejecting an update whose handler failed";
                     return;
                 } };
@@ -557,6 +565,38 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
             };
         },
     }
+}
+
+/// An update handler's error as its rejection: the Application failure it described with
+/// `ctx.fail`, or the failure of the activity or child workflow whose error it returned.
+fn updateFailure(a: Allocator, run: *const HandlerRun, err: anyerror) error{OutOfMemory}!Failure {
+    switch (err) {
+        error.ApplicationFailure => if (run.pending_failure) |p| return failure_mod.application(a, p),
+        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted => if (run.last_failure) |f| return f.*,
+        else => {},
+    }
+    return failure_mod.fromError(a, err);
+}
+
+/// The handler run executing now, or null in the workflow function, the coroutines it
+/// started, and outside any coroutine. A coroutine that a handler starts with `io.async` or a
+/// `Group` isn't matched: its failure details go to the workflow function's.
+fn currentHandler(inst: *Instance) ?*HandlerRun {
+    const fiber = inst.sched.currentFiber() orelse return null;
+    for (inst.handlers.items) |run| if (run.task.fiber == fiber) return run;
+    return null;
+}
+
+/// Records `Context.fail`'s failure for the running coroutine: its handler run's, or the
+/// workflow function's.
+pub fn setPendingFailure(inst: *Instance, a: failure_mod.Application) void {
+    if (inst.currentHandler()) |run| run.pending_failure = a else inst.ctx.pending_failure = a;
+}
+
+/// Records the failure a future's `get` returned for the running coroutine, as
+/// `setPendingFailure` does. `f` must live as long as the run (arena memory).
+pub fn setLastFailure(inst: *Instance, f: ?*const Failure) void {
+    if (inst.currentHandler()) |run| run.last_failure = f else inst.ctx.last_failure = f;
 }
 
 fn removeHandler(inst: *Instance, run: *HandlerRun) void {
@@ -703,9 +743,13 @@ fn finishIfDone(inst: *Instance) !void {
 
 fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
     const a = inst.arena();
-    if (inst.ctx.pending_failure) |p| return failure_mod.application(a, p);
+    const pending, const last = if (inst.failed_handler) |run|
+        .{ run.pending_failure, run.last_failure }
+    else
+        .{ inst.ctx.pending_failure, inst.ctx.last_failure };
+    if (pending) |p| return failure_mod.application(a, p);
     switch (err) {
-        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted => if (inst.ctx.last_failure) |f| return f.*,
+        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted => if (last) |f| return f.*,
         // Only the workflow function's return of ctx.continueAsNew's error continues as new.
         error.ContinueAsNew => return failure_mod.application(a, .{
             .message = if (inst.continue_as_new == null)
@@ -1827,6 +1871,152 @@ test "an update handler context on the coroutine's stack is rejected" {
     const inst = try create(testing.allocator, UpdateOnStackWf.registered, .{});
     defer inst.destroy();
     try testing.expectEqualStrings("\"UpdateContextOnStack\"", completedWith(try inst.activate(&try initActivation(a, "UpdateOnStack", .{}), a)));
+}
+
+// Failure details of handlers: each signal or update handler keeps its own `ctx.fail` and
+// failed-future details, apart from the workflow function's.
+const HandlerFailures = struct {
+    const Charge = workflow.UpdateDef("charge", fn (amount: i64) i64);
+    const Refuse = workflow.UpdateDef("refuse", fn () void);
+    const Plain = workflow.UpdateDef("plain", fn () void);
+    const Explode = workflow.SignalDef("explode", fn () void);
+    const Done = workflow.SignalDef("done", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        done: bool = false,
+
+        fn charge(s: *State, amount: i64) !i64 {
+            _ = try s.ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"charge"}).get();
+            return amount;
+        }
+        fn refuse(s: *State) error{ApplicationFailure}!void {
+            return s.ctx.fail(.{ .message = "refused", .type = "Refusal", .non_retryable = true });
+        }
+        fn plain(_: *State) error{ApplicationFailure}!void {
+            return error.ApplicationFailure;
+        }
+        fn explode(s: *State) !void {
+            _ = try s.ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"explode"}).get();
+        }
+        fn finish(s: *State) void {
+            s.done = true;
+        }
+        fn finished(s: *State) bool {
+            return s.done;
+        }
+    };
+
+    /// Handles updates and signals until `done`. With `fail_first`, calls `ctx.fail` before
+    /// waiting and returns its error; otherwise fails with error.Finished.
+    fn run(ctx: *workflow.Context, fail_first: bool) !i64 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandler(Charge, s, State.charge);
+        try ctx.setUpdateHandler(Refuse, s, State.refuse);
+        try ctx.setUpdateHandler(Plain, s, State.plain);
+        try ctx.setSignalHandler(Explode, s, State.explode);
+        try ctx.setSignalHandler(Done, s, State.finish);
+        const early: ?error{ApplicationFailure} = if (fail_first) ctx.fail(.{ .message = "workflow failed", .type = "WorkflowFailed" }) else null;
+        try ctx.await(s, State.finished);
+        if (early) |e| return e;
+        return error.Finished;
+    }
+};
+const HandlerFailuresWf = workflow.Def("HandlerFailures", HandlerFailures.run);
+
+/// An activity failure caused by an application failure, as the server reports one.
+fn activityFailure(a: Allocator, message: []const u8, app_type: []const u8) !*Failure {
+    const cause = try a.create(Failure);
+    cause.* = try failure_mod.application(a, .{ .message = message, .type = app_type });
+    const f = try a.create(Failure);
+    f.* = .{ .message = "activity error", .failure_info = .{ .activity_failure_info = .{ .activity_type = .{ .name = "Activity" } } }, .cause = cause };
+    return f;
+}
+
+fn resolveFailed(a: Allocator, seq: u32, f: *const Failure) !act_pb.WorkflowActivation {
+    return oneJob(a, .{ .resolve_activity = .{ .seq = seq, .result = .{ .status = .{ .failed = .{ .failure = f.* } } } } });
+}
+
+test "update: a handler whose activity fails is rejected with the activity's failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, HandlerFailuresWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "HandlerFailures", .{false}), a);
+    const scheduled = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "charge", .{@as(i64, -5)}, true)), a));
+    try testing.expectEqual(@as(usize, 2), scheduled.len);
+    try testing.expect(scheduled[1].variant.? == .schedule_activity);
+
+    const cmds = commandsOf(try inst.activate(&try resolveFailed(a, 1, try activityFailure(a, "invalid Amount", "InvalidAmount")), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    const rejected = (try updateResponse(cmds[0], "u1")).rejected;
+    try testing.expectEqualStrings("activity error", rejected.message);
+    try testing.expect(rejected.failure_info.? == .activity_failure_info);
+    try testing.expectEqualStrings("invalid Amount", rejected.cause.?.message);
+    try testing.expectEqualStrings("InvalidAmount", failure_mod.applicationType(rejected.cause.?.*).?);
+
+    // The handler's activity failure doesn't become the workflow's.
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "done", .{})), a));
+    try testing.expectEqualStrings("Finished", done[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+test "update: ctx.fail in a handler rejects it with that failure, and doesn't fail the workflow" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, HandlerFailuresWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "HandlerFailures", .{false}), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "refuse", .{}, true)), a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    const rejected = (try updateResponse(cmds[1], "u1")).rejected;
+    try testing.expectEqualStrings("refused", rejected.message);
+    try testing.expectEqualStrings("Refusal", failure_mod.applicationType(rejected).?);
+    try testing.expect(rejected.failure_info.?.application_failure_info.non_retryable);
+
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "done", .{})), a));
+    const fail = done[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expectEqualStrings("Finished", fail.message);
+    try testing.expectEqualStrings("Finished", failure_mod.applicationType(fail).?);
+}
+
+test "update: the workflow function's ctx.fail doesn't describe a handler's rejection" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, HandlerFailuresWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "HandlerFailures", .{true}), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "plain", .{}, true)), a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    try testing.expectEqualStrings("ApplicationFailure", (try updateResponse(cmds[1], "u1")).rejected.message);
+
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "done", .{})), a));
+    const fail = done[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expectEqualStrings("workflow failed", fail.message);
+    try testing.expectEqualStrings("WorkflowFailed", failure_mod.applicationType(fail).?);
+}
+
+test "a signal handler's activity failure fails the workflow with that failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, HandlerFailuresWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "HandlerFailures", .{false}), a);
+    const scheduled = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "explode", .{})), a));
+    try testing.expectEqual(@as(usize, 1), scheduled.len);
+    const cmds = commandsOf(try inst.activate(&try resolveFailed(a, 1, try activityFailure(a, "invalid Amount", "InvalidAmount")), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    const fail = cmds[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expectEqualStrings("activity error", fail.message);
+    try testing.expectEqualStrings("invalid Amount", fail.cause.?.message);
 }
 
 // An activity raced against a timer.
