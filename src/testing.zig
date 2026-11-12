@@ -879,6 +879,34 @@ const Fixtures = struct {
     const LocalGreetingsChanged = workflow.Def("LocalGreetings", remoteGreetings);
 };
 
+const SideEffectFixtures = struct {
+    /// How many times `issue` has run, in any workflow: replay must not move it.
+    var issued: u32 = 0;
+
+    const Ticket = struct { number: u32, label: []const u8 };
+
+    fn issue(base: u32) Ticket {
+        issued += 1;
+        return .{ .number = base + issued, .label = "ticket" };
+    }
+
+    /// Records a ticket with a side effect, then waits on a timer so the run spans more than
+    /// one workflow task.
+    fn takeTicket(ctx: *workflow.Context, base: u32) ![]const u8 {
+        const ticket = try ctx.sideEffect(Ticket, base, issue);
+        try ctx.io().sleep(.fromMilliseconds(10), .awake);
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {d}", .{ ticket.label, ticket.number });
+    }
+    const TakeTicket = workflow.Def("TakeTicket", takeTicket);
+
+    fn takeTicketDirectly(ctx: *workflow.Context, base: u32) ![]const u8 {
+        const ticket = issue(base);
+        try ctx.io().sleep(.fromMilliseconds(10), .awake);
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {d}", .{ ticket.label, ticket.number });
+    }
+    const TakeTicketChanged = workflow.Def("TakeTicket", takeTicketDirectly);
+};
+
 const SignalFixtures = struct {
     const Approve = workflow.SignalDef("approve", fn (approver: []const u8) void);
 
@@ -2255,6 +2283,46 @@ test "WorkflowReplayer replays local activities and their backoff timers" {
     defer changed.deinit();
     try changed.registerWorkflow(Fixtures.LocalGreetingsChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(local_activity_history));
+}
+
+test "sideEffect records its value once, on a worker with no activities, and replay reads it back" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SideEffectFixtures.TakeTicket);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const before = SideEffectFixtures.issued;
+    var run = try env.startWorkflow(SideEffectFixtures.TakeTicket, .{ .task_queue = "" }, .{100});
+    defer run.deinit();
+    // getResult also replays the run, which must not issue another ticket.
+    const result = try env.getResult(SideEffectFixtures.TakeTicket, &run, a, null);
+    try testing.expectEqual(before + 1, SideEffectFixtures.issued);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "ticket {d}", .{100 + before + 1}), result);
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var markers: usize = 0;
+    for (history.events.items) |e| markers += @intFromBool(e.event_type == .EVENT_TYPE_MARKER_RECORDED);
+    try testing.expectEqual(1, markers);
+}
+
+/// A dev-server run of `SideEffectFixtures.TakeTicket` with base 100, exported with
+/// `temporal workflow show`.
+const side_effect_history = @embedFile("testdata/side_effect_history.json");
+
+test "WorkflowReplayer replays a side effect without calling its function and catches a dropped one" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(SideEffectFixtures.TakeTicket);
+    const before = SideEffectFixtures.issued;
+    try ok.replayHistoryJson(side_effect_history);
+    try testing.expectEqual(before, SideEffectFixtures.issued);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(SideEffectFixtures.TakeTicketChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(side_effect_history));
 }
 
 test "dev-server WorkflowEnvironment starts a workflow and awaits its result" {

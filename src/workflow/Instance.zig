@@ -27,6 +27,12 @@ const result_pb = proto.coresdk.activity_result;
 const common = proto.temporal.api.common.v1;
 const Failure = failure_mod.Failure;
 
+/// Activity types starting with this belong to the SDK; workers refuse to register them.
+pub const reserved_activity_prefix = "__temporal_";
+/// The local activity that records a side effect's value by returning its input. Histories
+/// name it in their markers, so it must never change.
+pub const side_effect_activity_type = reserved_activity_prefix ++ "side_effect";
+
 gpa: Allocator,
 arena_state: std.heap.ArenaAllocator,
 sched: Scheduler,
@@ -612,7 +618,7 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
 fn updateFailure(a: Allocator, run: *const HandlerRun, err: anyerror) error{OutOfMemory}!Failure {
     switch (err) {
         error.ApplicationFailure => if (run.pending_failure) |p| return failure_mod.application(a, p),
-        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed => if (run.last_failure) |f| return f.*,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed => if (run.last_failure) |f| return f.*,
         else => {},
     }
     return failure_mod.fromError(a, err);
@@ -799,7 +805,7 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
         .{ inst.ctx.pending_failure, inst.ctx.last_failure };
     if (pending) |p| return failure_mod.application(a, p);
     switch (err) {
-        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed => if (last) |f| return f.*,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed => if (last) |f| return f.*,
         // Only the workflow function's return of ctx.continueAsNew's error continues as new.
         error.ContinueAsNew => return failure_mod.application(a, .{
             .message = if (inst.continue_as_new == null)
