@@ -1755,6 +1755,66 @@ const ContinueFixtures = struct {
     const CountUpCompleting = workflow.Def("CountUp", countUpCompleting);
 };
 
+/// One workflow at each stage of a change from greeting to saying goodbye: before it, behind a
+/// patch, with the patch deprecated, and with it removed; and the same change made with
+/// version numbers.
+const PatchFixtures = struct {
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+
+    fn farewell(ctx: *activity.Context, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "Goodbye {s}!", .{name});
+    }
+    const Farewell = activity.Def("Farewell", farewell);
+
+    fn greet(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return ctx.executeActivity(Fixtures.Greet, opts, .{name}).get();
+    }
+    fn bid(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return ctx.executeActivity(Farewell, opts, .{name}).get();
+    }
+
+    const Original = workflow.Def("Patched", greet);
+
+    fn patched(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        if (ctx.patched("farewell")) return bid(ctx, name);
+        return greet(ctx, name);
+    }
+    const Patched = workflow.Def("Patched", patched);
+
+    fn deprecated(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        ctx.deprecatePatch("farewell");
+        return bid(ctx, name);
+    }
+    const Deprecated = workflow.Def("Patched", deprecated);
+
+    const Removed = workflow.Def("Patched", bid);
+
+    const VersionedOriginal = workflow.Def("Versioned", greet);
+
+    fn versionedOne(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const v = try ctx.getVersion("farewell", workflow.default_version, 1);
+        return if (v == workflow.default_version) greet(ctx, name) else bid(ctx, name);
+    }
+    const VersionedOne = workflow.Def("Versioned", versionedOne);
+
+    /// Version 2 says goodbye twice.
+    fn versionedTwo(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return switch (try ctx.getVersion("farewell", workflow.default_version, 2)) {
+            workflow.default_version => greet(ctx, name),
+            1 => bid(ctx, name),
+            else => std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ try bid(ctx, name), try bid(ctx, name) }),
+        };
+    }
+    const VersionedTwo = workflow.Def("Versioned", versionedTwo);
+
+    /// `versionedTwo` once no run uses an older version.
+    fn versionedTwoOnly(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        _ = try ctx.getVersion("farewell", 2, 2);
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ try bid(ctx, name), try bid(ctx, name) });
+    }
+    const VersionedTwoOnly = workflow.Def("Versioned", versionedTwoOnly);
+};
+
 const LocalFixtures = struct {
     var started: Io.Event = .unset;
     /// Set once `block` has seen a cancel; `seen_reason` is written before.
@@ -2013,6 +2073,68 @@ test "WorkflowReplayer replays a run that continued as new and catches one that 
     defer changed.deinit();
     try changed.registerWorkflow(ContinueFixtures.CountUpCompleting);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(continue_as_new_history));
+}
+
+/// Dev-server runs of the `PatchFixtures` stages with the argument "Temporal", each on a
+/// worker with only that stage registered, exported with `temporal workflow show`: before the
+/// change (`Original`), behind its patch (`Patched`, which recorded the "farewell" marker),
+/// and with the patch deprecated (`Deprecated`, a deprecated marker); and for the version
+/// numbers, before the change (`VersionedOriginal`) and at version 1 (`VersionedOne`, a
+/// "farewell@v1" marker).
+const patch_before_history = @embedFile("testdata/patch_before_history.json");
+const patch_marker_history = @embedFile("testdata/patch_marker_history.json");
+const patch_deprecated_history = @embedFile("testdata/patch_deprecated_history.json");
+const version_before_history = @embedFile("testdata/version_before_history.json");
+const version_one_history = @embedFile("testdata/version_one_history.json");
+
+/// Replays `json` with only `Workflow` registered.
+fn replayWith(comptime Workflow: type, json: []const u8) WorkflowReplayer.ReplayError!void {
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    try r.registerWorkflow(Workflow);
+    return r.replayHistoryJson(json);
+}
+
+test "WorkflowReplayer: a patch replays runs from before it and after it" {
+    try replayWith(PatchFixtures.Patched, patch_before_history);
+    try replayWith(PatchFixtures.Patched, patch_marker_history);
+    // Code from before the patch can't replay a run that took the new path.
+    try testing.expectError(error.Nondeterminism, replayWith(PatchFixtures.Original, patch_marker_history));
+}
+
+test "WorkflowReplayer: deprecatePatch replays patched runs, and only then can the call go" {
+    try replayWith(PatchFixtures.Deprecated, patch_marker_history);
+    try replayWith(PatchFixtures.Deprecated, patch_deprecated_history);
+    // The old path is gone.
+    try testing.expectError(error.Nondeterminism, replayWith(PatchFixtures.Deprecated, patch_before_history));
+    // Without the call, a deprecated marker replays but a plain one doesn't: removing the
+    // patch before deprecating it breaks the runs that recorded it.
+    try replayWith(PatchFixtures.Removed, patch_deprecated_history);
+    try testing.expectError(error.Nondeterminism, replayWith(PatchFixtures.Removed, patch_marker_history));
+}
+
+test "WorkflowReplayer: getVersion replays each run on the version it recorded" {
+    try replayWith(PatchFixtures.VersionedOne, version_before_history);
+    try replayWith(PatchFixtures.VersionedOne, version_one_history);
+    try replayWith(PatchFixtures.VersionedTwo, version_before_history);
+    try replayWith(PatchFixtures.VersionedTwo, version_one_history);
+    // Dropping support for the default version and version 1 fails the workflow task.
+    try testing.expectError(error.ReplayFailed, replayWith(PatchFixtures.VersionedTwoOnly, version_before_history));
+    try testing.expectError(error.ReplayFailed, replayWith(PatchFixtures.VersionedTwoOnly, version_one_history));
+}
+
+test "patches and versions take the new path on a first run, which then replays" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try env.registerWorkflow(PatchFixtures.Patched);
+    try env.registerWorkflow(PatchFixtures.VersionedTwo);
+    try env.registerActivity(Fixtures.Greet);
+    try env.registerActivity(PatchFixtures.Farewell);
+    // executeWorkflow replays each finished run's history too.
+    try testing.expectEqualStrings("Goodbye Temporal!", try env.executeWorkflow(PatchFixtures.Patched, .{"Temporal"}, arena.allocator(), null));
+    try testing.expectEqualStrings("Goodbye Temporal! Goodbye Temporal!", try env.executeWorkflow(PatchFixtures.VersionedTwo, .{"Temporal"}, arena.allocator(), null));
 }
 
 test "WorkflowReplayer replays a batch of histories through one worker and reports each outcome" {
