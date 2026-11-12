@@ -136,9 +136,11 @@ pub fn build(b: *std.Build) void {
 /// uses. The samples runner reads the rest of sample.zon.
 const Sample = struct { name: []const u8, tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{} };
 
-/// Every directory under samples/ with a sample.zon, by name.
+/// Every directory under samples/ with a sample.zon, by name. The listing and the manifests
+/// are configure inputs, so adding a sample or changing its manifest reconfigures the build.
 fn findSamples(b: *std.Build) []const Sample {
     const io = b.graph.io;
+    b.dependOnDirectoryContents(b.path("samples"));
     var dir = b.root.openDir(io, "samples", .{ .iterate = true }) catch |err| std.debug.panic("cannot open samples/: {t}", .{err});
     defer dir.close(io);
     var found: std.ArrayList(Sample) = .empty;
@@ -146,6 +148,7 @@ fn findSamples(b: *std.Build) []const Sample {
     while (it.next(io) catch |err| std.debug.panic("cannot list samples/: {t}", .{err})) |entry| {
         if (entry.kind != .directory) continue;
         const manifest_path = b.fmt("samples/{s}/sample.zon", .{entry.name});
+        b.dependOnFileContents(b.path(manifest_path));
         const source = dir.readFileAllocOptions(io, manifest_path["samples/".len..], b.allocator, .limited(64 * 1024), .of(u8), 0) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => std.debug.panic("cannot read {s}: {t}", .{ manifest_path, err }),
