@@ -196,8 +196,8 @@ pub const StartWorkflowAction = struct {
     workflow_type: []const u8,
     /// The encoded arguments.
     args: []const converter.Payload = &.{},
-    /// The workflow ID. Each start appends the scheduled time ("<id>-<RFC 3339 time>") so
-    /// runs don't collide, unless `Policies.keep_original_workflow_id` is set.
+    /// The workflow ID. The server may append a timestamp to it for each start so runs
+    /// don't collide, unless `Policies.keep_original_workflow_id` is set.
     id: []const u8,
     task_queue: []const u8,
     execution_timeout: ?Duration = null,
@@ -305,12 +305,12 @@ pub const OverlapPolicy = enum(i32) {
 
 pub const Policies = struct {
     overlap: OverlapPolicy = .unspecified,
-    /// How late an action may still be taken after the server was unavailable. Null uses
-    /// the server's default (a year).
+    /// How late an action may still be taken after the server was unavailable; at least 10
+    /// seconds. Null uses the server's default, one year.
     catchup_window: ?Duration = null,
     /// Pause the schedule when a workflow it started fails or times out.
     pause_on_failure: bool = false,
-    /// Start every workflow with `StartWorkflowAction.id` as it is, with no time appended.
+    /// Start every workflow with `StartWorkflowAction.id` as it is, with no timestamp appended.
     /// Overlapping starts then conflict.
     keep_original_workflow_id: bool = false,
 };
