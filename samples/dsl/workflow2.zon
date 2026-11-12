@@ -1,0 +1,29 @@
+// Three steps in sequence:
+// 1) SampleActivity1 takes arg1 and stores its result in result1.
+// 2) A parallel block runs two sequences concurrently:
+//    2.1) SampleActivity2 takes result1 and stores result2; then SampleActivity3 takes arg2
+//         and result2 and stores result3.
+//    2.2) SampleActivity4 takes result1 and stores result4; then SampleActivity5 takes arg3
+//         and result4 and stores result5.
+// 3) SampleActivity1 takes result3 and result5 and stores its result in result6.
+.{
+    .variables = .{
+        .{ .name = "arg1", .value = "value1" },
+        .{ .name = "arg2", .value = "value2" },
+        .{ .name = "arg3", .value = "value3" },
+    },
+    .root = .{ .sequence = .{ .elements = .{
+        .{ .activity = .{ .name = "SampleActivity1", .arguments = .{"arg1"}, .result = "result1" } },
+        .{ .parallel = .{ .branches = .{
+            .{ .sequence = .{ .elements = .{
+                .{ .activity = .{ .name = "SampleActivity2", .arguments = .{"result1"}, .result = "result2" } },
+                .{ .activity = .{ .name = "SampleActivity3", .arguments = .{ "arg2", "result2" }, .result = "result3" } },
+            } } },
+            .{ .sequence = .{ .elements = .{
+                .{ .activity = .{ .name = "SampleActivity4", .arguments = .{"result1"}, .result = "result4" } },
+                .{ .activity = .{ .name = "SampleActivity5", .arguments = .{ "arg3", "result4" }, .result = "result5" } },
+            } } },
+        } } },
+        .{ .activity = .{ .name = "SampleActivity1", .arguments = .{ "result3", "result5" }, .result = "result6" } },
+    } } },
+}
