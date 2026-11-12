@@ -776,6 +776,7 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         .execution_timeout = zigDuration(init.workflow_execution_timeout),
         .run_timeout = zigDuration(init.workflow_run_timeout),
         .task_timeout = zigDuration(init.workflow_task_timeout),
+        .start_time = zigTimestamp(init.start_time),
     };
     if (init.parent_workflow_info) |p| inst.info.parent = .{
         .namespace = try a.dupe(u8, p.namespace),
@@ -1599,6 +1600,11 @@ fn dupeFailure(a: Allocator, f: ?Failure) !*const Failure {
     const out = try a.create(Failure);
     out.* = if (f) |v| try v.dupe(a) else .{ .message = "failed without a failure from the core" };
     return out;
+}
+
+fn zigTimestamp(t: ?proto.google.protobuf.Timestamp) ?std.Io.Timestamp {
+    const v = t orelse return null;
+    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
 }
 
 fn zigDuration(d: ?proto.google.protobuf.Duration) ?std.Io.Duration {
@@ -3020,6 +3026,7 @@ test "last completion result, cron info, and activities by name" {
     try init.last_completion_result.?.payloads.append(a, try converter.toPayload(a, @as(i64, 41)));
     const first = commandsOf(try inst.activate(&act, a));
     try testing.expectEqualStrings("* * * * *", inst.info.cron_schedule);
+    try testing.expect(inst.info.start_time == null);
     const sched = first[0].variant.?.schedule_activity;
     try testing.expectEqualStrings("Tick", sched.activity_type);
     try testing.expectEqualStrings("41", sched.arguments.items[0].data);
@@ -3028,7 +3035,7 @@ test "last completion result, cron info, and activities by name" {
     try testing.expectEqualStrings("42", done[0].variant.?.complete_workflow_execution.result.?.data);
 }
 
-test "info: parent and root are null for a top-level workflow and set for a child" {
+test "info: parent and root are null for a top-level workflow and set for a child; start time from the start" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -3045,7 +3052,9 @@ test "info: parent and root are null for a top-level workflow and set for a chil
     const init = &act.jobs.items[0].variant.?.initialize_workflow;
     init.parent_workflow_info = .{ .namespace = "parent-ns", .workflow_id = "parent-id", .run_id = "parent-run" };
     init.root_workflow = .{ .workflow_id = "root-id", .run_id = "root-run" };
+    init.start_time = .{ .seconds = 1_700_000_000, .nanos = 5 };
     _ = try inst.activate(&act, a);
+    try testing.expectEqual(@as(i96, 1_700_000_000 * std.time.ns_per_s + 5), inst.ctx.info().start_time.?.nanoseconds);
     const parent = inst.ctx.info().parent.?;
     try testing.expectEqualStrings("parent-ns", parent.namespace);
     try testing.expectEqualStrings("parent-id", parent.workflow_id);

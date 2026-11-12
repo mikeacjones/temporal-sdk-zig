@@ -716,18 +716,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     };
     // The context already exists: a cancel may have set its reason.
     ctx.arena = a;
-    ctx.info_ = .{
-        .activity_id = start.activity_id,
-        .activity_type = start.activity_type,
-        .task_queue = w.task_queue,
-        .workflow_id = execution.workflow_id,
-        .workflow_run_id = execution.run_id,
-        .workflow_type = start.workflow_type,
-        .workflow_namespace = start.workflow_namespace,
-        .attempt = start.attempt,
-        .is_local = start.is_local,
-        .task_token = run.task_token,
-    };
+    ctx.info_ = activityInfo(start, w.task_queue, run.task_token);
     ctx.logger_ = try (log_mod.Logger{ .sink = w.logSink() }).with(a, .{
         .ActivityID = start.activity_id,
         .ActivityType = start.activity_type,
@@ -780,6 +769,31 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };
+}
+
+/// An activity's info from its Start task; borrows `start`'s memory.
+fn activityInfo(start: *const task_pb.Start, task_queue: []const u8, task_token: []const u8) activity.Info {
+    const execution = start.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
+    return .{
+        .activity_id = start.activity_id,
+        .activity_type = start.activity_type,
+        .task_queue = task_queue,
+        .workflow_id = execution.workflow_id,
+        .workflow_run_id = execution.run_id,
+        .workflow_type = start.workflow_type,
+        .workflow_namespace = start.workflow_namespace,
+        .attempt = start.attempt,
+        .is_local = start.is_local,
+        .task_token = task_token,
+        .scheduled_time = zigTimestamp(start.scheduled_time),
+        .current_attempt_scheduled_time = zigTimestamp(start.current_attempt_scheduled_time),
+        .started_time = zigTimestamp(start.started_time),
+    };
+}
+
+fn zigTimestamp(t: ?proto.google.protobuf.Timestamp) ?Io.Timestamp {
+    const v = t orelse return null;
+    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
 }
 
 /// Decodes the activity's header, extracts its propagated values into `run.ctx`, and decodes
@@ -1516,6 +1530,20 @@ const ContextRecordingCodec = struct {
         try r.calls.append(r.arena, call);
     }
 };
+
+test "an activity's info carries its Start task's schedule and start times" {
+    var start: task_pb.Start = .{ .activity_id = "1", .activity_type = "Charge", .attempt = 2 };
+    try testing.expect(activityInfo(&start, "tq", "token").started_time == null);
+    start.scheduled_time = .{ .seconds = 100 };
+    start.current_attempt_scheduled_time = .{ .seconds = 105, .nanos = 7 };
+    start.started_time = .{ .seconds = 106 };
+    const info = activityInfo(&start, "tq", "token");
+    try testing.expectEqual(@as(i96, 100 * std.time.ns_per_s), info.scheduled_time.?.nanoseconds);
+    try testing.expectEqual(@as(i96, 105 * std.time.ns_per_s + 7), info.current_attempt_scheduled_time.?.nanoseconds);
+    try testing.expectEqual(@as(i96, 106 * std.time.ns_per_s), info.started_time.?.nanoseconds);
+    try testing.expectEqualStrings("Charge", info.activity_type);
+    try testing.expectEqual(@as(u32, 2), info.attempt);
+}
 
 const CodecContextTest = struct {
     fn echo(ctx: *workflow.Context, text: []const u8) ![]const u8 {

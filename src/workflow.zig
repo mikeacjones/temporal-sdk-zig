@@ -204,6 +204,9 @@ pub const Info = struct {
     /// The top-level workflow at the root of this one's chain of parents, or null when this
     /// workflow is the root. Its namespace is the parent's: a child runs in its parent's.
     root: ?WorkflowExecution = null,
+    /// When this run started, as the server recorded it; the same on every replay. Null when
+    /// the server didn't send it.
+    start_time: ?std.Io.Timestamp = null,
 };
 
 pub const RetryPolicy = struct {
