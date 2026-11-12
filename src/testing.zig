@@ -2672,3 +2672,75 @@ test "an activity that completes async stays started on the server; a local one 
 
     try testing.expectEqualStrings("LocalActivityCompleteAsync", try env.executeWorkflow(AsyncFixtures.ApproveLocally, .{}, a, null));
 }
+
+test "client: complete an async activity by task token or by ID; completing it again is NotFound" {
+    const env = try AsyncFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var by_token = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer by_token.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    try env.client.completeActivity(AsyncFixtures.token, @as([]const u8, "approved by token"));
+    try testing.expectEqualStrings("approved by token", try env.getResult(AsyncFixtures.Approve, &by_token, a, null));
+    try testing.expectError(error.NotFound, env.client.completeActivity(AsyncFixtures.token, @as([]const u8, "again")));
+
+    AsyncFixtures.reset();
+    var by_id = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer by_id.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    const id: client_mod.ActivityId = .{ .workflow_id = by_id.id, .run_id = by_id.run_id, .activity_id = AsyncFixtures.activity_id };
+    try env.client.completeActivityById(id, @as([]const u8, "approved by ID"));
+    try testing.expectEqualStrings("approved by ID", try env.getResult(AsyncFixtures.Approve, &by_id, a, null));
+    try testing.expectError(error.NotFound, env.client.completeActivityById(id, @as([]const u8, "again")));
+}
+
+test "client: fail an async activity by ID or by task token" {
+    const env = try AsyncFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var by_id = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer by_id.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    const id: client_mod.ActivityId = .{ .workflow_id = by_id.id, .activity_id = AsyncFixtures.activity_id };
+    try env.client.failActivityById(id, .{ .message = "over budget", .type = "Declined" });
+    try testing.expectEqualStrings("failed: Declined over budget", try env.getResult(AsyncFixtures.Approve, &by_id, a, null));
+    try testing.expectError(error.NotFound, env.client.failActivityById(id, .{ .message = "again" }));
+
+    AsyncFixtures.reset();
+    var by_token = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer by_token.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    try env.client.failActivity(AsyncFixtures.token, .{ .message = "missing receipt", .type = "Declined", .non_retryable = true });
+    try testing.expectEqualStrings("failed: Declined missing receipt", try env.getResult(AsyncFixtures.Approve, &by_token, a, null));
+}
+
+test "client: heartbeating an async activity reports its cancellation once the workflow cancels it" {
+    const env = try AsyncFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    const token = AsyncFixtures.token;
+    const id: client_mod.ActivityId = .{ .workflow_id = run.id, .run_id = run.run_id, .activity_id = AsyncFixtures.activity_id };
+    try testing.expect(!try env.client.recordActivityHeartbeat(token, @as(u32, 1)));
+    try testing.expect(!try env.client.recordActivityHeartbeatById(id, {}));
+
+    // Canceling the run cancels the activity, and the workflow waits for it to report.
+    try env.client.cancelWorkflow(run.id, run.run_id, "testing async activity cancellation");
+    while (!try env.client.recordActivityHeartbeat(token, @as(u32, 2))) try testing.io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expect(try env.client.recordActivityHeartbeatById(id, {}));
+    try env.client.reportActivityCancellationById(id, @as([]const u8, "stopped at step 2"));
+    try testing.expectError(error.WorkflowCanceled, env.getResult(AsyncFixtures.Approve, &run, a, null));
+    try testing.expectError(error.NotFound, env.client.reportActivityCancellation(token, {}));
+    try testing.expectError(error.NotFound, env.client.recordActivityHeartbeat(token, {}));
+}
