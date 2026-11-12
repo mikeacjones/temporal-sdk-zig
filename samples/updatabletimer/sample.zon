@@ -1,6 +1,6 @@
 // How samples-test validates this sample: start the worker, run the starter, and check that
 // the starter's output contains each `expect` line before `timeout_seconds`.
 .{
-    .expect = .{"updatabletimer sample is a placeholder"},
+    .expect = .{ "Queried wake-up time", "Signaled workflow to update wake-up time", "Workflow woke up and completed" },
     .timeout_seconds = 60,
 }
