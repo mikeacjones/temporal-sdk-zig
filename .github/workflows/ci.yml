@@ -28,6 +28,9 @@ jobs:
       - name: Check that the sdk-core pin, cargo workspace and proto list agree
         run: scripts/check-core-version.sh
 
+      - name: Check that samples/dispatch.zig lists every sample
+        run: zig build samples-index && git diff --exit-code samples/dispatch.zig
+
   unit-test:
     strategy:
       fail-fast: false
