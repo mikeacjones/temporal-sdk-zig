@@ -255,6 +255,9 @@ pub const WorkflowEnvironment = struct {
         var client_options = env.server.clientOptions();
         client_options.codecs = options.codecs;
         client_options.logger = options.logger;
+        // The time-skipping test server reports an old server version, which makes the core
+        // warn about heartbeat details on every worker start.
+        if (kind == .time_skipping) client_options.core_log_level = .err;
         env.client = try client_mod.Client.connect(gpa, io, client_options);
         errdefer env.client.close();
         var suffix: [8]u8 = undefined;
