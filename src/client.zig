@@ -18,6 +18,7 @@ const converter = @import("converter.zig");
 const search_attributes = @import("search_attributes.zig");
 const failure_mod = @import("failure.zig");
 const history_mod = @import("history.zig");
+const schedule = @import("schedule.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Duration = Io.Duration;
@@ -505,6 +506,55 @@ pub const Client = struct {
         }
     }
 
+    /// Creates the schedule `id` and returns a handle to it. Returns
+    /// `error.ScheduleAlreadyExists` if a schedule with that ID exists. The server rejects an
+    /// invalid spec or action with `error.RpcFailed`, logging why.
+    pub fn createSchedule(c: *Client, id: []const u8, options: schedule.CreateOptions) CreateScheduleError!ScheduleHandle {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var request: wfs.CreateScheduleRequest = .{
+            .namespace = c.namespace,
+            .schedule_id = id,
+            .schedule = try options.schedule.toProto(a, null),
+            .identity = c.identity,
+            .request_id = try uuid(a, c.io),
+        };
+        if (options.trigger_immediately or options.backfill.len > 0) {
+            var patch: proto.temporal.api.schedule.v1.SchedulePatch = .{};
+            if (options.trigger_immediately) patch.trigger_immediately = .{};
+            try patch.backfill_request.ensureTotalCapacity(a, options.backfill.len);
+            for (options.backfill) |b| patch.backfill_request.appendAssumeCapacity(b.toProto());
+            request.initial_patch = patch;
+        }
+        if (options.memo.len > 0) {
+            var memo: proto.temporal.api.common.v1.Memo = .{};
+            try memo.fields.ensureTotalCapacity(a, options.memo.len);
+            for (options.memo) |field| memo.fields.appendAssumeCapacity(.{ .key = field.name, .value = field.value });
+            request.memo = memo;
+        }
+        if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
+        _ = c.rpc(wfs.CreateScheduleResponse, "CreateSchedule", request, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.ScheduleAlreadyExists,
+            else => |e| return e,
+        };
+        return c.getScheduleHandle(id);
+    }
+
+    /// A handle to the schedule `id`. No call is made, so a missing schedule shows up as
+    /// `error.NotFound` from the handle's methods.
+    pub fn getScheduleHandle(c: *Client, id: []const u8) error{OutOfMemory}!ScheduleHandle {
+        return .{ .client = c, .id = try c.gpa.dupe(u8, id) };
+    }
+
+    /// Lists the namespace's schedules, or those matching `options.query`. Eventually
+    /// consistent: a schedule created or changed a moment ago may be missing or out of date.
+    /// The iterator fetches a page at a time as `next` reaches it; nothing is fetched here.
+    /// Free it with `deinit`.
+    pub fn listSchedules(c: *Client, options: schedule.ListOptions) error{OutOfMemory}!ScheduleIterator {
+        return .{ .client = c, .query = try c.gpa.dupe(u8, options.query), .page_size = options.page_size, .page = .init(c.gpa) };
+    }
+
     /// Sends `Query` (a `workflow.QueryDef`) with `args` to a workflow and returns the
     /// handler's result, decoded into `arena`. An empty `run_id` queries the latest run. A
     /// closed workflow still answers: the server has a worker replay its history. The server
@@ -930,6 +980,230 @@ pub const WorkflowExecutionIterator = struct {
         c.gpa.free(it.next_page_token);
         it.next_page_token = token;
         it.executions = response.executions.items;
+        it.fetched = true;
+    }
+};
+
+pub const CreateScheduleError = error{
+    OutOfMemory,
+    Canceled,
+    /// Also an invalid schedule; the server's reason is logged.
+    RpcFailed,
+    /// The client's namespace doesn't exist.
+    NotFound,
+    InvalidResponse,
+    ScheduleAlreadyExists,
+    /// A search attribute value the server can't index (logged).
+    InvalidSearchAttribute,
+};
+
+pub const ScheduleError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    /// No such schedule.
+    NotFound,
+    InvalidResponse,
+};
+
+/// A schedule on the server, from `Client.createSchedule` or `Client.getScheduleHandle`.
+/// Owns its ID with the client's allocator; free with `deinit`. Each method is one call to
+/// the server, so a handle can be used from several threads at once.
+pub const ScheduleHandle = struct {
+    client: *Client,
+    id: []u8,
+
+    pub fn deinit(h: *ScheduleHandle) void {
+        h.client.gpa.free(h.id);
+        h.* = undefined;
+    }
+
+    /// The schedule, its recent and upcoming actions, memo and search attributes. The
+    /// description and all its memory come from `arena`.
+    pub fn describe(h: *const ScheduleHandle, arena: Allocator) ScheduleError!schedule.Description {
+        const c = h.client;
+        const response = c.rpc(wfs.DescribeScheduleResponse, "DescribeSchedule", wfs.DescribeScheduleRequest{
+            .namespace = c.namespace,
+            .schedule_id = h.id,
+        }, arena) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+        return schedule.Description.fromProto(arena, h.id, response);
+    }
+
+    /// Changes the schedule by read-modify-write: describes it, calls
+    /// `f(context, &description)`, and sends the `schedule.Update` it returns; null leaves
+    /// the schedule as it is. The update carries the description's conflict token, so the
+    /// server doesn't apply it over a change made since the describe. The server applies the
+    /// update's search attributes a moment after the call returns.
+    ///
+    /// The description's memory is freed when `update` returns. Whatever the callback puts
+    /// into the update must live at least that long: memory owned by `context` or static
+    /// data, never a literal like `&.{...}` with run-time values, which lives on the
+    /// callback's stack.
+    ///
+    ///     const hourly = [_]schedule.Interval{.{ .every = .fromSeconds(3600) }};
+    ///     try handle.update(@as([]const schedule.Interval, &hourly), struct {
+    ///         fn f(intervals: []const schedule.Interval, d: *schedule.Description) !?schedule.Update {
+    ///             d.schedule.spec.intervals = intervals;
+    ///             return .{ .schedule = d.schedule };
+    ///         }
+    ///     }.f);
+    pub fn update(h: *const ScheduleHandle, context: anytype, comptime f: anytype) (UpdateScheduleError || CallbackError(f))!void {
+        const c = h.client;
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var description = try h.describe(a);
+        const changes: schedule.Update = (try f(context, &description)) orelse return;
+        _ = c.rpc(wfs.UpdateScheduleResponse, "UpdateSchedule", wfs.UpdateScheduleRequest{
+            .namespace = c.namespace,
+            .schedule_id = h.id,
+            .schedule = try changes.schedule.toProto(a, description.raw.schedule),
+            .conflict_token = description.raw.conflict_token,
+            .identity = c.identity,
+            .request_id = try uuid(a, c.io),
+            .search_attributes = if (changes.search_attributes) |updates| try search_attributes.toProto(a, updates, .start) else null,
+        }, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+    }
+
+    fn CallbackError(comptime f: anytype) type {
+        const Return = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+        return switch (@typeInfo(Return)) {
+            .error_union => |eu| eu.error_set,
+            else => error{},
+        };
+    }
+
+    /// Takes the schedule's action now, whatever its spec and even while it is paused.
+    /// `.unspecified` uses the schedule's overlap policy.
+    pub fn trigger(h: *const ScheduleHandle, overlap: schedule.OverlapPolicy) ScheduleError!void {
+        return h.patch(.{ .trigger_immediately = .{ .overlap_policy = @fromBackingInt(@backingInt(overlap)) } });
+    }
+
+    /// Takes the actions the schedule would have taken in each period of `periods`.
+    pub fn backfill(h: *const ScheduleHandle, periods: []const schedule.Backfill) ScheduleError!void {
+        var arena_state: std.heap.ArenaAllocator = .init(h.client.gpa);
+        defer arena_state.deinit();
+        const requests = try arena_state.allocator().alloc(proto.temporal.api.schedule.v1.BackfillRequest, periods.len);
+        for (periods, requests) |p, *r| r.* = p.toProto();
+        return h.patch(.{ .backfill_request = .fromOwnedSlice(requests) });
+    }
+
+    /// Pauses the schedule: it takes no action until `unpause` (a `trigger` still runs it).
+    /// `note` says why; empty records "Paused".
+    pub fn pause(h: *const ScheduleHandle, note: []const u8) ScheduleError!void {
+        return h.patch(.{ .pause = if (note.len > 0) note else "Paused" });
+    }
+
+    /// Resumes a paused schedule. `note` says why; empty records "Unpaused".
+    pub fn unpause(h: *const ScheduleHandle, note: []const u8) ScheduleError!void {
+        return h.patch(.{ .unpause = if (note.len > 0) note else "Unpaused" });
+    }
+
+    fn patch(h: *const ScheduleHandle, p: proto.temporal.api.schedule.v1.SchedulePatch) ScheduleError!void {
+        const c = h.client;
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = c.rpc(wfs.PatchScheduleResponse, "PatchSchedule", wfs.PatchScheduleRequest{
+            .namespace = c.namespace,
+            .schedule_id = h.id,
+            .patch = p,
+            .identity = c.identity,
+            .request_id = try uuid(a, c.io),
+        }, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+    }
+
+    /// Deletes the schedule. Workflows it started keep running.
+    pub fn delete(h: *const ScheduleHandle) ScheduleError!void {
+        const c = h.client;
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        _ = c.rpc(wfs.DeleteScheduleResponse, "DeleteSchedule", wfs.DeleteScheduleRequest{
+            .namespace = c.namespace,
+            .schedule_id = h.id,
+            .identity = c.identity,
+        }, arena_state.allocator()) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+    }
+};
+
+pub const UpdateScheduleError = ScheduleError || error{
+    /// A search attribute value in the update the server can't index (logged).
+    InvalidSearchAttribute,
+};
+
+/// The schedules from `Client.listSchedules`. Fetches a page from the server whenever `next`
+/// runs past the last one. Owns its memory with the client's allocator: free it with
+/// `deinit`. Not thread-safe.
+pub const ScheduleIterator = struct {
+    client: *Client,
+    query: []u8,
+    page_size: u31,
+    /// Holds the current page.
+    page: std.heap.ArenaAllocator,
+    entries: []const proto.temporal.api.schedule.v1.ScheduleListEntry = &.{},
+    index: usize = 0,
+    /// Where the next page starts; empty after the last page. Owned with the client's
+    /// allocator.
+    next_page_token: []u8 = &.{},
+    fetched: bool = false,
+
+    pub fn deinit(it: *ScheduleIterator) void {
+        it.page.deinit();
+        it.client.gpa.free(it.query);
+        it.client.gpa.free(it.next_page_token);
+        it.* = undefined;
+    }
+
+    /// The next schedule, copied into `arena`, or null after the last one. A failed fetch
+    /// can be retried by calling `next` again.
+    pub fn next(it: *ScheduleIterator, arena: Allocator) ListError!?schedule.ListEntry {
+        // The server may return an empty page that still has a token.
+        while (it.index == it.entries.len) {
+            if (it.fetched and it.next_page_token.len == 0) return null;
+            try it.fetch();
+        }
+        const raw = try it.entries[it.index].dupe(arena);
+        it.index += 1;
+        return try schedule.ListEntry.fromProto(arena, raw);
+    }
+
+    fn fetch(it: *ScheduleIterator) ListError!void {
+        const c = it.client;
+        it.entries = &.{};
+        it.index = 0;
+        _ = it.page.reset(.retain_capacity);
+        const a = it.page.allocator();
+        var status: ?Client.RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.ListSchedulesResponse, "ListSchedules", wfs.ListSchedulesRequest{
+            .namespace = c.namespace,
+            .maximum_page_size = it.page_size,
+            .next_page_token = it.next_page_token,
+            .query = it.query,
+        }, a, &status) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            error.RpcFailed => {
+                const s = status orelse return error.RpcFailed;
+                log.err("listing schedules with the query \"{s}\" failed: {s} (gRPC status {d})", .{ it.query, s.message, s.code });
+                return error.RpcFailed;
+            },
+            else => |e| return e,
+        };
+        const token = try c.gpa.dupe(u8, response.next_page_token);
+        c.gpa.free(it.next_page_token);
+        it.next_page_token = token;
+        it.entries = response.schedules.items;
         it.fetched = true;
     }
 };
