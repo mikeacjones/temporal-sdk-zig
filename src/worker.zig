@@ -43,6 +43,13 @@ pub const Options = struct {
     /// How long running activities may keep running after `stop` before they are canceled
     /// with reason `worker_shutdown`.
     graceful_shutdown_period: Io.Duration = .zero,
+    /// Where workflow and activity loggers write. Null uses the client's
+    /// (`client.Options.logger`). Borrowed: it must outlive the worker. Called concurrently
+    /// from workflow and activity threads.
+    logger: ?log_mod.Sink = null,
+    /// Keep workflow loggers on while workflows replay history. By default they are silent
+    /// during replay, so each message is logged once.
+    log_during_replay: bool = false,
 };
 
 pub const Worker = struct {
@@ -280,6 +287,11 @@ pub const Worker = struct {
         if (w.start_failed) return error.WorkerFailedToStart;
     }
 
+    /// The sink this worker's workflow and activity loggers write to.
+    fn logSink(w: *const Worker) log_mod.Sink {
+        return w.options.logger orelse w.client.logger;
+    }
+
     /// Runs until the process receives SIGINT or SIGTERM. One signal stops every worker in
     /// the process that is running this way; while any is, the previous handlers for those
     /// signals are replaced.
@@ -302,6 +314,8 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .namespace = w.client.namespace,
         .stack_size = w.options.workflow_stack_size,
         .codecs = w.client.codecs,
+        .logger = w.logSink(),
+        .log_during_replay = w.options.log_during_replay,
     };
     defer runner.deinit();
     var message: ?[]u8 = null;
@@ -333,6 +347,8 @@ pub const WorkflowRunner = struct {
     stack_size: usize,
     /// Borrowed; see `client.Options.codecs`.
     codecs: []const converter.PayloadCodec = &.{},
+    logger: log_mod.Sink = .std_log,
+    log_during_replay: bool = false,
     runs: std.StringHashMapUnmanaged(*Instance) = .empty,
     /// Called for each eviction with the core's reason and message (the replayer uses it to
     /// detect nondeterminism).
@@ -397,6 +413,8 @@ pub const WorkflowRunner = struct {
                 .task_queue = r.task_queue,
                 .namespace = r.namespace,
                 .stack_size = r.stack_size,
+                .logger = r.logger,
+                .log_during_replay = r.log_during_replay,
             });
             errdefer inst.destroy();
             const key = try r.gpa.dupe(u8, act.run_id);
@@ -644,14 +662,14 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .is_local = start.is_local,
         .task_token = run.task_token,
     };
-    ctx.logger_ = .{ .context = try log_mod.contextString(a, .{
+    ctx.logger_ = try (log_mod.Logger{ .sink = w.logSink() }).with(a, .{
         .ActivityID = start.activity_id,
         .ActivityType = start.activity_type,
         .Attempt = start.attempt,
         .WorkflowType = start.workflow_type,
         .WorkflowID = execution.workflow_id,
         .RunID = execution.run_id,
-    }) };
+    });
     var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token };
     ctx.heartbeat_details = start.heartbeat_details.items;
     // The core keeps no heartbeat state for local activities and warns on each heartbeat.
@@ -1200,4 +1218,156 @@ test "one SIGTERM stops every worker running until a signal, then the previous h
     std.posix.sigaction(.TERM, null, &current);
     try testing.expect(current.handler.handler != SignalWatcher.onSignal);
     try testing.expectEqual(@as(?std.Thread, null), SignalWatcher.thread);
+}
+
+/// A thread-safe sink that keeps SDK records and counts forwarded core records (those with a
+/// `target` field) without keeping them.
+const RecordingSink = struct {
+    mutex: Io.Mutex = .init,
+    arena: std.heap.ArenaAllocator = .init(testing.allocator),
+    records: std.ArrayList(Record) = .empty,
+    core_records: usize = 0,
+
+    const Record = struct { level: log_mod.Level, message: []const u8, fields: []const log_mod.Field };
+
+    fn sink(r: *RecordingSink) log_mod.Sink {
+        return .{ .ptr = r, .vtable = &.{ .log = record } };
+    }
+
+    fn deinit(r: *RecordingSink) void {
+        r.arena.deinit();
+    }
+
+    fn record(ptr: ?*anyopaque, level: log_mod.Level, message: []const u8, fields: []const log_mod.Field) void {
+        const r: *RecordingSink = @ptrCast(@alignCast(ptr.?));
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        for (fields) |f| if (std.mem.eql(u8, f.key, "target")) {
+            r.core_records += 1;
+            return;
+        };
+        const a = r.arena.allocator();
+        const copy = a.alloc(log_mod.Field, fields.len) catch return;
+        for (fields, copy) |f, *c| c.* = .{ .key = a.dupe(u8, f.key) catch return, .value = a.dupe(u8, f.value) catch return };
+        r.records.append(a, .{ .level = level, .message = a.dupe(u8, message) catch return, .fields = copy }) catch return;
+    }
+
+    /// How many records have `message` and, for each pair in `want`, a field with that value.
+    fn count(r: *RecordingSink, message: []const u8, want: []const log_mod.Field) usize {
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        var n: usize = 0;
+        records: for (r.records.items) |rec| {
+            if (!std.mem.eql(u8, rec.message, message)) continue;
+            for (want) |w| {
+                const found = for (rec.fields) |f| {
+                    if (std.mem.eql(u8, f.key, w.key)) break std.mem.eql(u8, f.value, w.value);
+                } else false;
+                if (!found) continue :records;
+            }
+            n += 1;
+        }
+        return n;
+    }
+
+    fn coreRecords(r: *RecordingSink) usize {
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        return r.core_records;
+    }
+};
+
+// With no workflow cache, every activation replays the run from the start, so the workflow's
+// first log call runs again (replaying) once the activity's result arrives.
+test "workflow and activity logs reach the worker's sink with their context fields, and replays log only when asked" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+
+    var client_sink: RecordingSink = .{};
+    defer client_sink.deinit();
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{
+        .host_port = server.target,
+        .logger = client_sink.sink(),
+        .core_log_level = .debug,
+    });
+    defer client.close();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |log_during_replay| {
+        var sink: RecordingSink = .{};
+        defer sink.deinit();
+        const task_queue = if (log_during_replay) "logs-replaying" else "logs";
+        var w = try Worker.init(testing.allocator, testing.io, &client, task_queue, .{
+            .max_cached_workflows = 0,
+            .logger = sink.sink(),
+            .log_during_replay = log_during_replay,
+        });
+        defer w.deinit();
+        try w.registerWorkflow(HelloTest.Hello);
+        try w.registerActivity(HelloTest.Greet);
+        var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+        defer {
+            w.stop();
+            running.await(testing.io) catch {};
+        }
+
+        const id = if (log_during_replay) "logs-replaying-wf" else "logs-wf";
+        var run = try client.executeWorkflow(HelloTest.Hello, .{ .id = id, .task_queue = task_queue }, .{"Temporal"});
+        defer run.deinit();
+        try testing.expectEqualStrings("Hello Temporal!", try run.get(arena.allocator()));
+
+        const workflow_fields = [_]log_mod.Field{
+            .{ .key = "name", .value = "Temporal" },
+            .{ .key = "WorkflowType", .value = "Workflow" },
+            .{ .key = "WorkflowID", .value = id },
+            .{ .key = "RunID", .value = run.run_id },
+        };
+        const started = sink.count("HelloWorld workflow started", &workflow_fields);
+        if (log_during_replay) try testing.expect(started >= 2) else try testing.expectEqual(1, started);
+        try testing.expectEqual(1, sink.count("HelloWorld workflow completed.", &.{.{ .key = "result", .value = "Hello Temporal!" }}));
+        try testing.expectEqual(1, sink.count("Activity", &.{
+            .{ .key = "name", .value = "Temporal" },
+            .{ .key = "ActivityType", .value = "Activity" },
+            .{ .key = "Attempt", .value = "1" },
+            .{ .key = "WorkflowType", .value = "Workflow" },
+            .{ .key = "WorkflowID", .value = id },
+            .{ .key = "RunID", .value = run.run_id },
+        }));
+        // Nothing went to the client's sink: the worker's overrides it.
+        try testing.expectEqual(0, client_sink.count("Activity", &.{}));
+    }
+    // The core logs at debug level while it polls and completes tasks.
+    try testing.expect(client_sink.coreRecords() > 0);
+}
+
+test "a worker without its own sink uses its client's" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target, .logger = sink.sink() });
+    defer client.close();
+    var w = try Worker.init(testing.allocator, testing.io, &client, "client-logs", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try client.executeWorkflow(HelloTest.Hello, .{ .id = "client-logs-wf", .task_queue = "client-logs" }, .{"Temporal"});
+    defer run.deinit();
+    _ = try run.get(arena.allocator());
+    try testing.expectEqual(1, sink.count("HelloWorld workflow started", &.{.{ .key = "WorkflowID", .value = "client-logs-wf" }}));
+    try testing.expectEqual(1, sink.count("Activity", &.{.{ .key = "WorkflowID", .value = "client-logs-wf" }}));
 }

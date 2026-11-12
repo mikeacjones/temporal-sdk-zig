@@ -161,6 +161,8 @@ pub const Context = struct {
         return &ctx.info_;
     }
 
+    /// A logger carrying the activity's ID, type, and attempt and its workflow's type, ID, and
+    /// run ID as fields, writing to the worker's sink (`worker.Options.logger`).
     pub fn logger(ctx: *const Context) log.Logger {
         return ctx.logger_;
     }

@@ -22,6 +22,7 @@ const failure_mod = @import("failure.zig");
 const history_mod = @import("history.zig");
 const schedule = @import("schedule.zig");
 const workflow = @import("workflow.zig");
+const log_mod = @import("log.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Duration = Io.Duration;
@@ -46,6 +47,13 @@ pub const Options = struct {
     /// and activity payloads. Search attributes are never encoded. Borrowed: the slice and
     /// the codecs must outlive the client and its workers.
     codecs: []const converter.PayloadCodec = &.{},
+    /// Where sdk-core's logs go, and the default for every worker on this client (see
+    /// `worker.Options.logger`). Null uses `log.Sink.std_log`. Borrowed: it must outlive the
+    /// client and its workers. Called concurrently from worker threads and sdk-core's threads.
+    logger: ?log_mod.Sink = null,
+    /// The least severe sdk-core log level forwarded to `logger`; null leaves sdk-core's logs
+    /// off. Logs from libraries sdk-core uses are forwarded from `warn` up.
+    core_log_level: ?log_mod.Level = .warn,
 
     pub const Tls = struct {
         /// PEM; empty uses the system roots.
@@ -55,6 +63,58 @@ pub const Options = struct {
         client_private_key: []const u8 = "",
     };
 };
+
+/// sdk-core's crates log at `level`; the libraries they use at `level` or `warn`, whichever is
+/// less verbose.
+fn coreLogFilter(buf: []u8, level: log_mod.Level) []const u8 {
+    const core = switch (level) {
+        .err => "ERROR",
+        .warn => "WARN",
+        .info => "INFO",
+        .debug => "DEBUG",
+    };
+    const other = if (@backingInt(level) < @backingInt(log_mod.Level.warn)) core else "WARN";
+    return std.fmt.bufPrint(buf, "{s},temporalio_sdk_core={s},temporalio_client={s},temporalio_common={s},temporalio_sdk_core_c_bridge={s}", .{ other, core, core, core, core }) catch unreachable;
+}
+
+/// Passes a core log record to the client's sink: the message, a `target` field naming the
+/// Rust module it came from, and the record's own fields. Runs on the core's threads.
+fn forwardCoreLog(ctx: *anyopaque, record: *const bridge.Runtime.LogRecord) void {
+    const sink: *const log_mod.Sink = @ptrCast(@alignCast(ctx));
+    var fields: [1 + log_mod.max_context_fields]log_mod.Field = undefined;
+    fields[0] = .{ .key = "target", .value = record.target };
+    var buf: [8 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const n = coreLogFields(fba.allocator(), record.fieldsJson(), fields[1..]);
+    sink.log(switch (record.level) {
+        .trace, .debug => .debug,
+        .info => .info,
+        .warn => .warn,
+        .err => .err,
+    }, record.message, fields[0 .. 1 + n]);
+}
+
+/// Splits a core log record's JSON fields into `out`: strings as they are, other values as
+/// JSON. A record whose fields don't parse within `a` gets one `fields` field with the JSON.
+fn coreLogFields(a: Allocator, json: []const u8, out: []log_mod.Field) usize {
+    if (out.len == 0 or json.len == 0 or std.mem.eql(u8, json, "{}")) return 0;
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}) catch null;
+    if (value == null or value.? != .object) {
+        out[0] = .{ .key = "fields", .value = json };
+        return 1;
+    }
+    var n: usize = 0;
+    var it = value.?.object.iterator();
+    while (it.next()) |kv| {
+        if (n == out.len) break;
+        out[n] = .{ .key = kv.key_ptr.*, .value = switch (kv.value_ptr.*) {
+            .string, .number_string => |s| s,
+            else => |v| std.json.Stringify.valueAlloc(a, v, .{}) catch continue,
+        } };
+        n += 1;
+    }
+    return n;
+}
 
 pub const ConnectError = error{ OutOfMemory, InvalidOptions, RuntimeInitFailed, ConnectFailed };
 
@@ -67,15 +127,40 @@ pub const Client = struct {
     identity: []u8,
     /// `Options.codecs`, borrowed.
     codecs: []const converter.PayloadCodec,
+    /// `Options.logger` or the default sink; workers on this client inherit it.
+    logger: log_mod.Sink,
+    /// A copy of `logger` that the runtime's core log forwarding points at, freed after the
+    /// runtime.
+    core_log_sink: ?*log_mod.Sink,
 
     /// Connects and checks the server. Close with `close`.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
         var message: ?[]u8 = null;
         defer if (message) |m| gpa.free(m);
 
-        const runtime = bridge.Runtime.init(gpa, .{}, &message) catch |err| {
-            if (message) |m| log.err("creating the core runtime failed: {s}", .{m});
-            return err;
+        const logger = options.logger orelse log_mod.Sink.std_log;
+        var core_log_sink: ?*log_mod.Sink = null;
+        errdefer if (core_log_sink) |s| gpa.destroy(s);
+        var filter_buf: [256]u8 = undefined;
+        var logging: ?bridge.Runtime.Logging = null;
+        if (options.core_log_level) |level| {
+            core_log_sink = try gpa.create(log_mod.Sink);
+            core_log_sink.?.* = logger;
+            logging = .{
+                .filter = coreLogFilter(&filter_buf, level),
+                .forward = .{ .ctx = core_log_sink.?, .func = forwardCoreLog },
+            };
+        }
+        const runtime = bridge.Runtime.init(gpa, .{ .logging = logging }, &message) catch |err| switch (err) {
+            error.TooManyLogForwarders => {
+                log.err("creating the core runtime failed: {d} clients in this process already forward sdk-core's logs; close one, or set Options.core_log_level to null", .{bridge.Runtime.max_forwarders});
+                return error.RuntimeInitFailed;
+            },
+            error.OutOfMemory, error.InvalidOptions => |e| return e,
+            error.RuntimeInitFailed => {
+                if (message) |m| log.err("creating the core runtime failed: {s}", .{m});
+                return error.RuntimeInitFailed;
+            },
         };
         errdefer runtime.deinit();
 
@@ -102,12 +187,23 @@ pub const Client = struct {
             log.err("connecting to {s} failed: {s}", .{ options.host_port, message orelse @errorName(err) });
             return err;
         };
-        return .{ .gpa = gpa, .io = io, .runtime = runtime, .connection = connection, .namespace = namespace, .identity = identity, .codecs = options.codecs };
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .runtime = runtime,
+            .connection = connection,
+            .namespace = namespace,
+            .identity = identity,
+            .codecs = options.codecs,
+            .logger = logger,
+            .core_log_sink = core_log_sink,
+        };
     }
 
     pub fn close(c: *Client) void {
         c.connection.deinit();
         c.runtime.deinit();
+        if (c.core_log_sink) |s| c.gpa.destroy(s);
         c.gpa.free(c.namespace);
         c.gpa.free(c.identity);
         c.* = undefined;
@@ -2275,4 +2371,30 @@ test "activity execution statuses match the server's values" {
         const server = @field(enums.ActivityExecutionStatus, "ACTIVITY_EXECUTION_STATUS_" ++ upper);
         try std.testing.expectEqual(value, @backingInt(server));
     }
+}
+
+const testing = std.testing;
+
+test "core log fields split into keys, with strings unquoted and other values as JSON" {
+    var buf: [1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    var out: [4]log_mod.Field = undefined;
+    const n = coreLogFields(fba.allocator(), "{\"task_queue\":\"q\",\"attempt\":2,\"sticky\":true}", &out);
+    try testing.expectEqual(3, n);
+    try testing.expectEqualStrings("task_queue", out[0].key);
+    try testing.expectEqualStrings("q", out[0].value);
+    try testing.expectEqualStrings("2", out[1].value);
+    try testing.expectEqualStrings("true", out[2].value);
+    try testing.expectEqual(0, coreLogFields(fba.allocator(), "{}", &out));
+
+    var tiny: [8]u8 = undefined;
+    var small: std.heap.FixedBufferAllocator = .init(&tiny);
+    try testing.expectEqual(1, coreLogFields(small.allocator(), "{\"a\":\"long enough to run out\"}", &out));
+    try testing.expectEqualStrings("fields", out[0].key);
+}
+
+test "the core log filter keeps libraries at warn or quieter" {
+    var buf: [256]u8 = undefined;
+    try testing.expectStringStartsWith(coreLogFilter(&buf, .debug), "WARN,temporalio_sdk_core=DEBUG,");
+    try testing.expectStringStartsWith(coreLogFilter(&buf, .err), "ERROR,temporalio_sdk_core=ERROR,");
 }
