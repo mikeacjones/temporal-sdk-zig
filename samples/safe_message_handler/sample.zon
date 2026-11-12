@@ -1,0 +1,6 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`.
+.{
+    .expect = .{"safe_message_handler sample is a placeholder"},
+    .timeout_seconds = 60,
+}
