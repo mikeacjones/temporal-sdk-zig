@@ -368,17 +368,23 @@ pub const StructOptions = struct {
 ///     _ = try ctx.executeActivity(billing.charge, options, .{order}).get();
 ///     try worker.registerActivities(&billing_impl, billing);
 ///
-/// An activity method is a pub fn shaped `fn (*T, *Context, args...) !Result` (or taking
-/// `*const T`) that returns an error union. Other pub declarations, such as constants,
-/// `init`, functions without a `*Context` second parameter, or functions that can't fail,
-/// are skipped, so a struct can hold helpers next to its activities. A pub alias of an
-/// activity method is an activity under the alias's name too. A struct with no activity
-/// method is a compile error.
+/// Every pub fn shaped `fn (*T, *Context, args...) !Result` (or taking `*const T`) that
+/// returns an error union is an activity method, except the dynamic activity shape
+/// `fn (*T, *Context, converter.EncodedValues) !Result`, which is skipped so the struct can
+/// also hold its dynamic fallback (register that with `registerDynamicActivityWith`). The
+/// arguments and result of an activity method must be convertible by the payload converter;
+/// one that isn't is a compile error naming the method and the type, so a helper of that
+/// shape, such as `fn (*T, *Context, *std.Io.Writer) !void`, must not be pub. Other pub
+/// declarations, such as constants, `init`, functions without a `*Context` second
+/// parameter, or functions that can't fail, are skipped. A pub alias of an activity method
+/// is an activity under the alias's name too. A struct with no activity method is a compile
+/// error.
 ///
-/// Declare the result outside `T`, or inside it without `pub`: finding `T`'s methods reads
-/// the type of each pub declaration of `T`, so a pub declaration of `defs(T, ...)` inside
-/// `T` depends on itself and fails to compile with a dependency loop. A file used as the
-/// struct follows the same rule at its top level.
+/// No pub declaration of `T` may depend on `defs(T, ...)`: finding `T`'s methods reads the
+/// type of each pub declaration of `T`, so such a declaration depends on itself and fails to
+/// compile with a dependency loop. That covers a pub `defs(T, ...)` constant inside `T` and a
+/// pub declaration reading a non-pub one. Declaring the result outside `T` is always safe. A
+/// file used as the struct follows the same rule at its top level.
 pub fn defs(comptime T: type, comptime options: StructOptions) MethodDefs(T, options) {
     return .{};
 }
@@ -401,7 +407,10 @@ fn activityMethodNames(comptime T: type) []const []const u8 {
     };
     var names: []const []const u8 = &.{};
     for (info.decl_names) |name| {
-        if (isActivityMethod(T, @TypeOf(@field(T, name)))) names = names ++ .{name};
+        const F = @TypeOf(@field(T, name));
+        if (!isActivityMethod(T, F)) continue;
+        checkConvertible(T, name, F);
+        names = names ++ .{name};
     }
     if (names.len == 0)
         @compileError(@typeName(T) ++ " has no activity methods: give it a pub fn (*" ++ @typeName(T) ++ ", *temporal.activity.Context, args...) !Result");
@@ -416,7 +425,25 @@ fn isActivityMethod(comptime T: type, comptime F: type) bool {
     };
     if (f.is_generic or f.param_types.len < 2) return false;
     const fallible = if (f.return_type) |R| @typeInfo(R) == .error_union else false;
-    return fallible and (f.param_types[0] == *T or f.param_types[0] == *const T) and f.param_types[1] == *Context;
+    const dynamic = f.param_types.len == 3 and f.param_types[2] == converter.EncodedValues;
+    return fallible and !dynamic and (f.param_types[0] == *T or f.param_types[0] == *const T) and f.param_types[1] == *Context;
+}
+
+fn checkConvertible(comptime T: type, comptime method: []const u8, comptime F: type) void {
+    const f = @typeInfo(F).@"fn";
+    const what = @typeName(T) ++ "." ++ method;
+    const fix = "; if it is a helper rather than an activity, make it non-pub";
+    for (f.param_types[2..], 3..) |P, i| {
+        if (converter.unconvertibleType(P.?, .decode)) |bad| @compileError(std.fmt.comptimePrint(
+            "activity method {s}: parameter {d} type {s} can't be decoded by the payload converter (because of {s}){s}",
+            .{ what, i, @typeName(P.?), @typeName(bad), fix },
+        ));
+    }
+    const R = @typeInfo(f.return_type.?).error_union.payload;
+    if (converter.unconvertibleType(R, .encode)) |bad| @compileError(std.fmt.comptimePrint(
+        "activity method {s}: result type {s} can't be encoded by the payload converter (because of {s}){s}",
+        .{ what, @typeName(R), @typeName(bad), fix },
+    ));
 }
 
 /// Defines a dynamic activity: one function that runs every activity type the worker has no
@@ -586,6 +613,42 @@ test "defs names each activity method with the prefix and skips other pub declar
     try std.testing.expectEqualStrings("15", (try charged.invoke(charged.receiver, &ctx, args.items)).data);
     const refunded = acts.refund.with(&impl);
     try std.testing.expectEqualStrings("5", (try refunded.invoke(refunded.receiver, &ctx, args.items)).data);
+}
+
+test "defs skips the dynamic activity shape and non-pub helpers that take the context" {
+    const Reports = struct {
+        title: []const u8,
+
+        pub fn render(r: *@This(), ctx: *Context, rows: []const u32) ![]const u8 {
+            var out: std.Io.Writer.Allocating = .init(ctx.allocator());
+            try r.writeHeader(ctx, &out.writer);
+            for (rows) |row| try out.writer.print("{d}\n", .{row});
+            return out.written();
+        }
+
+        pub fn fallback(r: *@This(), ctx: *Context, args: converter.EncodedValues) ![]const u8 {
+            _ = r;
+            return std.fmt.allocPrint(ctx.allocator(), "{s} with {d} arguments", .{ ctx.info().activity_type, args.len() });
+        }
+
+        fn writeHeader(r: *@This(), ctx: *Context, out: *std.Io.Writer) !void {
+            _ = ctx;
+            try out.print("{s}\n", .{r.title});
+        }
+    };
+    const acts = defs(Reports, .{ .prefix = "Reports." });
+    try std.testing.expectEqual(1, @typeInfo(@TypeOf(acts)).@"struct".field_names.len);
+    try std.testing.expectEqualStrings("Reports.render", acts.render.activity_name);
+    try std.testing.expect(DynamicDef(Reports.fallback).Receiver == Reports);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var impl: Reports = .{ .title = "Totals" };
+    var ctx: Context = .{ .arena = a, .io_ = std.testing.io, .info_ = undefined, .logger_ = .{} };
+    const args = try converter.toPayloads(a, .{@as([]const u32, &.{ 1, 2 })});
+    const rendered = acts.render.with(&impl);
+    try std.testing.expectEqualStrings("\"Totals\\n1\\n2\\n\"", (try rendered.invoke(rendered.receiver, &ctx, args.items)).data);
 }
 
 test "heartbeats reach the sink and details decode" {

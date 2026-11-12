@@ -155,7 +155,8 @@ pub const Worker = struct {
     /// `acts` is the value of `temporal.activity.defs(T, options)` for `impl`'s type `T`, the
     /// same value workflows call the activities through, so the worker registers exactly the
     /// names workflows schedule: `options.prefix` plus each method name. Declare it once, for
-    /// example as a pub constant next to the workflow, outside `T` or not pub (see `defs`).
+    /// example as a pub constant next to the workflow, outside `T`: no pub declaration of `T`
+    /// may depend on it (see `defs`).
     /// Naming rules: see `temporal.activity.Def`. `impl` must outlive the worker and be safe
     /// to use from several activities at once. On an error, the methods before the failing
     /// one stay registered.
@@ -1178,6 +1179,37 @@ test "registerActivities registers each activity method under the prefix, bound 
     counter.step = 4;
     try testing.expectEqualStrings("4", try invokeRegistered(&w, arena.allocator(), "reset", .{}));
     try testing.expectEqualStrings("9", try invokeRegistered(&w, arena.allocator(), "advance", .{@as(u32, 5)}));
+}
+
+test "registerActivities leaves a struct's dynamic method to registerDynamicActivityWith" {
+    const Router = struct {
+        pub fn ping(r: *@This(), ctx: *activity.Context) ![]const u8 {
+            _ = r;
+            _ = ctx;
+            return "pong";
+        }
+
+        pub fn fallback(r: *@This(), ctx: *activity.Context, args: converter.EncodedValues) ![]const u8 {
+            _ = r;
+            return std.fmt.allocPrint(ctx.allocator(), "{d} arguments", .{args.len()});
+        }
+    };
+    var client: client_mod.Client = undefined; // registration never touches the client
+    var w = try Worker.init(testing.allocator, testing.io, &client, "struct", .{});
+    defer w.deinit();
+    var router: Router = .{};
+    try w.registerActivities(&router, activity.defs(Router, .{ .prefix = "Router." }));
+    try w.registerDynamicActivityWith(activity.DynamicDef(Router.fallback), &router);
+    try testing.expectEqual(1, w.activities.count());
+    try testing.expect(!w.activities.contains("Router.fallback"));
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("\"pong\"", try invokeRegistered(&w, arena.allocator(), "Router.ping", .{}));
+    var ctx: activity.Context = .{ .arena = arena.allocator(), .io_ = testing.io, .info_ = undefined, .logger_ = .{} };
+    const dynamic = w.dynamic_activity.?;
+    const payloads = try converter.toPayloads(arena.allocator(), .{ @as(u32, 1), @as(u32, 2) });
+    try testing.expectEqualStrings("\"2 arguments\"", (try dynamic.invoke(dynamic.receiver, &ctx, payloads.items)).data);
 }
 
 test "registerActivities rejects a prefix already registered or reserved for the SDK" {
