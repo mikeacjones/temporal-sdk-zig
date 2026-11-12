@@ -20,6 +20,7 @@ const sa = @import("../search_attributes.zig");
 const propagation = @import("../propagation.zig");
 const interceptor = @import("../interceptor.zig");
 const metrics_mod = @import("../metrics.zig");
+const deployment = @import("../deployment.zig");
 const Scheduler = @import("Scheduler.zig");
 const WorkflowIo = @import("WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -132,6 +133,21 @@ continue_as_new: ?cmd_pb.ContinueAsNewWorkflowExecution = null,
 history_length: u32 = 0,
 history_size_bytes: u64 = 0,
 continue_as_new_suggested: bool = false,
+/// Patch IDs the core reported in history (NotifyHasPatch), in arrival order so that
+/// `getVersion` scans them deterministically. Arena memory.
+notified_patches: std.array_hash_map.String(void) = .empty,
+/// What the run's first `patch` call returned for each patch ID; later calls return the same.
+/// Arena memory.
+patches: std.StringHashMapUnmanaged(bool) = .empty,
+/// What the run's first `getVersion` call returned for each change ID. Arena memory.
+versions: std.StringHashMapUnmanaged(i32) = .empty,
+/// Sent with each successful completion when `send_versioning_behavior`; starts as the
+/// registered workflow's.
+versioning_behavior: workflow.VersioningBehavior = .unspecified,
+send_versioning_behavior: bool = false,
+/// The deployment version of the latest activation that wasn't query-only. Arena memory,
+/// copied again only when it changes.
+deployment_version: ?deployment.Version = null,
 
 /// A type-erased query handler: decodes `args` into `out`, calls the handler with `context`,
 /// and encodes its result into `out`. Runs on the worker thread, outside any coroutine.
@@ -297,6 +313,9 @@ pub const Options = struct {
     /// What the workflow's metrics handler records through. Borrowed: must outlive the
     /// instance.
     metrics: metrics_mod.Handler = .noop,
+    /// Send the run's versioning behavior with its completions: only a worker whose
+    /// deployment uses worker versioning may (the server rejects it from any other).
+    send_versioning_behavior: bool = false,
 };
 
 /// Creates the instance for a run. `entry` is the registered workflow named by the run's
@@ -310,6 +329,8 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
         .wio = undefined,
         .ctx = undefined,
         .entry = entry,
+        .versioning_behavior = entry.versioning_behavior,
+        .send_versioning_behavior = options.send_versioning_behavior,
     };
     inst.wio = .init(gpa, &inst.sched, .{ .ctx = inst, .vtable = &host_vtable }, 0);
     inst.ctx = .{ .instance = inst };
@@ -377,6 +398,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         inst.history_length = act.history_length;
         inst.history_size_bytes = act.history_size_bytes;
         inst.continue_as_new_suggested = act.continue_as_new_suggested;
+        try inst.setDeploymentVersion(act.deployment_version_for_current_task);
     }
     inst.replaying = act.is_replaying;
     inst.commands = .empty;
@@ -399,6 +421,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
             .signal_workflow => |s| try inst.deliverSignal(&s),
             .do_update => |u| try inst.deliverUpdate(&u),
             .resolve_activity => |r| try inst.resolveActivity(&r),
+            .notify_has_patch => |p| try inst.notified_patches.put(inst.arena(), try inst.arena().dupe(u8, p.patch_id), {}),
             .resolve_child_workflow_execution_start => |r| try inst.resolveChildStart(&r),
             .resolve_child_workflow_execution => |r| try inst.resolveChild(&r),
             .resolve_signal_external_workflow => |r| try inst.resolveExternal(r.seq, r.failure, switch (r.cause) {
@@ -437,11 +460,22 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         completion.status = .{ .failed = .{ .failure = try failure_mod.application(out, .{ .message = message, .type = "UnsupportedJob" }) } };
     } else {
         var success: done_pb.Success = .{};
+        if (inst.send_versioning_behavior) success.versioning_behavior = @fromBackingInt(@backingInt(inst.versioning_behavior));
         try success.commands.appendSlice(out, inst.commands.items);
         try success.commands.appendSlice(out, answers.items);
         completion.status = .{ .successful = success };
     }
     return completion;
+}
+
+fn setDeploymentVersion(inst: *Instance, v: ?proto.coresdk.common.WorkerDeploymentVersion) error{OutOfMemory}!void {
+    const next = v orelse {
+        inst.deployment_version = null;
+        return;
+    };
+    if (inst.deployment_version) |cur| if (std.mem.eql(u8, cur.deployment_name, next.deployment_name) and std.mem.eql(u8, cur.build_id, next.build_id)) return;
+    const a = inst.arena();
+    inst.deployment_version = .{ .deployment_name = try a.dupe(u8, next.deployment_name), .build_id = try a.dupe(u8, next.build_id) };
 }
 
 // ---------------------------------------------------------------- queries
@@ -995,6 +1029,72 @@ pub fn upsertSearchAttributes(inst: *Instance, updates: []const sa.Update) sa.En
     const view = try inst.search_attributes.withEntries(a, encoded.indexed_fields.items);
     try inst.commands.append(a, .{ .variant = .{ .upsert_workflow_search_attributes = .{ .search_attributes = encoded } } });
     inst.search_attributes = view;
+}
+
+// ---------------------------------------------------------------- patches
+
+/// Whether the run takes the patched code path for `patch_id`, as the core's patch rules say:
+/// always when not replaying, and on replay only when the history has the patch's marker.
+/// The first call decides for the run; when it says yes, it emits a SetPatchMarker command
+/// (which the core sends at most once per patch). `deprecated` marks the marker as one that
+/// code without the patch may replay. Out of memory fails the workflow task, which retries.
+pub fn patch(inst: *Instance, patch_id: []const u8, deprecated: bool) bool {
+    if (inst.patches.get(patch_id)) |used| return used;
+    const used = !inst.replaying or inst.notified_patches.contains(patch_id);
+    inst.recordPatch(patch_id, used, deprecated) catch {
+        inst.task_failure = "out of memory recording a patch";
+    };
+    return used;
+}
+
+fn recordPatch(inst: *Instance, patch_id: []const u8, used: bool, deprecated: bool) error{OutOfMemory}!void {
+    const a = inst.arena();
+    const id = try a.dupe(u8, patch_id);
+    try inst.patches.put(a, id, used);
+    if (used) try inst.commands.append(a, .{ .variant = .{ .set_patch_marker = .{ .patch_id = id, .deprecated = deprecated } } });
+}
+
+/// The patch ID that records version `version` of change `change_id`. A version is an
+/// integer, which never contains "@v", so the ID names one change and version only.
+fn versionPatchId(a: Allocator, change_id: []const u8, version: i32) error{OutOfMemory}![]const u8 {
+    return std.fmt.allocPrint(a, "{s}@v{d}", .{ change_id, version });
+}
+
+/// The version of `change_id` that history recorded, from the patches the core reported.
+fn recordedVersion(inst: *const Instance, change_id: []const u8) ?i32 {
+    for (inst.notified_patches.keys()) |id| {
+        if (id.len <= change_id.len + 2 or !std.mem.startsWith(u8, id, change_id)) continue;
+        const rest = id[change_id.len..];
+        if (!std.mem.startsWith(u8, rest, "@v")) continue;
+        return std.fmt.parseInt(i32, rest[2..], 10) catch continue;
+    }
+    return null;
+}
+
+/// See `workflow.Context.getVersion`. The version is a patch named `versionPatchId`; the
+/// default version has none.
+pub fn getVersion(inst: *Instance, change_id: []const u8, min_supported: i32, max_supported: i32) error{UnsupportedVersion}!i32 {
+    const a = inst.arena();
+    const version = inst.versions.get(change_id) orelse blk: {
+        const v = inst.recordedVersion(change_id) orelse if (inst.replaying) workflow.default_version else max_supported;
+        inst.versions.put(a, a.dupe(u8, change_id) catch return inst.versionOutOfMemory(v), v) catch return inst.versionOutOfMemory(v);
+        break :blk v;
+    };
+    if (version < min_supported or version > max_supported) {
+        // Failing the task, not the workflow, lets a worker whose code supports the
+        // version run it. The message reaches the server's WorkflowTaskFailed event; the
+        // workflow's logger is silent during the replay that usually finds this.
+        inst.task_failure = std.fmt.allocPrint(a, "getVersion(\"{s}\", {d}, {d}): the run uses version {d} of this change, which this code doesn't support", .{ change_id, min_supported, max_supported, version }) catch "getVersion: the run uses a version of a change this code doesn't support";
+        return error.UnsupportedVersion;
+    }
+    if (version == workflow.default_version) return version;
+    _ = inst.patch(versionPatchId(a, change_id, version) catch return inst.versionOutOfMemory(version), false);
+    return version;
+}
+
+fn versionOutOfMemory(inst: *Instance, version: i32) i32 {
+    inst.task_failure = "out of memory recording a version";
+    return version;
 }
 
 /// An outgoing call's encoded arguments and its header, holding what the propagators write
@@ -1903,8 +2003,130 @@ test "unsupported jobs fail the workflow task" {
     const inst = try create(testing.allocator, Hello.registered, .{});
     defer inst.destroy();
     _ = try inst.activate(&try initActivation(a, "Workflow", .{@as([]const u8, "Temporal")}), a);
-    const c = try inst.activate(&try oneJob(a, .{ .notify_has_patch = .{ .patch_id = "p" } }), a);
+    const c = try inst.activate(&try oneJob(a, .{ .resolve_nexus_operation_start = .{ .seq = 1 } }), a);
     try testing.expect(c.status.? == .failed);
+}
+
+// Patches: the workflow reports what `patched`, `deprecatePatch` and `getVersion` decided.
+const Patches = struct {
+    fn run(ctx: *workflow.Context, min_version: i32) ![]const u8 {
+        const first = ctx.patched("p1");
+        const again = ctx.patched("p1");
+        ctx.deprecatePatch("old");
+        const v = try ctx.getVersion("pricing", min_version, 2);
+        const v_again = try ctx.getVersion("pricing", min_version, 2);
+        return std.fmt.allocPrint(ctx.allocator(), "{} {} {d} {d}", .{ first, again, v, v_again });
+    }
+};
+const PatchesWf = workflow.Def("Patches", Patches.run);
+
+/// Runs `PatchesWf` on `inst` with one activation, replaying (with `notified` patches) or not.
+/// The completion points into the run's arena.
+fn runPatches(inst: *Instance, a: Allocator, replaying: bool, notified: []const []const u8, min_version: i32) !done_pb.WorkflowActivationCompletion {
+    var act = try initActivation(a, "Patches", .{min_version});
+    act.is_replaying = replaying;
+    for (notified) |id| try act.jobs.append(a, .{ .variant = .{ .notify_has_patch = .{ .patch_id = id } } });
+    return inst.activate(&act, a);
+}
+
+fn expectMarker(cmd: cmd_pb.WorkflowCommand, id: []const u8, deprecated: bool) !void {
+    const m = cmd.variant.?.set_patch_marker;
+    try testing.expectEqualStrings(id, m.patch_id);
+    try testing.expectEqual(deprecated, m.deprecated);
+}
+
+test "patches: a first run takes every new path and records each marker once" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, PatchesWf.registered, .{});
+    defer inst.destroy();
+    const cmds = commandsOf(try runPatches(inst, a, false, &.{}, workflow.default_version));
+    try testing.expectEqual(@as(usize, 4), cmds.len);
+    try expectMarker(cmds[0], "p1", false);
+    try expectMarker(cmds[1], "old", true);
+    try expectMarker(cmds[2], "pricing@v2", false);
+    try testing.expectEqualStrings("\"true true 2 2\"", cmds[3].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "patches: a replay without markers takes the old paths and records nothing" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, PatchesWf.registered, .{});
+    defer inst.destroy();
+    const cmds = commandsOf(try runPatches(inst, a, true, &.{}, workflow.default_version));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expectEqualStrings("\"false false -1 -1\"", cmds[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "patches: a replay with markers takes the recorded paths and versions" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, PatchesWf.registered, .{});
+    defer inst.destroy();
+    // A marker of a change with a longer name sharing the prefix isn't this change's version.
+    const cmds = commandsOf(try runPatches(inst, a, true, &.{ "p1", "pricing-old@v2", "pricing@v1" }, workflow.default_version));
+    try testing.expectEqual(@as(usize, 3), cmds.len);
+    try expectMarker(cmds[0], "p1", false);
+    try expectMarker(cmds[1], "pricing@v1", false);
+    try testing.expectEqualStrings("\"true true 1 1\"", cmds[2].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "patches: getVersion fails the task for a recorded version below min_supported" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, PatchesWf.registered, .{});
+    defer inst.destroy();
+    const old_run = try runPatches(inst, a, true, &.{"pricing@v1"}, 2);
+    const message = old_run.status.?.failed.failure.?.message;
+    try testing.expect(std.mem.indexOf(u8, message, "getVersion(\"pricing\", 2, 2): the run uses version 1") != null);
+    // A run from before the change has the default version, also below 2.
+    const older = try create(testing.allocator, PatchesWf.registered, .{});
+    defer older.destroy();
+    try testing.expect((try runPatches(older, a, true, &.{}, 2)).status.? == .failed);
+}
+
+// Versioning behavior: the Def's goes with every completion until the run sets another.
+const Versioning = struct {
+    fn run(ctx: *workflow.Context, switch_to: workflow.VersioningBehavior) ![]const u8 {
+        const before = ctx.currentDeploymentVersion();
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        ctx.setVersioningBehavior(switch_to);
+        const after = ctx.currentDeploymentVersion().?;
+        return std.fmt.allocPrint(ctx.allocator(), "{} {s}.{s}", .{ before == null, after.deployment_name, after.build_id });
+    }
+};
+const PinnedWf = workflow.DefWithOptions("Pinned", Versioning.run, .{ .versioning_behavior = .pinned });
+
+test "versioning: completions carry the Def's behavior, then the one the run sets, and the task's version" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try testing.expectEqual(workflow.VersioningBehavior.pinned, PinnedWf.versioning_behavior);
+    const inst = try create(testing.allocator, PinnedWf.registered, .{ .send_versioning_behavior = true });
+    defer inst.destroy();
+    const first = try inst.activate(&try initActivation(a, "Pinned", .{workflow.VersioningBehavior.auto_upgrade}), a);
+    try testing.expectEqual(proto.temporal.api.enums.v1.VersioningBehavior.VERSIONING_BEHAVIOR_PINNED, first.status.?.successful.versioning_behavior);
+    const timer = commandsOf(first)[0].variant.?.start_timer;
+
+    var fire = try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } });
+    fire.deployment_version_for_current_task = .{ .deployment_name = "shop", .build_id = "b2" };
+    const second = try inst.activate(&fire, a);
+    try testing.expectEqual(proto.temporal.api.enums.v1.VersioningBehavior.VERSIONING_BEHAVIOR_AUTO_UPGRADE, second.status.?.successful.versioning_behavior);
+    try testing.expectEqualStrings("\"true shop.b2\"", commandsOf(second)[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "versioning: a worker that doesn't use worker versioning sends no behavior" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, PinnedWf.registered, .{});
+    defer inst.destroy();
+    const first = try inst.activate(&try initActivation(a, "Pinned", .{workflow.VersioningBehavior.auto_upgrade}), a);
+    try testing.expectEqual(proto.temporal.api.enums.v1.VersioningBehavior.VERSIONING_BEHAVIOR_UNSPECIFIED, first.status.?.successful.versioning_behavior);
 }
 
 // Signal handlers. `State.log` records what handlers and the workflow function did, in order.
