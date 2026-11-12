@@ -1,16 +1,18 @@
 // How samples-test validates this sample: start the worker, run the starter, and check that
 // the starter's output contains each `expect` line before `timeout_seconds`. The starter
 // scrapes the worker's Prometheus endpoint after the workflow, so this checks the export end
-// to end. The worker serves on its default address, 0.0.0.0:9090: the runner passes no worker
-// arguments.
+// to end. Both programs take the endpoint's address as their first argument; this run uses a
+// less common port than the default 9090, which a local Prometheus may hold.
 .{
     .expect = .{
         "Scraped activity_started{",
         "Scraped activity_succeeded{",
         "Scraped schedule_to_start_latency_count{",
         "Scraped activity_latency_count{",
-        "Check metrics at http://127.0.0.1:9090/metrics",
+        "Check metrics at http://127.0.0.1:19464/metrics",
     },
+    .worker_args = .{"127.0.0.1:19464"},
+    .starter_args = .{"127.0.0.1:19464"},
     .timeout_seconds = 60,
     .tests = .{"workflow_test.zig"},
 }

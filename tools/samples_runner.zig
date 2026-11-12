@@ -25,6 +25,9 @@ const Manifest = struct {
     /// Arguments for the starter, for validating with shorter parameters than the sample's
     /// defaults.
     starter_args: []const []const u8 = &.{},
+    /// Arguments for the worker, for example an address to serve on that won't clash with
+    /// another program on the machine.
+    worker_args: []const []const u8 = &.{},
     timeout_seconds: u32 = 60,
     /// The sample's test files, the other samples it imports, and its extra programs; read by
     /// build.zig.
@@ -196,8 +199,12 @@ fn validate(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, work: Io.Dir
     const log_file = work.createFile(io, log_name, .{}) catch return "cannot create worker log";
     defer log_file.close(io);
 
+    var worker_argv_list: std.ArrayList([]const u8) = .empty;
+    worker_argv_list.append(arena, worker_exe) catch return "out of memory";
+    worker_argv_list.appendSlice(arena, manifest.worker_args) catch return "out of memory";
+    const worker_argv = worker_argv_list.items;
     const worker = std.process.spawn(io, .{
-        .argv = &.{worker_exe},
+        .argv = worker_argv,
         .environ_map = &worker_env,
         .stdin = .ignore,
         .stdout = .{ .file = log_file },
