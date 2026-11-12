@@ -11,3 +11,8 @@
 zig-out/
 deps/target/
 zig-pkg/
+
+# Gas City
+.beads/*
+!.beads/identity.toml
+.claude/skills/
