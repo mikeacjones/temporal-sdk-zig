@@ -87,8 +87,12 @@ pub fn main(init: std.process.Init) !void {
     const root = try Io.Dir.cwd().openDir(io, root_path, .{});
     const work = try Io.Dir.cwd().openDir(io, work_path, .{});
 
-    // The custom search attributes tests get, so samples can use them too.
-    var server = try temporal.testing.DevServer.start(gpa, io, .{ .search_attributes = &temporal.testing.custom_search_attributes });
+    // The custom search attributes tests get, and standalone activities, so samples can use
+    // them too.
+    var server = try temporal.testing.DevServer.start(gpa, io, .{
+        .search_attributes = &temporal.testing.custom_search_attributes,
+        .extra_args = &temporal.testing.DevServer.standalone_activity_args,
+    });
     errdefer server.stop(io);
 
     // An empty config file: the children read only TEMPORAL_ADDRESS and TEMPORAL_NAMESPACE.
