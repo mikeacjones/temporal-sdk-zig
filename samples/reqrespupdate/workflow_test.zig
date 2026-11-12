@@ -1,12 +1,14 @@
-//! Tests for the reqrespupdate sample, on the dev server: the workflow handles hundreds of
-//! requests in real time, with no timers to skip.
+//! Tests for the reqrespupdate sample, on the dev server: the workflow handles its requests
+//! in real time, with no timers to skip. The tests run the workflow with a limit of 20 requests
+//! per run instead of the sample's 500, so they reach continue-as-new quickly.
 
 const std = @import("std");
 const temporal = @import("temporal");
 const reqrespupdate = @import("reqrespupdate.zig");
 
 const testing = std.testing;
-const limit = reqrespupdate.requests_before_continue_as_new;
+const limit = 20;
+const UppercaseWorkflow = reqrespupdate.UppercaseWorkflowWithLimit(limit).Def;
 
 /// Holds the request "foo {limit - 1}" in its activity until set, so the workflow has reached
 /// its request limit but still has a handler running: it can't continue as new yet, and the
@@ -36,14 +38,14 @@ fn runToContinueAsNew(reject_update_on_pending_continue_as_new: bool, extra: usi
     defer env.deinit();
     // Released on every path, so a failed check doesn't leave the worker stuck in the activity.
     defer last_request_gate.set(io);
-    try env.registerWorkflow(reqrespupdate.UppercaseWorkflow);
+    try env.registerWorkflow(UppercaseWorkflow);
     try env.registerActivityAs(reqrespupdate.UppercaseActivity, gatedUppercase);
 
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var run = try env.startWorkflow(reqrespupdate.UppercaseWorkflow, .{ .task_queue = "" }, .{reject_update_on_pending_continue_as_new});
+    var run = try env.startWorkflow(UppercaseWorkflow, .{ .task_queue = "" }, .{reject_update_on_pending_continue_as_new});
     defer run.deinit();
     const first_run_id = try arena.dupe(u8, run.run_id);
 
@@ -76,7 +78,7 @@ fn runToContinueAsNew(reject_update_on_pending_continue_as_new: bool, extra: usi
 }
 
 test "requests past the limit are rejected until the workflow continues as new" {
-    try runToContinueAsNew(true, 50);
+    try runToContinueAsNew(true, 10);
 }
 
 test "without the validator, requests past the limit are handled before continuing as new" {

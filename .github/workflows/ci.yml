@@ -51,6 +51,12 @@ jobs:
         run: rustup toolchain install --profile minimal
         working-directory: deps
 
+      # Checkout stamps every file with the current time, so cargo would rebuild the sdk-core
+      # crates even on a cache hit. The cache key pins those sources (CORE_VERSION), so give
+      # them a fixed old time instead.
+      - name: Date the sdk-core sources so cargo reuses the cached build
+        run: find deps -exec touch -h -t 200001010000 {} +
+
       - name: Cache the sdk-core cargo build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
