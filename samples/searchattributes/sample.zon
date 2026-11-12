@@ -1,0 +1,16 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The dev server
+// registers the Custom*Field search attributes the sample uses.
+.{
+    .expect = .{
+        "Workflow completed",
+        "Described search attribute: CustomBoolField=true",
+        "Described search attribute: CustomIntField=2",
+        "Described search attribute: CustomKeywordField=\"Keyword fields supports prefix search\"",
+        "Described search attribute: CustomKeywordListField=[\"value1\",\"value2\"]",
+        "Described search attribute: CustomDoubleField is unset",
+        "Visibility query found the completed workflow with CustomIntField=2",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"searchattributes_workflow_test.zig"},
+}
