@@ -40,6 +40,31 @@
 //!     const state = try ctx.allocator().create(State); // outlives the workflow function
 //!     state.* = .{};
 //!     try ctx.setQueryHandler(Greeting, state, State.current);
+//!
+//! Signals change a workflow's state from outside. Name one with `SignalDef` and handle it
+//! with `ctx.setSignalHandler`. Each signal runs its handler in a coroutine of its own, so a
+//! handler may block (on `ctx.await`, an activity, a timer, a `std.Io.Mutex`). Handlers start
+//! in the order their signals arrived, before the coroutines that the same workflow task's
+//! other events wake. A signal that arrives before its handler is registered waits for it:
+//!
+//!     pub const Approve = temporal.workflow.SignalDef("approve", fn (approver: []const u8) void);
+//!
+//!     const State = struct {
+//!         approver: ?[]const u8 = null,
+//!         fn approve(s: *State, approver: []const u8) void {
+//!             s.approver = approver;
+//!         }
+//!         fn approved(s: *State) bool {
+//!             return s.approver != null;
+//!         }
+//!     };
+//!     const state = try ctx.allocator().create(State);
+//!     state.* = .{};
+//!     try ctx.setSignalHandler(Approve, state, State.approve);
+//!     try ctx.await(state, State.approved);
+//!
+//! The workflow ends when its function returns, even while handlers are still running; to let
+//! them finish first, `try ctx.await(ctx, temporal.workflow.Context.allHandlersFinished)`.
 
 const std = @import("std");
 const converter = @import("converter.zig");
@@ -326,16 +351,64 @@ pub const Context = struct {
                 return converter.toPayload(out, value);
             }
         };
-        const addr: ?usize = switch (@typeInfo(C)) {
-            .pointer => |p| switch (p.size) {
-                .slice => if (context.len > 0) @intFromPtr(context.ptr) else null,
-                else => @intFromPtr(context),
-            },
-            else => null,
+        const stored = try ctx.allocator().create(C);
+        stored.* = context;
+        return ctx.instance.setQueryHandler(Query.query_name, .{ .context = @ptrCast(stored), .call = Erased.call }, contextAddress(context));
+    }
+
+    pub const SetSignalHandlerError = error{
+        OutOfMemory,
+        /// `context` points into the calling coroutine's stack (logged with the signal name).
+        SignalContextOnStack,
+    };
+
+    /// Handles signals named by `Signal` (a `SignalDef`) with `handler(context, args...)`,
+    /// which returns `void` or `!void`. Registering the same signal again replaces its
+    /// handler for the signals that arrive afterwards.
+    ///
+    /// Each signal runs the handler in a new workflow coroutine, so the handler may block and
+    /// may use the workflow context. Handlers start in the order their signals arrived.
+    /// Signals that arrived before this call are buffered, and each starts its handler
+    /// coroutine here, in arrival order; they run once the caller blocks. A signal whose
+    /// arguments don't decode as the handler's parameters is dropped with a warning.
+    ///
+    /// An error from the handler fails the workflow as if the workflow function had returned
+    /// it (`error.Canceled` cancels it), unless the workflow has already finished.
+    ///
+    /// `context` is usually a pointer to the state the handler changes. It must outlive the
+    /// run, so allocate it with `ctx.allocator()` (or point to a global); a pointer into the
+    /// calling coroutine's stack returns `error.SignalContextOnStack`. Decoded arguments live
+    /// in `ctx.allocator()`, so the handler may keep them.
+    ///
+    ///     const state = try ctx.allocator().create(State);
+    ///     try ctx.setSignalHandler(Approve, state, State.approve);
+    pub fn setSignalHandler(ctx: *Context, comptime Signal: type, context: anytype, comptime handler: anytype) SetSignalHandlerError!void {
+        const C = @TypeOf(context);
+        comptime checkSignalHandler(Signal, C, @TypeOf(handler));
+        const Erased = struct {
+            fn decode(out: Allocator, payloads: []const converter.Payload) anyerror!*const anyopaque {
+                const args = try out.create(Signal.Args);
+                args.* = try converter.fromPayloads(Signal.Args, out, payloads);
+                return @ptrCast(args);
+            }
+            fn call(p: *const anyopaque, a: *const anyopaque) anyerror!void {
+                const c: *const C = @ptrCast(@alignCast(p));
+                const args: *const Signal.Args = @ptrCast(@alignCast(a));
+                const result = @call(.auto, handler, .{c.*} ++ args.*);
+                if (@typeInfo(@TypeOf(result)) == .error_union) try result;
+            }
         };
         const stored = try ctx.allocator().create(C);
         stored.* = context;
-        return ctx.instance.setQueryHandler(Query.query_name, .{ .context = @ptrCast(stored), .call = Erased.call }, addr);
+        return ctx.instance.setSignalHandler(Signal.signal_name, .{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call }, contextAddress(context));
+    }
+
+    /// Whether no signal handler coroutine is running: every delivered signal's handler has
+    /// returned. Wait for it before returning so handlers aren't cut short:
+    ///
+    ///     try ctx.await(ctx, temporal.workflow.Context.allHandlersFinished);
+    pub fn allHandlersFinished(ctx: *Context) bool {
+        return ctx.instance.handlers.items.len == 0;
     }
 
     /// Whether the previous run of this cron (or retried) workflow completed with a result.
@@ -549,6 +622,59 @@ pub fn QueryDef(comptime name: []const u8, comptime F: type) type {
             else => Ret,
         };
     };
+}
+
+/// Names a signal and its arguments: `F` is a function type whose parameters are the
+/// signal's arguments and whose return type is `void`. Workflows handle it with
+/// `Context.setSignalHandler`; clients send it by the same type.
+///
+///     pub const Approve = temporal.workflow.SignalDef("approve", fn (approver: []const u8) void);
+pub fn SignalDef(comptime name: []const u8, comptime F: type) type {
+    if (@typeInfo(F) != .@"fn")
+        @compileError("SignalDef(\"" ++ name ++ "\", F): F must be a function type such as `fn ([]const u8) void`, not " ++ @typeName(F));
+    const Ret = @typeInfo(F).@"fn".return_type orelse
+        @compileError("SignalDef(\"" ++ name ++ "\", F): F must have a concrete return type");
+    if (Ret != void)
+        @compileError("SignalDef(\"" ++ name ++ "\", F): a signal returns nothing, so F must return void, not " ++ @typeName(Ret));
+    return struct {
+        pub const signal_name = name;
+        /// The signal's arguments, as a tuple.
+        pub const Args = std.meta.ArgsTuple(F);
+    };
+}
+
+/// The address a handler context points to, for the on-stack check, or null if it isn't a
+/// pointer.
+fn contextAddress(context: anytype) ?usize {
+    return switch (@typeInfo(@TypeOf(context))) {
+        .pointer => |p| switch (p.size) {
+            .slice => if (context.len > 0) @intFromPtr(context.ptr) else null,
+            else => @intFromPtr(context),
+        },
+        else => null,
+    };
+}
+
+/// Compile error unless `H` is `fn (C, Signal.Args...) void` or returns an error union of void.
+fn checkSignalHandler(comptime Signal: type, comptime C: type, comptime H: type) void {
+    const arg_types = @typeInfo(Signal.Args).@"struct".field_types;
+    var want: []const u8 = "fn (" ++ @typeName(C);
+    for (arg_types) |T| want = want ++ ", " ++ @typeName(T);
+    want = want ++ ") void (or !void)";
+    const bad = "signal handler for \"" ++ Signal.signal_name ++ "\" must be " ++ want ++ ", not " ++ @typeName(H);
+    const info = switch (@typeInfo(H)) {
+        .@"fn" => |f| f,
+        else => @compileError(bad),
+    };
+    if (info.param_types.len != 1 + arg_types.len) @compileError(bad);
+    if (info.param_types[0] != C) @compileError(bad);
+    for (arg_types, info.param_types[1..]) |want_t, got| if (got != want_t) @compileError(bad);
+    const Ret = info.return_type orelse @compileError(bad);
+    const payload = switch (@typeInfo(Ret)) {
+        .error_union => |eu| eu.payload,
+        else => Ret,
+    };
+    if (payload != void) @compileError(bad);
 }
 
 /// Compile error unless `H` is `fn (C, Query.Args...) Query.Result` or returns an error union

@@ -777,6 +777,50 @@ const Fixtures = struct {
     const LocalGreetingsChanged = workflow.Def("LocalGreetings", remoteGreetings);
 };
 
+const SignalFixtures = struct {
+    const Approve = workflow.SignalDef("approve", fn (approver: []const u8) void);
+
+    const Approvals = struct {
+        ctx: *workflow.Context,
+        greetings: std.ArrayList([]const u8) = .empty,
+        received: usize = 0,
+
+        /// Greets the approver with an activity, so the handler's commands are in history.
+        fn approve(s: *Approvals, approver: []const u8) !void {
+            s.received += 1;
+            const greeting = try s.ctx.executeActivity(Fixtures.Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{approver}).get();
+            try s.greetings.append(s.ctx.allocator(), greeting);
+        }
+        fn approveWithoutActivity(s: *Approvals, approver: []const u8) !void {
+            s.received += 1;
+            try s.greetings.append(s.ctx.allocator(), approver);
+        }
+        fn enough(s: *Approvals) bool {
+            return s.received >= 2;
+        }
+    };
+
+    /// Sleeps 2 s before registering its handler, so a signal sent at once is buffered; then
+    /// waits for two approvals and for their handlers to finish.
+    fn collect(ctx: *workflow.Context, comptime handler: anytype) ![]const u8 {
+        const s = try ctx.allocator().create(Approvals);
+        s.* = .{ .ctx = ctx };
+        try ctx.io().sleep(.fromSeconds(2), .awake);
+        try ctx.setSignalHandler(Approve, s, handler);
+        try ctx.await(s, Approvals.enough);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return std.mem.join(ctx.allocator(), " ", s.greetings.items);
+    }
+    fn collectApprovals(ctx: *workflow.Context) ![]const u8 {
+        return collect(ctx, Approvals.approve);
+    }
+    const CollectApprovals = workflow.Def("CollectApprovals", collectApprovals);
+    fn collectApprovalsWithoutActivity(ctx: *workflow.Context) ![]const u8 {
+        return collect(ctx, Approvals.approveWithoutActivity);
+    }
+    const CollectApprovalsChanged = workflow.Def("CollectApprovals", collectApprovalsWithoutActivity);
+};
+
 const ChildFixtures = struct {
     fn greetChild(ctx: *workflow.Context, name: []const u8) ![]const u8 {
         return std.fmt.allocPrint(ctx.allocator(), "Hello {s} from a child!", .{name});
@@ -1031,6 +1075,22 @@ test "WorkflowReplayer replays a workflow that waits for its activity's cancella
     defer ok.deinit();
     try ok.registerWorkflow(Fixtures.WaitCancellation);
     try ok.replayHistoryJson(wait_cancellation_history);
+}
+
+/// A dev-server run of `SignalFixtures.CollectApprovals` signaled "ann" while it slept, before
+/// it registered its handler, and "bob" after, exported with `temporal workflow show`.
+const signal_history = @embedFile("testdata/signal_history.json");
+
+test "WorkflowReplayer replays signal handlers and catches a handler that changed" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(SignalFixtures.CollectApprovals);
+    try ok.replayHistoryJson(signal_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(SignalFixtures.CollectApprovalsChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(signal_history));
 }
 
 test "WorkflowEnvironment runs local activities, retrying one after workflow timers" {
