@@ -15,6 +15,7 @@ const std = @import("std");
 const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
 const converter = @import("converter.zig");
+const search_attributes = @import("search_attributes.zig");
 const failure_mod = @import("failure.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -135,7 +136,7 @@ pub const Client = struct {
     }
 
     /// The start request for `options`, allocated from `a`. Signal-with-start copies it.
-    fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) error{OutOfMemory}!wfs.StartWorkflowExecutionRequest {
+    fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) search_attributes.EncodeError!wfs.StartWorkflowExecutionRequest {
         var request: wfs.StartWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_id = id,
@@ -168,6 +169,7 @@ pub const Client = struct {
             for (options.memo) |field| memo.fields.appendAssumeCapacity(.{ .key = field.name, .value = field.value });
             request.memo = memo;
         }
+        if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
         return request;
     }
 
@@ -453,21 +455,54 @@ pub const Client = struct {
             log.err("DescribeWorkflowExecution for workflow {s} returned no execution info", .{workflow_id});
             return error.InvalidResponse;
         };
-        const execution = info.execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
-        return .{
-            .workflow_id = execution.workflow_id,
-            .run_id = execution.run_id,
-            .workflow_type = if (info.type) |t| t.name else "",
-            .task_queue = info.task_queue,
-            .status = @fromBackingInt(@intCast(@backingInt(info.status))),
-            .start_time = timestamp(info.start_time),
-            .execution_time = timestamp(info.execution_time),
-            .close_time = timestamp(info.close_time),
-            .history_length = info.history_length,
-            .memo = if (info.memo) |m| try converter.fieldsFromMap(arena, m.fields.items) else &.{},
-            .search_attributes = if (info.search_attributes) |s| try converter.fieldsFromMap(arena, s.indexed_fields.items) else &.{},
-            .raw = response,
+        const lifted = try executionInfo(arena, info);
+        var d: WorkflowDescription = undefined;
+        inline for (@typeInfo(WorkflowDescription).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "raw")) continue;
+            @field(d, name) = @field(lifted, name);
+        }
+        d.raw = response;
+        return d;
+    }
+
+    /// Lists the workflow executions matching the visibility `query`, such as
+    /// `WorkflowType = 'Greet' AND ExecutionStatus = 'Running'` or a condition on a search
+    /// attribute (`CustomerId = 'c-42'`); an empty query lists them all. Visibility is
+    /// eventually consistent: a workflow started or changed a moment ago may not match yet.
+    /// The iterator fetches a page at a time as `next` reaches it; nothing is fetched here.
+    /// Free it with `deinit`.
+    pub fn listWorkflows(c: *Client, query: []const u8, options: ListWorkflowsOptions) error{OutOfMemory}!WorkflowExecutionIterator {
+        return .{ .client = c, .query = try c.gpa.dupe(u8, query), .page_size = options.page_size, .page = .init(c.gpa) };
+    }
+
+    /// The number of workflow executions matching the visibility `query` (see
+    /// `listWorkflows`); an empty query counts them all. Eventually consistent, like
+    /// `listWorkflows`.
+    pub fn countWorkflows(c: *Client, query: []const u8) ListError!u64 {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var status: ?RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.CountWorkflowExecutionsResponse, "CountWorkflowExecutions", wfs.CountWorkflowExecutionsRequest{
+            .namespace = c.namespace,
+            .query = query,
+        }, a, &status) catch |err| return visibilityError(err, status, "counting", query);
+        return std.math.cast(u64, response.count) orelse {
+            log.err("CountWorkflowExecutions for query \"{s}\" returned the count {d}", .{ query, response.count });
+            return error.InvalidResponse;
         };
+    }
+
+    fn visibilityError(err: RpcError, status: ?RpcStatus, comptime what: []const u8, query: []const u8) ListError {
+        switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            error.RpcFailed => {
+                const s = status orelse return error.RpcFailed;
+                log.err(what ++ " workflows with the query \"{s}\" failed: {s} (gRPC status {d})", .{ query, s.message, s.code });
+                return error.RpcFailed;
+            },
+            else => |e| return e,
+        }
     }
 
     /// Sends `Query` (a `workflow.QueryDef`) with `args` to a workflow and returns the
@@ -740,6 +775,10 @@ pub const StartWorkflowOptions = struct {
     /// Non-indexed values recorded with the workflow, such as a description. Build them with
     /// `converter.toFields`; they are only read while starting.
     memo: []const converter.Field = &.{},
+    /// Indexed values for visibility queries, built with `search_attributes.Key.set`; unsets
+    /// are ignored. Only read while starting. A value the server can't index fails the start
+    /// with `error.InvalidSearchAttribute`.
+    search_attributes: []const search_attributes.Update = &.{},
 };
 
 /// Names an activity by its workflow and activity ID, for completing it without its task
@@ -760,11 +799,140 @@ pub const ActivityCompletionError = error{
     InvalidResponse,
 };
 
-pub const StartError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, WorkflowExecutionAlreadyStarted };
+pub const StartError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    NotFound,
+    InvalidResponse,
+    WorkflowExecutionAlreadyStarted,
+    /// `StartWorkflowOptions.search_attributes` holds a value the server can't index (logged).
+    InvalidSearchAttribute,
+};
 
 pub const SignalError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
 
 pub const DescribeError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
+
+pub const ListError = error{
+    OutOfMemory,
+    Canceled,
+    /// Also an invalid query; the server's reason is logged with the query.
+    RpcFailed,
+    /// The client's namespace doesn't exist.
+    NotFound,
+    InvalidResponse,
+};
+
+pub const ListWorkflowsOptions = struct {
+    /// Executions per page; 0 uses the server's default.
+    page_size: u31 = 0,
+};
+
+/// A workflow run as a visibility query (`Client.listWorkflows`) reports it. Every slice
+/// borrows the arena passed to `WorkflowExecutionIterator.next`.
+pub const WorkflowExecutionInfo = struct {
+    workflow_id: []const u8,
+    run_id: []const u8,
+    workflow_type: []const u8,
+    task_queue: []const u8,
+    status: WorkflowExecutionStatus,
+    start_time: ?Io.Timestamp,
+    /// When the first workflow task was, or will be, scheduled: later than `start_time` for a
+    /// delayed start or a cron or retry backoff.
+    execution_time: ?Io.Timestamp,
+    /// Null while the run is open.
+    close_time: ?Io.Timestamp,
+    history_length: i64,
+    /// Decode a value with `memoValue` or `converter.fieldValue`.
+    memo: []const converter.Field,
+    /// Read a value with `search_attributes.get(arena, key)`.
+    search_attributes: search_attributes.View,
+    /// The server's record, for anything not lifted into the fields above.
+    raw: proto.temporal.api.workflow.v1.WorkflowExecutionInfo,
+
+    /// Decodes the memo value called `name` as `T`, or returns null if the memo has no such
+    /// value. Memory comes from `arena`.
+    pub fn memoValue(i: *const WorkflowExecutionInfo, comptime T: type, arena: Allocator, name: []const u8) converter.DecodeError!?T {
+        return converter.fieldValue(T, arena, i.memo, name);
+    }
+};
+
+/// Lifts the fields of `info` into a `WorkflowExecutionInfo` that borrows it.
+fn executionInfo(arena: Allocator, info: proto.temporal.api.workflow.v1.WorkflowExecutionInfo) error{OutOfMemory}!WorkflowExecutionInfo {
+    const execution = info.execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
+    return .{
+        .workflow_id = execution.workflow_id,
+        .run_id = execution.run_id,
+        .workflow_type = if (info.type) |t| t.name else "",
+        .task_queue = info.task_queue,
+        .status = @fromBackingInt(@intCast(@backingInt(info.status))),
+        .start_time = timestamp(info.start_time),
+        .execution_time = timestamp(info.execution_time),
+        .close_time = timestamp(info.close_time),
+        .history_length = info.history_length,
+        .memo = if (info.memo) |m| try converter.fieldsFromMap(arena, m.fields.items) else &.{},
+        .search_attributes = try .fromProto(arena, info.search_attributes),
+        .raw = info,
+    };
+}
+
+/// The workflow executions matching a visibility query, from `Client.listWorkflows`. Fetches
+/// a page from the server whenever `next` runs past the last one. Owns its memory with the
+/// client's allocator: free it with `deinit`. Not thread-safe.
+pub const WorkflowExecutionIterator = struct {
+    client: *Client,
+    query: []u8,
+    page_size: u31,
+    /// Holds the current page.
+    page: std.heap.ArenaAllocator,
+    executions: []const proto.temporal.api.workflow.v1.WorkflowExecutionInfo = &.{},
+    index: usize = 0,
+    /// Where the next page starts; empty after the last page. Owned with the client's
+    /// allocator.
+    next_page_token: []u8 = &.{},
+    fetched: bool = false,
+
+    pub fn deinit(it: *WorkflowExecutionIterator) void {
+        it.page.deinit();
+        it.client.gpa.free(it.query);
+        it.client.gpa.free(it.next_page_token);
+        it.* = undefined;
+    }
+
+    /// The next matching execution, copied into `arena`, or null after the last one. A
+    /// failed fetch can be retried by calling `next` again.
+    pub fn next(it: *WorkflowExecutionIterator, arena: Allocator) ListError!?WorkflowExecutionInfo {
+        // The server may return an empty page that still has a token.
+        while (it.index == it.executions.len) {
+            if (it.fetched and it.next_page_token.len == 0) return null;
+            try it.fetch();
+        }
+        const raw = try it.executions[it.index].dupe(arena);
+        it.index += 1;
+        return try executionInfo(arena, raw);
+    }
+
+    fn fetch(it: *WorkflowExecutionIterator) ListError!void {
+        const c = it.client;
+        it.executions = &.{};
+        it.index = 0;
+        _ = it.page.reset(.retain_capacity);
+        const a = it.page.allocator();
+        var status: ?Client.RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.ListWorkflowExecutionsResponse, "ListWorkflowExecutions", wfs.ListWorkflowExecutionsRequest{
+            .namespace = c.namespace,
+            .page_size = it.page_size,
+            .next_page_token = it.next_page_token,
+            .query = it.query,
+        }, a, &status) catch |err| return Client.visibilityError(err, status, "listing", it.query);
+        const token = try c.gpa.dupe(u8, response.next_page_token);
+        c.gpa.free(it.next_page_token);
+        it.next_page_token = token;
+        it.executions = response.executions.items;
+        it.fetched = true;
+    }
+};
 
 pub const QueryOptions = struct {
     /// When the server rejects the query instead of sending it to the workflow.
@@ -833,8 +1001,8 @@ pub const WorkflowDescription = struct {
     history_length: i64,
     /// Decode a value with `memoValue` or `converter.fieldValue`.
     memo: []const converter.Field,
-    /// Raw search attribute payloads, as the server returns them.
-    search_attributes: []const converter.Field,
+    /// Read a value with `search_attributes.get(arena, key)`.
+    search_attributes: search_attributes.View,
     /// The full server response, for anything not lifted into the fields above (pending
     /// activities, children, versioning info, ...).
     raw: wfs.DescribeWorkflowExecutionResponse,
@@ -996,6 +1164,8 @@ pub const UpdateWithStartError = error{
     InvalidOptions,
     /// The workflow is running and `id_conflict_policy` is `.fail`.
     WorkflowExecutionAlreadyStarted,
+    /// `StartWorkflowOptions.search_attributes` holds a value the server can't index (logged).
+    InvalidSearchAttribute,
 };
 
 pub const UpdateResultError = error{
