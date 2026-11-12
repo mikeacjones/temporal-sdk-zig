@@ -1,0 +1,15 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter also
+// does the work of the query and signal programs, and terminates the trip workflow at the end.
+.{
+    .expect = .{
+        "Trip counter before recovery: 3",
+        "Recovery workflow completed",
+        "Trip workflow restarted in a new run",
+        "Trip counter after recovery: 3",
+        "Terminated the trip workflow",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"recovery_test.zig"},
+    .programs = .{ "query", "signal" },
+}
