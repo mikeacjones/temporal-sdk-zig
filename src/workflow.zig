@@ -226,6 +226,20 @@ pub const RetryPolicy = struct {
     non_retryable_error_types: []const []const u8 = &.{},
 };
 
+/// How the server orders and shares out a workflow's tasks among others on the same task
+/// queue. Every zero field inherits its value from the parent or caller, or else uses the
+/// server's default.
+pub const Priority = struct {
+    /// 1 is the highest priority; larger keys run later. 0 uses the default, the middle of
+    /// the server's range.
+    priority_key: i32 = 0,
+    /// Groups tasks that share dispatch capacity fairly with other keys at the same priority,
+    /// such as a tenant ID. Empty uses the default key.
+    fairness_key: []const u8 = "",
+    /// This fairness key's share relative to others. 0 uses the default weight, 1.0.
+    fairness_weight: f32 = 0,
+};
+
 /// What canceling an activity's future does: `try_cancel` requests the cancellation and
 /// reports it at once, `wait_cancellation_completed` requests it and waits for the activity to
 /// end, and `abandon` reports it at once without telling the activity.
