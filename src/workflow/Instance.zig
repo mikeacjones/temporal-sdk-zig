@@ -16,6 +16,7 @@ const failure_mod = @import("../failure.zig");
 const log = @import("../log.zig");
 const workflow = @import("../workflow.zig");
 const client = @import("../client.zig");
+const sa = @import("../search_attributes.zig");
 const Scheduler = @import("Scheduler.zig");
 const WorkflowIo = @import("WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -67,6 +68,10 @@ last_completion_result: ?converter.Payload = null,
 /// by name so its order doesn't depend on the wire order of the start memo's map. Each upsert
 /// replaces the slice, so a slice handed out earlier keeps its contents. Arena memory.
 memo: []const converter.Field = &.{},
+/// The search attributes as the workflow sees them: the start values with this run's upserts
+/// applied, sorted by name. Each upsert replaces the view's slice, so a view handed out
+/// earlier keeps its contents. Arena memory.
+search_attributes: sa.View = .{},
 task_queue: []const u8 = "",
 namespace: []const u8 = "",
 root: ?*WorkflowIo.Task = null,
@@ -767,6 +772,7 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         std.mem.sort(converter.Field, fields, {}, fieldLessThan);
         inst.memo = fields;
     }
+    inst.search_attributes = try (try sa.View.fromProto(a, init.search_attributes)).dupe(a);
     const args = try a.alloc(converter.Payload, init.arguments.items.len);
     for (init.arguments.items, args) |p, *d| d.* = try p.dupe(a);
     inst.args = args;
@@ -843,7 +849,7 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
 
 /// Records the ContinueAsNewWorkflowExecution command to send if the workflow function returns
 /// error.ContinueAsNew, replacing any earlier request. `args` are encoded into the arena now.
-pub fn requestContinueAsNew(inst: *Instance, workflow_type: []const u8, options: workflow.ContinueAsNewOptions, args: anytype) error{OutOfMemory}!void {
+pub fn requestContinueAsNew(inst: *Instance, workflow_type: []const u8, options: workflow.ContinueAsNewOptions, args: anytype) sa.EncodeError!void {
     const a = inst.arena();
     var cmd: cmd_pb.ContinueAsNewWorkflowExecution = .{
         .workflow_type = workflow_type,
@@ -859,6 +865,12 @@ pub fn requestContinueAsNew(inst: *Instance, workflow_type: []const u8, options:
     const memo = options.memo orelse inst.memo;
     try cmd.memo.ensureTotalCapacity(a, memo.len);
     for (memo) |f| cmd.memo.appendAssumeCapacity(.{ .key = try a.dupe(u8, f.name), .value = try f.value.dupe(a) });
+    // Core fills missing search attributes with the start values plus upserts, removals
+    // included; the current view (an empty one too) carries only the values that are set.
+    cmd.search_attributes = if (options.search_attributes) |updates|
+        try sa.toProto(a, updates, .start)
+    else
+        try inst.search_attributes.toProto(a);
     inst.continue_as_new = cmd;
 }
 
@@ -907,6 +919,19 @@ fn fieldLessThan(_: void, x: converter.Field, y: converter.Field) bool {
 
 fn fieldOrder(name: []const u8, f: converter.Field) std.math.Order {
     return std.mem.order(u8, name, f.name);
+}
+
+// ---------------------------------------------------------------- search attributes
+
+/// Emits one UpsertWorkflowSearchAttributes command with `updates` (in their order) and
+/// applies them to `inst.search_attributes`. Upserting nothing does nothing.
+pub fn upsertSearchAttributes(inst: *Instance, updates: []const sa.Update) sa.EncodeError!void {
+    if (updates.len == 0) return;
+    const a = inst.arena();
+    const encoded = try sa.toProto(a, updates, .upsert);
+    const view = try inst.search_attributes.withEntries(a, encoded.indexed_fields.items);
+    try inst.commands.append(a, .{ .variant = .{ .upsert_workflow_search_attributes = .{ .search_attributes = encoded } } });
+    inst.search_attributes = view;
 }
 
 // ---------------------------------------------------------------- activities
@@ -1165,6 +1190,10 @@ pub fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: w
     if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
     try cmd.memo.ensureTotalCapacity(a, options.memo.len);
     for (options.memo) |f| cmd.memo.appendAssumeCapacity(.{ .key = f.name, .value = f.value });
+    if (options.search_attributes.len > 0) cmd.search_attributes = sa.toProto(a, options.search_attributes, .start) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidSearchAttribute => return error.InvalidOptions,
+    };
     try inst.children.put(a, state.seq, state);
     inst.next_child_seq += 1;
     try inst.commands.append(a, .{ .variant = .{ .start_child_workflow_execution = cmd } });
@@ -2783,6 +2812,87 @@ test "memo: the start memo is visible, sorted; an upsert emits ModifyWorkflowPro
     try testing.expectEqualStrings("\"owner,status,tags,zeta|added,status,zeta|queued->shipped\"", cmds[1].variant.?.complete_workflow_execution.result.?.data);
 }
 
+const SearchAttributesWf = struct {
+    const status = sa.key(.keyword, "Status");
+    const priority = sa.key(.int, "Priority");
+    const tags = sa.key(.keyword_list, "Tags");
+
+    /// Returns "<start status>|<names after the upserts>|<priority>", then continues as new
+    /// with the default options when `again` is set.
+    fn run(ctx: *workflow.Context, again: bool) ![]const u8 {
+        const a = ctx.allocator();
+        const start = ctx.searchAttributes();
+        const before = (try start.get(a, status)).?;
+        try ctx.upsertSearchAttributes(&.{ priority.set(2), status.unset(), tags.set(&.{ "x", "y" }), priority.set(3) });
+        try ctx.upsertSearchAttributes(&.{});
+        if (start.len() != 2) return error.StartViewChanged;
+        if (again) return ctx.continueAsNew(Def, .{}, .{false});
+        var names: std.ArrayList([]const u8) = .empty;
+        for (ctx.searchAttributes().fields) |f| try names.append(a, f.name);
+        return std.fmt.allocPrint(a, "{s}|{s}|{d}", .{ before, try std.mem.join(a, ",", names.items), (try ctx.searchAttributes().get(a, priority)).? });
+    }
+    const Def = workflow.Def("SearchAttributes", run);
+
+    fn badDouble(ctx: *workflow.Context) !void {
+        try ctx.upsertSearchAttributes(&.{sa.key(.double, "Score").set(std.math.nan(f64))});
+    }
+    const BadDouble = workflow.Def("BadDouble", badDouble);
+};
+
+fn startWithSearchAttributes(a: Allocator, workflow_type: []const u8, again: bool) !act_pb.WorkflowActivation {
+    var act = try initActivation(a, workflow_type, .{again});
+    act.jobs.items[0].variant.?.initialize_workflow.search_attributes = try sa.toProto(a, &.{
+        SearchAttributesWf.status.set("queued"),
+        SearchAttributesWf.priority.set(1),
+    }, .start);
+    return act;
+}
+
+test "search attributes: the start values are visible; an upsert emits UpsertWorkflowSearchAttributes and updates the view" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SearchAttributesWf.Def.registered, .{});
+    defer inst.destroy();
+
+    const cmds = commandsOf(try inst.activate(&try startWithSearchAttributes(a, "SearchAttributes", false), a));
+    try testing.expectEqual(@as(usize, 2), cmds.len); // upserting nothing emits no command
+    const upserted = cmds[0].variant.?.upsert_workflow_search_attributes.search_attributes.?.indexed_fields.items;
+    const want = [_][]const u8{ "Priority", "Status", "Tags", "Priority" };
+    try testing.expectEqual(want.len, upserted.len);
+    for (want, upserted) |name, entry| try testing.expectEqualStrings(name, entry.key);
+    try testing.expectEqualStrings("binary/null", converter.encodingOf(upserted[1].value.?).?);
+    try testing.expectEqualStrings("[\"x\",\"y\"]", upserted[2].value.?.data);
+    try testing.expectEqualStrings("\"queued|Priority,Tags|3\"", cmds[1].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "search attributes: continue-as-new with default options sends the current values" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SearchAttributesWf.Def.registered, .{});
+    defer inst.destroy();
+
+    const cmds = commandsOf(try inst.activate(&try startWithSearchAttributes(a, "SearchAttributes", true), a));
+    const can = cmds[1].variant.?.continue_as_new_workflow_execution;
+    const view = try sa.View.fromProto(a, can.search_attributes);
+    try testing.expectEqual(@as(usize, 2), view.len());
+    try testing.expectEqual(@as(?i64, 3), try view.get(a, SearchAttributesWf.priority));
+    try testing.expectEqualStrings("y", (try view.get(a, SearchAttributesWf.tags)).?[1]);
+}
+
+test "search attributes: a value the server can't index fails the workflow, with no command" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SearchAttributesWf.BadDouble.registered, .{});
+    defer inst.destroy();
+
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "BadDouble", .{}), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expectEqualStrings("InvalidSearchAttribute", cmds[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
 const QueryWf = struct {
     const Status = workflow.QueryDef("status", fn () []const u8);
     const Add = workflow.QueryDef("add", fn (i64, i64) i64);
@@ -2958,6 +3068,7 @@ const ChildWf = struct {
             .parent_close_policy = .abandon,
             .id_reuse_policy = .reject_duplicate,
             .memo = try converter.toFields(a, .{ .owner = "parent" }),
+            .search_attributes = &.{ sa.key(.keyword, "Owner").set("parent"), sa.key(.int, "Skipped").unset() },
         }, .{"kid"});
         const exec = f.started() catch |err| switch (err) {
             error.ChildWorkflowAlreadyStarted => return std.fmt.allocPrint(a, "already started: {s}", .{f.failure().?.message}),
@@ -3037,6 +3148,11 @@ test "child workflow: StartChildWorkflowExecution with the options, then the sta
     try testing.expect(start.cancellation_type == .TRY_CANCEL);
     try testing.expectEqualStrings("owner", start.memo.items[0].key);
     try testing.expectEqualStrings("\"parent\"", start.memo.items[0].value.?.data);
+    // A start leaves unsets out.
+    const child_sa = start.search_attributes.?.indexed_fields.items;
+    try testing.expectEqual(@as(usize, 1), child_sa.len);
+    try testing.expectEqualStrings("Owner", child_sa[0].key);
+    try testing.expectEqualStrings("\"parent\"", child_sa[0].value.?.data);
     // A version 4 UUID from the seeded randomness: the same seed generates the same ID.
     try testing.expectEqual(@as(usize, 36), start.workflow_id.len);
     try testing.expectEqual(@as(u8, '4'), start.workflow_id[14]);
