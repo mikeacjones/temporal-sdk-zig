@@ -153,6 +153,16 @@ const samples = [_]Sample{
     .{ .name = "child-workflow", .tests = &.{"parent_workflow_test.zig"} },
     .{ .name = "query", .tests = &.{"query_workflow_test.zig"} },
     .{ .name = "memo", .tests = &.{"memo_workflow_test.zig"} },
+    .{ .name = "await-signals", .tests = &.{"await_signals_workflow_test.zig"} },
+    .{ .name = "update", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "early-return", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "reqrespquery", .tests = &.{ "workflow_test.zig", "requester_test.zig" } },
+    .{ .name = "reqrespupdate", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "safe_message_handler", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "shoppingcart", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "updatabletimer", .tests = &.{"workflow_test.zig"} },
+    .{ .name = "sleep-for-days", .tests = &.{"sleep_for_days_workflow_test.zig"} },
+    .{ .name = "child-workflow-continue-as-new", .tests = &.{"parent_workflow_test.zig"} },
 };
 
 /// Runs cargo to build the C bridge as a static library for `target` and returns its path.

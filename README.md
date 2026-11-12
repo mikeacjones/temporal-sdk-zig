@@ -76,6 +76,16 @@ Where the Go SDK relies on machinery Temporal's Rust core doesn't have, this SDK
 | [child-workflow](samples/child-workflow) | child-workflow |
 | [query](samples/query) | query |
 | [memo](samples/memo) | memo |
+| [await-signals](samples/await-signals) | await-signals |
+| [update](samples/update) | update |
+| [early-return](samples/early-return) | early-return |
+| [reqrespquery](samples/reqrespquery) | reqrespquery |
+| [reqrespupdate](samples/reqrespupdate) | reqrespupdate |
+| [safe_message_handler](samples/safe_message_handler) | safe_message_handler |
+| [shoppingcart](samples/shoppingcart) | shoppingcart |
+| [updatabletimer](samples/updatabletimer) | updatabletimer |
+| [sleep-for-days](samples/sleep-for-days) | sleep-for-days |
+| [child-workflow-continue-as-new](samples/child-workflow-continue-as-new) | child-workflow-continue-as-new |
 
 ## Development
 
