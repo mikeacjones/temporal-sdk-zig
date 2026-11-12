@@ -151,6 +151,13 @@
 //!     }
 //!     pub const Counter = temporal.workflow.Def("Counter", counter);
 //!
+//! Changing a workflow's code changes the commands it produces, so runs that started before
+//! the change would no longer replay. `ctx.patched` keeps both paths until the old runs are
+//! gone (then `ctx.deprecatePatch`, then nothing); `ctx.getVersion` does the same with
+//! version numbers:
+//!
+//!     if (ctx.patched("send-receipt")) _ = try ctx.executeActivity(SendReceipt, opts, .{order}).get();
+//!
 //! A dynamic workflow runs every workflow type the worker has no `Def` registered for:
 //! define it with `DynamicDef`, register it with `Worker.registerDynamicWorkflow`, and read
 //! the type from `ctx.info().workflow_type` and the arguments from `converter.EncodedValues`.
@@ -447,6 +454,70 @@ pub const Context = struct {
     /// The size of the history in bytes, as of the current workflow task's start.
     pub fn historySizeBytes(ctx: *const Context) u64 {
         return ctx.instance.history_size_bytes;
+    }
+
+    /// Whether this run takes the new code path of the change named `patch_id`, so a changed
+    /// workflow still replays the histories of runs that started before the change:
+    ///
+    ///     if (ctx.patched("send-receipt")) {
+    ///         _ = try ctx.executeActivity(SendReceipt, opts, .{order}).get();
+    ///     }
+    ///
+    /// True when the code runs for the first time, which records a marker in history; on
+    /// replay, true only if the history has that marker, so runs that passed this point
+    /// before the change keep their old path. The first call decides for the whole run; later
+    /// calls with the same ID return the same answer.
+    ///
+    /// Once no run that took the old path is left, replace the call with
+    /// `deprecatePatch(patch_id)` and remove the old path; once no run that recorded the
+    /// marker is left either, remove the `deprecatePatch` call. Removing the `patched` call
+    /// directly fails replay of the runs that recorded its marker.
+    ///
+    /// On a worker that belongs to a Worker Deployment, a pinned workflow
+    /// doesn't need patches: each run stays on the deployment version it started on, whose
+    /// code doesn't change. An auto-upgrade workflow moves to the new version's code in the
+    /// middle of its history, so an incompatible change to it needs a patch.
+    ///
+    /// Out of memory fails the workflow task, which the server retries.
+    pub fn patched(ctx: *Context, patch_id: []const u8) bool {
+        return ctx.instance.patch(patch_id, false);
+    }
+
+    /// Marks the change named `patch_id` as one whose old code path is gone: the run records
+    /// the marker as `patched` does, but code without the call also replays it. Call it where
+    /// `patched(patch_id)` was, once no run that took the old path is left; remove it once no
+    /// run that recorded the marker is left.
+    ///
+    ///     ctx.deprecatePatch("send-receipt");
+    ///     _ = try ctx.executeActivity(SendReceipt, opts, .{order}).get();
+    pub fn deprecatePatch(ctx: *Context, patch_id: []const u8) void {
+        _ = ctx.instance.patch(patch_id, true);
+    }
+
+    /// The version of the change named `change_id` this run uses, for changes made a version
+    /// number at a time: `max_supported` when the code reaches this point for the first time
+    /// (recorded in history), the recorded version on replay, and `default_version` when
+    /// replaying a run that passed this point before the change existed:
+    ///
+    ///     const v = try ctx.getVersion("pricing", temporal.workflow.default_version, 2);
+    ///     const price = switch (v) {
+    ///         temporal.workflow.default_version => oldPrice(order),
+    ///         1 => try ctx.executeActivity(PriceV1, opts, .{order}).get(),
+    ///         else => try ctx.executeActivity(PriceV2, opts, .{order}).get(),
+    ///     };
+    ///
+    /// Raise `max_supported` for each new version, and raise `min_supported` (dropping the
+    /// branches below it) once no run uses the older versions. The first call decides for
+    /// the whole run. Each version is recorded as a patch named `"<change_id>@v<version>"`,
+    /// so the patch rules above apply: a version stays readable by the code that supports
+    /// it, and on versioned workers only auto-upgrade workflows need this.
+    ///
+    /// `error.UnsupportedVersion`: the run uses a version outside
+    /// `min_supported..max_supported`. Return it: the workflow task fails (with a message
+    /// naming the change and the versions) and is retried, so a worker whose code supports
+    /// the version can run it. Out of memory also fails the task.
+    pub fn getVersion(ctx: *Context, change_id: []const u8, min_supported: i32, max_supported: i32) error{UnsupportedVersion}!i32 {
+        return ctx.instance.getVersion(change_id, min_supported, max_supported);
     }
 
     /// Schedules an activity defined with `temporal.activity.Def` and returns a future for its
@@ -1042,6 +1113,10 @@ const ExternalFuture = struct {
         return state.outcome != null;
     }
 };
+
+/// The version `Context.getVersion` returns for a run that passed the change's point before
+/// the change existed.
+pub const default_version: i32 = -1;
 
 /// What a worker registers: a name and a type-erased call that decodes arguments, runs the
 /// workflow function, and encodes its result.
