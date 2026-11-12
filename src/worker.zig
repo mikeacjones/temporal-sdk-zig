@@ -404,10 +404,34 @@ pub const WorkflowRunner = struct {
         };
     }
 
+    /// Decodes `act`'s payloads with the codecs, in the context of its run. A run that isn't
+    /// cached yet starts with this activation: its start header is decoded first, without
+    /// propagated values, so the rest is decoded with the values the propagators extract
+    /// from it, the same ones the workflow will see.
+    fn decodeActivation(r: *WorkflowRunner, act: *act_pb.WorkflowActivation, a: Allocator, io: Io) converter.CodecError!void {
+        if (r.codecs.len == 0) return;
+        if (r.runs.get(act.run_id)) |inst| return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &runCodecContext(r.namespace, inst));
+        const index = for (act.jobs.items, 0..) |job, i| {
+            if (job.variant) |v| if (v == .initialize_workflow) break i;
+        } else return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &.{ .namespace = r.namespace });
+        const init = &act.jobs.items[index].variant.?.initialize_workflow;
+        var context: converter.CodecContext = .{ .namespace = r.namespace, .workflow_id = init.workflow_id, .workflow_type = init.workflow_type };
+        var headers = init.headers;
+        try converter.decodeMessage(@TypeOf(headers), &headers, r.codecs, a, io, &context);
+        const values = try a.create(propagation.Values);
+        values.* = .init(a);
+        try propagation.extractAll(r.propagators, a, try .fromEntries(a, headers.items), values, "the workflow start");
+        context.values = values;
+        init.headers = .empty;
+        try converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &context);
+        // Decoding copied the jobs; the header goes back into the copy.
+        act.jobs.items[index].variant.?.initialize_workflow.headers = headers;
+    }
+
     fn handle(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io) !done_pb.WorkflowActivationCompletion {
         var reader: Io.Reader = .fixed(bytes);
         var act = try act_pb.WorkflowActivation.decode(&reader, a);
-        converter.decodeMessage(act_pb.WorkflowActivation, &act, r.codecs, a, io) catch |err| switch (err) {
+        r.decodeActivation(&act, a, io) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // The task fails and is retried; the workflow never sees undecoded payloads.
             error.Canceled, error.CodecFailed => return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "decoding the workflow activation's payloads with the client's codecs failed: {t}", .{err})),
@@ -448,13 +472,18 @@ pub const WorkflowRunner = struct {
             break :blk inst;
         };
         var completion = inst.activate(&act, a) catch |err| return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err}));
-        converter.encodeMessage(done_pb.WorkflowActivationCompletion, &completion, r.codecs, a, io) catch |err| switch (err) {
+        converter.encodeMessage(done_pb.WorkflowActivationCompletion, &completion, r.codecs, a, io, &runCodecContext(r.namespace, inst)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled, error.CodecFailed => return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "encoding the workflow activation completion's payloads with the client's codecs failed: {t}", .{err})),
         };
         return completion;
     }
 };
+
+/// The codec context of a cached run: its identity and the values `ctx.propagated()` returns.
+fn runCodecContext(namespace: []const u8, inst: *const Instance) converter.CodecContext {
+    return .{ .values = &inst.propagated, .namespace = namespace, .workflow_id = inst.info.workflow_id, .workflow_type = inst.info.workflow_type };
+}
 
 fn taskFailure(a: Allocator, run_id: []const u8, message: []const u8) !done_pb.WorkflowActivationCompletion {
     log.warn("failing workflow task: {s}", .{message});
@@ -513,6 +542,9 @@ const RunningActivity = struct {
     task_token: []const u8,
     start: task_pb.Start,
     ctx: activity.Context,
+    /// What the codecs see for this activity's payloads: its identity, and once its header is
+    /// decoded, `ctx.propagated_`.
+    codec_context: converter.CodecContext = .{},
     /// Set when the activity returns or a cancel arrives; wakes the supervisor.
     wake: Io.Event = .unset,
 
@@ -600,7 +632,7 @@ fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivitie
     };
     const a = run.arena.allocator();
     var result = outcome catch return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
-    converter.encodeMessage(result_pb.ActivityExecutionResult, &result, w.client.codecs, a, w.io) catch |err| {
+    converter.encodeMessage(result_pb.ActivityExecutionResult, &result, w.client.codecs, a, w.io, &run.codec_context) catch |err| {
         if (err == error.OutOfMemory) return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
         // Report a failure without the payloads that couldn't be encoded.
         result = .{ .status = .{ .failed = .{ .failure = failure_mod.application(a, .{
@@ -631,6 +663,7 @@ const Heartbeats = struct {
     w: *Worker,
     core: bridge.Worker,
     task_token: []const u8,
+    codec_context: *const converter.CodecContext,
 
     fn record(context: *anyopaque, details: []const proto.temporal.api.common.v1.Payload) void {
         const h: *Heartbeats = @ptrCast(@alignCast(context));
@@ -639,7 +672,7 @@ const Heartbeats = struct {
         const a = scratch.allocator();
         var heartbeat: proto.coresdk.self.ActivityHeartbeat = .{ .task_token = h.task_token };
         heartbeat.details.appendSlice(a, details) catch return;
-        converter.encodeMessage(proto.coresdk.self.ActivityHeartbeat, &heartbeat, h.w.client.codecs, a, h.w.io) catch |err| {
+        converter.encodeMessage(proto.coresdk.self.ActivityHeartbeat, &heartbeat, h.w.client.codecs, a, h.w.io, h.codec_context) catch |err| {
             log.warn("recording an activity heartbeat failed: encoding its details with the client's codecs failed: {t}", .{err});
             return;
         };
@@ -656,7 +689,17 @@ const Heartbeats = struct {
 fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !result_pb.ActivityExecutionResult {
     const a = run.arena.allocator();
     const start = &run.start;
-    converter.decodeMessage(task_pb.Start, start, w.client.codecs, a, w.io) catch |err| switch (err) {
+    const execution = start.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
+    run.codec_context = .{
+        .namespace = w.client.namespace,
+        .workflow_id = execution.workflow_id,
+        .workflow_type = start.workflow_type,
+        .activity_type = start.activity_type,
+        .activity_id = start.activity_id,
+    };
+    const ctx = &run.ctx;
+    ctx.propagated_ = .init(a);
+    decodeActivityStart(w, run) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled, error.CodecFailed => return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
             .message = try std.fmt.allocPrint(a, "decoding the input of activity {s} with the client's codecs failed: {t}", .{ start.activity_id, err }),
@@ -671,9 +714,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
             .type = "ActivityNotRegistered",
         }) } } };
     };
-    const execution = start.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
     // The context already exists: a cancel may have set its reason.
-    const ctx = &run.ctx;
     ctx.arena = a;
     ctx.info_ = .{
         .activity_id = start.activity_id,
@@ -702,10 +743,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .workflow_type = start.workflow_type,
     });
     defer ctx.metrics_.deinit();
-    ctx.header_ = try .fromEntries(a, start.header_fields.items);
-    ctx.propagated_ = .init(a);
-    try propagation.extractAll(w.client.propagators, a, ctx.header_, &ctx.propagated_, "an activity task");
-    var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token };
+    var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token, .codec_context = &run.codec_context };
     ctx.heartbeat_details = start.heartbeat_details.items;
     // The core keeps no heartbeat state for local activities and warns on each heartbeat.
     if (!start.is_local) ctx.heartbeat_sink = .{ .gpa = w.gpa, .context = &heartbeats, .record = Heartbeats.record };
@@ -742,6 +780,22 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };
+}
+
+/// Decodes the activity's header, extracts its propagated values into `run.ctx`, and decodes
+/// the rest of its Start task with them in `run.codec_context`.
+fn decodeActivityStart(w: *Worker, run: *RunningActivity) converter.CodecError!void {
+    const a = run.arena.allocator();
+    const start = &run.start;
+    const codecs = w.client.codecs;
+    try converter.decodeMessage(@TypeOf(start.header_fields), &start.header_fields, codecs, a, w.io, &run.codec_context);
+    run.ctx.header_ = try .fromEntries(a, start.header_fields.items);
+    try propagation.extractAll(w.client.propagators, a, run.ctx.header_, &run.ctx.propagated_, "an activity task");
+    run.codec_context.values = &run.ctx.propagated_;
+    const header_fields = start.header_fields;
+    start.header_fields = .empty;
+    defer start.header_fields = header_fields;
+    try converter.decodeMessage(task_pb.Start, start, codecs, a, w.io, &run.codec_context);
 }
 
 /// The end of an activity's inbound interceptor chain: the registered activity itself.
@@ -1429,4 +1483,89 @@ test "a worker without its own sink uses its client's" {
     _ = try run.get(arena.allocator());
     try testing.expectEqual(1, sink.count("HelloWorld workflow started", &.{.{ .key = "WorkflowID", .value = "client-logs-wf" }}));
     try testing.expectEqual(1, sink.count("Activity", &.{.{ .key = "WorkflowID", .value = "client-logs-wf" }}));
+}
+
+/// Passes payloads through and records, for each call, the propagated tenant and the
+/// workflow its context names. Used from one thread.
+const ContextRecordingCodec = struct {
+    const tenant = propagation.key([]const u8, "tenant");
+    arena: Allocator,
+    calls: std.ArrayList([]const u8) = .empty,
+
+    fn codec(r: *ContextRecordingCodec) converter.PayloadCodec {
+        return .{ .ptr = r, .vtable = &.{ .encode = plain, .decode = plain, .encodeWithContext = encode, .decodeWithContext = decode } };
+    }
+
+    fn plain(_: *anyopaque, arena: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn encode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        try record(ptr, "encode", context);
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn decode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        try record(ptr, "decode", context);
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn record(ptr: *anyopaque, what: []const u8, context: *const converter.CodecContext) !void {
+        const r: *ContextRecordingCodec = @ptrCast(@alignCast(ptr));
+        const call = try std.fmt.allocPrint(r.arena, "{s} tenant={s} {s}/{s}/{s}", .{ what, context.values.get(tenant) orelse "-", context.namespace, context.workflow_type, context.workflow_id });
+        try r.calls.append(r.arena, call);
+    }
+};
+
+const CodecContextTest = struct {
+    fn echo(ctx: *workflow.Context, text: []const u8) ![]const u8 {
+        _ = ctx;
+        return text;
+    }
+    const Echo = workflow.Def("Echo", echo);
+};
+
+test "the workflow runner hands codecs the run's propagated values and identity" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recorder: ContextRecordingCodec = .{ .arena = a };
+    const codecs = [_]converter.PayloadCodec{recorder.codec()};
+    const propagators = [_]propagation.ContextPropagator{propagation.HeaderPropagator(ContextRecordingCodec.tenant).propagator};
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, CodecContextTest.Echo.workflow_name, CodecContextTest.Echo.registered);
+    var runner: WorkflowRunner = .{
+        .gpa = testing.allocator,
+        .workflows = &workflows,
+        .task_queue = "tq",
+        .namespace = "ns",
+        .stack_size = 256 * 1024,
+        .codecs = &codecs,
+        .propagators = &propagators,
+    };
+    defer runner.deinit();
+
+    var init: act_pb.InitializeWorkflow = .{ .workflow_type = "Echo", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    init.arguments = try converter.toPayloads(a, .{@as([]const u8, "hi")});
+    try init.headers.append(a, .{ .key = "tenant", .value = try converter.toPayload(a, @as([]const u8, "acme")) });
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+    try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+    var bytes: Io.Writer.Allocating = .init(a);
+    try act.encode(&bytes.writer, a);
+
+    const completion = try runner.handle(bytes.written(), a, testing.io);
+    const commands = completion.status.?.successful.commands.items;
+    try testing.expectEqualStrings("\"hi\"", commands[0].variant.?.complete_workflow_execution.result.?.data);
+    // The start header is decoded before its values are known; the arguments and the
+    // completion see them.
+    const want = [_][]const u8{
+        "decode tenant=- ns/Echo/wf-1",
+        "decode tenant=acme ns/Echo/wf-1",
+        "encode tenant=acme ns/Echo/wf-1",
+    };
+    try testing.expectEqual(want.len, recorder.calls.items.len);
+    for (want, recorder.calls.items) |w, got| try testing.expectEqualStrings(w, got);
+    // The workflow saw the header decoded once, not dropped by the two-step decode.
+    try testing.expectEqualStrings("acme", runner.runs.get("run-1").?.propagated.get(ContextRecordingCodec.tenant).?);
 }
