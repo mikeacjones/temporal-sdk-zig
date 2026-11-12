@@ -101,8 +101,13 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "temporal", .module = temporal }},
         }) }) catch @panic("OOM");
 
-        const programs = [_][]const u8{ "worker", "starter" };
-        for (programs) |program| {
+        // The runner runs the worker and the starter; other programs (`programs` in
+        // sample.zon) are only built, for running by hand.
+        const run_programs = [_][]const u8{ "worker", "starter" };
+        var programs: std.ArrayList([]const u8) = .empty;
+        programs.appendSlice(b.allocator, &run_programs) catch @panic("OOM");
+        programs.appendSlice(b.allocator, sample.programs) catch @panic("OOM");
+        for (programs.items, 0..) |program, i| {
             const exe = b.addExecutable(.{
                 .name = b.fmt("{s}-{s}", .{ sample.name, program }),
                 .root_module = b.createModule(.{
@@ -113,6 +118,7 @@ pub fn build(b: *std.Build) void {
                 }),
             });
             samples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+            if (i >= run_programs.len) continue;
             run_samples.addArg(b.fmt("{s}:{s}", .{ sample.name, program }));
             run_samples.addArtifactArg(exe);
         }
@@ -132,9 +138,9 @@ pub fn build(b: *std.Build) void {
 }
 
 /// A sample in samples/<name>: worker.zig, starter.zig, and sample.zon, whose `tests` are its
-/// test files and whose `imports` name other samples whose samples/<other>/<other>.zig it
-/// uses. The samples runner reads the rest of sample.zon.
-const Sample = struct { name: []const u8, tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{} };
+/// test files, whose `imports` name other samples whose samples/<other>/<other>.zig it
+/// uses, and whose `programs` name extra programs (samples/<name>/<program>.zig) to build. The samples runner reads the rest of sample.zon.
+const Sample = struct { name: []const u8, tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{}, programs: []const []const u8 = &.{} };
 
 /// Every directory under samples/ with a sample.zon, by name. The listing and the manifests
 /// are configure inputs, so adding a sample or changing its manifest reconfigures the build.
@@ -154,14 +160,14 @@ fn findSamples(b: *std.Build) []const Sample {
             else => std.debug.panic("cannot read {s}: {t}", .{ manifest_path, err }),
         };
         var diag: std.zon.parse.Diagnostics = undefined;
-        const manifest = std.zon.parse.fromSlice(struct { tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{} }, .{
+        const manifest = std.zon.parse.fromSlice(struct { tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{}, programs: []const []const u8 = &.{} }, .{
             .gpa = b.allocator,
             .arena = b.allocator,
             .source = source,
             .diagnostics = &diag,
             .ignore_unknown_fields = true,
         }) catch std.debug.panic("invalid {s}: {f}", .{ manifest_path, diag.fmt(manifest_path) });
-        found.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = manifest.tests, .imports = manifest.imports }) catch @panic("OOM");
+        found.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = manifest.tests, .imports = manifest.imports, .programs = manifest.programs }) catch @panic("OOM");
     }
     std.mem.sort(Sample, found.items, {}, struct {
         fn lessThan(_: void, a: Sample, c: Sample) bool {
