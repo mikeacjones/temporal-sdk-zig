@@ -10,6 +10,7 @@ pub const search_attributes = @import("search_attributes.zig");
 pub const failure = @import("failure.zig");
 pub const log = @import("log.zig");
 pub const history = @import("history.zig");
+pub const schedule = @import("schedule.zig");
 pub const Failure = failure.Failure;
 pub const testing = @import("testing.zig");
 
