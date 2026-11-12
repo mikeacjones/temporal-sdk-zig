@@ -337,7 +337,8 @@ pub const Context = struct {
         return &ctx.instance.info;
     }
 
-    /// A logger that is silent while the workflow replays.
+    /// A logger carrying the workflow's type, ID, and run ID as fields. It is silent while the
+    /// workflow replays unless `worker.Options.log_during_replay` is set.
     pub fn logger(ctx: *const Context) log.Logger {
         return ctx.instance.logger;
     }

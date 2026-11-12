@@ -22,6 +22,7 @@ const search_attributes = @import("search_attributes.zig");
 const history_mod = @import("history.zig");
 const schedule = @import("schedule.zig");
 const failure_mod = @import("failure.zig");
+const log_mod = @import("log.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -218,6 +219,9 @@ pub const WorkflowEnvironment = struct {
         /// replay of each finished workflow use too. Borrowed: they must outlive the
         /// environment.
         codecs: []const converter.PayloadCodec = &.{},
+        /// Where the client's sdk-core logs and the worker's workflow and activity logs go
+        /// (`client.Options.logger`). Borrowed: it must outlive the environment.
+        logger: ?log_mod.Sink = null,
     };
 
     /// Starts the environment on a dev server. Allocated so the worker's pointer to the
@@ -250,6 +254,7 @@ pub const WorkflowEnvironment = struct {
         errdefer env.server.stop(io);
         var client_options = env.server.clientOptions();
         client_options.codecs = options.codecs;
+        client_options.logger = options.logger;
         env.client = try client_mod.Client.connect(gpa, io, client_options);
         errdefer env.client.close();
         var suffix: [8]u8 = undefined;

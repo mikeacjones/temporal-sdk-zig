@@ -266,6 +266,10 @@ pub const Options = struct {
     task_queue: []const u8 = "",
     namespace: []const u8 = "default",
     stack_size: usize = 256 * 1024,
+    /// Where the workflow's logger writes.
+    logger: log.Sink = .std_log,
+    /// Keep the workflow's logger on while it replays history.
+    log_during_replay: bool = false,
 };
 
 /// Creates the instance for a run. `entry` is the registered workflow named by the run's
@@ -284,6 +288,7 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
     inst.ctx = .{ .instance = inst };
     inst.task_queue = try inst.arena().dupe(u8, options.task_queue);
     inst.namespace = try inst.arena().dupe(u8, options.namespace);
+    inst.logger = .{ .sink = options.logger, .replaying = if (options.log_during_replay) null else &inst.replaying };
     return inst;
 }
 
@@ -755,14 +760,11 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
     if (init.last_completion_result) |r| if (r.payloads.items.len > 0) {
         inst.last_completion_result = try r.payloads.items[0].dupe(a);
     };
-    inst.logger = .{
-        .context = try log.contextString(a, .{
-            .WorkflowType = inst.info.workflow_type,
-            .WorkflowID = inst.info.workflow_id,
-            .RunID = inst.info.run_id,
-        }),
-        .replaying = &inst.replaying,
-    };
+    inst.logger = try inst.logger.with(a, .{
+        .WorkflowType = inst.info.workflow_type,
+        .WorkflowID = inst.info.workflow_id,
+        .RunID = inst.info.run_id,
+    });
     if (init.memo) |m| {
         const fields = try a.alloc(converter.Field, m.fields.items.len);
         for (m.fields.items, fields) |entry, *f| f.* = .{

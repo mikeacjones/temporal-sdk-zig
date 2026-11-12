@@ -11,6 +11,8 @@ const bytes = @import("bytes.zig");
 const Allocator = std.mem.Allocator;
 
 ptr: *c.TemporalCoreRuntime,
+/// The forwarding slot this runtime's core logs go through, released by `deinit`.
+forward_slot: ?usize = null,
 
 pub const Options = struct {
     logging: ?Logging = null,
@@ -25,10 +27,99 @@ pub const Options = struct {
 pub const Logging = struct {
     /// A tracing filter for core logs, such as "temporalio_sdk_core=WARN,temporalio_client=WARN".
     filter: []const u8 = "WARN",
-    /// Receives each core log record. The record is only valid during the call, which may
-    /// happen on any thread. Null prints logs to stderr instead.
-    forward: c.TemporalCoreForwardedLogCallback = null,
+    /// Receives each core log record. Null prints logs to stderr instead.
+    forward: ?Forward = null,
 };
+
+/// A core log callback with its context. `func` runs on the core's threads, possibly several
+/// at once; `ctx` must stay valid until `Runtime.deinit` returns, which waits for calls in
+/// progress to finish.
+pub const Forward = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, record: *const LogRecord) void,
+};
+
+/// One core log record, only valid during the `Forward.func` call.
+pub const LogRecord = struct {
+    level: Level,
+    /// The Rust module path the record came from, such as "temporalio_sdk_core::worker".
+    target: []const u8,
+    message: []const u8,
+    timestamp_ms: u64,
+    raw: *const c.TemporalCoreForwardedLog,
+
+    pub const Level = enum { trace, debug, info, warn, err };
+
+    /// The record's structured fields as a JSON object.
+    pub fn fieldsJson(r: *const LogRecord) []const u8 {
+        return bytes.slice(c.temporal_core_forwarded_log_fields_json(r.raw));
+    }
+};
+
+// The core's log callback carries no context pointer, so each runtime that forwards logs
+// takes one of a fixed set of slots, each with its own C callback that finds the slot's
+// `Forward`.
+pub const max_forwarders = 32;
+
+const ForwardSlot = struct {
+    forward: Forward = undefined,
+    claimed: std.atomic.Value(bool) = .init(false),
+    /// Set while the slot's runtime may forward; `release` clears it, then waits for `busy`
+    /// (callbacks in progress) to drain before the slot's context may be freed.
+    live: std.atomic.Value(bool) = .init(false),
+    busy: std.atomic.Value(u32) = .init(0),
+};
+
+var forward_slots: [max_forwarders]ForwardSlot = @splat(.{});
+
+const forward_callbacks = blk: {
+    var callbacks: [max_forwarders]c.TemporalCoreForwardedLogCallback = undefined;
+    for (&callbacks, 0..) |*cb, i| cb.* = &ForwardTrampoline(i).call;
+    break :blk callbacks;
+};
+
+fn ForwardTrampoline(comptime i: usize) type {
+    return struct {
+        fn call(level: c.TemporalCoreForwardedLogLevel, raw: ?*const c.TemporalCoreForwardedLog) callconv(.c) void {
+            const slot = &forward_slots[i];
+            _ = slot.busy.fetchAdd(1, .seq_cst);
+            defer _ = slot.busy.fetchSub(1, .release);
+            if (!slot.live.load(.seq_cst)) return;
+            const log = raw orelse return;
+            const record: LogRecord = .{
+                .level = switch (level) {
+                    c.TemporalCoreForwardedLogLevel_Trace => .trace,
+                    c.TemporalCoreForwardedLogLevel_Debug => .debug,
+                    c.TemporalCoreForwardedLogLevel_Info => .info,
+                    c.TemporalCoreForwardedLogLevel_Warn => .warn,
+                    else => .err,
+                },
+                .target = bytes.slice(c.temporal_core_forwarded_log_target(log)),
+                .message = bytes.slice(c.temporal_core_forwarded_log_message(log)),
+                .timestamp_ms = c.temporal_core_forwarded_log_timestamp_millis(log),
+                .raw = log,
+            };
+            slot.forward.func(slot.forward.ctx, &record);
+        }
+    };
+}
+
+fn claimForwardSlot(forward: Forward) ?usize {
+    for (&forward_slots, 0..) |*slot, i| {
+        if (slot.claimed.cmpxchgStrong(false, true, .acquire, .monotonic) != null) continue;
+        slot.forward = forward;
+        slot.live.store(true, .seq_cst);
+        return i;
+    }
+    return null;
+}
+
+fn releaseForwardSlot(i: usize) void {
+    const slot = &forward_slots[i];
+    slot.live.store(false, .seq_cst);
+    while (slot.busy.load(.seq_cst) != 0) std.atomic.spinLoopHint();
+    slot.claimed.store(false, .release);
+}
 
 pub const Metrics = struct {
     exporter: Exporter,
@@ -75,7 +166,13 @@ pub const Metrics = struct {
     };
 };
 
-pub const InitError = error{ OutOfMemory, InvalidOptions, RuntimeInitFailed };
+pub const InitError = error{
+    OutOfMemory,
+    InvalidOptions,
+    RuntimeInitFailed,
+    /// `max_forwarders` runtimes that forward core logs already exist in this process.
+    TooManyLogForwarders,
+};
 
 /// Creates a runtime. On `error.RuntimeInitFailed`, `failure` (if given) receives the core's
 /// message, allocated with `gpa`; the caller frees it.
@@ -91,8 +188,14 @@ pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtim
 
     var telemetry: c.TemporalCoreTelemetryOptions = .{ .logging = null, .metrics = null };
     var logging: c.TemporalCoreLoggingOptions = undefined;
+    var forward_slot: ?usize = null;
+    errdefer if (forward_slot) |i| releaseForwardSlot(i);
     if (options.logging) |l| {
-        logging = .{ .filter = bytes.ref(l.filter), .forward_to = l.forward };
+        logging = .{ .filter = bytes.ref(l.filter), .forward_to = null };
+        if (l.forward) |f| {
+            forward_slot = claimForwardSlot(f) orelse return error.TooManyLogForwarders;
+            logging.forward_to = forward_callbacks[forward_slot.?];
+        }
         telemetry.logging = &logging;
     }
     var metrics: c.TemporalCoreMetricsOptions = undefined;
@@ -163,11 +266,14 @@ pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtim
         c.temporal_core_runtime_free(ptr);
         return error.RuntimeInitFailed;
     }
-    return .{ .ptr = ptr };
+    return .{ .ptr = ptr, .forward_slot = forward_slot };
 }
 
+/// Frees the runtime. Once this returns, its log forwarding callback is no longer running and
+/// won't be called again.
 pub fn deinit(r: Runtime) void {
     c.temporal_core_runtime_free(r.ptr);
+    if (r.forward_slot) |i| releaseForwardSlot(i);
 }
 
 fn mapEncodeError(err: bytes.EncodeError) InitError {
