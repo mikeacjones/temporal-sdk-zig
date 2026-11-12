@@ -580,6 +580,7 @@ pub const WorkflowEnvironment = struct {
             .workflows = env.worker.workflows,
             .dynamic_workflow = env.worker.dynamic_workflow,
             .workflow_id = workflow_id,
+            .options = .{ .namespace = env.client.namespace, .task_queue = env.task_queue },
         };
         return replayer.replayHistory(history);
     }
@@ -643,14 +644,28 @@ pub const WorkflowReplayer = struct {
     workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty,
     /// Replays workflow types with no entry in `workflows`, if set.
     dynamic_workflow: ?workflow.Registered = null,
-    /// The workflow ID replayed workflows see in `ctx.info().workflow_id`. A history doesn't
-    /// record its own workflow ID, so set this to the original run's ID when the workflow's
-    /// commands depend on it (a child or activity ID derived from it, for example), or
-    /// replay fails with `error.Nondeterminism`. Borrowed: it must outlive every replay call.
+    /// The workflow ID replayed workflows see in `ctx.info().workflow_id` when a call doesn't
+    /// name one. A history doesn't record its own workflow ID, so set this to the original
+    /// run's ID when the workflow's commands depend on it (a child or activity ID derived
+    /// from it, for example), or replay fails with `error.Nondeterminism`. Borrowed: it must
+    /// outlive every replay call.
     workflow_id: []const u8 = "replay",
+    options: Options = .{},
+
+    /// What replayed workflows see in `ctx.info()`. Set them to the original worker's values
+    /// when a workflow's commands depend on them. Borrowed: they must outlive every replay
+    /// call.
+    pub const Options = struct {
+        namespace: []const u8 = "default",
+        task_queue: []const u8 = "replay",
+    };
 
     pub fn init(gpa: Allocator, io: Io) WorkflowReplayer {
         return .{ .gpa = gpa, .io = io };
+    }
+
+    pub fn initWithOptions(gpa: Allocator, io: Io, options: Options) WorkflowReplayer {
+        return .{ .gpa = gpa, .io = io, .options = options };
     }
 
     pub fn deinit(r: *WorkflowReplayer) void {
@@ -668,7 +683,32 @@ pub const WorkflowReplayer = struct {
         r.dynamic_workflow = Dynamic.registered;
     }
 
-    pub const ReplayError = error{ OutOfMemory, InvalidHistoryJson, ReplayFailed, Nondeterminism };
+    pub const ReplayError = error{
+        OutOfMemory,
+        InvalidHistoryJson,
+        /// The history doesn't start with a WorkflowExecutionStarted event naming a workflow
+        /// type, or isn't a serialized history.
+        InvalidHistory,
+        /// Replay couldn't run or finish the history, for example because its workflow type
+        /// isn't registered.
+        ReplayFailed,
+        /// The workflow code doesn't produce the commands the history recorded.
+        Nondeterminism,
+    };
+
+    /// How one history replayed, from `replayHistories` or `replayWorkflowExecution`. The
+    /// slices borrow the arena passed to that call.
+    pub const ReplayResult = struct {
+        workflow_id: []const u8,
+        /// The run ID in the history's started event; empty for an invalid history.
+        run_id: []const u8,
+        /// Null when the history replayed cleanly; otherwise `error.Nondeterminism`,
+        /// `error.InvalidHistory`, or `error.ReplayFailed`.
+        err: ?ReplayError = null,
+        /// Why replay failed, as the core reports it (for nondeterminism, the command or event
+        /// that didn't match). Empty on success.
+        message: []const u8 = "",
+    };
 
     /// Replays the history in a JSON file (a Temporal CLI or UI export).
     pub fn replayHistoryFromJsonFile(r: *WorkflowReplayer, path: []const u8) !void {
@@ -684,86 +724,224 @@ pub const WorkflowReplayer = struct {
     pub fn replayHistoryJson(r: *WorkflowReplayer, json: []const u8) ReplayError!void {
         var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
         defer arena_state.deinit();
-        const a = arena_state.allocator();
-        const h = try history_mod.fromJson(a, json);
-        var encoded: Io.Writer.Allocating = .init(a);
-        h.encode(&encoded.writer, a) catch return error.OutOfMemory;
-        return r.replayHistoryBytes(encoded.written());
-    }
-
-    /// Replays a history, for example one from `Client.fetchHistory`.
-    pub fn replayHistory(r: *WorkflowReplayer, history: history_mod.History) ReplayError!void {
-        var scratch: std.heap.ArenaAllocator = .init(r.gpa);
-        defer scratch.deinit();
-        var encoded: Io.Writer.Allocating = .init(scratch.allocator());
-        history.encode(&encoded.writer, scratch.allocator()) catch return error.OutOfMemory;
-        return r.replayHistoryBytes(encoded.written());
+        return r.replayHistory(try history_mod.fromJson(arena_state.allocator(), json));
     }
 
     /// Replays a serialized temporal.api.history.v1.History.
     pub fn replayHistoryBytes(r: *WorkflowReplayer, history_bytes: []const u8) ReplayError!void {
-        var message: ?[]u8 = null;
-        defer if (message) |m| r.gpa.free(m);
-        const runtime = bridge.Runtime.init(r.gpa, .{}, &message) catch return error.ReplayFailed;
-        defer runtime.deinit();
-        var replayer = bridge.Worker.initReplayer(r.gpa, runtime, .{
-            .namespace = "default",
-            .task_queue = "replay",
-            .task_types = .{ .local_activities = false, .remote_activities = false, .nexus = false },
-            .max_cached_workflows = 1,
-        }, &message) catch {
-            log.err("creating the replay worker failed: {s}", .{message orelse "unknown error"});
-            return error.ReplayFailed;
+        var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var reader: Io.Reader = .fixed(history_bytes);
+        const history = history_mod.History.decode(&reader, a) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.warn("replay failed: the bytes are not a serialized history ({t})", .{err});
+                return error.InvalidHistory;
+            },
         };
-        defer replayer.worker.deinit();
+        return r.replayHistory(history);
+    }
 
-        var outcome: Outcome = .{ .gpa = r.gpa };
-        defer outcome.deinit();
-        var runner: worker_mod.WorkflowRunner = .{
-            .gpa = r.gpa,
-            .workflows = &r.workflows,
-            .dynamic_workflow = r.dynamic_workflow,
-            .task_queue = "replay",
-            .namespace = "default",
-            .stack_size = 256 * 1024,
-            .on_evict = Outcome.record,
-            .on_evict_ctx = &outcome,
+    /// Replays a history, for example one from `Client.fetchHistory`, as `r.workflow_id`.
+    /// The core's reason for a failure is logged; use `replayHistories` to read it instead.
+    pub fn replayHistory(r: *WorkflowReplayer, history: history_mod.History) ReplayError!void {
+        var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
+        defer arena_state.deinit();
+        var session: Session = undefined;
+        try session.init(r);
+        defer session.deinit();
+        const result = try session.replay(arena_state.allocator(), r.workflow_id, history);
+        if (result.err) |err| {
+            log.warn("replay failed: {s}", .{result.message});
+            return err;
+        }
+    }
+
+    /// Replays several histories through one replay worker, one after another, and returns
+    /// a result for each in order: a history that fails to replay doesn't stop the rest.
+    /// `histories` is a slice of `history.WorkflowHistory`, or a pointer to an iterator whose
+    /// `next(arena)` returns `!?history.WorkflowHistory`; an error from the iterator ends the
+    /// batch and is returned. Results are allocated from `arena`.
+    pub fn replayHistories(r: *WorkflowReplayer, arena: Allocator, histories: anytype) ![]ReplayResult {
+        var results: std.ArrayList(ReplayResult) = .empty;
+        // Created on the first history, so an empty batch starts no worker.
+        var session: Session = undefined;
+        var started = false;
+        defer if (started) session.deinit();
+        const is_iterator = comptime switch (@typeInfo(@TypeOf(histories))) {
+            .pointer => |p| p.size == .one and @typeInfo(p.child) == .@"struct",
+            else => false,
         };
-        defer runner.deinit();
+        if (is_iterator) {
+            while (try histories.next(arena)) |h| {
+                if (!started) try session.init(r);
+                started = true;
+                try results.append(arena, try session.replay(arena, h.workflow_id, h.history));
+            }
+        } else {
+            const slice: []const history_mod.WorkflowHistory = histories;
+            for (slice) |h| {
+                if (!started) try session.init(r);
+                started = true;
+                try results.append(arena, try session.replay(arena, h.workflow_id, h.history));
+            }
+        }
+        return results.toOwnedSlice(arena);
+    }
 
-        // The core sends the history from a background task that uses the pusher, so the
-        // pusher is freed only after the worker has shut down (as the .NET SDK does).
-        defer replayer.finishPushing();
-        replayer.push(r.gpa, r.workflow_id, history_bytes, &message) catch {
-            log.err("pushing a history for replay failed: {s}", .{message orelse "unknown error"});
-            return error.ReplayFailed;
-        };
+    /// Fetches the history of a workflow run through `client` and replays it as
+    /// `workflow_id`. An empty `run_id` reads the latest run. A replay failure is in the
+    /// result's `err` and `message`; errors returned are fetch failures, or a replay worker
+    /// that couldn't start (`error.ReplayFailed`, logged). The result is allocated from
+    /// `arena`.
+    pub fn replayWorkflowExecution(
+        r: *WorkflowReplayer,
+        arena: Allocator,
+        client: *client_mod.Client,
+        workflow_id: []const u8,
+        run_id: []const u8,
+    ) (client_mod.HistoryError || error{ReplayFailed})!ReplayResult {
+        const history = try client.fetchHistory(arena, workflow_id, run_id);
+        var session: Session = undefined;
+        try session.init(r);
+        defer session.deinit();
+        return session.replay(arena, workflow_id, history);
+    }
 
-        // The core evicts the run when replay reaches the end of the history (or fails).
-        while (!outcome.evicted) {
-            const polled = replayer.worker.pollWorkflowActivation(r.gpa, r.io, &message) catch {
-                log.err("replay polling failed: {s}", .{message orelse "unknown error"});
+    /// A replay worker with the workflow runner that answers its activations. Pinned in
+    /// memory once `init` returns: the runner points at its `outcome`.
+    const Session = struct {
+        r: *const WorkflowReplayer,
+        runtime: bridge.Runtime,
+        replayer: bridge.Worker.Replayer,
+        runner: worker_mod.WorkflowRunner,
+        outcome: Outcome,
+        /// The worker stopped polling; later histories can't replay.
+        stopped: bool,
+
+        fn init(s: *Session, r: *const WorkflowReplayer) error{ReplayFailed}!void {
+            var message: ?[]u8 = null;
+            defer if (message) |m| r.gpa.free(m);
+            const runtime = bridge.Runtime.init(r.gpa, .{}, &message) catch {
+                log.err("creating the core runtime for replay failed: {s}", .{message orelse "unknown error"});
                 return error.ReplayFailed;
-            } orelse break;
-            defer polled.deinit();
-            runner.process(replayer.worker, r.io, polled.bytes());
+            };
+            errdefer runtime.deinit();
+            const replayer = bridge.Worker.initReplayer(r.gpa, runtime, .{
+                .namespace = r.options.namespace,
+                .task_queue = r.options.task_queue,
+                .task_types = .{ .local_activities = false, .remote_activities = false, .nexus = false },
+                .max_cached_workflows = 1,
+            }, &message) catch {
+                log.err("creating the replay worker for namespace {s}, task queue {s} failed: {s}", .{ r.options.namespace, r.options.task_queue, message orelse "unknown error" });
+                return error.ReplayFailed;
+            };
+            s.* = .{
+                .r = r,
+                .runtime = runtime,
+                .replayer = replayer,
+                .outcome = .{ .gpa = r.gpa },
+                .stopped = false,
+                .runner = .{
+                    .gpa = r.gpa,
+                    .workflows = &r.workflows,
+                    .dynamic_workflow = r.dynamic_workflow,
+                    .task_queue = r.options.task_queue,
+                    .namespace = r.options.namespace,
+                    .stack_size = 256 * 1024,
+                    .on_evict = Outcome.record,
+                    .on_evict_ctx = undefined,
+                },
+            };
+            s.runner.on_evict_ctx = &s.outcome;
         }
-        replayer.worker.initiateShutdown();
-        while (true) {
-            const polled = replayer.worker.pollWorkflowActivation(r.gpa, r.io, &message) catch break orelse break;
-            defer polled.deinit();
-            runner.process(replayer.worker, r.io, polled.bytes());
-        }
-        replayer.worker.finalizeShutdown(r.gpa, r.io, null) catch {};
 
-        if (!outcome.evicted) {
-            log.err("replay ended without finishing the history", .{});
-            return error.ReplayFailed;
+        fn deinit(s: *Session) void {
+            const gpa = s.r.gpa;
+            const io = s.r.io;
+            var message: ?[]u8 = null;
+            defer if (message) |m| gpa.free(m);
+            s.replayer.worker.initiateShutdown();
+            while (true) {
+                const polled = s.replayer.worker.pollWorkflowActivation(gpa, io, &message) catch break orelse break;
+                defer polled.deinit();
+                s.runner.process(s.replayer.worker, io, polled.bytes());
+            }
+            s.replayer.worker.finalizeShutdown(gpa, io, null) catch {};
+            // The core sends histories from a background task that uses the pusher, so the
+            // pusher is freed only after the worker has shut down (as the .NET SDK does).
+            s.replayer.finishPushing();
+            s.runner.deinit();
+            s.outcome.deinit();
+            s.replayer.worker.deinit();
+            s.runtime.deinit();
+            s.* = undefined;
         }
-        if (outcome.failed) {
-            log.warn("replay failed: {s}", .{outcome.message orelse "unknown reason"});
-            return if (outcome.nondeterminism) error.Nondeterminism else error.ReplayFailed;
+
+        /// Replays one history as `workflow_id` and waits for the core to evict its run.
+        /// Histories are pushed one at a time so each eviction belongs to the history just
+        /// pushed.
+        fn replay(s: *Session, arena: Allocator, workflow_id: []const u8, history: history_mod.History) error{OutOfMemory}!ReplayResult {
+            const gpa = s.r.gpa;
+            var result: ReplayResult = .{ .workflow_id = try arena.dupe(u8, workflow_id), .run_id = "" };
+            // The core can't report these: it panics on a history without them.
+            const started = startedEvent(history) orelse {
+                result.err = error.InvalidHistory;
+                result.message = "the history's first event must be a WorkflowExecutionStarted event naming the workflow type";
+                return result;
+            };
+            result.run_id = try arena.dupe(u8, started.original_execution_run_id);
+            if (s.stopped) {
+                result.err = error.ReplayFailed;
+                result.message = "the replay worker stopped while replaying an earlier history";
+                return result;
+            }
+
+            var scratch: std.heap.ArenaAllocator = .init(gpa);
+            defer scratch.deinit();
+            var encoded: Io.Writer.Allocating = .init(scratch.allocator());
+            history.encode(&encoded.writer, scratch.allocator()) catch return error.OutOfMemory;
+
+            s.outcome.reset();
+            var message: ?[]u8 = null;
+            defer if (message) |m| gpa.free(m);
+            s.replayer.push(gpa, workflow_id, encoded.written(), &message) catch {
+                result.err = error.ReplayFailed;
+                result.message = try std.fmt.allocPrint(arena, "pushing the history for replay failed: {s}", .{message orelse "unknown error"});
+                return result;
+            };
+            // The core evicts the run when replay reaches the end of the history (or fails).
+            while (!s.outcome.evicted) {
+                const polled = s.replayer.worker.pollWorkflowActivation(gpa, s.r.io, &message) catch {
+                    s.stopped = true;
+                    result.err = error.ReplayFailed;
+                    result.message = try std.fmt.allocPrint(arena, "polling the replay worker failed: {s}", .{message orelse "unknown error"});
+                    return result;
+                } orelse {
+                    s.stopped = true;
+                    result.err = error.ReplayFailed;
+                    result.message = "replay ended without finishing the history";
+                    return result;
+                };
+                defer polled.deinit();
+                s.runner.process(s.replayer.worker, s.r.io, polled.bytes());
+            }
+            if (s.outcome.failed) {
+                result.err = if (s.outcome.nondeterminism) error.Nondeterminism else error.ReplayFailed;
+                result.message = try arena.dupe(u8, s.outcome.message orelse "unknown reason");
+            }
+            return result;
         }
+    };
+
+    fn startedEvent(history: history_mod.History) ?proto.temporal.api.history.v1.WorkflowExecutionStartedEventAttributes {
+        if (history.events.items.len == 0) return null;
+        const attrs = history.events.items[0].attributes orelse return null;
+        return switch (attrs) {
+            .workflow_execution_started_event_attributes => |started| if (started.workflow_type != null) started else null,
+            else => null,
+        };
     }
 
     const Outcome = struct {
@@ -786,6 +964,11 @@ pub const WorkflowReplayer = struct {
                     o.message = std.fmt.allocPrint(o.gpa, "{t}: {s}", .{ reason, message }) catch null;
                 },
             }
+        }
+
+        fn reset(o: *Outcome) void {
+            o.deinit();
+            o.* = .{ .gpa = o.gpa };
         }
 
         fn deinit(o: *Outcome) void {
@@ -1039,6 +1222,15 @@ const Fixtures = struct {
         return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ first, second });
     }
     const LocalGreetingsChanged = workflow.Def("LocalGreetings", remoteGreetings);
+
+    /// Waits on a timer only when run on an environment's task queue ("test-..."), so its
+    /// history replays only with that task queue.
+    fn queueDependent(ctx: *workflow.Context) ![]const u8 {
+        if (!std.mem.startsWith(u8, ctx.info().task_queue, "test-")) return "no timer";
+        try ctx.io().sleep(.fromMilliseconds(10), .awake);
+        return "timer";
+    }
+    const QueueDependent = workflow.Def("QueueDependent", queueDependent);
 };
 
 const SideEffectFixtures = struct {
@@ -1718,6 +1910,197 @@ test "WorkflowReplayer replays a run that continued as new and catches one that 
     defer changed.deinit();
     try changed.registerWorkflow(ContinueFixtures.CountUpCompleting);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(continue_as_new_history));
+}
+
+test "WorkflowReplayer replays a batch of histories through one worker and reports each outcome" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    try r.registerWorkflow(Fixtures.Hello);
+    try r.registerWorkflow(Fixtures.MemoUpdatesChanged);
+
+    const hello = try history_mod.fromJson(a, hello_history);
+    const hello_run_id = hello.events.items[0].attributes.?.workflow_execution_started_event_attributes.original_execution_run_id;
+    const histories = [_]history_mod.WorkflowHistory{
+        .{ .workflow_id = "hello-1", .history = hello },
+        .{ .workflow_id = "memo", .history = try history_mod.fromJson(a, upsert_memo_history) },
+        .{ .workflow_id = "empty", .history = .{} },
+        .{ .workflow_id = "hello-2", .history = hello },
+    };
+    const results = try r.replayHistories(a, &histories);
+    try testing.expectEqual(@as(usize, 4), results.len);
+
+    try testing.expectEqualStrings("hello-1", results[0].workflow_id);
+    try testing.expectEqualStrings(hello_run_id, results[0].run_id);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), results[0].err);
+    try testing.expectEqualStrings("", results[0].message);
+
+    try testing.expectEqualStrings("memo", results[1].workflow_id);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, error.Nondeterminism), results[1].err);
+    try testing.expect(std.mem.startsWith(u8, results[1].message, "NONDETERMINISM: "));
+
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, error.InvalidHistory), results[2].err);
+    try testing.expectEqualStrings("", results[2].run_id);
+
+    // A failed history doesn't stop the ones after it.
+    try testing.expectEqualStrings("hello-2", results[3].workflow_id);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), results[3].err);
+
+    // The same, from an iterator.
+    const Feed = struct {
+        items: []const history_mod.WorkflowHistory,
+        i: usize = 0,
+        pub fn next(f: *@This(), _: Allocator) error{}!?history_mod.WorkflowHistory {
+            if (f.i == f.items.len) return null;
+            defer f.i += 1;
+            return f.items[f.i];
+        }
+    };
+    var feed: Feed = .{ .items = histories[0..2] };
+    const fed = try r.replayHistories(a, &feed);
+    try testing.expectEqual(@as(usize, 2), fed.len);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), fed[0].err);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, error.Nondeterminism), fed[1].err);
+
+    try testing.expectEqual(@as(usize, 0), (try r.replayHistories(a, &[_]history_mod.WorkflowHistory{})).len);
+}
+
+test "WorkflowReplayer replays a run fetched through a client, seeing the options' task queue" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.QueueDependent);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(Fixtures.QueueDependent, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    // getResult replays the run with the environment's task queue too.
+    try testing.expectEqualStrings("timer", try env.getResult(Fixtures.QueueDependent, &run, a, null));
+
+    var r: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .task_queue = env.task_queue });
+    defer r.deinit();
+    try r.registerWorkflow(Fixtures.QueueDependent);
+    const ok = try r.replayWorkflowExecution(a, &env.client, run.id, "");
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), ok.err);
+    try testing.expectEqualStrings(run.id, ok.workflow_id);
+    try testing.expectEqualStrings(run.run_id, ok.run_id);
+
+    // On the default task queue the workflow skips the timer its history recorded.
+    var defaults: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer defaults.deinit();
+    try defaults.registerWorkflow(Fixtures.QueueDependent);
+    const changed = try defaults.replayWorkflowExecution(a, &env.client, run.id, run.run_id);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, error.Nondeterminism), changed.err);
+    try testing.expect(changed.message.len > 0);
+
+    try testing.expectError(error.NotFound, r.replayWorkflowExecution(a, &env.client, "no-such-workflow", ""));
+}
+
+test "client: a history iterator pages lazily, matches fetchHistory, and filters the close event" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(Fixtures.Hello, .{ .task_queue = "" }, .{"pages"});
+    defer run.deinit();
+    _ = try env.getResult(Fixtures.Hello, &run, a, null);
+    const whole = (try env.client.fetchHistory(a, run.id, run.run_id)).events.items;
+
+    var it = try env.client.historyIterator(run.id, run.run_id, .{ .page_size = 2 });
+    defer it.deinit();
+    var count: usize = 0;
+    while (try it.next(a)) |event| : (count += 1) {
+        // Two events a page: after the first, more pages remain.
+        if (count == 0) try testing.expect(it.next_page_token.len > 0);
+        try testing.expect(count < whole.len);
+        try testing.expectEqual(whole[count].event_id, event.event_id);
+        try testing.expectEqual(whole[count].event_type, event.event_type);
+    }
+    try testing.expectEqual(whole.len, count);
+
+    var close = try env.client.historyIterator(run.id, run.run_id, .{ .filter = .close_event });
+    defer close.deinit();
+    const last = (try close.next(a)) orelse return error.TestExpectedCloseEvent;
+    try testing.expectEqual(EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED, last.event_type);
+    try testing.expectEqual(whole[whole.len - 1].event_id, last.event_id);
+    try testing.expectEqual(null, try close.next(a));
+
+    var missing = try env.client.historyIterator("no-such-workflow", "", .{});
+    defer missing.deinit();
+    try testing.expectError(error.NotFound, missing.next(a));
+}
+
+const EventType = proto.temporal.api.enums.v1.EventType;
+
+/// What `readHistoryToEnd` saw.
+const HistoryTail = struct {
+    events: usize = 0,
+    signaled: bool = false,
+    last: EventType = .EVENT_TYPE_UNSPECIFIED,
+};
+
+fn readHistoryToEnd(it: *client_mod.HistoryIterator) client_mod.HistoryError!HistoryTail {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var tail: HistoryTail = .{};
+    while (try it.next(arena.allocator())) |event| {
+        tail.events += 1;
+        tail.signaled = tail.signaled or event.event_type == .EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED;
+        tail.last = event.event_type;
+    }
+    return tail;
+}
+
+test "client: a waiting history iterator follows a running workflow until it closes" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(SignalFixtures.AwaitApprovals, .{ .task_queue = "" }, .{1});
+    defer run.deinit();
+
+    var all = try env.client.historyIterator(run.id, run.run_id, .{ .wait_new_event = true });
+    defer all.deinit();
+    // Up to the first completed workflow task: then the workflow waits for a signal.
+    while (try all.next(a)) |event| {
+        if (event.event_type == .EVENT_TYPE_WORKFLOW_TASK_COMPLETED) break;
+    } else return error.TestExpectedWorkflowTaskCompleted;
+
+    // Without waiting, iteration stops at the events recorded so far.
+    var now = try env.client.historyIterator(run.id, run.run_id, .{});
+    defer now.deinit();
+    const so_far = try readHistoryToEnd(&now);
+    try testing.expectEqual(EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED, so_far.last);
+
+    var close = try env.client.historyIterator(run.id, run.run_id, .{ .wait_new_event = true, .filter = .close_event });
+    defer close.deinit();
+    var tail_future = try env.io.concurrent(readHistoryToEnd, .{&all});
+    var close_future = env.io.concurrent(readHistoryToEnd, .{&close}) catch |err| {
+        _ = tail_future.cancel(env.io) catch {};
+        return err;
+    };
+    env.signalWorkflow(SignalFixtures.Approve, run.id, .{"ann"}) catch |err| {
+        _ = tail_future.cancel(env.io) catch {};
+        _ = close_future.cancel(env.io) catch {};
+        return err;
+    };
+    const tail_result = tail_future.await(env.io);
+    const close_result = close_future.await(env.io);
+    const tail = try tail_result;
+    const closed = try close_result;
+
+    try testing.expect(tail.signaled);
+    try testing.expectEqual(EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED, tail.last);
+    try testing.expectEqual(@as(usize, 1), closed.events);
+    try testing.expectEqual(EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED, closed.last);
+    try testing.expectEqualStrings("ann", try env.getResult(SignalFixtures.AwaitApprovals, &run, a, null));
 }
 
 test "continue-as-new: WorkflowRun.get follows the chain to the last run's result" {
