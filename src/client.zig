@@ -355,6 +355,27 @@ pub const Client = struct {
         c.* = undefined;
     }
 
+    /// Replaces the API key sent with every call from now on, by this client and every worker
+    /// on it; empty sends none. Calls already sent keep the key they had. Use it to rotate a
+    /// key before it expires. Thread-safe.
+    pub fn updateApiKey(c: *Client, api_key: []const u8) void {
+        c.connection.setApiKey(api_key);
+    }
+
+    /// Replaces the gRPC headers (`Options.headers`) sent with every call from now on, by
+    /// this client and every worker on it. Returns `error.InvalidOptions` (logged) for a key
+    /// that isn't a valid header name or ends in "-bin" (binary headers aren't supported), or
+    /// a value with characters other than visible ASCII, space and tab; the headers are then
+    /// unchanged. Thread-safe.
+    pub fn updateHeaders(c: *Client, headers: []const bridge.bytes.MetadataEntry) error{ OutOfMemory, InvalidOptions }!void {
+        for (headers) |h| try validateHeader(h);
+        c.connection.setMetadata(c.gpa, headers) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // validateHeader already rejects newlines.
+            error.NewlineInKey, error.NewlineInValue => unreachable,
+        };
+    }
+
     /// Starts a workflow defined with `temporal.workflow.Def` and returns a handle to its run.
     /// `args` is a tuple of the workflow's parameters after its context.
     pub fn executeWorkflow(c: *Client, comptime Workflow: type, options: StartWorkflowOptions, args: Workflow.Args) StartError!WorkflowRun(Workflow.Result) {
@@ -2917,6 +2938,23 @@ fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
     return options;
 }
 
+/// Rejects what sdk-core would silently drop from `Client.updateHeaders`: gRPC ASCII headers
+/// only.
+fn validateHeader(h: bridge.bytes.MetadataEntry) error{InvalidOptions}!void {
+    const token_symbols = "!#$%&'*+-.^_`|~";
+    const key_ok = h.key.len > 0 and !std.ascii.endsWithIgnoreCase(h.key, "-bin") and for (h.key) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, token_symbols, ch) == null) break false;
+    } else true;
+    if (!key_ok) {
+        log.warn("updating the client's headers failed: \"{s}\" is not a valid header name (letters, digits and {s}, not ending in -bin)", .{ h.key, token_symbols });
+        return error.InvalidOptions;
+    }
+    for (h.value) |ch| if (ch != '\t' and (ch < ' ' or ch > '~')) {
+        log.warn("updating the client's headers failed: the value of header {s} has a byte (0x{x:0>2}) other than visible ASCII, space or tab", .{ h.key, ch });
+        return error.InvalidOptions;
+    };
+}
+
 fn defaultIdentity(gpa: Allocator) error{OutOfMemory}![]u8 {
     var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const host = std.posix.gethostname(&host_buf) catch "unknown-host";
@@ -3176,4 +3214,13 @@ test "TLS PEM is read from the paths when connecting" {
     const path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path, "ca.pem" });
     try testing.expectEqualStrings("PEM BYTES", try tlsFile(arena.allocator(), testing.io, "", path, "server_root_ca_cert"));
     try testing.expectEqualStrings("inline", try tlsFile(arena.allocator(), testing.io, "inline", "", "server_root_ca_cert"));
+}
+
+test "header updates accept gRPC ASCII headers only" {
+    try validateHeader(.{ .key = "X-Tenant_ID", .value = "a b\tc~" });
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "", .value = "v" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "bad key", .value = "v" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "blob-bin", .value = "v" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k", .value = "caf\xc3\xa9" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k", .value = "a\nb" }));
 }
