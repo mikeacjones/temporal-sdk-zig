@@ -1,0 +1,15 @@
+// How samples-test validates this sample: start the worker (build 1.0), run the starter, and
+// check that the starter's output contains each `expect` line before `timeout_seconds`. The
+// starter runs the workers of builds 1.0, 1.1 and 2.0 itself and plays the rollout through;
+// workerv1, workerv1.1 and workerv2 run those workers by hand.
+.{
+    .expect = .{
+        "Build 2.0 is the current version",
+        "Auto-upgrading workflow finished on build 2.0",
+        "Pinned workflow finished on build 1.0",
+        "Second pinned workflow finished on build 2.0",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
+    .programs = .{ "workerv1", "workerv1.1", "workerv2" },
+}
