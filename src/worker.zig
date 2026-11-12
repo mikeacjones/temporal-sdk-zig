@@ -537,6 +537,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .workflow_namespace = start.workflow_namespace,
         .attempt = start.attempt,
         .is_local = start.is_local,
+        .task_token = run.task_token,
     };
     ctx.logger_ = .{ .context = try log_mod.contextString(a, .{
         .ActivityID = start.activity_id,
@@ -551,12 +552,24 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     // The core keeps no heartbeat state for local activities and warns on each heartbeat.
     if (!start.is_local) ctx.heartbeat_sink = .{ .gpa = w.gpa, .context = &heartbeats, .record = Heartbeats.record };
     const payload = entry.invoke(entry.receiver, ctx, start.input.items) catch |err| {
+        if (err == error.CompleteAsync) {
+            if (!start.is_local) return .{ .status = .{ .will_complete_async = .{} } };
+            return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
+                .message = try std.fmt.allocPrint(a, "local activity \"{s}\" returned completeAsync, but only activities scheduled with executeActivity can complete asynchronously", .{start.activity_type}),
+                .type = "LocalActivityCompleteAsync",
+                .non_retryable = true,
+            }) } } };
+        }
         if (err == error.Canceled) if (ctx.cancelReason()) |reason| return .{ .status = .{ .cancelled = .{ .failure = .{
             .message = try std.fmt.allocPrint(a, "activity canceled: {t}", .{reason}),
             .source = failure_mod.source,
             .failure_info = .{ .canceled_failure_info = .{} },
         } } } };
         const f = if (ctx.pending_failure) |p| try failure_mod.application(a, p) else try failure_mod.fromError(a, err);
+        if (failure_mod.applicationCategory(f) == .benign)
+            ctx.logger_.debug("Activity failed", .{ .Error = f.message })
+        else
+            ctx.logger_.warn("Activity failed", .{ .Error = f.message });
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };

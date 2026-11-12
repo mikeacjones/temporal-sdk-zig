@@ -22,6 +22,10 @@
 //! bounds how late the cancel arrives. A local activity (`info().is_local`) gets its cancels
 //! straight from the worker, without heartbeating, and its heartbeats are dropped.
 //!
+//! An activity that finishes elsewhere (a person approves it, another system calls back)
+//! returns `ctx.completeAsync()` after handing `ctx.info().task_token` to whatever completes
+//! it through the client.
+//!
 //! Activities that share state (a client, a connection pool, configuration) are methods taking the state first and the context second. The worker binds them to an
 //! instance with `registerActivityWith`; workflows call them through the same `Def`:
 //!
@@ -52,6 +56,10 @@ pub const Info = struct {
     attempt: u32,
     /// The activity runs as a local activity of its workflow, on this worker.
     is_local: bool = false,
+    /// Identifies this attempt to the server. Hand a copy to whoever completes the activity
+    /// after `completeAsync`; like the other fields, it is freed once the activity's result
+    /// has been reported.
+    task_token: []const u8 = "",
 };
 
 /// Why an activity was canceled.
@@ -131,6 +139,18 @@ pub const Context = struct {
     pub fn fail(ctx: *Context, a: failure_mod.Application) error{ApplicationFailure} {
         ctx.pending_failure = a;
         return error.ApplicationFailure;
+    }
+
+    /// Ends the activity's function without completing the activity: it stays running on the
+    /// server until something completes it with the client (`Client.completeActivity`,
+    /// `failActivity`, or `reportActivityCancellation`, by `info().task_token` or by ID), or
+    /// until it times out. Return the error this gives back. The worker keeps nothing for
+    /// the activity afterwards, so heartbeats and cancellation go through the client
+    /// (`Client.recordActivityHeartbeat`). Local activities can't complete asynchronously:
+    /// one that tries fails without retrying.
+    pub fn completeAsync(ctx: *Context) error{CompleteAsync} {
+        _ = ctx;
+        return error.CompleteAsync;
     }
 
     /// Reports that the activity is alive, with progress `details` (any value the converter

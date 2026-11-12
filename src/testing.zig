@@ -522,6 +522,7 @@ pub const ActivityEnvironment = struct {
         .workflow_type = "TestWorkflow",
         .workflow_namespace = "default",
         .attempt = 1,
+        .task_token = "test-task-token",
     },
     /// Heartbeat details the activity sees from a "previous attempt".
     heartbeat_details: []const converter.Payload = &.{},
@@ -2524,4 +2525,222 @@ test "WorkflowReplayer replays a parent's child workflow and catches a changed c
     defer changed.deinit();
     try changed.registerWorkflow(ChildFixtures.ParentChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(child_workflow_history));
+}
+
+const RetryDelayFixtures = struct {
+    /// Fails its first attempt as an expected, benign failure that asks for a 2 s retry delay.
+    fn pollReady(ctx: *activity.Context) ![]const u8 {
+        if (ctx.info().attempt == 1) return ctx.fail(.{
+            .message = "not ready yet",
+            .type = "NotReady",
+            .category = .benign,
+            .next_retry_delay = .fromSeconds(2),
+        });
+        return "ready";
+    }
+    const PollReady = activity.Def("PollReady", pollReady);
+
+    fn waitReady(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(PollReady, .{
+            .start_to_close_timeout = .fromSeconds(10),
+            .retry_policy = .{ .initial_interval = .fromMilliseconds(100), .backoff_coefficient = 1 },
+        }, .{}).get();
+    }
+    const WaitReady = workflow.Def("WaitReady", waitReady);
+
+    fn nanos(t: ?proto.google.protobuf.Timestamp) i96 {
+        const v = t orelse return 0;
+        return @as(i96, v.seconds) * std.time.ns_per_s + v.nanos;
+    }
+};
+
+test "a benign failure's next retry delay overrides the retry policy, and its category reaches history" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(RetryDelayFixtures.WaitReady);
+    try env.registerActivity(RetryDelayFixtures.PollReady);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(RetryDelayFixtures.WaitReady, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("ready", try env.getResult(RetryDelayFixtures.WaitReady, &run, a, null));
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var scheduled_at: ?i96 = null;
+    var started: ?proto.temporal.api.history.v1.HistoryEvent = null;
+    for (history.events.items) |e| switch (e.attributes orelse continue) {
+        .activity_task_scheduled_event_attributes => scheduled_at = RetryDelayFixtures.nanos(e.event_time),
+        .activity_task_started_event_attributes => started = e,
+        else => {},
+    };
+    const attempt = started.?.attributes.?.activity_task_started_event_attributes;
+    try testing.expectEqual(@as(i32, 2), attempt.attempt);
+    // The second attempt waited for the failure's 2 s delay, not the policy's 100 ms.
+    try testing.expect(RetryDelayFixtures.nanos(started.?.event_time) - scheduled_at.? >= 2 * std.time.ns_per_s);
+    const last = attempt.last_failure.?;
+    try testing.expectEqual(failure_mod.Application.Category.benign, failure_mod.applicationCategory(last).?);
+    try testing.expectEqual(@as(i64, 2), last.failure_info.?.application_failure_info.next_retry_delay.?.seconds);
+}
+
+const AsyncFixtures = struct {
+    /// Set once `awaitApproval` has handed off its task token and activity ID.
+    var started: Io.Event = .unset;
+    var token_buf: [1024]u8 = undefined;
+    var token: []const u8 = "";
+    var activity_id_buf: [64]u8 = undefined;
+    var activity_id: []const u8 = "";
+
+    fn reset() void {
+        started = .unset;
+        token = "";
+        activity_id = "";
+    }
+
+    fn keep(buf: []u8, value: []const u8) error{ValueTooLong}![]const u8 {
+        if (value.len > buf.len) return error.ValueTooLong;
+        @memcpy(buf[0..value.len], value);
+        return buf[0..value.len];
+    }
+
+    /// Hands its task token to the test and leaves the activity running for the client to
+    /// complete.
+    fn awaitApproval(ctx: *activity.Context) ![]const u8 {
+        token = try keep(&token_buf, ctx.info().task_token);
+        activity_id = try keep(&activity_id_buf, ctx.info().activity_id);
+        started.set(ctx.io());
+        return ctx.completeAsync();
+    }
+    const AwaitApproval = activity.Def("AwaitApproval", awaitApproval);
+
+    /// Returns the approval, "failed: <type> <message>" when it fails, or ends canceled when
+    /// the run is canceled (after the activity reports its cancellation).
+    fn approve(ctx: *workflow.Context) ![]const u8 {
+        const approval = ctx.executeActivity(AwaitApproval, .{
+            .start_to_close_timeout = .fromSeconds(60),
+            .retry_policy = .{ .maximum_attempts = 1 },
+            .cancellation_type = .wait_cancellation_completed,
+        }, .{});
+        return approval.get() catch |err| switch (err) {
+            error.ActivityFailed => {
+                const root = failure_mod.rootCause(approval.failure().?);
+                if (root.failure_info != null and root.failure_info.? == .canceled_failure_info) return error.Canceled;
+                return std.fmt.allocPrint(ctx.allocator(), "failed: {s} {s}", .{ failure_mod.applicationType(root.*) orelse "", root.message });
+            },
+            else => err,
+        };
+    }
+    const Approve = workflow.Def("Approve", approve);
+
+    fn approveLocally(ctx: *workflow.Context) ![]const u8 {
+        const approval = ctx.executeLocalActivity(AwaitApproval, .{ .start_to_close_timeout = .fromSeconds(60) }, .{});
+        return approval.get() catch |err| switch (err) {
+            error.ActivityFailed => failure_mod.applicationType(failure_mod.rootCause(approval.failure().?).*) orelse "no type",
+            else => err,
+        };
+    }
+    const ApproveLocally = workflow.Def("ApproveLocally", approveLocally);
+
+    fn start() !*WorkflowEnvironment {
+        reset();
+        const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+        errdefer env.deinit();
+        try env.registerWorkflow(Approve);
+        try env.registerWorkflow(ApproveLocally);
+        try env.registerActivity(AwaitApproval);
+        return env;
+    }
+};
+
+test "an activity that completes async stays started on the server; a local one fails" {
+    const env = try AsyncFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    try testing.expect(AsyncFixtures.token.len > 0);
+    const description = try env.client.describeWorkflow(a, run.id, run.run_id);
+    const pending = description.raw.pending_activities.items;
+    try testing.expectEqual(1, pending.len);
+    try testing.expectEqual(.PENDING_ACTIVITY_STATE_STARTED, pending[0].state);
+    try env.client.terminateWorkflow(run.id, run.run_id, "test cleanup");
+
+    try testing.expectEqualStrings("LocalActivityCompleteAsync", try env.executeWorkflow(AsyncFixtures.ApproveLocally, .{}, a, null));
+}
+
+test "client: complete an async activity by task token or by ID; completing it again is NotFound" {
+    const env = try AsyncFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var by_token = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer by_token.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    try env.client.completeActivity(AsyncFixtures.token, @as([]const u8, "approved by token"));
+    try testing.expectEqualStrings("approved by token", try env.getResult(AsyncFixtures.Approve, &by_token, a, null));
+    try testing.expectError(error.NotFound, env.client.completeActivity(AsyncFixtures.token, @as([]const u8, "again")));
+
+    AsyncFixtures.reset();
+    var by_id = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer by_id.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    const id: client_mod.ActivityId = .{ .workflow_id = by_id.id, .run_id = by_id.run_id, .activity_id = AsyncFixtures.activity_id };
+    try env.client.completeActivityById(id, @as([]const u8, "approved by ID"));
+    try testing.expectEqualStrings("approved by ID", try env.getResult(AsyncFixtures.Approve, &by_id, a, null));
+    try testing.expectError(error.NotFound, env.client.completeActivityById(id, @as([]const u8, "again")));
+}
+
+test "client: fail an async activity by ID or by task token" {
+    const env = try AsyncFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var by_id = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer by_id.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    const id: client_mod.ActivityId = .{ .workflow_id = by_id.id, .activity_id = AsyncFixtures.activity_id };
+    try env.client.failActivityById(id, .{ .message = "over budget", .type = "Declined" });
+    try testing.expectEqualStrings("failed: Declined over budget", try env.getResult(AsyncFixtures.Approve, &by_id, a, null));
+    try testing.expectError(error.NotFound, env.client.failActivityById(id, .{ .message = "again" }));
+
+    AsyncFixtures.reset();
+    var by_token = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer by_token.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    try env.client.failActivity(AsyncFixtures.token, .{ .message = "missing receipt", .type = "Declined", .non_retryable = true });
+    try testing.expectEqualStrings("failed: Declined missing receipt", try env.getResult(AsyncFixtures.Approve, &by_token, a, null));
+}
+
+test "client: heartbeating an async activity reports its cancellation once the workflow cancels it" {
+    const env = try AsyncFixtures.start();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(AsyncFixtures.Approve, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try AsyncFixtures.started.wait(testing.io);
+    const token = AsyncFixtures.token;
+    const id: client_mod.ActivityId = .{ .workflow_id = run.id, .run_id = run.run_id, .activity_id = AsyncFixtures.activity_id };
+    try testing.expect(!try env.client.recordActivityHeartbeat(token, @as(u32, 1)));
+    try testing.expect(!try env.client.recordActivityHeartbeatById(id, {}));
+
+    // Canceling the run cancels the activity, and the workflow waits for it to report.
+    try env.client.cancelWorkflow(run.id, run.run_id, "testing async activity cancellation");
+    while (!try env.client.recordActivityHeartbeat(token, @as(u32, 2))) try testing.io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expect(try env.client.recordActivityHeartbeatById(id, {}));
+    try env.client.reportActivityCancellationById(id, @as([]const u8, "stopped at step 2"));
+    try testing.expectError(error.WorkflowCanceled, env.getResult(AsyncFixtures.Approve, &run, a, null));
+    try testing.expectError(error.NotFound, env.client.reportActivityCancellation(token, {}));
+    try testing.expectError(error.NotFound, env.client.recordActivityHeartbeat(token, {}));
 }
