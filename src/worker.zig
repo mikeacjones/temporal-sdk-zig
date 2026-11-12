@@ -202,10 +202,13 @@ pub const Worker = struct {
         if (w.core_ptr) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
     }
 
-    /// Runs until the process receives SIGINT or SIGTERM.
+    /// Runs until the process receives SIGINT or SIGTERM. One signal stops every worker in
+    /// the process that is running this way; while any is, the previous handlers for those
+    /// signals are replaced.
     pub fn runUntilSignal(w: *Worker) RunError!void {
-        const watcher = try SignalWatcher.start(w);
-        defer watcher.finish();
+        var node: SignalWatcher.Node = .{ .worker = w };
+        try SignalWatcher.register(&node);
+        defer SignalWatcher.unregister(&node);
         return w.run();
     }
 };
@@ -553,49 +556,93 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
 /// Turns SIGINT and SIGTERM into `Worker.stop`. A signal handler may only do
 /// async-signal-safe work, so it writes a byte to a pipe; a thread reading the pipe calls
 /// `stop`.
+/// Stops every worker running in `runUntilSignal` when the process gets SIGINT or SIGTERM.
+/// Process-wide: the first worker to register installs the signal handlers and starts a
+/// thread that waits on a pipe the handler writes to; the last one to leave restores the
+/// previous handlers and ends the thread. Workers register through a node on their
+/// `runUntilSignal` stack frame.
 const SignalWatcher = struct {
-    thread: std.Thread,
-
-    var pipe_fds: [2]std.c.fd_t = .{ -1, -1 };
-    var previous: [2]std.posix.Sigaction = undefined;
     const signals = [_]std.posix.SIG{ .INT, .TERM };
 
-    fn start(w: *Worker) !SignalWatcher {
-        if (std.c.pipe(&pipe_fds) != 0) return error.OutOfMemory;
-        const action: std.posix.Sigaction = .{
-            .handler = .{ .handler = onSignal },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        for (signals, &previous) |sig, *prev| std.posix.sigaction(sig, &action, prev);
-        const thread = std.Thread.spawn(.{}, watch, .{w}) catch return error.OutOfMemory;
-        return .{ .thread = thread };
+    const Node = struct {
+        worker: *Worker,
+        node: std.DoublyLinkedList.Node = .{},
+    };
+
+    /// Guards everything below except `signal_fd`, which the signal handler reads.
+    var mutex: Io.Mutex = .init;
+    var io: Io = undefined;
+    var workers: std.DoublyLinkedList = .{};
+    var thread: ?std.Thread = null;
+    var pipe_fds: [2]std.c.fd_t = .{ -1, -1 };
+    var previous: [2]std.posix.Sigaction = undefined;
+    var signal_fd: std.atomic.Value(std.c.fd_t) = .init(-1);
+
+    fn register(n: *Node) error{OutOfMemory}!void {
+        const w = n.worker;
+        mutex.lockUncancelable(w.io);
+        defer mutex.unlock(w.io);
+        if (thread == null) {
+            var fds: [2]std.c.fd_t = undefined;
+            if (std.c.pipe(&fds) != 0) return error.OutOfMemory;
+            const t = std.Thread.spawn(.{}, watch, .{fds[0]}) catch {
+                _ = std.c.close(fds[0]);
+                _ = std.c.close(fds[1]);
+                return error.OutOfMemory;
+            };
+            io = w.io;
+            pipe_fds = fds;
+            thread = t;
+            signal_fd.store(fds[1], .release);
+            const action: std.posix.Sigaction = .{
+                .handler = .{ .handler = onSignal },
+                .mask = std.posix.sigemptyset(),
+                .flags = 0,
+            };
+            for (signals, &previous) |sig, *prev| std.posix.sigaction(sig, &action, prev);
+        }
+        workers.append(&n.node);
     }
 
-    fn finish(s: SignalWatcher) void {
+    fn unregister(n: *Node) void {
+        const w = n.worker;
+        mutex.lockUncancelable(w.io);
+        workers.remove(&n.node);
+        if (workers.first != null) {
+            mutex.unlock(w.io);
+            return;
+        }
+        // The last worker out: hand the thread and pipe to this call, so a worker that
+        // registers meanwhile starts fresh ones.
         for (signals, &previous) |sig, *prev| std.posix.sigaction(sig, prev, null);
-        // Wake the watcher if no signal came, then let it exit.
-        _ = std.c.write(pipe_fds[1], "q", 1);
-        s.thread.join();
-        _ = std.c.close(pipe_fds[0]);
-        _ = std.c.close(pipe_fds[1]);
+        signal_fd.store(-1, .release);
+        const t = thread.?;
+        const fds = pipe_fds;
+        thread = null;
         pipe_fds = .{ -1, -1 };
+        mutex.unlock(w.io);
+
+        _ = std.c.write(fds[1], "q", 1);
+        t.join();
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
     }
 
     fn onSignal(_: std.posix.SIG) callconv(.c) void {
-        _ = std.c.write(pipe_fds[1], "s", 1);
+        const fd = signal_fd.load(.acquire);
+        if (fd >= 0) _ = std.c.write(fd, "s", 1);
     }
 
-    fn watch(w: *Worker) void {
+    fn watch(read_fd: std.c.fd_t) void {
         var byte: [1]u8 = undefined;
         while (true) {
-            const n = std.c.read(pipe_fds[0], &byte, 1);
-            if (n <= 0) return;
-            if (byte[0] == 's') {
-                log.info("Worker received a stop signal, shutting down", .{});
-                w.stop();
-            }
-            if (byte[0] == 'q') return;
+            const n = std.c.read(read_fd, &byte, 1);
+            if (n <= 0 or byte[0] == 'q') return;
+            log.info("Worker received a stop signal, shutting down", .{});
+            mutex.lockUncancelable(io);
+            defer mutex.unlock(io);
+            var it = workers.first;
+            while (it) |node| : (it = node.next) @as(*Node, @fieldParentPtr("node", node)).worker.stop();
         }
     }
 };
@@ -628,6 +675,10 @@ const HelloTest = struct {
 
     fn runWorker(w: *Worker) Worker.RunError!void {
         return w.run();
+    }
+
+    fn runWorkerUntilSignal(w: *Worker) Worker.RunError!void {
+        return w.runUntilSignal();
     }
 };
 
@@ -930,4 +981,39 @@ test "stopping the worker cancels running activities with reason worker_shutdown
     try env.running.?.await(testing.io);
     env.running = null;
     try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
+}
+
+test "one SIGTERM stops every worker running until a signal, then the previous handler is back" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var a = try Worker.init(testing.allocator, testing.io, &client, "signal-a", .{});
+    defer a.deinit();
+    try a.registerActivity(HelloTest.Greet);
+    var b = try Worker.init(testing.allocator, testing.io, &client, "signal-b", .{});
+    defer b.deinit();
+    try b.registerActivity(HelloTest.Greet);
+
+    var running_a = try testing.io.concurrent(HelloTest.runWorkerUntilSignal, .{&a});
+    var running_b = try testing.io.concurrent(HelloTest.runWorkerUntilSignal, .{&b});
+    // Both must be registered before the signal, or the second would start after it.
+    while (true) {
+        SignalWatcher.mutex.lockUncancelable(testing.io);
+        const both = SignalWatcher.workers.len() == 2;
+        SignalWatcher.mutex.unlock(testing.io);
+        if (both) break;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.posix.kill(std.c.getpid(), .TERM);
+    try running_a.await(testing.io);
+    try running_b.await(testing.io);
+
+    var current: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.TERM, null, &current);
+    try testing.expect(current.handler.handler != SignalWatcher.onSignal);
+    try testing.expectEqual(@as(?std.Thread, null), SignalWatcher.thread);
 }
