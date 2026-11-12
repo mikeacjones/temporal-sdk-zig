@@ -271,6 +271,152 @@ pub const Client = struct {
         };
     }
 
+    /// Completes an activity that returned `ctx.completeAsync()`, identified by the task token
+    /// it handed off, with `result` (a value of the activity's result type, or `{}` for
+    /// `void`). Returns `error.NotFound` when the activity is no longer waiting: it already
+    /// completed, failed, or timed out, or its workflow closed. Safe to call from any process
+    /// that can reach the server, not only the worker's.
+    pub fn completeActivity(c: *Client, task_token: []const u8, result: anytype) ActivityCompletionError!void {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = try c.activityRpc(wfs.RespondActivityTaskCompletedResponse, "RespondActivityTaskCompleted", wfs.RespondActivityTaskCompletedRequest{
+            .namespace = c.namespace,
+            .task_token = task_token,
+            .result = try resultPayloads(a, result),
+            .identity = c.identity,
+        }, a);
+    }
+
+    /// `completeActivity` for the activity `id`.
+    pub fn completeActivityById(c: *Client, id: ActivityId, result: anytype) ActivityCompletionError!void {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = try c.activityRpc(wfs.RespondActivityTaskCompletedByIdResponse, "RespondActivityTaskCompletedById", wfs.RespondActivityTaskCompletedByIdRequest{
+            .namespace = c.namespace,
+            .workflow_id = id.workflow_id,
+            .run_id = id.run_id,
+            .activity_id = id.activity_id,
+            .result = try resultPayloads(a, result),
+            .identity = c.identity,
+        }, a);
+    }
+
+    /// Fails an activity that returned `ctx.completeAsync()` with the failure `f`. The
+    /// activity's retry policy applies, as for a failure returned by the activity itself.
+    /// Returns `error.NotFound` when the activity is no longer waiting.
+    pub fn failActivity(c: *Client, task_token: []const u8, f: failure_mod.Application) ActivityCompletionError!void {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = try c.activityRpc(wfs.RespondActivityTaskFailedResponse, "RespondActivityTaskFailed", wfs.RespondActivityTaskFailedRequest{
+            .namespace = c.namespace,
+            .task_token = task_token,
+            .failure = try failure_mod.application(a, f),
+            .identity = c.identity,
+        }, a);
+    }
+
+    /// `failActivity` for the activity `id`.
+    pub fn failActivityById(c: *Client, id: ActivityId, f: failure_mod.Application) ActivityCompletionError!void {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = try c.activityRpc(wfs.RespondActivityTaskFailedByIdResponse, "RespondActivityTaskFailedById", wfs.RespondActivityTaskFailedByIdRequest{
+            .namespace = c.namespace,
+            .workflow_id = id.workflow_id,
+            .run_id = id.run_id,
+            .activity_id = id.activity_id,
+            .failure = try failure_mod.application(a, f),
+            .identity = c.identity,
+        }, a);
+    }
+
+    /// Reports that an activity that returned `ctx.completeAsync()` was canceled, with
+    /// `details` (any value the converter encodes, or `{}` for none). Call it after
+    /// `recordActivityHeartbeat` returns true. Returns `error.NotFound` when the activity is
+    /// no longer waiting.
+    pub fn reportActivityCancellation(c: *Client, task_token: []const u8, details: anytype) ActivityCompletionError!void {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = try c.activityRpc(wfs.RespondActivityTaskCanceledResponse, "RespondActivityTaskCanceled", wfs.RespondActivityTaskCanceledRequest{
+            .namespace = c.namespace,
+            .task_token = task_token,
+            .details = try detailPayloads(a, details),
+            .identity = c.identity,
+        }, a);
+    }
+
+    /// `reportActivityCancellation` for the activity `id`.
+    pub fn reportActivityCancellationById(c: *Client, id: ActivityId, details: anytype) ActivityCompletionError!void {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = try c.activityRpc(wfs.RespondActivityTaskCanceledByIdResponse, "RespondActivityTaskCanceledById", wfs.RespondActivityTaskCanceledByIdRequest{
+            .namespace = c.namespace,
+            .workflow_id = id.workflow_id,
+            .run_id = id.run_id,
+            .activity_id = id.activity_id,
+            .details = try detailPayloads(a, details),
+            .identity = c.identity,
+        }, a);
+    }
+
+    /// Heartbeats an activity that returned `ctx.completeAsync()`, with progress `details`
+    /// (any value the converter encodes, or `{}` for none), which a retry reads with
+    /// `ctx.heartbeatDetails`. Returns true when cancellation of the activity has been
+    /// requested: finish it with `reportActivityCancellation` (or complete or fail it). Not
+    /// throttled: each call is a request to the server. Returns `error.NotFound` when the
+    /// activity is no longer waiting.
+    pub fn recordActivityHeartbeat(c: *Client, task_token: []const u8, details: anytype) ActivityCompletionError!bool {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const response = try c.activityRpc(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", wfs.RecordActivityTaskHeartbeatRequest{
+            .namespace = c.namespace,
+            .task_token = task_token,
+            .details = try detailPayloads(a, details),
+            .identity = c.identity,
+        }, a);
+        return response.cancel_requested;
+    }
+
+    /// `recordActivityHeartbeat` for the activity `id`.
+    pub fn recordActivityHeartbeatById(c: *Client, id: ActivityId, details: anytype) ActivityCompletionError!bool {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const response = try c.activityRpc(wfs.RecordActivityTaskHeartbeatByIdResponse, "RecordActivityTaskHeartbeatById", wfs.RecordActivityTaskHeartbeatByIdRequest{
+            .namespace = c.namespace,
+            .workflow_id = id.workflow_id,
+            .run_id = id.run_id,
+            .activity_id = id.activity_id,
+            .details = try detailPayloads(a, details),
+            .identity = c.identity,
+        }, a);
+        return response.cancel_requested;
+    }
+
+    fn activityRpc(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator) ActivityCompletionError!Response {
+        return c.rpc(Response, method, request, arena) catch |err| switch (err) {
+            error.AlreadyExists => error.InvalidResponse,
+            else => |e| e,
+        };
+    }
+
+    fn resultPayloads(a: Allocator, result: anytype) error{OutOfMemory}!proto.temporal.api.common.v1.Payloads {
+        var payloads: proto.temporal.api.common.v1.Payloads = .{};
+        try payloads.payloads.append(a, try converter.toPayload(a, result));
+        return payloads;
+    }
+
+    fn detailPayloads(a: Allocator, details: anytype) error{OutOfMemory}!?proto.temporal.api.common.v1.Payloads {
+        if (@TypeOf(details) == void) return null;
+        return try resultPayloads(a, details);
+    }
+
     /// Returns the full event history of a workflow run (all pages). An empty `run_id` reads
     /// the latest run. Memory comes from `arena`.
     pub fn fetchHistory(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!proto.temporal.api.history.v1.History {
@@ -594,6 +740,24 @@ pub const StartWorkflowOptions = struct {
     /// Non-indexed values recorded with the workflow, such as a description. Build them with
     /// `converter.toFields`; they are only read while starting.
     memo: []const converter.Field = &.{},
+};
+
+/// Names an activity by its workflow and activity ID, for completing it without its task
+/// token. An empty `run_id` targets the workflow's latest run.
+pub const ActivityId = struct {
+    workflow_id: []const u8,
+    run_id: []const u8 = "",
+    activity_id: []const u8,
+};
+
+pub const ActivityCompletionError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    /// The activity is no longer waiting: it completed, failed, or timed out, or its
+    /// workflow closed.
+    NotFound,
+    InvalidResponse,
 };
 
 pub const StartError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, WorkflowExecutionAlreadyStarted };
