@@ -17,6 +17,7 @@ const proto = @import("proto.zig");
 const converter = @import("converter.zig");
 const search_attributes = @import("search_attributes.zig");
 const failure_mod = @import("failure.zig");
+const history_mod = @import("history.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Duration = Io.Duration;
@@ -421,23 +422,22 @@ pub const Client = struct {
 
     /// Returns the full event history of a workflow run (all pages). An empty `run_id` reads
     /// the latest run. Memory comes from `arena`.
-    pub fn fetchHistory(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!proto.temporal.api.history.v1.History {
-        var history: proto.temporal.api.history.v1.History = .{};
-        var token: []const u8 = "";
-        while (true) {
-            const response = c.rpc(wfs.GetWorkflowExecutionHistoryResponse, "GetWorkflowExecutionHistory", wfs.GetWorkflowExecutionHistoryRequest{
-                .namespace = c.namespace,
-                .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
-                .skip_archival = true,
-                .next_page_token = token,
-            }, arena) catch |err| switch (err) {
-                error.AlreadyExists => return error.InvalidResponse,
-                else => |e| return e,
-            };
-            if (response.history) |page| try history.events.appendSlice(arena, page.events.items);
-            if (response.next_page_token.len == 0) return history;
-            token = response.next_page_token;
-        }
+    pub fn fetchHistory(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8) HistoryError!History {
+        var it = try c.historyIterator(workflow_id, run_id, .{});
+        defer it.deinit();
+        var history: History = .{};
+        while (try it.next(arena)) |event| try history.events.append(arena, event);
+        return history;
+    }
+
+    /// Iterates over the events of a workflow run's history, oldest first. An empty `run_id`
+    /// reads the latest run. The iterator fetches a page at a time as `next` reaches it;
+    /// nothing is fetched here, so a missing workflow shows up as `error.NotFound` from
+    /// `next`. Free it with `deinit`.
+    pub fn historyIterator(c: *Client, workflow_id: []const u8, run_id: []const u8, options: HistoryIteratorOptions) error{OutOfMemory}!HistoryIterator {
+        const id = try c.gpa.dupe(u8, workflow_id);
+        errdefer c.gpa.free(id);
+        return .{ .client = c, .workflow_id = id, .run_id = try c.gpa.dupe(u8, run_id), .options = options, .page = .init(c.gpa) };
     }
 
     /// Describes a workflow run: its status, type, times, memo and search attributes. An
@@ -930,6 +930,102 @@ pub const WorkflowExecutionIterator = struct {
         c.gpa.free(it.next_page_token);
         it.next_page_token = token;
         it.executions = response.executions.items;
+        it.fetched = true;
+    }
+};
+
+pub const History = history_mod.History;
+pub const HistoryEvent = history_mod.HistoryEvent;
+
+pub const HistoryError = error{
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    /// No such workflow or run.
+    NotFound,
+    InvalidResponse,
+};
+
+pub const HistoryIteratorOptions = struct {
+    /// Keep a run that is still open going: `next` waits (long-polling the server) for the
+    /// events it records next, and returns null only once the run has closed. Without it,
+    /// `next` returns null after the events recorded so far.
+    wait_new_event: bool = false,
+    filter: enum {
+        all,
+        /// Only the event that closed the run (completed, failed, continued as new, ...);
+        /// with `wait_new_event`, `next` waits for the run to close.
+        close_event,
+    } = .all,
+    /// The most events per page; 0 uses the server's default.
+    page_size: u31 = 0,
+};
+
+/// The events of a workflow run's history, from `Client.historyIterator`. Fetches a page
+/// from the server whenever `next` runs past the last one. Owns its memory with the client's
+/// allocator: free it with `deinit`. Not thread-safe.
+pub const HistoryIterator = struct {
+    client: *Client,
+    workflow_id: []u8,
+    run_id: []u8,
+    options: HistoryIteratorOptions,
+    /// Holds the current page.
+    page: std.heap.ArenaAllocator,
+    events: []const HistoryEvent = &.{},
+    index: usize = 0,
+    /// Where the next page starts; empty after the last page. Owned with the client's
+    /// allocator.
+    next_page_token: []u8 = &.{},
+    fetched: bool = false,
+
+    pub fn deinit(it: *HistoryIterator) void {
+        it.page.deinit();
+        const gpa = it.client.gpa;
+        gpa.free(it.workflow_id);
+        gpa.free(it.run_id);
+        gpa.free(it.next_page_token);
+        it.* = undefined;
+    }
+
+    /// The next event, copied into `arena`, or null after the last one. With
+    /// `wait_new_event`, blocks until the run records another event or closes. A failed
+    /// fetch can be retried by calling `next` again.
+    pub fn next(it: *HistoryIterator, arena: Allocator) HistoryError!?HistoryEvent {
+        // A long poll that times out returns an empty page that still has a token.
+        while (it.index == it.events.len) {
+            if (it.fetched and it.next_page_token.len == 0) return null;
+            try it.fetch();
+        }
+        const event = try it.events[it.index].dupe(arena);
+        it.index += 1;
+        return event;
+    }
+
+    fn fetch(it: *HistoryIterator) HistoryError!void {
+        const c = it.client;
+        it.events = &.{};
+        it.index = 0;
+        _ = it.page.reset(.retain_capacity);
+        const a = it.page.allocator();
+        const response = c.rpc(wfs.GetWorkflowExecutionHistoryResponse, "GetWorkflowExecutionHistory", wfs.GetWorkflowExecutionHistoryRequest{
+            .namespace = c.namespace,
+            .execution = .{ .workflow_id = it.workflow_id, .run_id = it.run_id },
+            .maximum_page_size = it.options.page_size,
+            .next_page_token = it.next_page_token,
+            .wait_new_event = it.options.wait_new_event,
+            .history_event_filter_type = switch (it.options.filter) {
+                .all => .HISTORY_EVENT_FILTER_TYPE_ALL_EVENT,
+                .close_event => .HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT,
+            },
+            .skip_archival = true,
+        }, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+        const token = try c.gpa.dupe(u8, response.next_page_token);
+        c.gpa.free(it.next_page_token);
+        it.next_page_token = token;
+        if (response.history) |h| it.events = h.events.items;
         it.fetched = true;
     }
 };

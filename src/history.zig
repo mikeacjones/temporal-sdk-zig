@@ -1,5 +1,5 @@
-//! Workflow histories from JSON, as `temporal workflow show --output json` and the Temporal UI
-//! export them.
+//! Workflow histories: the types, and parsing them from JSON as `temporal workflow show
+//! --output json` and the Temporal UI export them.
 //!
 //! Those exports are ProtoJSON with two differences the protobuf parser can't take directly,
 //! so `fromJson` rewrites the JSON first, guided by the generated message types:
@@ -16,6 +16,7 @@ const proto = @import("proto.zig");
 const Allocator = std.mem.Allocator;
 
 pub const History = proto.temporal.api.history.v1.History;
+pub const HistoryEvent = proto.temporal.api.history.v1.HistoryEvent;
 const Payload = proto.temporal.api.common.v1.Payload;
 
 pub const Error = error{ OutOfMemory, InvalidHistoryJson };
