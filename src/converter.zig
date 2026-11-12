@@ -112,6 +112,33 @@ pub fn fromPayloads(comptime Args: type, arena: Allocator, payloads: []const Pay
     return out;
 }
 
+/// Arguments not yet decoded, as a dynamic workflow, activity, or signal handler receives
+/// them: the handler reads each one as the type it expects. A view: the payloads are owned by
+/// the run or task that delivered them and live as long as its memory (`ctx.allocator()`);
+/// decoded values come from the arena passed in.
+pub const EncodedValues = struct {
+    payloads: []const Payload,
+
+    pub fn len(v: EncodedValues) usize {
+        return v.payloads.len;
+    }
+
+    /// Decodes the argument at `index` as `T`. Past the last argument, an optional `T`
+    /// decodes as null and anything else returns `error.WrongArgumentCount`, as in
+    /// `decode`.
+    pub fn get(v: EncodedValues, comptime T: type, arena: Allocator, index: usize) DecodeError!T {
+        if (index < v.payloads.len) return fromPayload(T, arena, v.payloads[index]);
+        if (@typeInfo(T) == .optional) return null;
+        return error.WrongArgumentCount;
+    }
+
+    /// Decodes every argument into the tuple `Args`, by the rules for typed arguments:
+    /// missing trailing optionals are null, extra arguments are ignored.
+    pub fn decode(v: EncodedValues, comptime Args: type, arena: Allocator) DecodeError!Args {
+        return fromPayloads(Args, arena, v.payloads);
+    }
+};
+
 /// A named value, such as one entry of a workflow memo.
 pub const Field = struct {
     name: []const u8,
@@ -406,4 +433,22 @@ test "fields from a proto map keep wire order and decode by name" {
     try testing.expectEqualStrings("empty", fields[1].name);
     try testing.expectEqual(@as(usize, 0), fields[1].value.data.len);
     try testing.expectEqual(@as(usize, 0), (try fieldsFromMap(a, memo.fields.items[0..0])).len);
+}
+
+test "EncodedValues decodes arguments one at a time or as a tuple" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ps = try toPayloads(a, .{ @as([]const u8, "x"), @as(i64, 42) });
+    const values: EncodedValues = .{ .payloads = ps.items };
+    try testing.expectEqual(@as(usize, 2), values.len());
+    try testing.expectEqualStrings("x", try values.get([]const u8, a, 0));
+    try testing.expectEqual(@as(i64, 42), try values.get(i64, a, 1));
+    try testing.expectEqual(@as(?bool, null), try values.get(?bool, a, 2));
+    try testing.expectError(error.WrongArgumentCount, values.get(bool, a, 2));
+    try testing.expectError(error.InvalidPayload, values.get(i64, a, 0));
+    const args = try values.decode(struct { []const u8, i64 }, a);
+    try testing.expectEqual(@as(i64, 42), args[1]);
+    try testing.expectError(error.InvalidPayload, values.decode(struct { i64, i64 }, a));
 }

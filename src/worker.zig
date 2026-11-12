@@ -53,6 +53,10 @@ pub const Worker = struct {
     options: Options,
     workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty,
     activities: std.StringHashMapUnmanaged(activity.Registered) = .empty,
+    /// Runs workflow types with no entry in `workflows`, if set.
+    dynamic_workflow: ?workflow.Registered = null,
+    /// Runs activity types with no entry in `activities`, if set.
+    dynamic_activity: ?activity.Registered = null,
     /// The core worker while `run` is active, for `stop` on other threads.
     /// Guards `core_ptr` and `stop_requested`, which `stop` (any thread) and `run` share.
     stop_mutex: Io.Mutex = .init,
@@ -72,6 +76,8 @@ pub const Worker = struct {
 
     /// Registers a workflow defined with `temporal.workflow.Def`.
     pub fn registerWorkflow(w: *Worker, comptime Workflow: type) error{ OutOfMemory, AlreadyRegistered }!void {
+        if (!@hasDecl(Workflow, "workflow_name"))
+            @compileError("registerWorkflow takes a temporal.workflow.Def; register a temporal.workflow.DynamicDef with registerDynamicWorkflow");
         const gop = try w.workflows.getOrPut(w.gpa, Workflow.workflow_name);
         if (gop.found_existing) return error.AlreadyRegistered;
         gop.value_ptr.* = Workflow.registered;
@@ -110,11 +116,53 @@ pub const Worker = struct {
 
     pub const RegisterActivityError = error{ OutOfMemory, AlreadyRegistered, ReservedActivityName };
 
+    /// Registers a dynamic workflow (`temporal.workflow.DynamicDef`), which runs every
+    /// workflow type that has no `Def` registered: a registered `Def` always wins. A worker
+    /// has at most one; a second returns `error.AlreadyRegistered`.
+    pub fn registerDynamicWorkflow(w: *Worker, comptime Dynamic: type) error{AlreadyRegistered}!void {
+        if (@hasDecl(Dynamic, "workflow_name"))
+            @compileError("registerDynamicWorkflow takes a temporal.workflow.DynamicDef; register workflow \"" ++ Dynamic.workflow_name ++ "\" with registerWorkflow");
+        if (w.dynamic_workflow != null) {
+            log.warn("registering a dynamic workflow failed: this worker already has one; a worker runs at most one dynamic workflow", .{});
+            return error.AlreadyRegistered;
+        }
+        w.dynamic_workflow = Dynamic.registered;
+    }
+
+    /// Registers a dynamic activity (`temporal.activity.DynamicDef`), which runs every
+    /// activity type that has no `Def` registered: a registered `Def` always wins. A worker
+    /// has at most one; a second returns `error.AlreadyRegistered`.
+    pub fn registerDynamicActivity(w: *Worker, comptime Dynamic: type) error{AlreadyRegistered}!void {
+        return w.registerDynamicActivityImpl(Dynamic.registered);
+    }
+
+    /// Registers a dynamic activity that is a method, bound to `receiver`, as
+    /// `registerActivityWith` does for a `Def`.
+    pub fn registerDynamicActivityWith(w: *Worker, comptime Dynamic: type, receiver: *Dynamic.Receiver) error{AlreadyRegistered}!void {
+        return w.registerDynamicActivityImpl(Dynamic.with(receiver));
+    }
+
+    fn registerDynamicActivityImpl(w: *Worker, registered: activity.Registered) error{AlreadyRegistered}!void {
+        if (w.dynamic_activity != null) {
+            log.warn("registering a dynamic activity failed: this worker already has one; a worker runs at most one dynamic activity", .{});
+            return error.AlreadyRegistered;
+        }
+        w.dynamic_activity = registered;
+    }
+
+    fn hasWorkflows(w: *const Worker) bool {
+        return w.workflows.count() > 0 or w.dynamic_workflow != null;
+    }
+
+    fn hasActivities(w: *const Worker) bool {
+        return w.activities.count() > 0 or w.dynamic_activity != null;
+    }
+
     pub const RunError = error{ OutOfMemory, NothingRegistered, WorkerInitFailed, InvalidOptions, ValidationFailed, ShutdownFailed, ConcurrencyUnavailable };
 
     /// Polls and runs tasks until `stop` is called. Returns after in-flight work finishes.
     pub fn run(w: *Worker) RunError!void {
-        if (w.workflows.count() == 0 and w.activities.count() == 0) return error.NothingRegistered;
+        if (!w.hasWorkflows() and !w.hasActivities()) return error.NothingRegistered;
         var message: ?[]u8 = null;
         defer if (message) |m| w.gpa.free(m);
 
@@ -128,11 +176,11 @@ pub const Worker = struct {
                 .activity = .{ .fixed = w.options.max_concurrent_activity_executions },
             },
             .task_types = .{
-                .workflows = w.workflows.count() > 0,
-                .remote_activities = w.activities.count() > 0,
+                .workflows = w.hasWorkflows(),
+                .remote_activities = w.hasActivities(),
                 // The core runs local activities only on a worker that also polls workflows.
                 // Every workflow worker runs them: side effects are recorded by one.
-                .local_activities = w.workflows.count() > 0,
+                .local_activities = w.hasWorkflows(),
                 .nexus = false,
             },
             .workflow_task_pollers = .{ .simple_maximum = w.options.max_concurrent_workflow_task_pollers },
@@ -163,7 +211,7 @@ pub const Worker = struct {
         }
         log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
 
-        var workflows_done = if (w.workflows.count() > 0) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
+        var workflows_done = if (w.hasWorkflows()) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
         // Once a loop polls `core`, returning early would free the core worker under it: shut
         // down like a normal stop, drain both pollers (finalizing waits for each to return
         // null), finalize, then return the error.
@@ -229,6 +277,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
     var runner: WorkflowRunner = .{
         .gpa = w.gpa,
         .workflows = &w.workflows,
+        .dynamic_workflow = w.dynamic_workflow,
         .task_queue = w.task_queue,
         .namespace = w.client.namespace,
         .stack_size = w.options.workflow_stack_size,
@@ -254,6 +303,8 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
 pub const WorkflowRunner = struct {
     gpa: Allocator,
     workflows: *const std.StringHashMapUnmanaged(workflow.Registered),
+    /// Runs workflow types with no entry in `workflows`, if set.
+    dynamic_workflow: ?workflow.Registered = null,
     task_queue: []const u8,
     namespace: []const u8,
     stack_size: usize,
@@ -308,7 +359,7 @@ pub const WorkflowRunner = struct {
             const workflow_type = for (act.jobs.items) |job| {
                 if (job.variant) |v| if (v == .initialize_workflow) break v.initialize_workflow.workflow_type;
             } else return try taskFailure(a, act.run_id, "activation for a workflow run that is not cached and has no InitializeWorkflow job");
-            const entry = r.workflows.get(workflow_type) orelse {
+            const entry = r.workflows.get(workflow_type) orelse r.dynamic_workflow orelse {
                 const known = try registeredNames(a, r.workflows.*);
                 return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow type \"{s}\" is not registered on this worker; registered: {s}", .{ workflow_type, known }));
             };
@@ -516,7 +567,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     const a = run.arena.allocator();
     const start = &run.start;
     const side_effect = start.is_local and std.mem.eql(u8, start.activity_type, Instance.side_effect_activity_type);
-    const entry = if (side_effect) side_effect_activity else w.activities.get(start.activity_type) orelse {
+    const entry = if (side_effect) side_effect_activity else w.activities.get(start.activity_type) orelse w.dynamic_activity orelse {
         const known = try registeredNames(a, w.activities);
         return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
             .message = try std.fmt.allocPrint(a, "activity type \"{s}\" is not registered on this worker; registered: {s}", .{ start.activity_type, known }),
