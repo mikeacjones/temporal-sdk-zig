@@ -1,19 +1,26 @@
-//! Placeholder worker for the await-signals sample, replaced by its implementation.
-
 const std = @import("std");
 const temporal = @import("temporal");
-
-fn placeholder(ctx: *temporal.workflow.Context) !void {
-    _ = ctx;
-}
-const Placeholder = temporal.workflow.Def("Placeholder", placeholder);
+const await_signals = @import("workflow.zig");
 
 pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+
+    // The client and worker are heavyweight objects that should be created once per process.
     const options = try temporal.client.loadDefaultOptions(init.arena.allocator());
-    var client = try temporal.client.Client.connect(init.gpa, init.io, options);
+    var client = temporal.client.Client.connect(gpa, io, options) catch |err| {
+        std.log.err("Unable to create client: {t}", .{err});
+        std.process.exit(1);
+    };
     defer client.close();
-    var w = try temporal.worker.Worker.init(init.gpa, init.io, &client, "await_signals", .{});
+
+    var w = try temporal.worker.Worker.init(gpa, io, &client, "await_signals", .{});
     defer w.deinit();
-    try w.registerWorkflow(Placeholder);
-    try w.runUntilSignal();
+
+    try w.registerWorkflow(await_signals.AwaitSignalsWorkflow);
+
+    w.runUntilSignal() catch |err| {
+        std.log.err("Unable to start worker: {t}", .{err});
+        std.process.exit(1);
+    };
 }
