@@ -1720,6 +1720,111 @@ test "WorkflowReplayer replays a run that continued as new and catches one that 
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(continue_as_new_history));
 }
 
+test "client: a history iterator pages lazily, matches fetchHistory, and filters the close event" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(Fixtures.Hello, .{ .task_queue = "" }, .{"pages"});
+    defer run.deinit();
+    _ = try env.getResult(Fixtures.Hello, &run, a, null);
+    const whole = (try env.client.fetchHistory(a, run.id, run.run_id)).events.items;
+
+    var it = try env.client.historyIterator(run.id, run.run_id, .{ .page_size = 2 });
+    defer it.deinit();
+    var count: usize = 0;
+    while (try it.next(a)) |event| : (count += 1) {
+        // Two events a page: after the first, more pages remain.
+        if (count == 0) try testing.expect(it.next_page_token.len > 0);
+        try testing.expect(count < whole.len);
+        try testing.expectEqual(whole[count].event_id, event.event_id);
+        try testing.expectEqual(whole[count].event_type, event.event_type);
+    }
+    try testing.expectEqual(whole.len, count);
+
+    var close = try env.client.historyIterator(run.id, run.run_id, .{ .filter = .close_event });
+    defer close.deinit();
+    const last = (try close.next(a)) orelse return error.TestExpectedCloseEvent;
+    try testing.expectEqual(EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED, last.event_type);
+    try testing.expectEqual(whole[whole.len - 1].event_id, last.event_id);
+    try testing.expectEqual(null, try close.next(a));
+
+    var missing = try env.client.historyIterator("no-such-workflow", "", .{});
+    defer missing.deinit();
+    try testing.expectError(error.NotFound, missing.next(a));
+}
+
+const EventType = proto.temporal.api.enums.v1.EventType;
+
+/// What `readHistoryToEnd` saw.
+const HistoryTail = struct {
+    events: usize = 0,
+    signaled: bool = false,
+    last: EventType = .EVENT_TYPE_UNSPECIFIED,
+};
+
+fn readHistoryToEnd(it: *client_mod.HistoryIterator) client_mod.HistoryError!HistoryTail {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var tail: HistoryTail = .{};
+    while (try it.next(arena.allocator())) |event| {
+        tail.events += 1;
+        tail.signaled = tail.signaled or event.event_type == .EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED;
+        tail.last = event.event_type;
+    }
+    return tail;
+}
+
+test "client: a waiting history iterator follows a running workflow until it closes" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(SignalFixtures.AwaitApprovals, .{ .task_queue = "" }, .{1});
+    defer run.deinit();
+
+    var all = try env.client.historyIterator(run.id, run.run_id, .{ .wait_new_event = true });
+    defer all.deinit();
+    // Up to the first completed workflow task: then the workflow waits for a signal.
+    while (try all.next(a)) |event| {
+        if (event.event_type == .EVENT_TYPE_WORKFLOW_TASK_COMPLETED) break;
+    } else return error.TestExpectedWorkflowTaskCompleted;
+
+    // Without waiting, iteration stops at the events recorded so far.
+    var now = try env.client.historyIterator(run.id, run.run_id, .{});
+    defer now.deinit();
+    const so_far = try readHistoryToEnd(&now);
+    try testing.expectEqual(EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED, so_far.last);
+
+    var close = try env.client.historyIterator(run.id, run.run_id, .{ .wait_new_event = true, .filter = .close_event });
+    defer close.deinit();
+    var tail_future = try env.io.concurrent(readHistoryToEnd, .{&all});
+    var close_future = env.io.concurrent(readHistoryToEnd, .{&close}) catch |err| {
+        _ = tail_future.cancel(env.io) catch {};
+        return err;
+    };
+    env.signalWorkflow(SignalFixtures.Approve, run.id, .{"ann"}) catch |err| {
+        _ = tail_future.cancel(env.io) catch {};
+        _ = close_future.cancel(env.io) catch {};
+        return err;
+    };
+    const tail_result = tail_future.await(env.io);
+    const close_result = close_future.await(env.io);
+    const tail = try tail_result;
+    const closed = try close_result;
+
+    try testing.expect(tail.signaled);
+    try testing.expectEqual(EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED, tail.last);
+    try testing.expectEqual(@as(usize, 1), closed.events);
+    try testing.expectEqual(EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED, closed.last);
+    try testing.expectEqualStrings("ann", try env.getResult(SignalFixtures.AwaitApprovals, &run, a, null));
+}
+
 test "continue-as-new: WorkflowRun.get follows the chain to the last run's result" {
     const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
