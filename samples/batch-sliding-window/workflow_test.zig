@@ -125,10 +125,11 @@ test "state query shows a full window waiting for room" {
 
     // Time stays locked until getResult, so no child's delay passes and the window stays full
     // once two children have started.
-    const state = while (true) {
+    // Bounded, so a workflow that never gets there fails the test instead of hanging it.
+    const state = for (0..1000) |_| {
         const s = try env.queryWorkflow(sample.State, a, run.id, .{});
         if (s.children_started_by_this_run == 2) break s;
-    };
+    } else return error.WindowNeverFilled;
     try testing.expectEqualSlices(u32, &.{ 0, 1 }, state.current_records);
     try testing.expectEqual(0, state.offset);
     try testing.expectEqual(0, state.progress);
