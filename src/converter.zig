@@ -185,6 +185,80 @@ pub fn fromPayloads(comptime Args: type, arena: Allocator, payloads: []const Pay
     return out;
 }
 
+pub const Direction = enum { encode, decode };
+
+/// The type that stops `toPayload` (`.encode`) or `fromPayload` (`.decode`) from compiling
+/// for `T`, or null if it compiles: `T` itself, or a type inside it that `std.json` can't
+/// handle, such as a function pointer, an `anyopaque`, or an untagged union. Lets callers
+/// reject a type with an error that names it instead of one deep inside `std.json`.
+pub fn unconvertibleType(comptime T: type, comptime direction: Direction) ?type {
+    if (T == Payload or T == void or T == @TypeOf(null) or T == Bytes) return null;
+    if (comptime hasPayloadHooks(T) or isProtoMessage(T)) return null;
+    if (@typeInfo(T) == .optional) return unconvertibleType(@typeInfo(T).optional.child, direction);
+    return jsonUnconvertible(T, direction);
+}
+
+// Mirrors the type switches of std.json's Stringify.write and innerParse. A depth-first
+// worklist that visits each type once, so shared subtypes are walked once and recursive types
+// terminate. Callers check many methods in one comptime evaluation, so the quota is raised
+// with a wide base plus the walk's own work rather than left at the default 1000.
+fn jsonUnconvertible(comptime Root: type, comptime direction: Direction) ?type {
+    comptime {
+        const hook = if (direction == .encode) "jsonStringify" else "jsonParse";
+        var visited: []const type = &.{};
+        var stack: []const type = &.{Root};
+        var work: usize = 0;
+        while (stack.len > 0) {
+            work += visited.len + 8;
+            @setEvalBranchQuota(100_000 + 8 * work);
+            const T = stack[stack.len - 1];
+            stack = stack[0 .. stack.len - 1];
+            if (std.mem.indexOfScalar(type, visited, T) != null) continue;
+            visited = visited ++ .{T};
+            var children: []const type = &.{};
+            switch (@typeInfo(T)) {
+                .bool, .int, .float, .@"enum" => {},
+                .optional => |o| children = &.{o.child},
+                .error_set => if (direction == .decode) return T,
+                .array => |a| children = &.{a.child},
+                .vector => |v| children = &.{v.child},
+                .pointer => |p| switch (p.size) {
+                    .one, .slice => children = &.{p.child},
+                    .many => if (direction == .encode and p.sentinel_ptr != null) {
+                        children = &.{p.child};
+                    } else return T,
+                    .c => return T,
+                },
+                .@"union" => |u| if (!std.meta.hasFn(T, hook)) {
+                    if (u.tag_type == null) return T;
+                    for (u.field_types) |F| {
+                        if (F != void) children = children ++ .{F};
+                    }
+                },
+                .@"struct" => |s| if (!std.meta.hasFn(T, hook)) {
+                    for (s.field_types, s.field_attrs) |F, attrs| {
+                        if (direction == .decode and attrs.@"comptime" and !s.is_tuple) return T;
+                        if (F == void) {
+                            if (direction == .decode) return F;
+                            continue;
+                        }
+                        children = children ++ .{F};
+                    }
+                },
+                else => return T,
+            }
+            work += children.len;
+            // Pushed in reverse so the first field is walked first, as a recursive walk would.
+            var i = children.len;
+            while (i > 0) {
+                i -= 1;
+                stack = stack ++ .{children[i]};
+            }
+        }
+        return null;
+    }
+}
+
 /// Arguments not yet decoded, as a dynamic workflow, activity, or signal handler receives
 /// them: the handler reads each one as the type it expects. A view: the payloads are owned by
 /// the run or task that delivered them and live as long as its memory (`ctx.allocator()`);
@@ -609,6 +683,26 @@ pub const Time = struct {
         return .{ .year = yoe + era * 400 + @intFromBool(month <= 2), .month = month, .day = day };
     }
 };
+
+test "unconvertibleType names the type the default converter can't handle" {
+    const Node = struct { value: u32, next: ?*const @This() };
+    const Shape = union(enum) { circle: f32, empty };
+    const Untagged = union { a: u32, b: f32 };
+    const Failure = proto.temporal.api.failure.v1.Failure;
+    inline for (.{ void, Payload, Bytes, Point, ?Point, Failure, []const u8, ?u32, Node, Shape, [3]u8, struct { a: []const []const u8 } }) |T| {
+        try testing.expectEqual(null, unconvertibleType(T, .encode));
+        try testing.expectEqual(null, unconvertibleType(T, .decode));
+    }
+    try testing.expect(unconvertibleType(*std.Io.Writer, .decode) != null);
+    try testing.expect(unconvertibleType(*std.Io.Writer, .encode) != null);
+    try testing.expectEqual(anyopaque, unconvertibleType(*anyopaque, .encode));
+    try testing.expectEqual(fn () void, unconvertibleType(struct { f: *const fn () void }, .decode));
+    try testing.expectEqual(Untagged, unconvertibleType(struct { u: Untagged }, .decode));
+    try testing.expectEqual(null, unconvertibleType(error{Oops}, .encode));
+    try testing.expectEqual(error{Oops}, unconvertibleType(error{Oops}, .decode));
+    try testing.expectEqual(null, unconvertibleType([*:0]const u8, .encode));
+    try testing.expectEqual([*:0]const u8, unconvertibleType([*:0]const u8, .decode));
+}
 
 test "strings, structs and numbers encode as JSON" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

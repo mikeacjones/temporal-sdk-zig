@@ -309,18 +309,27 @@ pub const WorkflowEnvironment = struct {
     }
 
     /// Registers a method activity bound to `receiver`. See `Worker.registerActivityWith`.
+    /// Naming rules: see `temporal.activity.Def`.
     pub fn registerActivityWith(env: *WorkflowEnvironment, comptime Activity: type, receiver: *Activity.Receiver) !void {
         return env.worker.registerActivityWith(Activity, receiver);
     }
 
     /// Registers several method activities bound to one receiver. See
-    /// `Worker.registerActivitiesWith`.
+    /// `Worker.registerActivitiesWith`. Naming rules: see `temporal.activity.Def`.
     pub fn registerActivitiesWith(env: *WorkflowEnvironment, receiver: anytype, comptime activities: anytype) !void {
         return env.worker.registerActivitiesWith(receiver, activities);
     }
 
+    /// Registers every activity method of the struct `impl` points to, under the names of
+    /// `acts`, the `temporal.activity.defs` value workflows call them through. See
+    /// `Worker.registerActivities`.
+    pub fn registerActivities(env: *WorkflowEnvironment, impl: anytype, comptime acts: anytype) !void {
+        return env.worker.registerActivities(impl, acts);
+    }
+
     /// Registers `impl` in place of `Activity`: workflows calling `Activity` run `impl`.
-    /// `impl` takes the same parameters.
+    /// `impl` takes the same parameters. It takes `Activity`'s name, so `Activity` itself
+    /// must not be registered too (`error.AlreadyRegistered`).
     pub fn registerActivityAs(env: *WorkflowEnvironment, comptime Activity: type, comptime impl: anytype) !void {
         return env.worker.registerActivityImpl(activity.Def(Activity.activity_name, impl).registered);
     }
@@ -1923,6 +1932,45 @@ test "WorkflowEnvironment runs a workflow with a test double for its activity" {
     defer arena.deinit();
     const result = try env.executeWorkflow(Fixtures.Hello, .{"Temporal"}, arena.allocator(), null);
     try testing.expectEqualStrings("Hello from the test double!", result);
+}
+
+const StructActivities = struct {
+    const Shop = struct {
+        fee: u32,
+
+        pub fn charge(s: *Shop, ctx: *activity.Context, amount: u32) !u32 {
+            _ = ctx;
+            return amount + s.fee;
+        }
+
+        pub fn isLocal(s: *Shop, ctx: *activity.Context) !bool {
+            _ = s;
+            return ctx.info().is_local;
+        }
+    };
+    const acts = activity.defs(Shop, .{ .prefix = "Shop." });
+
+    fn order(ctx: *workflow.Context, amount: u32) ![]const u8 {
+        const ao: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+        const lao: workflow.LocalActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+        const remote = try ctx.executeActivity(acts.charge, ao, .{amount}).get();
+        const local = try ctx.executeLocalActivity(acts.charge, lao, .{remote}).get();
+        const ran_local = try ctx.executeLocalActivity(acts.isLocal, lao, .{}).get();
+        return std.fmt.allocPrint(ctx.allocator(), "{d} {d} local={}", .{ remote, local, ran_local });
+    }
+    const Order = workflow.Def("Order", order);
+};
+
+test "WorkflowEnvironment registers a struct's activities, and workflows call them through activity.defs" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var shop: StructActivities.Shop = .{ .fee = 2 };
+    try env.registerWorkflow(StructActivities.Order);
+    try env.registerActivities(&shop, StructActivities.acts);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(StructActivities.Order, .{@as(u32, 10)}, arena.allocator(), null);
+    try testing.expectEqualStrings("12 14 local=true", result);
 }
 
 test "DevServer honors namespace, port and search attribute options" {
