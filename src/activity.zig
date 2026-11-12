@@ -58,6 +58,7 @@ const client_mod = @import("client.zig");
 const failure_mod = @import("failure.zig");
 const log = @import("log.zig");
 const propagation = @import("propagation.zig");
+const interceptor = @import("interceptor.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Info = struct {
@@ -111,6 +112,8 @@ pub const Context = struct {
     header_: converter.Header = .{},
     /// What the client's propagators extracted from `header_`.
     propagated_: propagation.Values = .empty,
+    /// The attempt's outbound interceptors (`interceptor.ActivityOutbound`).
+    outbound: []const interceptor.ActivityOutbound = &.{},
     /// Written once by the worker when a cancel arrives, possibly from another thread.
     cancel_reason_: std.atomic.Value(u8) = .init(not_canceled),
 
@@ -179,9 +182,28 @@ pub const Context = struct {
     }
 
     /// A logger carrying the activity's ID, type, and attempt and its workflow's type, ID, and
-    /// run ID as fields, writing to the worker's sink (`worker.Options.logger`).
+    /// run ID as fields, writing to the worker's sink (`worker.Options.logger`), as the
+    /// activity's outbound interceptors (`interceptor.ActivityOutbound.logger`) return it.
     pub fn logger(ctx: *const Context) log.Logger {
+        if (ctx.outbound.len == 0) return ctx.logger_;
+        return ctx.outboundNext().logger(.{});
+    }
+
+    fn outboundNext(ctx: *const Context) interceptor.ActivityOutbound.Next {
+        return .{ .chain = ctx.outbound, .root = .{ .ptr = @constCast(ctx), .vtable = &outbound_root } };
+    }
+
+    const outbound_root: interceptor.ActivityOutbound.VTable = .{ .logger = rootLogger, .heartbeat = rootHeartbeat };
+
+    fn rootLogger(ptr: *anyopaque, _: interceptor.LoggerInput, _: interceptor.ActivityOutbound.Next) log.Logger {
+        const ctx: *const Context = @ptrCast(@alignCast(ptr));
         return ctx.logger_;
+    }
+
+    fn rootHeartbeat(ptr: *anyopaque, input: interceptor.HeartbeatInput, _: interceptor.ActivityOutbound.Next) void {
+        const ctx: *const Context = @ptrCast(@alignCast(ptr));
+        const sink = ctx.heartbeat_sink orelse return;
+        sink.record(sink.context, input.details);
     }
 
     /// Fails the activity with a failure you describe. Return the error this gives back.
@@ -210,12 +232,12 @@ pub const Context = struct {
         const sink = ctx.heartbeat_sink orelse return;
         var scratch: std.heap.ArenaAllocator = .init(sink.gpa);
         defer scratch.deinit();
-        if (@TypeOf(details) == void) return sink.record(sink.context, &.{});
+        if (@TypeOf(details) == void) return ctx.outboundNext().heartbeat(.{ .details = &.{} });
         const payload = converter.toPayload(scratch.allocator(), details) catch {
             ctx.logger_.warn("dropping a heartbeat: its details could not be encoded", .{});
             return;
         };
-        sink.record(sink.context, &.{payload});
+        ctx.outboundNext().heartbeat(.{ .details = &.{payload} });
     }
 
     /// Whether the previous attempt heartbeated with details.

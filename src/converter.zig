@@ -10,6 +10,7 @@
 //! | `converter.Bytes`                 | `binary/plain`    | the bytes                  |
 //! | a generated protobuf message      | `json/protobuf`   | ProtoJSON                  |
 //! | `converter.ProtoBinary(T)`        | `binary/protobuf` | the message's wire format  |
+//! | `converter.Payload`               | its own           | as it is (already encoded) |
 //! | anything else (strings included)  | `json/plain`      | JSON from `std.json`       |
 //!
 //! Strings are JSON strings; use `Bytes` for raw binary data. Decoding
@@ -112,6 +113,7 @@ pub fn encodingOf(p: Payload) ?[]const u8 {
 /// Encodes one value. Memory comes from `arena`.
 pub fn toPayload(arena: Allocator, value: anytype) error{OutOfMemory}!Payload {
     const T = @TypeOf(value);
+    if (T == Payload) return value;
     if (T == void or T == @TypeOf(null)) return payloadWith(arena, .null, "");
     if (@typeInfo(T) == .optional) {
         if (value) |v| return toPayload(arena, v);
@@ -126,6 +128,7 @@ pub fn toPayload(arena: Allocator, value: anytype) error{OutOfMemory}!Payload {
 
 /// Decodes one value of type `T`. Memory comes from `arena`.
 pub fn fromPayload(comptime T: type, arena: Allocator, p: Payload) DecodeError!T {
+    if (T == Payload) return try p.dupe(arena);
     if (comptime hasPayloadHooks(T)) return T.fromPayload(arena, p);
     const enc = encodingOf(p) orelse return error.UnknownEncoding;
     if (std.mem.eql(u8, enc, Encoding.null.text())) {
