@@ -74,8 +74,16 @@ queries: std.array_hash_map.String(QueryHandler) = .empty,
 signal_handlers: std.array_hash_map.String(SignalHandler) = .empty,
 /// Signals that arrived before a handler for their name, in arrival order. Arena memory.
 buffered_signals: std.ArrayList(*const Signal) = .empty,
-/// Handler coroutines that have not returned, in start order. Each removes itself when its
-/// handler returns; `destroy` cancels the rest.
+/// Update handlers by update name, in registration order (the order an unregistered update's
+/// rejection lists them in). Arena memory.
+update_handlers: std.array_hash_map.String(UpdateHandler) = .empty,
+/// Updates delivered before a handler for their name, in arrival order. Whatever is still here
+/// once the activation's coroutines have all blocked is rejected. Arena memory.
+buffered_updates: std.ArrayList(*const Update) = .empty,
+/// Set when the current activation accepted an update.
+accepted_update: bool = false,
+/// Signal and update handler coroutines that have not returned, in start order. Each removes
+/// itself when its handler returns; `destroy` cancels the rest.
 handlers: std.ArrayList(*HandlerRun) = .empty,
 
 /// A type-erased query handler: decodes `args` into `out`, calls the handler with `context`,
@@ -94,14 +102,40 @@ pub const SignalHandler = struct {
     call: *const fn (context: *const anyopaque, args: *const anyopaque) anyerror!void,
 };
 
+/// A type-erased update handler. `decode` turns an update's payloads into the handler's
+/// argument tuple, allocated in `out`; `validate` (if set) runs the validator with `context`
+/// and those arguments, outside any coroutine; `call` runs the handler inside the update's
+/// coroutine and encodes its result into `out`.
+pub const UpdateHandler = struct {
+    context: *const anyopaque,
+    decode: *const fn (out: Allocator, args: []const converter.Payload) anyerror!*const anyopaque,
+    validate: ?*const fn (context: *const anyopaque, args: *const anyopaque) anyerror!void,
+    call: *const fn (context: *const anyopaque, out: Allocator, args: *const anyopaque) anyerror!converter.Payload,
+};
+
 /// A delivered signal, copied into the arena so it outlives its activation.
 const Signal = struct { name: []const u8, args: []const converter.Payload };
 
-/// A running signal handler coroutine. Arena memory.
+/// A delivered update, copied into the arena so it outlives its activation.
+const Update = struct {
+    protocol_instance_id: []const u8,
+    name: []const u8,
+    args: []const converter.Payload,
+    run_validator: bool,
+};
+
+/// A running signal or update handler coroutine. Arena memory.
 const HandlerRun = struct {
     name: []const u8,
-    handler: SignalHandler,
+    context: *const anyopaque,
     args: *const anyopaque,
+    kind: union(enum) {
+        signal: *const fn (context: *const anyopaque, args: *const anyopaque) anyerror!void,
+        update: struct {
+            call: *const fn (context: *const anyopaque, out: Allocator, args: *const anyopaque) anyerror!converter.Payload,
+            protocol_instance_id: []const u8,
+        },
+    },
     /// Set after spawning, before the coroutine first runs; freed when it returns.
     task: *WorkflowIo.Task = undefined,
 };
@@ -239,12 +273,17 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         const v = job.variant orelse break false;
         if (v != .query_workflow) break false;
     } else true;
+    const update_only = act.jobs.items.len > 0 and for (act.jobs.items) |job| {
+        const v = job.variant orelse break false;
+        if (v != .do_update) break false;
+    } else true;
     if (!query_only) if (act.timestamp) |ts| {
         inst.now_ns = @as(i96, ts.seconds) * std.time.ns_per_s + ts.nanos;
     };
     inst.replaying = act.is_replaying;
     inst.commands = .empty;
     inst.task_failure = null;
+    inst.accepted_update = false;
     // Query answers go to `out`, not the run's arena, so answering doesn't grow the run.
     var answers: std.ArrayList(cmd_pb.WorkflowCommand) = .empty;
 
@@ -260,6 +299,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
             },
             .update_random_seed => |s| inst.wio.setRandomSeed(s.randomness_seed),
             .signal_workflow => |s| try inst.deliverSignal(&s),
+            .do_update => |u| try inst.deliverUpdate(&u),
             .resolve_activity => |r| try inst.resolveActivity(&r),
             .resolve_child_workflow_execution_start => |r| try inst.resolveChildStart(&r),
             .resolve_child_workflow_execution => |r| try inst.resolveChild(&r),
@@ -273,8 +313,12 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
 
     // Once the workflow has finished, coroutines that are still blocked (handlers, or the root
     // after a handler failed it) never run again: their commands would follow the completion.
+    // An update-only activation whose updates were all rejected is not in history, so on
+    // replay its coroutines could not run: they run only once an update is accepted (and core
+    // rejects anything but rejections from it).
     if (inst.task_failure == null and !query_only and !inst.finished) {
-        inst.runUntilQuiet();
+        if (!update_only or inst.accepted_update) inst.runUntilQuiet();
+        try inst.rejectUnhandledUpdates();
         try inst.finishIfDone();
     }
 
@@ -368,28 +412,145 @@ fn startSignalHandler(inst: *Instance, handler: SignalHandler, signal: *const Si
         },
     };
     const run = try a.create(HandlerRun);
-    run.* = .{ .name = signal.name, .handler = handler, .args = args };
-    try inst.handlers.ensureUnusedCapacity(a, 1);
-    run.task = inst.wio.spawn("signal", handlerMain, .{ inst, run }) catch |err| {
-        inst.logger.warn("starting a signal handler coroutine failed", .{ .SignalName = signal.name, .error_name = err });
+    run.* = .{ .name = signal.name, .context = handler.context, .args = args, .kind = .{ .signal = handler.call } };
+    try inst.startHandler(run);
+}
+
+// ---------------------------------------------------------------- updates
+
+/// Registers `handler` for updates called `name`, replacing any handler registered under it,
+/// then delivers each buffered update of that name to it, in arrival order. `name` and the
+/// handler's context must outlive the run; `context_addr` is checked as in `setQueryHandler`.
+pub fn setUpdateHandler(inst: *Instance, name: []const u8, handler: UpdateHandler, context_addr: ?usize) error{ OutOfMemory, UpdateContextOnStack }!void {
+    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
+        inst.logger.warn("setUpdateHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{ .UpdateName = name });
+        return error.UpdateContextOnStack;
+    };
+    try inst.update_handlers.put(inst.arena(), name, handler);
+    var i: usize = 0;
+    while (i < inst.buffered_updates.items.len) {
+        const update = inst.buffered_updates.items[i];
+        if (!std.mem.eql(u8, update.name, name)) {
+            i += 1;
+            continue;
+        }
+        _ = inst.buffered_updates.orderedRemove(i);
+        try inst.startUpdate(handler, update);
+    }
+}
+
+/// Copies a DoUpdate job into the arena and starts it, or buffers it until a handler for its
+/// name is registered. Once the workflow has finished nothing would run its handler, so the
+/// update is rejected.
+fn deliverUpdate(inst: *Instance, job: *const act_pb.DoUpdate) !void {
+    const a = inst.arena();
+    const protocol_instance_id = try a.dupe(u8, job.protocol_instance_id);
+    if (inst.finished) return inst.respondToUpdate(protocol_instance_id, .{ .rejected = try failure_mod.application(a, .{
+        .message = try std.fmt.allocPrint(a, "update \"{s}\" arrived after workflow \"{s}\" finished", .{ job.name, inst.info.workflow_type }),
+        .type = "WorkflowFinished",
+    }) });
+    const args = try a.alloc(converter.Payload, job.input.items.len);
+    for (job.input.items, args) |p, *d| d.* = try p.dupe(a);
+    const update = try a.create(Update);
+    update.* = .{
+        .protocol_instance_id = protocol_instance_id,
+        .name = try a.dupe(u8, job.name),
+        .args = args,
+        .run_validator = job.run_validator,
+    };
+    if (inst.update_handlers.get(update.name)) |handler| return inst.startUpdate(handler, update);
+    try inst.buffered_updates.append(a, update);
+}
+
+/// Decodes the update's arguments and runs its validator (unless replaying, where every
+/// update in history was accepted): either error rejects the update. Otherwise accepts it
+/// and spawns its handler coroutine.
+fn startUpdate(inst: *Instance, handler: UpdateHandler, update: *const Update) error{OutOfMemory}!void {
+    const a = inst.arena();
+    const args = handler.decode(a, update.args) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try failure_mod.fromError(a, err) }),
+    };
+    if (update.run_validator) if (handler.validate) |validate| validate(handler.context, args) catch |err|
+        return inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try failure_mod.fromError(a, err) });
+    try inst.respondToUpdate(update.protocol_instance_id, .{ .accepted = .{} });
+    inst.accepted_update = true;
+    const run = try a.create(HandlerRun);
+    run.* = .{ .name = update.name, .context = handler.context, .args = args, .kind = .{ .update = .{
+        .call = handler.call,
+        .protocol_instance_id = update.protocol_instance_id,
+    } } };
+    try inst.startHandler(run);
+}
+
+/// Rejects the updates no handler was registered for while the activation's coroutines ran,
+/// in arrival order. Core needs every update accepted or rejected in the completion of the
+/// activation that delivered it.
+fn rejectUnhandledUpdates(inst: *Instance) error{OutOfMemory}!void {
+    if (inst.buffered_updates.items.len == 0) return;
+    const a = inst.arena();
+    const names = try std.mem.join(a, ", ", inst.update_handlers.keys());
+    for (inst.buffered_updates.items) |update| try inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try failure_mod.application(a, .{
+        .message = try std.fmt.allocPrint(a, "update \"{s}\" is not registered on workflow \"{s}\"; registered updates: [{s}]", .{ update.name, inst.info.workflow_type, names }),
+        .type = "UpdateNotRegistered",
+    }) });
+    inst.buffered_updates.clearRetainingCapacity();
+}
+
+fn respondToUpdate(inst: *Instance, protocol_instance_id: []const u8, response: cmd_pb.UpdateResponse.response_union) error{OutOfMemory}!void {
+    try inst.commands.append(inst.arena(), .{ .variant = .{ .update_response = .{
+        .protocol_instance_id = protocol_instance_id,
+        .response = response,
+    } } });
+}
+
+/// Spawns a handler coroutine for `run` and tracks it in `handlers`.
+fn startHandler(inst: *Instance, run: *HandlerRun) error{OutOfMemory}!void {
+    try inst.handlers.ensureUnusedCapacity(inst.arena(), 1);
+    run.task = inst.wio.spawn(@tagName(run.kind), handlerMain, .{ inst, run }) catch |err| {
+        inst.logger.warn("starting a handler coroutine failed", .{ .HandlerName = run.name, .error_name = err });
         return error.OutOfMemory;
     };
     inst.handlers.appendAssumeCapacity(run);
 }
 
 fn handlerMain(inst: *Instance, run: *HandlerRun) void {
-    const result = run.handler.call(run.handler.context, run.args);
+    switch (run.kind) {
+        .signal => |call| {
+            const result = call(run.context, run.args);
+            inst.removeHandler(run);
+            result catch |err| {
+                if (inst.evicting) return;
+                if (inst.root_outcome == null) {
+                    inst.root_outcome = .{ .failed = err };
+                } else {
+                    inst.logger.warn("a signal handler failed after the workflow finished; its error is ignored", .{ .SignalName = run.name, .error_name = err });
+                }
+            };
+        },
+        .update => |u| {
+            const a = inst.arena();
+            const result = u.call(run.context, a, run.args);
+            inst.removeHandler(run);
+            if (inst.evicting) return;
+            const response: cmd_pb.UpdateResponse.response_union = if (result) |payload|
+                .{ .completed = payload }
+            else |err|
+                .{ .rejected = failure_mod.fromError(a, err) catch {
+                    inst.task_failure = "out of memory rejecting an update whose handler failed";
+                    return;
+                } };
+            inst.respondToUpdate(u.protocol_instance_id, response) catch {
+                inst.task_failure = "out of memory completing an update";
+            };
+        },
+    }
+}
+
+fn removeHandler(inst: *Instance, run: *HandlerRun) void {
     for (inst.handlers.items, 0..) |r, i| if (r == run) {
         _ = inst.handlers.orderedRemove(i);
-        break;
-    };
-    result catch |err| {
-        if (inst.evicting) return;
-        if (inst.root_outcome == null) {
-            inst.root_outcome = .{ .failed = err };
-        } else {
-            inst.logger.warn("a signal handler failed after the workflow finished; its error is ignored", .{ .SignalName = run.name, .error_name = err });
-        }
+        return;
     };
 }
 
@@ -1363,6 +1524,261 @@ test "a signal handler context on the coroutine's stack is rejected" {
     const inst = try create(testing.allocator, SignalOnStackWf.registered, .{});
     defer inst.destroy();
     try testing.expectEqualStrings("\"SignalContextOnStack\"", completedWith(try inst.activate(&try initActivation(a, "SignalOnStack", .{}), a)));
+}
+
+// Update handlers. `State.value` is what `set` updates change; a `done` signal ends the run.
+const Updates = struct {
+    const Set = workflow.UpdateDef("set", fn (value: i64) i64);
+    const SetSlowly = workflow.UpdateDef("set_slowly", fn (value: i64) i64);
+    const Break = workflow.UpdateDef("break", fn () void);
+    const Done = workflow.SignalDef("done", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        value: i64 = 0,
+        done: bool = false,
+
+        fn create(ctx: *workflow.Context) !*State {
+            const s = try ctx.allocator().create(State);
+            s.* = .{ .ctx = ctx };
+            return s;
+        }
+        /// Returns the previous value.
+        fn set(s: *State, value: i64) i64 {
+            defer s.value = value;
+            return s.value;
+        }
+        fn setSlowly(s: *State, value: i64) !i64 {
+            try s.ctx.io().sleep(.fromSeconds(5), .awake);
+            return s.set(value);
+        }
+        fn positive(_: *State, value: i64) error{NotPositive}!void {
+            if (value <= 0) return error.NotPositive;
+        }
+        fn breaks(_: *State) error{Broken}!void {
+            return error.Broken;
+        }
+        fn finish(s: *State) void {
+            s.done = true;
+        }
+        fn finished(s: *State) bool {
+            return s.done;
+        }
+    };
+
+    /// Handles updates until a `done` signal, waits for running handlers, and returns the
+    /// value.
+    fn run(ctx: *workflow.Context) !i64 {
+        const s = try State.create(ctx);
+        try ctx.setUpdateHandlerWithValidator(Set, s, State.set, State.positive);
+        try ctx.setUpdateHandler(SetSlowly, s, State.setSlowly);
+        try ctx.setUpdateHandler(Break, s, State.breaks);
+        try ctx.setSignalHandler(Done, s, State.finish);
+        try ctx.await(s, State.finished);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return s.value;
+    }
+
+    /// Registers `set` only after sleeping 10 s.
+    fn late(ctx: *workflow.Context) !i64 {
+        const s = try State.create(ctx);
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        try ctx.setUpdateHandler(Set, s, State.set);
+        try ctx.await(s, State.finished);
+        return s.value;
+    }
+
+    /// Returns at once, leaving `set` registered.
+    fn quick(ctx: *workflow.Context) !i64 {
+        const s = try State.create(ctx);
+        try ctx.setUpdateHandler(Set, s, State.set);
+        return 7;
+    }
+
+    fn onStack(ctx: *workflow.Context) ![]const u8 {
+        var s: State = .{ .ctx = ctx };
+        ctx.setUpdateHandler(Set, &s, State.set) catch |err| return @errorName(err);
+        return "registered";
+    }
+};
+const UpdatesWf = workflow.Def("Updates", Updates.run);
+const LateUpdatesWf = workflow.Def("LateUpdates", Updates.late);
+const QuickUpdatesWf = workflow.Def("QuickUpdates", Updates.quick);
+const UpdateOnStackWf = workflow.Def("UpdateOnStack", Updates.onStack);
+
+fn updateJob(a: Allocator, id: []const u8, name: []const u8, args: anytype, run_validator: bool) !act_pb.WorkflowActivationJob.variant_union {
+    var job: act_pb.DoUpdate = .{ .id = id, .protocol_instance_id = id, .name = name, .run_validator = run_validator };
+    job.input = try converter.toPayloads(a, args);
+    return .{ .do_update = job };
+}
+
+/// The update response in `cmd`, checking it is for update `id`.
+fn updateResponse(cmd: cmd_pb.WorkflowCommand, id: []const u8) !cmd_pb.UpdateResponse.response_union {
+    const r = cmd.variant.?.update_response;
+    try testing.expectEqualStrings(id, r.protocol_instance_id);
+    return r.response.?;
+}
+
+test "update: accepted, then completed with the handler's result" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UpdatesWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Updates", .{}), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "set", .{@as(i64, 5)}, true)), a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    try testing.expect(try updateResponse(cmds[0], "u1") == .accepted);
+    try testing.expectEqualStrings("0", (try updateResponse(cmds[1], "u1")).completed.data);
+    try testing.expectEqualStrings("5", completedWith(try inst.activate(&try oneJob(a, try signalJob(a, "done", .{})), a)));
+}
+
+test "update: a validator's error rejects it, and nothing else runs" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UpdatesWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Updates", .{}), a);
+    // The argument doesn't decode, or the validator rejects it.
+    var act = try oneJob(a, try updateJob(a, "u1", "set", .{@as(i64, -1)}, true));
+    try act.jobs.append(a, .{ .variant = try updateJob(a, "u2", "set", .{@as([]const u8, "five")}, true) });
+    const cmds = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    const rejected = (try updateResponse(cmds[0], "u1")).rejected;
+    try testing.expectEqualStrings("NotPositive", rejected.message);
+    try testing.expectEqualStrings("NotPositive", failure_mod.applicationType(rejected).?);
+    try testing.expect(try updateResponse(cmds[1], "u2") == .rejected);
+    try testing.expectEqualStrings("0", completedWith(try inst.activate(&try oneJob(a, try signalJob(a, "done", .{})), a)));
+}
+
+test "update: on replay the validator doesn't run and the update is accepted" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UpdatesWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Updates", .{}), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "set", .{@as(i64, -1)}, false)), a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    try testing.expect(try updateResponse(cmds[0], "u1") == .accepted);
+    try testing.expect(try updateResponse(cmds[1], "u1") == .completed);
+}
+
+test "update: a handler's error rejects it after acceptance without failing the workflow" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UpdatesWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Updates", .{}), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "break", .{}, true)), a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    try testing.expect(try updateResponse(cmds[0], "u1") == .accepted);
+    try testing.expectEqualStrings("Broken", (try updateResponse(cmds[1], "u1")).rejected.message);
+    try testing.expectEqualStrings("0", completedWith(try inst.activate(&try oneJob(a, try signalJob(a, "done", .{})), a)));
+}
+
+test "update: a handler that blocks on a timer completes in a later activation, and allHandlersFinished waits for it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UpdatesWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Updates", .{}), a);
+    try testing.expect(inst.ctx.allHandlersFinished());
+    var act = try oneJob(a, try updateJob(a, "u1", "set_slowly", .{@as(i64, 9)}, true));
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "done", .{}) });
+    const blocked = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 2), blocked.len);
+    try testing.expect(try updateResponse(blocked[0], "u1") == .accepted);
+    try testing.expect(blocked[1].variant.? == .start_timer);
+    try testing.expect(!inst.ctx.allHandlersFinished());
+
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a));
+    try testing.expectEqual(@as(usize, 2), done.len);
+    try testing.expectEqualStrings("0", (try updateResponse(done[0], "u1")).completed.data);
+    try testing.expectEqualStrings("9", done[1].variant.?.complete_workflow_execution.result.?.data);
+    try testing.expect(inst.ctx.allHandlersFinished());
+}
+
+test "update: one delivered with the start waits for the workflow function to register its handler" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UpdatesWf.registered, .{});
+    defer inst.destroy();
+
+    var start = try initActivation(a, "Updates", .{});
+    try start.jobs.append(a, .{ .variant = try updateJob(a, "u1", "set", .{@as(i64, 3)}, true) });
+    const cmds = commandsOf(try inst.activate(&start, a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    try testing.expect(try updateResponse(cmds[0], "u1") == .accepted);
+    try testing.expect(try updateResponse(cmds[1], "u1") == .completed);
+    try testing.expectEqual(@as(usize, 0), inst.buffered_updates.items.len);
+}
+
+test "update: one with no handler once the coroutines block is rejected, naming the registered updates" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const registered = try create(testing.allocator, UpdatesWf.registered, .{});
+    defer registered.destroy();
+    _ = try registered.activate(&try initActivation(a, "Updates", .{}), a);
+    const cmds = commandsOf(try registered.activate(&try oneJob(a, try updateJob(a, "u1", "nope", .{}, true)), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    const rejected = (try updateResponse(cmds[0], "u1")).rejected;
+    try testing.expectEqualStrings("UpdateNotRegistered", failure_mod.applicationType(rejected).?);
+    try testing.expectEqualStrings("update \"nope\" is not registered on workflow \"Updates\"; registered updates: [set, set_slowly, break]", rejected.message);
+
+    // Sent with the start, before a handler that is registered only after a timer.
+    const late = try create(testing.allocator, LateUpdatesWf.registered, .{});
+    defer late.destroy();
+    var start = try initActivation(a, "LateUpdates", .{});
+    try start.jobs.append(a, .{ .variant = try updateJob(a, "u2", "set", .{@as(i64, 3)}, true) });
+    const first = commandsOf(try late.activate(&start, a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expect(first[0].variant.? == .start_timer);
+    try testing.expectEqualStrings("update \"set\" is not registered on workflow \"LateUpdates\"; registered updates: []", (try updateResponse(first[1], "u2")).rejected.message);
+    try testing.expectEqual(@as(usize, 0), late.buffered_updates.items.len);
+}
+
+test "update: one delivered after the workflow finished is rejected" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, QuickUpdatesWf.registered, .{});
+    defer inst.destroy();
+
+    try testing.expectEqualStrings("7", completedWith(try inst.activate(&try initActivation(a, "QuickUpdates", .{}), a)));
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "set", .{@as(i64, 1)}, true)), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expectEqualStrings("WorkflowFinished", failure_mod.applicationType((try updateResponse(cmds[0], "u1")).rejected).?);
+}
+
+test "update: eviction cancels a handler blocked on a timer" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UpdatesWf.registered, .{});
+    _ = try inst.activate(&try initActivation(a, "Updates", .{}), a);
+    _ = try inst.activate(&try oneJob(a, try updateJob(a, "u1", "set_slowly", .{@as(i64, 1)}, true)), a);
+    inst.destroy(); // testing.allocator reports leaks
+}
+
+test "an update handler context on the coroutine's stack is rejected" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UpdateOnStackWf.registered, .{});
+    defer inst.destroy();
+    try testing.expectEqualStrings("\"UpdateContextOnStack\"", completedWith(try inst.activate(&try initActivation(a, "UpdateOnStack", .{}), a)));
 }
 
 // An activity raced against a timer.
