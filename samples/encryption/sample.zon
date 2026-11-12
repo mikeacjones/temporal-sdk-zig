@@ -1,0 +1,14 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter
+// also reads the workflow's input back from history without the codecs, to show it stored
+// encrypted. codec_server is only built, for running by hand with the Temporal CLI.
+.{
+    .expect = .{
+        "Workflow result: Hello My Secret Friend!",
+        "Workflow input as stored: encoding binary/encrypted, key ID test",
+        "Workflow input decoded with the codecs: My Secret Friend",
+    },
+    .timeout_seconds = 60,
+    .tests = .{ "codec_test.zig", "workflow_test.zig" },
+    .programs = .{"codec_server"},
+}
