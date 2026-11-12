@@ -9,6 +9,8 @@ const converter = @import("converter.zig");
 const failure_mod = @import("failure.zig");
 const interceptor = @import("interceptor.zig");
 const log = @import("log.zig");
+const proto = @import("proto.zig");
+const schedule = @import("schedule.zig");
 const testing_mod = @import("testing.zig");
 const WorkflowEnvironment = testing_mod.WorkflowEnvironment;
 const Payload = converter.Payload;
@@ -289,4 +291,133 @@ test "worker interceptors observe and change a workflow's start, signal, query, 
     defer without.deinit();
     try without.registerWorkflow(Fixtures.Guarded);
     try testing.expectError(error.Nondeterminism, without.replayHistory(history));
+}
+
+/// Records the method of every request, refuses terminations, and tags starts with a header.
+const Recording = struct {
+    mutex: std.Io.Mutex = .init,
+    io: std.Io,
+    arena: std.heap.ArenaAllocator,
+    methods: std.ArrayList([]const u8) = .empty,
+
+    pub fn call(r: *Recording, input: *interceptor.ClientCall, next: interceptor.Client.Next) interceptor.ClientError!void {
+        {
+            r.mutex.lockUncancelable(r.io);
+            defer r.mutex.unlock(r.io);
+            const last = if (r.methods.items.len > 0) r.methods.items[r.methods.items.len - 1] else "";
+            // Long polls repeat a method; one entry per run of them.
+            if (!std.mem.eql(u8, last, input.method)) try r.methods.append(r.arena.allocator(), try r.arena.allocator().dupe(u8, input.method));
+        }
+        if (std.mem.eql(u8, input.method, "TerminateWorkflowExecution")) return error.RpcFailed;
+        if (input.request(proto.temporal.api.workflowservice.v1.StartWorkflowExecutionRequest)) |request|
+            try input.header.?.set("client-tag", try std.fmt.allocPrint(input.arena, "for {s}", .{request.workflow_id}));
+        try next.call(input);
+        if (input.response(proto.temporal.api.workflowservice.v1.CountWorkflowExecutionsResponse)) |response| response.count += 1000;
+    }
+};
+
+const ClientFixtures = struct {
+    const Done = workflow.SignalDef("done", fn () void);
+    const Peek = workflow.QueryDef("peek", fn () []const u8);
+    const Bump = workflow.UpdateDef("bump", fn () u32);
+
+    const State = struct {
+        done: bool = false,
+        bumps: u32 = 0,
+        fn finish(s: *State) void {
+            s.done = true;
+        }
+        fn peek(_: *State) []const u8 {
+            return "peeked";
+        }
+        fn bump(s: *State) u32 {
+            s.bumps += 1;
+            return s.bumps;
+        }
+        fn finished(s: *State) bool {
+            return s.done;
+        }
+    };
+
+    /// Waits for `done` and returns its start header's tag.
+    fn tagged(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{};
+        try ctx.setSignalHandler(Done, s, State.finish);
+        try ctx.setQueryHandler(Peek, s, State.peek);
+        try ctx.setUpdateHandler(Bump, s, State.bump);
+        try ctx.await(s, State.finished);
+        return (try ctx.headers().value([]const u8, ctx.allocator(), "client-tag")) orelse "untagged";
+    }
+    const Tagged = workflow.Def("Tagged", tagged);
+
+    fn double(_: *activity.Context, n: u32) !u32 {
+        return 2 * n;
+    }
+    const Double = activity.Def("Double", double);
+};
+
+test "a client interceptor sees every operation's request in order, and can change or refuse one" {
+    var recording: Recording = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer recording.arena.deinit();
+    const interceptors = [_]interceptor.Client{interceptor.Client.from(Recording, &recording)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .interceptors = &interceptors,
+        .dev_server_extra_args = &testing_mod.DevServer.standalone_activity_args,
+    });
+    defer env.deinit();
+    try env.registerWorkflow(ClientFixtures.Tagged);
+    try env.registerActivity(ClientFixtures.Double);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var run = try env.startWorkflow(ClientFixtures.Tagged, .{ .id = "tagged", .task_queue = "" }, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("peeked", try c.queryWorkflow(ClientFixtures.Peek, a, "tagged", "", .{}));
+    var bumped = try c.updateWorkflow(ClientFixtures.Bump, "tagged", "", .{}, .{});
+    defer bumped.deinit();
+    try c.signalWorkflow(ClientFixtures.Done, "tagged", "", .{});
+    try testing.expectEqualStrings("for tagged", try run.get(a));
+    _ = try c.describeWorkflow(a, "tagged", "");
+
+    var other = try c.signalWithStartWorkflow(ClientFixtures.Tagged, .{ .id = "other", .task_queue = env.task_queue }, .{}, ClientFixtures.Done, .{});
+    defer other.deinit();
+    try c.cancelWorkflow("other", "", "done with it");
+    try testing.expectError(error.RpcFailed, c.terminateWorkflow("other", "", "refused"));
+    var with_start = try c.updateWithStartWorkflow(ClientFixtures.Tagged, .{ .id = "third", .task_queue = env.task_queue, .id_conflict_policy = .use_existing }, .{}, ClientFixtures.Bump, .{}, .{});
+    defer with_start.deinit();
+    try testing.expect(try c.countWorkflows("") >= 1000);
+    var listed = try c.listWorkflows("", .{});
+    defer listed.deinit();
+    _ = try listed.next(a);
+    _ = try c.fetchHistory(a, "tagged", "");
+
+    var handle = try c.createSchedule("tagged-schedule", .{ .schedule = .{
+        .action = try schedule.startWorkflow(a, ClientFixtures.Tagged, .{}, .{ .id = "scheduled", .task_queue = env.task_queue }),
+        .spec = .{},
+    } });
+    defer handle.deinit();
+    _ = try handle.describe(a);
+    try handle.delete();
+
+    var doubled = try c.executeActivity(ClientFixtures.Double, .{ .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{21});
+    defer doubled.deinit();
+    try testing.expectEqual(@as(u32, 42), try doubled.get(a));
+
+    const want = [_][]const u8{
+        "StartWorkflowExecution",           "QueryWorkflow",                  "UpdateWorkflowExecution",
+        "SignalWorkflowExecution",          "GetWorkflowExecutionHistory",    "DescribeWorkflowExecution",
+        "SignalWithStartWorkflowExecution", "RequestCancelWorkflowExecution", "TerminateWorkflowExecution",
+        "ExecuteMultiOperation",            "CountWorkflowExecutions",        "ListWorkflowExecutions",
+        "GetWorkflowExecutionHistory",      "CreateSchedule",                 "DescribeSchedule",
+        "DeleteSchedule",                   "StartActivityExecution",         "PollActivityExecution",
+    };
+    const got = recording.methods.items;
+    if (got.len != want.len) {
+        std.debug.print("client interceptor saw {any}\n", .{got});
+        return error.TestUnexpectedResult;
+    }
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
 }
