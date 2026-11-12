@@ -20,6 +20,7 @@ const activity = @import("activity.zig");
 const converter = @import("converter.zig");
 const search_attributes = @import("search_attributes.zig");
 const history_mod = @import("history.zig");
+const schedule = @import("schedule.zig");
 const failure_mod = @import("failure.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -2886,6 +2887,165 @@ test "client: list and count workflows by a visibility query on search attribute
     var none = try env.client.listWorkflows("CustomKeywordListField = 'no-such-tag'", .{});
     defer none.deinit();
     try testing.expect(try none.next(a) == null);
+}
+
+const ScheduleFixtures = struct {
+    /// Reports the search attributes the server sets on a workflow a schedule starts.
+    fn scheduledBy(ctx: *workflow.Context, greeting: []const u8) ![]const u8 {
+        const sa = ctx.searchAttributes();
+        const by = try sa.get(ctx.allocator(), schedule.scheduled_by_id) orelse "nobody";
+        const at = try sa.get(ctx.allocator(), schedule.scheduled_start_time);
+        return std.fmt.allocPrint(ctx.allocator(), "{s} from {s}, scheduled time known: {}", .{ greeting, by, at != null });
+    }
+    const ScheduledBy = workflow.Def("ScheduledBy", scheduledBy);
+
+    fn newSpec(intervals: []const schedule.Interval, d: *schedule.Description) !?schedule.Update {
+        d.schedule.spec.intervals = intervals;
+        d.schedule.state.note = "slowed down";
+        return .{ .schedule = d.schedule, .search_attributes = &new_search_attributes };
+    }
+    // Static: what the callback returns must outlive it.
+    const new_search_attributes = [_]search_attributes.Update{Fixtures.priority.set(2)};
+
+    fn noChange(_: void, _: *schedule.Description) error{}!?schedule.Update {
+        return null;
+    }
+
+    /// Polls `describe` until the schedule has taken `want` actions, for at most 30 s, and
+    /// returns that description.
+    fn waitForActions(handle: *const client_mod.ScheduleHandle, arena: Allocator, want: i64) !schedule.Description {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            const d = try handle.describe(arena);
+            if (d.info.action_count >= want) return d;
+            if (tries == 300) {
+                log.err("schedule {s} took {d} actions, want {d}", .{ handle.id, d.info.action_count, want });
+                return error.TestUnexpectedResult;
+            }
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    }
+};
+
+test "client: create, describe, update, pause, trigger, backfill, list and delete a schedule" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ScheduleFixtures.ScheduledBy);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = try std.fmt.allocPrint(a, "schedule-{s}", .{env.task_queue});
+
+    var handle = try env.client.createSchedule(id, .{
+        .schedule = .{
+            .action = try schedule.startWorkflow(a, ScheduleFixtures.ScheduledBy, .{"hello"}, .{
+                .id = "scheduled",
+                .task_queue = env.task_queue,
+                .run_timeout = .fromSeconds(30),
+            }),
+            .spec = .{ .intervals = &.{.{ .every = .fromSeconds(1) }} },
+            .policies = .{ .overlap = .allow_all },
+        },
+        .memo = try converter.toFields(a, .{ .owner = "scheduler" }),
+        .search_attributes = &.{Fixtures.order_id.set(env.task_queue)},
+    });
+    defer handle.deinit();
+    try testing.expectError(error.ScheduleAlreadyExists, env.client.createSchedule(id, .{ .schedule = .{
+        .action = try schedule.startWorkflowByName(a, "ScheduledBy", .{"again"}, .{ .id = "x", .task_queue = env.task_queue }),
+        .spec = .{},
+    } }));
+
+    // The interval fires within a second; the workflow sees which schedule started it.
+    var d = try ScheduleFixtures.waitForActions(&handle, a, 1);
+    try testing.expectEqualStrings(id, d.id);
+    const first = d.info.recent_actions[0];
+    try testing.expect(std.mem.startsWith(u8, first.workflow.workflow_id, "scheduled-"));
+    try testing.expect(first.scheduled_at != null and first.taken_at != null);
+    var run = try env.client.getWorkflow([]const u8, first.workflow.workflow_id, first.workflow.run_id);
+    defer run.deinit();
+    const want = try std.fmt.allocPrint(a, "hello from {s}, scheduled time known: true", .{id});
+    try testing.expectEqualStrings(want, try env.getResult(ScheduleFixtures.ScheduledBy, &run, a, null));
+
+    const action = d.schedule.action.start_workflow;
+    try testing.expectEqualStrings("ScheduledBy", action.workflow_type);
+    try testing.expectEqualStrings(env.task_queue, action.task_queue);
+    try testing.expectEqual(@as(?Io.Duration, .fromSeconds(30)), action.run_timeout);
+    try testing.expectEqualStrings("hello", (try converter.fromPayloads(struct { []const u8 }, a, action.args))[0]);
+    try testing.expectEqual(Io.Duration.fromSeconds(1), d.schedule.spec.intervals[0].every);
+    try testing.expectEqual(schedule.OverlapPolicy.allow_all, d.schedule.policies.overlap);
+    try testing.expect(d.info.next_action_times.len > 0);
+    try testing.expect(d.info.create_time != null);
+    try testing.expectEqualStrings("scheduler", (try d.memoValue([]const u8, a, "owner")).?);
+    try testing.expectEqualStrings(env.task_queue, (try d.search_attributes.get(a, Fixtures.order_id)).?);
+
+    // Update by read-modify-write: an hourly interval leaves only triggers and backfills.
+    try handle.update({}, ScheduleFixtures.noChange);
+    const hourly = [_]schedule.Interval{.{ .every = .fromSeconds(3600) }};
+    try handle.update(@as([]const schedule.Interval, &hourly), ScheduleFixtures.newSpec);
+    d = try handle.describe(a);
+    try testing.expectEqual(@as(usize, 1), d.schedule.spec.intervals.len);
+    try testing.expectEqual(Io.Duration.fromSeconds(3600), d.schedule.spec.intervals[0].every);
+    try testing.expectEqualStrings("slowed down", d.schedule.state.note);
+    try testing.expectEqualStrings("ScheduledBy", d.schedule.action.start_workflow.workflow_type);
+    // The update replaces the schedule's search attributes.
+    // The update replaces the schedule's search attributes once the server has applied it,
+    // a moment after it returns.
+    var polls: usize = 0;
+    while (try d.search_attributes.get(a, Fixtures.priority) == null) : (polls += 1) {
+        if (polls == 300) return error.TestUnexpectedResult;
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+        d = try handle.describe(a);
+    }
+    try testing.expectEqual(@as(?i64, 2), try d.search_attributes.get(a, Fixtures.priority));
+    try testing.expectEqual(@as(?[]const u8, null), try d.search_attributes.get(a, Fixtures.order_id));
+    const before_trigger = d.info.action_count;
+
+    try handle.pause("maintenance");
+    d = try handle.describe(a);
+    try testing.expect(d.schedule.state.paused);
+    try testing.expectEqualStrings("maintenance", d.schedule.state.note);
+    try handle.unpause("");
+    d = try handle.describe(a);
+    try testing.expect(!d.schedule.state.paused);
+    try testing.expectEqualStrings("Unpaused", d.schedule.state.note);
+
+    try handle.trigger(.unspecified);
+    _ = try ScheduleFixtures.waitForActions(&handle, a, before_trigger + 1);
+
+    // Any two-hour period holds two hourly actions.
+    const now = Io.Timestamp.now(testing.io, .real);
+    try handle.backfill(&.{.{
+        .start = now.subDuration(.fromSeconds(3 * 3600 - 1)),
+        .end = now.subDuration(.fromSeconds(3600 - 1)),
+    }});
+    d = try ScheduleFixtures.waitForActions(&handle, a, before_trigger + 3);
+    var backfilled: usize = 0;
+    for (d.info.recent_actions) |r| {
+        if (r.scheduled_at.?.nanoseconds < now.subDuration(.fromSeconds(1800)).nanoseconds) backfilled += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), backfilled);
+
+    // Listing is eventually consistent: wait until the schedule shows up.
+    var tries: usize = 0;
+    const listed = while (true) : (tries += 1) {
+        var it = try env.client.listSchedules(.{ .page_size = 1 });
+        defer it.deinit();
+        const found = while (try it.next(a)) |entry| {
+            if (std.mem.eql(u8, entry.id, id)) break entry;
+        } else null;
+        if (found) |entry| if (std.mem.eql(u8, entry.note, "Unpaused")) break entry;
+        if (tries == 300) return error.TestUnexpectedResult;
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    };
+    try testing.expectEqualStrings("ScheduledBy", listed.workflow_type);
+    try testing.expect(!listed.paused);
+    try testing.expectEqual(Io.Duration.fromSeconds(3600), listed.spec.intervals[0].every);
+    try testing.expectEqualStrings("scheduler", (try converter.fieldValue([]const u8, a, listed.memo, "owner")).?);
+
+    try handle.delete();
+    try testing.expectError(error.NotFound, handle.describe(a));
+    try testing.expectError(error.NotFound, handle.trigger(.unspecified));
 }
 
 test "an activity signals its own workflow through ctx.client()" {
