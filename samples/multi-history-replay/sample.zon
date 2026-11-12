@@ -1,0 +1,14 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter runs
+// the workflows, then lists and replays them as the replayer program does.
+.{
+    .expect = .{
+        "Workflow finished",
+        "Found workflows Count=10",
+        "All 10 workflow histories replayed without nondeterminism",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"multi_history_replay_test.zig"},
+    .imports = .{"helloworld"},
+    .programs = .{"replayer"},
+}
