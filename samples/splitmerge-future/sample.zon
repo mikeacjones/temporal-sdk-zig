@@ -3,4 +3,5 @@
 .{
     .expect = .{"Workflow result: items=15 sum=55"},
     .timeout_seconds = 60,
+    .tests = .{"splitmerge_workflow_test.zig"},
 }

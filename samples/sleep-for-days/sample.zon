@@ -7,4 +7,5 @@
         "Workflow result: done",
     },
     .timeout_seconds = 60,
+    .tests = .{"sleep_for_days_workflow_test.zig"},
 }
