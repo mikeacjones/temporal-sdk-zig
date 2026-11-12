@@ -1,0 +1,11 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`.
+.{
+    .expect = .{
+        "Workflow result: DurableExecution - Hello - Temporal",
+        "Workflow result: dynamic-activity - Peanut - Butter",
+        "Workflow result: dynamic-activity123 - Jelly - Time",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
+}
