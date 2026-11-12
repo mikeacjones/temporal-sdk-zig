@@ -23,6 +23,8 @@ const history_mod = @import("history.zig");
 const schedule = @import("schedule.zig");
 const workflow = @import("workflow.zig");
 const log_mod = @import("log.zig");
+const propagation = @import("propagation.zig");
+const interceptor = @import("interceptor.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Duration = Io.Duration;
@@ -54,6 +56,19 @@ pub const Options = struct {
     /// The least severe sdk-core log level forwarded to `logger`; null leaves sdk-core's logs
     /// off. Logs from libraries sdk-core uses are forwarded from `warn` up.
     core_log_level: ?log_mod.Level = .warn,
+    /// Context propagators, run in order: they write the `.context` values of each call that
+    /// carries a header into that header, and every worker on this client reads them back out
+    /// for its workflows and activities (see `temporal.propagation`). Borrowed: the slice and
+    /// the propagators must outlive the client and its workers.
+    propagators: []const propagation.ContextPropagator = &.{},
+    /// Interceptors of the workflows and activities of every worker on this client, before
+    /// the worker's own (`worker.Options.interceptors`). Borrowed: the slice and the
+    /// interceptors must outlive the client and its workers.
+    worker_interceptors: []const interceptor.Worker = &.{},
+    /// Interceptors of every request this client sends, in order (the first is the
+    /// outermost); see `interceptor.Client`. Borrowed: the slice and the interceptors must
+    /// outlive the client. Called concurrently from every thread using the client.
+    interceptors: []const interceptor.Client = &.{},
 
     pub const Tls = struct {
         /// PEM; empty uses the system roots.
@@ -132,6 +147,12 @@ pub const Client = struct {
     /// A copy of `logger` that the runtime's core log forwarding points at, freed after the
     /// runtime.
     core_log_sink: ?*log_mod.Sink,
+    /// `Options.propagators`, borrowed; workers on this client use them too.
+    propagators: []const propagation.ContextPropagator,
+    /// `Options.worker_interceptors`, borrowed.
+    worker_interceptors: []const interceptor.Worker,
+    /// `Options.interceptors`, borrowed.
+    interceptors: []const interceptor.Client,
 
     /// Connects and checks the server. Close with `close`.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
@@ -197,6 +218,9 @@ pub const Client = struct {
             .codecs = options.codecs,
             .logger = logger,
             .core_log_sink = core_log_sink,
+            .propagators = options.propagators,
+            .worker_interceptors = options.worker_interceptors,
+            .interceptors = options.interceptors,
         };
     }
 
@@ -241,7 +265,8 @@ pub const Client = struct {
         // Set here rather than in `startRequest`: the core reserves a workflow task slot only
         // for a plain start, so signal-with-start and update-with-start never ask for it.
         request.request_eager_execution = options.enable_eager_start;
-        const response = c.rpc(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a) catch |err| switch (err) {
+        var header = try c.outgoingHeader(a, options.context);
+        const response = c.rpcCall(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a, null, &header) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             else => |e| return e,
         };
@@ -292,17 +317,23 @@ pub const Client = struct {
     /// run has closed. The call returns once the server has recorded the signal, not once a
     /// handler has run it.
     pub fn signalWorkflow(c: *Client, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args) SignalError!void {
+        return c.signalWorkflowWithOptions(Signal, workflow_id, run_id, args, .{});
+    }
+
+    /// `signalWorkflow` with options.
+    pub fn signalWorkflowWithOptions(c: *Client, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args, options: SignalOptions) SignalError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        _ = c.rpc(wfs.SignalWorkflowExecutionResponse, "SignalWorkflowExecution", wfs.SignalWorkflowExecutionRequest{
+        var header = try c.outgoingHeader(a, options.context);
+        _ = c.rpcCall(wfs.SignalWorkflowExecutionResponse, "SignalWorkflowExecution", wfs.SignalWorkflowExecutionRequest{
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .signal_name = Signal.signal_name,
             .input = .{ .payloads = try converter.toPayloads(a, args) },
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
-        }, a) catch |err| switch (err) {
+        }, a, null, &header) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
         };
@@ -341,7 +372,8 @@ pub const Client = struct {
                 @field(request, name) = @field(start, name);
         }
 
-        const response = c.rpc(wfs.SignalWithStartWorkflowExecutionResponse, "SignalWithStartWorkflowExecution", request, a) catch |err| switch (err) {
+        var header = try c.outgoingHeader(a, options.context);
+        const response = c.rpcCall(wfs.SignalWithStartWorkflowExecutionResponse, "SignalWithStartWorkflowExecution", request, a, null, &header) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             else => |e| return e,
         };
@@ -673,7 +705,8 @@ pub const Client = struct {
         }
         if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
         var status: ?RpcStatus = null;
-        const response = c.rpcWithStatus(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status) catch |err| switch (err) {
+        var header = try c.outgoingHeader(a, options.context);
+        const response = c.rpcCall(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status, &header) catch |err| switch (err) {
             error.AlreadyExists => return error.ActivityExecutionAlreadyStarted,
             error.RpcFailed => {
                 const st = status orelse return error.RpcFailed;
@@ -783,7 +816,8 @@ pub const Client = struct {
     /// `options.reject_condition` matches the workflow's state.
     pub fn queryWorkflowWithOptions(c: *Client, comptime Query: type, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: Query.Args, options: QueryOptions) QueryError!Query.Result {
         var status: ?RpcStatus = null;
-        const response = c.rpcWithStatus(wfs.QueryWorkflowResponse, "QueryWorkflow", wfs.QueryWorkflowRequest{
+        var header = try c.outgoingHeader(arena, options.context);
+        const response = c.rpcCall(wfs.QueryWorkflowResponse, "QueryWorkflow", wfs.QueryWorkflowRequest{
             .namespace = c.namespace,
             .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .query = .{ .query_type = Query.query_name, .query_args = .{ .payloads = try converter.toPayloads(arena, args) } },
@@ -792,7 +826,7 @@ pub const Client = struct {
                 .not_open => .QUERY_REJECT_CONDITION_NOT_OPEN,
                 .not_completed_cleanly => .QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY,
             },
-        }, arena, &status) catch |err| switch (err) {
+        }, arena, &status, &header) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             error.RpcFailed => {
                 const s = status orelse return error.RpcFailed;
@@ -826,7 +860,8 @@ pub const Client = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
         const request = try c.updateRequest(a, Update.update_name, workflow_id, run_id, args, options);
-        const response = try c.updateUntilStage(a, request);
+        var header = try c.outgoingHeader(a, options.context);
+        const response = try c.updateUntilStage(a, request, &header);
         const ref_run_id = if (response.update_ref) |r| if (r.workflow_execution) |e| e.run_id else "" else "";
         return .init(c, workflow_id, if (ref_run_id.len > 0) ref_run_id else run_id, request.request.?.meta.?.update_id, response.outcome);
     }
@@ -871,10 +906,13 @@ pub const Client = struct {
         const id = if (start_options.id.len > 0) start_options.id else try uuid(a, c.io);
 
         var update = try c.updateRequest(a, Update.update_name, id, "", update_args, update_options);
+        update.request.?.input.?.header = try protoHeader(a, try c.outgoingHeader(a, update_options.context));
+        var start = try c.startRequest(a, Workflow.workflow_name, id, start_options, args);
+        start.header = try protoHeader(a, try c.outgoingHeader(a, start_options.context));
         const Operation = wfs.ExecuteMultiOperationRequest.Operation;
         var operations: std.ArrayList(Operation) = .empty;
         try operations.appendSlice(a, &.{
-            .{ .operation = .{ .start_workflow = try c.startRequest(a, Workflow.workflow_name, id, start_options, args) } },
+            .{ .operation = .{ .start_workflow = start } },
             .{ .operation = .{ .update_workflow = update } },
         });
 
@@ -906,7 +944,7 @@ pub const Client = struct {
         // with the same update ID, which the server deduplicates.
         if (!reachedStage(updated, update_options.wait_for_stage)) {
             update.workflow_execution.?.run_id = started.run_id;
-            updated = try c.updateUntilStage(a, update);
+            updated = try c.updateUntilStage(a, update, null);
         }
         return .init(c, id, started.run_id, update.request.?.meta.?.update_id, updated.outcome);
     }
@@ -946,11 +984,12 @@ pub const Client = struct {
     }
 
     /// Sends `request` until the update reaches the stage it waits for: the server returns
-    /// early, below that stage, when its long poll times out.
-    fn updateUntilStage(c: *Client, a: Allocator, request: wfs.UpdateWorkflowExecutionRequest) UpdateError!wfs.UpdateWorkflowExecutionResponse {
+    /// early, below that stage, when its long poll times out. `header` (null keeps the
+    /// request's own) is sent as the update's header.
+    fn updateUntilStage(c: *Client, a: Allocator, request: wfs.UpdateWorkflowExecutionRequest, header: ?*converter.HeaderWriter) UpdateError!wfs.UpdateWorkflowExecutionResponse {
         const want: UpdateStage = if (request.wait_policy.?.lifecycle_stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED) .accepted else .completed;
         while (true) {
-            const response = c.rpc(wfs.UpdateWorkflowExecutionResponse, "UpdateWorkflowExecution", request, a) catch |err| switch (err) {
+            const response = c.rpcCall(wfs.UpdateWorkflowExecutionResponse, "UpdateWorkflowExecution", request, a, null, header) catch |err| switch (err) {
                 error.AlreadyExists => return error.InvalidResponse,
                 else => |e| return e,
             };
@@ -962,12 +1001,82 @@ pub const Client = struct {
         return response.outcome != null or @backingInt(response.stage) >= @backingInt(want.toProto());
     }
 
-    const RpcError = error{ OutOfMemory, Canceled, RpcFailed, AlreadyExists, NotFound, InvalidResponse, CodecFailed };
+    /// The header of an outgoing call, holding what the client's propagators write for
+    /// `context` (no values when null), for the interceptors. Allocated from `a`.
+    fn outgoingHeader(c: *Client, a: Allocator, context: ?*const propagation.Values) error{OutOfMemory}!converter.HeaderWriter {
+        var w: converter.HeaderWriter = .init(a);
+        try propagation.injectAll(c.propagators, a, context orelse &propagation.Values.empty, &w);
+        return w;
+    }
+
+    /// `w`'s fields as a request header, or null when there are none. Allocated from `a`.
+    fn protoHeader(a: Allocator, w: converter.HeaderWriter) error{OutOfMemory}!?proto.temporal.api.common.v1.Header {
+        if (w.fields.items.len == 0) return null;
+        return .{ .fields = try w.header().toEntries(proto.temporal.api.common.v1.Header.FieldsEntry, a) };
+    }
+
+    const RpcError = interceptor.ClientError;
 
     /// Calls a WorkflowService method with a typed request and response. The response's
     /// memory comes from `arena`.
     fn rpc(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator) RpcError!Response {
         return c.rpcWithStatus(Response, method, request, arena, null);
+    }
+
+    /// `rpcWithStatus` without a header to send.
+    fn rpcWithStatus(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus) RpcError!Response {
+        return c.rpcCall(Response, method, request, arena, status, null);
+    }
+
+    /// Passes the call through the client's interceptors, which end in `send`. `header`, for
+    /// a request that carries one, replaces the request's header (null leaves it as it is).
+    fn rpcCall(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter) RpcError!Response {
+        const Request = @TypeOf(request);
+        var req = request;
+        var resp: Response = .{};
+        var call: interceptor.ClientCall = .{
+            .method = method,
+            .header = header,
+            .arena = arena,
+            .request_ptr = &req,
+            .request_type = @typeName(Request),
+            .response_ptr = &resp,
+            .response_type = @typeName(Response),
+        };
+        const End = struct {
+            client: *Client,
+            status: ?*?RpcStatus,
+
+            const vtable: interceptor.Client.VTable = .{ .call = end };
+
+            fn end(ptr: *anyopaque, input: *interceptor.ClientCall, _: interceptor.Client.Next) RpcError!void {
+                const e: *@This() = @ptrCast(@alignCast(ptr));
+                const r = input.request(Request).?;
+                if (comptime carriesHeader(Request)) if (input.header) |w| setHeader(Request, r, try protoHeader(input.arena, w.*));
+                input.response(Response).?.* = try e.client.send(Response, method, r.*, input.arena, e.status);
+            }
+        };
+        var end: End = .{ .client = c, .status = status };
+        const next: interceptor.Client.Next = .{ .chain = c.interceptors, .root = .{ .ptr = &end, .vtable = &End.vtable } };
+        try next.call(&call);
+        return resp;
+    }
+
+    fn carriesHeader(comptime Request: type) bool {
+        return @hasField(Request, "header") or Request == wfs.QueryWorkflowRequest or Request == wfs.UpdateWorkflowExecutionRequest;
+    }
+
+    /// Sets the header of a request that carries one (`carriesHeader`).
+    fn setHeader(comptime Request: type, r: *Request, header: ?proto.temporal.api.common.v1.Header) void {
+        if (comptime @hasField(Request, "header")) {
+            r.header = header;
+        } else if (Request == wfs.QueryWorkflowRequest) {
+            if (r.query) |*q| q.header = header;
+        } else if (Request == wfs.UpdateWorkflowExecutionRequest) {
+            if (r.request) |*u| if (u.input) |*i| {
+                i.header = header;
+            };
+        } else @compileError(@typeName(Request) ++ " carries no header");
     }
 
     /// A failed call's gRPC status; its slices borrow the call's arena.
@@ -988,10 +1097,10 @@ pub const Client = struct {
         }
     };
 
-    /// `rpc`, except that when `status` is given, a failure other than ALREADY_EXISTS or
-    /// NOT_FOUND is stored there (allocated from `arena`) for the caller to report instead
-    /// of being logged.
-    fn rpcWithStatus(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus) RpcError!Response {
+    /// Sends the request to the server: the end of the interceptor chain. When `status` is
+    /// given, a failure other than ALREADY_EXISTS or NOT_FOUND is stored there (allocated from
+    /// `arena`) for the caller to report instead of being logged.
+    fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus) RpcError!Response {
         var coded = request;
         converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: encoding its payloads with the client's codecs failed", .{method});
@@ -1059,6 +1168,17 @@ pub const StartWorkflowOptions = struct {
     /// the workflow starts normally. `WorkflowRun.eagerly_started` says which happened.
     /// Only `executeWorkflow` and `executeWorkflowByName` use it.
     enable_eager_start: bool = false,
+    /// Values the client's propagators (`Options.propagators`) write into the start's header;
+    /// the workflow reads them with `ctx.propagated()`. Signal-with-start and update-with-start
+    /// send them with the start. Only read during the call.
+    context: ?*const propagation.Values = null,
+};
+
+/// How `Client.signalWorkflowWithOptions` sends a signal.
+pub const SignalOptions = struct {
+    /// Values the client's propagators write into the signal's header. Only read during the
+    /// call.
+    context: ?*const propagation.Values = null,
 };
 
 /// Names an activity by its workflow and activity ID, for completing it without its task
@@ -1247,6 +1367,9 @@ pub const StartActivityOptions = struct {
     /// Indexed values for `Client.listActivities` queries, built with
     /// `search_attributes.Key.set`; unsets are ignored. Only read while starting.
     search_attributes: []const search_attributes.Update = &.{},
+    /// Values the client's propagators write into the activity's header; the activity reads
+    /// them with `ctx.propagated()`. Only read during the call.
+    context: ?*const propagation.Values = null,
 };
 
 pub const StartActivityError = error{
@@ -1915,6 +2038,9 @@ pub const QueryOptions = struct {
     failure_message: ?*[]const u8 = null,
     /// On `error.QueryRejected`, receives the workflow's status.
     rejected_status: ?*WorkflowExecutionStatus = null,
+    /// Values the client's propagators write into the query's header. Only read during the
+    /// call.
+    context: ?*const propagation.Values = null,
 };
 
 pub const QueryRejectCondition = enum {
@@ -2129,6 +2255,9 @@ pub const UpdateOptions = struct {
     /// update's outcome instead of running it twice. Empty generates a UUID.
     update_id: []const u8 = "",
     wait_for_stage: UpdateStage = .completed,
+    /// Values the client's propagators write into the update's header. Only read during the
+    /// call.
+    context: ?*const propagation.Values = null,
 };
 
 pub const UpdateError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };

@@ -20,6 +20,8 @@ const log_mod = @import("log.zig");
 const workflow = @import("workflow.zig");
 const activity = @import("activity.zig");
 const client_mod = @import("client.zig");
+const propagation = @import("propagation.zig");
+const interceptor = @import("interceptor.zig");
 const Instance = @import("workflow/Instance.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -50,6 +52,10 @@ pub const Options = struct {
     /// Keep workflow loggers on while workflows replay history. By default they are silent
     /// during replay, so each message is logged once.
     log_during_replay: bool = false,
+    /// Interceptors of this worker's workflows and activities, after the client's
+    /// (`client.Options.worker_interceptors`); the first is the outermost. Borrowed: they
+    /// must outlive the worker. Called concurrently from workflow and activity threads.
+    interceptors: []const interceptor.Worker = &.{},
 };
 
 pub const Worker = struct {
@@ -73,6 +79,8 @@ pub const Worker = struct {
     /// failed before getting there (`start_failed`). See `waitUntilRunning`.
     started: Io.Event = .unset,
     start_failed: bool = false,
+    /// The client's worker interceptors, then `options.interceptors`, while `run` is active.
+    interceptors: []const interceptor.Worker = &.{},
 
     pub fn init(gpa: Allocator, io: Io, client: *client_mod.Client, task_queue: []const u8, options: Options) error{OutOfMemory}!Worker {
         return .{ .gpa = gpa, .io = io, .client = client, .task_queue = try gpa.dupe(u8, task_queue), .options = options };
@@ -179,6 +187,10 @@ pub const Worker = struct {
             w.started.set(w.io);
         };
         if (!w.hasWorkflows() and !w.hasActivities()) return error.NothingRegistered;
+        const interceptors = try std.mem.concat(w.gpa, interceptor.Worker, &.{ w.client.worker_interceptors, w.options.interceptors });
+        defer w.gpa.free(interceptors);
+        w.interceptors = interceptors;
+        defer w.interceptors = &.{};
         var message: ?[]u8 = null;
         defer if (message) |m| w.gpa.free(m);
 
@@ -314,6 +326,8 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .namespace = w.client.namespace,
         .stack_size = w.options.workflow_stack_size,
         .codecs = w.client.codecs,
+        .propagators = w.client.propagators,
+        .interceptors = w.interceptors,
         .logger = w.logSink(),
         .log_during_replay = w.options.log_during_replay,
     };
@@ -347,6 +361,10 @@ pub const WorkflowRunner = struct {
     stack_size: usize,
     /// Borrowed; see `client.Options.codecs`.
     codecs: []const converter.PayloadCodec = &.{},
+    /// Borrowed; see `client.Options.propagators`.
+    propagators: []const propagation.ContextPropagator = &.{},
+    /// Borrowed; see `Options.interceptors`.
+    interceptors: []const interceptor.Worker = &.{},
     logger: log_mod.Sink = .std_log,
     log_during_replay: bool = false,
     runs: std.StringHashMapUnmanaged(*Instance) = .empty,
@@ -415,6 +433,8 @@ pub const WorkflowRunner = struct {
                 .stack_size = r.stack_size,
                 .logger = r.logger,
                 .log_during_replay = r.log_during_replay,
+                .propagators = r.propagators,
+                .interceptors = r.interceptors,
             });
             errdefer inst.destroy();
             const key = try r.gpa.dupe(u8, act.run_id);
@@ -670,11 +690,25 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .WorkflowID = execution.workflow_id,
         .RunID = execution.run_id,
     });
+    ctx.header_ = try .fromEntries(a, start.header_fields.items);
+    ctx.propagated_ = .init(a);
+    try propagation.extractAll(w.client.propagators, a, ctx.header_, &ctx.propagated_, "an activity task");
     var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token };
     ctx.heartbeat_details = start.heartbeat_details.items;
     // The core keeps no heartbeat state for local activities and warns on each heartbeat.
     if (!start.is_local) ctx.heartbeat_sink = .{ .gpa = w.gpa, .context = &heartbeats, .record = Heartbeats.record };
-    const payload = entry.invoke(entry.receiver, ctx, start.input.items) catch |err| {
+    var inbound: std.ArrayList(interceptor.ActivityInbound) = .empty;
+    var outbound: std.ArrayList(interceptor.ActivityOutbound) = .empty;
+    // Side effects belong to the SDK: interceptors see their local activity in the workflow.
+    if (!side_effect) for (w.interceptors) |wi| {
+        const attempt = try wi.interceptActivity(ctx);
+        if (attempt.inbound) |i| try inbound.append(a, i);
+        if (attempt.outbound) |o| try outbound.append(a, o);
+    };
+    ctx.outbound = outbound.items;
+    var call: ActivityCall = .{ .entry = entry, .ctx = ctx };
+    const next: interceptor.ActivityInbound.Next = .{ .chain = inbound.items, .root = .{ .ptr = &call, .vtable = &ActivityCall.vtable } };
+    const payload = next.execute(.{ .activity_type = start.activity_type, .args = .{ .payloads = start.input.items }, .header = ctx.header_ }) catch |err| {
         if (err == error.CompleteAsync) {
             if (!start.is_local) return .{ .status = .{ .will_complete_async = .{} } };
             return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
@@ -697,6 +731,19 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };
 }
+
+/// The end of an activity's inbound interceptor chain: the registered activity itself.
+const ActivityCall = struct {
+    entry: activity.Registered,
+    ctx: *activity.Context,
+
+    const vtable: interceptor.ActivityInbound.VTable = .{ .execute = execute };
+
+    fn execute(ptr: *anyopaque, input: interceptor.ExecuteActivityInput, _: interceptor.ActivityInbound.Next) anyerror!converter.Payload {
+        const call: *ActivityCall = @ptrCast(@alignCast(ptr));
+        return call.entry.invoke(call.entry.receiver, call.ctx, input.args.payloads);
+    }
+};
 
 /// Every worker's implementation of `Instance.side_effect_activity_type`: returns the value the
 /// workflow computed, so the core records it in history. A replayed side effect is scheduled
