@@ -1223,6 +1223,26 @@ const ExternalFixtures = struct {
         return s.approver.?;
     }
     const PingPongChanged = workflow.Def("PingPong", pingPongChanged);
+
+    /// Requests cancellation of the latest run of `workflow_id` and returns "requested", or
+    /// the error and the failure's message.
+    fn cancelOther(ctx: *workflow.Context, workflow_id: []const u8) ![]const u8 {
+        const f = ctx.cancelExternalWorkflow(workflow_id, "");
+        f.get() catch |err| switch (err) {
+            error.ExternalWorkflowNotFound => return std.fmt.allocPrint(ctx.allocator(), "{t}: {s}", .{ err, f.failure().?.message }),
+            else => return err,
+        };
+        return "requested";
+    }
+    const CancelOther = workflow.Def("CancelOther", cancelOther);
+
+    /// `cancelOther` without the request, which can't replay `CancelOther`'s history.
+    fn cancelOtherChanged(ctx: *workflow.Context, workflow_id: []const u8) ![]const u8 {
+        _ = ctx;
+        _ = workflow_id;
+        return "requested";
+    }
+    const CancelOtherChanged = workflow.Def("CancelOther", cancelOtherChanged);
 };
 
 const ContinueFixtures = struct {
@@ -2386,6 +2406,40 @@ test "WorkflowReplayer replays signals to other workflows and catches a dropped 
     defer changed.deinit();
     try changed.registerWorkflow(ExternalFixtures.PingPongChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(signal_external_history));
+}
+
+test "cancelExternalWorkflow: one workflow cancels another, which ends canceled" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ExternalFixtures.WaitForApproval);
+    try env.registerWorkflow(ExternalFixtures.CancelOther);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var target = try env.startWorkflow(ExternalFixtures.WaitForApproval, .{ .task_queue = "" }, .{});
+    defer target.deinit();
+    try testing.expectEqualStrings("requested", try env.executeWorkflow(ExternalFixtures.CancelOther, .{target.id}, a, null));
+    try testing.expectError(error.WorkflowCanceled, env.getResult(ExternalFixtures.WaitForApproval, &target, a, null));
+
+    const missing = try env.executeWorkflow(ExternalFixtures.CancelOther, .{"no-such-workflow"}, a, null);
+    try testing.expect(std.mem.startsWith(u8, missing, "ExternalWorkflowNotFound: Unable to cancel external workflow because not found"));
+}
+
+/// A dev-server run of `ExternalFixtures.CancelOther` canceling a running
+/// `ExternalFixtures.WaitForApproval`, exported with `temporal workflow show`.
+const cancel_external_history = @embedFile("testdata/cancel_external_history.json");
+
+test "WorkflowReplayer replays a cancellation request to another workflow and catches a dropped one" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(ExternalFixtures.CancelOther);
+    try ok.replayHistoryJson(cancel_external_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(ExternalFixtures.CancelOtherChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(cancel_external_history));
 }
 
 /// A dev-server run of `ChildFixtures.Parent`, whose child ran on the same worker, exported

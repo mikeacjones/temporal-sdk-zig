@@ -73,6 +73,13 @@
 //!     const parent = ctx.info().parent orelse return error.NoParent;
 //!     try ctx.signalExternalWorkflow(Approve, parent.workflow_id, parent.run_id, .{"child"}).get();
 //!
+//! `ctx.cancelExternalWorkflow` requests another workflow's cancellation the same way:
+//!
+//!     ctx.cancelExternalWorkflow(other_id, "").get() catch |err| switch (err) {
+//!         error.ExternalWorkflowNotFound => {}, // it has already closed
+//!         else => return err,
+//!     };
+//!
 //! Updates change a workflow's state and return a result to their caller. Name one with
 //! `UpdateDef` and handle it with `ctx.setUpdateHandler`, or with
 //! `ctx.setUpdateHandlerWithValidator` to check it first. The validator runs synchronously when
@@ -416,6 +423,15 @@ pub const Context = struct {
     /// target runs in this workflow's namespace. `args` are encoded here; the IDs are copied.
     pub fn signalExternalWorkflow(ctx: *Context, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args) SignalExternalFuture {
         return .{ .ctx = ctx, .state = ctx.instance.signalExternal(.{ .execution = .{ .workflow_id = workflow_id, .run_id = run_id } }, Signal.signal_name, args) };
+    }
+
+    /// Requests cancellation of the workflow `workflow_id` and returns a future for the
+    /// request's delivery. An empty `run_id` targets the workflow's latest run. The target runs
+    /// in this workflow's namespace and decides what canceling means: its code sees the
+    /// cancellation and may clean up, or ignore it. To cancel a child, cancel its future
+    /// instead. The IDs are copied.
+    pub fn cancelExternalWorkflow(ctx: *Context, workflow_id: []const u8, run_id: []const u8) CancelExternalFuture {
+        return .{ .ctx = ctx, .state = ctx.instance.requestCancelExternal(workflow_id, run_id) };
     }
 
     /// The workflow's memo: the memo it started with, with this run's `upsertMemo` calls
@@ -787,6 +803,10 @@ pub const ExternalWorkflowError = error{ ExternalWorkflowNotFound, ExternalWorkf
 /// or `ChildWorkflowFuture.signal`.
 pub const SignalExternalFuture = ExternalFuture;
 
+/// The pending delivery of a cancellation request to another workflow, from
+/// `Context.cancelExternalWorkflow`.
+pub const CancelExternalFuture = ExternalFuture;
+
 const ExternalFuture = struct {
     const Self = @This();
 
@@ -795,10 +815,10 @@ const ExternalFuture = struct {
     /// returns it.
     state: Instance.ScheduleError!*Instance.ExternalState,
 
-    /// Waits until the server has delivered the request. If the calling coroutine is
-    /// canceled while waiting, this returns `error.Canceled` at once. For a signal, the
-    /// signal is also withdrawn if the server hasn't recorded it yet; once recorded it is
-    /// delivered anyway.
+    /// Waits until the server has delivered the signal or cancellation request. If the
+    /// calling coroutine is canceled while waiting, this returns `error.Canceled` at once.
+    /// A signal is also withdrawn if the server hasn't recorded it yet; once recorded it is
+    /// delivered anyway. A cancellation request is never withdrawn.
     pub fn get(f: Self) ExternalWorkflowError!void {
         const state = try f.state;
         try f.ctx.instance.awaitExternal(state);
