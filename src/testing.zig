@@ -2890,6 +2890,48 @@ test "client: query a running, a canceled and a completed workflow" {
     try testing.expectError(error.NotFound, env.client.queryWorkflow(Fixtures.Status, a, "no-such-workflow", "", .{}));
 }
 
+test "client: every connection option at once, a health check, and a stopped server" {
+    var server = try DevServer.start(testing.allocator, testing.io, .{});
+    var running = true;
+    defer if (running) server.stop(testing.io);
+    var options = server.clientOptions();
+    options.keep_alive = .{ .interval = .fromSeconds(5), .timeout = .fromSeconds(2) };
+    options.retry = .{ .max_retries = 2, .max_elapsed_time = .fromSeconds(3) };
+    options.client_name = "temporal-zig-test-wrapper";
+    options.client_version = "0.0.1";
+    options.worker_heartbeat_interval = .fromSeconds(5);
+    options.rpc_timeout = .fromSeconds(10);
+    var c = try client_mod.Client.connect(testing.allocator, testing.io, options);
+    defer c.close();
+
+    try c.checkHealth();
+    _ = try c.countWorkflows("");
+
+    // A server that is gone fails the check at once (it isn't retried).
+    server.stop(testing.io);
+    running = false;
+    try testing.expectError(error.RpcFailed, c.checkHealth());
+}
+
+test "client: rpc_timeout doesn't cut short waiting for a workflow's result" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Queryable);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var run = try env.startWorkflow(Fixtures.Queryable, .{ .task_queue = "" }, .{1});
+    defer run.deinit();
+    var options = env.server.clientOptions();
+    options.rpc_timeout = .fromMilliseconds(200);
+    var other = try client_mod.Client.connect(testing.allocator, testing.io, options);
+    defer other.close();
+    // The workflow sleeps for 1 s, so the long poll for its result outlasts the timeout.
+    var waiting = try other.getWorkflow([]const u8, run.id, run.run_id);
+    defer waiting.deinit();
+    try testing.expectEqualStrings("finished", try waiting.get(arena.allocator()));
+}
+
 test "client: signal a running workflow; signaling an unknown or closed one is NotFound" {
     const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
