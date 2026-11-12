@@ -170,6 +170,7 @@ const log = @import("log.zig");
 const proto = @import("proto.zig");
 const propagation = @import("propagation.zig");
 const search_attributes = @import("search_attributes.zig");
+const metrics_mod = @import("metrics.zig");
 const Instance = @import("workflow/Instance.zig");
 const WorkflowIo = @import("workflow/WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -356,6 +357,17 @@ pub const Context = struct {
     /// activity, child workflow, external signal, and continue-as-new this workflow sends.
     pub fn propagated(ctx: *const Context) *const propagation.Values {
         return &ctx.instance.propagated;
+    }
+
+    /// Records metrics through the client's exporter (`client.Options.metrics`) with
+    /// `namespace`, `task_queue`, and `workflow_type` attributes, or records nothing without
+    /// one. Nothing is recorded while the workflow replays history, so each value is recorded
+    /// once. Valid while the run is cached; recording doesn't affect determinism. See
+    /// `temporal.metrics`.
+    pub fn metrics(ctx: *const Context) metrics_mod.Handler {
+        var h = ctx.instance.metrics;
+        h.owned = false;
+        return h;
     }
 
     pub fn isReplaying(ctx: *const Context) bool {

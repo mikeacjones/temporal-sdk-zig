@@ -59,6 +59,7 @@ const failure_mod = @import("failure.zig");
 const log = @import("log.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
+const metrics_mod = @import("metrics.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Info = struct {
@@ -114,6 +115,8 @@ pub const Context = struct {
     propagated_: propagation.Values = .empty,
     /// The attempt's outbound interceptors (`interceptor.ActivityOutbound`).
     outbound: []const interceptor.ActivityOutbound = &.{},
+    /// Records with the activity's attributes; the worker frees it after the activity.
+    metrics_: metrics_mod.Handler = .noop,
     /// Written once by the worker when a cancel arrives, possibly from another thread.
     cancel_reason_: std.atomic.Value(u8) = .init(not_canceled),
 
@@ -179,6 +182,17 @@ pub const Context = struct {
     /// activity's header.
     pub fn propagated(ctx: *const Context) *const propagation.Values {
         return &ctx.propagated_;
+    }
+
+    /// Records metrics through the client's exporter (`client.Options.metrics`) with
+    /// `namespace`, `task_queue`, `activity_type`, and `workflow_type` attributes, as
+    /// sdk-core's activity metrics have them; records nothing without
+    /// one. Valid until the activity returns: free the metrics created from it, and handlers
+    /// from its `with`, before then. See `temporal.metrics`.
+    pub fn metrics(ctx: *const Context) metrics_mod.Handler {
+        var h = ctx.metrics_;
+        h.owned = false;
+        return h;
     }
 
     /// A logger carrying the activity's ID, type, and attempt and its workflow's type, ID, and

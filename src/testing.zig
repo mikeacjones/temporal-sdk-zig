@@ -25,6 +25,7 @@ const failure_mod = @import("failure.zig");
 const log_mod = @import("log.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
+const metrics_mod = @import("metrics.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -234,6 +235,8 @@ pub const WorkflowEnvironment = struct {
         /// Interceptors of the client's requests (`client.Options.interceptors`). Borrowed:
         /// they must outlive the environment.
         interceptors: []const interceptor.Client = &.{},
+        /// Where the client's metrics go (`client.Options.metrics`).
+        metrics: ?metrics_mod.Options = null,
     };
 
     /// Starts the environment on a dev server. Allocated so the worker's pointer to the
@@ -270,6 +273,7 @@ pub const WorkflowEnvironment = struct {
         client_options.propagators = options.propagators;
         client_options.worker_interceptors = options.worker_interceptors;
         client_options.interceptors = options.interceptors;
+        client_options.metrics = options.metrics;
         // The time-skipping test server reports an old server version, which makes the core
         // warn about heartbeat details on every worker start.
         if (kind == .time_skipping) client_options.core_log_level = .err;
@@ -678,6 +682,9 @@ pub const ActivityEnvironment = struct {
     on_heartbeat: ?activity.Context.HeartbeatSink = null,
     /// What `ctx.client()` returns; null makes it return `error.NoClient`. Borrowed.
     client: ?*client_mod.Client = null,
+    /// What `ctx.metrics()` returns, such as a custom handler that keeps what the activity
+    /// records. Borrowed.
+    metrics: metrics_mod.Handler = .noop,
 
     pub fn init(io: Io) ActivityEnvironment {
         return .{ .io = io };
@@ -700,6 +707,7 @@ pub const ActivityEnvironment = struct {
             .heartbeat_details = env.heartbeat_details,
             .heartbeat_sink = env.on_heartbeat,
             .client_ = env.client,
+            .metrics_ = env.metrics,
         };
         return Activity.call(receiver, &ctx, args);
     }
