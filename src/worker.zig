@@ -62,6 +62,10 @@ pub const Worker = struct {
     stop_mutex: Io.Mutex = .init,
     core_ptr: ?*bridge.c.TemporalCoreWorker = null,
     stop_requested: bool = false,
+    /// Set once `run` has registered the worker with its client and started polling, or has
+    /// failed before getting there (`start_failed`). See `waitUntilRunning`.
+    started: Io.Event = .unset,
+    start_failed: bool = false,
 
     pub fn init(gpa: Allocator, io: Io, client: *client_mod.Client, task_queue: []const u8, options: Options) error{OutOfMemory}!Worker {
         return .{ .gpa = gpa, .io = io, .client = client, .task_queue = try gpa.dupe(u8, task_queue), .options = options };
@@ -162,6 +166,11 @@ pub const Worker = struct {
 
     /// Polls and runs tasks until `stop` is called. Returns after in-flight work finishes.
     pub fn run(w: *Worker) RunError!void {
+        var running = false;
+        defer if (!running) {
+            w.start_failed = true;
+            w.started.set(w.io);
+        };
         if (!w.hasWorkflows() and !w.hasActivities()) return error.NothingRegistered;
         var message: ?[]u8 = null;
         defer if (message) |m| w.gpa.free(m);
@@ -210,6 +219,8 @@ pub const Worker = struct {
             w.stop_mutex.unlock(w.io);
         }
         log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
+        running = true;
+        w.started.set(w.io);
 
         var workflows_done = if (w.hasWorkflows()) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
         // Once a loop polls `core`, returning early would free the core worker under it: shut
@@ -258,6 +269,15 @@ pub const Worker = struct {
         defer w.stop_mutex.unlock(w.io);
         w.stop_requested = true;
         if (w.core_ptr) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
+    }
+
+    /// Waits until `run` (on another task) has registered the worker with its client and
+    /// started polling, for example before an eager workflow start, which only reaches a worker
+    /// the client already knows. Returns `error.WorkerFailedToStart` if `run` returned before
+    /// getting there (its error says why).
+    pub fn waitUntilRunning(w: *Worker) error{ Canceled, WorkerFailedToStart }!void {
+        try w.started.wait(w.io);
+        if (w.start_failed) return error.WorkerFailedToStart;
     }
 
     /// Runs until the process receives SIGINT or SIGTERM. One signal stops every worker in
@@ -1084,6 +1104,33 @@ test "stopping the worker cancels running activities with reason worker_shutdown
     try env.running.?.await(testing.io);
     env.running = null;
     try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
+}
+
+test "waitUntilRunning returns once run polls, or fails if run returned first" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var empty = try Worker.init(testing.allocator, testing.io, &client, "wait-empty", .{});
+    defer empty.deinit();
+    try testing.expectError(error.NothingRegistered, empty.run());
+    try testing.expectError(error.WorkerFailedToStart, empty.waitUntilRunning());
+
+    var w = try Worker.init(testing.allocator, testing.io, &client, "wait-running", .{});
+    defer w.deinit();
+    try w.registerActivity(HelloTest.Greet);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    try w.waitUntilRunning();
+    {
+        w.stop_mutex.lockUncancelable(testing.io);
+        defer w.stop_mutex.unlock(testing.io);
+        try testing.expect(w.core_ptr != null);
+    }
+    w.stop();
+    try running.await(testing.io);
 }
 
 test "one SIGTERM stops every worker running until a signal, then the previous handler is back" {
