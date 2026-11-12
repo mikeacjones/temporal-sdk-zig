@@ -1,6 +1,10 @@
 // How samples-test validates this sample: start the worker, run the starter, and check that
-// the starter's output contains each `expect` line before `timeout_seconds`.
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter
+// waits for the workflow to complete the transaction.
 .{
-    .expect = .{"early-return sample is a placeholder"},
+    .expect = .{
+        "Transaction initialized successfully",
+        "Transaction completed TxID=",
+    },
     .timeout_seconds = 60,
 }
