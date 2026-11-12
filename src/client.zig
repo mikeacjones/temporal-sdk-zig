@@ -114,7 +114,16 @@ pub const Client = struct {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
+        const request = try c.startRequest(a, workflow_type, id, options, args);
+        const response = c.rpc(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
+            else => |e| return e,
+        };
+        return c.gpa.dupe(u8, response.run_id);
+    }
 
+    /// The start request for `options`, allocated from `a`. Signal-with-start copies it.
+    fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) error{OutOfMemory}!wfs.StartWorkflowExecutionRequest {
         var request: wfs.StartWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_id = id,
@@ -147,11 +156,70 @@ pub const Client = struct {
             for (options.memo) |field| memo.fields.appendAssumeCapacity(.{ .key = field.name, .value = field.value });
             request.memo = memo;
         }
-        const response = c.rpc(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a) catch |err| switch (err) {
+        return request;
+    }
+
+    /// Sends `Signal` (a `workflow.SignalDef`) with `args` to a workflow. An empty `run_id`
+    /// signals the latest run. Returns `error.NotFound` if no such workflow exists or the
+    /// run has closed. The call returns once the server has recorded the signal, not once a
+    /// handler has run it.
+    pub fn signalWorkflow(c: *Client, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args) SignalError!void {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        _ = c.rpc(wfs.SignalWorkflowExecutionResponse, "SignalWorkflowExecution", wfs.SignalWorkflowExecutionRequest{
+            .namespace = c.namespace,
+            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .signal_name = Signal.signal_name,
+            .input = .{ .payloads = try converter.toPayloads(a, args) },
+            .identity = c.identity,
+            .request_id = try uuid(a, c.io),
+        }, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+    }
+
+    /// Sends `Signal` with `signal_args` to the workflow `options.id`, first starting it
+    /// with `args` if it isn't running, in one atomic call. A new run's first workflow task
+    /// carries the signal, which waits until the workflow registers its handler. If the
+    /// workflow is already running, it is only signaled: `args` and the other start options
+    /// are ignored and the returned run is the running one. An empty `options.id` generates
+    /// a UUID, so the call always starts a new workflow.
+    pub fn signalWithStartWorkflow(
+        c: *Client,
+        comptime Workflow: type,
+        options: StartWorkflowOptions,
+        args: Workflow.Args,
+        comptime Signal: type,
+        signal_args: Signal.Args,
+    ) StartError!WorkflowRun(Workflow.Result) {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const id = if (options.id.len > 0) options.id else try uuid(a, c.io);
+
+        const start = try c.startRequest(a, Workflow.workflow_name, id, options, args);
+        var request: wfs.SignalWithStartWorkflowExecutionRequest = .{
+            .signal_name = Signal.signal_name,
+            .signal_input = .{ .payloads = try converter.toPayloads(a, signal_args) },
+        };
+        // Every start field the two requests share, so a start option mapped in
+        // `startRequest` reaches signal-with-start too.
+        const Start = wfs.StartWorkflowExecutionRequest;
+        const info = @typeInfo(wfs.SignalWithStartWorkflowExecutionRequest).@"struct";
+        inline for (info.field_names, info.field_types) |name, F| {
+            if (comptime @hasField(Start, name) and @FieldType(Start, name) == F and !std.mem.eql(u8, name, "_unknown_fields"))
+                @field(request, name) = @field(start, name);
+        }
+
+        const response = c.rpc(wfs.SignalWithStartWorkflowExecutionResponse, "SignalWithStartWorkflowExecution", request, a) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             else => |e| return e,
         };
-        return c.gpa.dupe(u8, response.run_id);
+        const run_id = try c.gpa.dupe(u8, response.run_id);
+        errdefer c.gpa.free(run_id);
+        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
     }
 
     /// Terminates a workflow execution: it stops at once, with no chance to clean up. An empty
@@ -370,6 +438,8 @@ pub const StartWorkflowOptions = struct {
 };
 
 pub const StartError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, WorkflowExecutionAlreadyStarted };
+
+pub const SignalError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
 
 pub const DescribeError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
 

@@ -819,6 +819,28 @@ const SignalFixtures = struct {
         return collect(ctx, Approvals.approveWithoutActivity);
     }
     const CollectApprovalsChanged = workflow.Def("CollectApprovals", collectApprovalsWithoutActivity);
+
+    const Approvers = struct {
+        names: std.ArrayList([]const u8) = .empty,
+        wanted: usize,
+        ctx: *workflow.Context,
+
+        fn approve(s: *Approvers, approver: []const u8) !void {
+            try s.names.append(s.ctx.allocator(), approver);
+        }
+        fn enough(s: *Approvers) bool {
+            return s.names.items.len >= s.wanted;
+        }
+    };
+    /// Waits for `count` approvals and returns the approvers in the order they arrived.
+    fn awaitApprovals(ctx: *workflow.Context, count: u32) ![]const u8 {
+        const s = try ctx.allocator().create(Approvers);
+        s.* = .{ .wanted = count, .ctx = ctx };
+        try ctx.setSignalHandler(Approve, s, Approvers.approve);
+        try ctx.await(s, Approvers.enough);
+        return std.mem.join(ctx.allocator(), " ", s.names.items);
+    }
+    const AwaitApprovals = workflow.Def("AwaitApprovals", awaitApprovals);
 };
 
 const ChildFixtures = struct {
@@ -1394,6 +1416,73 @@ test "client: query a running, a canceled and a completed workflow" {
     try testing.expectEqual(client_mod.WorkflowExecutionStatus.completed, status);
 
     try testing.expectError(error.NotFound, env.client.queryWorkflow(Fixtures.Status, a, "no-such-workflow", "", .{}));
+}
+
+test "client: signal a running workflow; signaling an unknown or closed one is NotFound" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(SignalFixtures.AwaitApprovals, .{ .task_queue = "" }, .{2});
+    defer run.deinit();
+    try env.client.signalWorkflow(SignalFixtures.Approve, run.id, run.run_id, .{"ann"});
+    try env.client.signalWorkflow(SignalFixtures.Approve, run.id, "", .{"bob"});
+    try testing.expectEqualStrings("ann bob", try env.getResult(SignalFixtures.AwaitApprovals, &run, a, null));
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var signaled: usize = 0;
+    for (history.events.items) |event| switch (event.attributes orelse continue) {
+        .workflow_execution_signaled_event_attributes => |attrs| {
+            signaled += 1;
+            try testing.expectEqualStrings("approve", attrs.signal_name);
+            try testing.expectEqualStrings(env.client.identity, attrs.identity);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), signaled);
+
+    try testing.expectError(error.NotFound, env.client.signalWorkflow(SignalFixtures.Approve, run.id, run.run_id, .{"late"}));
+    try testing.expectError(error.NotFound, env.client.signalWorkflow(SignalFixtures.Approve, "no-such-workflow", "", .{"nobody"}));
+}
+
+test "client: signal-with-start starts a workflow with the signal, then only signals it while it runs" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try env.executeWorkflow(Fixtures.Hello, .{"warm-up"}, a, null); // starts the worker
+
+    const memo = try converter.toFields(a, .{ .source = "signal-with-start" });
+    const options: client_mod.StartWorkflowOptions = .{ .id = "signal-with-start", .task_queue = env.task_queue, .memo = memo };
+    var run = try env.client.signalWithStartWorkflow(SignalFixtures.AwaitApprovals, options, .{2}, SignalFixtures.Approve, .{"ann"});
+    defer run.deinit();
+    try testing.expectEqualStrings("signal-with-start", run.id);
+
+    // The workflow is running (it waits for a second approval), so this only signals it;
+    // the different start argument is ignored.
+    var again = try env.client.signalWithStartWorkflow(SignalFixtures.AwaitApprovals, options, .{99}, SignalFixtures.Approve, .{"bob"});
+    defer again.deinit();
+    try testing.expectEqualStrings(run.run_id, again.run_id);
+    try testing.expectEqualStrings("ann bob", try env.getResult(SignalFixtures.AwaitApprovals, &run, a, null));
+
+    // The start options reached the server along with the signal.
+    const d = try env.client.describeWorkflow(a, run.id, run.run_id);
+    try testing.expectEqualStrings("AwaitApprovals", d.workflow_type);
+    try testing.expectEqualStrings(env.task_queue, d.task_queue);
+    try testing.expectEqualStrings("signal-with-start", (try d.memoValue([]const u8, a, "source")).?);
+
+    // A generated ID always starts a new workflow.
+    var fresh = try env.client.signalWithStartWorkflow(SignalFixtures.AwaitApprovals, .{ .task_queue = env.task_queue }, .{1}, SignalFixtures.Approve, .{"cy"});
+    defer fresh.deinit();
+    try testing.expectEqual(@as(usize, 36), fresh.id.len);
+    try testing.expectEqualStrings("cy", try env.getResult(SignalFixtures.AwaitApprovals, &fresh, a, null));
 }
 
 test "time-skipping WorkflowEnvironment: a workflow mid-timer answers a query while time is locked" {
