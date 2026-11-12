@@ -1,0 +1,8 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter
+// starts the workflow by its type name and waits for it to complete.
+.{
+    .expect = .{"Workflow completed"},
+    .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
+}
