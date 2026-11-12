@@ -69,14 +69,75 @@ pub const Options = struct {
     /// the worker's own (`worker.Options.interceptors`). Borrowed: the slice and the
     /// interceptors must outlive the client and its workers.
     worker_interceptors: []const interceptor.Worker = &.{},
-    /// Interceptors of every request this client sends, in order (the first is the
-    /// outermost); see `interceptor.Client`. Borrowed: the slice and the interceptors must
-    /// outlive the client. Called concurrently from every thread using the client.
+    /// Interceptors of every WorkflowService request this client sends, in order (the first
+    /// is the outermost); see `interceptor.Client`. `Client.checkHealth` bypasses them.
+    /// Borrowed: the slice and the interceptors must outlive the client. Called
+    /// concurrently from every thread using the client.
     interceptors: []const interceptor.Client = &.{},
     /// Where metrics go: sdk-core's, from every worker on this client, and those recorded
     /// through `Client.metrics()` and the workflow and activity contexts. Null records none.
     /// See `temporal.metrics`.
     metrics: ?metrics_mod.Options = null,
+    /// Keep-alive pings on the connection. The default is sdk-core's: a ping every 30 s,
+    /// each answered within 15 s. Null sends no pings.
+    keep_alive: ?KeepAlive = .{},
+    /// Connect through an HTTP CONNECT proxy. Null connects directly.
+    http_connect_proxy: ?HttpConnectProxy = null,
+    /// How sdk-core retries failed calls: this client's, and its workers' calls other than
+    /// polls, which have their own policy. Null is sdk-core's default policy, the same as
+    /// `.{}`.
+    retry: ?Retry = null,
+    /// Sent to the server with every call, as the `client-name` header. Visible ASCII,
+    /// space and tab.
+    client_name: []const u8 = bridge.Connection.default_client_name,
+    /// Sent to the server with every call, as the `client-version` header. Visible ASCII,
+    /// space and tab.
+    client_version: []const u8 = bridge.Connection.default_client_version,
+    /// How often workers on this client heartbeat to the server: from 1 s to 60 s, or
+    /// `.zero` for no heartbeats. Null is sdk-core's 60 s.
+    worker_heartbeat_interval: ?Duration = null,
+    /// The deadline of each call this client makes, including each retry attempt, and of
+    /// `Client.checkHealth`. A call that runs out fails with `error.RpcFailed`, logged with
+    /// gRPC status 1 (CANCELLED, "Timeout expired"), or 4 (DEADLINE_EXCEEDED) when the server
+    /// gives up first, and isn't retried. Calls that wait on the server, such as
+    /// waiting for a workflow's result or an update's outcome, aren't limited by it, and
+    /// workers' own calls aren't affected. Null keeps sdk-core's default of 30 s. Must be
+    /// positive; under 1 ms counts as 1 ms.
+    rpc_timeout: ?Duration = null,
+
+    pub const KeepAlive = struct {
+        /// Time between pings. Must be positive.
+        interval: Duration = .fromMilliseconds(bridge_keep_alive.interval_ms),
+        /// How long to wait for each ping's answer before the connection is dropped. Must be
+        /// positive.
+        timeout: Duration = .fromMilliseconds(bridge_keep_alive.timeout_ms),
+
+        const bridge_keep_alive: bridge.Connection.Options.KeepAlive = .{};
+    };
+
+    pub const HttpConnectProxy = struct {
+        /// host:port of the proxy.
+        host_port: []const u8,
+        /// Basic auth credentials for the proxy: both or neither.
+        username: []const u8 = "",
+        password: []const u8 = "",
+    };
+
+    /// Each field defaults to sdk-core's default policy, so setting one changes only that
+    /// one. Durations must not be negative.
+    pub const Retry = struct {
+        /// The wait before the first retry.
+        initial_interval: Duration = .fromMilliseconds(100),
+        /// The fraction of each wait added or subtracted at random. Not negative.
+        randomization_factor: f64 = 0.2,
+        /// How much the wait grows after each retry, up to `max_interval`. Not negative.
+        multiplier: f64 = 1.7,
+        max_interval: Duration = .fromMilliseconds(5_000),
+        /// How long to keep retrying a call in all. Zero means no limit.
+        max_elapsed_time: Duration = .fromMilliseconds(10_000),
+        /// Zero means no limit.
+        max_retries: usize = 10,
+    };
 
     pub const Tls = struct {
         /// PEM; empty uses the system roots.
@@ -95,18 +156,124 @@ pub const Options = struct {
 
     /// The options the connection uses, for `Client.reconnect`.
     pub fn connectionOptions(o: Options) ConnectionOptions {
-        return .{ .host_port = o.host_port, .api_key = o.api_key, .tls = o.tls, .headers = o.headers };
+        return .{
+            .host_port = o.host_port,
+            .api_key = o.api_key,
+            .tls = o.tls,
+            .headers = o.headers,
+            .keep_alive = o.keep_alive,
+            .http_connect_proxy = o.http_connect_proxy,
+            .retry = o.retry,
+            .client_name = o.client_name,
+            .client_version = o.client_version,
+        };
     }
 };
 
-/// What `Client.reconnect` replaces: the `Options` fields the connection is made with. The
-/// others (namespace, identity, codecs, ...) stay as `connect` set them.
+/// What `Client.reconnect` replaces: the `Options` fields the connection is made with, each
+/// as documented there. The others (namespace, identity, codecs, `rpc_timeout`,
+/// `worker_heartbeat_interval`, ...) stay as `connect` set them.
 pub const ConnectionOptions = struct {
     host_port: []const u8 = "localhost:7233",
     api_key: []const u8 = "",
     tls: ?Options.Tls = null,
     headers: []const bridge.bytes.MetadataEntry = &.{},
+    keep_alive: ?Options.KeepAlive = .{},
+    http_connect_proxy: ?Options.HttpConnectProxy = null,
+    retry: ?Options.Retry = null,
+    client_name: []const u8 = bridge.Connection.default_client_name,
+    client_version: []const u8 = bridge.Connection.default_client_version,
 };
+
+/// Why an option was rejected, naming the option and its value, for the caller to log.
+const Rejection = struct {
+    buf: [256]u8 = undefined,
+    message: []const u8 = "",
+
+    fn reject(r: *Rejection, comptime fmt: []const u8, args: anytype) error{InvalidOptions} {
+        r.message = std.fmt.bufPrint(&r.buf, fmt, args) catch r.buf[0..];
+        return error.InvalidOptions;
+    }
+};
+
+/// Milliseconds for the core: a positive duration under 1 ms counts as 1 ms, and a duration
+/// too long for a u64 as the longest.
+fn durationMs(d: Duration) u64 {
+    if (d.nanoseconds <= 0) return 0;
+    return std.math.cast(u64, @max(@divTrunc(d.nanoseconds, std.time.ns_per_ms), 1)) orelse std.math.maxInt(u64);
+}
+
+/// The bridge's options for connecting to `url` with `options`. `tls` is `options.tls`
+/// with its files read. Checks the options sdk-core would otherwise silently drop or
+/// misread, filling `rejection` when it returns `error.InvalidOptions`.
+fn bridgeConnectionOptions(url: []const u8, identity: []const u8, options: ConnectionOptions, tls: ?bridge.Connection.Options.Tls, rejection: *Rejection) error{InvalidOptions}!bridge.Connection.Options {
+    var keep_alive: ?bridge.Connection.Options.KeepAlive = null;
+    if (options.keep_alive) |k| {
+        if (k.interval.nanoseconds <= 0) return rejection.reject("Options.keep_alive.interval must be positive, not {f}", .{k.interval});
+        if (k.timeout.nanoseconds <= 0) return rejection.reject("Options.keep_alive.timeout must be positive, not {f}", .{k.timeout});
+        keep_alive = .{ .interval_ms = durationMs(k.interval), .timeout_ms = durationMs(k.timeout) };
+    }
+    var proxy: ?bridge.Connection.Options.HttpConnectProxy = null;
+    if (options.http_connect_proxy) |p| {
+        if (p.host_port.len == 0) return rejection.reject("Options.http_connect_proxy.host_port is empty; set the proxy's host:port, or set http_connect_proxy to null to connect directly", .{});
+        if ((p.username.len == 0) != (p.password.len == 0))
+            return rejection.reject("Options.http_connect_proxy.username and .password go together: set both for basic auth, or neither (proxy {s})", .{p.host_port});
+        proxy = .{ .target_host = p.host_port, .username = p.username, .password = p.password };
+    }
+    var retry: ?bridge.Connection.Options.Retry = null;
+    if (options.retry) |r| {
+        inline for (.{ "initial_interval", "max_interval", "max_elapsed_time" }) |field| {
+            const d = @field(r, field);
+            if (d.nanoseconds < 0) return rejection.reject("Options.retry." ++ field ++ " must not be negative, not {f}", .{d});
+        }
+        inline for (.{ "randomization_factor", "multiplier" }) |field| {
+            const v = @field(r, field);
+            if (!std.math.isFinite(v) or v < 0) return rejection.reject("Options.retry." ++ field ++ " must be finite and not negative, not {d}", .{v});
+        }
+        retry = .{
+            .initial_interval_ms = durationMs(r.initial_interval),
+            .randomization_factor = r.randomization_factor,
+            .multiplier = r.multiplier,
+            .max_interval_ms = durationMs(r.max_interval),
+            .max_elapsed_time_ms = durationMs(r.max_elapsed_time),
+            .max_retries = r.max_retries,
+        };
+    }
+    inline for (.{ "client_name", "client_version" }) |field| {
+        const v = @field(options, field);
+        if (v.len == 0) return rejection.reject("Options." ++ field ++ " is empty", .{});
+        for (v) |ch| if (ch != '\t' and (ch < ' ' or ch > '~'))
+            return rejection.reject("Options." ++ field ++ " \"{s}\" has a byte (0x{x:0>2}) other than visible ASCII, space or tab", .{ v, ch });
+    }
+    return .{
+        .target_url = url,
+        .identity = identity,
+        .client_name = options.client_name,
+        .client_version = options.client_version,
+        .api_key = options.api_key,
+        .metadata = options.headers,
+        .tls = tls,
+        .retry = retry,
+        .keep_alive = keep_alive,
+        .http_connect_proxy = proxy,
+    };
+}
+
+/// `Options.worker_heartbeat_interval` in milliseconds for the runtime.
+fn heartbeatIntervalMs(interval: ?Duration, rejection: *Rejection) error{InvalidOptions}!u64 {
+    const d = interval orelse return (bridge.Runtime.Options{}).worker_heartbeat_interval_ms;
+    if (d.nanoseconds == 0) return 0;
+    if (d.nanoseconds < std.time.ns_per_s or d.nanoseconds > 60 * std.time.ns_per_s)
+        return rejection.reject("Options.worker_heartbeat_interval must be from 1s to 1m, or zero to turn worker heartbeats off, not {f}", .{d});
+    return durationMs(d);
+}
+
+/// `Options.rpc_timeout` in milliseconds for `CallOptions.timeout_ms`: 0 sends none.
+fn rpcTimeoutMs(timeout: ?Duration, rejection: *Rejection) error{InvalidOptions}!u32 {
+    const d = timeout orelse return 0;
+    if (d.nanoseconds <= 0) return rejection.reject("Options.rpc_timeout must be positive, not {f}; set it to null for sdk-core's default", .{d});
+    return std.math.cast(u32, durationMs(d)) orelse std.math.maxInt(u32);
+}
 
 /// Connects to the server `options` names, reading the TLS files it names, and checks it.
 /// Logs why on failure: as an error, or as a warning for a `reconnect`, after which the
@@ -124,15 +291,17 @@ fn openConnection(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []c
     };
     const scheme = if (options.tls != null) "https" else "http";
     const url = try std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, options.host_port });
+    var rejection: Rejection = .{};
+    const bridge_options = bridgeConnectionOptions(url, identity, options, tls, &rejection) catch |err| {
+        if (reconnecting)
+            log.warn("reconnecting to {s} failed, keeping the current connection: {s}", .{ options.host_port, rejection.message })
+        else
+            log.err("connecting to {s} failed: {s}", .{ options.host_port, rejection.message });
+        return err;
+    };
     var message: ?[]u8 = null;
     defer if (message) |m| gpa.free(m);
-    return bridge.Connection.connect(gpa, io, runtime, .{
-        .target_url = url,
-        .identity = identity,
-        .api_key = options.api_key,
-        .metadata = options.headers,
-        .tls = tls,
-    }, &message) catch |err| {
+    return bridge.Connection.connect(gpa, io, runtime, bridge_options, &message) catch |err| {
         const reason = message orelse @errorName(err);
         if (reconnecting)
             log.warn("reconnecting to {s} failed, keeping the current connection: {s}", .{ options.host_port, reason })
@@ -291,6 +460,8 @@ pub const Client = struct {
     interceptors: []const interceptor.Client,
     /// The runtime's meter; null without `Options.metrics`.
     meter: ?*bridge.metric.Meter,
+    /// `Options.rpc_timeout` in milliseconds; 0 sends none.
+    rpc_timeout_ms: u32 = 0,
 
     /// Records through this client's metrics exporter (`Options.metrics`) with the runtime's
     /// default attributes, or records nothing without one. Valid until `close`; metrics
@@ -304,6 +475,16 @@ pub const Client = struct {
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
         var message: ?[]u8 = null;
         defer if (message) |m| gpa.free(m);
+
+        var rejection: Rejection = .{};
+        const heartbeat_ms = heartbeatIntervalMs(options.worker_heartbeat_interval, &rejection) catch |err| {
+            log.err("connecting to {s} failed: {s}", .{ options.host_port, rejection.message });
+            return err;
+        };
+        const rpc_timeout_ms = rpcTimeoutMs(options.rpc_timeout, &rejection) catch |err| {
+            log.err("connecting to {s} failed: {s}", .{ options.host_port, rejection.message });
+            return err;
+        };
 
         const logger = options.logger orelse log_mod.Sink.std_log;
         var core_log_sink: ?*log_mod.Sink = null;
@@ -319,7 +500,7 @@ pub const Client = struct {
             };
         }
         const runtime_metrics = if (options.metrics) |m| try runtimeMetrics(gpa, m) else null;
-        const runtime = bridge.Runtime.init(gpa, .{ .logging = logging, .metrics = runtime_metrics }, &message) catch |err| switch (err) {
+        const runtime = bridge.Runtime.init(gpa, .{ .logging = logging, .metrics = runtime_metrics, .worker_heartbeat_interval_ms = heartbeat_ms }, &message) catch |err| switch (err) {
             error.TooManyLogForwarders => {
                 log.err("creating the core runtime failed: {d} clients in this process already forward sdk-core's logs; close one, or set Options.core_log_level to null", .{bridge.Runtime.max_forwarders});
                 return error.RuntimeInitFailed;
@@ -358,7 +539,56 @@ pub const Client = struct {
             .worker_interceptors = options.worker_interceptors,
             .interceptors = options.interceptors,
             .meter = meter,
+            .rpc_timeout_ms = rpc_timeout_ms,
         };
+    }
+
+    /// The gRPC health service name `checkHealth` asks about: the service this client calls.
+    const health_service = "temporal.api.workflowservice.v1.WorkflowService";
+
+    /// Asks the server, through the gRPC health service (grpc.health.v1.Health/Check),
+    /// whether it is serving the WorkflowService this client calls, and returns if it is.
+    /// Each failure is logged as a warning. Makes one attempt, without retries, within
+    /// `Options.rpc_timeout`; canceling the calling task cancels it. Bypasses
+    /// `Options.interceptors` and the codecs. Thread-safe.
+    pub fn checkHealth(c: *Client) CheckHealthError!void {
+        const health = proto.grpc.health.v1;
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var encoded: Io.Writer.Allocating = .init(a);
+        (health.HealthCheckRequest{ .service = health_service }).encode(&encoded.writer, a) catch return error.OutOfMemory;
+        var failure: ?bridge.Connection.RpcFailure = null;
+        defer if (failure) |f| f.deinit(c.gpa);
+        const bytes = c.currentConnection().call(c.gpa, c.io, .health, "Check", encoded.written(), .{ .retry = false, .timeout_ms = c.rpc_timeout_ms }, &failure) catch |err| switch (err) {
+            error.RpcFailed, error.InvalidOptions => {
+                const f = failure orelse {
+                    log.warn("checking the health of " ++ health_service ++ " failed: {t}", .{err});
+                    return error.RpcFailed;
+                };
+                log.warn("checking the health of " ++ health_service ++ " failed: {s} (gRPC status {d})", .{ f.message, f.status_code });
+                return error.RpcFailed;
+            },
+            error.OutOfMemory, error.Canceled => |e| return e,
+        };
+        defer c.gpa.free(bytes);
+        return healthResponse(a, bytes);
+    }
+
+    /// Whether a serialized HealthCheckResponse reports SERVING, logging why not.
+    fn healthResponse(a: Allocator, bytes: []const u8) CheckHealthError!void {
+        const health = proto.grpc.health.v1;
+        var reader: Io.Reader = .fixed(bytes);
+        const response = health.HealthCheckResponse.decode(&reader, a) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.warn("checking the health of " ++ health_service ++ " failed: the response doesn't decode as a HealthCheckResponse ({t})", .{err});
+                return error.InvalidResponse;
+            },
+        };
+        if (response.status == .SERVING) return;
+        log.warn("checking the health of " ++ health_service ++ " failed: the server reports {s}, not SERVING", .{std.enums.tagName(health.HealthCheckResponse.ServingStatus, response.status) orelse "an unknown status"});
+        return error.NotServing;
     }
 
     pub fn close(c: *Client) void {
@@ -409,7 +639,8 @@ pub const Client = struct {
         };
     }
 
-    /// Connects again with `options` (address, API key, TLS and headers) and sends every
+    /// Connects again with `options` (address, API key, TLS, headers, keep-alive, proxy,
+    /// retry policy, and client name and version) and sends every
     /// later call over the new connection: this client's, and those of the workers running
     /// on it, which move over without stopping (their polls already waiting finish on the old
     /// connection). Workers started later use it too. TLS files named by `options.tls` are
@@ -1389,6 +1620,17 @@ pub const Client = struct {
         }
     };
 
+    /// The deadline `send` gives a call: `rpc_timeout_ms`, or 0 (sdk-core's default) for a
+    /// call that waits on the server for as long as it takes.
+    fn callTimeoutMs(comptime Request: type, comptime method: []const u8, request: *const Request, rpc_timeout_ms: u32) u32 {
+        const waits = comptime for ([_][]const u8{ "UpdateWorkflowExecution", "ExecuteMultiOperation", "PollWorkflowExecutionUpdate", "PollActivityExecution" }) |m| {
+            if (std.mem.eql(u8, m, method)) break true;
+        } else false;
+        if (waits) return 0;
+        if (comptime Request == wfs.GetWorkflowExecutionHistoryRequest) if (request.wait_new_event) return 0;
+        return rpc_timeout_ms;
+    }
+
     /// Sends the request to the server: the end of the interceptor chain. When `status` is
     /// given, a failure other than ALREADY_EXISTS or NOT_FOUND is stored there (allocated from
     /// `arena`) for the caller to report instead of being logged. The codecs encode the
@@ -1406,7 +1648,8 @@ pub const Client = struct {
         coded.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var failure: ?bridge.Connection.RpcFailure = null;
         defer if (failure) |f| f.deinit(c.gpa);
-        const bytes = c.currentConnection().call(c.gpa, c.io, .workflow, method, encoded.written(), .{ .retry = true }, &failure) catch |err| switch (err) {
+        const call_options: bridge.Connection.CallOptions = .{ .retry = true, .timeout_ms = callTimeoutMs(@TypeOf(coded), method, &coded, c.rpc_timeout_ms) };
+        const bytes = c.currentConnection().call(c.gpa, c.io, .workflow, method, encoded.written(), call_options, &failure) catch |err| switch (err) {
             error.RpcFailed => {
                 const f = failure.?;
                 // gRPC ALREADY_EXISTS and NOT_FOUND are expected outcomes callers handle.
@@ -1513,6 +1756,19 @@ pub const StartError = error{
 pub const SignalError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };
 
 pub const DescribeError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };
+
+pub const CheckHealthError = error{
+    OutOfMemory,
+    /// The calling task was canceled.
+    Canceled,
+    /// The call failed, for example because the server is unreachable or didn't answer
+    /// within `Options.rpc_timeout`; logged with its gRPC status.
+    RpcFailed,
+    /// The server answered with a status other than SERVING; logged.
+    NotServing,
+    /// The server's answer isn't a health check response; logged.
+    InvalidResponse,
+};
 
 pub const ListError = error{
     /// A payload codec (`Options.codecs`) failed; logged.
@@ -3332,4 +3588,161 @@ test "header updates accept gRPC ASCII headers only" {
     try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "blob-bin", .value = "v" }));
     try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k", .value = "caf\xc3\xa9" }));
     try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k", .value = "a\nb" }));
+}
+
+test "default options send what the client always sent" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loadOptions(arena.allocator(), .{ .config_file = "/does/not/exist.toml", .disable_env = true });
+    var rejection: Rejection = .{};
+    for ([_]Options{ .{}, loaded }) |o| {
+        const b = try bridgeConnectionOptions("http://localhost:7233", "id", o.connectionOptions(), null, &rejection);
+        try testing.expectEqualStrings("temporal-zig", b.client_name);
+        try testing.expectEqualStrings(@import("temporal.zig").version, b.client_version);
+        try testing.expectEqual(@as(u64, 30_000), b.keep_alive.?.interval_ms);
+        try testing.expectEqual(@as(u64, 15_000), b.keep_alive.?.timeout_ms);
+        try testing.expect(b.retry == null);
+        try testing.expect(b.http_connect_proxy == null);
+        try testing.expect(b.tls == null);
+        try testing.expectEqual(@as(u64, 60_000), try heartbeatIntervalMs(o.worker_heartbeat_interval, &rejection));
+        try testing.expectEqual(@as(u32, 0), try rpcTimeoutMs(o.rpc_timeout, &rejection));
+    }
+}
+
+test "custom connection options map to the bridge, through connectionOptions too" {
+    var rejection: Rejection = .{};
+    const o: Options = .{
+        .keep_alive = .{ .interval = .fromSeconds(10) },
+        .http_connect_proxy = .{ .host_port = "proxy.corp:3128", .username = "svc", .password = "pw" },
+        .retry = .{ .max_retries = 3, .max_elapsed_time = .zero, .initial_interval = .fromMicroseconds(10) },
+        .client_name = "wrapper",
+        .client_version = "1.2.3 beta",
+    };
+    const b = try bridgeConnectionOptions("http://h:1", "id", o.connectionOptions(), null, &rejection);
+    try testing.expectEqual(@as(u64, 10_000), b.keep_alive.?.interval_ms);
+    try testing.expectEqual(@as(u64, 15_000), b.keep_alive.?.timeout_ms);
+    try testing.expectEqualStrings("proxy.corp:3128", b.http_connect_proxy.?.target_host);
+    try testing.expectEqualStrings("svc", b.http_connect_proxy.?.username);
+    try testing.expectEqualStrings("pw", b.http_connect_proxy.?.password);
+    const retry = b.retry.?;
+    try testing.expectEqual(@as(usize, 3), retry.max_retries);
+    try testing.expectEqual(@as(u64, 0), retry.max_elapsed_time_ms);
+    try testing.expectEqual(@as(u64, 1), retry.initial_interval_ms);
+    try testing.expectEqual(@as(u64, 5_000), retry.max_interval_ms);
+    try testing.expectEqual(@as(f64, 1.7), retry.multiplier);
+    try testing.expectEqual(@as(f64, 0.2), retry.randomization_factor);
+    try testing.expectEqualStrings("wrapper", b.client_name);
+    try testing.expectEqualStrings("1.2.3 beta", b.client_version);
+
+    // The client's Retry defaults are the bridge's, which are sdk-core's.
+    const zig_default = (try bridgeConnectionOptions("http://h:1", "id", .{ .retry = .{} }, null, &rejection)).retry.?;
+    try testing.expectEqual(bridge.Connection.Options.Retry{}, zig_default);
+
+    const off = try bridgeConnectionOptions("http://h:1", "id", .{ .keep_alive = null }, null, &rejection);
+    try testing.expect(off.keep_alive == null);
+
+    try testing.expectEqual(@as(u64, 0), try heartbeatIntervalMs(.zero, &rejection));
+    try testing.expectEqual(@as(u64, 15_000), try heartbeatIntervalMs(.fromSeconds(15), &rejection));
+    try testing.expectEqual(@as(u64, 1_000), try heartbeatIntervalMs(.fromSeconds(1), &rejection));
+    try testing.expectEqual(@as(u64, 60_000), try heartbeatIntervalMs(.fromSeconds(60), &rejection));
+    try testing.expectEqual(@as(u32, 5_000), try rpcTimeoutMs(.fromSeconds(5), &rejection));
+    try testing.expectEqual(@as(u32, 1), try rpcTimeoutMs(.fromNanoseconds(1), &rejection));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), try rpcTimeoutMs(.max, &rejection));
+}
+
+fn expectRejected(result: anytype, rejection: *const Rejection, comptime option: []const u8) !void {
+    try testing.expectError(error.InvalidOptions, result);
+    if (std.mem.indexOf(u8, rejection.message, option) == null) {
+        std.debug.print("rejection \"{s}\" doesn't name {s}\n", .{ rejection.message, option });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "invalid connection options are rejected, naming the option" {
+    var r: Rejection = .{};
+    const url = "http://h:1";
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .keep_alive = .{ .interval = .zero } }, null, &r), &r, "keep_alive.interval");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .keep_alive = .{ .timeout = .fromSeconds(-1) } }, null, &r), &r, "keep_alive.timeout");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .http_connect_proxy = .{ .host_port = "" } }, null, &r), &r, "http_connect_proxy.host_port");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .http_connect_proxy = .{ .host_port = "p:1", .username = "svc" } }, null, &r), &r, "http_connect_proxy.username and .password");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .http_connect_proxy = .{ .host_port = "p:1", .password = "pw" } }, null, &r), &r, "http_connect_proxy.username and .password");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .retry = .{ .initial_interval = .fromMilliseconds(-5) } }, null, &r), &r, "retry.initial_interval");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .retry = .{ .max_elapsed_time = .fromSeconds(-1) } }, null, &r), &r, "retry.max_elapsed_time");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .retry = .{ .multiplier = -1 } }, null, &r), &r, "retry.multiplier");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .retry = .{ .randomization_factor = std.math.nan(f64) } }, null, &r), &r, "retry.randomization_factor");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .retry = .{ .multiplier = std.math.inf(f64) } }, null, &r), &r, "retry.multiplier");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .client_name = "" }, null, &r), &r, "client_name");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .client_version = "caf\xc3\xa9" }, null, &r), &r, "client_version");
+    try expectRejected(bridgeConnectionOptions(url, "id", .{ .client_name = "a\nb" }, null, &r), &r, "client_name");
+    try expectRejected(heartbeatIntervalMs(.fromMilliseconds(500), &r), &r, "1s to 1m");
+    try expectRejected(heartbeatIntervalMs(.fromSeconds(61), &r), &r, "worker_heartbeat_interval");
+    try expectRejected(heartbeatIntervalMs(.fromSeconds(-1), &r), &r, "worker_heartbeat_interval");
+    try expectRejected(rpcTimeoutMs(.zero, &r), &r, "rpc_timeout");
+    try expectRejected(rpcTimeoutMs(.fromSeconds(-3), &r), &r, "rpc_timeout");
+}
+
+test "calls that wait on the server get no rpc timeout" {
+    const t: u32 = 750;
+    try testing.expectEqual(@as(u32, 0), Client.callTimeoutMs(wfs.UpdateWorkflowExecutionRequest, "UpdateWorkflowExecution", &.{}, t));
+    try testing.expectEqual(@as(u32, 0), Client.callTimeoutMs(wfs.ExecuteMultiOperationRequest, "ExecuteMultiOperation", &.{}, t));
+    try testing.expectEqual(@as(u32, 0), Client.callTimeoutMs(wfs.PollWorkflowExecutionUpdateRequest, "PollWorkflowExecutionUpdate", &.{}, t));
+    try testing.expectEqual(@as(u32, 0), Client.callTimeoutMs(wfs.PollActivityExecutionRequest, "PollActivityExecution", &.{}, t));
+    try testing.expectEqual(@as(u32, 0), Client.callTimeoutMs(wfs.GetWorkflowExecutionHistoryRequest, "GetWorkflowExecutionHistory", &.{ .wait_new_event = true }, t));
+    try testing.expectEqual(t, Client.callTimeoutMs(wfs.GetWorkflowExecutionHistoryRequest, "GetWorkflowExecutionHistory", &.{}, t));
+    try testing.expectEqual(t, Client.callTimeoutMs(wfs.QueryWorkflowRequest, "QueryWorkflow", &.{}, t));
+    try testing.expectEqual(t, Client.callTimeoutMs(wfs.StartWorkflowExecutionRequest, "StartWorkflowExecution", &.{}, t));
+}
+
+test "health check responses other than SERVING fail" {
+    const health = proto.grpc.health.v1;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Status = health.HealthCheckResponse.ServingStatus;
+    for ([_]Status{ .SERVING, .NOT_SERVING, .UNKNOWN, .SERVICE_UNKNOWN, @fromBackingInt(@intCast(7)) }) |status| {
+        var w: Io.Writer.Allocating = .init(a);
+        try (health.HealthCheckResponse{ .status = status }).encode(&w.writer, a);
+        const result = Client.healthResponse(a, w.written());
+        if (status == .SERVING) try result else try testing.expectError(error.NotServing, result);
+    }
+    try testing.expectError(error.InvalidResponse, Client.healthResponse(a, "\x08\xff"));
+}
+
+test "rpc_timeout cuts short a query the server holds" {
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var options = server.clientOptions();
+    options.rpc_timeout = .fromMilliseconds(500);
+    var c = try Client.connect(testing.allocator, testing.io, options);
+    defer c.close();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No worker polls this task queue, so the server holds a query until its deadline.
+    const id = try uuid(a, testing.io);
+    _ = try c.rpc(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", wfs.StartWorkflowExecutionRequest{
+        .namespace = c.namespace,
+        .workflow_id = id,
+        .workflow_type = .{ .name = "Unpolled" },
+        .task_queue = .{ .name = try uuid(a, testing.io), .kind = .TASK_QUEUE_KIND_NORMAL },
+        .request_id = try uuid(a, testing.io),
+        .identity = c.identity,
+    }, a);
+    const start = Io.Timestamp.now(testing.io, .awake);
+    var status: ?Client.RpcStatus = null;
+    try testing.expectError(error.RpcFailed, c.rpcWithStatus(wfs.QueryWorkflowResponse, "QueryWorkflow", wfs.QueryWorkflowRequest{
+        .namespace = c.namespace,
+        .execution = .{ .workflow_id = id },
+        .query = .{ .query_type = "status" },
+    }, a, &status));
+    const waited = start.durationTo(Io.Timestamp.now(testing.io, .awake));
+    // sdk-core's gRPC transport reports its own deadline as CANCELLED; the server's would be
+    // DEADLINE_EXCEEDED. Either way, well before sdk-core's default deadline of 30 s.
+    const s = status.?;
+    if (!(s.code == 1 and std.mem.indexOf(u8, s.message, "Timeout expired") != null) and s.code != 4) {
+        std.debug.print("want a timeout, got gRPC status {d}: {s}\n", .{ s.code, s.message });
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
 }
