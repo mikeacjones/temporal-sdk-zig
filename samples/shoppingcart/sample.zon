@@ -1,6 +1,15 @@
 // How samples-test validates this sample: start the worker, run the starter, and check that
-// the starter's output contains each `expect` line before `timeout_seconds`.
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter
+// checks out at the end, so the cart workflow completes.
 .{
-    .expect = .{"shoppingcart sample is a placeholder"},
+    .expect = .{
+        "Cart after add apple: {\"apple\":1}",
+        "Cart after add banana: {\"apple\":1,\"banana\":1}",
+        "Cart after add apple: {\"apple\":2,\"banana\":1}",
+        "Cart after remove banana: {\"apple\":2}",
+        "Cart after list: {\"apple\":2}",
+        "Action invalid rejected: UnsupportedActionType",
+        "Checked out: cart workflow completed",
+    },
     .timeout_seconds = 60,
 }
