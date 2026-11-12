@@ -1,6 +1,17 @@
 // How samples-test validates this sample: start the worker, run the starter, and check that
-// the starter's output contains each `expect` line before `timeout_seconds`.
+// the starter's output contains each `expect` line before `timeout_seconds`. Odd addends are
+// negative, so the validator rejects them and the count is 0 + 2 + 4 + 6 + 8.
 .{
-    .expect = .{"update sample is a placeholder"},
+    .expect = .{
+        "fetch_and_add with addend 0 succeeded: 0",
+        "fetch_and_add with addend -1 failed: NegativeAddend",
+        "fetch_and_add with addend 2 succeeded: 0",
+        "fetch_and_add with addend -3 failed: NegativeAddend",
+        "fetch_and_add with addend 4 succeeded: 2",
+        "fetch_and_add with addend 6 succeeded: 6",
+        "fetch_and_add with addend 8 succeeded: 12",
+        "fetch_and_add with addend -9 failed: NegativeAddend",
+        "workflow result: 20",
+    },
     .timeout_seconds = 60,
 }
