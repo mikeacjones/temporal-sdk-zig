@@ -1,0 +1,12 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter also
+// does the work of the query program.
+.{
+    .expect = .{
+        "Received query result Result=PSO_Child_",
+        "Workflow result: Optimization was successful at attempt #1. Yay! Goal was reached @ step ",
+    },
+    .timeout_seconds = 60,
+    .tests = .{ "workflow_test.zig", "swarm_test.zig" },
+    .programs = .{"query"},
+}
