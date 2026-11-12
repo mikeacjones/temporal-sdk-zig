@@ -85,6 +85,13 @@ accepted_update: bool = false,
 /// Signal and update handler coroutines that have not returned, in start order. Each removes
 /// itself when its handler returns; `destroy` cancels the rest.
 handlers: std.ArrayList(*HandlerRun) = .empty,
+/// The latest `requestContinueAsNew`, sent if the workflow function returns
+/// error.ContinueAsNew. Arena memory.
+continue_as_new: ?cmd_pb.ContinueAsNewWorkflowExecution = null,
+/// From the latest activation that wasn't query-only.
+history_length: u32 = 0,
+history_size_bytes: u64 = 0,
+continue_as_new_suggested: bool = false,
 
 /// A type-erased query handler: decodes `args` into `out`, calls the handler with `context`,
 /// and encodes its result into `out`. Runs on the worker thread, outside any coroutine.
@@ -140,7 +147,9 @@ const HandlerRun = struct {
     task: *WorkflowIo.Task = undefined,
 };
 
-const RootOutcome = union(enum) { completed: converter.Payload, failed: anyerror };
+/// `continued_as_new`: the workflow function returned error.ContinueAsNew after
+/// `requestContinueAsNew`; the request is in `continue_as_new`.
+const RootOutcome = union(enum) { completed: converter.Payload, failed: anyerror, continued_as_new };
 
 pub const ActivityState = struct {
     seq: u32,
@@ -277,9 +286,12 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         const v = job.variant orelse break false;
         if (v != .do_update) break false;
     } else true;
-    if (!query_only) if (act.timestamp) |ts| {
-        inst.now_ns = @as(i96, ts.seconds) * std.time.ns_per_s + ts.nanos;
-    };
+    if (!query_only) {
+        if (act.timestamp) |ts| inst.now_ns = @as(i96, ts.seconds) * std.time.ns_per_s + ts.nanos;
+        inst.history_length = act.history_length;
+        inst.history_size_bytes = act.history_size_bytes;
+        inst.continue_as_new_suggested = act.continue_as_new_suggested;
+    }
     inst.replaying = act.is_replaying;
     inst.commands = .empty;
     inst.task_failure = null;
@@ -649,7 +661,9 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
 fn rootMain(inst: *Instance) void {
     const outcome: RootOutcome = if (inst.entry.invoke(&inst.ctx, inst.args)) |result|
         .{ .completed = result }
-    else |err|
+    else |err| if (err == error.ContinueAsNew and inst.continue_as_new != null)
+        .continued_as_new
+    else
         .{ .failed = err };
     // A signal handler's error may have finished the workflow first.
     if (inst.root_outcome == null) inst.root_outcome = outcome;
@@ -673,6 +687,9 @@ fn finishIfDone(inst: *Instance) !void {
         .completed => |result| try inst.commands.append(a, .{ .variant = .{
             .complete_workflow_execution = .{ .result = result },
         } }),
+        .continued_as_new => try inst.commands.append(a, .{ .variant = .{
+            .continue_as_new_workflow_execution = inst.continue_as_new.?,
+        } }),
         .failed => |err| switch (err) {
             // The workflow can't make progress; fail the task so the server retries it.
             error.OutOfMemory => inst.task_failure = "out of memory running the workflow",
@@ -689,9 +706,40 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
     if (inst.ctx.pending_failure) |p| return failure_mod.application(a, p);
     switch (err) {
         error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted => if (inst.ctx.last_failure) |f| return f.*,
+        // Only the workflow function's return of ctx.continueAsNew's error continues as new.
+        error.ContinueAsNew => return failure_mod.application(a, .{
+            .message = if (inst.continue_as_new == null)
+                try std.fmt.allocPrint(a, "workflow \"{s}\" returned error.ContinueAsNew without calling ctx.continueAsNew; return ctx.continueAsNew(Workflow, options, args) to continue as new", .{inst.info.workflow_type})
+            else
+                try std.fmt.allocPrint(a, "a signal handler of workflow \"{s}\" returned error.ContinueAsNew; only the workflow function can continue as new, by returning ctx.continueAsNew(...)", .{inst.info.workflow_type}),
+            .type = "ContinueAsNew",
+        }),
         else => {},
     }
     return failure_mod.fromError(a, err);
+}
+
+// ---------------------------------------------------------------- continue-as-new
+
+/// Records the ContinueAsNewWorkflowExecution command to send if the workflow function returns
+/// error.ContinueAsNew, replacing any earlier request. `args` are encoded into the arena now.
+pub fn requestContinueAsNew(inst: *Instance, workflow_type: []const u8, options: workflow.ContinueAsNewOptions, args: anytype) error{OutOfMemory}!void {
+    const a = inst.arena();
+    var cmd: cmd_pb.ContinueAsNewWorkflowExecution = .{
+        .workflow_type = workflow_type,
+        // Empty: core and the server keep this run's task queue.
+        .task_queue = try a.dupe(u8, options.task_queue),
+        .arguments = try converter.toPayloads(a, args),
+        .workflow_run_timeout = protoDuration(options.run_timeout),
+        .workflow_task_timeout = protoDuration(options.task_timeout),
+    };
+    if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
+    // Core fills an empty memo with the memo this run started with, which would drop
+    // `upsertMemo` changes; sending the current view keeps them.
+    const memo = options.memo orelse inst.memo;
+    try cmd.memo.ensureTotalCapacity(a, memo.len);
+    for (memo) |f| cmd.memo.appendAssumeCapacity(.{ .key = try a.dupe(u8, f.name), .value = try f.value.dupe(a) });
+    inst.continue_as_new = cmd;
 }
 
 // ---------------------------------------------------------------- memo
@@ -2675,4 +2723,154 @@ test "child workflow: an empty workflow type returns error.InvalidOptions from g
     const done = commandsOf(try inst.activate(&try initActivation(a, "ByName", .{}), a));
     try testing.expectEqual(@as(usize, 1), done.len);
     try testing.expectEqualStrings("InvalidOptions", done[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+// Continue-as-new.
+const Continue = struct {
+    const Again = workflow.SignalDef("again", fn () void);
+
+    /// Upserts the memo, then continues as new with every option set.
+    fn withOptions(ctx: *workflow.Context, n: u32) !u32 {
+        try ctx.upsertMemo(.{ .status = "upserted" });
+        return ctx.continueAsNew(WithOptions, .{
+            .task_queue = "elsewhere",
+            .run_timeout = .fromSeconds(60),
+            .task_timeout = .fromSeconds(5),
+            .memo = try converter.toFields(ctx.allocator(), .{ .round = n + 1 }),
+            .retry_policy = .{ .maximum_attempts = 3, .non_retryable_error_types = &.{"Fatal"} },
+        }, .{n + 1});
+    }
+    /// Upserts the memo, then continues as new with the default options.
+    fn defaults(ctx: *workflow.Context, n: u32) !u32 {
+        try ctx.upsertMemo(.{ .status = "upserted" });
+        return ctx.continueAsNew(Defaults, .{}, .{n + 1});
+    }
+    fn bare(_: *workflow.Context) !u32 {
+        return error.ContinueAsNew;
+    }
+    fn fromSignal(ctx: *workflow.Context) !u32 {
+        try ctx.setSignalHandler(Again, ctx, continueFromHandler);
+        try ctx.io().sleep(.fromSeconds(3600), .awake);
+        return 0;
+    }
+    fn continueFromHandler(ctx: *workflow.Context) !void {
+        return ctx.continueAsNew(FromSignal, .{}, .{});
+    }
+    const WithOptions = workflow.Def("WithOptions", withOptions);
+    const Defaults = workflow.Def("Defaults", defaults);
+    const Bare = workflow.Def("Bare", bare);
+    const FromSignal = workflow.Def("FromSignal", fromSignal);
+};
+
+test "continue-as-new: ContinueAsNewWorkflowExecution carries the type, arguments and options" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, Continue.WithOptions.registered, .{ .task_queue = "tq" });
+    defer inst.destroy();
+
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "WithOptions", .{@as(u32, 1)}), a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    const can = cmds[1].variant.?.continue_as_new_workflow_execution;
+    try testing.expectEqualStrings("WithOptions", can.workflow_type);
+    try testing.expectEqualStrings("elsewhere", can.task_queue);
+    try testing.expectEqual(@as(usize, 1), can.arguments.items.len);
+    try testing.expectEqualStrings("2", can.arguments.items[0].data);
+    try testing.expectEqual(@as(i64, 60), can.workflow_run_timeout.?.seconds);
+    try testing.expectEqual(@as(i64, 5), can.workflow_task_timeout.?.seconds);
+    try testing.expectEqual(@as(usize, 1), can.memo.items.len);
+    try testing.expectEqualStrings("round", can.memo.items[0].key);
+    try testing.expectEqualStrings("2", can.memo.items[0].value.?.data);
+    try testing.expectEqual(@as(i32, 3), can.retry_policy.?.maximum_attempts);
+    try testing.expectEqualStrings("Fatal", can.retry_policy.?.non_retryable_error_types.items[0]);
+    try testing.expect(inst.finished);
+}
+
+test "continue-as-new: default options keep the task queue, timeouts and retry policy, and send the current memo" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, Continue.Defaults.registered, .{ .task_queue = "tq" });
+    defer inst.destroy();
+
+    var act = try initActivation(a, "Defaults", .{@as(u32, 7)});
+    var start_memo: common.Memo = .{};
+    for (try converter.toFields(a, .{ .owner = "data", .status = "queued" })) |f|
+        try start_memo.fields.append(a, .{ .key = f.name, .value = f.value });
+    act.jobs.items[0].variant.?.initialize_workflow.memo = start_memo;
+
+    const cmds = commandsOf(try inst.activate(&act, a));
+    const can = cmds[1].variant.?.continue_as_new_workflow_execution;
+    try testing.expectEqualStrings("Defaults", can.workflow_type);
+    try testing.expectEqualStrings("", can.task_queue);
+    try testing.expectEqualStrings("8", can.arguments.items[0].data);
+    try testing.expect(can.workflow_run_timeout == null);
+    try testing.expect(can.workflow_task_timeout == null);
+    try testing.expect(can.retry_policy == null);
+    try testing.expectEqual(@as(usize, 2), can.memo.items.len);
+    try testing.expectEqualStrings("owner", can.memo.items[0].key);
+    try testing.expectEqualStrings("status", can.memo.items[1].key);
+    try testing.expectEqualStrings("\"upserted\"", can.memo.items[1].value.?.data);
+}
+
+test "continue-as-new: error.ContinueAsNew without ctx.continueAsNew fails the workflow saying so" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, Continue.Bare.registered, .{});
+    defer inst.destroy();
+
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "Bare", .{}), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    const f = cmds[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expect(std.mem.indexOf(u8, f.message, "without calling ctx.continueAsNew") != null);
+    try testing.expectEqualStrings("ContinueAsNew", failure_mod.applicationType(f).?);
+}
+
+test "continue-as-new: a signal handler's error.ContinueAsNew fails the workflow instead" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, Continue.FromSignal.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "FromSignal", .{}), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, .{ .signal_workflow = .{ .signal_name = "again" } }), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    const f = cmds[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expect(std.mem.indexOf(u8, f.message, "only the workflow function can continue as new") != null);
+}
+
+test "continue-as-new: history length, size and suggestion follow each activation but not query-only ones" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, Nap.registered, .{});
+    defer inst.destroy();
+
+    var init = try initActivation(a, "Nap", .{});
+    init.history_length = 3;
+    init.history_size_bytes = 300;
+    _ = try inst.activate(&init, a);
+    try testing.expectEqual(@as(u32, 3), inst.ctx.historyLength());
+    try testing.expectEqual(@as(u64, 300), inst.ctx.historySizeBytes());
+    try testing.expect(!inst.ctx.continueAsNewSuggested());
+
+    var query = try oneJob(a, .{ .query_workflow = .{ .query_id = "q", .query_type = "none" } });
+    query.history_length = 99;
+    query.history_size_bytes = 9900;
+    query.continue_as_new_suggested = true;
+    _ = try inst.activate(&query, a);
+    try testing.expectEqual(@as(u32, 3), inst.ctx.historyLength());
+    try testing.expectEqual(@as(u64, 300), inst.ctx.historySizeBytes());
+    try testing.expect(!inst.ctx.continueAsNewSuggested());
+
+    var fire = try oneJob(a, .{ .fire_timer = .{ .seq = 1 } });
+    fire.history_length = 8;
+    fire.history_size_bytes = 800;
+    fire.continue_as_new_suggested = true;
+    _ = try inst.activate(&fire, a);
+    try testing.expectEqual(@as(u32, 8), inst.ctx.historyLength());
+    try testing.expectEqual(@as(u64, 800), inst.ctx.historySizeBytes());
+    try testing.expect(inst.ctx.continueAsNewSuggested());
 }
