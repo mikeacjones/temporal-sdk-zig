@@ -1,0 +1,8 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The worker's JSON
+// log lines go to its own stderr.
+.{
+    .expect = .{"Workflow completed. Check worker logs."},
+    .timeout_seconds = 60,
+    .tests = .{"logadapter_test.zig"},
+}
