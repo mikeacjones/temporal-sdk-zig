@@ -607,6 +607,8 @@ pub const ActivityEnvironment = struct {
     heartbeat_details: []const converter.Payload = &.{},
     /// Called with each heartbeat's details.
     on_heartbeat: ?activity.Context.HeartbeatSink = null,
+    /// What `ctx.client()` returns; null makes it return `error.NoClient`. Borrowed.
+    client: ?*client_mod.Client = null,
 
     pub fn init(io: Io) ActivityEnvironment {
         return .{ .io = io };
@@ -628,6 +630,7 @@ pub const ActivityEnvironment = struct {
             .logger_ = .{},
             .heartbeat_details = env.heartbeat_details,
             .heartbeat_sink = env.on_heartbeat,
+            .client_ = env.client,
         };
         return Activity.call(receiver, &ctx, args);
     }
@@ -952,6 +955,37 @@ const Fixtures = struct {
         return std.fmt.allocPrint(a, "{s} {d}: {s}", .{ id, p, try std.mem.join(a, ",", names.items) });
     }
     const SearchAttributeUpdates = workflow.Def("SearchAttributeUpdates", searchAttributeUpdates);
+
+    const SelfSignal = workflow.SignalDef("self", fn (value: []const u8) void);
+
+    const SignalBox = struct {
+        value: ?[]const u8 = null,
+        fn set(b: *SignalBox, value: []const u8) void {
+            b.value = value;
+        }
+        fn received(b: *SignalBox) bool {
+            return b.value != null;
+        }
+    };
+
+    /// Runs an activity that signals this workflow through the worker's client, then returns
+    /// the signal's value.
+    fn signalSelf(ctx: *workflow.Context, value: []const u8) ![]const u8 {
+        const box = try ctx.allocator().create(SignalBox);
+        box.* = .{};
+        try ctx.setSignalHandler(SelfSignal, box, SignalBox.set);
+        try ctx.executeActivity(SignalOwnWorkflow, .{ .start_to_close_timeout = .fromSeconds(10) }, .{value}).get();
+        try ctx.await(box, SignalBox.received);
+        return box.value.?;
+    }
+    const SignalSelf = workflow.Def("SignalSelf", signalSelf);
+
+    fn signalOwnWorkflow(ctx: *activity.Context, value: []const u8) !void {
+        const c = try ctx.client();
+        const info = ctx.info();
+        try c.signalWorkflow(SelfSignal, info.workflow_id, info.workflow_run_id, .{value});
+    }
+    const SignalOwnWorkflow = activity.Def("SignalOwnWorkflow", signalOwnWorkflow);
 
     fn searchAttributeUpdatesWithoutUpserts(ctx: *workflow.Context, tag: []const u8) ![]const u8 {
         _ = try ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{tag}).get();
@@ -2469,6 +2503,33 @@ test "client: list and count workflows by a visibility query on search attribute
     var none = try env.client.listWorkflows("CustomKeywordListField = 'no-such-tag'", .{});
     defer none.deinit();
     try testing.expect(try none.next(a) == null);
+}
+
+test "an activity signals its own workflow through ctx.client()" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.SignalSelf);
+    try env.registerActivity(Fixtures.SignalOwnWorkflow);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("from the activity", try env.executeWorkflow(Fixtures.SignalSelf, .{"from the activity"}, arena.allocator(), null));
+}
+
+test "ActivityEnvironment hands the activity its client, or error.NoClient without one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    try testing.expectError(error.NoClient, env.executeActivity(Fixtures.SignalOwnWorkflow, .{"x"}, arena.allocator()));
+
+    const Probe = struct {
+        fn same(ctx: *activity.Context) !bool {
+            return (try ctx.client()).namespace.len > 0;
+        }
+    };
+    var c: client_mod.Client = undefined; // the activity only reads its namespace
+    c.namespace = @constCast("default");
+    env.client = &c;
+    try testing.expect(try env.executeActivity(activity.Def("Probe", Probe.same), .{}, arena.allocator()));
 }
 
 test "client: a search attribute value the server can't index fails the start" {

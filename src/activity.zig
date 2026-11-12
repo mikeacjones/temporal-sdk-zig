@@ -54,6 +54,7 @@
 
 const std = @import("std");
 const converter = @import("converter.zig");
+const client_mod = @import("client.zig");
 const failure_mod = @import("failure.zig");
 const log = @import("log.zig");
 const Allocator = std.mem.Allocator;
@@ -103,6 +104,8 @@ pub const Context = struct {
     heartbeat_details: []const converter.Payload = &.{},
     /// Where heartbeats go; null drops them (for example outside a worker).
     heartbeat_sink: ?HeartbeatSink = null,
+    /// The worker's client; null outside a worker unless the test environment sets one.
+    client_: ?*client_mod.Client = null,
     /// Written once by the worker when a cancel arrives, possibly from another thread.
     cancel_reason_: std.atomic.Value(u8) = .init(not_canceled),
 
@@ -138,6 +141,20 @@ pub const Context = struct {
     /// reason wins; returns whether this call set it. Called by the worker (any thread).
     pub fn setCancelReason(ctx: *Context, reason: CancelReason) bool {
         return ctx.cancel_reason_.cmpxchgStrong(not_canceled, @backingInt(reason), .acq_rel, .acquire) == null;
+    }
+
+    /// The client of the worker running the activity, for starting, signaling, querying or
+    /// listing workflows from it. The client is safe to use from activities running at the
+    /// same time: its calls go through the core connection, which takes concurrent requests,
+    /// and otherwise only read the client, whose allocator is shared with the worker and so
+    /// must be thread-safe already. Don't `close` it. Returns `error.NoClient` (logged) for
+    /// an activity run without one, such as in an `ActivityEnvironment` whose `client` isn't
+    /// set.
+    pub fn client(ctx: *const Context) error{NoClient}!*client_mod.Client {
+        return ctx.client_ orelse {
+            ctx.logger_.warn("activity.Context.client: this activity runs without a client; in tests, set ActivityEnvironment.client", .{});
+            return error.NoClient;
+        };
     }
 
     pub fn info(ctx: *const Context) *const Info {
