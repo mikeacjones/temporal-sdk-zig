@@ -1,0 +1,14 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter plays
+// the order UI with fixed answers, and waits for the order workflow to ship the order.
+.{
+    .expect = .{
+        "invalid size: size: extra-large is not valid (small, medium, large)",
+        "invalid color: color: green is not valid (red, blue, black)",
+        "Thanks for your order!",
+        "You will receive an email with shipping details shortly",
+        "Order shipped",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
+}
