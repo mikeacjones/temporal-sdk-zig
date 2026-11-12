@@ -185,6 +185,61 @@ pub fn fromPayloads(comptime Args: type, arena: Allocator, payloads: []const Pay
     return out;
 }
 
+pub const Direction = enum { encode, decode };
+
+/// The type that stops `toPayload` (`.encode`) or `fromPayload` (`.decode`) from compiling
+/// for `T`, or null if it compiles: `T` itself, or a type inside it that `std.json` can't
+/// handle, such as a function pointer, an `anyopaque`, or an untagged union. Lets callers
+/// reject a type with an error that names it instead of one deep inside `std.json`.
+pub fn unconvertibleType(comptime T: type, comptime direction: Direction) ?type {
+    if (T == Payload or T == void or T == @TypeOf(null) or T == Bytes) return null;
+    if (comptime hasPayloadHooks(T) or isProtoMessage(T)) return null;
+    if (@typeInfo(T) == .optional) return unconvertibleType(@typeInfo(T).optional.child, direction);
+    return jsonUnconvertible(T, direction, &.{});
+}
+
+// Mirrors the type switches of std.json's Stringify.write and innerParse. `seen` stops the
+// walk at types it is already inside, so recursive types terminate.
+fn jsonUnconvertible(comptime T: type, comptime direction: Direction, comptime seen: []const type) ?type {
+    for (seen) |S| if (S == T) return null;
+    const inside = seen ++ .{T};
+    const hook = if (direction == .encode) "jsonStringify" else "jsonParse";
+    switch (@typeInfo(T)) {
+        .bool, .int, .float, .@"enum" => return null,
+        .optional => |o| return jsonUnconvertible(o.child, direction, inside),
+        .error_set => return if (direction == .encode) null else T,
+        .array => |a| return jsonUnconvertible(a.child, direction, inside),
+        .vector => |v| return jsonUnconvertible(v.child, direction, inside),
+        .pointer => |p| return switch (p.size) {
+            .one, .slice => jsonUnconvertible(p.child, direction, inside),
+            .many => if (direction == .encode and p.sentinel_ptr != null) jsonUnconvertible(p.child, direction, inside) else T,
+            .c => T,
+        },
+        .@"union" => |u| {
+            if (std.meta.hasFn(T, hook)) return null;
+            if (u.tag_type == null) return T;
+            for (u.field_types) |F| {
+                if (F == void) continue;
+                if (jsonUnconvertible(F, direction, inside)) |bad| return bad;
+            }
+            return null;
+        },
+        .@"struct" => |s| {
+            if (std.meta.hasFn(T, hook)) return null;
+            for (s.field_types, s.field_attrs) |F, attrs| {
+                if (direction == .decode and attrs.@"comptime" and !s.is_tuple) return T;
+                if (F == void) {
+                    if (direction == .decode) return F;
+                    continue;
+                }
+                if (jsonUnconvertible(F, direction, inside)) |bad| return bad;
+            }
+            return null;
+        },
+        else => return T,
+    }
+}
+
 /// Arguments not yet decoded, as a dynamic workflow, activity, or signal handler receives
 /// them: the handler reads each one as the type it expects. A view: the payloads are owned by
 /// the run or task that delivered them and live as long as its memory (`ctx.allocator()`);
@@ -588,6 +643,26 @@ pub const Time = struct {
         return .{ .year = yoe + era * 400 + @intFromBool(month <= 2), .month = month, .day = day };
     }
 };
+
+test "unconvertibleType names the type the default converter can't handle" {
+    const Node = struct { value: u32, next: ?*const @This() };
+    const Shape = union(enum) { circle: f32, empty };
+    const Untagged = union { a: u32, b: f32 };
+    const Failure = proto.temporal.api.failure.v1.Failure;
+    inline for (.{ void, Payload, Bytes, Point, ?Point, Failure, []const u8, ?u32, Node, Shape, [3]u8, struct { a: []const []const u8 } }) |T| {
+        try testing.expectEqual(null, unconvertibleType(T, .encode));
+        try testing.expectEqual(null, unconvertibleType(T, .decode));
+    }
+    try testing.expect(unconvertibleType(*std.Io.Writer, .decode) != null);
+    try testing.expect(unconvertibleType(*std.Io.Writer, .encode) != null);
+    try testing.expectEqual(anyopaque, unconvertibleType(*anyopaque, .encode));
+    try testing.expectEqual(fn () void, unconvertibleType(struct { f: *const fn () void }, .decode));
+    try testing.expectEqual(Untagged, unconvertibleType(struct { u: Untagged }, .decode));
+    try testing.expectEqual(null, unconvertibleType(error{Oops}, .encode));
+    try testing.expectEqual(error{Oops}, unconvertibleType(error{Oops}, .decode));
+    try testing.expectEqual(null, unconvertibleType([*:0]const u8, .encode));
+    try testing.expectEqual([*:0]const u8, unconvertibleType([*:0]const u8, .decode));
+}
 
 test "strings, structs and numbers encode as JSON" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
