@@ -1,0 +1,8 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The worker's log
+// lines, with the interceptor's start-time fields, go to its own stderr.
+.{
+    .expect = .{"Workflow result: Hello Temporal!"},
+    .timeout_seconds = 60,
+    .tests = .{"logger_interceptor_test.zig"},
+}
