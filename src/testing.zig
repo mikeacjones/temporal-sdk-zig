@@ -1132,6 +1132,28 @@ const ChildFixtures = struct {
     const CronParent = workflow.Def("CronParent", cronParent);
 };
 
+const LineageFixtures = struct {
+    /// Starts itself as a child `depth` times, each child under its parent's ID plus "-c".
+    /// Each level reports "<parent ID>/<root ID>" ("-" for null), its own first, joined by
+    /// ";" with its child's report.
+    fn describe(ctx: *workflow.Context, depth: u32) ![]const u8 {
+        const a = ctx.allocator();
+        const info = ctx.info();
+        for ([_]?workflow.WorkflowExecution{ info.parent, info.root }) |maybe| if (maybe) |e| {
+            if (!std.mem.eql(u8, e.namespace, info.namespace) or e.run_id.len == 0) return error.IncompleteExecution;
+        };
+        const own = try std.fmt.allocPrint(a, "{s}/{s}", .{
+            if (info.parent) |p| p.workflow_id else "-",
+            if (info.root) |r| r.workflow_id else "-",
+        });
+        if (depth == 0) return own;
+        const child_id = try std.fmt.allocPrint(a, "{s}-c", .{info.workflow_id});
+        const child = try ctx.executeChildWorkflow(Describe, .{ .id = child_id }, .{depth - 1}).get();
+        return std.fmt.allocPrint(a, "{s};{s}", .{ own, child });
+    }
+    const Describe = workflow.Def("DescribeLineage", describe);
+};
+
 const ContinueFixtures = struct {
     /// Records `count` in the memo, then continues as new with `count + 1` until it reaches
     /// `until`. Each run checks that it continued from `previous_run_id`. The last run returns
@@ -2234,6 +2256,17 @@ test "replay runs a workflow under its real workflow ID" {
     // Under another ID the derived child ID differs from the recorded one.
     replayer.workflow_id = "another-id";
     try testing.expectError(error.Nondeterminism, replayer.replayHistory(history));
+}
+
+test "workflow.Info: a child sees its parent, and a grandchild its parent and the root" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(LineageFixtures.Describe);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const result = try env.executeWorkflowWithOptions(LineageFixtures.Describe, .{ .id = "lineage", .task_queue = "" }, .{2}, a, null);
+    try testing.expectEqualStrings("-/-;lineage/lineage;lineage-c/lineage", result);
 }
 
 /// A dev-server run of `ChildFixtures.Parent`, whose child ran on the same worker, exported
