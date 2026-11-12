@@ -24,6 +24,7 @@ const schedule = @import("schedule.zig");
 const workflow = @import("workflow.zig");
 const log_mod = @import("log.zig");
 const propagation = @import("propagation.zig");
+const interceptor = @import("interceptor.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Duration = Io.Duration;
@@ -60,6 +61,10 @@ pub const Options = struct {
     /// for its workflows and activities (see `temporal.propagation`). Borrowed: the slice and
     /// the propagators must outlive the client and its workers.
     propagators: []const propagation.ContextPropagator = &.{},
+    /// Interceptors of the workflows and activities of every worker on this client, before
+    /// the worker's own (`worker.Options.interceptors`). Borrowed: the slice and the
+    /// interceptors must outlive the client and its workers.
+    worker_interceptors: []const interceptor.Worker = &.{},
 
     pub const Tls = struct {
         /// PEM; empty uses the system roots.
@@ -140,6 +145,8 @@ pub const Client = struct {
     core_log_sink: ?*log_mod.Sink,
     /// `Options.propagators`, borrowed; workers on this client use them too.
     propagators: []const propagation.ContextPropagator,
+    /// `Options.worker_interceptors`, borrowed.
+    worker_interceptors: []const interceptor.Worker,
 
     /// Connects and checks the server. Close with `close`.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
@@ -206,6 +213,7 @@ pub const Client = struct {
             .logger = logger,
             .core_log_sink = core_log_sink,
             .propagators = options.propagators,
+            .worker_interceptors = options.worker_interceptors,
         };
     }
 

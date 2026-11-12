@@ -7,6 +7,7 @@ pub const activity = @import("activity.zig");
 pub const nexus = @import("nexus.zig");
 pub const converter = @import("converter.zig");
 pub const propagation = @import("propagation.zig");
+pub const interceptor = @import("interceptor.zig");
 pub const search_attributes = @import("search_attributes.zig");
 pub const failure = @import("failure.zig");
 pub const log = @import("log.zig");
@@ -29,4 +30,5 @@ test {
     _ = bridge;
     _ = @import("proto_test.zig");
     _ = @import("propagation_test.zig");
+    _ = @import("interceptor_test.zig");
 }

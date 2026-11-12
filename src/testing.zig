@@ -24,6 +24,7 @@ const schedule = @import("schedule.zig");
 const failure_mod = @import("failure.zig");
 const log_mod = @import("log.zig");
 const propagation = @import("propagation.zig");
+const interceptor = @import("interceptor.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -226,6 +227,10 @@ pub const WorkflowEnvironment = struct {
         /// The client's context propagators (`client.Options.propagators`), which its worker
         /// and replays use too. Borrowed: they must outlive the environment.
         propagators: []const propagation.ContextPropagator = &.{},
+        /// Interceptors of the worker's workflows and activities
+        /// (`client.Options.worker_interceptors`), which replays use too. Borrowed: they must
+        /// outlive the environment.
+        worker_interceptors: []const interceptor.Worker = &.{},
     };
 
     /// Starts the environment on a dev server. Allocated so the worker's pointer to the
@@ -260,6 +265,7 @@ pub const WorkflowEnvironment = struct {
         client_options.codecs = options.codecs;
         client_options.logger = options.logger;
         client_options.propagators = options.propagators;
+        client_options.worker_interceptors = options.worker_interceptors;
         // The time-skipping test server reports an old server version, which makes the core
         // warn about heartbeat details on every worker start.
         if (kind == .time_skipping) client_options.core_log_level = .err;
@@ -637,6 +643,7 @@ pub const WorkflowEnvironment = struct {
                 .task_queue = env.task_queue,
                 .codecs = env.client.codecs,
                 .propagators = env.client.propagators,
+                .interceptors = env.client.worker_interceptors,
             },
         };
         return replayer.replayHistory(history);
@@ -724,6 +731,10 @@ pub const WorkflowReplayer = struct {
         /// `ctx.propagated()`, as the original worker's client did
         /// (`client.Options.propagators`).
         propagators: []const propagation.ContextPropagator = &.{},
+        /// Worker interceptors of the replayed workflows, as the original worker had them
+        /// (`worker.Options.interceptors`): workflow interceptors run during replay, and
+        /// those that change commands must be present for the history to match.
+        interceptors: []const interceptor.Worker = &.{},
     };
 
     pub fn init(gpa: Allocator, io: Io) WorkflowReplayer {
@@ -918,6 +929,7 @@ pub const WorkflowReplayer = struct {
                     .stack_size = 256 * 1024,
                     .codecs = r.options.codecs,
                     .propagators = r.options.propagators,
+                    .interceptors = r.options.interceptors,
                     .on_evict = Outcome.record,
                     .on_evict_ctx = undefined,
                 },

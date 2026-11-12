@@ -338,10 +338,11 @@ pub const Context = struct {
         return &ctx.instance.info;
     }
 
-    /// A logger carrying the workflow's type, ID, and run ID as fields. It is silent while the
-    /// workflow replays unless `worker.Options.log_during_replay` is set.
+    /// A logger carrying the workflow's type, ID, and run ID as fields, as the workflow's
+    /// outbound interceptors (`interceptor.WorkflowOutbound.logger`) return it. It is silent
+    /// while the workflow replays unless `worker.Options.log_during_replay` is set.
     pub fn logger(ctx: *const Context) log.Logger {
-        return ctx.instance.logger;
+        return ctx.instance.currentLogger();
     }
 
     /// The header the workflow was started with, as sent by its client's interceptors and
@@ -436,14 +437,14 @@ pub const Context = struct {
     /// Schedules an activity defined with `temporal.activity.Def` and returns a future for its
     /// result. `args` is a tuple of the activity's parameters after its context.
     pub fn executeActivity(ctx: *Context, comptime Activity: type, options: ActivityOptions, args: Activity.Args) ActivityFuture(Activity.Result) {
-        return .{ .ctx = ctx, .state = ctx.instance.scheduleActivity(Activity.activity_name, options, args) };
+        return .{ .ctx = ctx, .state = ctx.instance.executeActivity(Activity.activity_name, options, args).state };
     }
 
     /// Schedules an activity by its type name, for activities this program has no `Def` for
     /// (for example ones implemented in another language). `args` is a tuple of argument
     /// values; `Result` is the type to decode the result as.
     pub fn executeActivityByName(ctx: *Context, comptime Result: type, activity_type: []const u8, options: ActivityOptions, args: anytype) ActivityFuture(Result) {
-        return .{ .ctx = ctx, .state = ctx.instance.scheduleActivity(activity_type, options, args) };
+        return .{ .ctx = ctx, .state = ctx.instance.executeActivity(activity_type, options, args).state };
     }
 
     /// Schedules a local activity: one the worker running this workflow executes itself, for
@@ -452,13 +453,13 @@ pub const Context = struct {
     /// A retry whose backoff exceeds `local_retry_threshold` waits on a workflow timer;
     /// canceling the future then cancels the retry at once, whatever the cancellation type.
     pub fn executeLocalActivity(ctx: *Context, comptime Activity: type, options: LocalActivityOptions, args: Activity.Args) ActivityFuture(Activity.Result) {
-        return .{ .ctx = ctx, .state = ctx.instance.scheduleLocalActivity(Activity.activity_name, options, args) };
+        return .{ .ctx = ctx, .state = ctx.instance.executeLocalActivity(Activity.activity_name, options, args).state };
     }
 
     /// Schedules a local activity by its type name, decoding its result as `Result`. `args`
     /// is a tuple of argument values.
     pub fn executeLocalActivityByName(ctx: *Context, comptime Result: type, activity_type: []const u8, options: LocalActivityOptions, args: anytype) ActivityFuture(Result) {
-        return .{ .ctx = ctx, .state = ctx.instance.scheduleLocalActivity(activity_type, options, args) };
+        return .{ .ctx = ctx, .state = ctx.instance.executeLocalActivity(activity_type, options, args).state };
     }
 
     /// `SideEffectFailed`: the worker couldn't record the value (it shut down first, or a
@@ -482,12 +483,8 @@ pub const Context = struct {
     /// For a value that changes over the run, keep it in workflow state and record each new
     /// reading with another `sideEffect`.
     pub fn sideEffect(ctx: *Context, comptime T: type, context: anytype, comptime func: fn (@TypeOf(context)) T) SideEffectError!T {
-        const options: LocalActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
-        const state = if (ctx.instance.replaying)
-            ctx.instance.scheduleLocalActivity(Instance.side_effect_activity_type, options, .{})
-        else
-            ctx.instance.scheduleLocalActivity(Instance.side_effect_activity_type, options, .{func(context)});
-        const future: ActivityFuture(T) = .{ .ctx = ctx, .state = state };
+        const value: ?converter.Payload = if (ctx.instance.replaying) null else try converter.toPayload(ctx.allocator(), func(context));
+        const future: ActivityFuture(T) = .{ .ctx = ctx, .state = ctx.instance.sideEffect(value).state };
         return future.get() catch |err| switch (err) {
             error.ActivityFailed => error.SideEffectFailed,
             error.InvalidOptions => {
@@ -503,13 +500,13 @@ pub const Context = struct {
     /// result. `args` is a tuple of the child's parameters after its context. The child runs
     /// on whichever worker polls its task queue, this one included.
     pub fn executeChildWorkflow(ctx: *Context, comptime Workflow: type, options: ChildWorkflowOptions, args: Workflow.Args) ChildWorkflowFuture(Workflow.Result) {
-        return .{ .ctx = ctx, .state = ctx.instance.startChildWorkflow(Workflow.workflow_name, options, args) };
+        return .{ .ctx = ctx, .state = ctx.instance.executeChildWorkflow(Workflow.workflow_name, options, args).state };
     }
 
     /// Starts a child workflow by its type name, decoding its result as `Result`. `args` is a
     /// tuple of argument values.
     pub fn executeChildWorkflowByName(ctx: *Context, comptime Result: type, workflow_type: []const u8, options: ChildWorkflowOptions, args: anytype) ChildWorkflowFuture(Result) {
-        return .{ .ctx = ctx, .state = ctx.instance.startChildWorkflow(workflow_type, options, args) };
+        return .{ .ctx = ctx, .state = ctx.instance.executeChildWorkflow(workflow_type, options, args).state };
     }
 
     /// Sends `Signal` (a `SignalDef`) with `args` to the workflow `workflow_id` and returns a
@@ -523,7 +520,7 @@ pub const Context = struct {
     /// argument values) to the workflow `workflow_id`, like `signalExternalWorkflow`. The
     /// name and IDs are copied; `args` are encoded here.
     pub fn signalExternalWorkflowByName(ctx: *Context, signal_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype) SignalExternalFuture {
-        return .{ .ctx = ctx, .state = ctx.instance.signalExternal(.{ .execution = .{ .workflow_id = workflow_id, .run_id = run_id } }, signal_name, args) };
+        return ctx.instance.signalExternal(.{ .execution = .{ .workflow_id = workflow_id, .run_id = run_id } }, signal_name, args);
     }
 
     /// Requests cancellation of the workflow `workflow_id` and returns a future for the
@@ -532,7 +529,7 @@ pub const Context = struct {
     /// cancellation and may clean up, or ignore it. To cancel a child, cancel its future
     /// instead. The IDs are copied.
     pub fn cancelExternalWorkflow(ctx: *Context, workflow_id: []const u8, run_id: []const u8) CancelExternalFuture {
-        return .{ .ctx = ctx, .state = ctx.instance.requestCancelExternal(workflow_id, run_id) };
+        return ctx.instance.cancelExternalWorkflow(workflow_id, run_id);
     }
 
     /// The workflow's memo: the memo it started with, with this run's `upsertMemo` calls
@@ -826,7 +823,8 @@ pub const Context = struct {
 /// `InvalidOptions`: the options were rejected before scheduling (the worker logs why).
 pub const ActivityError = error{ ActivityFailed, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
 
-/// The pending result of an activity.
+/// The pending result of an activity. `ActivityFuture(converter.Payload)` returns the result
+/// still encoded, as workflow interceptors (`interceptor.WorkflowOutbound`) handle it.
 pub fn ActivityFuture(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -888,7 +886,8 @@ pub fn ActivityFuture(comptime T: type) type {
 /// `InvalidOptions`: the options were rejected before starting (the worker logs why).
 pub const ChildWorkflowError = error{ ChildWorkflowFailed, ChildWorkflowAlreadyStarted, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
 
-/// The pending start and result of a child workflow.
+/// The pending start and result of a child workflow. `ChildWorkflowFuture(converter.Payload)`
+/// returns the result still encoded, as workflow interceptors handle it.
 pub fn ChildWorkflowFuture(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -963,7 +962,7 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// workflow.
         pub fn signal(f: Self, comptime Signal: type, args: Signal.Args) ChildWorkflowError!SignalExternalFuture {
             const exec = try f.started();
-            return .{ .ctx = f.ctx, .state = f.ctx.instance.signalExternal(.{ .child = exec.workflow_id }, Signal.signal_name, args) };
+            return f.ctx.instance.signalExternal(.{ .child = exec.workflow_id }, Signal.signal_name, args);
         }
     };
 }
