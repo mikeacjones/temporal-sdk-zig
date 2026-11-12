@@ -1,0 +1,8 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The two
+// workflows hold the lock one after the other, for 10 seconds each.
+.{
+    .expect = .{ "Workflow1 completed", "Workflow2 completed" },
+    .timeout_seconds = 60,
+    .tests = .{"mutex_test.zig"},
+}
