@@ -212,6 +212,27 @@ pub const EncodedValues = struct {
     }
 };
 
+/// One value not yet decoded, or no value, for a caller that learns its type only at run
+/// time, such as the result of `Client.queryWorkflowByName`. A view: the payload lives as
+/// long as the memory it came from; decoded values come from the arena passed to `get`.
+pub const EncodedValue = struct {
+    payload: ?Payload,
+
+    /// Whether there is a value to decode.
+    pub fn hasValue(v: EncodedValue) bool {
+        return v.payload != null;
+    }
+
+    /// Decodes the value as `T` into `arena`. With no value, an optional `T` decodes as null
+    /// and anything else returns `error.WrongArgumentCount`, as `EncodedValues.get` does
+    /// past the last argument.
+    pub fn get(v: EncodedValue, comptime T: type, arena: Allocator) DecodeError!T {
+        if (v.payload) |p| return fromPayload(T, arena, p);
+        if (@typeInfo(T) == .optional) return null;
+        return error.WrongArgumentCount;
+    }
+};
+
 /// A named value, such as one entry of a workflow memo.
 pub const Field = struct {
     name: []const u8,
@@ -756,6 +777,23 @@ test "EncodedValues decodes arguments one at a time or as a tuple" {
     const args = try values.decode(struct { []const u8, i64 }, a);
     try testing.expectEqual(@as(i64, 42), args[1]);
     try testing.expectError(error.InvalidPayload, values.decode(struct { i64, i64 }, a));
+}
+
+test "EncodedValue decodes its value on demand, or reports that it has none" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const none: EncodedValue = .{ .payload = null };
+    try testing.expect(!none.hasValue());
+    try testing.expectEqual(@as(?i64, null), try none.get(?i64, a));
+    try testing.expectError(error.WrongArgumentCount, none.get(i64, a));
+
+    const some: EncodedValue = .{ .payload = try toPayload(a, @as([]const u8, "sleeping")) };
+    try testing.expect(some.hasValue());
+    try testing.expectEqualStrings("sleeping", try some.get([]const u8, a));
+    try testing.expectEqualStrings("sleeping", (try some.get(?[]const u8, a)).?);
+    try testing.expectError(error.InvalidPayload, some.get(i64, a));
 }
 
 /// The example from the file's header: a type with its own payload conversion.

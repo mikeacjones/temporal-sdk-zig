@@ -276,6 +276,15 @@ pub const Context = struct {
             else => |e| e,
         };
     }
+
+    /// Every payload of the previous attempt's last heartbeat, in order, undecoded; empty on
+    /// a first attempt or when it heartbeated without details. Use this when that attempt
+    /// may have sent several payloads, such as a worker in another language; `heartbeatDetails`
+    /// reads only the first. The payloads live as long as the activity's memory; decode each
+    /// with `get(T, ctx.allocator(), index)`.
+    pub fn encodedHeartbeatDetails(ctx: *const Context) converter.EncodedValues {
+        return .{ .payloads = ctx.heartbeat_details };
+    }
 };
 
 /// What a worker registers: a name and a type-erased call that decodes arguments, runs the
