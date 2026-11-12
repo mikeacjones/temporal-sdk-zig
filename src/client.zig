@@ -9,7 +9,9 @@
 //!
 //! Errors follow the SDK's pattern (see `temporal.failure`): `run.get` returns
 //! `error.WorkflowFailed` and the failure is read with `run.failure()`. RPC failures are
-//! logged with the server's message under the `temporal` log scope.
+//! logged with the server's message under the `temporal` log scope. Calls that send or
+//! receive payloads return `error.CodecFailed`, also logged, when a payload codec
+//! (`Options.codecs`) fails.
 
 const std = @import("std");
 const bridge = @import("bridge.zig");
@@ -38,6 +40,12 @@ pub const Options = struct {
     tls: ?Tls = null,
     /// gRPC headers sent with every call.
     headers: []const bridge.bytes.MetadataEntry = &.{},
+    /// Payload codecs, such as `converter.ZlibCodec` or encryption, applied in order to every
+    /// payload this client sends and in reverse to every payload it receives (results,
+    /// failures, memos, history events), and by every worker on this client to its workflow
+    /// and activity payloads. Search attributes are never encoded. Borrowed: the slice and
+    /// the codecs must outlive the client and its workers.
+    codecs: []const converter.PayloadCodec = &.{},
 
     pub const Tls = struct {
         /// PEM; empty uses the system roots.
@@ -57,6 +65,8 @@ pub const Client = struct {
     connection: bridge.Connection,
     namespace: []u8,
     identity: []u8,
+    /// `Options.codecs`, borrowed.
+    codecs: []const converter.PayloadCodec,
 
     /// Connects and checks the server. Close with `close`.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
@@ -92,7 +102,7 @@ pub const Client = struct {
             log.err("connecting to {s} failed: {s}", .{ options.host_port, message orelse @errorName(err) });
             return err;
         };
-        return .{ .gpa = gpa, .io = io, .runtime = runtime, .connection = connection, .namespace = namespace, .identity = identity };
+        return .{ .gpa = gpa, .io = io, .runtime = runtime, .connection = connection, .namespace = namespace, .identity = identity, .codecs = options.codecs };
     }
 
     pub fn close(c: *Client) void {
@@ -246,7 +256,7 @@ pub const Client = struct {
 
     /// Terminates a workflow execution: it stops at once, with no chance to clean up. An empty
     /// `run_id` targets the latest run.
-    pub fn terminateWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!void {
+    pub fn terminateWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
@@ -265,7 +275,7 @@ pub const Client = struct {
     /// from its next cancelable wait and may clean up before it returns; the run ends
     /// canceled when the workflow returns `error.Canceled`. An empty `run_id` targets the
     /// latest run. Returns `error.NotFound` if no such workflow exists.
-    pub fn cancelWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse }!void {
+    pub fn cancelWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
@@ -856,7 +866,7 @@ pub const Client = struct {
         return response.outcome != null or @backingInt(response.stage) >= @backingInt(want.toProto());
     }
 
-    const RpcError = error{ OutOfMemory, Canceled, RpcFailed, AlreadyExists, NotFound, InvalidResponse };
+    const RpcError = error{ OutOfMemory, Canceled, RpcFailed, AlreadyExists, NotFound, InvalidResponse, CodecFailed };
 
     /// Calls a WorkflowService method with a typed request and response. The response's
     /// memory comes from `arena`.
@@ -886,8 +896,13 @@ pub const Client = struct {
     /// NOT_FOUND is stored there (allocated from `arena`) for the caller to report instead
     /// of being logged.
     fn rpcWithStatus(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus) RpcError!Response {
+        var coded = request;
+        converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io) catch |err| {
+            if (err == error.CodecFailed) log.warn("{s} failed: encoding its payloads with the client's codecs failed", .{method});
+            return err;
+        };
         var encoded: Io.Writer.Allocating = .init(arena);
-        request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
+        coded.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var failure: ?bridge.Connection.RpcFailure = null;
         defer if (failure) |f| f.deinit(c.gpa);
         const bytes = c.connection.call(c.gpa, c.io, .workflow, method, encoded.written(), .{ .retry = true }, &failure) catch |err| switch (err) {
@@ -909,10 +924,15 @@ pub const Client = struct {
         defer c.gpa.free(bytes);
         const owned = try arena.dupe(u8, bytes);
         var reader: Io.Reader = .fixed(owned);
-        return Response.decode(&reader, arena) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.InvalidResponse,
+        var response = Response.decode(&reader, arena) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidResponse,
         };
+        converter.decodeMessage(Response, &response, c.codecs, arena, c.io) catch |err| {
+            if (err == error.CodecFailed) log.warn("{s} failed: decoding the response's payloads with the client's codecs failed", .{method});
+            return err;
+        };
+        return response;
     }
 };
 
@@ -954,6 +974,8 @@ pub const ActivityId = struct {
 };
 
 pub const ActivityCompletionError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,
@@ -964,6 +986,8 @@ pub const ActivityCompletionError = error{
 };
 
 pub const StartError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,
@@ -974,11 +998,13 @@ pub const StartError = error{
     InvalidSearchAttribute,
 };
 
-pub const SignalError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
+pub const SignalError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };
 
-pub const DescribeError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
+pub const DescribeError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };
 
 pub const ListError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     /// Also an invalid query; the server's reason is logged with the query.
@@ -1128,6 +1154,8 @@ pub const StartActivityOptions = struct {
 };
 
 pub const StartActivityError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     /// Also options or a server the call can't work with; the server's reason is logged.
@@ -1142,6 +1170,8 @@ pub const StartActivityError = error{
 };
 
 pub const ActivityResultError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,
@@ -1161,6 +1191,8 @@ pub const ActivityResultError = error{
 };
 
 pub const ActivityError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,
@@ -1453,6 +1485,8 @@ pub const ActivityExecutionIterator = struct {
 };
 
 pub const CreateScheduleError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     /// Also an invalid schedule; the server's reason is logged.
@@ -1466,6 +1500,8 @@ pub const CreateScheduleError = error{
 };
 
 pub const ScheduleError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,
@@ -1680,6 +1716,8 @@ pub const History = history_mod.History;
 pub const HistoryEvent = history_mod.HistoryEvent;
 
 pub const HistoryError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,
@@ -1793,6 +1831,8 @@ pub const QueryRejectCondition = enum {
 };
 
 pub const QueryError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,
@@ -1853,6 +1893,8 @@ pub const WorkflowDescription = struct {
 };
 
 pub const ResultError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,
@@ -1993,9 +2035,11 @@ pub const UpdateOptions = struct {
     wait_for_stage: UpdateStage = .completed,
 };
 
-pub const UpdateError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse };
+pub const UpdateError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };
 
 pub const UpdateWithStartError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,
@@ -2010,6 +2054,8 @@ pub const UpdateWithStartError = error{
 };
 
 pub const UpdateResultError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
     OutOfMemory,
     Canceled,
     RpcFailed,

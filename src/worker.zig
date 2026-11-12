@@ -301,6 +301,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .task_queue = w.task_queue,
         .namespace = w.client.namespace,
         .stack_size = w.options.workflow_stack_size,
+        .codecs = w.client.codecs,
     };
     defer runner.deinit();
     var message: ?[]u8 = null;
@@ -319,7 +320,9 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
 
 /// Turns workflow activations into completions for one worker (or replayer): keeps the cache
 /// of running workflow instances, creates them on InitializeWorkflow, and destroys them on
-/// eviction. Used from a single thread.
+/// eviction. Decodes each activation's payloads with `codecs` before a workflow sees them and
+/// encodes the completion's after, so codecs never run inside workflow code. Used from a
+/// single thread.
 pub const WorkflowRunner = struct {
     gpa: Allocator,
     workflows: *const std.StringHashMapUnmanaged(workflow.Registered),
@@ -328,6 +331,8 @@ pub const WorkflowRunner = struct {
     task_queue: []const u8,
     namespace: []const u8,
     stack_size: usize,
+    /// Borrowed; see `client.Options.codecs`.
+    codecs: []const converter.PayloadCodec = &.{},
     runs: std.StringHashMapUnmanaged(*Instance) = .empty,
     /// Called for each eviction with the core's reason and message (the replayer uses it to
     /// detect nondeterminism).
@@ -348,7 +353,7 @@ pub const WorkflowRunner = struct {
         var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        const completion = r.handle(bytes, a) catch |err| {
+        const completion = r.handle(bytes, a, io) catch |err| {
             log.err("processing a workflow activation failed: {t}", .{err});
             return;
         };
@@ -361,9 +366,14 @@ pub const WorkflowRunner = struct {
         };
     }
 
-    fn handle(r: *WorkflowRunner, bytes: []const u8, a: Allocator) !done_pb.WorkflowActivationCompletion {
+    fn handle(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io) !done_pb.WorkflowActivationCompletion {
         var reader: Io.Reader = .fixed(bytes);
-        const act = try act_pb.WorkflowActivation.decode(&reader, a);
+        var act = try act_pb.WorkflowActivation.decode(&reader, a);
+        converter.decodeMessage(act_pb.WorkflowActivation, &act, r.codecs, a, io) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // The task fails and is retried; the workflow never sees undecoded payloads.
+            error.Canceled, error.CodecFailed => return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "decoding the workflow activation's payloads with the client's codecs failed: {t}", .{err})),
+        };
 
         // An eviction comes alone; complete it, then drop the run.
         for (act.jobs.items) |job| if (job.variant) |v| if (v == .remove_from_cache) {
@@ -394,7 +404,12 @@ pub const WorkflowRunner = struct {
             try r.runs.put(r.gpa, key, inst);
             break :blk inst;
         };
-        return inst.activate(&act, a) catch |err| try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err}));
+        var completion = inst.activate(&act, a) catch |err| return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err}));
+        converter.encodeMessage(done_pb.WorkflowActivationCompletion, &completion, r.codecs, a, io) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled, error.CodecFailed => return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "encoding the workflow activation completion's payloads with the client's codecs failed: {t}", .{err})),
+        };
+        return completion;
     }
 };
 
@@ -541,7 +556,15 @@ fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivitie
         break :blk if (run.ctx.cancelReason() != null) task.cancel(w.io) else task.await(w.io);
     };
     const a = run.arena.allocator();
-    const result = outcome catch return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
+    var result = outcome catch return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
+    converter.encodeMessage(result_pb.ActivityExecutionResult, &result, w.client.codecs, a, w.io) catch |err| {
+        if (err == error.OutOfMemory) return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
+        // Report a failure without the payloads that couldn't be encoded.
+        result = .{ .status = .{ .failed = .{ .failure = failure_mod.application(a, .{
+            .message = std.fmt.allocPrint(a, "encoding the result of activity {s} with the client's codecs failed: {t}", .{ run.start.activity_id, err }) catch return,
+            .type = "PayloadCodecFailed",
+        }) catch return } } };
+    };
     var encoded: Io.Writer.Allocating = .init(a);
     (proto.coresdk.self.ActivityTaskCompletion{ .task_token = run.task_token, .result = result }).encode(&encoded.writer, a) catch return;
     var message: ?[]u8 = null;
@@ -573,6 +596,10 @@ const Heartbeats = struct {
         const a = scratch.allocator();
         var heartbeat: proto.coresdk.self.ActivityHeartbeat = .{ .task_token = h.task_token };
         heartbeat.details.appendSlice(a, details) catch return;
+        converter.encodeMessage(proto.coresdk.self.ActivityHeartbeat, &heartbeat, h.w.client.codecs, a, h.w.io) catch |err| {
+            log.warn("recording an activity heartbeat failed: encoding its details with the client's codecs failed: {t}", .{err});
+            return;
+        };
         var encoded: Io.Writer.Allocating = .init(a);
         heartbeat.encode(&encoded.writer, a) catch return;
         var message: ?[]u8 = null;
@@ -586,6 +613,13 @@ const Heartbeats = struct {
 fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !result_pb.ActivityExecutionResult {
     const a = run.arena.allocator();
     const start = &run.start;
+    converter.decodeMessage(task_pb.Start, start, w.client.codecs, a, w.io) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled, error.CodecFailed => return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
+            .message = try std.fmt.allocPrint(a, "decoding the input of activity {s} with the client's codecs failed: {t}", .{ start.activity_id, err }),
+            .type = "PayloadCodecFailed",
+        }) } } },
+    };
     const side_effect = start.is_local and std.mem.eql(u8, start.activity_type, Instance.side_effect_activity_type);
     const entry = if (side_effect) side_effect_activity else w.activities.get(start.activity_type) orelse w.dynamic_activity orelse {
         const known = try registeredNames(a, w.activities);

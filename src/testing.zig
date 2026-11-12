@@ -214,6 +214,10 @@ pub const WorkflowEnvironment = struct {
         /// Extra arguments for the dev server's `temporal server start-dev`, such as
         /// `DevServer.standalone_activity_args`.
         dev_server_extra_args: []const []const u8 = &.{},
+        /// The client's payload codecs (`client.Options.codecs`), which its worker and the
+        /// replay of each finished workflow use too. Borrowed: they must outlive the
+        /// environment.
+        codecs: []const converter.PayloadCodec = &.{},
     };
 
     /// Starts the environment on a dev server. Allocated so the worker's pointer to the
@@ -244,7 +248,9 @@ pub const WorkflowEnvironment = struct {
             .time_skipping => .{ .time_skipping = try TestServer.start(gpa, io, .{}) },
         };
         errdefer env.server.stop(io);
-        env.client = try client_mod.Client.connect(gpa, io, env.server.clientOptions());
+        var client_options = env.server.clientOptions();
+        client_options.codecs = options.codecs;
+        env.client = try client_mod.Client.connect(gpa, io, client_options);
         errdefer env.client.close();
         var suffix: [8]u8 = undefined;
         io.random(&suffix);
@@ -613,7 +619,7 @@ pub const WorkflowEnvironment = struct {
             .workflows = env.worker.workflows,
             .dynamic_workflow = env.worker.dynamic_workflow,
             .workflow_id = workflow_id,
-            .options = .{ .namespace = env.client.namespace, .task_queue = env.task_queue },
+            .options = .{ .namespace = env.client.namespace, .task_queue = env.task_queue, .codecs = env.client.codecs },
         };
         return replayer.replayHistory(history);
     }
@@ -691,6 +697,11 @@ pub const WorkflowReplayer = struct {
     pub const Options = struct {
         namespace: []const u8 = "default",
         task_queue: []const u8 = "replay",
+        /// Payload codecs that decode the history's payloads before the workflow sees them,
+        /// as the original worker's client did (`client.Options.codecs`). A history fetched
+        /// through a client with codecs is already decoded; codecs pass decoded payloads
+        /// through.
+        codecs: []const converter.PayloadCodec = &.{},
     };
 
     pub fn init(gpa: Allocator, io: Io) WorkflowReplayer {
@@ -883,6 +894,7 @@ pub const WorkflowReplayer = struct {
                     .task_queue = r.options.task_queue,
                     .namespace = r.options.namespace,
                     .stack_size = 256 * 1024,
+                    .codecs = r.options.codecs,
                     .on_evict = Outcome.record,
                     .on_evict_ctx = undefined,
                 },
@@ -3990,4 +4002,180 @@ test "a dynamic signal handler receives the signals no handler is registered for
     try env.signalWorkflow(RuntimeSignalFixtures.Color, run.id, .{"red"});
     try env.signalWorkflow(RuntimeSignalFixtures.Size, run.id, .{"large"});
     try testing.expectEqualStrings("approved by ann, color=red, size=large", try env.getResult(RuntimeSignalFixtures.InboxWf, &run, a, null));
+}
+
+/// Replaces each payload with one of encoding "test/reversed" holding the original,
+/// serialized and reversed, so no payload text reaches the server in the clear; decoding
+/// undoes "test/reversed" payloads and passes others through.
+const ReversingCodec = struct {
+    const encoding = "test/reversed";
+    encoded: std.atomic.Value(u32) = .init(0),
+
+    fn codec(r: *ReversingCodec) converter.PayloadCodec {
+        return .{ .ptr = r, .vtable = &.{ .encode = encode, .decode = decode } };
+    }
+
+    fn encode(ptr: *anyopaque, arena: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const r: *ReversingCodec = @ptrCast(@alignCast(ptr));
+        _ = r.encoded.fetchAdd(@intCast(payloads.len), .monotonic);
+        const out = try arena.alloc(converter.Payload, payloads.len);
+        for (payloads, out) |p, *o| {
+            var serialized: Io.Writer.Allocating = .init(arena);
+            p.encode(&serialized.writer, arena) catch return error.OutOfMemory;
+            std.mem.reverse(u8, serialized.written());
+            o.* = try converter.payloadWithEncoding(arena, encoding, serialized.written());
+        }
+        return out;
+    }
+
+    fn decode(_: *anyopaque, arena: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const out = try arena.dupe(converter.Payload, payloads);
+        for (out) |*p| {
+            if (!std.mem.eql(u8, converter.encodingOf(p.*) orelse "", encoding)) continue;
+            const data = try arena.dupe(u8, p.data);
+            std.mem.reverse(u8, data);
+            var reader: Io.Reader = .fixed(data);
+            p.* = converter.Payload.decode(&reader, arena) catch return error.CodecFailed;
+        }
+        return out;
+    }
+};
+
+const CodecFixtures = struct {
+    const Note = workflow.SignalDef("note", fn (text: []const u8) void);
+    const Notes = workflow.QueryDef("notes", fn () []const u8);
+    const Shout = workflow.UpdateDef("shout", fn (text: []const u8) []const u8);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        notes: std.ArrayList([]const u8) = .empty,
+        shouted: ?[]const u8 = null,
+
+        fn note(s: *State, text: []const u8) void {
+            s.notes.append(s.ctx.allocator(), text) catch {};
+        }
+        fn list(s: *State) []const u8 {
+            return std.mem.join(s.ctx.allocator(), ",", s.notes.items) catch "";
+        }
+        fn shout(s: *State, text: []const u8) ![]const u8 {
+            s.shouted = try std.ascii.allocUpperString(s.ctx.allocator(), text);
+            return s.shouted.?;
+        }
+        fn ready(s: *State) bool {
+            return s.notes.items.len > 0 and s.shouted != null;
+        }
+    };
+
+    fn refuse(ctx: *activity.Context, text: []const u8) ![]const u8 {
+        const details = try ctx.allocator().alloc(converter.Payload, 1);
+        details[0] = try converter.toPayload(ctx.allocator(), text);
+        return ctx.fail(.{ .message = "refused", .type = "Refused", .non_retryable = true, .details = details });
+    }
+    const Refuse = activity.Def("CodecRefuse", refuse);
+
+    fn child(ctx: *workflow.Context, text: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "child got {s}", .{text});
+    }
+    const Child = workflow.Def("CodecChild", child);
+
+    /// Runs an activity, a child, and a failing activity, waits for a signal and an update,
+    /// then fails with every value it saw (the memo's included) as the failure's details.
+    fn coded(ctx: *workflow.Context, input: []const u8) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setSignalHandler(Note, s, State.note);
+        try ctx.setQueryHandler(Notes, s, State.list);
+        try ctx.setUpdateHandler(Shout, s, State.shout);
+        const options: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+        const greeting = try ctx.executeActivity(Fixtures.Greet, options, .{input}).get();
+        const from_child = try ctx.executeChildWorkflow(Child, .{}, .{greeting}).get();
+        const refused = ctx.executeActivity(Refuse, options, .{input});
+        _ = refused.get() catch {};
+        const info = (failure_mod.rootCause(refused.failure() orelse return error.ActivityDidNotFail).failure_info) orelse return error.NoFailureInfo;
+        const details = info.application_failure_info.details orelse return error.NoFailureDetails;
+        const detail = try converter.fromPayload([]const u8, ctx.allocator(), details.payloads.items[0]);
+        try ctx.await(s, State.ready);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        const memo = (try ctx.memoValue([]const u8, "owner")) orelse "no memo";
+        const summary = try std.mem.join(ctx.allocator(), "|", &.{ greeting, from_child, detail, s.notes.items[0], s.shouted.?, memo });
+        const out = try ctx.allocator().alloc(converter.Payload, 1);
+        out[0] = try converter.toPayload(ctx.allocator(), summary);
+        return ctx.fail(.{ .message = "finished with a summary", .type = "Summary", .non_retryable = true, .details = out });
+    }
+    const Coded = workflow.Def("Coded", coded);
+};
+
+test "codecs encode every payload the client and worker send and decode what they receive" {
+    var reversing: ReversingCodec = .{};
+    const zlib: converter.ZlibCodec = .{};
+    const codecs = [_]converter.PayloadCodec{ reversing.codec(), zlib.codec() };
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs });
+    defer env.deinit();
+    try env.registerWorkflow(CodecFixtures.Coded);
+    try env.registerWorkflow(CodecFixtures.Child);
+    try env.registerActivity(Fixtures.Greet);
+    try env.registerActivity(CodecFixtures.Refuse);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(CodecFixtures.Coded, .{
+        .task_queue = "",
+        .memo = try converter.toFields(a, .{ .owner = "secret-memo" }),
+    }, .{"secret-input"});
+    defer run.deinit();
+    try env.signalWorkflow(CodecFixtures.Note, run.id, .{"secret-note"});
+    var shout = try env.client.updateWorkflow(CodecFixtures.Shout, run.id, run.run_id, .{"secret-update"}, .{});
+    defer shout.deinit();
+    try testing.expectEqualStrings("SECRET-UPDATE", try shout.get(a));
+    try testing.expectEqualStrings("secret-note", try env.queryWorkflow(CodecFixtures.Notes, a, run.id, .{}));
+
+    // Waiting for the result also replays the (decoded) history with the codecs.
+    var failure: ?failure_mod.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.getResult(CodecFixtures.Coded, &run, a, &failure));
+    const details = failure.?.failure_info.?.application_failure_info.details.?.payloads.items;
+    try testing.expectEqualStrings(
+        "Hello secret-input!|child got Hello secret-input!|secret-input|secret-note|SECRET-UPDATE|secret-memo",
+        try converter.fromPayload([]const u8, a, details[0]),
+    );
+    const description = try env.client.describeWorkflow(a, run.id, run.run_id);
+    try testing.expectEqualStrings("secret-memo", (try description.memoValue([]const u8, a, "owner")).?);
+    try testing.expect(reversing.encoded.load(.monotonic) > 0);
+
+    // A client without codecs sees what the server stored: no payload in the clear.
+    var plain = try client_mod.Client.connect(testing.allocator, testing.io, env.server.clientOptions());
+    defer plain.close();
+    const raw = try plain.fetchHistory(a, run.id, run.run_id);
+    var raw_bytes: Io.Writer.Allocating = .init(a);
+    try raw.encode(&raw_bytes.writer, a);
+    try testing.expect(std.mem.indexOf(u8, raw_bytes.written(), "secret") == null);
+    try testing.expect(std.mem.indexOf(u8, raw_bytes.written(), ReversingCodec.encoding) != null);
+    try testing.expectEqualStrings(ReversingCodec.encoding, converter.encodingOf(raw.events.items[0].attributes.?.workflow_execution_started_event_attributes.input.?.payloads.items[0]).?);
+
+    // The encoded history replays with the codecs.
+    var replayer: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .namespace = env.client.namespace, .task_queue = env.task_queue, .codecs = &codecs });
+    defer replayer.deinit();
+    replayer.workflow_id = run.id;
+    try replayer.registerWorkflow(CodecFixtures.Coded);
+    try replayer.replayHistory(raw);
+}
+
+/// A history of `Fixtures.Hello` run with `ReversingCodec`: every payload in it is encoded.
+const codec_history = @embedFile("testdata/codec_history.json");
+
+test "WorkflowReplayer decodes an encoded history with its codecs" {
+    var reversing: ReversingCodec = .{};
+    const codecs = [_]converter.PayloadCodec{reversing.codec()};
+    var with_codecs: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs });
+    defer with_codecs.deinit();
+    try with_codecs.registerWorkflow(Fixtures.Hello);
+    try with_codecs.replayHistoryJson(codec_history);
+    // Replay encodes the workflow's commands again, as the original worker did.
+    try testing.expect(reversing.encoded.load(.monotonic) > 0);
+
+    // Without them the workflow can't read its argument and does something else.
+    var without: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer without.deinit();
+    try without.registerWorkflow(Fixtures.Hello);
+    try testing.expectError(error.Nondeterminism, without.replayHistoryJson(codec_history));
 }
