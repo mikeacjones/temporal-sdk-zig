@@ -2932,6 +2932,55 @@ test "client: rpc_timeout doesn't cut short waiting for a workflow's result" {
     try testing.expectEqualStrings("finished", try waiting.get(arena.allocator()));
 }
 
+test "client: query a workflow by a name known only at run time" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Queryable);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(Fixtures.Queryable, .{ .task_queue = "" }, .{std.time.s_per_hour});
+    defer run.deinit();
+    const status = try env.client.queryWorkflowByName(Fixtures.Status.query_name, a, run.id, run.run_id, .{});
+    try testing.expect(status.hasValue());
+    try testing.expectEqualStrings(try env.client.queryWorkflow(Fixtures.Status, a, run.id, run.run_id, .{}), try status.get([]const u8, a));
+    try testing.expectError(error.InvalidPayload, status.get(i64, a));
+    try Fixtures.waitForTimer(&env.client, run.id, run.run_id);
+    const sum = try env.client.queryWorkflowByNameWithOptions(Fixtures.Add.query_name, a, run.id, "", .{ @as(i64, 1), @as(i64, 2) }, .{ .reject_condition = .not_open });
+    try testing.expectEqual(try env.client.queryWorkflow(Fixtures.Add, a, run.id, "", .{ 1, 2 }), try sum.get(i64, a));
+
+    var message: []const u8 = "";
+    try testing.expectError(error.QueryFailed, env.client.queryWorkflowByNameWithOptions("missing", a, run.id, "", .{}, .{ .failure_message = &message }));
+    try testing.expect(std.mem.indexOf(u8, message, "query type \"missing\" is not registered") != null);
+    try testing.expectError(error.QueryFailed, env.client.queryWorkflowByName("missing", a, run.id, "", .{}));
+    try env.client.cancelWorkflow(run.id, run.run_id, "");
+}
+
+test "ActivityEnvironment hands the activity every payload of the previous attempt's heartbeat" {
+    const S = struct {
+        fn resumeWork(ctx: *activity.Context) !void {
+            const details = ctx.encodedHeartbeatDetails();
+            if (!ctx.hasHeartbeatDetails()) return testing.expectEqual(@as(usize, 0), details.len());
+            try testing.expectEqual(@as(usize, 3), details.len());
+            try testing.expectEqual(@as(i64, 5), try details.get(i64, ctx.allocator(), 0));
+            try testing.expectEqualStrings("cursor-9", try details.get([]const u8, ctx.allocator(), 1));
+            try testing.expect(try details.get(bool, ctx.allocator(), 2));
+            try testing.expectEqual(@as(i64, 5), try ctx.heartbeatDetails(i64));
+        }
+        const Resume = activity.Def("Resume", resumeWork);
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var env: ActivityEnvironment = .init(testing.io);
+    try env.executeActivity(S.Resume, .{}, a);
+    const previous = try converter.toPayloads(a, .{ @as(i64, 5), @as([]const u8, "cursor-9"), true });
+    env.heartbeat_details = previous.items;
+    try env.executeActivity(S.Resume, .{}, a);
+}
+
 test "client: signal a running workflow; signaling an unknown or closed one is NotFound" {
     const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
