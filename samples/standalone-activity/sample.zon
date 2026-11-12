@@ -1,0 +1,13 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. Listing and
+// counting are eventually consistent, so only their headings are checked.
+.{
+    .expect = .{
+        "Started standalone activity ActivityID=standalone_activity_helloworld_ActivityID RunID=",
+        "Activity result: Hello Temporal!",
+        "ListActivities results",
+        "Total activities: ",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"activity_test.zig"},
+}
