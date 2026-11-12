@@ -135,7 +135,9 @@ pub const Metrics = struct {
         prometheus: Prometheus,
         /// Push metrics to an OpenTelemetry collector.
         opentelemetry: OpenTelemetry,
-        /// Hand metrics to SDK code. The core frees it through its own `meter_free` callback.
+        /// Hand metrics to SDK code (see `metric.CustomMeter`). `init` takes ownership: the
+        /// core frees it through its own `meter_free` callback, and `init` does so on errors
+        /// found before the core sees it.
         custom: *const c.TemporalCoreCustomMetricMeter,
     };
 
@@ -177,6 +179,12 @@ pub const InitError = error{
 /// Creates a runtime. On `error.RuntimeInitFailed`, `failure` (if given) receives the core's
 /// message, allocated with `gpa`; the caller frees it.
 pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtime {
+    var custom_meter: ?*const c.TemporalCoreCustomMetricMeter = if (options.metrics) |m| switch (m.exporter) {
+        .custom => |meter| meter,
+        else => null,
+    } else null;
+    errdefer if (custom_meter) |m| m.meter_free.?(m);
+
     // Everything the core reads from the options only needs to live through this call.
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -257,6 +265,8 @@ pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtim
         .disable_environment_info = options.disable_environment_info,
     };
 
+    // From here the core owns the custom meter, on failure too.
+    custom_meter = null;
     const result = c.temporal_core_runtime_new(&core_options);
     const ptr = result.runtime orelse return error.RuntimeInitFailed;
     if (bytes.Owned.take(ptr, result.fail)) |fail| {

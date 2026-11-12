@@ -15,6 +15,9 @@ pub const Completion = @import("bridge/completion.zig").Completion;
 /// The core runtime: threads, telemetry, and process-wide worker settings.
 pub const Runtime = @import("bridge/Runtime.zig");
 
+/// The runtime's metric meter, and custom meters the core records to.
+pub const metric = @import("bridge/metric.zig");
+
 /// Local dev and time-skipping test servers started by the core.
 pub const EphemeralServer = @import("bridge/EphemeralServer.zig");
 
@@ -28,6 +31,7 @@ test {
     _ = bytes;
     _ = @import("bridge/completion.zig");
     _ = Runtime;
+    _ = metric;
     _ = EphemeralServer;
     _ = Connection;
     _ = Worker;
