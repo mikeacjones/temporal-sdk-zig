@@ -1033,19 +1033,19 @@ pub const ScheduleHandle = struct {
     }
 
     /// Changes the schedule by read-modify-write: describes it, calls
-    /// `f(context, &description)`, and sends the `schedule.Update` it returns; null leaves
-    /// the schedule as it is. The update carries the description's conflict token, so the
-    /// server doesn't apply it over a change made since the describe. The server applies the
-    /// update's search attributes a moment after the call returns.
+    /// `f(context, arena, &description)`, and sends the `schedule.Update` it returns; null
+    /// leaves the schedule as it is. The update carries the description's conflict token, so
+    /// the server doesn't apply it over a change made since the describe. The server applies
+    /// the update's search attributes a moment after the call returns.
     ///
-    /// The description's memory is freed when `update` returns. Whatever the callback puts
-    /// into the update must live at least that long: memory owned by `context` or static
-    /// data, never a literal like `&.{...}` with run-time values, which lives on the
-    /// callback's stack.
+    /// The description lives in `arena`, and anything the callback allocates from it lives
+    /// until the request is sent; `update` frees it all before returning.
     ///
-    ///     const hourly = [_]schedule.Interval{.{ .every = .fromSeconds(3600) }};
-    ///     try handle.update(@as([]const schedule.Interval, &hourly), struct {
-    ///         fn f(intervals: []const schedule.Interval, d: *schedule.Description) !?schedule.Update {
+    ///     try handle.update(Io.Duration.fromSeconds(3600), struct {
+    ///         fn f(every: Io.Duration, arena: Allocator, d: *schedule.Description) !?schedule.Update {
+    ///             const intervals = try arena.alloc(schedule.Interval, d.schedule.spec.intervals.len + 1);
+    ///             @memcpy(intervals[1..], d.schedule.spec.intervals);
+    ///             intervals[0] = .{ .every = every };
     ///             d.schedule.spec.intervals = intervals;
     ///             return .{ .schedule = d.schedule };
     ///         }
@@ -1056,7 +1056,7 @@ pub const ScheduleHandle = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
         var description = try h.describe(a);
-        const changes: schedule.Update = (try f(context, &description)) orelse return;
+        const changes: schedule.Update = (try f(context, a, &description)) orelse return;
         _ = c.rpc(wfs.UpdateScheduleResponse, "UpdateSchedule", wfs.UpdateScheduleRequest{
             .namespace = c.namespace,
             .schedule_id = h.id,

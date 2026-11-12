@@ -2899,15 +2899,18 @@ const ScheduleFixtures = struct {
     }
     const ScheduledBy = workflow.Def("ScheduledBy", scheduledBy);
 
-    fn newSpec(intervals: []const schedule.Interval, d: *schedule.Description) !?schedule.Update {
+    /// Replaces the intervals with one of `every`, built in the update's arena.
+    fn newSpec(every: Io.Duration, arena: Allocator, d: *schedule.Description) !?schedule.Update {
+        const intervals = try arena.alloc(schedule.Interval, 1);
+        intervals[0] = .{ .every = every };
         d.schedule.spec.intervals = intervals;
         d.schedule.state.note = "slowed down";
-        return .{ .schedule = d.schedule, .search_attributes = &new_search_attributes };
+        const updates = try arena.alloc(search_attributes.Update, 1);
+        updates[0] = Fixtures.priority.set(2);
+        return .{ .schedule = d.schedule, .search_attributes = updates };
     }
-    // Static: what the callback returns must outlive it.
-    const new_search_attributes = [_]search_attributes.Update{Fixtures.priority.set(2)};
 
-    fn noChange(_: void, _: *schedule.Description) error{}!?schedule.Update {
+    fn noChange(_: void, _: Allocator, _: *schedule.Description) error{}!?schedule.Update {
         return null;
     }
 
@@ -2981,8 +2984,7 @@ test "client: create, describe, update, pause, trigger, backfill, list and delet
 
     // Update by read-modify-write: an hourly interval leaves only triggers and backfills.
     try handle.update({}, ScheduleFixtures.noChange);
-    const hourly = [_]schedule.Interval{.{ .every = .fromSeconds(3600) }};
-    try handle.update(@as([]const schedule.Interval, &hourly), ScheduleFixtures.newSpec);
+    try handle.update(Io.Duration.fromSeconds(3600), ScheduleFixtures.newSpec);
     d = try handle.describe(a);
     try testing.expectEqual(@as(usize, 1), d.schedule.spec.intervals.len);
     try testing.expectEqual(Io.Duration.fromSeconds(3600), d.schedule.spec.intervals[0].every);
