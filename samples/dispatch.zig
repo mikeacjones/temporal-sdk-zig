@@ -50,6 +50,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "polling:starter")) return @import("polling/starter.zig").main(init);
     if (std.mem.eql(u8, name, "query:worker")) return @import("query/worker.zig").main(init);
     if (std.mem.eql(u8, name, "query:starter")) return @import("query/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "recovery:worker")) return @import("recovery/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "recovery:starter")) return @import("recovery/starter.zig").main(init);
     if (std.mem.eql(u8, name, "reqrespactivity:worker")) return @import("reqrespactivity/worker.zig").main(init);
     if (std.mem.eql(u8, name, "reqrespactivity:starter")) return @import("reqrespactivity/starter.zig").main(init);
     if (std.mem.eql(u8, name, "reqrespquery:worker")) return @import("reqrespquery/worker.zig").main(init);

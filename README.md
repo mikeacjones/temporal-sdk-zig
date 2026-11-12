@@ -9,7 +9,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
 
 ## Status
 
-Workflows can run activities and local activities (sequentially, in parallel, or chosen at run time), start child workflows, wait on timers, race activities against timers, run concurrent coroutines on the workflow's deterministic `std.Io`, await conditions, answer typed queries, handle signals and updates (with validators) in their own coroutines, wait for all handlers to finish, continue as new, and read and upsert their memo. Cancellation reaches workflows, activities, and children as `std.Io` cancellation, honoring each activity's or child's cancellation type. Activities can share state, heartbeat, observe cancellation, and resume from their last heartbeat on retry. Clients can start workflows with a start delay, a cron schedule, or a memo, wait for results (following continue-as-new), signal, signal-with-start, update (waiting for acceptance or completion), update-with-start, query, describe, cancel, and terminate workflows. Tests run on a dev server or the time-skipping test server, and can signal, query, and update the workflows they start. Forty [samples](samples) pass against a dev server with their tests (see [Parity](#parity)). Every test run through the test environment also replays the workflow's own history to check determinism.
+Workflows can run activities and local activities (sequentially, in parallel, or chosen at run time), start child workflows, wait on timers, race activities against timers, run concurrent coroutines on the workflow's deterministic `std.Io`, await conditions, answer typed queries, handle signals and updates (with validators) in their own coroutines, wait for all handlers to finish, continue as new, and read and upsert their memo. Cancellation reaches workflows, activities, and children as `std.Io` cancellation, honoring each activity's or child's cancellation type. Activities can share state, heartbeat, observe cancellation, and resume from their last heartbeat on retry. Clients can start workflows with a start delay, a cron schedule, or a memo, wait for results (following continue-as-new), signal, signal-with-start, update (waiting for acceptance or completion), update-with-start, query, describe, cancel, and terminate workflows. Tests run on a dev server or the time-skipping test server, and can signal, query, and update the workflows they start. Forty-one [samples](samples) pass against a dev server with their tests (see [Parity](#parity)). Every test run through the test environment also replays the workflow's own history to check determinism.
 
 Signaling other workflows from a workflow, Nexus, search attributes, schedules, and most client and worker options are not implemented yet.
 
@@ -99,6 +99,7 @@ Where the Go SDK relies on machinery Temporal's Rust core doesn't have, this SDK
 | [mutex](samples/mutex) | mutex |
 | [searchattributes](samples/searchattributes) | searchattributes, typed-searchattributes |
 | [multi-history-replay](samples/multi-history-replay) | multi-history-replay |
+| [recovery](samples/recovery) | recovery |
 
 ## Development
 
