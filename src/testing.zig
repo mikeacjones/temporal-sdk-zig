@@ -1154,6 +1154,77 @@ const LineageFixtures = struct {
     const Describe = workflow.Def("DescribeLineage", describe);
 };
 
+const ExternalFixtures = struct {
+    const Approve = workflow.SignalDef("approve", fn (approver: []const u8) void);
+
+    const State = struct {
+        approver: ?[]const u8 = null,
+        fn approve(s: *State, approver: []const u8) void {
+            s.approver = approver;
+        }
+        fn approved(s: *State) bool {
+            return s.approver != null;
+        }
+    };
+
+    /// Waits for an approval and returns the approver.
+    fn waitForApproval(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{};
+        try ctx.setSignalHandler(Approve, s, State.approve);
+        try ctx.await(s, State.approved);
+        return s.approver.?;
+    }
+    const WaitForApproval = workflow.Def("WaitForApproval", waitForApproval);
+
+    /// Approves the latest run of `workflow_id` as "ann" and returns "delivered", or the
+    /// error and the failure's message.
+    fn approveOther(ctx: *workflow.Context, workflow_id: []const u8) ![]const u8 {
+        const f = ctx.signalExternalWorkflow(Approve, workflow_id, "", .{"ann"});
+        f.get() catch |err| switch (err) {
+            error.ExternalWorkflowNotFound => return std.fmt.allocPrint(ctx.allocator(), "{t}: {s}", .{ err, f.failure().?.message }),
+            else => return err,
+        };
+        return "delivered";
+    }
+    const ApproveOther = workflow.Def("ApproveOther", approveOther);
+
+    /// Waits for its parent's approval, then sends it back to the parent's run.
+    fn echoChild(ctx: *workflow.Context) !void {
+        const approver = try waitForApproval(ctx);
+        const parent = ctx.info().parent orelse return error.NoParent;
+        const echoed = try std.fmt.allocPrint(ctx.allocator(), "{s} via the child", .{approver});
+        try ctx.signalExternalWorkflow(Approve, parent.workflow_id, parent.run_id, .{echoed}).get();
+    }
+    const EchoChild = workflow.Def("EchoChild", echoChild);
+
+    /// Approves `EchoChild` through its future and returns what it sends back.
+    fn pingPong(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{};
+        try ctx.setSignalHandler(Approve, s, State.approve);
+        const child = ctx.executeChildWorkflow(EchoChild, .{ .id = "echo-child" }, .{});
+        try (try child.signal(Approve, .{"ann"})).get();
+        try ctx.await(s, State.approved);
+        try child.get();
+        return s.approver.?;
+    }
+    const PingPong = workflow.Def("PingPong", pingPong);
+
+    /// `pingPong` without the signal to the child, which can't replay `PingPong`'s history.
+    fn pingPongChanged(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{};
+        try ctx.setSignalHandler(Approve, s, State.approve);
+        const child = ctx.executeChildWorkflow(EchoChild, .{ .id = "echo-child" }, .{});
+        _ = try child.started();
+        try ctx.await(s, State.approved);
+        try child.get();
+        return s.approver.?;
+    }
+    const PingPongChanged = workflow.Def("PingPong", pingPongChanged);
+};
+
 const ContinueFixtures = struct {
     /// Records `count` in the memo, then continues as new with `count + 1` until it reaches
     /// `until`. Each run checks that it continued from `previous_run_id`. The last run returns
@@ -2267,6 +2338,54 @@ test "workflow.Info: a child sees its parent, and a grandchild its parent and th
     const a = arena.allocator();
     const result = try env.executeWorkflowWithOptions(LineageFixtures.Describe, .{ .id = "lineage", .task_queue = "" }, .{2}, a, null);
     try testing.expectEqualStrings("-/-;lineage/lineage;lineage-c/lineage", result);
+}
+
+test "signalExternalWorkflow: one workflow signals another by ID and waits for the delivery" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ExternalFixtures.WaitForApproval);
+    try env.registerWorkflow(ExternalFixtures.ApproveOther);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var receiver = try env.startWorkflow(ExternalFixtures.WaitForApproval, .{ .task_queue = "" }, .{});
+    defer receiver.deinit();
+    try testing.expectEqualStrings("delivered", try env.executeWorkflow(ExternalFixtures.ApproveOther, .{receiver.id}, a, null));
+    try testing.expectEqualStrings("ann", try env.getResult(ExternalFixtures.WaitForApproval, &receiver, a, null));
+
+    // The receiver has closed now, and a workflow that never ran isn't found either.
+    for ([_][]const u8{ receiver.id, "no-such-workflow" }) |id| {
+        const result = try env.executeWorkflow(ExternalFixtures.ApproveOther, .{id}, a, null);
+        try testing.expect(std.mem.startsWith(u8, result, "ExternalWorkflowNotFound: Unable to signal external workflow because it was not found"));
+        try testing.expect(std.mem.indexOf(u8, result, id) != null);
+    }
+}
+
+test "signalExternalWorkflow: a parent signals its child, which signals the parent back through Info.parent" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ExternalFixtures.PingPong);
+    try env.registerWorkflow(ExternalFixtures.EchoChild);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("ann via the child", try env.executeWorkflow(ExternalFixtures.PingPong, .{}, arena.allocator(), null));
+}
+
+/// A dev-server run of `ExternalFixtures.PingPong`, whose child ran on the same worker,
+/// exported with `temporal workflow show`.
+const signal_external_history = @embedFile("testdata/signal_external_history.json");
+
+test "WorkflowReplayer replays signals to other workflows and catches a dropped signal" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(ExternalFixtures.PingPong);
+    try ok.replayHistoryJson(signal_external_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(ExternalFixtures.PingPongChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(signal_external_history));
 }
 
 /// A dev-server run of `ChildFixtures.Parent`, whose child ran on the same worker, exported

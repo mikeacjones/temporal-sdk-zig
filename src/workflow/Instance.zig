@@ -42,10 +42,15 @@ commands: std.ArrayList(cmd_pb.WorkflowCommand) = .empty,
 next_activity_seq: u32 = 1,
 next_timer_seq: u32 = 1,
 next_child_seq: u32 = 1,
+/// Signals and cancellation requests to other workflows share one sequence space; the core
+/// keys each kind separately, so their seqs never meet.
+next_external_seq: u32 = 1,
 activities: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 timers: std.AutoHashMapUnmanaged(u32, *WorkflowIo.Timer) = .empty,
 /// Child workflows that have not closed, by seq.
 children: std.AutoHashMapUnmanaged(u32, *ChildState) = .empty,
+/// Signals and cancellation requests to other workflows that the core has not resolved, by seq.
+externals: std.AutoHashMapUnmanaged(u32, *ExternalState) = .empty,
 /// Local activities waiting on a workflow timer before their next attempt, by timer seq.
 backoffs: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 /// Coroutines blocked in `awaitCondition`, in the order they started waiting.
@@ -218,6 +223,29 @@ pub const ChildState = struct {
     }
 };
 
+/// A signal or cancellation request sent to another workflow, from its command until the
+/// core resolves it. Arena memory; the future keeps pointing at it after it resolves.
+pub const ExternalState = struct {
+    seq: u32,
+    kind: Kind,
+    /// The target's workflow ID, named in the failure's message.
+    workflow_id: []const u8,
+    waiter: ?*WorkflowIo.Wait = null,
+    outcome: ?Outcome = null,
+    cancel_requested: bool = false,
+
+    pub const Kind = enum { signal, cancel };
+
+    /// `not_found`: the workflow (or its namespace) doesn't exist or has closed. `failed`: the
+    /// server refused for another reason. `canceled`: a signal canceled before it was sent.
+    pub const Outcome = union(enum) {
+        delivered,
+        not_found: *const Failure,
+        failed: *const Failure,
+        canceled: *const Failure,
+    };
+};
+
 pub const Options = struct {
     /// The worker's task queue and namespace, reported in `Info` and used as the default task
     /// queue for activities.
@@ -322,6 +350,12 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
             .resolve_activity => |r| try inst.resolveActivity(&r),
             .resolve_child_workflow_execution_start => |r| try inst.resolveChildStart(&r),
             .resolve_child_workflow_execution => |r| try inst.resolveChild(&r),
+            .resolve_signal_external_workflow => |r| try inst.resolveExternal(r.seq, r.failure, switch (r.cause) {
+                .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND,
+                .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND,
+                => true,
+                else => false,
+            }),
             .cancel_workflow => if (!inst.finished) if (inst.root) |root| inst.wio.cancelTask(root),
             .remove_from_cache => {},
             else => |other| {
@@ -572,7 +606,7 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
 fn updateFailure(a: Allocator, run: *const HandlerRun, err: anyerror) error{OutOfMemory}!Failure {
     switch (err) {
         error.ApplicationFailure => if (run.pending_failure) |p| return failure_mod.application(a, p),
-        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted => if (run.last_failure) |f| return f.*,
+        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed => if (run.last_failure) |f| return f.*,
         else => {},
     }
     return failure_mod.fromError(a, err);
@@ -759,7 +793,7 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
         .{ inst.ctx.pending_failure, inst.ctx.last_failure };
     if (pending) |p| return failure_mod.application(a, p);
     switch (err) {
-        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted => if (last) |f| return f.*,
+        error.ActivityFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed => if (last) |f| return f.*,
         // Only the workflow function's return of ctx.continueAsNew's error continues as new.
         error.ContinueAsNew => return failure_mod.application(a, .{
             .message = if (inst.continue_as_new == null)
@@ -1198,6 +1232,104 @@ fn resolveChild(inst: *Instance, r: *const act_pb.ResolveChildWorkflowExecution)
         .cancelled => |c| .{ .cancelled = try dupeFailure(a, c.failure) },
     };
     state.wake(&inst.wio);
+}
+
+// ---------------------------------------------------------------- external workflows
+
+/// Whom a signal goes to: a workflow by ID (and run ID, empty for its latest run), or a
+/// child of this workflow by its workflow ID.
+pub const SignalTarget = union(enum) {
+    execution: struct { workflow_id: []const u8, run_id: []const u8 },
+    child: []const u8,
+};
+
+/// Emits SignalExternalWorkflowExecution sending `signal_name` with `args` (encoded here) to
+/// `target`. The IDs are copied into the arena.
+pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []const u8, args: anytype) ScheduleError!*ExternalState {
+    const workflow_id = switch (target) {
+        .execution => |e| e.workflow_id,
+        .child => |id| id,
+    };
+    if (workflow_id.len == 0) {
+        inst.logger.warn("signalExternalWorkflow: the target workflow ID is empty", .{ .SignalName = signal_name });
+        return error.InvalidOptions;
+    }
+    const a = inst.arena();
+    const state = try inst.newExternal(.signal, workflow_id);
+    try inst.commands.append(a, .{ .variant = .{ .signal_external_workflow_execution = .{
+        .seq = state.seq,
+        .signal_name = signal_name,
+        .args = try converter.toPayloads(a, args),
+        .target = switch (target) {
+            .execution => |e| .{ .workflow_execution = .{
+                .namespace = inst.namespace,
+                .workflow_id = state.workflow_id,
+                .run_id = try a.dupe(u8, e.run_id),
+            } },
+            .child => .{ .child_workflow_id = state.workflow_id },
+        },
+    } } });
+    return state;
+}
+
+fn newExternal(inst: *Instance, kind: ExternalState.Kind, workflow_id: []const u8) !*ExternalState {
+    const a = inst.arena();
+    const state = try a.create(ExternalState);
+    state.* = .{ .seq = inst.next_external_seq, .kind = kind, .workflow_id = try a.dupe(u8, workflow_id) };
+    try inst.externals.put(a, state.seq, state);
+    inst.next_external_seq += 1;
+    return state;
+}
+
+/// Blocks the calling coroutine until the core resolves the signal or cancellation request.
+/// When the coroutine is canceled while waiting, returns error.Canceled at once; for a signal
+/// it also sends CancelSignalWorkflow, which withdraws the signal if the server hasn't
+/// recorded it yet (a recorded signal is delivered anyway). A cancellation request can't be
+/// withdrawn. Eviction ends the wait with error.Canceled.
+pub fn awaitExternal(inst: *Instance, state: *ExternalState) error{Canceled}!void {
+    if (state.outcome != null) return;
+    var wait = inst.wio.newWaitPoint();
+    state.waiter = &wait;
+    defer state.waiter = null;
+    while (state.outcome == null) {
+        if (inst.evicting) return error.Canceled;
+        wait = inst.wio.newWaitPoint();
+        inst.wio.waitFor(&wait, true) catch |err| {
+            inst.cancelExternal(state);
+            return err;
+        };
+    }
+}
+
+fn cancelExternal(inst: *Instance, state: *ExternalState) void {
+    if (state.kind != .signal or state.outcome != null or state.cancel_requested) return;
+    state.cancel_requested = true;
+    inst.commands.append(inst.arena(), .{ .variant = .{ .cancel_signal_workflow = .{ .seq = state.seq } } }) catch {
+        inst.task_failure = "out of memory canceling a signal to an external workflow";
+    };
+}
+
+/// Applies a ResolveSignalExternalWorkflow or ResolveRequestCancelExternalWorkflow job: no
+/// failure means the server delivered it. A canceled failure is a signal withdrawn before it
+/// was sent; `not_found` is from the job's cause.
+fn resolveExternal(inst: *Instance, seq: u32, failure: ?Failure, not_found: bool) !void {
+    const kv = inst.externals.fetchRemove(seq) orelse return;
+    const state = kv.value;
+    const f = failure orelse {
+        state.outcome = .delivered;
+        if (state.waiter) |w| inst.wio.wake(w);
+        return;
+    };
+    const a = inst.arena();
+    const copy = try a.create(Failure);
+    copy.* = try f.dupe(a);
+    if (f.failure_info != null and f.failure_info.? == .canceled_failure_info) {
+        state.outcome = .{ .canceled = copy };
+    } else {
+        copy.message = try std.fmt.allocPrint(a, "{s} (workflow ID \"{s}\")", .{ f.message, state.workflow_id });
+        state.outcome = if (not_found) .{ .not_found = copy } else .{ .failed = copy };
+    }
+    if (state.waiter) |w| inst.wio.wake(w);
 }
 
 fn dupeFailure(a: Allocator, f: ?Failure) !*const Failure {
@@ -2951,6 +3083,164 @@ test "child workflow: an empty workflow type returns error.InvalidOptions from g
     const done = commandsOf(try inst.activate(&try initActivation(a, "ByName", .{}), a));
     try testing.expectEqual(@as(usize, 1), done.len);
     try testing.expectEqualStrings("InvalidOptions", done[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+// Signals to other workflows. `ExternalWf.Kid` never runs here: the tests resolve it.
+const ExternalWf = struct {
+    const Approve = workflow.SignalDef("approve", fn (approver: []const u8) void);
+
+    /// Describes how `get` ended: "delivered", or the error and the failure's message.
+    fn outcome(ctx: *workflow.Context, f: workflow.SignalExternalFuture) ![]const u8 {
+        f.get() catch |err| switch (err) {
+            error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed => return std.fmt.allocPrint(ctx.allocator(), "{t}: {s}", .{ err, f.failure().?.message }),
+            else => return err,
+        };
+        return "delivered";
+    }
+
+    /// Signals the workflow `workflow_id` with an approval from "ann".
+    fn signal(ctx: *workflow.Context, workflow_id: []const u8, run_id: []const u8) ![]const u8 {
+        return outcome(ctx, ctx.signalExternalWorkflow(Approve, workflow_id, run_id, .{"ann"}));
+    }
+    const Signal = workflow.Def("SignalOther", signal);
+
+    /// Signals the same workflow twice; a returned error fails the workflow.
+    fn signalTwice(ctx: *workflow.Context) !void {
+        try ctx.signalExternalWorkflow(Approve, "target", "", .{"ann"}).get();
+        try ctx.signalExternalWorkflow(Approve, "target", "", .{"bob"}).get();
+    }
+    const SignalTwice = workflow.Def("SignalTwice", signalTwice);
+
+    fn kid(ctx: *workflow.Context) !void {
+        _ = ctx;
+    }
+    const Kid = workflow.Def("Kid", kid);
+
+    /// Starts `Kid`, signals it, then waits for it.
+    fn signalChild(ctx: *workflow.Context) ![]const u8 {
+        const child = ctx.executeChildWorkflow(Kid, .{ .id = "kid-1" }, .{});
+        const delivered = try outcome(ctx, try child.signal(Approve, .{"ann"}));
+        try child.get();
+        return delivered;
+    }
+    const SignalChild = workflow.Def("SignalChild", signalChild);
+};
+
+fn signalResolved(a: Allocator, seq: u32, failure: ?Failure, cause: proto.temporal.api.enums.v1.SignalExternalWorkflowExecutionFailedCause) !act_pb.WorkflowActivation {
+    return oneJob(a, .{ .resolve_signal_external_workflow = .{ .seq = seq, .failure = failure, .cause = cause } });
+}
+
+test "signal external: SignalExternalWorkflowExecution to the workflow, then its delivery" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.Signal.registered, .{ .namespace = "ns" });
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "SignalOther", .{ @as([]const u8, "target"), @as([]const u8, "target-run") }), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const cmd = first[0].variant.?.signal_external_workflow_execution;
+    try testing.expectEqual(@as(u32, 1), cmd.seq);
+    try testing.expectEqualStrings("approve", cmd.signal_name);
+    try testing.expectEqualStrings("\"ann\"", cmd.args.items[0].data);
+    const target = cmd.target.?.workflow_execution;
+    try testing.expectEqualStrings("ns", target.namespace);
+    try testing.expectEqualStrings("target", target.workflow_id);
+    try testing.expectEqualStrings("target-run", target.run_id);
+
+    const done = try inst.activate(&try signalResolved(a, 1, null, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a);
+    try testing.expectEqualStrings("\"delivered\"", completedWith(done));
+}
+
+test "signal external: a workflow that isn't found returns error.ExternalWorkflowNotFound with the failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.Signal.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "SignalOther", .{ @as([]const u8, "missing"), @as([]const u8, "") }), a);
+    const f = try failure_mod.application(a, .{ .message = "Unable to signal external workflow because it was not found", .type = "ExternalWorkflowExecutionNotFound" });
+    const done = try inst.activate(&try signalResolved(a, 1, f, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND), a);
+    try testing.expectEqualStrings("\"ExternalWorkflowNotFound: Unable to signal external workflow because it was not found (workflow ID \\\"missing\\\")\"", completedWith(done));
+
+    // Another cause is ExternalWorkflowRequestFailed.
+    const other = try create(testing.allocator, ExternalWf.Signal.registered, .{});
+    defer other.destroy();
+    _ = try other.activate(&try initActivation(a, "SignalOther", .{ @as([]const u8, "busy"), @as([]const u8, "") }), a);
+    const limit = try failure_mod.application(a, .{ .message = "Unable to signal external workflow because The per-workflow signal limit was exceeded", .type = "SignalCountLimitExceeded" });
+    const failed = try other.activate(&try signalResolved(a, 1, limit, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_SIGNAL_COUNT_LIMIT_EXCEEDED), a);
+    try testing.expect(std.mem.startsWith(u8, completedWith(failed), "\"ExternalWorkflowRequestFailed: "));
+}
+
+test "signal external: an unhandled failure fails the workflow with it; seqs count up" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.SignalTwice.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "SignalTwice", .{}), a);
+    const second = commandsOf(try inst.activate(&try signalResolved(a, 1, null, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a));
+    try testing.expectEqual(@as(u32, 2), second[0].variant.?.signal_external_workflow_execution.seq);
+    const f = try failure_mod.application(a, .{ .message = "Unable to signal external workflow because it was not found", .type = "ExternalWorkflowExecutionNotFound" });
+    const done = commandsOf(try inst.activate(&try signalResolved(a, 2, f, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND), a));
+    const fail = done[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expectEqualStrings("Unable to signal external workflow because it was not found (workflow ID \"target\")", fail.message);
+    try testing.expectEqualStrings("ExternalWorkflowExecutionNotFound", failure_mod.applicationType(fail).?);
+}
+
+test "signal external: canceling the waiting coroutine sends CancelSignalWorkflow and returns error.Canceled" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.Signal.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "SignalOther", .{ @as([]const u8, "target"), @as([]const u8, "") }), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    try testing.expectEqual(@as(u32, 1), cmds[0].variant.?.cancel_signal_workflow.seq);
+    try testing.expect(cmds[1].variant.? == .cancel_workflow_execution);
+    // The core's resolution of the withdrawn signal that follows changes nothing.
+    const cause = .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED;
+    const canceled: Failure = .{ .message = "Signal was cancelled before being sent", .failure_info = .{ .canceled_failure_info = .{} } };
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try signalResolved(a, 1, canceled, cause), a)).len);
+}
+
+test "signal external: an empty workflow ID returns error.InvalidOptions and sends nothing" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.Signal.registered, .{});
+    defer inst.destroy();
+    const done = commandsOf(try inst.activate(&try initActivation(a, "SignalOther", .{ @as([]const u8, ""), @as([]const u8, "") }), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("InvalidOptions", done[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+test "signal external: a child's signal waits for its start and targets it by workflow ID" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.SignalChild.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "SignalChild", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expect(first[0].variant.? == .start_child_workflow_execution);
+    const started = commandsOf(try inst.activate(&try childStarted(a, 1, "kid-run"), a));
+    try testing.expectEqual(@as(usize, 1), started.len);
+    const cmd = started[0].variant.?.signal_external_workflow_execution;
+    try testing.expectEqualStrings("kid-1", cmd.target.?.child_workflow_id);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try signalResolved(a, 1, null, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a)).len);
+    const done = try inst.activate(&try childResolved(a, 1, .{ .completed = .{} }), a);
+    try testing.expectEqualStrings("\"delivered\"", completedWith(done));
+}
+
+test "signal external: eviction ends a wait for a delivery" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ExternalWf.Signal.registered, .{});
+    _ = try inst.activate(&try initActivation(a, "SignalOther", .{ @as([]const u8, "target"), @as([]const u8, "") }), a);
+    inst.destroy(); // testing.allocator reports leaks
 }
 
 // Continue-as-new.
