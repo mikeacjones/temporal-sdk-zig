@@ -971,6 +971,36 @@ const ChildFixtures = struct {
     const CronParent = workflow.Def("CronParent", cronParent);
 };
 
+const ContinueFixtures = struct {
+    /// Records `count` in the memo, then continues as new with `count + 1` until it reaches
+    /// `until`. Each run checks that it continued from `previous_run_id`. The last run returns
+    /// its count, the memo's `round` (carried from the run before), and its timeouts.
+    fn countUp(ctx: *workflow.Context, count: u32, until: u32, previous_run_id: []const u8) ![]const u8 {
+        if (!std.mem.eql(u8, ctx.info().continued_run_id, previous_run_id)) return error.WrongContinuedRunId;
+        if (count < until) {
+            try ctx.upsertMemo(.{ .round = count });
+            return ctx.continueAsNew(CountUp, .{}, .{ count + 1, until, ctx.info().run_id });
+        }
+        const round = try ctx.memoValue(?u32, "round") orelse null;
+        const seconds = struct {
+            fn of(d: ?std.Io.Duration) i64 {
+                return if (d) |v| @intCast(@divFloor(v.nanoseconds, std.time.ns_per_s)) else -1;
+            }
+        }.of;
+        return std.fmt.allocPrint(ctx.allocator(), "{d} round={?d} run_timeout={d} task_timeout={d}", .{ count, round, seconds(ctx.info().run_timeout), seconds(ctx.info().task_timeout) });
+    }
+    const CountUp = workflow.Def("CountUp", countUp);
+
+    /// `countUp` that completes where it continued as new.
+    fn countUpCompleting(ctx: *workflow.Context, count: u32, until: u32, previous_run_id: []const u8) ![]const u8 {
+        _ = until;
+        _ = previous_run_id;
+        try ctx.upsertMemo(.{ .round = count });
+        return "done";
+    }
+    const CountUpCompleting = workflow.Def("CountUp", countUpCompleting);
+};
+
 const LocalFixtures = struct {
     var started: Io.Event = .unset;
     /// Set once `block` has seen a cancel; `seen_reason` is written before.
@@ -1190,6 +1220,48 @@ test "WorkflowReplayer replays update handlers and catches a handler that change
     defer changed.deinit();
     try changed.registerWorkflow(UpdateFixtures.HandleUpdatesChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(update_history));
+}
+
+/// The first run of a dev-server run of `ContinueFixtures.CountUp` started with
+/// `.{ 0, 3, "" }`, which upserted its memo and continued as new; exported with `temporal
+/// workflow show --run-id`.
+const continue_as_new_history = @embedFile("testdata/continue_as_new_history.json");
+
+test "WorkflowReplayer replays a run that continued as new and catches one that completes instead" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(ContinueFixtures.CountUp);
+    try ok.replayHistoryJson(continue_as_new_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(ContinueFixtures.CountUpCompleting);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(continue_as_new_history));
+}
+
+test "continue-as-new: WorkflowRun.get follows the chain to the last run's result" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ContinueFixtures.CountUp);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(ContinueFixtures.CountUp, .{
+        .task_queue = "",
+        .run_timeout = .fromSeconds(600),
+        .task_timeout = .fromSeconds(7),
+    }, .{ 0, 3, "" });
+    defer run.deinit();
+    const first_run_id = try a.dupe(u8, run.run_id);
+
+    var first = try env.client.getWorkflow([]const u8, run.id, first_run_id);
+    defer first.deinit();
+    try testing.expectError(error.WorkflowContinuedAsNew, first.getWithOptions(a, .{ .follow_runs = false }));
+
+    try testing.expectEqualStrings("3 round=2 run_timeout=600 task_timeout=7", try env.getResult(ContinueFixtures.CountUp, &run, a, null));
+    try testing.expect(!std.mem.eql(u8, first_run_id, run.run_id));
+    try env.replayRun(run.id, first_run_id);
 }
 
 test "WorkflowEnvironment runs local activities, retrying one after workflow timers" {
