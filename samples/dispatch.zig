@@ -26,6 +26,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "codec-server:starter")) return @import("codec-server/starter.zig").main(init);
     if (std.mem.eql(u8, name, "cron:worker")) return @import("cron/worker.zig").main(init);
     if (std.mem.eql(u8, name, "cron:starter")) return @import("cron/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "ctxpropagation:worker")) return @import("ctxpropagation/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "ctxpropagation:starter")) return @import("ctxpropagation/starter.zig").main(init);
     if (std.mem.eql(u8, name, "dsl:worker")) return @import("dsl/worker.zig").main(init);
     if (std.mem.eql(u8, name, "dsl:starter")) return @import("dsl/starter.zig").main(init);
     if (std.mem.eql(u8, name, "dynamic:worker")) return @import("dynamic/worker.zig").main(init);
