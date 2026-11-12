@@ -16,14 +16,19 @@ const Io = std.Io;
 ptr: *c.TemporalCoreConnection,
 runtime: Runtime,
 
+/// The client name and version sent to the server (as the `client-name` and
+/// `client-version` headers) unless the options name others.
+pub const default_client_name = "temporal-zig";
+pub const default_client_version = @import("../temporal.zig").version;
+
 pub const Options = struct {
     /// Server URL including the scheme, such as "http://localhost:7233" or
     /// "https://my-namespace.a1b2c.tmprl.cloud:7233".
     target_url: []const u8,
     /// Identity reported to the server for this client and its workers.
     identity: []const u8,
-    client_name: []const u8 = "temporal-zig",
-    client_version: []const u8 = @import("../temporal.zig").version,
+    client_name: []const u8 = default_client_name,
+    client_version: []const u8 = default_client_version,
     /// gRPC headers sent with every call.
     metadata: []const bytes.MetadataEntry = &.{},
     /// Binary gRPC headers (keys end in "-bin") sent with every call.
@@ -50,17 +55,18 @@ pub const Options = struct {
         client_private_key: []const u8 = "",
     };
 
-    /// Retries of failed calls inside the core. Null uses the core defaults (200 ms initial
-    /// interval, doubling to 10 s, retrying indefinitely).
+    /// Retries of failed calls inside the core: calls made with `CallOptions.retry`, and
+    /// workers' calls other than polls (which have their own policy). Null, and the field
+    /// defaults, are the core's default policy.
     pub const Retry = struct {
-        initial_interval_ms: u64 = 200,
+        initial_interval_ms: u64 = 100,
         randomization_factor: f64 = 0.2,
-        multiplier: f64 = 2.0,
-        max_interval_ms: u64 = 10_000,
+        multiplier: f64 = 1.7,
+        max_interval_ms: u64 = 5_000,
         /// 0 means no limit.
-        max_elapsed_time_ms: u64 = 0,
+        max_elapsed_time_ms: u64 = 10_000,
         /// 0 means no limit.
-        max_retries: usize = 0,
+        max_retries: usize = 10,
     };
 
     /// The core's defaults.
@@ -85,61 +91,11 @@ pub const ConnectError = error{ OutOfMemory, InvalidOptions, ConnectFailed };
 pub fn connect(gpa: Allocator, io: Io, runtime: Runtime, options: Options, failure: ?*?[]u8) ConnectError!Connection {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tls: c.TemporalCoreClientTlsOptions = undefined;
-    var retry: c.TemporalCoreClientRetryOptions = undefined;
-    var keep_alive: c.TemporalCoreClientKeepAliveOptions = undefined;
-    var proxy: c.TemporalCoreClientHttpConnectProxyOptions = undefined;
-    var dns: c.TemporalCoreClientDnsLoadBalancingOptions = undefined;
-
-    var core: c.TemporalCoreConnectionOptions = std.mem.zeroes(c.TemporalCoreConnectionOptions);
-    core.target_url = bytes.ref(options.target_url);
-    core.client_name = bytes.ref(options.client_name);
-    core.client_version = bytes.ref(options.client_version);
-    core.metadata = bytes.metadata(arena, options.metadata) catch |err| return encodeError(err);
-    core.binary_metadata = bytes.metadata(arena, options.binary_metadata) catch |err| return encodeError(err);
-    core.api_key = bytes.ref(options.api_key);
-    core.identity = bytes.ref(options.identity);
-    if (options.tls) |t| {
-        tls = .{
-            .server_root_ca_cert = bytes.ref(t.server_root_ca_cert),
-            .domain = bytes.ref(t.domain),
-            .client_cert = bytes.ref(t.client_cert),
-            .client_private_key = bytes.ref(t.client_private_key),
-        };
-        core.tls_options = &tls;
-    }
-    if (options.retry) |r| {
-        retry = .{
-            .initial_interval_millis = r.initial_interval_ms,
-            .randomization_factor = r.randomization_factor,
-            .multiplier = r.multiplier,
-            .max_interval_millis = r.max_interval_ms,
-            .max_elapsed_time_millis = r.max_elapsed_time_ms,
-            .max_retries = r.max_retries,
-        };
-        core.retry_options = &retry;
-    }
-    if (options.keep_alive) |k| {
-        keep_alive = .{ .interval_millis = k.interval_ms, .timeout_millis = k.timeout_ms };
-        core.keep_alive_options = &keep_alive;
-    }
-    if (options.http_connect_proxy) |p| {
-        proxy = .{ .target_host = bytes.ref(p.target_host), .username = bytes.ref(p.username), .password = bytes.ref(p.password) };
-        core.http_connect_proxy_options = &proxy;
-    }
-    if (options.dns_load_balancing_interval_ms) |ms| {
-        dns = .{ .resolution_interval_millis = ms };
-        core.dns_load_balancing_options = &dns;
-    }
-    core.grpc_compression = switch (options.compression) {
-        .gzip => c.TemporalCoreClientGrpcCompression_Gzip,
-        .none => c.TemporalCoreClientGrpcCompression_None,
-    };
+    var core: CoreOptions = undefined;
+    try core.init(arena_state.allocator(), options);
 
     const done = try Completion(ConnectResult).create(gpa, io, ConnectResult.free);
-    c.temporal_core_client_connect(runtime.ptr, &core, done, onConnect);
+    c.temporal_core_client_connect(runtime.ptr, &core.connection, done, onConnect);
     const result = done.waitUncancelable();
     const conn = result.conn orelse {
         defer if (result.fail) |f| f.deinit();
@@ -149,6 +105,66 @@ pub fn connect(gpa: Allocator, io: Io, runtime: Runtime, options: Options, failu
     if (result.fail) |f| f.deinit();
     return .{ .ptr = conn, .runtime = runtime };
 }
+
+/// The core's connection options and the structs they point at, which point into this value
+/// and the arena passed to `init`: don't move it while the core reads it.
+const CoreOptions = struct {
+    connection: c.TemporalCoreConnectionOptions,
+    tls: c.TemporalCoreClientTlsOptions,
+    retry: c.TemporalCoreClientRetryOptions,
+    keep_alive: c.TemporalCoreClientKeepAliveOptions,
+    proxy: c.TemporalCoreClientHttpConnectProxyOptions,
+    dns: c.TemporalCoreClientDnsLoadBalancingOptions,
+
+    /// Borrows the strings in `options`.
+    fn init(o: *CoreOptions, arena: Allocator, options: Options) error{ OutOfMemory, InvalidOptions }!void {
+        const core = &o.connection;
+        core.* = std.mem.zeroes(c.TemporalCoreConnectionOptions);
+        core.target_url = bytes.ref(options.target_url);
+        core.client_name = bytes.ref(options.client_name);
+        core.client_version = bytes.ref(options.client_version);
+        core.metadata = bytes.metadata(arena, options.metadata) catch |err| return encodeError(err);
+        core.binary_metadata = bytes.metadata(arena, options.binary_metadata) catch |err| return encodeError(err);
+        core.api_key = bytes.ref(options.api_key);
+        core.identity = bytes.ref(options.identity);
+        if (options.tls) |t| {
+            o.tls = .{
+                .server_root_ca_cert = bytes.ref(t.server_root_ca_cert),
+                .domain = bytes.ref(t.domain),
+                .client_cert = bytes.ref(t.client_cert),
+                .client_private_key = bytes.ref(t.client_private_key),
+            };
+            core.tls_options = &o.tls;
+        }
+        if (options.retry) |r| {
+            o.retry = .{
+                .initial_interval_millis = r.initial_interval_ms,
+                .randomization_factor = r.randomization_factor,
+                .multiplier = r.multiplier,
+                .max_interval_millis = r.max_interval_ms,
+                .max_elapsed_time_millis = r.max_elapsed_time_ms,
+                .max_retries = r.max_retries,
+            };
+            core.retry_options = &o.retry;
+        }
+        if (options.keep_alive) |k| {
+            o.keep_alive = .{ .interval_millis = k.interval_ms, .timeout_millis = k.timeout_ms };
+            core.keep_alive_options = &o.keep_alive;
+        }
+        if (options.http_connect_proxy) |p| {
+            o.proxy = .{ .target_host = bytes.ref(p.target_host), .username = bytes.ref(p.username), .password = bytes.ref(p.password) };
+            core.http_connect_proxy_options = &o.proxy;
+        }
+        if (options.dns_load_balancing_interval_ms) |ms| {
+            o.dns = .{ .resolution_interval_millis = ms };
+            core.dns_load_balancing_options = &o.dns;
+        }
+        core.grpc_compression = switch (options.compression) {
+            .gzip => c.TemporalCoreClientGrpcCompression_Gzip,
+            .none => c.TemporalCoreClientGrpcCompression_None,
+        };
+    }
+};
 
 pub fn deinit(conn: Connection) void {
     c.temporal_core_client_free(conn.ptr);
@@ -421,4 +437,60 @@ test "an invalid URL fails to connect with the core's message" {
     defer if (failure) |f| testing.allocator.free(f);
     try testing.expectError(error.ConnectFailed, connect(testing.allocator, testing.io, rt, .{ .target_url = "not a url", .identity = "test" }, &failure));
     try testing.expect(failure != null and failure.?.len > 0);
+}
+
+test "connection options reach the core's C structs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Defaults: keep-alive at the core's values, no retry options or proxy, the SDK's name.
+    var core: CoreOptions = undefined;
+    try core.init(a, .{ .target_url = "http://localhost:7233", .identity = "id" });
+    try testing.expectEqualStrings(default_client_name, bytes.slice(core.connection.client_name));
+    try testing.expectEqualStrings(default_client_version, bytes.slice(core.connection.client_version));
+    try testing.expectEqual(@as(u64, 30_000), core.connection.keep_alive_options.*.interval_millis);
+    try testing.expectEqual(@as(u64, 15_000), core.connection.keep_alive_options.*.timeout_millis);
+    try testing.expect(core.connection.retry_options == null);
+    try testing.expect(core.connection.http_connect_proxy_options == null);
+
+    // Custom values, and null keep-alive.
+    try core.init(a, .{
+        .target_url = "http://localhost:7233",
+        .identity = "id",
+        .client_name = "wrapper",
+        .client_version = "9.9.9",
+        .keep_alive = null,
+        .retry = .{ .max_elapsed_time_ms = 0, .max_retries = 3 },
+        .http_connect_proxy = .{ .target_host = "proxy.corp:3128", .username = "svc", .password = "pw" },
+    });
+    try testing.expectEqualStrings("wrapper", bytes.slice(core.connection.client_name));
+    try testing.expectEqualStrings("9.9.9", bytes.slice(core.connection.client_version));
+    try testing.expect(core.connection.keep_alive_options == null);
+    const retry = core.connection.retry_options.*;
+    try testing.expectEqual(@as(u64, 100), retry.initial_interval_millis);
+    try testing.expectEqual(@as(f64, 0.2), retry.randomization_factor);
+    try testing.expectEqual(@as(f64, 1.7), retry.multiplier);
+    try testing.expectEqual(@as(u64, 5_000), retry.max_interval_millis);
+    try testing.expectEqual(@as(u64, 0), retry.max_elapsed_time_millis);
+    try testing.expectEqual(@as(usize, 3), retry.max_retries);
+    const proxy = core.connection.http_connect_proxy_options.*;
+    try testing.expectEqualStrings("proxy.corp:3128", bytes.slice(proxy.target_host));
+    try testing.expectEqualStrings("svc", bytes.slice(proxy.username));
+    try testing.expectEqualStrings("pw", bytes.slice(proxy.password));
+
+    try core.init(a, .{ .target_url = "http://localhost:7233", .identity = "id", .keep_alive = .{ .interval_ms = 10_000, .timeout_ms = 2_000 } });
+    try testing.expectEqual(@as(u64, 10_000), core.connection.keep_alive_options.*.interval_millis);
+    try testing.expectEqual(@as(u64, 2_000), core.connection.keep_alive_options.*.timeout_millis);
+}
+
+test "Retry defaults are the core's default policy" {
+    // deps/sdk-core/crates/client/src/retry.rs: RetryOptions::default().
+    const r: Options.Retry = .{};
+    try testing.expectEqual(@as(u64, 100), r.initial_interval_ms);
+    try testing.expectEqual(@as(f64, 0.2), r.randomization_factor);
+    try testing.expectEqual(@as(f64, 1.7), r.multiplier);
+    try testing.expectEqual(@as(u64, 5_000), r.max_interval_ms);
+    try testing.expectEqual(@as(u64, 10_000), r.max_elapsed_time_ms);
+    try testing.expectEqual(@as(usize, 10), r.max_retries);
 }
