@@ -93,6 +93,22 @@
 //! The workflow ends when its function returns, even while signal or update handlers are still
 //! running; to let them finish first,
 //! `try ctx.await(ctx, temporal.workflow.Context.allHandlersFinished)`.
+//!
+//! A long-running workflow keeps its history small by continuing as new: the workflow
+//! function returns `ctx.continueAsNew`, which ends the run and starts a fresh one with the
+//! same workflow ID and the arguments given, carrying state forward. The server suggests when
+//! (`ctx.continueAsNewSuggested()`); `ctx.historyLength()` and `ctx.historySizeBytes()` show
+//! the history's size. A client waiting on the workflow follows it to the last run's result:
+//!
+//!     fn counter(ctx: *temporal.workflow.Context, start: u64) !u64 {
+//!         var count = start;
+//!         while (count < 100_000) : (count += 1) {
+//!             if (ctx.continueAsNewSuggested()) return ctx.continueAsNew(Counter, .{}, .{count});
+//!             try ctx.io().sleep(.fromSeconds(60), .awake);
+//!         }
+//!         return count;
+//!     }
+//!     pub const Counter = temporal.workflow.Def("Counter", counter);
 
 const std = @import("std");
 const converter = @import("converter.zig");
@@ -210,6 +226,21 @@ pub const ChildWorkflowOptions = struct {
     memo: []const converter.Field = &.{},
 };
 
+/// How `Context.continueAsNew` starts the next run.
+pub const ContinueAsNewOptions = struct {
+    /// Empty continues on this run's task queue.
+    task_queue: []const u8 = "",
+    /// Limits the new run. Null keeps this run's run timeout.
+    run_timeout: ?Duration = null,
+    /// Limits one workflow task of the new run. Null keeps this run's task timeout.
+    task_timeout: ?Duration = null,
+    /// The new run's memo, built with `converter.toFields`. Null (or an empty slice, which the
+    /// command can't tell apart from null) keeps this run's memo, `upsertMemo` changes included.
+    memo: ?[]const converter.Field = null,
+    /// Null keeps this run's retry policy.
+    retry_policy: ?RetryPolicy = null,
+};
+
 pub const Context = struct {
     instance: *Instance,
     /// Set by `fail` and reported instead of the returned error's name.
@@ -277,6 +308,36 @@ pub const Context = struct {
     pub fn fail(ctx: *Context, a: failure_mod.Application) error{ApplicationFailure} {
         ctx.pending_failure = a;
         return error.ApplicationFailure;
+    }
+
+    /// Ends this run and starts a new run of `Workflow` (a `Def`, usually this workflow's own)
+    /// with the same workflow ID and `args`, which are encoded here. Return the error this
+    /// gives back from the workflow function:
+    ///
+    ///     return ctx.continueAsNew(Counter, .{}, .{count + 1});
+    ///
+    /// Only the workflow function's return continues as new. Calling this again replaces the
+    /// earlier request. The error from a signal handler fails the workflow and from an update
+    /// handler rejects the update, like any other error.
+    pub fn continueAsNew(ctx: *Context, comptime Workflow: type, options: ContinueAsNewOptions, args: Workflow.Args) error{ ContinueAsNew, OutOfMemory } {
+        try ctx.instance.requestContinueAsNew(Workflow.workflow_name, options, args);
+        return error.ContinueAsNew;
+    }
+
+    /// Whether the server suggests continuing as new because the history is getting large.
+    /// Updated with each workflow task, the same way on replay.
+    pub fn continueAsNewSuggested(ctx: *const Context) bool {
+        return ctx.instance.continue_as_new_suggested;
+    }
+
+    /// The number of events in the history so far, as of the current workflow task.
+    pub fn historyLength(ctx: *const Context) u32 {
+        return ctx.instance.history_length;
+    }
+
+    /// The size of the history in bytes, as of the current workflow task's start.
+    pub fn historySizeBytes(ctx: *const Context) u64 {
+        return ctx.instance.history_size_bytes;
     }
 
     /// Schedules an activity defined with `temporal.activity.Def` and returns a future for its
