@@ -47,7 +47,9 @@ pub const Options = struct {
     /// Payload codecs, such as `converter.ZlibCodec` or encryption, applied in order to every
     /// payload this client sends and in reverse to every payload it receives (results,
     /// failures, memos, history events), and by every worker on this client to its workflow
-    /// and activity payloads. Search attributes are never encoded. Borrowed: the slice and
+    /// and activity payloads. Search attributes are never encoded. A codec that sets
+    /// `encodeWithContext` and `decodeWithContext` sees each call's `converter.CodecContext`:
+    /// its propagated values and the workflow or activity it is for. Borrowed: the slice and
     /// the codecs must outlive the client and its workers.
     codecs: []const converter.PayloadCodec = &.{},
     /// Where sdk-core's logs go, and the default for every worker on this client (see
@@ -338,7 +340,7 @@ pub const Client = struct {
         // for a plain start, so signal-with-start and update-with-start never ask for it.
         request.request_eager_execution = options.enable_eager_start;
         var header = try c.outgoingHeader(a, options.context);
-        const response = c.rpcCall(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a, null, &header) catch |err| switch (err) {
+        const response = c.rpcCall(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a, null, &header, options.context) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             else => |e| return e,
         };
@@ -405,7 +407,7 @@ pub const Client = struct {
             .input = .{ .payloads = try converter.toPayloads(a, args) },
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
-        }, a, null, &header) catch |err| switch (err) {
+        }, a, null, &header, options.context) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
         };
@@ -445,7 +447,7 @@ pub const Client = struct {
         }
 
         var header = try c.outgoingHeader(a, options.context);
-        const response = c.rpcCall(wfs.SignalWithStartWorkflowExecutionResponse, "SignalWithStartWorkflowExecution", request, a, null, &header) catch |err| switch (err) {
+        const response = c.rpcCall(wfs.SignalWithStartWorkflowExecutionResponse, "SignalWithStartWorkflowExecution", request, a, null, &header, options.context) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             else => |e| return e,
         };
@@ -778,7 +780,7 @@ pub const Client = struct {
         if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
         var status: ?RpcStatus = null;
         var header = try c.outgoingHeader(a, options.context);
-        const response = c.rpcCall(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status, &header) catch |err| switch (err) {
+        const response = c.rpcCall(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status, &header, options.context) catch |err| switch (err) {
             error.AlreadyExists => return error.ActivityExecutionAlreadyStarted,
             error.RpcFailed => {
                 const st = status orelse return error.RpcFailed;
@@ -898,7 +900,7 @@ pub const Client = struct {
                 .not_open => .QUERY_REJECT_CONDITION_NOT_OPEN,
                 .not_completed_cleanly => .QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY,
             },
-        }, arena, &status, &header) catch |err| switch (err) {
+        }, arena, &status, &header, options.context) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             error.RpcFailed => {
                 const s = status orelse return error.RpcFailed;
@@ -933,7 +935,7 @@ pub const Client = struct {
         const a = arena_state.allocator();
         const request = try c.updateRequest(a, Update.update_name, workflow_id, run_id, args, options);
         var header = try c.outgoingHeader(a, options.context);
-        const response = try c.updateUntilStage(a, request, &header);
+        const response = try c.updateUntilStage(a, request, &header, options.context);
         const ref_run_id = if (response.update_ref) |r| if (r.workflow_execution) |e| e.run_id else "" else "";
         return .init(c, workflow_id, if (ref_run_id.len > 0) ref_run_id else run_id, request.request.?.meta.?.update_id, response.outcome);
     }
@@ -989,10 +991,11 @@ pub const Client = struct {
         });
 
         var status: ?RpcStatus = null;
-        const response = c.rpcWithStatus(wfs.ExecuteMultiOperationResponse, "ExecuteMultiOperation", wfs.ExecuteMultiOperationRequest{
+        // Both operations' payloads go through the codecs with the start's values.
+        const response = c.rpcCall(wfs.ExecuteMultiOperationResponse, "ExecuteMultiOperation", wfs.ExecuteMultiOperationRequest{
             .namespace = c.namespace,
             .operations = operations,
-        }, a, &status) catch |err| switch (err) {
+        }, a, &status, null, start_options.context) catch |err| switch (err) {
             // The call fails with the failing operation's status code, and only the start
             // operation can fail with ALREADY_EXISTS.
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
@@ -1016,7 +1019,7 @@ pub const Client = struct {
         // with the same update ID, which the server deduplicates.
         if (!reachedStage(updated, update_options.wait_for_stage)) {
             update.workflow_execution.?.run_id = started.run_id;
-            updated = try c.updateUntilStage(a, update, null);
+            updated = try c.updateUntilStage(a, update, null, update_options.context);
         }
         return .init(c, id, started.run_id, update.request.?.meta.?.update_id, updated.outcome);
     }
@@ -1057,11 +1060,12 @@ pub const Client = struct {
 
     /// Sends `request` until the update reaches the stage it waits for: the server returns
     /// early, below that stage, when its long poll times out. `header` (null keeps the
-    /// request's own) is sent as the update's header.
-    fn updateUntilStage(c: *Client, a: Allocator, request: wfs.UpdateWorkflowExecutionRequest, header: ?*converter.HeaderWriter) UpdateError!wfs.UpdateWorkflowExecutionResponse {
+    /// request's own) is sent as the update's header; `values` are the update's propagated
+    /// values, for the codecs.
+    fn updateUntilStage(c: *Client, a: Allocator, request: wfs.UpdateWorkflowExecutionRequest, header: ?*converter.HeaderWriter, values: ?*const propagation.Values) UpdateError!wfs.UpdateWorkflowExecutionResponse {
         const want: UpdateStage = if (request.wait_policy.?.lifecycle_stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED) .accepted else .completed;
         while (true) {
-            const response = c.rpcCall(wfs.UpdateWorkflowExecutionResponse, "UpdateWorkflowExecution", request, a, null, header) catch |err| switch (err) {
+            const response = c.rpcCall(wfs.UpdateWorkflowExecutionResponse, "UpdateWorkflowExecution", request, a, null, header, values) catch |err| switch (err) {
                 error.AlreadyExists => return error.InvalidResponse,
                 else => |e| return e,
             };
@@ -1097,12 +1101,14 @@ pub const Client = struct {
 
     /// `rpcWithStatus` without a header to send.
     fn rpcWithStatus(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus) RpcError!Response {
-        return c.rpcCall(Response, method, request, arena, status, null);
+        return c.rpcCall(Response, method, request, arena, status, null, null);
     }
 
     /// Passes the call through the client's interceptors, which end in `send`. `header`, for
     /// a request that carries one, replaces the request's header (null leaves it as it is).
-    fn rpcCall(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter) RpcError!Response {
+    /// `values` are the call's propagated values (its `.context`), which `send` hands the
+    /// codecs.
+    fn rpcCall(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter, values: ?*const propagation.Values) RpcError!Response {
         const Request = @TypeOf(request);
         var req = request;
         var resp: Response = .{};
@@ -1118,6 +1124,7 @@ pub const Client = struct {
         const End = struct {
             client: *Client,
             status: ?*?RpcStatus,
+            values: ?*const propagation.Values,
 
             const vtable: interceptor.Client.VTable = .{ .call = end };
 
@@ -1125,13 +1132,35 @@ pub const Client = struct {
                 const e: *@This() = @ptrCast(@alignCast(ptr));
                 const r = input.request(Request).?;
                 if (comptime carriesHeader(Request)) if (input.header) |w| setHeader(Request, r, try protoHeader(input.arena, w.*));
-                input.response(Response).?.* = try e.client.send(Response, method, r.*, input.arena, e.status);
+                input.response(Response).?.* = try e.client.send(Response, method, r.*, input.arena, e.status, e.values);
             }
         };
-        var end: End = .{ .client = c, .status = status };
+        var end: End = .{ .client = c, .status = status, .values = values };
         const next: interceptor.Client.Next = .{ .chain = c.interceptors, .root = .{ .ptr = &end, .vtable = &End.vtable } };
         try next.call(&call);
         return resp;
+    }
+
+    /// Fills `context`'s workflow and activity fields from those `r` names, for the codecs.
+    fn requestIdentity(comptime Request: type, r: *const Request, context: *converter.CodecContext) void {
+        const common = proto.temporal.api.common.v1;
+        if (comptime Request == wfs.ExecuteMultiOperationRequest) {
+            for (r.operations.items) |op| if (op.operation) |o| if (o == .start_workflow) return requestIdentity(wfs.StartWorkflowExecutionRequest, &o.start_workflow, context);
+            return;
+        }
+        if (comptime @hasField(Request, "workflow_id") and @FieldType(Request, "workflow_id") == []const u8) context.workflow_id = r.workflow_id;
+        inline for (.{ "workflow_execution", "execution" }) |name| {
+            if (comptime @hasField(Request, name) and @FieldType(Request, name) == ?common.WorkflowExecution) {
+                if (@field(r, name)) |e| context.workflow_id = e.workflow_id;
+            }
+        }
+        if (comptime @hasField(Request, "workflow_type") and @FieldType(Request, "workflow_type") == ?common.WorkflowType) {
+            if (r.workflow_type) |t| context.workflow_type = t.name;
+        }
+        if (comptime @hasField(Request, "activity_type") and @FieldType(Request, "activity_type") == ?common.ActivityType) {
+            if (r.activity_type) |t| context.activity_type = t.name;
+        }
+        if (comptime @hasField(Request, "activity_id") and @FieldType(Request, "activity_id") == []const u8) context.activity_id = r.activity_id;
     }
 
     fn carriesHeader(comptime Request: type) bool {
@@ -1171,10 +1200,14 @@ pub const Client = struct {
 
     /// Sends the request to the server: the end of the interceptor chain. When `status` is
     /// given, a failure other than ALREADY_EXISTS or NOT_FOUND is stored there (allocated from
-    /// `arena`) for the caller to report instead of being logged.
-    fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus) RpcError!Response {
+    /// `arena`) for the caller to report instead of being logged. The codecs encode the
+    /// request and decode the response with `values` and the workflow or activity the request
+    /// names.
+    fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values) RpcError!Response {
         var coded = request;
-        converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io) catch |err| {
+        var codec_context: converter.CodecContext = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
+        requestIdentity(@TypeOf(coded), &coded, &codec_context);
+        converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io, &codec_context) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: encoding its payloads with the client's codecs failed", .{method});
             return err;
         };
@@ -1205,7 +1238,7 @@ pub const Client = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidResponse,
         };
-        converter.decodeMessage(Response, &response, c.codecs, arena, c.io) catch |err| {
+        converter.decodeMessage(Response, &response, c.codecs, arena, c.io, &codec_context) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: decoding the response's payloads with the client's codecs failed", .{method});
             return err;
         };
@@ -2598,4 +2631,34 @@ test "the core log filter keeps libraries at warn or quieter" {
     var buf: [256]u8 = undefined;
     try testing.expectStringStartsWith(coreLogFilter(&buf, .debug), "WARN,temporalio_sdk_core=DEBUG,");
     try testing.expectStringStartsWith(coreLogFilter(&buf, .err), "ERROR,temporalio_sdk_core=ERROR,");
+}
+
+test "codec contexts name the workflow or activity a request names" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var context: converter.CodecContext = .{};
+    Client.requestIdentity(wfs.StartWorkflowExecutionRequest, &.{ .workflow_id = "wf", .workflow_type = .{ .name = "Order" } }, &context);
+    try testing.expectEqualStrings("wf", context.workflow_id);
+    try testing.expectEqualStrings("Order", context.workflow_type);
+
+    context = .{};
+    Client.requestIdentity(wfs.SignalWorkflowExecutionRequest, &.{ .workflow_execution = .{ .workflow_id = "signaled" } }, &context);
+    try testing.expectEqualStrings("signaled", context.workflow_id);
+    context = .{};
+    Client.requestIdentity(wfs.QueryWorkflowRequest, &.{ .execution = .{ .workflow_id = "queried" } }, &context);
+    try testing.expectEqualStrings("queried", context.workflow_id);
+
+    context = .{};
+    Client.requestIdentity(wfs.StartActivityExecutionRequest, &.{ .activity_id = "act", .activity_type = .{ .name = "Charge" } }, &context);
+    try testing.expectEqualStrings("act", context.activity_id);
+    try testing.expectEqualStrings("Charge", context.activity_type);
+    try testing.expectEqualStrings("", context.workflow_id);
+
+    var multi: wfs.ExecuteMultiOperationRequest = .{};
+    try multi.operations.append(a, .{ .operation = .{ .start_workflow = .{ .workflow_id = "uws", .workflow_type = .{ .name = "Cart" } } } });
+    context = .{};
+    Client.requestIdentity(wfs.ExecuteMultiOperationRequest, &multi, &context);
+    try testing.expectEqualStrings("uws", context.workflow_id);
+    try testing.expectEqualStrings("Cart", context.workflow_type);
 }
