@@ -69,7 +69,12 @@
 //! the update is delivered, like a query handler: it must only read state, and its error
 //! rejects the update, which then leaves no trace in history. An accepted update runs its
 //! handler in a coroutine of its own, like a signal: it may block, and its result (or error)
-//! goes back to the caller. An update that arrives before its handler is registered waits
+//! goes back to the caller. A handler's error rejects the update the way the workflow
+//! function's error fails the workflow: with the failure described by `ctx.fail`, or the
+//! failure of the activity or child workflow whose error it returns. A signal handler's error
+//! fails the workflow the same way. Each handler keeps these details apart from the workflow
+//! function's and other handlers'; a coroutine a handler starts with `io.async` shares the
+//! workflow function's. An update that arrives before its handler is registered waits
 //! until the workflow's coroutines have all blocked; if no handler was registered by then, it
 //! is rejected:
 //!
@@ -243,10 +248,12 @@ pub const ContinueAsNewOptions = struct {
 
 pub const Context = struct {
     instance: *Instance,
-    /// Set by `fail` and reported instead of the returned error's name.
+    /// Set by `fail` in the workflow function (or a coroutine it started) and reported
+    /// instead of the returned error's name. Signal and update handlers keep their own.
     pending_failure: ?failure_mod.Application = null,
-    /// The last activity or child workflow failure a future returned; reported as the
-    /// workflow's failure when the workflow returns the future's error.
+    /// The last activity or child workflow failure a future returned to the workflow function
+    /// (or a coroutine it started); reported as the workflow's failure when the workflow
+    /// returns the future's error. Signal and update handlers keep their own.
     last_failure: ?*const failure_mod.Failure = null,
 
     /// The deterministic Io for this workflow: concurrency, timers, time, randomness.
@@ -304,9 +311,10 @@ pub const Context = struct {
         return ctx.instance.awaitCondition(Erased.check, @ptrCast(&state), timeout);
     }
 
-    /// Fails the workflow with a failure you describe. Return the error this gives back.
+    /// Fails the workflow with a failure you describe. Return the error this gives back. In
+    /// an update handler, returning it rejects the update with that failure instead.
     pub fn fail(ctx: *Context, a: failure_mod.Application) error{ApplicationFailure} {
-        ctx.pending_failure = a;
+        ctx.instance.setPendingFailure(a);
         return error.ApplicationFailure;
     }
 
@@ -625,7 +633,7 @@ pub fn ActivityFuture(comptime T: type) type {
                     return converter.fromPayload(T, f.ctx.allocator(), p);
                 },
                 .failed, .cancelled => |fl| {
-                    f.ctx.last_failure = fl;
+                    f.ctx.instance.setLastFailure(fl);
                     return error.ActivityFailed;
                 },
             }
@@ -708,7 +716,7 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         }
 
         fn fail(f: Self, state: *const Instance.ChildState) ChildWorkflowError {
-            f.ctx.last_failure = f.failure();
+            f.ctx.instance.setLastFailure(f.failure());
             return if (state.already_started) error.ChildWorkflowAlreadyStarted else error.ChildWorkflowFailed;
         }
 
