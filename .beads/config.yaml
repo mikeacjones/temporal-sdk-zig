@@ -6,7 +6,8 @@
 # Issue prefix for this repository (used by bd init)
 # If not set, bd init will auto-detect from directory name
 # Example: issue-prefix: "myproject" creates issues like "myproject-1", "myproject-2", etc.
-issue-prefix: "temporal-sdk-zig"
+# issue-prefix: ""
+
 # Use no-db mode: JSONL-only, no Dolt database
 # When true, .beads/issues.jsonl is the only local store
 # no-db: false
@@ -69,15 +70,3 @@ issue-prefix: "temporal-sdk-zig"
 # Secret keys (stored in this file but prefer env vars to avoid git exposure):
 # - linear.api_key  → use LINEAR_API_KEY env var instead
 # - github.token    → use GITHUB_TOKEN env var instead
-sync:
-  remote: "git+https://github.com/mikeacjones/temporal-sdk-zig.git"
-issue_prefix: temporal-sdk-zig
-dolt.auto-start: false
-dolt:
-  disable-event-flush: true
-export.auto: false
-backup.enabled: false
-gc.endpoint_origin: inherited_city
-gc.endpoint_status: verified
-dolt.mode: embedded
-types.custom: molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step,startup-health-episode
