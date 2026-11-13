@@ -52,4 +52,12 @@ We pin release tags only, never a branch. The .NET SDK uses the same C bridge, s
 
 6. Commit the submodule move, `CORE_VERSION`, the regenerated code and the bridge changes together, with the old and new tags in the commit message.
 
+7. After the bump lands on main, publish core bundles for the new release and pin them. Until then, a checkout still builds (cargo builds the core), but a fetched package fails with `no prebuilt core for <target> at sdk-core <new version>`, and release.yml refuses to release.
+
+   1. Dispatch `.github/workflows/core-bundles.yml` on main with `revision` 1, first as a dry run, then with `dry_run` off.
+   2. Replace the old `core-<old version>-<target>` entries in `build.zig.zon` with the entries the run's summary lists, one per tier 1 target.
+   3. Land the pins, and check that `scripts/release-preflight.sh` no longer reports `core-pins`.
+
+   [releasing.md](releasing.md) describes the workflow and the rest of the release sequence.
+
 Step 4 refers to code that doesn't exist yet. Update this file when the bridge task lands.

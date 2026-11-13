@@ -24,10 +24,14 @@ jobs:
         with:
           submodules: true
 
+      # setup-zig points the global and local Zig caches at .zig-cache in the workspace. Its own
+      # caching saves that directory, cargo build included, and empties it past 2 GiB, so the
+      # steps below cache it instead.
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
+          use-cache: false
 
       - name: Install the Rust toolchain pinned in deps/rust-toolchain.toml
         run: rustup toolchain install --profile minimal
@@ -39,14 +43,34 @@ jobs:
       - name: Date the sdk-core sources so cargo reuses the cached build
         run: find deps -exec touch -h -t 200001010000 {} +
 
-      - name: Cache the sdk-core cargo build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore the sdk-core cargo build
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             .zig-cache/cargo-target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CORE_VERSION', 'deps/Cargo.lock', 'deps/rust-toolchain.toml') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-native-${{ hashFiles('CORE_VERSION', 'deps/Cargo.lock', 'deps/rust-toolchain.toml') }}
+
+      # Everything in .zig-cache but the cargo build, and the packages Zig fetched into zig-pkg.
+      # A `!` pattern can't exclude part of a listed directory, so list the directory's entries
+      # instead. build.zig.zon's hash starts a new cache when the Zig version or a dependency
+      # changes.
+      - name: Restore the Zig cache
+        id: zig-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .zig-cache/*
+            !.zig-cache/cargo-target
+            zig-pkg
+          key: zig-${{ runner.os }}-${{ runner.arch }}-samples-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-samples-${{ hashFiles('build.zig.zon') }}-
+
+      - name: Build the core
+        id: core
+        run: zig build core --summary all
 
       # The hang dumps attach gdb to stuck processes on Linux; the runner image lacks it.
       - name: Install gdb for hang stack dumps
@@ -58,3 +82,35 @@ jobs:
       - name: Run the samples against a dev server
         # A hang dumps every stuck process's stacks instead of waiting for the job timeout.
         run: scripts/run-with-hang-dump.sh 2400 zig build samples-test --summary all
+
+      # Saved even when the samples fail, so the next run doesn't rebuild the core. A cargo
+      # build that didn't finish isn't saved: its key would stay taken by a partial build.
+      - name: Save the sdk-core cargo build
+        if: always() && steps.core.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .zig-cache/cargo-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      # Each run restores the newest cache and adds this commit's builds to it. Past 2 GiB it
+      # isn't saved, so later runs keep restoring the last cache under the limit.
+      - name: Measure the Zig cache
+        id: zig-size
+        if: always() && steps.zig-cache.outcome == 'success' && steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          kib=$( (find .zig-cache -mindepth 1 -maxdepth 1 ! -name cargo-target; ls -d zig-pkg 2>/dev/null) | xargs du -sk | awk '{ n += $1 } END { print n + 0 }')
+          echo "Zig cache without the cargo build: $((kib / 1024)) MiB"
+          echo "fits=$([ "$kib" -le 2097152 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Save the Zig cache
+        if: always() && steps.zig-size.outputs.fits == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .zig-cache/*
+            !.zig-cache/cargo-target
+            zig-pkg
+          key: ${{ steps.zig-cache.outputs.cache-primary-key }}

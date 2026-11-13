@@ -13,22 +13,12 @@ Workflows can run activities and local activities (sequentially, in parallel, or
 
 Not implemented yet: custom data converters and payload codecs, interceptors and context propagation, metrics and logger adapters, TLS and API-key connections and environment config profiles, worker versioning and patching, and Nexus.
 
-## Add the SDK to your project
+## Install
 
-You need Zig 0.17.1 and a Rust toolchain installed through [rustup](https://rustup.rs). The build compiles the Rust core with cargo and installs the pinned Rust version on first use. You don't need `protoc`.
-
-The Rust core is a git submodule, and `zig fetch` doesn't fetch submodules, so clone the SDK next to your project:
+You need Zig 0.17.1. Add a release to your project's `build.zig.zon`:
 
 ```bash
-git clone --recursive https://github.com/mikeacjones/temporal-sdk-zig
-```
-
-Then add it to your project's `build.zig.zon`:
-
-```zig
-.dependencies = .{
-    .temporal = .{ .path = "../temporal-sdk-zig" },
-},
+zig fetch --save=temporal https://github.com/mikeacjones/temporal-sdk-zig/releases/download/v<version>/temporal-sdk-zig-<version>.tar.gz
 ```
 
 and import the module in `build.zig`:
@@ -38,7 +28,23 @@ const temporal = b.dependency("temporal", .{ .target = target, .optimize = optim
 exe.root_module.addImport("temporal", temporal.module("temporal"));
 ```
 
-Fetching by URL with prebuilt core libraries, so you don't need Rust, is planned.
+A release needs no Rust toolchain: its build links a prebuilt core library for your target, which Zig fetches on first use. Prebuilt libraries exist for `aarch64-macos`, `x86_64-macos`, `aarch64-linux-gnu`, `x86_64-linux-gnu`, `aarch64-linux-musl`, and `x86_64-linux-musl`; for any other target, the build stops and says so. [docs/releasing.md](docs/releasing.md) has the support policy, including the glibc the gnu libraries need. No release has been published yet; the [releases page](https://github.com/mikeacjones/temporal-sdk-zig/releases) lists them once there are.
+
+To build from source instead, for another target or for unreleased changes, clone the SDK with its submodule next to your project and depend on it by path. The build then compiles the Rust core with cargo, so it needs a Rust toolchain installed through [rustup](https://rustup.rs), which installs the pinned Rust version on first use. You don't need `protoc`.
+
+```bash
+git clone --recursive https://github.com/mikeacjones/temporal-sdk-zig
+```
+
+```zig
+.dependencies = .{
+    .temporal = .{ .path = "../temporal-sdk-zig" },
+},
+```
+
+## Versioning
+
+Releases follow [SemVer 2.0](https://semver.org/spec/v2.0.0.html) and are tagged `v<version>`. Until the SDK reaches parity, releases are 0.x pre-releases starting at `0.1.0-alpha.1`, and a minor version may break the API. Each release supports one Zig version and one sdk-core release (`CORE_VERSION`). [CHANGELOG.md](CHANGELOG.md) lists the changes in each release, and [docs/releasing.md](docs/releasing.md) describes the policy and how releases are made.
 
 ## Getting started
 
@@ -130,7 +136,7 @@ zig build fmt            # check formatting
 zig build samples-test   # build the samples and validate them against a dev server
 ```
 
-A clean build of the Rust core takes a minute or two. Later builds reuse it from `.zig-cache/cargo-target`. To skip cargo, pass a prebuilt core library with `-Dcore-lib=<path>`.
+A clean build of the Rust core takes a minute or two. Later builds reuse it from `.zig-cache/cargo-target`. To skip cargo, pass a prebuilt core library with `-Dcore-lib=<path>`, or an extracted core bundle (library and header, from `scripts/package-core-bundle.sh`) with `-Dcore-bundle=<dir>`.
 
 Fiber and workflow runtime code must pass in optimized builds too:
 

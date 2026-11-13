@@ -1,0 +1,228 @@
+name: Release
+# Releases the SDK as v<version>: gates the commit (scripts/release-preflight.sh, the tag,
+# main's HEAD, and the commit's CI and Samples runs), packs the release tarball
+# (scripts/package-release.sh), builds and runs a project that depends on it with the pinned
+# core bundles and no cargo (scripts/smoke-release.sh), and, unless dry_run, publishes a
+# GitHub release with the tarball. docs/releasing.md describes the release sequence.
+# Nothing here creates, moves or deletes a tag by hand: publishing the release creates
+# v<version> at the gated commit.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, SemVer without a leading v (0.1.0-alpha.1); the tag is v<version>
+        required: true
+        type: string
+      dry_run:
+        description: Run every check and the smoke tests without publishing
+        type: boolean
+        default: true
+      prerelease:
+        description: Mark the GitHub release as a pre-release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# An explicit bash runs with -o pipefail, so a step that pipes a script into tee fails with it.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.gate.outputs.tag }}
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the version, build.zig.zon, CHANGELOG.md and the core pins
+        run: scripts/release-preflight.sh "$VERSION"
+
+      - name: Check the tag, main's HEAD, and the commit's CI and Samples runs
+        id: gate
+        run: |
+          failed=0
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::release check tag failed: tag $tag already exists; release a new version instead"
+            failed=1
+          fi
+          main=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$GITHUB_SHA" != "$main" ]; then
+            echo "::error::release check main-head failed: this run is at $GITHUB_SHA ($GITHUB_REF), but main's HEAD is $main; dispatch on main at its newest commit"
+            failed=1
+          fi
+          for wf in ci.yml samples.yml; do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?head_sha=$GITHUB_SHA&per_page=1" \
+              --jq '.workflow_runs[0] | if . == null then "none" else "\(.status) \(.conclusion) \(.html_url)" end')
+            if [ "$run" = none ]; then
+              echo "::error::release check $wf failed: $wf never ran on $GITHUB_SHA"
+              failed=1
+            elif [[ "$run" != "completed success "* ]]; then
+              echo "::error::release check $wf failed: the newest $wf run on $GITHUB_SHA is not a success ($run)"
+              failed=1
+            else
+              echo "$wf succeeded on $GITHUB_SHA: ${run##* }"
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then exit 1; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: gate
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: ${{ needs.gate.outputs.tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+          use-cache: false
+
+      - name: Pack the release tarball
+        id: pack
+        run: |
+          scripts/package-release.sh "$VERSION" "$RUNNER_TEMP/dist" | tee "$RUNNER_TEMP/pack.txt"
+          awk -F': ' '{ key = $1; sub(/-/, "_", key); print key "=" $2 }' "$RUNNER_TEMP/pack.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Record the tarball's hashes
+        run: |
+          {
+            echo "## temporal-sdk-zig $VERSION ($TAG)"
+            if [ "$DRY_RUN" = true ]; then echo "Dry run: nothing is published."; fi
+            echo
+            echo "| Archive | SHA-256 | Zig hash |"
+            echo "| --- | --- | --- |"
+            echo "| $(basename "${{ steps.pack.outputs.archive }}") | \`${{ steps.pack.outputs.sha256 }}\` | \`${{ steps.pack.outputs.zig_hash }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.pack.outputs.zig_hash }}" > "$RUNNER_TEMP/dist/zig-hash"
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            ${{ steps.pack.outputs.archive }}
+            ${{ runner.temp }}/dist/zig-hash
+          if-no-files-found: error
+          compression-level: 0
+
+  smoke:
+    name: smoke (${{ matrix.os }})
+    needs: [gate, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      # Only for scripts/ and tools/release-smoke: the SDK under test is the tarball.
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+          use-cache: false
+
+      - name: Download the tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+
+      # The SDK links the core bundle its build.zig.zon pins for the runner's target.
+      - name: Build and run a project on the tarball, without cargo
+        run: |
+          scripts/smoke-release.sh "dist/temporal-sdk-zig-$VERSION.tar.gz" | tee "$RUNNER_TEMP/smoke.txt"
+          glibc=$(sed -n 's/^glibc: //p' "$RUNNER_TEMP/smoke.txt")
+          if [ -n "$glibc" ]; then echo "${{ matrix.os }}: the smoke test program needs $glibc" >> "$GITHUB_STEP_SUMMARY"; fi
+
+  publish:
+    needs: [gate, package, smoke]
+    if: inputs.dry_run == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: ${{ needs.gate.outputs.tag }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+
+      - name: Write SHA256SUMS and the release notes
+        run: |
+          zig_hash=$(cat dist/zig-hash)
+          rm dist/zig-hash
+          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG/temporal-sdk-zig-$VERSION.tar.gz"
+          # The CHANGELOG.md section, without its heading, up to the next section or link list.
+          awk -v h="## [$VERSION]" '
+            substr($0, 1, length(h)) == h { on = 1; next }
+            on && (/^## \[/ || /^\[[^]]*\]: /) { exit }
+            on { print }' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          {
+            echo
+            echo "## Install"
+            echo
+            echo "Add the SDK to your project with Zig 0.17.1. No Rust toolchain is needed: the build links a prebuilt core library for your target."
+            echo
+            echo '```sh'
+            echo "zig fetch --save=temporal $url"
+            echo '```'
+            echo
+            echo "Zig hash: \`$zig_hash\`. See README.md for the supported targets."
+          } >> "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      # The release is created as a draft so it never shows up without its assets. Publishing
+      # it creates the tag at the gated commit; if the tag appeared in the meantime, publishing
+      # would attach the release to it, so check again first and leave the draft instead.
+      - name: Publish the release
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG was created while this run was checking; release a new version instead"
+            exit 1
+          fi
+          prerelease=()
+          if [ "$PRERELEASE" = true ]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" --draft ${prerelease[@]+"${prerelease[@]}"} --target "$GITHUB_SHA" \
+            --title "temporal-sdk-zig $VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/*
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG was created while the release was uploading; the draft release is left for the maintainer to delete"
+            exit 1
+          fi
+          gh release edit "$TAG" --draft=false
