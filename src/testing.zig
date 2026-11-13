@@ -4820,3 +4820,204 @@ test "WorkflowReplayer decodes an encoded history with its codecs" {
     try without.registerWorkflow(Fixtures.Hello);
     try testing.expectError(error.Nondeterminism, without.replayHistoryJson(codec_history));
 }
+
+const SessionFixtures = struct {
+    var hold_started: Io.Event = .unset;
+
+    /// The session and task queue the activity ran in.
+    fn whereAmI(ctx: *activity.Context) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|{s}", .{ ctx.info().session_id, ctx.info().task_queue });
+    }
+    const WhereAmI = activity.Def("WhereAmI", whereAmI);
+
+    /// Runs until canceled.
+    fn hold(ctx: *activity.Context) !void {
+        hold_started.set(ctx.io());
+        try ctx.io().sleep(.fromSeconds(600), .awake);
+    }
+    const Hold = activity.Def("Hold", hold);
+
+    const options: workflow.SessionOptions = .{ .creation_timeout = .fromSeconds(10), .execution_timeout = .fromSeconds(60) };
+
+    fn in(s: *const workflow.Session) workflow.ActivityOptions {
+        return .{ .start_to_close_timeout = .fromSeconds(10), .session = s };
+    }
+
+    fn whereSessionIs(ctx: *workflow.Context, s: *const workflow.Session) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|{s}", .{ s.id, s.task_queue });
+    }
+
+    /// What the last failed call's failure was, by its root cause.
+    fn lastFailure(ctx: *workflow.Context) ![]const u8 {
+        const root = failure_mod.rootCause(ctx.last_failure orelse return "no failure");
+        if (failure_mod.applicationType(root.*)) |t| return t;
+        return switch (root.failure_info orelse return root.message) {
+            .timeout_failure_info => |t| std.fmt.allocPrint(ctx.allocator(), "timeout {t}", .{t.timeout_type}),
+            else => root.message,
+        };
+    }
+
+    const Report = struct {
+        session_id: []const u8,
+        task_queue: []const u8,
+        host_name: []const u8,
+        opened: []const u8,
+        activities_in_session: bool,
+        closed: []const u8,
+        after_close: []const u8,
+    };
+
+    fn happy(ctx: *workflow.Context) !Report {
+        const s = try ctx.createSession(options);
+        const opened = s.info();
+        const expected = try whereSessionIs(ctx, s);
+        const first = try ctx.executeActivity(WhereAmI, in(s), .{}).get();
+        const second = try ctx.executeActivity(WhereAmI, in(s), .{}).get();
+        try ctx.completeSession(s);
+        try ctx.completeSession(s); // closed: a no-op
+        const after: []const u8 = if (ctx.executeActivity(WhereAmI, in(s), .{}).get()) |_| "ran" else |err| @errorName(err);
+        return .{
+            .session_id = opened.session_id,
+            .task_queue = opened.task_queue,
+            .host_name = opened.host_name,
+            .opened = @tagName(opened.state),
+            .activities_in_session = std.mem.eql(u8, first, expected) and std.mem.eql(u8, second, expected),
+            .closed = @tagName(s.info().state),
+            .after_close = after,
+        };
+    }
+    const Happy = workflow.Def("SessionHappyPath", happy);
+
+    /// With one session slot: a second session can't open while the first is, neither from
+    /// the shared queue nor recreated on the host; once the first completes, a third opens
+    /// on the same host.
+    fn cap(ctx: *workflow.Context) ![]const u8 {
+        const a = try ctx.createSession(options);
+        const queued: []const u8 = if (ctx.createSession(.{ .creation_timeout = .fromSeconds(2), .execution_timeout = .fromSeconds(60) })) |_| "opened" else |err| @errorName(err);
+        const queued_failure = try lastFailure(ctx);
+        const recreated: []const u8 = if (ctx.recreateSession(a.task_queue, options)) |_| "opened" else |err| @errorName(err);
+        const recreated_failure = try lastFailure(ctx);
+        try ctx.completeSession(a);
+        const c = try ctx.createSession(options);
+        const same_host = std.mem.eql(u8, a.task_queue, c.task_queue);
+        try ctx.completeSession(c);
+        return std.fmt.allocPrint(ctx.allocator(), "{s} ({s}); {s} ({s}); after complete same_host={}", .{ queued, queued_failure, recreated, recreated_failure, same_host });
+    }
+    const Cap = workflow.Def("SessionCap", cap);
+
+    fn recreate(ctx: *workflow.Context) ![]const u8 {
+        const first = try ctx.createSession(options);
+        const host = first.info().task_queue;
+        try ctx.completeSession(first);
+        const second = try ctx.recreateSession(host, options);
+        const seen = try ctx.executeActivity(WhereAmI, in(second), .{}).get();
+        const expected = try whereSessionIs(ctx, second);
+        try ctx.completeSession(second);
+        return std.fmt.allocPrint(ctx.allocator(), "new_id={} same_host={} seen={}", .{ !std.mem.eql(u8, first.id, second.id), std.mem.eql(u8, host, second.task_queue), std.mem.eql(u8, seen, expected) });
+    }
+    const Recreate = workflow.Def("SessionRecreate", recreate);
+
+    fn isFailed(s: *const workflow.Session) bool {
+        return s.state() == .failed;
+    }
+
+    /// Waits for its session's host to go away while an activity runs in it.
+    fn lostHost(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.createSession(options);
+        _ = ctx.executeActivity(Hold, .{ .start_to_close_timeout = .fromSeconds(600), .session = s }, .{});
+        try ctx.await(@as(*const workflow.Session, s), isFailed);
+        const after: []const u8 = if (ctx.executeActivity(WhereAmI, in(s), .{}).get()) |_| "ran" else |err| @errorName(err);
+        const f = s.failure() orelse return "no failure";
+        return std.fmt.allocPrint(ctx.allocator(), "{t} {s} {s}", .{ s.state(), after, failure_mod.applicationType(failure_mod.rootCause(f).*) orelse "?" });
+    }
+    const LostHost = workflow.Def("SessionLostHost", lostHost);
+
+    fn start(max_concurrent_sessions: usize) !*WorkflowEnvironment {
+        hold_started = .unset;
+        const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+        errdefer env.deinit();
+        env.worker.options.sessions = .{ .max_concurrent_sessions = max_concurrent_sessions };
+        try env.registerWorkflow(Happy);
+        try env.registerWorkflow(Cap);
+        try env.registerWorkflow(Recreate);
+        try env.registerActivity(WhereAmI);
+        return env;
+    }
+};
+
+test "sessions: activities run on the session's host and see its ID, until the session completes" {
+    const env = try SessionFixtures.start(1000);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(SessionFixtures.Happy, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    const report = try env.getResult(SessionFixtures.Happy, &run, a, null);
+    try testing.expectEqual(36, report.session_id.len);
+    try testing.expect(std.mem.startsWith(u8, report.task_queue, try std.fmt.allocPrint(a, "{s}@{s}@", .{ env.task_queue, report.host_name })));
+    try testing.expect(report.host_name.len > 0);
+    try testing.expectEqualStrings("open", report.opened);
+    try testing.expect(report.activities_in_session);
+    try testing.expectEqualStrings("closed", report.closed);
+    try testing.expectEqualStrings("InvalidOptions", report.after_close);
+
+    // The creation activity waited on the shared session queue, with the session's timeouts
+    // and one attempt.
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var found = false;
+    for (history.events.items) |event| switch (event.attributes orelse continue) {
+        .activity_task_scheduled_event_attributes => |s| if (std.mem.eql(u8, s.activity_type.?.name, "__temporal_session_create")) {
+            found = true;
+            try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}__temporal_sessions", .{env.task_queue}), s.task_queue.?.name);
+            try testing.expectEqual(10, s.schedule_to_start_timeout.?.seconds);
+            try testing.expectEqual(60, s.start_to_close_timeout.?.seconds);
+            try testing.expectEqual(20, s.heartbeat_timeout.?.seconds);
+            try testing.expectEqual(1, s.retry_policy.?.maximum_attempts);
+        },
+        else => {},
+    };
+    try testing.expect(found);
+}
+
+test "sessions: a full host takes no more sessions until one completes" {
+    const env = try SessionFixtures.start(1);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(SessionFixtures.Cap, .{}, arena.allocator(), null);
+    try testing.expectEqualStrings("SessionCreationFailed (timeout TIMEOUT_TYPE_SCHEDULE_TO_START); SessionCreationFailed (SessionWorkerFull); after complete same_host=true", result);
+}
+
+test "sessions: recreating a session opens a new one on the same host" {
+    const env = try SessionFixtures.start(1);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(SessionFixtures.Recreate, .{}, arena.allocator(), null);
+    try testing.expectEqualStrings("new_id=true same_host=true seen=true", result);
+}
+
+test "sessions: a session fails when its host stops, and then its activities aren't scheduled" {
+    SessionFixtures.hold_started = .unset;
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SessionFixtures.LostHost);
+    var host = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, env.task_queue, .{ .sessions = .{} });
+    defer host.deinit();
+    try host.registerActivity(SessionFixtures.Hold);
+    try host.registerActivity(SessionFixtures.WhereAmI);
+    var host_running = try testing.io.concurrent(WorkflowEnvironment.runWorker, .{&host});
+    defer {
+        host.stop();
+        host_running.await(testing.io) catch {};
+    }
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try env.startWorkflow(SessionFixtures.LostHost, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try SessionFixtures.hold_started.wait(testing.io);
+    host.stop();
+    const result = try env.getResult(SessionFixtures.LostHost, &run, arena.allocator(), null);
+    try testing.expectEqualStrings("failed SessionFailed SessionWorkerStopped", result);
+}

@@ -38,6 +38,23 @@ pub const reserved_activity_prefix = "__temporal_";
 /// name it in their markers, so it must never change.
 pub const side_effect_activity_type = reserved_activity_prefix ++ "side_effect";
 
+// Sessions (`workflow.Context.createSession`). Histories name these, so they must never change.
+/// The activity that holds a session's slot on its host, from creation until the session
+/// completes; it signals the workflow once the host has taken the session.
+pub const session_create_activity_type = reserved_activity_prefix ++ "session_create";
+/// The activity that frees a session's slot on its host when the workflow completes it.
+pub const session_complete_activity_type = reserved_activity_prefix ++ "session_complete";
+/// The signal the creation activity sends with `SessionOpened`.
+pub const session_opened_signal = reserved_activity_prefix ++ "session_opened";
+/// The header carrying the session ID of an activity run in a session.
+pub const session_id_header = reserved_activity_prefix ++ "session_id";
+/// Appended to a task queue to name the queue that session workers take new sessions from.
+pub const session_queue_suffix = reserved_activity_prefix ++ "sessions";
+/// The creation activity's argument.
+pub const SessionCreateInput = struct { session_id: []const u8, heartbeat_interval_ms: i64 };
+/// The opened signal's argument: the host's own task queue and its name.
+pub const SessionOpened = struct { session_id: []const u8, task_queue: []const u8, host_name: []const u8 };
+
 gpa: Allocator,
 arena_state: std.heap.ArenaAllocator,
 sched: Scheduler,
@@ -69,6 +86,9 @@ externals: std.AutoHashMapUnmanaged(u32, *ExternalState) = .empty,
 backoffs: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 /// Coroutines blocked in `awaitCondition`, in the order they started waiting.
 conditions: std.ArrayList(*Condition) = .empty,
+/// Every session the run created, in creation order, for the opened signal to find. Arena
+/// memory.
+sessions: std.ArrayList(*workflow.Session) = .empty,
 args: []const converter.Payload = &.{},
 /// The start header (InitializeWorkflow's headers), sorted by name. Arena memory.
 header: converter.Header = .{},
@@ -556,6 +576,7 @@ pub fn setDynamicSignalHandler(inst: *Instance, handler: SignalHandler, context_
 /// handler for its name is registered.
 fn deliverSignal(inst: *Instance, job: *const act_pb.SignalWorkflow) !void {
     if (inst.finished) return;
+    if (std.mem.eql(u8, job.signal_name, session_opened_signal)) return inst.openSession(job.input.items);
     const a = inst.arena();
     const args = try a.alloc(converter.Payload, job.input.items.len);
     for (job.input.items, args) |p, *d| d.* = try p.dupe(a);
@@ -564,6 +585,23 @@ fn deliverSignal(inst: *Instance, job: *const act_pb.SignalWorkflow) !void {
     if (inst.signal_handlers.get(signal.name)) |handler| return inst.startSignalHandler(handler, signal);
     if (inst.dynamic_signal_handler) |handler| return inst.startSignalHandler(handler, signal);
     try inst.buffered_signals.append(a, signal);
+}
+
+/// Handles the opened signal of a session's creation activity: the session that is still
+/// waiting with that ID gets its host. Other signals (a stale or duplicate one) are dropped.
+fn openSession(inst: *Instance, payloads: []const converter.Payload) error{OutOfMemory}!void {
+    const a = inst.arena();
+    const opened = (converter.fromPayloads(struct { SessionOpened }, a, payloads) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        inst.logger.warn("dropping a session opened signal whose argument doesn't decode", .{ .error_name = err });
+        return;
+    })[0];
+    for (inst.sessions.items) |s| if (!s.opened and !s.closed and std.mem.eql(u8, s.id, opened.session_id)) {
+        s.task_queue = try a.dupe(u8, opened.task_queue);
+        s.host_name = try a.dupe(u8, opened.host_name);
+        s.opened = true;
+        return;
+    };
 }
 
 /// Spawns the signal's handler coroutine, which runs the inbound interceptors and then the
@@ -712,7 +750,7 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
 fn updateFailure(a: Allocator, run: *const HandlerRun, err: anyerror) error{OutOfMemory}!Failure {
     switch (err) {
         error.ApplicationFailure => if (run.pending_failure) |p| return failure_mod.application(a, p),
-        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed => if (run.last_failure) |f| return f.*,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed => if (run.last_failure) |f| return f.*,
         else => {},
     }
     return failure_mod.fromError(a, err);
@@ -920,7 +958,7 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
         .{ inst.ctx.pending_failure, inst.ctx.last_failure };
     if (pending) |p| return failure_mod.application(a, p);
     switch (err) {
-        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed => if (last) |f| return f.*,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed => if (last) |f| return f.*,
         // Only the workflow function's return of ctx.continueAsNew's error continues as new.
         error.ContinueAsNew => return failure_mod.application(a, .{
             .message = if (inst.continue_as_new == null)
@@ -1216,6 +1254,8 @@ pub fn rejectedChild(inst: *Instance, workflow_type: []const u8, f: failure_mod.
 // ---------------------------------------------------------------- activities
 
 pub const ScheduleError = error{ OutOfMemory, InvalidOptions };
+/// `SessionFailed`: the activity's session had failed, so it wasn't scheduled.
+pub const ActivityScheduleError = ScheduleError || error{SessionFailed};
 
 /// Creates the state of a new activity, local or remote: both share one sequence space.
 fn newActivity(inst: *Instance, cancellation_type: ActivityState.CancellationType) !*ActivityState {
@@ -1791,7 +1831,31 @@ const outbound_root: interceptor.WorkflowOutbound.VTable = .{
 
 fn rootExecuteActivity(ptr: *anyopaque, input: interceptor.ActivityInput, _: interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(converter.Payload) {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    return .{ .ctx = &inst.ctx, .state = inst.scheduleActivity(input.activity_type, input.options, input.args.payloads, input.header.header()) };
+    const options = if (input.options.session) |s| inst.sessionActivityOptions(input, s) catch |err| return .{ .ctx = &inst.ctx, .state = err } else input.options;
+    return .{ .ctx = &inst.ctx, .state = inst.scheduleActivity(input.activity_type, options, input.args.payloads, input.header.header()) };
+}
+
+/// The options that run an activity in `session`, on its host's task queue, after writing the
+/// session's ID into the activity's header. Nothing is scheduled for a session that isn't
+/// open.
+fn sessionActivityOptions(inst: *Instance, input: interceptor.ActivityInput, session: *const workflow.Session) ActivityScheduleError!workflow.ActivityOptions {
+    if (input.options.task_queue.len > 0) {
+        inst.logger.warn("executeActivity: ActivityOptions.session and task_queue are both set; an activity in a session runs on its host's task queue, so leave task_queue empty", .{ .ActivityType = input.activity_type, .SessionID = session.id });
+        return error.InvalidOptions;
+    }
+    switch (session.state()) {
+        .open => {},
+        .failed => return error.SessionFailed,
+        .closed => {
+            inst.logger.warn("executeActivity: the activity's session is closed: completeSession was called on it; create or recreate a session", .{ .ActivityType = input.activity_type, .SessionID = session.id });
+            return error.InvalidOptions;
+        },
+    }
+    try input.header.set(session_id_header, session.id);
+    var options = input.options;
+    options.task_queue = session.task_queue;
+    options.session = null;
+    return options;
 }
 
 fn rootExecuteLocalActivity(ptr: *anyopaque, input: interceptor.LocalActivityInput, _: interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(converter.Payload) {
