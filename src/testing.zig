@@ -355,7 +355,7 @@ pub const WorkflowEnvironment = struct {
         arena: Allocator,
         failure: ?*?failure_mod.Failure,
     ) !Workflow.Result {
-        return env.executeWorkflowWithOptions(Workflow, .{ .task_queue = "" }, args, arena, failure);
+        return env.executeWorkflowWithOptions(Workflow, .{}, args, arena, failure);
     }
 
     /// `executeWorkflow` with start options. `id` and `task_queue` default to a unique ID and
@@ -2884,6 +2884,74 @@ test "client: summary, details, priority and a versioning override set at start 
     const plain_started = plain_event.attributes.?.workflow_execution_started_event_attributes;
     try testing.expect(plain_started.versioning_override == null);
     try testing.expect(plain_started.retry_policy == null);
+    try testing.expect(plain_started.priority == null);
+}
+
+test "client: an empty task queue fails every client start before any call; the environment fills in its own" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("Hello default!", try env.executeWorkflowWithOptions(Fixtures.Hello, .{}, .{"default"}, a, null));
+
+    const options: client_mod.StartWorkflowOptions = .{ .id = "no-task-queue", .id_conflict_policy = .use_existing };
+    try testing.expectError(error.InvalidOptions, env.client.executeWorkflow(Fixtures.Hello, options, .{"typed"}));
+    try testing.expectError(error.InvalidOptions, env.client.executeWorkflowByName([]const u8, Fixtures.Hello.workflow_name, options, .{"by name"}));
+    try testing.expectError(error.InvalidOptions, env.client.signalWithStartWorkflow(SignalFixtures.AwaitApprovals, options, .{1}, SignalFixtures.Approve, .{"ann"}));
+    try testing.expectError(error.InvalidOptions, env.client.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, options, .{}, UpdateFixtures.Set, .{3}, .{}));
+    // None of them reached the server.
+    try testing.expectError(error.NotFound, env.client.describeWorkflow(a, "no-task-queue", ""));
+}
+
+test "client: signal-with-start sends the retry policy, summary and priority" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No worker polls this task queue; the started event is all the test needs.
+    var run = try env.client.signalWithStartWorkflow(SignalFixtures.AwaitApprovals, .{
+        .task_queue = "nobody-polls-this",
+        .retry_policy = .{ .maximum_attempts = 5 },
+        .static_summary = "Approval",
+        .priority = .{ .priority_key = 3 },
+    }, .{1}, SignalFixtures.Approve, .{"ann"});
+    defer run.deinit();
+    defer env.client.terminateWorkflow(run.id, run.run_id, "test cleanup") catch {};
+    const event = try StartOptionFixtures.startedEvent(&env.client, a, run.id, run.run_id);
+    try StartOptionFixtures.expectMetadata(a, event, "Approval", "");
+    const started = event.attributes.?.workflow_execution_started_event_attributes;
+    try testing.expectEqual(@as(i32, 5), started.retry_policy.?.maximum_attempts);
+    try testing.expectEqual(@as(i32, 3), started.priority.?.priority_key);
+}
+
+test "client: update-with-start sends the retry policy, summary and priority" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFixtures.HandleUpdates);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var handle = try env.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, .{
+        .id_conflict_policy = .use_existing,
+        .retry_policy = .{ .maximum_attempts = 5 },
+        .static_summary = "Updates",
+        .priority = .{ .priority_key = 3 },
+    }, .{}, UpdateFixtures.Set, .{3}, .{});
+    defer handle.deinit();
+    try testing.expectEqual(@as(i64, 0), try handle.get(a));
+    defer env.client.terminateWorkflow(handle.workflow_id, handle.run_id, "test cleanup") catch {};
+    const event = try StartOptionFixtures.startedEvent(&env.client, a, handle.workflow_id, handle.run_id);
+    try StartOptionFixtures.expectMetadata(a, event, "Updates", "");
+    const started = event.attributes.?.workflow_execution_started_event_attributes;
+    try testing.expectEqual(@as(i32, 5), started.retry_policy.?.maximum_attempts);
+    try testing.expectEqual(@as(i32, 3), started.priority.?.priority_key);
 }
 
 test "client: start options reach by-name, eager, and environment starts" {

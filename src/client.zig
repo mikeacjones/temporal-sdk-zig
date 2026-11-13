@@ -748,7 +748,11 @@ pub const Client = struct {
     }
 
     /// The start request for `options`, allocated from `a`. Signal-with-start copies it.
-    fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) search_attributes.EncodeError!wfs.StartWorkflowExecutionRequest {
+    fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) (search_attributes.EncodeError || error{InvalidOptions})!wfs.StartWorkflowExecutionRequest {
+        if (options.task_queue.len == 0) {
+            log.warn("starting workflow \"{s}\" of type \"{s}\": StartWorkflowOptions.task_queue is empty; set it to the task queue a worker polls (WorkflowEnvironment fills in its own)", .{ id, workflow_type });
+            return error.InvalidOptions;
+        }
         var request: wfs.StartWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_id = id,
@@ -1704,7 +1708,9 @@ pub const Client = struct {
 pub const StartWorkflowOptions = struct {
     /// Workflow ID. Empty generates a random UUID; read it from the run.
     id: []const u8 = "",
-    task_queue: []const u8,
+    /// Task queue a worker polls for the workflow's tasks. Required for client starts, which
+    /// return `error.InvalidOptions` when it is empty; `WorkflowEnvironment` fills in its own.
+    task_queue: []const u8 = "",
     execution_timeout: ?Duration = null,
     run_timeout: ?Duration = null,
     task_timeout: ?Duration = null,
@@ -1798,6 +1804,8 @@ pub const StartError = error{
     WorkflowExecutionAlreadyStarted,
     /// `StartWorkflowOptions.search_attributes` holds a value the server can't index (logged).
     InvalidSearchAttribute,
+    /// `StartWorkflowOptions.task_queue` is empty (logged). Returned before any call.
+    InvalidOptions,
 };
 
 pub const SignalError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };
@@ -3106,7 +3114,8 @@ pub const UpdateWithStartError = error{
     RpcFailed,
     NotFound,
     InvalidResponse,
-    /// `StartWorkflowOptions.id_conflict_policy` is unspecified.
+    /// `StartWorkflowOptions.id_conflict_policy` is unspecified or `task_queue` is empty
+    /// (logged). Returned before any call.
     InvalidOptions,
     /// The workflow is running and `id_conflict_policy` is `.fail`.
     WorkflowExecutionAlreadyStarted,
