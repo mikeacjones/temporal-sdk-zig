@@ -80,6 +80,28 @@ pub fn deinit(s: *Scheduler) void {
     s.* = undefined;
 }
 
+/// Like `deinit`, for fibers that refuse to exit: frees the pooled stacks and the pool's
+/// list, and leaves the stacks of unfinished fibers mapped. Those fibers (their headers live
+/// on their stacks) must never be resumed or woken afterwards.
+pub fn deinitLeakingLive(s: *Scheduler) void {
+    assert(s.current == null);
+    for (s.free_stacks.items) |stack| stack.unmap();
+    s.free_stacks.deinit(s.gpa);
+    s.* = undefined;
+}
+
+/// Stack bytes the scheduler holds, counted at the configured size: one stack per
+/// unfinished fiber plus the pooled ones. Depends only on the spawns and exits, not on
+/// how many pages were touched.
+pub fn stackBytes(s: *const Scheduler) usize {
+    return s.stackCount() * s.options.stack_size;
+}
+
+/// Stacks the scheduler holds: unfinished fibers plus pooled stacks.
+pub fn stackCount(s: *const Scheduler) usize {
+    return s.live + s.free_stacks.items.len;
+}
+
 /// Creates a fiber that will call `func` with `args` and puts it at the back of the ready
 /// queue. `func` must return `void`. Can be called from `run`'s caller or from a fiber.
 pub fn spawn(s: *Scheduler, name: []const u8, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !*Fiber {
@@ -519,6 +541,28 @@ fn deep(depth: u32) u64 {
 
 fn useStack(out: *u64) void {
     out.* = deep(200); // about 200 KiB of frames
+}
+
+test "deinitLeakingLive frees the pool and leaves a blocked fiber's stack mapped" {
+    var s: Scheduler = .init(testing.allocator, .{ .stack_size = 64 * 1024 });
+    var first: usize = 0;
+    _ = try s.spawn("a", recordStack, .{&first});
+    s.run();
+    var log: Log = .{};
+    var gate: Gate = .{ .log = &log };
+    _ = try s.spawn("stuck", waitOnGate, .{ &s, &gate });
+    var second: usize = 0;
+    _ = try s.spawn("b", recordStack, .{&second});
+    s.run();
+    try testing.expectEqual(@as(usize, 1), s.live);
+    try testing.expectEqual(@as(usize, 2), s.stackCount());
+    try testing.expectEqual(@as(usize, 2 * 64 * 1024), s.stackBytes());
+    const stuck = gate.waiter.?;
+    s.deinitLeakingLive();
+    // The blocked fiber's header is on its stack, which is still mapped. Unmap it here so
+    // the test process doesn't keep it.
+    try testing.expectEqual(Fiber.State.blocked, stuck.state);
+    stuck.stack.unmap();
 }
 
 test "a fiber can use most of its stack" {

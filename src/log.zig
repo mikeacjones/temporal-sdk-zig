@@ -116,22 +116,24 @@ pub const Logger = struct {
     }
 
     pub fn debug(l: Logger, comptime message: []const u8, fields: anytype) void {
-        l.emit(.debug, message, fields);
+        l.log(.debug, message, fields);
     }
 
     pub fn info(l: Logger, comptime message: []const u8, fields: anytype) void {
-        l.emit(.info, message, fields);
+        l.log(.info, message, fields);
     }
 
     pub fn warn(l: Logger, comptime message: []const u8, fields: anytype) void {
-        l.emit(.warn, message, fields);
+        l.log(.warn, message, fields);
     }
 
     pub fn err(l: Logger, comptime message: []const u8, fields: anytype) void {
-        l.emit(.err, message, fields);
+        l.log(.err, message, fields);
     }
 
-    fn emit(l: Logger, level: Level, comptime message: []const u8, fields: anytype) void {
+    /// Logs a message built at run time, such as a failure message that is also returned
+    /// elsewhere, so both carry the same text.
+    pub fn log(l: Logger, level: Level, message: []const u8, fields: anytype) void {
         if (l.silenced()) return;
         const names = comptime fieldNames(@TypeOf(fields));
         // Values that don't fit are truncated rather than allocated: this runs on workflow
