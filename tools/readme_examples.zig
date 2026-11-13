@@ -7,8 +7,8 @@
 //! `<!-- example: <id> -->` followed by a zig code block marks a block that must equal that
 //! region, with the region's common indentation removed. A zig code block is any fenced block
 //! whose info string starts with `zig`, in any case: a fence of three or more backticks or
-//! tildes, indented or inside a block quote, closed by a fence of the same character at least
-//! as long. `check` reports every block that differs, every zig block with no marker, every
+//! tildes, indented, inside block quotes, or opening a list item (`-`, `*`, `+`, `1.`, `1)`),
+//! closed by a fence of the same character at least as long. `check` reports every block that differs, every zig block with no marker, every
 //! marker that names no region, every region no block uses, and every id defined twice, and
 //! exits 1 if there are any. `update` rewrites the blocks from the regions and still fails on
 //! the other problems.
@@ -29,19 +29,28 @@ const zig_info = "zig";
 
 /// The opening line of a fenced code block.
 const Fence = struct {
-    /// What precedes the fence characters: indentation and block quote markers. Body lines
-    /// carry it too, and it is removed before they are compared.
+    /// What precedes the fence characters: indentation, block quote markers, and list item
+    /// markers. Body lines carry it too, with spaces in place of list markers, and it is
+    /// removed before they are compared.
     prefix: []const u8,
     char: u8,
     len: usize,
     info: []const u8,
 
     /// Reads `line` as an opening fence: a run of at least three backticks or tildes after
-    /// any indentation and block quote markers, then an info string, which after backticks
-    /// may not contain a backtick.
+    /// any indentation, block quote markers, and list item markers, in any nesting, then an
+    /// info string, which after backticks may not contain a backtick.
     fn parse(line: []const u8) ?Fence {
         const l = std.mem.trimEnd(u8, line, " \t\r");
-        const start = std.mem.findNone(u8, l, " \t>") orelse return null;
+        var start: usize = 0;
+        while (start < l.len) {
+            if (std.mem.findScalar(u8, " \t>", l[start]) != null) {
+                start += 1;
+            } else if (listMarkerLen(l[start..])) |n| {
+                start += n;
+            } else break;
+        }
+        if (start == l.len) return null;
         const c = l[start];
         if (c != '`' and c != '~') return null;
         const end = std.mem.findNonePos(u8, l, start, &.{c}) orelse l.len;
@@ -49,6 +58,20 @@ const Fence = struct {
         const info = std.mem.trim(u8, l[end..], " \t");
         if (c == '`' and std.mem.findScalar(u8, info, '`') != null) return null;
         return .{ .prefix = l[0..start], .char = c, .len = end - start, .info = info };
+    }
+
+    /// The length of the list item marker `s` starts with, without the space after it: a
+    /// bullet (`-`, `*`, `+`) or one to nine digits and `.` or `)`, followed by a space or tab.
+    fn listMarkerLen(s: []const u8) ?usize {
+        const n = if (s.len > 0 and std.mem.findScalar(u8, "-*+", s[0]) != null)
+            1
+        else n: {
+            const digits = std.mem.findNone(u8, s, "0123456789") orelse return null;
+            if (digits == 0 or digits > 9 or (s[digits] != '.' and s[digits] != ')')) return null;
+            break :n digits + 1;
+        };
+        if (n == s.len or (s[n] != ' ' and s[n] != '\t')) return null;
+        return n;
     }
 
     fn isZig(f: Fence) bool {
@@ -63,11 +86,22 @@ const Fence = struct {
         return rest.len >= f.len and std.mem.findNone(u8, rest, &.{f.char}) == null;
     }
 
-    /// `line` without the part of the fence's prefix it starts with.
+    /// `line` without the part of the fence's prefix it starts with, where a space stands
+    /// for each character of a list marker.
     fn strip(f: Fence, line: []const u8) []const u8 {
         var k: usize = 0;
-        while (k < f.prefix.len and k < line.len and line[k] == f.prefix[k]) k += 1;
+        while (k < f.prefix.len and k < line.len and line[k] == continuation(f.prefix[k])) k += 1;
         return line[k..];
+    }
+
+    /// The prefix character a body line carries for `c` of the opening line's prefix.
+    fn continuation(c: u8) u8 {
+        return if (std.mem.findScalar(u8, " \t>", c) != null) c else ' ';
+    }
+
+    /// Appends the prefix a body line carries.
+    fn appendContinuation(f: Fence, arena: Allocator, out: *std.ArrayList(u8)) Allocator.Error!void {
+        for (f.prefix) |c| try out.append(arena, continuation(c));
     }
 };
 
@@ -191,12 +225,12 @@ pub fn process(arena: Allocator, mode: Mode, readme_name: []const u8, readme: []
                 } else if (region.text.len > 0) {
                     var region_lines = std.mem.splitScalar(u8, region.text, '\n');
                     while (region_lines.next()) |l| {
+                        const line_start = out.items.len;
+                        try fence.appendContinuation(arena, &out);
                         if (l.len == 0) {
-                            try appendLine(arena, &out, std.mem.trimEnd(u8, fence.prefix, " \t"));
-                        } else {
-                            try out.appendSlice(arena, fence.prefix);
-                            try appendLine(arena, &out, l);
-                        }
+                            out.items.len = line_start + std.mem.trimEnd(u8, out.items[line_start..], " \t").len;
+                            try out.append(arena, '\n');
+                        } else try appendLine(arena, &out, l);
                     }
                 }
             } else {
@@ -445,6 +479,10 @@ test "every fence spelling with a zig info string is a zig block" {
         .{ "```zig title=a", "```" },
         .{ "~~~~ zig {.numberLines}", "~~~~~" },
         .{ "> ```zig", "> ```" },
+        .{ "- ```zig", "  ```" },
+        .{ "1. ```zig", "   ```" },
+        .{ "> - ```zig", ">   ```" },
+        .{ "* 2) + ~~~zig", "       ~~~" },
     };
     for (spellings) |s| {
         var f: Fixture = .{ .arena = .init(testing.allocator) };
@@ -510,4 +548,25 @@ test "an indented or quoted block is compared and rewritten without its prefix" 
     try testing.expectEqualStrings(quoted, try f.run(.check, quoted));
     try testing.expectEqual(@as(usize, 0), f.problems.items.len);
     try testing.expectEqualStrings(quoted, try f.run(.update, "<!-- example: greet -->\n> ```zig\n> old\n> ```\n"));
+}
+
+test "a block opening a list item is compared and rewritten without its marker" {
+    var f: Fixture = .{ .arena = .init(testing.allocator) };
+    defer f.deinit();
+    try f.add(&.{.{ "ex.zig", example_file }});
+    const bullet = "<!-- example: greet -->\n- ```zig\n  const name = \"Ann\";\n\n  _ = name;\n  ```\n";
+    try testing.expectEqualStrings(bullet, try f.run(.check, bullet));
+    const quoted = "<!-- example: greet -->\n> 1. ```zig\n>    const name = \"Ann\";\n>\n>    _ = name;\n>    ```\n";
+    try testing.expectEqualStrings(quoted, try f.run(.check, quoted));
+    try testing.expectEqual(@as(usize, 0), f.problems.items.len);
+    try testing.expectEqualStrings(quoted, try f.run(.update, "<!-- example: greet -->\n> 1. ```zig\n>    old\n>    ```\n"));
+    _ = try f.run(.check, "<!-- example: greet -->\n- ```zig\n  const name = \"Ann\";\n\n  _ = nom;\n  ```\n");
+    try f.expectProblem("README.md:5: example \"greet\" differs");
+}
+
+test "list markers need a space and at most nine digits" {
+    for ([_][]const u8{ "-```zig", "1.```zig", "1234567890. ```zig", "a. ```zig", "1: ```zig" }) |line| {
+        try testing.expect(Fence.parse(line) == null);
+    }
+    try testing.expectEqualStrings("12) ", Fence.parse("12) ```zig").?.prefix);
 }
