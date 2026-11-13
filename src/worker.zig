@@ -574,16 +574,22 @@ pub const Worker = struct {
     const PollKind = enum { workflow, activity };
 
     /// Reports a failed poll from a poll loop: the core has already retried what it considers
-    /// transient, so the worker logs it, records it for `run` to return, and stops.
-    fn pollFailed(w: *Worker, kind: PollKind, task_queue: []const u8, err: PollError, detail: ?[]const u8) void {
-        log.err("polling for {t} tasks on task queue {s} failed: {s}; stopping the worker", .{ kind, task_queue, detail orelse @errorName(err) });
-        w.recordPollFailure(kind, task_queue, err, detail);
+    /// transient, so the worker logs it, records it for `run` to return, and stops. Frees the
+    /// core's message and sets it to null: the bridge overwrites it without freeing on the
+    /// next failure, and leaves it alone when that failure is OutOfMemory.
+    fn pollFailed(w: *Worker, kind: PollKind, task_queue: []const u8, err: PollError, message: *?[]u8) void {
+        log.err("polling for {t} tasks on task queue {s} failed: {s}; stopping the worker", .{ kind, task_queue, message.* orelse @errorName(err) });
+        w.recordPollFailure(kind, task_queue, err, message);
     }
 
     /// `pollFailed` without the log line (the test runner fails any test that logs an error):
-    /// keeps the run's first failure and its text, and stops the worker.
-    fn recordPollFailure(w: *Worker, kind: PollKind, task_queue: []const u8, err: PollError, detail: ?[]const u8) void {
-        const text = std.fmt.allocPrint(w.gpa, "polling for {t} tasks on task queue {s} failed: {s}", .{ kind, task_queue, detail orelse @errorName(err) }) catch null;
+    /// keeps the run's first failure and its text, stops the worker, and frees `message`.
+    fn recordPollFailure(w: *Worker, kind: PollKind, task_queue: []const u8, err: PollError, message: *?[]u8) void {
+        defer if (message.*) |m| {
+            w.gpa.free(m);
+            message.* = null;
+        };
+        const text = std.fmt.allocPrint(w.gpa, "polling for {t} tasks on task queue {s} failed: {s}", .{ kind, task_queue, message.* orelse @errorName(err) }) catch null;
         {
             w.stop_mutex.lockUncancelable(w.io);
             defer w.stop_mutex.unlock(w.io);
@@ -648,7 +654,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
     var group: Io.Group = .init;
     while (true) {
         const polled = core.pollWorkflowActivation(w.gpa, w.io, &message) catch |err| {
-            w.pollFailed(.workflow, w.task_queue, err, message);
+            w.pollFailed(.workflow, w.task_queue, err, &message);
             continue;
         } orelse break;
         group.concurrent(w.io, processActivation, .{ &runner, core, w.io, polled }) catch {
@@ -1077,7 +1083,7 @@ fn activityLoop(w: *Worker, core: bridge.Worker, task_queue: []const u8) void {
     defer if (message) |m| w.gpa.free(m);
     while (true) {
         const polled = core.pollActivityTask(w.gpa, w.io, &message) catch |err| {
-            w.pollFailed(.activity, task_queue, err, message);
+            w.pollFailed(.activity, task_queue, err, &message);
             continue;
         } orelse break;
         const run = receiveActivityTask(w, &running, polled, task_queue) orelse continue;
@@ -2249,15 +2255,23 @@ test "the first poll failure is recorded with its kind, task queue and detail" {
     var client: client_mod.Client = undefined; // never touched: nothing is registered
     var w = try Worker.init(testing.allocator, testing.io, &client, "fatal", .{});
     defer w.deinit();
-    w.recordPollFailure(.activity, "q1", error.PollFailed, "permission denied");
-    w.recordPollFailure(.workflow, "q2", error.PollFailed, "later");
+    // One message variable for both failures, as in a poll loop: each failure frees it, so
+    // testing.allocator reports a leak if the first is overwritten, and a later failure
+    // without a message isn't reported with the earlier one's text.
+    var message: ?[]u8 = try testing.allocator.dupe(u8, "permission denied");
+    defer if (message) |m| testing.allocator.free(m);
+    w.recordPollFailure(.activity, "q1", error.PollFailed, &message);
+    try testing.expectEqual(@as(?[]u8, null), message);
+    message = try testing.allocator.dupe(u8, "later");
+    w.recordPollFailure(.workflow, "q2", error.PollFailed, &message);
+    try testing.expectEqual(@as(?[]u8, null), message);
     try testing.expectEqualStrings("polling for activity tasks on task queue q1 failed: permission denied", w.fatalMessage().?);
     try testing.expectEqual(@as(?Worker.PollError, error.PollFailed), w.fatal);
 
     // Without a message from the core, the error's name is the detail.
     var bare = try Worker.init(testing.allocator, testing.io, &client, "bare", .{});
     defer bare.deinit();
-    bare.recordPollFailure(.workflow, "q3", error.OutOfMemory, null);
+    bare.recordPollFailure(.workflow, "q3", error.OutOfMemory, &message);
     try testing.expectEqualStrings("polling for workflow tasks on task queue q3 failed: OutOfMemory", bare.fatalMessage().?);
 
     // A run clears the last run's failure first, even one that returns early.
@@ -2281,7 +2295,8 @@ fn expectPollFailureReturned(comptime runFn: fn (*Worker) Worker.RunError!void, 
     try w.registerActivity(HelloTest.Greet);
     var running = try testing.io.concurrent(runFn, .{&w});
     try w.waitUntilRunning();
-    w.recordPollFailure(.activity, w.task_queue, error.PollFailed, "boom");
+    var message: ?[]u8 = try testing.allocator.dupe(u8, "boom");
+    w.recordPollFailure(.activity, w.task_queue, error.PollFailed, &message);
     try testing.expectError(error.PollFailed, running.await(testing.io));
     const expected = try std.fmt.allocPrint(testing.allocator, "polling for activity tasks on task queue {s} failed: boom", .{task_queue});
     defer testing.allocator.free(expected);
