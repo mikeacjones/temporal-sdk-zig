@@ -462,19 +462,26 @@ fn greetTwice(ctx: *workflow.Context, name: []const u8) ![]const u8 {
     const remote = ctx.executeActivity(Greet, .{
         .start_to_close_timeout = .fromSeconds(10),
         .retry_policy = .{ .maximum_attempts = 3 },
+        .summary = "greet the caller", // shown on the scheduled event in the UI
+        .priority = .{ .priority_key = 2, .fairness_key = "tenant-a" },
     }, .{name});
-    const local = ctx.executeLocalActivityByName([]const u8, "greet", .{ .start_to_close_timeout = .fromSeconds(5) }, .{"local friend"});
+    const local = ctx.executeLocalActivityByName([]const u8, "greet", .{
+        .start_to_close_timeout = .fromSeconds(5),
+        .summary = "greet a friend",
+    }, .{"local friend"});
     return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ try remote.get(), try local.get() });
 }
 pub const GreetTwice = workflow.Def("greet_twice", greetTwice);
 ```
 
-<!-- stub: temporal-sdk-zig-d51.7.3 -->
 Notes:
 - `start_to_close_timeout` or `schedule_to_close_timeout` is required; without either, `get` returns `error.InvalidOptions`.
 - On `error.ActivityFailed`, `future.failure()` has the failure; returning the error fails the workflow with it as the cause.
 - `future.cancel()`, or canceling the waiting coroutine, cancels the activity as `cancellation_type` says.
-- Not implemented yet: a summary, a priority, and a versioning intent on activity options.
+- `summary` (on `workflow.ActivityOptions` and `workflow.LocalActivityOptions`) is a single line the UI and CLI show on the activity's scheduled or marker event. It is sent as a JSON string payload through the worker's codecs; empty sends none.
+- `priority` is a `workflow.Priority`; null uses the workflow's, and each zero field inherits the workflow's value. A value the server rejects fails the workflow task.
+- `versioning_intent` (`workflow.VersioningIntent`: `unspecified`, `compatible`, `default`) picks the build an activity runs on, only on task queues with build-ID-based versioning rules. `unspecified` means `compatible` on the workflow's own task queue and `default` elsewhere.
+- Adding any of the three to existing workflow code doesn't break replay of histories recorded without them.
 
 #### Timers and conditions
 `ctx.io().sleep` starts a durable timer; `workflow.Context.await` blocks until a condition holds, and `awaitTimeout` gives up after a timeout.
@@ -932,7 +939,8 @@ try w.registerActivity(Greet);
 var running = try io.concurrent(Worker.run, .{&w});
 defer {
     w.stop();
-    running.await(io) catch |err| std.log.err("greetings worker failed: {t}", .{err});
+    running.await(io) catch |err|
+        std.log.err("greetings worker failed: {t} {s}", .{ err, w.fatalMessage() orelse "" });
 }
 try w.waitUntilRunning();
 
@@ -941,22 +949,23 @@ defer run.deinit();
 const result = try run.get(arena); // "Hello, Ana!"
 ```
 
-<!-- stub: temporal-sdk-zig-d51.9.1 -->
 Notes:
 - The client must outlive the worker; call `deinit` after `run` has returned.
-- `run` returns `error.NothingRegistered`, `error.InvalidOptions`, `error.WorkerInitFailed`, or `error.ValidationFailed` (the last three logged with the reason).
+- There is no separate start function: to keep working while the worker polls, run `run` on `io.concurrent` as above, and read its error from `await`.
+- `run` returns `error.NothingRegistered`, `error.InvalidOptions`, `error.WorkerInitFailed`, or `error.ValidationFailed` before polling starts (the last three logged with the reason); `Worker.RunError` lists every error.
+- When sdk-core gives up polling for tasks, the worker logs it, shuts down as `stop` does, and `run` (or `runUntilSignal`) returns `error.PollFailed`. `Worker.fatalMessage` then has `polling for <workflow|activity> tasks on task queue <queue> failed: <reason>`, owned by the worker until the next `run` or `deinit`.
 - `stop` is safe from any thread, before or during `run`. `waitUntilRunning` returns `error.WorkerFailedToStart` when `run` failed first.
 - Several workers can share a process and a client, one per task queue; one signal stops every worker in `runUntilSignal`.
-- Not implemented yet: a failed poll logs and stops the worker, and `run` returns without an error; it is to return `error.PollFailed`.
 
 #### Options
 
 `worker.Options` is the struct literal passed to `Worker.init`; every field has a default, so `.{}` works.
 
 Notes:
-- `max_concurrent_workflow_task_executions`, `max_concurrent_activity_executions` (100 each): fixed slot counts.
+- `max_concurrent_workflow_task_executions` (100): workflow activations processed at once. Activations of different runs run in parallel, each on its own thread; one run's activations run one at a time, possibly on different threads. Payload codecs, interceptors, and log sinks are therefore called concurrently.
+- `max_concurrent_activity_executions` (100): activities run at once, each on its own task.
 - `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers` (2 each): polls in flight at once.
-- `max_cached_workflows` (1000): runs kept in memory between tasks. `workflow_stack_size` (256 KiB): each coroutine's stack.
+- `max_cached_workflows` (1000): runs kept in memory between tasks. Over the limit the least recently used run is evicted and replayed from its history at its next task; 0 replays every task from the start. `workflow_stack_size` (256 KiB): each coroutine's stack.
 - `identity`: the worker's name to the server; empty uses the client's.
 - `graceful_shutdown_period` (zero) and `workflow_memory_limit` (null): see below.
 - `logger` (null uses the client's sink) and `log_during_replay` (false): where workflow and activity logs go, and whether replay logs.
@@ -1298,6 +1307,7 @@ Notes:
 - A sink is called concurrently from workflow, activity, and sdk-core threads and must outlive its clients and workers.
 - A workflow's logger drops records while it replays history, unless `worker.Options.log_during_replay` is set.
 - `Logger.with` allocates from the arena it is given: in a workflow, build the logger once.
+- A worker logs each workflow run it evicts from its cache, with `run_id`, `reason`, `message`, and, for a run it had cached, `workflow_id` and `workflow_type`: at error for nondeterminism or a fatal core error, at warn when fetching history failed, and at debug for routine cache evictions.
 
 #### Metrics
 

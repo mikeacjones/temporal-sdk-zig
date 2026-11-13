@@ -40,7 +40,8 @@ test "workers: a worker runs a workflow until it is stopped" {
     var running = try io.concurrent(Worker.run, .{&w});
     defer {
         w.stop();
-        running.await(io) catch |err| std.log.err("greetings worker failed: {t}", .{err});
+        running.await(io) catch |err|
+            std.log.err("greetings worker failed: {t} {s}", .{ err, w.fatalMessage() orelse "" });
     }
     try w.waitUntilRunning();
 

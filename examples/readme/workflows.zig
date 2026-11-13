@@ -48,8 +48,13 @@ fn greetTwice(ctx: *workflow.Context, name: []const u8) ![]const u8 {
     const remote = ctx.executeActivity(Greet, .{
         .start_to_close_timeout = .fromSeconds(10),
         .retry_policy = .{ .maximum_attempts = 3 },
+        .summary = "greet the caller", // shown on the scheduled event in the UI
+        .priority = .{ .priority_key = 2, .fairness_key = "tenant-a" },
     }, .{name});
-    const local = ctx.executeLocalActivityByName([]const u8, "greet", .{ .start_to_close_timeout = .fromSeconds(5) }, .{"local friend"});
+    const local = ctx.executeLocalActivityByName([]const u8, "greet", .{
+        .start_to_close_timeout = .fromSeconds(5),
+        .summary = "greet a friend",
+    }, .{"local friend"});
     return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ try remote.get(), try local.get() });
 }
 pub const GreetTwice = workflow.Def("greet_twice", greetTwice);
