@@ -176,7 +176,7 @@ pub fn runWorker(gpa: std.mem.Allocator, io: std.Io, options: temporal.client.Op
 ```
 Notes:
 - In a program, `options` usually comes from `temporal.client.loadDefaultOptions(arena)`: the Temporal config file and `TEMPORAL_*` environment variables, defaulting to `localhost:7233` and the `default` namespace, where `temporal server start-dev` runs a local server.
-- `Worker.runUntilSignal` returns after SIGINT or SIGTERM once in-flight work has finished. `Worker.run` runs until another thread calls `Worker.stop`.
+- `Worker.runUntilSignal` returns after SIGINT or SIGTERM once in-flight work has finished. `Worker.run` runs until another thread calls `Worker.stop`. Both return an error instead when the worker can't start or polling fails for good; see [Running and stopping](#running-and-stopping).
 - Registering a name twice returns `error.AlreadyRegistered`.
 - The client must outlive its workers. Both are heavyweight: create them once per process.
 
@@ -205,7 +205,7 @@ pub fn startGreeting(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocato
 Notes:
 - `get` waits for the workflow to close, following continue-as-new, and allocates the result from the allocator passed to it. Free the handle with `deinit`.
 - A failed workflow is `error.WorkflowFailed` from `get`; read the failure with `run.failure()`.
-- Starting a workflow ID that is already running returns `error.WorkflowExecutionAlreadyStarted`. An empty `task_queue` returns `error.InvalidOptions` before any call.
+- By default, starting a workflow ID that a running run holds, or a closed run that `id_reuse_policy` keeps from reuse, returns `error.WorkflowExecutionAlreadyStarted`. An empty `task_queue` returns `error.InvalidOptions` before any call.
 
 ### Next steps
 
@@ -245,9 +245,9 @@ var staging = try temporal.client.Client.connect(gpa, io, try temporal.client.lo
 defer staging.close();
 ```
 Notes:
-- `connect` checks the connection. It returns `error.ConnectFailed` or `error.InvalidOptions`, logged with the reason. Free the client with `close`.
-- `api_key` alone doesn't turn TLS on; `loadOptions` does for a profile with an API key or TLS settings, and returns `error.InvalidConfig` for a named profile that doesn't exist. TLS file paths are read on each connect, so `Client.reconnect` picks up rotated certificates.
-- `Options.rpc_timeout` (default 30 s) bounds each call, but not waits for a result. Slices in `Options` are borrowed and must outlive the client.
+- `connect` checks the connection. It returns `error.ConnectFailed`, `error.InvalidOptions`, or `error.RuntimeInitFailed` (sdk-core's runtime couldn't be created), logged with the reason, or `error.OutOfMemory`. Free the client with `close`.
+- `api_key` alone doesn't turn TLS on; `loadOptions` does for a profile with an API key or TLS settings, and returns `error.InvalidConfig`, logged, for a named profile that doesn't exist, a config file it can't read or parse, a key `strict` rejects, or a certificate given as both a path and data. TLS file paths are read on each connect, so `Client.reconnect` picks up rotated certificates.
+- `Options.rpc_timeout` (default 30 s) bounds each call, but not waits for a result. `connect` copies `namespace` and `identity`; `codecs`, `logger`, `propagators`, `worker_interceptors`, and `interceptors` are borrowed and must outlive the client and its workers.
 
 #### Starting workflows
 
@@ -264,8 +264,8 @@ defer by_name.deinit();
 _ = try by_name.get(arena);
 ```
 Notes:
-- `id_conflict_policy` applies while a run with the ID is open: `.unspecified` and `.fail` return `error.WorkflowExecutionAlreadyStarted`, `.use_existing` returns the running run, `.terminate_existing` replaces it.
-- `get` returns `error.WorkflowFailed`, `WorkflowCanceled`, `WorkflowTerminated`, or `WorkflowTimedOut`; `run.failure()` holds the failure.
+- `id_conflict_policy` applies while a run with the ID is open: `.unspecified` and `.fail` return `error.WorkflowExecutionAlreadyStarted` (with `error_when_already_started = false`, a handle to the run holding the ID instead), `.use_existing` returns the running run, `.terminate_existing` replaces it.
+- `get` returns `error.WorkflowFailed`, `WorkflowCanceled`, `WorkflowTerminated`, or `WorkflowTimedOut`. Only after `WorkflowFailed` does `run.failure()` hold a failure; after the other three it is null.
 - `Client.getWorkflow` makes a handle to an existing workflow without a call; an empty run ID follows the latest run.
 
 #### Signals, queries, and updates
@@ -279,19 +279,21 @@ pub const Finish = workflow.SignalDef("finish", fn () void);
 pub const CurrentGreeting = workflow.QueryDef("current_greeting", fn () []const u8);
 pub const SetGreeting = workflow.UpdateDef("set_greeting", fn (greeting: []const u8) []const u8);
 
-pub fn sendMessages(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
+pub const Replies = struct { previous: []const u8, current: []const u8, result: []const u8 };
+
+pub fn sendMessages(client: *temporal.client.Client, arena: Allocator) !Replies {
     var run = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-1", .task_queue = "greetings" }, .{"World"});
     defer run.deinit();
     var update = try client.updateWorkflow(SetGreeting, run.id, "", .{"Hi"}, .{});
     defer update.deinit();
-    _ = try update.get(arena); // the previous greeting, "Hello"
-    _ = try client.queryWorkflow(CurrentGreeting, arena, run.id, "", .{}); // "Hi"
+    const previous = try update.get(arena); // the previous greeting, "Hello"
+    const current = try client.queryWorkflow(CurrentGreeting, arena, run.id, "", .{}); // "Hi"
     try client.signalWorkflow(Finish, run.id, "", .{});
     var signaled = try client.signalWithStartWorkflow(GreeterWorkflow, .{ .id = "greeter-2", .task_queue = "greetings" }, .{"Zig"}, Finish, .{});
     defer signaled.deinit();
     var updated = try client.updateWithStartWorkflow(GreeterWorkflow, .{ .id = "greeter-3", .task_queue = "greetings", .id_conflict_policy = .use_existing }, .{"Ziggy"}, SetGreeting, .{"Howdy"}, .{});
     defer updated.deinit();
-    return run.get(arena); // "Hi, World!"
+    return .{ .previous = previous, .current = current, .result = try run.get(arena) }; // result: "Hi, World!"
 }
 ```
 Notes:
@@ -319,7 +321,7 @@ std.log.info("{d} in all", .{try client.countWorkflows("WorkflowType = 'greeter'
 try client.cancelWorkflow(run.id, run.run_id, "no longer needed");
 ```
 Notes:
-- Results are allocated from the arena passed in; the full server response is in `raw`.
+- Results are allocated from the arena passed in. A description's `raw` is the full server response, and a listed workflow's `raw` is the server's record of that execution.
 - Visibility is eventually consistent. An invalid query is `error.RpcFailed`, logged with the server's reason.
 - A cancelled workflow sees `error.Canceled` from its next cancelable wait and may clean up first. `Client.historyIterator` reads history a page at a time, optionally waiting for new events.
 <!-- stub: temporal-sdk-zig-d51.5.3 -->
@@ -364,7 +366,7 @@ std.log.info("{s} took {d} attempt(s)", .{ description.activity_type, descriptio
 ```
 Notes:
 - The server must enable standalone activities (`testing.DevServer.standalone_activity_args` on a dev server); otherwise the start is `error.RpcFailed`.
-- `start_to_close_timeout` or `schedule_to_close_timeout` is required. `get` returns `error.ActivityFailed`, `ActivityTimedOut`, and so on, with `failure()`.
+- `start_to_close_timeout` or `schedule_to_close_timeout` is required: the client doesn't check, and the server refuses a start with neither as `error.RpcFailed`, logged. `get` returns `error.ActivityFailed`, `ActivityCanceled`, `ActivityTerminated`, or `ActivityTimedOut`, with `failure()`.
 - `cancel` and `terminate` return `error.ActivityClosed` for a closed activity. `listActivities` and `countActivities` cover only standalone activities.
 
 #### Completing activities asynchronously
@@ -464,6 +466,7 @@ fn greetTwice(ctx: *workflow.Context, name: []const u8) ![]const u8 {
         .retry_policy = .{ .maximum_attempts = 3 },
         .summary = "greet the caller", // shown on the scheduled event in the UI
         .priority = .{ .priority_key = 2, .fairness_key = "tenant-a" },
+        .versioning_intent = .compatible, // with build-ID versioning: this workflow's build
     }, .{name});
     const local = ctx.executeLocalActivityByName([]const u8, "greet", .{
         .start_to_close_timeout = .fromSeconds(5),
@@ -475,8 +478,8 @@ pub const GreetTwice = workflow.Def("greet_twice", greetTwice);
 ```
 
 Notes:
-- `start_to_close_timeout` or `schedule_to_close_timeout` is required; without either, `get` returns `error.InvalidOptions`.
-- On `error.ActivityFailed`, `future.failure()` has the failure; returning the error fails the workflow with it as the cause.
+- `start_to_close_timeout` or `schedule_to_close_timeout` is required. Without either, a local activity's `get` returns `error.InvalidOptions` (logged); `executeActivity` schedules its activity anyway, and the server rejects the command and fails the workflow task (cause `BadScheduleActivityAttributes`), again on every retry until the code sets a timeout.
+- On `error.ActivityFailed`, `future.failure()` has the failure; returning the error fails the workflow with that failure.
 - `future.cancel()`, or canceling the waiting coroutine, cancels the activity as `cancellation_type` says.
 - `summary` (on `workflow.ActivityOptions` and `workflow.LocalActivityOptions`) is a single line the UI and CLI show on the activity's scheduled or marker event. It is sent as a JSON string payload through the worker's codecs; empty sends none.
 - `priority` is a `workflow.Priority`; null uses the workflow's, and each zero field inherits the workflow's value. A value the server rejects fails the workflow task.
@@ -622,12 +625,12 @@ pub const GreetFamily = workflow.Def("greet_family", greetFamily);
 
 Notes:
 - `started` returns the child's execution; `error.ChildWorkflowAlreadyStarted` means its ID is taken.
-- `get` returns `error.ChildWorkflowFailed` for a failed, timed-out, canceled, or terminated child; `future.failure()` says which.
+- `get` returns `error.ChildWorkflowFailed` for a failed, timed-out, canceled, or terminated child, `future.failure()` saying which, and `error.ChildWorkflowAlreadyStarted` when the child's ID is taken.
 - `parent_close_policy` defaults to `.terminate`; `future.signal` signals the child and `future.cancel()` cancels it.
 
 #### External workflows
 - `ctx.signalExternalWorkflow` and `ctx.cancelExternalWorkflow` signal or cancel a workflow by ID; an empty run ID targets the latest run.
-- `get` returns `error.ExternalWorkflowNotFound` for a missing or closed target, and `error.ExternalWorkflowRequestFailed` otherwise.
+- `get` returns `error.ExternalWorkflowNotFound` for a missing or closed target, `error.ExternalWorkflowRequestFailed` when the server refuses for another reason, `error.InvalidOptions` (logged) for an empty workflow ID, and `error.Canceled` if the waiting coroutine is canceled.
 - The target runs in the same namespace; a child finds its parent in `ctx.info().parent`.
 
 #### Continue-as-new
@@ -741,8 +744,8 @@ pub const GreetOnOneHost = workflow.Def("greet_on_one_host", greetOnOneHost);
 ```
 
 Notes:
-- The host is a worker with `worker.Options.sessions` set; `error.SessionCreationFailed` means none took the session in time.
-- A session fails when its host stops or misses heartbeats; activities then return `error.SessionFailed`, and running ones aren't canceled.
+- The host is a worker with `worker.Options.sessions` set. `createSession` returns `error.SessionCreationFailed` when no host took the session within `creation_timeout` or the host refused it; [Sessions](#sessions-1) under Workers lists the cases and the other errors.
+- A session fails when its host stops, misses heartbeats, or runs past `execution_timeout`; activities scheduled in it then return `error.SessionFailed`, and running ones aren't canceled.
 - `ctx.recreateSession` opens a new session on an earlier session's host, from its `info().task_queue`.
 
 #### Dynamic workflows
@@ -768,7 +771,7 @@ Notes:
 
 #### Workflow info
 - `ctx.info()` returns the run's IDs, type, task queue, namespace, attempt, timeouts, parent, start time, retry policy, and priority.
-- `ctx.isReplaying()` says whether the task replays history; `ctx.logger()` and `ctx.metrics()` stay silent during replay.
+- `ctx.isReplaying()` says whether the task replays history. `ctx.metrics()` records nothing during replay, and `ctx.logger()` drops its records then unless `worker.Options.log_during_replay` is set.
 - `ctx.lastCompletionResult(T)` and `ctx.previousRunFailure()` read a cron or retried workflow's previous run.
 
 #### Failure policy and deadlock detection
@@ -847,8 +850,8 @@ pub const SendGreetings = activity.Def("send_greetings", sendGreetings);
 ```
 
 Notes:
-- A cancel from the workflow arrives only in the server's answer to a heartbeat, so an activity that should notice it must heartbeat. Heartbeats are throttled to 80% of the heartbeat timeout (at most 60 seconds), so calling `heartbeat` often is cheap.
-- `heartbeat({})` sends no details; pass a struct for several values. `heartbeatDetails(T)` returns `error.NoHeartbeatDetails` on a first attempt; `encodedHeartbeatDetails()` returns every payload undecoded.
+- A cancel from the workflow arrives only in the server's answer to a heartbeat, so an activity that should notice it must heartbeat. Heartbeats are throttled to 80% of the heartbeat timeout (at most 60 seconds; 30 seconds without a heartbeat timeout), so calling `heartbeat` often is cheap.
+- `heartbeat({})` sends no details; pass a struct for several values. `heartbeatDetails(T)` decodes the first detail, and returns `error.NoHeartbeatDetails` when the previous attempt left none (a first attempt, or one that never heartbeated or heartbeated with `{}`); `encodedHeartbeatDetails()` returns every payload undecoded.
 - Returning `error.Canceled` after a cancel reports the activity canceled; any other outcome is reported as usual. Without a cancel, `error.Canceled` is reported as a failure.
 - A local activity (`info().is_local`) gets cancels straight from the worker, and its heartbeats are dropped.
 
@@ -919,7 +922,7 @@ A dynamic activity, `fn (*Context, converter.EncodedValues) !Result` wrapped in 
 
 Notes:
 - A registered `Def` always wins; a second dynamic activity returns `error.AlreadyRegistered`.
-- Decode arguments with `args.get(T, allocator, index)` or `args.decode(Tuple, allocator)`; a mismatch returns `error.InvalidPayload`.
+- Decode arguments with `args.get(T, allocator, index)` or `args.decode(Tuple, allocator)`. Past the last argument, `get` returns null for an optional `T` and `error.WrongArgumentCount` for any other type, and `decode` does the same for each missing field. A payload that doesn't decode as its type returns `fromPayload`'s errors: `error.InvalidPayload` or `error.UnknownEncoding` (see [Payloads](#payloads)).
 - A method form is registered with `registerDynamicActivityWith`; `activity.defs` skips methods of that shape. `testing.ActivityEnvironment` can't run a dynamic activity.
 
 ### Workers
@@ -953,7 +956,7 @@ Notes:
 - The client must outlive the worker; call `deinit` after `run` has returned.
 - There is no separate start function: to keep working while the worker polls, run `run` on `io.concurrent` as above, and read its error from `await`.
 - `run` returns `error.NothingRegistered`, `error.InvalidOptions`, `error.WorkerInitFailed`, or `error.ValidationFailed` before polling starts (the last three logged with the reason); `Worker.RunError` lists every error.
-- When sdk-core gives up polling for tasks, the worker logs it, shuts down as `stop` does, and `run` (or `runUntilSignal`) returns `error.PollFailed`. `Worker.fatalMessage` then has `polling for <workflow|activity> tasks on task queue <queue> failed: <reason>`, owned by the worker until the next `run` or `deinit`.
+- When sdk-core gives up polling for tasks, the worker logs it, shuts down as `stop` does, and `run` (or `runUntilSignal`) returns `error.PollFailed`, or `error.OutOfMemory` when the poll itself ran out of memory. `Worker.fatalMessage` then has `polling for <workflow|activity> tasks on task queue <queue> failed: <reason>`, owned by the worker until the next `run` or `deinit`; it is null if that text couldn't be allocated.
 - `stop` is safe from any thread, before or during `run`. `waitUntilRunning` returns `error.WorkerFailedToStart` when `run` failed first.
 - Several workers can share a process and a client, one per task queue; one signal stops every worker in `runUntilSignal`.
 
@@ -964,7 +967,7 @@ Notes:
 Notes:
 - `max_concurrent_workflow_task_executions` (100): workflow activations processed at once. Activations of different runs run in parallel, each on its own thread; one run's activations run one at a time, possibly on different threads. Payload codecs, interceptors, and log sinks are therefore called concurrently.
 - `max_concurrent_activity_executions` (100): activities run at once, each on its own task.
-- `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers` (2 each): polls in flight at once.
+- `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers` (2 each): polls in flight at once. Each must be at least 1, and the workflow pollers at least 2 while `max_cached_workflows` isn't 0; sdk-core rejects other values and `run` returns `error.WorkerInitFailed`, logged.
 - `max_cached_workflows` (1000): runs kept in memory between tasks. Over the limit the least recently used run is evicted and replayed from its history at its next task; 0 replays every task from the start. `workflow_stack_size` (256 KiB): each coroutine's stack.
 - `identity`: the worker's name to the server; empty uses the client's.
 - `graceful_shutdown_period` (zero) and `workflow_memory_limit` (null): see below.
@@ -1029,7 +1032,7 @@ const GreetingCard = workflow.Def("greeting_card", greetingCard);
 ```
 
 Notes:
-- `createSession` returns `error.SessionCreationFailed` when no host took it within `creation_timeout`, or the host was full (`SessionWorkerFull`).
+- `createSession` returns `error.SessionCreationFailed` when the session didn't open: no host took it within `creation_timeout`, or the host stopped or refused it as full (failure type `SessionWorkerFull`: a full host stops taking new sessions, so this comes mostly from `recreateSession`). Returning the error fails the workflow with the session's creation failure. A timeout that isn't positive returns `error.InvalidOptions` (logged), and canceling the waiting coroutine `error.Canceled`.
 - `max_concurrent_sessions` (1000, must be positive) bounds a host's open sessions; session activities get their own slot pool.
 - A session fails when its host stops, goes silent past `heartbeat_timeout`, or exceeds `execution_timeout`; activities scheduled in it then return `error.SessionFailed`.
 - `recreateSession` opens a new session on an earlier session's host, by its `info().task_queue`.
@@ -1082,14 +1085,15 @@ try testing.expectEqualStrings("greeting-1", (try later.get(Execution, arena)).w
 
 Notes:
 
-- `void` and null encode as `binary/null`, `converter.Bytes` as `binary/plain`, protobuf messages as ProtoJSON, and everything else, strings included, as JSON through `std.json`.
+- A `converter.Payload` passes through as is. `void` and null encode as `binary/null`, `converter.Bytes` as `binary/plain`, protobuf messages as ProtoJSON (`converter.ProtoBinary` as `binary/protobuf`), and everything else, strings included, as JSON through `std.json`.
 - A type that declares `pub fn toPayload(self, arena)` and `pub fn fromPayload(arena, payload)` encodes itself, also as an optional.
 - Decoded strings and slices come from the arena passed in; an encoded payload may borrow the value's bytes.
-- `fromPayload` returns `error.UnknownEncoding` for an encoding the type doesn't accept and `error.InvalidPayload` for data that doesn't parse as the type.
+- `fromPayload` returns `error.UnknownEncoding` for a payload with no `encoding` or with one the converter doesn't handle, which for a protobuf message type is anything but `binary/null` and the two protobuf encodings.
+- It returns `error.InvalidPayload` for `binary/null` into a type that isn't `void` or optional, `binary/plain` into anything but `converter.Bytes` or a byte slice, and JSON or protobuf data that doesn't parse as the type.
 
 #### Payload codecs
 
-A `converter.PayloadCodec` transforms payloads after encoding and before decoding, to compress or encrypt them. Set codecs with `client.Options.codecs`; the client and every worker on it apply them. `converter.ZlibCodec` compresses.
+A `converter.PayloadCodec` transforms payloads after encoding and before decoding, to compress or encrypt them. Set codecs with `client.Options.codecs`; the client and every worker on it apply them. `converter.ZlibCodec` compresses each payload that compression makes smaller and leaves the others as they were, unless `always_encode` is set.
 
 <!-- example: converter-codecs -->
 ```zig
@@ -1139,10 +1143,10 @@ fn greeting(ctx: *workflow.Context, name: []const u8) ![]const u8 {
 
 Notes:
 
-- A plain error becomes an application failure whose message and type are the error's name.
+- A plain error becomes an application failure whose message and type are the error's name, unless an earlier `ctx.fail` in the same workflow coroutine or activity attempt described one, which is used instead. In a workflow, `error.Canceled` cancels it and `error.OutOfMemory` fails the workflow task for a retry; in an activity, `error.Canceled` after a cancel reports it canceled.
 - `ctx.fail` takes a `failure.Application` (`type`, `non_retryable`, `details`, `category`, `next_retry_delay`) and returns `error.ApplicationFailure`.
 - On the client, `run.failure()` reads the failure after `error.WorkflowFailed`; it borrows the arena passed to `get`.
-- A workflow that returns a failed activity's error fails with that activity's failure, so `failure.rootCause` reaches the original one.
+- A workflow that returns `error.ActivityFailed` (or a child, external, or session error) fails with the failure of the last `get` that failed in its coroutine, so return the error as soon as `get` gives it; `failure.rootCause` then reaches the original one.
 
 #### Failure converter
 <!-- stub: temporal-sdk-zig-d51.4.5 -->
@@ -1185,10 +1189,10 @@ test "testing: a workflow with a test double for its activity" {
 
 Notes:
 
-- Every workflow `executeWorkflow` or `getResult` waits for is then replayed from its history, so a test also fails with `error.Nondeterminism`.
+- Every workflow `executeWorkflow` or `getResult` waits for that completes, fails, is canceled, or times out is then replayed from its history, so a test also fails with `error.Nondeterminism`. A terminated run, or any other error, returns before the replay.
 - `registerActivityAs` runs a double under the activity's name; registering the activity as well returns `error.AlreadyRegistered`.
 - `startWorkflow` returns the run without waiting, for tests that signal, query, or update it before `getResult`.
-- `startWithOptions` takes codecs, a logger, propagators, interceptors, and metrics, borrowed for the environment's life.
+- `startWithOptions` takes extra dev server arguments, codecs, a logger, propagators, worker and client interceptors, and metrics, borrowed for the environment's life. `startTimeSkipping` takes no options.
 
 #### Time skipping
 
@@ -1241,7 +1245,7 @@ test "testing: an activity on its own" {
 Notes:
 
 - The result comes from the arena passed in; the failure a `ctx.fail` call describes isn't exposed.
-- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, and `metrics` to control what the activity sees.
+- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, and `metrics` to control what the activity sees; `info.activity_type` is always the activity's name.
 - The environment can't cancel a running activity.
 
 #### Replaying histories
@@ -1331,13 +1335,13 @@ const otel_metrics: temporal.metrics.Options = .{ .exporter = .{ .opentelemetry 
 
 Notes:
 
-- Free each instrument with `deinit` before its handler. Recording never fails.
+- Free each instrument with `deinit` before its handler. Recording returns no error: a value whose attributes can't be allocated is dropped.
 - A workflow's handler adds `namespace`, `task_queue`, and `workflow_type` and records nothing during replay; an activity's also adds `activity_type`.
 - Without an exporter, every handler is `Handler.noop`.
 
 #### Interceptors
 
-An `interceptor.Worker` hands out each workflow run's `WorkflowInbound` and `WorkflowOutbound` interceptors and each activity attempt's `ActivityInbound` and `ActivityOutbound`. An `interceptor.Client` wraps every request a client sends. Install them with `worker.Options.interceptors`, `client.Options.worker_interceptors`, and `client.Options.interceptors`.
+An `interceptor.Worker` hands out each workflow run's `WorkflowInbound` and `WorkflowOutbound` interceptors and each activity attempt's `ActivityInbound` and `ActivityOutbound`. An `interceptor.Client` wraps every request a client sends, except `Client.checkHealth`. Install them with `worker.Options.interceptors`, `client.Options.worker_interceptors`, and `client.Options.interceptors`.
 
 <!-- example: observability-interceptors -->
 ```zig
@@ -1361,8 +1365,8 @@ const Scheduling = struct {
 Notes:
 
 - `from(T, impl)` builds any of them from the methods `T` declares; the others pass the call through to `next`. Activity interceptors come from `interceptActivity` the same way.
-- Workflow interceptors run as part of the workflow, again on replay, and follow the workflow rules.
-- Inputs are type-erased (`converter.EncodedValues`, a header, options), and results are encoded payloads.
+- Workflow interceptors run as part of the workflow, again on replay, and follow the workflow rules. Query and update-validation interceptors run outside any coroutine, like their handlers, and must not block or change state.
+- Workflow and activity interceptor inputs are type-erased (`converter.EncodedValues`, a header, options), and results are encoded payloads. A client interceptor reads each request and response as its generated protobuf type.
 - Client interceptors run on any calling thread and must be thread-safe.
 
 #### Context propagation

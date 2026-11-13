@@ -4,11 +4,14 @@
 //!
 //! Paths after the root are relative to it. An example file marks a region with a line
 //! `// example: <id>` and ends it with `// end-example`. In README.md, a line
-//! `<!-- example: <id> -->` followed by a zig fence marks a block that must equal that region,
-//! with the region's common indentation removed. `check` reports every block that differs,
-//! every zig block with no marker, every marker that names no region, every region no block
-//! uses, and every id defined twice, and exits 1 if there are any. `update` rewrites the
-//! blocks from the regions and still fails on the other problems.
+//! `<!-- example: <id> -->` followed by a zig code block marks a block that must equal that
+//! region, with the region's common indentation removed. A zig code block is any fenced block
+//! whose info string starts with `zig`, in any case: a fence of three or more backticks or
+//! tildes, indented or inside a block quote, closed by a fence of the same character at least
+//! as long. `check` reports every block that differs, every zig block with no marker, every
+//! marker that names no region, every region no block uses, and every id defined twice, and
+//! exits 1 if there are any. `update` rewrites the blocks from the regions and still fails on
+//! the other problems.
 //!
 //! The marker `<!-- example: unchecked -->` exempts a block, at most `max_unchecked` times:
 //! for the snippets of a user's build files, which can't be compiled here.
@@ -22,8 +25,51 @@ const region_start = "// example: ";
 const region_end = "// end-example";
 const marker_start = "<!-- example: ";
 const marker_end = " -->";
-const zig_fence = "```zig";
-const fence = "```";
+const zig_info = "zig";
+
+/// The opening line of a fenced code block.
+const Fence = struct {
+    /// What precedes the fence characters: indentation and block quote markers. Body lines
+    /// carry it too, and it is removed before they are compared.
+    prefix: []const u8,
+    char: u8,
+    len: usize,
+    info: []const u8,
+
+    /// Reads `line` as an opening fence: a run of at least three backticks or tildes after
+    /// any indentation and block quote markers, then an info string, which after backticks
+    /// may not contain a backtick.
+    fn parse(line: []const u8) ?Fence {
+        const l = std.mem.trimEnd(u8, line, " \t\r");
+        const start = std.mem.findNone(u8, l, " \t>") orelse return null;
+        const c = l[start];
+        if (c != '`' and c != '~') return null;
+        const end = std.mem.findNonePos(u8, l, start, &.{c}) orelse l.len;
+        if (end - start < 3) return null;
+        const info = std.mem.trim(u8, l[end..], " \t");
+        if (c == '`' and std.mem.findScalar(u8, info, '`') != null) return null;
+        return .{ .prefix = l[0..start], .char = c, .len = end - start, .info = info };
+    }
+
+    fn isZig(f: Fence) bool {
+        return f.info.len >= zig_info.len and std.ascii.eqlIgnoreCase(f.info[0..zig_info.len], zig_info);
+    }
+
+    /// Whether `line` closes the block: only the fence's character, at least as many, after
+    /// indentation (and block quote markers, if the fence is quoted).
+    fn closedBy(f: Fence, line: []const u8) bool {
+        const skip: []const u8 = if (std.mem.findScalar(u8, f.prefix, '>') != null) " \t>" else " \t";
+        const rest = std.mem.trim(u8, std.mem.trimStart(u8, line, skip), " \t\r");
+        return rest.len >= f.len and std.mem.findNone(u8, rest, &.{f.char}) == null;
+    }
+
+    /// `line` without the part of the fence's prefix it starts with.
+    fn strip(f: Fence, line: []const u8) []const u8 {
+        var k: usize = 0;
+        while (k < f.prefix.len and k < line.len and line[k] == f.prefix[k]) k += 1;
+        return line[k..];
+    }
+};
 
 pub const Region = struct {
     id: []const u8,
@@ -117,17 +163,19 @@ pub fn process(arena: Allocator, mode: Mode, readme_name: []const u8, readme: []
             try appendLine(arena, &out, line);
             i += 1;
             while (i < lines.items.len and isBlank(lines.items[i])) : (i += 1) try appendLine(arena, &out, lines.items[i]);
-            if (i == lines.items.len or !std.mem.eql(u8, std.mem.trimEnd(u8, lines.items[i], " \t\r"), zig_fence)) {
-                try problems.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}: example marker \"{s}\" is not followed by a {s} block", .{ readme_name, marker_line, id, zig_fence }));
+            const open = if (i < lines.items.len) Fence.parse(lines.items[i]) else null;
+            if (open == null or !open.?.isZig()) {
+                try problems.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}: example marker \"{s}\" is not followed by a zig code block", .{ readme_name, marker_line, id }));
                 continue;
             }
+            const fence = open.?;
             const fence_line = i;
             try appendLine(arena, &out, lines.items[i]);
             i += 1;
             const body_start = i;
-            while (i < lines.items.len and !std.mem.eql(u8, std.mem.trimEnd(u8, lines.items[i], " \t\r"), fence)) i += 1;
+            while (i < lines.items.len and !fence.closedBy(lines.items[i])) i += 1;
             if (i == lines.items.len) {
-                try problems.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}: the {s} block of example \"{s}\" is never closed", .{ readme_name, fence_line + 1, zig_fence, id }));
+                try problems.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}: the zig code block of example \"{s}\" is never closed", .{ readme_name, fence_line + 1, id }));
                 for (lines.items[body_start..]) |l| try appendLine(arena, &out, l);
                 break;
             }
@@ -138,10 +186,18 @@ pub fn process(arena: Allocator, mode: Mode, readme_name: []const u8, readme: []
             } else if (findRegion(regions, id)) |region| {
                 region.used = true;
                 if (mode == .check) {
-                    if (firstDifference(body, region.text)) |n| try problems.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}: example \"{s}\" differs from {s}:{d} at line {d} of the example; run zig build readme", .{ readme_name, body_start + 1 + n, id, region.file, region.line + 1 + n, n + 1 }));
+                    if (firstDifference(fence, body, region.text)) |n| try problems.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}: example \"{s}\" differs from {s}:{d} at line {d} of the example; run zig build readme", .{ readme_name, body_start + 1 + n, id, region.file, region.line + 1 + n, n + 1 }));
                     for (body) |l| try appendLine(arena, &out, l);
-                } else {
-                    if (region.text.len > 0) try appendLine(arena, &out, region.text);
+                } else if (region.text.len > 0) {
+                    var region_lines = std.mem.splitScalar(u8, region.text, '\n');
+                    while (region_lines.next()) |l| {
+                        if (l.len == 0) {
+                            try appendLine(arena, &out, std.mem.trimEnd(u8, fence.prefix, " \t"));
+                        } else {
+                            try out.appendSlice(arena, fence.prefix);
+                            try appendLine(arena, &out, l);
+                        }
+                    }
                 }
             } else {
                 try problems.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}: example \"{s}\" names no region in the example files", .{ readme_name, marker_line, id }));
@@ -151,14 +207,12 @@ pub fn process(arena: Allocator, mode: Mode, readme_name: []const u8, readme: []
             i += 1;
             continue;
         }
-        if (std.mem.eql(u8, trimmed, zig_fence)) {
-            try problems.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}: {s} block has no {s}<id>{s} marker before it", .{ readme_name, i + 1, zig_fence, marker_start, marker_end }));
-        }
-        if (std.mem.startsWith(u8, trimmed, fence)) {
+        if (Fence.parse(line)) |fence| {
+            if (fence.isZig()) try problems.append(arena, try std.fmt.allocPrint(arena, "{s}:{d}: zig code block has no {s}<id>{s} marker before it", .{ readme_name, i + 1, marker_start, marker_end }));
             // Skip any fenced block whole, so marker-like lines inside it aren't read.
             try appendLine(arena, &out, line);
             i += 1;
-            while (i < lines.items.len and !std.mem.eql(u8, std.mem.trimEnd(u8, lines.items[i], " \t\r"), fence)) : (i += 1) try appendLine(arena, &out, lines.items[i]);
+            while (i < lines.items.len and !fence.closedBy(lines.items[i])) : (i += 1) try appendLine(arena, &out, lines.items[i]);
             if (i < lines.items.len) {
                 try appendLine(arena, &out, lines.items[i]);
                 i += 1;
@@ -192,13 +246,14 @@ fn findRegion(regions: []Region, id: []const u8) ?*Region {
     return null;
 }
 
-/// The index of the first line where `body` and `text` differ, or null if they are equal.
-fn firstDifference(body: []const []const u8, text: []const u8) ?usize {
+/// The index of the first line where `body`, without `fence`'s prefix, and `text` differ, or
+/// null if they are equal.
+fn firstDifference(fence: Fence, body: []const []const u8, text: []const u8) ?usize {
     if (text.len == 0) return if (body.len == 0) null else 0;
     var expected = std.mem.splitScalar(u8, text, '\n');
     for (body, 0..) |line, n| {
         const want = expected.next() orelse return n;
-        if (!std.mem.eql(u8, std.mem.trimEnd(u8, line, "\r"), want)) return n;
+        if (!std.mem.eql(u8, fence.strip(std.mem.trimEnd(u8, line, "\r")), want)) return n;
     }
     return if (expected.next() != null) body.len else null;
 }
@@ -324,7 +379,7 @@ test "a zig block without a marker is reported; other fences are not" {
     try f.add(&.{.{ "ex.zig", example_file }});
     _ = try f.run(.check, "```bash\nzig build\n```\n\n```zig\nconst x = 1;\n```\n<!-- example: greet -->\n```zig\nconst name = \"Ann\";\n\n_ = name;\n```\n");
     try testing.expectEqual(@as(usize, 1), f.problems.items.len);
-    try f.expectProblem("README.md:5: ```zig block has no");
+    try f.expectProblem("README.md:5: zig code block has no");
 }
 
 test "a marker naming no region, and a region no block uses, are reported" {
@@ -341,7 +396,7 @@ test "a marker not followed by a zig block is reported" {
     defer f.deinit();
     try f.add(&.{.{ "ex.zig", example_file }});
     _ = try f.run(.check, "<!-- example: greet -->\nSome text.\n");
-    try f.expectProblem("is not followed by a ```zig block");
+    try f.expectProblem("is not followed by a zig code block");
 }
 
 test "an id defined twice, a nested region, and an unterminated region are reported" {
@@ -377,4 +432,82 @@ test "unchecked blocks are kept as written, up to the limit" {
     try testing.expectEqual(@as(usize, 0), f.problems.items.len);
     _ = try f.run(.check, two ++ "<!-- example: unchecked -->\n```zig\nc\n```\n");
     try f.expectProblem("3 blocks are marked <!-- example: unchecked -->; at most 2 may be");
+}
+
+test "every fence spelling with a zig info string is a zig block" {
+    const spellings = [_][2][]const u8{
+        .{ "   ```zig", "   ```" },
+        .{ "``` zig", "```" },
+        .{ "```Zig", "```" },
+        .{ "```ZIG", "```" },
+        .{ "~~~zig", "~~~" },
+        .{ "````zig", "````" },
+        .{ "```zig title=a", "```" },
+        .{ "~~~~ zig {.numberLines}", "~~~~~" },
+        .{ "> ```zig", "> ```" },
+    };
+    for (spellings) |s| {
+        var f: Fixture = .{ .arena = .init(testing.allocator) };
+        defer f.deinit();
+        try f.add(&.{.{ "ex.zig", example_file }});
+        const a = f.arena.allocator();
+        const block = try std.fmt.allocPrint(a, "{s}\nconst x = 1;\n{s}\n", .{ s[0], s[1] });
+        _ = try f.run(.check, try std.mem.concat(a, u8, &.{ block, "<!-- example: greet -->\n```zig\nconst name = \"Ann\";\n\n_ = name;\n```\n" }));
+        f.expectProblem("README.md:1: zig code block has no") catch |err| {
+            std.debug.print("fence: {s}\n", .{s[0]});
+            return err;
+        };
+        try testing.expectEqual(@as(usize, 1), f.problems.items.len);
+
+        var g: Fixture = .{ .arena = .init(testing.allocator) };
+        defer g.deinit();
+        try g.add(&.{.{ "ex.zig", example_file }});
+        _ = try g.run(.check, try std.fmt.allocPrint(g.arena.allocator(), "<!-- example: greet -->\n{s}\nconst name = \"Ann\";\n_ = nom;\n{s}\n", .{ s[0], s[1] }));
+        g.expectProblem("example \"greet\" differs") catch |err| {
+            std.debug.print("fence: {s}\n", .{s[0]});
+            return err;
+        };
+    }
+}
+
+test "fences that aren't zig blocks are skipped whole" {
+    var f: Fixture = .{ .arena = .init(testing.allocator) };
+    defer f.deinit();
+    try f.add(&.{.{ "ex.zig", example_file }});
+    // A longer fence holds shorter ones, and a tilde fence holds backtick lines.
+    const readme =
+        \\````markdown
+        \\```zig
+        \\x
+        \\```
+        \\````
+        \\~~~
+        \\```zig
+        \\~~~
+        \\```zigx`
+        \\not a fence: backticks in a backtick info string
+        \\``zig
+        \\not a fence: two backticks
+        \\<!-- example: greet -->
+        \\```zig
+        \\const name = "Ann";
+        \\
+        \\_ = name;
+        \\```
+        \\
+    ;
+    try testing.expectEqualStrings(readme, try f.run(.check, readme));
+    try testing.expectEqual(@as(usize, 0), f.problems.items.len);
+}
+
+test "an indented or quoted block is compared and rewritten without its prefix" {
+    var f: Fixture = .{ .arena = .init(testing.allocator) };
+    defer f.deinit();
+    try f.add(&.{.{ "ex.zig", example_file }});
+    const indented = "<!-- example: greet -->\n  ~~~Zig\n  const name = \"Ann\";\n\n  _ = name;\n  ~~~\n";
+    try testing.expectEqualStrings(indented, try f.run(.check, indented));
+    const quoted = "<!-- example: greet -->\n> ```zig\n> const name = \"Ann\";\n>\n> _ = name;\n> ```\n";
+    try testing.expectEqualStrings(quoted, try f.run(.check, quoted));
+    try testing.expectEqual(@as(usize, 0), f.problems.items.len);
+    try testing.expectEqualStrings(quoted, try f.run(.update, "<!-- example: greet -->\n> ```zig\n> old\n> ```\n"));
 }
