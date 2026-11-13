@@ -507,12 +507,16 @@ test "visitPayloads reaches every payload of an activation and a completion, but
     var upsert: cmd_pb.UpsertWorkflowSearchAttributes = .{};
     upsert.search_attributes = sa;
     var success: proto.coresdk.workflow_completion.Success = .{};
-    try success.commands.append(a, .{ .variant = .{ .schedule_activity = schedule } }); // 2
+    try success.commands.append(a, .{
+        .user_metadata = .{ .summary = try converter.toPayload(a, @as([]const u8, "greet x")) },
+        .variant = .{ .schedule_activity = schedule },
+    }); // 2 + 1
     try success.commands.append(a, .{ .variant = .{ .upsert_workflow_search_attributes = upsert } }); // 0
     try success.commands.append(a, .{ .variant = .{ .fail_workflow_execution = .{ .failure = try failureWithDetails(a, "failed") } } }); // 3
     try success.commands.append(a, .{ .variant = .{ .complete_workflow_execution = .{ .result = try converter.toPayload(a, @as(i64, 5)) } } }); // 1
     var completion: proto.coresdk.workflow_completion.WorkflowActivationCompletion = .{ .run_id = "run", .status = .{ .successful = success } };
-    try testing.expectEqual(@as(usize, 6), try countPayloads(@TypeOf(completion), &completion, a));
+    try testing.expectEqual(@as(usize, 7), try countPayloads(@TypeOf(completion), &completion, a));
+    try testing.expectEqualStrings("test/visited", converter.encodingOf(completion.status.?.successful.commands.items[0].user_metadata.?.summary.?).?);
     const failed: proto.coresdk.workflow_completion.WorkflowActivationCompletion = .{ .run_id = "run", .status = .{ .failed = .{ .failure = try failureWithDetails(a, "task") } } };
     var failed_copy = failed;
     try testing.expectEqual(@as(usize, 3), try countPayloads(@TypeOf(failed_copy), &failed_copy, a));

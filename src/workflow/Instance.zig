@@ -45,6 +45,7 @@ const cmd_pb = proto.coresdk.workflow_commands;
 const done_pb = proto.coresdk.workflow_completion;
 const result_pb = proto.coresdk.activity_result;
 const common = proto.temporal.api.common.v1;
+const sdk_pb = proto.temporal.api.sdk.v1;
 const Failure = failure_mod.Failure;
 
 /// Activity types starting with this belong to the SDK; workers refuse to register them.
@@ -284,6 +285,9 @@ pub const ActivityState = struct {
         id_from_seq: bool,
         /// The backoff timer's seq while the activity waits for its next attempt.
         backoff_timer: ?u32 = null,
+        /// The summary, sent with every attempt: the core records the last attempt's on the
+        /// marker.
+        user_metadata: ?sdk_pb.UserMetadata = null,
     };
 
     pub const Outcome = union(enum) {
@@ -1473,8 +1477,27 @@ fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflo
         .do_not_eagerly_execute = options.disable_eager_execution,
     };
     if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
-    try inst.emit(.{ .variant = .{ .schedule_activity = cmd } });
+    if (options.priority) |p| cmd.priority = .{
+        .priority_key = p.priority_key,
+        .fairness_key = p.fairness_key,
+        .fairness_weight = p.fairness_weight,
+    };
+    cmd.versioning_intent = switch (options.versioning_intent) {
+        .unspecified => .UNSPECIFIED,
+        .compatible => .COMPATIBLE,
+        .default => .DEFAULT,
+    };
+    try inst.emit(.{
+        .user_metadata = try summaryMetadata(a, options.summary),
+        .variant = .{ .schedule_activity = cmd },
+    });
     return state;
+}
+
+/// A command's `user_metadata` for an activity summary, or null for none.
+fn summaryMetadata(a: Allocator, summary: []const u8) error{OutOfMemory}!?sdk_pb.UserMetadata {
+    if (summary.len == 0) return null;
+    return .{ .summary = try converter.toPayload(a, summary) };
 }
 
 fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: workflow.LocalActivityOptions, args: []const converter.Payload, header: converter.Header) ScheduleError!*ActivityState {
@@ -1499,10 +1522,11 @@ fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: wo
             .cancellation_type = protoCancellationType(options.cancellation_type),
         },
         .id_from_seq = options.activity_id.len == 0,
+        .user_metadata = try summaryMetadata(a, options.summary),
     };
     if (options.retry_policy) |rp| local.cmd.retry_policy = try protoRetryPolicy(a, rp);
     state.local = local;
-    try inst.emit(.{ .variant = .{ .schedule_local_activity = local.cmd } });
+    try inst.emit(.{ .user_metadata = local.user_metadata, .variant = .{ .schedule_local_activity = local.cmd } });
     return state;
 }
 
@@ -1537,7 +1561,7 @@ fn retryLocalActivity(inst: *Instance, state: *ActivityState) !void {
     inst.next_activity_seq += 1;
     local.cmd.seq = state.seq;
     if (local.id_from_seq) local.cmd.activity_id = try std.fmt.allocPrint(a, "{d}", .{state.seq});
-    try inst.emit(.{ .variant = .{ .schedule_local_activity = local.cmd } });
+    try inst.emit(.{ .user_metadata = local.user_metadata, .variant = .{ .schedule_local_activity = local.cmd } });
 }
 
 fn protoCancellationType(t: ActivityState.CancellationType) cmd_pb.ActivityCancellationType {
@@ -3520,6 +3544,149 @@ test "sessions: invalid options fail with error.InvalidOptions and schedule noth
         try testing.expectEqual(@as(usize, 1), cmds.len);
         try testing.expectEqualStrings("InvalidOptions", cmds[0].variant.?.fail_workflow_execution.failure.?.message);
     }
+}
+
+const ActivityMeta = struct {
+    const charge: workflow.ActivityOptions = .{
+        .start_to_close_timeout = .fromSeconds(10),
+        .summary = "charge the card",
+        .priority = .{ .priority_key = 1, .fairness_key = "tenant-a", .fairness_weight = 1.5 },
+        .versioning_intent = .default,
+    };
+
+    fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, mode, "all")) return ctx.executeActivity(Greet, charge, .{"x"}).get();
+        if (std.mem.eql(u8, mode, "compatible")) return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10), .versioning_intent = .compatible }, .{"x"}).get();
+        if (std.mem.eql(u8, mode, "defaults")) return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get();
+        if (std.mem.eql(u8, mode, "session")) {
+            var creation: ActivityState = .{ .seq = 0 };
+            const session: workflow.Session = .{ .id = "s1", .task_queue = "host-q", .heartbeat_timeout = .fromSeconds(20), .creation = &creation, .opened = true };
+            var opts = charge;
+            opts.session = &session;
+            return ctx.executeActivity(Greet, opts, .{"x"}).get();
+        }
+        if (std.mem.eql(u8, mode, "local")) return ctx.executeLocalActivity(Greet, .{
+            .start_to_close_timeout = .fromSeconds(5),
+            .local_retry_threshold = .fromSeconds(2),
+            .summary = "look up the rate",
+        }, .{"x"}).get();
+        if (std.mem.eql(u8, mode, "side_effect")) {
+            const value = try ctx.sideEffect(u32, {}, fortyTwo);
+            return if (value == 42) "42" else error.InvalidPayload;
+        }
+        return error.InvalidPayload;
+    }
+
+    fn fortyTwo(_: void) u32 {
+        return 42;
+    }
+
+    /// Sets a summary on every activity before scheduling it.
+    const Summarize = struct {
+        pub fn interceptWorkflow(s: *Summarize, _: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+            return .{ .outbound = interceptor.WorkflowOutbound.from(Summarize, s) };
+        }
+
+        pub fn executeActivity(_: *Summarize, input: interceptor.ActivityInput, next: interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(converter.Payload) {
+            var changed = input;
+            changed.options.summary = "set by an interceptor";
+            return next.executeActivity(changed);
+        }
+    };
+};
+const ActivityMetaWf = workflow.Def("ActivityMeta", ActivityMeta.run);
+
+/// The one command `inst`'s first activation sends; it lives as long as `inst`.
+fn firstCommand(inst: *Instance, a: Allocator, mode: []const u8) !cmd_pb.WorkflowCommand {
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "ActivityMeta", .{mode}), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    return cmds[0];
+}
+
+test "activity options: summary, priority and versioning intent reach the ScheduleActivity command" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const all_inst = try create(testing.allocator, ActivityMetaWf.registered, .{});
+    defer all_inst.destroy();
+    const all = try firstCommand(all_inst, a, "all");
+    try testing.expectEqualStrings("\"charge the card\"", all.user_metadata.?.summary.?.data);
+    try testing.expect(all.user_metadata.?.details == null);
+    const sched = all.variant.?.schedule_activity;
+    try testing.expectEqual(@as(i32, 1), sched.priority.?.priority_key);
+    try testing.expectEqualStrings("tenant-a", sched.priority.?.fairness_key);
+    try testing.expectEqual(@as(f32, 1.5), sched.priority.?.fairness_weight);
+    try testing.expect(sched.versioning_intent == .DEFAULT);
+
+    const compatible_inst = try create(testing.allocator, ActivityMetaWf.registered, .{});
+    defer compatible_inst.destroy();
+    const compatible = try firstCommand(compatible_inst, a, "compatible");
+    try testing.expect(compatible.variant.?.schedule_activity.versioning_intent == .COMPATIBLE);
+
+    const defaults_inst = try create(testing.allocator, ActivityMetaWf.registered, .{});
+    defer defaults_inst.destroy();
+    const defaults = try firstCommand(defaults_inst, a, "defaults");
+    try testing.expect(defaults.user_metadata == null);
+    try testing.expect(defaults.variant.?.schedule_activity.priority == null);
+    try testing.expect(defaults.variant.?.schedule_activity.versioning_intent == .UNSPECIFIED);
+}
+
+test "activity options: a session activity keeps them on the host's task queue" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ActivityMetaWf.registered, .{});
+    defer inst.destroy();
+    const cmd = try firstCommand(inst, a, "session");
+    const sched = cmd.variant.?.schedule_activity;
+    try testing.expectEqualStrings("host-q", sched.task_queue);
+    try testing.expectEqualStrings("\"charge the card\"", cmd.user_metadata.?.summary.?.data);
+    try testing.expectEqualStrings("tenant-a", sched.priority.?.fairness_key);
+    try testing.expect(sched.versioning_intent == .DEFAULT);
+}
+
+test "activity options: an outbound interceptor that sets a summary changes the command" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var impl: ActivityMeta.Summarize = .{};
+    const interceptors = [_]interceptor.Worker{.from(ActivityMeta.Summarize, &impl)};
+    const inst = try create(testing.allocator, ActivityMetaWf.registered, .{ .interceptors = &interceptors });
+    defer inst.destroy();
+    const cmd = try firstCommand(inst, a, "defaults");
+    try testing.expectEqualStrings("\"set by an interceptor\"", cmd.user_metadata.?.summary.?.data);
+}
+
+test "local activity summary: sent with the first attempt and with the one after a backoff timer" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ActivityMetaWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "ActivityMeta", .{@as([]const u8, "local")}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqualStrings("\"look up the rate\"", first[0].user_metadata.?.summary.?.data);
+    _ = first[0].variant.?.schedule_local_activity;
+
+    const backoff = commandsOf(try inst.activate(&try localBackoff(a, 1), a));
+    try testing.expect(backoff[0].user_metadata == null);
+    const retry = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = backoff[0].variant.?.start_timer.seq } }), a));
+    try testing.expectEqual(@as(usize, 1), retry.len);
+    try testing.expectEqual(@as(u32, 2), retry[0].variant.?.schedule_local_activity.seq);
+    try testing.expectEqualStrings("\"look up the rate\"", retry[0].user_metadata.?.summary.?.data);
+}
+
+test "side effects send no summary" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ActivityMetaWf.registered, .{});
+    defer inst.destroy();
+    const cmd = try firstCommand(inst, a, "side_effect");
+    try testing.expectEqualStrings(side_effect_activity_type, cmd.variant.?.schedule_local_activity.activity_type);
+    try testing.expect(cmd.user_metadata == null);
 }
 
 test "eviction while a local activity backs off frees everything" {

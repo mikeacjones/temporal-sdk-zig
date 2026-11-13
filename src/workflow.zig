@@ -300,8 +300,8 @@ pub const RetryPolicy = struct {
     non_retryable_error_types: []const []const u8 = &.{},
 };
 
-/// How the server orders and shares out a workflow's tasks among others on the same task
-/// queue. Every zero field inherits its value from the parent or caller, or else uses the
+/// How the server orders and shares out a workflow's or an activity's tasks among others on
+/// the same task queue. Every zero field inherits its value from the parent or caller, or else uses the
 /// server's default.
 pub const Priority = struct {
     /// 1 is the highest priority; larger keys run later. 0 uses the default, the middle of
@@ -313,6 +313,14 @@ pub const Priority = struct {
     /// This fairness key's share relative to others. 0 uses the default weight, 1.0.
     fairness_weight: f32 = 0,
 };
+
+/// Which build an activity runs on when its task queue uses build-ID-based versioning rules.
+/// `compatible` runs it on a worker compatible with the workflow's build, and `default` on the
+/// task queue's current default build. `unspecified` means `compatible` when the activity runs
+/// on the workflow's task queue and `default` otherwise. It has no effect on task queues that
+/// use worker deployments or no versioning; history records the choice as the scheduled
+/// event's `use_workflow_build_id`.
+pub const VersioningIntent = enum { unspecified, compatible, default };
 
 /// What canceling an activity's future does: `try_cancel` requests the cancellation and
 /// reports it at once, `wait_cancellation_completed` requests it and waits for the activity to
@@ -333,6 +341,17 @@ pub const ActivityOptions = struct {
     retry_policy: ?RetryPolicy = null,
     cancellation_type: ActivityCancellationType = .try_cancel,
     disable_eager_execution: bool = false,
+    /// A short, single-line description of this activity, shown by the UI and CLI on its
+    /// scheduled event. Sent as a JSON string payload, through the worker's payload codecs.
+    /// Empty sends none.
+    summary: []const u8 = "",
+    /// The priority of this activity's task. Null uses the workflow's priority; inside a set
+    /// priority, each zero field inherits the workflow's value. The server checks the values:
+    /// one it rejects fails the workflow task.
+    priority: ?Priority = null,
+    /// Only matters on task queues with build-ID-based versioning rules; see
+    /// `VersioningIntent`.
+    versioning_intent: VersioningIntent = .unspecified,
     /// Runs the activity in a session (`Context.createSession`): on the session's host, with
     /// `activity.Info.session_id` set. Leave `task_queue` empty. A failed session makes the
     /// future's `get` return `error.SessionFailed`, and a closed one `error.InvalidOptions`
@@ -448,6 +467,10 @@ pub const LocalActivityOptions = struct {
     /// on the worker, so the workflow task doesn't stay open. Null means one minute.
     local_retry_threshold: ?Duration = null,
     cancellation_type: ActivityCancellationType = .try_cancel,
+    /// A short, single-line description of this activity, recorded on its marker event and
+    /// shown by the UI and CLI. Sent as a JSON string payload, through the worker's payload
+    /// codecs, with every attempt. Empty sends none.
+    summary: []const u8 = "",
 };
 
 /// What canceling a child workflow's future does: `try_cancel` requests the child's
