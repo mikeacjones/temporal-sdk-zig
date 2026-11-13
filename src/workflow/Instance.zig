@@ -4,8 +4,23 @@
 //! the order the core sends them (it orders them for determinism), then every coroutine runs
 //! until it blocks, and the commands they produced become the activation's completion.
 //!
-//! The run's memory (workflow state, decoded arguments, results kept by futures) lives in an
-//! arena owned by the instance and freed by `deinit` when the core evicts the run.
+//! The run's memory (workflow state, decoded arguments, results kept by futures, and the
+//! coroutines' Task blocks) lives in an arena owned by the instance, reached through
+//! `arena()`, which counts the bytes requested from it. `memoryUsed` adds the coroutine
+//! stacks the run holds (in use or pooled) at the configured stack size. Both depend on what
+//! the run did, so the same activations give the same figure on any worker and on replay,
+//! except for allocations made only when not replaying: a side effect's encoded value (and
+//! the argument list carrying it) is counted where it first ran, and not when replayed. With
+//! `Options.memory_limit` set, `activate` compares the figure with the limit once all
+//! coroutines have blocked in an activation that ran them, and fails the workflow task (not
+//! the workflow) when the run is over it.
+//!
+//! When the core evicts the run, `destroy` tears it down in order: `teardown` marks the run
+//! evicting (from then on `emit` drops every command, so nothing reaches the core), cancels
+//! the root and handler coroutines, wakes waits that ignore cancellation, and runs the
+//! scheduler so their defers run. Then the scheduler, the metrics handler, and the arena are
+//! freed. A coroutine that still hasn't exited (it blocked with cancel protection on) keeps
+//! its stack mapped and is reported; everything else is freed.
 
 const Instance = @This();
 
@@ -57,6 +72,10 @@ pub const SessionOpened = struct { session_id: []const u8, task_queue: []const u
 
 gpa: Allocator,
 arena_state: std.heap.ArenaAllocator,
+/// Live bytes requested through `arena()`: allocations add, frees subtract.
+allocated: usize = 0,
+/// See `Options.memory_limit`.
+memory_limit: ?usize = null,
 sched: Scheduler,
 wio: WorkflowIo,
 ctx: workflow.Context,
@@ -125,6 +144,8 @@ evicting: bool = false,
 /// Set when an activation must fail the workflow task (it is retried) instead of producing
 /// commands, for example on an unsupported job.
 task_failure: ?[]const u8 = null,
+/// The application failure type of `task_failure`.
+task_failure_type: []const u8 = "UnsupportedJob",
 /// Query handlers by query type, in registration order (the order an unknown query's failure
 /// lists them in). Arena memory; they outlive the workflow function.
 queries: std.array_hash_map.String(QueryHandler) = .empty,
@@ -329,6 +350,10 @@ pub const Options = struct {
     task_queue: []const u8 = "",
     namespace: []const u8 = "default",
     stack_size: usize = 256 * 1024,
+    /// The most memory the run may hold (`memoryUsed`), checked at the end of each
+    /// activation that runs workflow code; over it, the activation fails the workflow task.
+    /// Null: no limit. See `worker.Options.workflow_memory_limit`.
+    memory_limit: ?usize = null,
     /// Where the workflow's logger writes.
     logger: log.Sink = .std_log,
     /// Keep the workflow's logger on while it replays history.
@@ -359,8 +384,9 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
         .entry = entry,
         .versioning_behavior = entry.versioning_behavior,
         .send_versioning_behavior = options.send_versioning_behavior,
+        .memory_limit = options.memory_limit,
     };
-    inst.wio = .init(gpa, &inst.sched, .{ .ctx = inst, .vtable = &host_vtable }, 0);
+    inst.wio = .init(inst.arena(), &inst.sched, .{ .ctx = inst, .vtable = &host_vtable }, 0);
     inst.ctx = .{ .instance = inst };
     inst.task_queue = try inst.arena().dupe(u8, options.task_queue);
     inst.namespace = try inst.arena().dupe(u8, options.namespace);
@@ -372,9 +398,36 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
     return inst;
 }
 
-/// Tears the run down: cancels its coroutines, lets them exit, and frees everything.
+/// Tears the run down: cancels its coroutines, lets them exit, and frees everything. A
+/// coroutine that refuses to exit keeps its stack mapped (it is never resumed); the rest of
+/// the run, including that coroutine's Task block, is freed.
 pub fn destroy(inst: *Instance) void {
+    const stuck = inst.teardown();
+    const gpa = inst.gpa;
+    if (stuck == 0) {
+        inst.sched.deinit();
+    } else {
+        // Freeing a stack under a coroutine that may still reference it isn't safe, so its
+        // stack is leaked; the arena below frees its Task block and anything else it held.
+        inst.logger.warn("workflow coroutines did not exit on eviction (blocked with cancel protection on?); leaking their stacks", .{
+            .count = stuck,
+            .stack_bytes = stuck * inst.sched.options.stack_size,
+        });
+        inst.sched.deinitLeakingLive();
+    }
+    inst.metrics.deinit();
+    inst.arena_state.deinit();
+    gpa.destroy(inst);
+}
+
+/// The first half of `destroy`: marks the run evicting, so `emit` drops every command from
+/// here on, cancels the root and handler coroutines, wakes waits that ignore cancellation,
+/// and runs the scheduler so they exit and their defers run. Returns how many coroutines are
+/// still alive. Calling it again returns that count without doing anything else.
+pub fn teardown(inst: *Instance) usize {
+    if (inst.evicting) return inst.sched.live;
     inst.evicting = true;
+    inst.commands.clearRetainingCapacity();
     // The root and handler coroutines may still be blocked even after the workflow finished
     // (a handler's error finishes it, and handlers outlive the root).
     if (inst.root) |root| inst.wio.cancelTask(root);
@@ -388,21 +441,63 @@ pub fn destroy(inst: *Instance) void {
     var children = inst.children.valueIterator();
     while (children.next()) |state| state.*.wake(&inst.wio);
     inst.wio.run();
-    const gpa = inst.gpa;
-    if (inst.sched.live == 0) {
-        inst.sched.deinit();
-    } else {
-        // A coroutine ignored cancellation (for example it blocked with cancel protection on).
-        // Its stack can't be reclaimed safely, so it is leaked rather than freed under it.
-        inst.logger.warn("workflow coroutines did not exit on eviction; leaking their stacks", .{ .count = inst.sched.live });
-    }
-    inst.metrics.deinit();
-    inst.arena_state.deinit();
-    gpa.destroy(inst);
+    std.debug.assert(inst.commands.items.len == 0);
+    return inst.sched.live;
 }
 
+/// The run's allocator: the arena, counting live requested bytes into `allocated`. Freed
+/// as a whole by `destroy`.
 pub fn arena(inst: *Instance) Allocator {
-    return inst.arena_state.allocator();
+    return .{ .ptr = inst, .vtable = &run_vtable };
+}
+
+/// Bytes the run holds: live bytes requested from `arena()` plus its coroutine stacks, in
+/// use or pooled, at the configured stack size. Independent of how the arena or the heap
+/// placed the allocations.
+pub fn memoryUsed(inst: *const Instance) usize {
+    return inst.allocated + inst.sched.stackBytes();
+}
+
+const run_vtable: Allocator.VTable = .{
+    .alloc = runAlloc,
+    .resize = runResize,
+    .remap = runRemap,
+    .free = runFree,
+};
+
+fn runAlloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+    const inst: *Instance = @ptrCast(@alignCast(ptr));
+    const p = inst.arena_state.allocator().rawAlloc(len, alignment, ret_addr) orelse return null;
+    inst.allocated += len;
+    return p;
+}
+
+fn runResize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+    const inst: *Instance = @ptrCast(@alignCast(ptr));
+    if (!inst.arena_state.allocator().rawResize(memory, alignment, new_len, ret_addr)) return false;
+    inst.allocated = inst.allocated - memory.len + new_len;
+    return true;
+}
+
+fn runRemap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    const inst: *Instance = @ptrCast(@alignCast(ptr));
+    const p = inst.arena_state.allocator().rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+    inst.allocated = inst.allocated - memory.len + new_len;
+    return p;
+}
+
+fn runFree(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+    const inst: *Instance = @ptrCast(@alignCast(ptr));
+    inst.arena_state.allocator().rawFree(memory, alignment, ret_addr);
+    inst.allocated -= memory.len;
+}
+
+/// Adds a command to the activation's completion. Every command goes through here, and none
+/// is added once eviction has started (`teardown`): coroutines unwinding at eviction may
+/// still cancel timers or activities, but the core has dropped the run, so nothing is sent.
+fn emit(inst: *Instance, command: cmd_pb.WorkflowCommand) error{OutOfMemory}!void {
+    if (inst.evicting) return;
+    try inst.commands.append(inst.arena(), command);
 }
 
 /// Applies an activation and returns its completion. `out` holds the completion's memory
@@ -429,8 +524,9 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         try inst.setDeploymentVersion(act.deployment_version_for_current_task);
     }
     inst.replaying = act.is_replaying;
-    inst.commands = .empty;
+    inst.commands.clearRetainingCapacity();
     inst.task_failure = null;
+    inst.task_failure_type = "UnsupportedJob";
     inst.accepted_update = false;
     // Query answers go to `out`, not the run's arena, so answering doesn't grow the run.
     var answers: std.ArrayList(cmd_pb.WorkflowCommand) = .empty;
@@ -477,15 +573,19 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     // An update-only activation whose updates were all rejected is not in history, so on
     // replay its coroutines could not run: they run only once an update is accepted (and core
     // rejects anything but rejections from it).
+    // The memory check, too, runs only when coroutines ran: an activation that only rejected
+    // updates is not in history either, so failing it would fail the task on this worker only.
     if (inst.task_failure == null and !query_only and !inst.finished) {
-        if (!update_only or inst.accepted_update) inst.runUntilQuiet();
+        const ran = !update_only or inst.accepted_update;
+        if (ran) inst.runUntilQuiet();
         try inst.rejectUnhandledUpdates();
         try inst.finishIfDone();
+        if (ran and !inst.finished and inst.task_failure == null) try inst.checkMemoryLimit(out);
     }
 
     var completion: done_pb.WorkflowActivationCompletion = .{ .run_id = act.run_id };
     if (inst.task_failure) |message| {
-        completion.status = .{ .failed = .{ .failure = try failure_mod.application(out, .{ .message = message, .type = "UnsupportedJob" }) } };
+        completion.status = .{ .failed = .{ .failure = try failure_mod.application(out, .{ .message = message, .type = inst.task_failure_type }) } };
     } else {
         var success: done_pb.Success = .{};
         if (inst.send_versioning_behavior) success.versioning_behavior = @fromBackingInt(@backingInt(inst.versioning_behavior));
@@ -494,6 +594,28 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         completion.status = .{ .successful = success };
     }
     return completion;
+}
+
+/// Fails the workflow task when the run holds more than `memory_limit`. Called once per
+/// activation that ran workflow code, after every coroutine blocked, so the figure is the
+/// same on every execution of the activation, replay included, apart from the side-effect
+/// values a cached run encoded when they first ran (see the namespace docs).
+fn checkMemoryLimit(inst: *Instance, out: Allocator) error{OutOfMemory}!void {
+    const limit = inst.memory_limit orelse return;
+    const used = inst.memoryUsed();
+    if (used <= limit) return;
+    const stack_bytes = inst.sched.stackBytes();
+    const stacks = inst.sched.stackCount();
+    const message = try std.fmt.allocPrint(out, "workflow run holds {d} bytes ({d} allocated from ctx.allocator() and the runtime, {d} in {d} coroutine stacks), over worker.Options.workflow_memory_limit = {d}; raise the limit, or keep less state in the run (continue-as-new sooner)", .{ used, inst.allocated, stack_bytes, stacks, limit });
+    inst.task_failure = message;
+    inst.task_failure_type = "WorkflowMemoryLimitExceeded";
+    inst.logger.log(.err, message, .{
+        .used = used,
+        .allocated = inst.allocated,
+        .stack_bytes = stack_bytes,
+        .stacks = stacks,
+        .limit = limit,
+    });
 }
 
 fn setDeploymentVersion(inst: *Instance, v: ?proto.coresdk.common.WorkerDeploymentVersion) error{OutOfMemory}!void {
@@ -703,7 +825,7 @@ fn rejectUnhandledUpdates(inst: *Instance) error{OutOfMemory}!void {
 }
 
 fn respondToUpdate(inst: *Instance, protocol_instance_id: []const u8, response: cmd_pb.UpdateResponse.response_union) error{OutOfMemory}!void {
-    try inst.commands.append(inst.arena(), .{ .variant = .{ .update_response = .{
+    try inst.emit(.{ .variant = .{ .update_response = .{
         .protocol_instance_id = protocol_instance_id,
         .response = response,
     } } });
@@ -967,17 +1089,17 @@ fn finishIfDone(inst: *Instance) !void {
         inst.logger.warn("the workflow finished before its run method was called (its arguments didn't decode, or an interceptor didn't call next); its signals and updates are dropped", .{ .count = inst.held_handlers.items.len, .HandlerNames = names.items });
     }
     switch (outcome) {
-        .completed => |result| try inst.commands.append(a, .{ .variant = .{
+        .completed => |result| try inst.emit(.{ .variant = .{
             .complete_workflow_execution = .{ .result = result },
         } }),
-        .continued_as_new => try inst.commands.append(a, .{ .variant = .{
+        .continued_as_new => try inst.emit(.{ .variant = .{
             .continue_as_new_workflow_execution = inst.continue_as_new.?,
         } }),
         .failed => |err| switch (err) {
             // The workflow can't make progress; fail the task so the server retries it.
             error.OutOfMemory => inst.task_failure = "out of memory running the workflow",
-            error.Canceled => try inst.commands.append(a, .{ .variant = .{ .cancel_workflow_execution = .{} } }),
-            else => try inst.commands.append(a, .{ .variant = .{
+            error.Canceled => try inst.emit(.{ .variant = .{ .cancel_workflow_execution = .{} } }),
+            else => try inst.emit(.{ .variant = .{
                 .fail_workflow_execution = .{ .failure = try inst.workflowFailure(err) },
             } }),
         },
@@ -1068,7 +1190,7 @@ pub fn upsertMemo(inst: *Instance, fields: []const converter.Field) error{OutOfM
             merged.insertAssumeCapacity(i, f);
         }
     }
-    try inst.commands.append(a, .{ .variant = .{ .modify_workflow_properties = .{ .upserted_memo = upserted } } });
+    try inst.emit(.{ .variant = .{ .modify_workflow_properties = .{ .upserted_memo = upserted } } });
     inst.memo = merged.items;
 }
 
@@ -1099,7 +1221,7 @@ pub fn upsertSearchAttributes(inst: *Instance, updates: []const sa.Update) sa.En
     const a = inst.arena();
     const encoded = try sa.toProto(a, updates, .upsert);
     const view = try inst.search_attributes.withEntries(a, encoded.indexed_fields.items);
-    try inst.commands.append(a, .{ .variant = .{ .upsert_workflow_search_attributes = .{ .search_attributes = encoded } } });
+    try inst.emit(.{ .variant = .{ .upsert_workflow_search_attributes = .{ .search_attributes = encoded } } });
     inst.search_attributes = view;
 }
 
@@ -1123,7 +1245,7 @@ fn recordPatch(inst: *Instance, patch_id: []const u8, used: bool, deprecated: bo
     const a = inst.arena();
     const id = try a.dupe(u8, patch_id);
     try inst.patches.put(a, id, used);
-    if (used) try inst.commands.append(a, .{ .variant = .{ .set_patch_marker = .{ .patch_id = id, .deprecated = deprecated } } });
+    if (used) try inst.emit(.{ .variant = .{ .set_patch_marker = .{ .patch_id = id, .deprecated = deprecated } } });
 }
 
 /// The patch ID that records version `version` of change `change_id`. A version is an
@@ -1321,7 +1443,7 @@ fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflo
         .do_not_eagerly_execute = options.disable_eager_execution,
     };
     if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
-    try inst.commands.append(a, .{ .variant = .{ .schedule_activity = cmd } });
+    try inst.emit(.{ .variant = .{ .schedule_activity = cmd } });
     return state;
 }
 
@@ -1350,7 +1472,7 @@ fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: wo
     };
     if (options.retry_policy) |rp| local.cmd.retry_policy = try protoRetryPolicy(a, rp);
     state.local = local;
-    try inst.commands.append(a, .{ .variant = .{ .schedule_local_activity = local.cmd } });
+    try inst.emit(.{ .variant = .{ .schedule_local_activity = local.cmd } });
     return state;
 }
 
@@ -1368,7 +1490,7 @@ fn startLocalBackoff(inst: *Instance, state: *ActivityState, b: result_pb.DoBack
     inst.next_timer_seq += 1;
     try inst.backoffs.put(a, seq, state);
     local.backoff_timer = seq;
-    try inst.commands.append(a, .{ .variant = .{ .start_timer = .{
+    try inst.emit(.{ .variant = .{ .start_timer = .{
         .seq = seq,
         .start_to_fire_timeout = b.backoff_duration orelse .{},
     } } });
@@ -1385,7 +1507,7 @@ fn retryLocalActivity(inst: *Instance, state: *ActivityState) !void {
     inst.next_activity_seq += 1;
     local.cmd.seq = state.seq;
     if (local.id_from_seq) local.cmd.activity_id = try std.fmt.allocPrint(a, "{d}", .{state.seq});
-    try inst.commands.append(a, .{ .variant = .{ .schedule_local_activity = local.cmd } });
+    try inst.emit(.{ .variant = .{ .schedule_local_activity = local.cmd } });
 }
 
 fn protoCancellationType(t: ActivityState.CancellationType) cmd_pb.ActivityCancellationType {
@@ -1446,14 +1568,14 @@ pub fn cancelActivity(inst: *Instance, state: *ActivityState) void {
 fn requestCancel(inst: *Instance, state: *ActivityState) !void {
     const a = inst.arena();
     const local = state.local orelse
-        return inst.commands.append(a, .{ .variant = .{ .request_cancel_activity = .{ .seq = state.seq } } });
+        return inst.emit(.{ .variant = .{ .request_cancel_activity = .{ .seq = state.seq } } });
     const timer = local.backoff_timer orelse
-        return inst.commands.append(a, .{ .variant = .{ .request_cancel_local_activity = .{ .seq = state.seq } } });
+        return inst.emit(.{ .variant = .{ .request_cancel_local_activity = .{ .seq = state.seq } } });
     // Between attempts nothing runs: cancel the backoff timer and resolve here, whatever the
     // cancellation type.
     _ = inst.backoffs.remove(timer);
     local.backoff_timer = null;
-    try inst.commands.append(a, .{ .variant = .{ .cancel_timer = .{ .seq = timer } } });
+    try inst.emit(.{ .variant = .{ .cancel_timer = .{ .seq = timer } } });
     state.outcome = .{ .cancelled = try localCancelFailure(a, local) };
     if (state.waiter) |w| inst.wio.wake(w);
 }
@@ -1552,7 +1674,7 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
     };
     try inst.children.put(a, state.seq, state);
     inst.next_child_seq += 1;
-    try inst.commands.append(a, .{ .variant = .{ .start_child_workflow_execution = cmd } });
+    try inst.emit(.{ .variant = .{ .start_child_workflow_execution = cmd } });
     return state;
 }
 
@@ -1590,7 +1712,7 @@ pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) 
 pub fn cancelChild(inst: *Instance, state: *ChildState) void {
     if (state.outcome != null or state.cancel_requested) return;
     state.cancel_requested = true;
-    inst.commands.append(inst.arena(), .{ .variant = .{ .cancel_child_workflow_execution = .{
+    inst.emit(.{ .variant = .{ .cancel_child_workflow_execution = .{
         .child_workflow_seq = state.seq,
         .reason = "the parent canceled the child workflow",
     } } }) catch {
@@ -1673,7 +1795,7 @@ fn sendSignalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
     }
     const a = inst.arena();
     const state = try inst.newExternal(.signal, workflow_id);
-    try inst.commands.append(a, .{ .variant = .{ .signal_external_workflow_execution = .{
+    try inst.emit(.{ .variant = .{ .signal_external_workflow_execution = .{
         .seq = state.seq,
         .signal_name = try a.dupe(u8, signal_name),
         .args = try payloadList(a, args),
@@ -1699,7 +1821,7 @@ fn requestCancelExternal(inst: *Instance, workflow_id: []const u8, run_id: []con
     }
     const a = inst.arena();
     const state = try inst.newExternal(.cancel, workflow_id);
-    try inst.commands.append(a, .{ .variant = .{ .request_cancel_external_workflow_execution = .{
+    try inst.emit(.{ .variant = .{ .request_cancel_external_workflow_execution = .{
         .seq = state.seq,
         .workflow_execution = .{
             .namespace = inst.namespace,
@@ -1742,7 +1864,7 @@ pub fn awaitExternal(inst: *Instance, state: *ExternalState) error{Canceled}!voi
 fn cancelExternal(inst: *Instance, state: *ExternalState) void {
     if (state.kind != .signal or state.outcome != null or state.cancel_requested) return;
     state.cancel_requested = true;
-    inst.commands.append(inst.arena(), .{ .variant = .{ .cancel_signal_workflow = .{ .seq = state.seq } } }) catch {
+    inst.emit(.{ .variant = .{ .cancel_signal_workflow = .{ .seq = state.seq } } }) catch {
         inst.task_failure = "out of memory canceling a signal to an external workflow";
     };
 }
@@ -1953,7 +2075,7 @@ fn hostStartTimer(ctx: *anyopaque, timer: *WorkflowIo.Timer, duration: std.Io.Du
         inst.task_failure = "out of memory starting a timer";
         return;
     };
-    inst.commands.append(inst.arena(), .{ .variant = .{ .start_timer = .{
+    inst.emit(.{ .variant = .{ .start_timer = .{
         .seq = seq,
         .start_to_fire_timeout = protoDuration(duration),
     } } }) catch {
@@ -1965,7 +2087,7 @@ fn hostCancelTimer(ctx: *anyopaque, timer: *WorkflowIo.Timer) void {
     const inst: *Instance = @ptrCast(@alignCast(ctx));
     const seq: u32 = @intCast(timer.host_data);
     _ = inst.timers.remove(seq);
-    inst.commands.append(inst.arena(), .{ .variant = .{ .cancel_timer = .{ .seq = seq } } }) catch {
+    inst.emit(.{ .variant = .{ .cancel_timer = .{ .seq = seq } } }) catch {
         inst.task_failure = "out of memory canceling a timer";
     };
 }
@@ -4551,4 +4673,344 @@ test "struct workflow: run may register handlers at run time and replace a decla
     try act.jobs.append(a, .{ .variant = try signalJob(a, "extra", .{}) });
     try act.jobs.append(a, .{ .variant = try signalJob(a, "extra", .{}) });
     try testing.expectEqualStrings("\"runtime\"", completedWith(try inst.activate(&act, a)));
+}
+
+// ---------------------------------------------------------------- per-run memory
+
+/// Counts log records and keeps the last one at or above `min`.
+const LogRecorder = struct {
+    arena: std.heap.ArenaAllocator,
+    min: log.Level,
+    count: usize = 0,
+    message: []const u8 = "",
+    fields: []const log.Field = &.{},
+
+    fn sink(r: *LogRecorder) log.Sink {
+        return .{ .ptr = r, .vtable = &.{ .log = record } };
+    }
+
+    fn record(ptr: ?*anyopaque, level: log.Level, message: []const u8, fields: []const log.Field) void {
+        const r: *LogRecorder = @ptrCast(@alignCast(ptr.?));
+        if (@backingInt(level) > @backingInt(r.min)) return;
+        const a = r.arena.allocator();
+        r.count += 1;
+        r.message = a.dupe(u8, message) catch "";
+        const copy = a.alloc(log.Field, fields.len) catch return;
+        for (fields, copy) |f, *c| c.* = .{ .key = a.dupe(u8, f.key) catch "", .value = a.dupe(u8, f.value) catch "" };
+        r.fields = copy;
+    }
+
+    fn get(r: *const LogRecorder, key: []const u8) ?[]const u8 {
+        for (r.fields) |f| if (std.mem.eql(u8, f.key, key)) return f.value;
+        return null;
+    }
+};
+
+const MemoryHog = struct {
+    /// Allocates `chunk` bytes, then sleeps a second, `rounds` times; then allocates once more
+    /// and completes. Answers the `status` query.
+    fn run(ctx: *workflow.Context, chunk: usize, rounds: usize) ![]const u8 {
+        try ctx.setQueryHandler(QueryWf.Status, ctx, status);
+        for (0..rounds) |_| {
+            @memset(try ctx.allocator().alloc(u8, chunk), 0);
+            try ctx.io().sleep(.fromSeconds(1), .awake);
+        }
+        @memset(try ctx.allocator().alloc(u8, chunk), 0);
+        return "done";
+    }
+
+    fn status(_: *workflow.Context) []const u8 {
+        return "hogging";
+    }
+
+    /// Starts and awaits `n` futures one after another, then sleeps.
+    fn futures(ctx: *workflow.Context, n: usize) !u64 {
+        const io = ctx.io();
+        var sum: u64 = 0;
+        for (0..n) |i| {
+            var f = io.async(square, .{@as(u64, i)});
+            sum += f.await(io);
+        }
+        try io.sleep(.fromSeconds(1), .awake);
+        return sum;
+    }
+
+    fn square(x: u64) u64 {
+        return x * x;
+    }
+
+    /// Waits on an activity while a group member sleeps.
+    fn timerAndActivity(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        group.async(io, napQuietly, .{io});
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get();
+    }
+
+    fn napQuietly(io: std.Io) void {
+        io.sleep(.fromSeconds(10), .awake) catch {};
+    }
+
+    /// Blocks cancellation, then sleeps: eviction can't end the sleep.
+    fn stuck(ctx: *workflow.Context) ![]const u8 {
+        _ = ctx.io().swapCancelProtection(.blocked);
+        try ctx.io().sleep(.fromSeconds(60), .awake);
+        return "woke";
+    }
+};
+const Oversize = struct {
+    /// More than the largest pooled block size class.
+    const Big = [100_000]u8;
+    /// More aligned than pooled blocks.
+    const Wide = struct { v: u64 align(64) };
+
+    /// `rounds` times: starts and awaits, one after another, `n` coroutines with an oversize
+    /// result and `n` with an over-aligned argument, then sleeps.
+    fn run(ctx: *workflow.Context, n: usize, rounds: usize) !u64 {
+        const io = ctx.io();
+        var sum: u64 = 0;
+        for (0..rounds) |_| {
+            for (0..n) |i| {
+                var big = io.async(fill, .{ io, @as(u64, i) });
+                sum += big.await(io)[@sizeOf(Big) - 1];
+                var wide = io.async(widen, .{ io, Wide{ .v = i } });
+                sum += wide.await(io);
+            }
+            try io.sleep(.fromSeconds(1), .awake);
+        }
+        return sum;
+    }
+
+    // Each starts a small coroutine whose block, pooled once it finishes, is allocated after
+    // the oversize block: an arena can't reclaim a block with a later allocation behind it.
+    fn fill(io: std.Io, i: u64) Big {
+        var inner = io.async(MemoryHog.square, .{i});
+        var b: Big = undefined;
+        @memset(&b, @truncate(inner.await(io)));
+        return b;
+    }
+
+    fn widen(io: std.Io, w: Wide) u64 {
+        var inner = io.async(MemoryHog.square, .{w.v});
+        return inner.await(io);
+    }
+};
+const OversizeWf = workflow.Def("Oversize", Oversize.run);
+const MemoryHogWf = workflow.Def("MemoryHog", MemoryHog.run);
+const FuturesWf = workflow.Def("Futures", MemoryHog.futures);
+const StuckWf = workflow.Def("Stuck", MemoryHog.stuck);
+const TimerAndActivityWf = workflow.Def("TimerAndActivity", MemoryHog.timerAndActivity);
+
+const hog_stack = 64 * 1024;
+
+/// Runs MemoryHog(chunk, 3) to completion with no limit and returns `memoryUsed` after each
+/// of its four activations.
+fn hogUsage(a: Allocator, chunk: usize, replaying: bool) ![4]usize {
+    const inst = try create(testing.allocator, MemoryHogWf.registered, .{ .stack_size = hog_stack });
+    defer inst.destroy();
+    var used: [4]usize = undefined;
+    for (&used, 0..) |*u, i| {
+        var act = if (i == 0)
+            try initActivation(a, "MemoryHog", .{ chunk, @as(usize, 3) })
+        else
+            try oneJob(a, .{ .fire_timer = .{ .seq = @intCast(i) } });
+        act.is_replaying = replaying;
+        const c = try inst.activate(&act, a);
+        try testing.expect(c.status.? == .successful);
+        u.* = inst.memoryUsed();
+    }
+    return used;
+}
+
+test "memoryUsed counts requested bytes and the run's stacks" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, MemoryHogWf.registered, .{ .stack_size = hog_stack });
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "MemoryHog", .{ @as(usize, 1000), @as(usize, 3) }), a);
+    // The workflow coroutine is blocked in its sleep: one stack, nothing pooled.
+    try testing.expectEqual(@as(usize, 1), inst.sched.stackCount());
+    try testing.expectEqual(inst.allocated + hog_stack, inst.memoryUsed());
+
+    // Only the workflow's own allocations differ between these runs (the arguments encode
+    // to the same length).
+    const small = try hogUsage(a, 1000, false);
+    const large = try hogUsage(a, 2000, false);
+    for (small, large, 1..) |s, l, rounds| try testing.expectEqual(s + 1000 * rounds, l);
+}
+
+test "memoryUsed is the same whether or not the activations replay" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try testing.expectEqual(try hogUsage(a, 4096, false), try hogUsage(a, 4096, true));
+}
+
+test "a run over its memory limit fails the workflow task, the same way when replaying" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const used = try hogUsage(a, 4096, false);
+    const limit = used[1];
+
+    for ([_]bool{ false, true }) |replaying| {
+        var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
+        defer recorder.arena.deinit();
+        const inst = try create(testing.allocator, MemoryHogWf.registered, .{
+            .stack_size = hog_stack,
+            .memory_limit = limit,
+            .logger = recorder.sink(),
+            .log_during_replay = true,
+        });
+        defer inst.destroy();
+        var first = try initActivation(a, "MemoryHog", .{ @as(usize, 4096), @as(usize, 3) });
+        first.is_replaying = replaying;
+        try testing.expect((try inst.activate(&first, a)).status.? == .successful);
+        var second = try oneJob(a, .{ .fire_timer = .{ .seq = 1 } });
+        second.is_replaying = replaying;
+        try testing.expect((try inst.activate(&second, a)).status.? == .successful);
+        try testing.expectEqual(@as(usize, 0), recorder.count);
+
+        var third = try oneJob(a, .{ .fire_timer = .{ .seq = 2 } });
+        third.is_replaying = replaying;
+        const c = try inst.activate(&third, a);
+        const f = c.status.?.failed.failure.?;
+        try testing.expectEqualStrings("WorkflowMemoryLimitExceeded", failure_mod.applicationType(f).?);
+        const want = try std.fmt.allocPrint(a, "workflow run holds {d} bytes ({d} allocated from ctx.allocator() and the runtime, {d} in 1 coroutine stacks), over worker.Options.workflow_memory_limit = {d}; raise the limit, or keep less state in the run (continue-as-new sooner)", .{ used[2], used[2] - hog_stack, hog_stack, limit });
+        try testing.expectEqualStrings(want, f.message);
+        try testing.expectEqual(@as(usize, 1), recorder.count);
+        try testing.expectEqualStrings(want, recorder.message);
+        try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{used[2]}), recorder.get("used").?);
+        try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{limit}), recorder.get("limit").?);
+    }
+}
+
+test "a run under its limit, or with none, is not failed; nor is one that finishes or answers a query over it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const used = try hogUsage(a, 4096, false);
+
+    for ([_]?usize{ null, used[3], used[2] }) |limit| {
+        const inst = try create(testing.allocator, MemoryHogWf.registered, .{ .stack_size = hog_stack, .memory_limit = limit });
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "MemoryHog", .{ @as(usize, 4096), @as(usize, 3) }), a);
+        _ = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a);
+        _ = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 2 } }), a);
+        // With the limit at used[2], the run goes over it in the activation that completes it.
+        const done = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 3 } }), a);
+        try testing.expectEqualStrings("\"done\"", commandsOf(done)[0].variant.?.complete_workflow_execution.result.?.data);
+    }
+
+    // A query-only activation of a run already over its limit answers.
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, MemoryHogWf.registered, .{ .stack_size = hog_stack, .memory_limit = used[0] - 1, .logger = recorder.sink() });
+    defer inst.destroy();
+    try testing.expect((try inst.activate(&try initActivation(a, "MemoryHog", .{ @as(usize, 4096), @as(usize, 3) }), a)).status.? == .failed);
+    const q = try inst.activate(&try queryActivation(a, &.{.{ "q1", "status", &.{} }}), a);
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+    try testing.expectEqualStrings("\"hogging\"", answer(q, 0).variant.?.succeeded.response.?.data);
+}
+
+test "finished coroutines' blocks and stacks are reused" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var used: [2]usize = undefined;
+    for (&used, [_]usize{ 100, 999 }) |*u, n| {
+        const inst = try create(testing.allocator, FuturesWf.registered, .{ .stack_size = hog_stack });
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "Futures", .{n}), a);
+        u.* = inst.memoryUsed();
+    }
+    try testing.expectEqual(used[0], used[1]);
+}
+
+test "oversize and over-aligned coroutine blocks are reused: neither memoryUsed nor the arena grows" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, OversizeWf.registered, .{ .stack_size = 2 * 1024 * 1024 });
+    defer inst.destroy();
+    // Each activation runs 20 of each coroutine. Freed blocks that an arena couldn't reclaim
+    // would add 2 MB of arena per activation while memoryUsed() stayed flat.
+    var used: [3]usize = undefined;
+    var capacity: [3]usize = undefined;
+    for (&used, &capacity, 0..) |*u, *cap, i| {
+        const act = if (i == 0)
+            try initActivation(a, "Oversize", .{ @as(usize, 20), @as(usize, 3) })
+        else
+            try oneJob(a, .{ .fire_timer = .{ .seq = @intCast(i) } });
+        try testing.expect((try inst.activate(&act, a)).status.? == .successful);
+        u.* = inst.memoryUsed();
+        cap.* = inst.arena_state.queryCapacity();
+    }
+    // The finished oversize block is held for reuse, and counted.
+    try testing.expect(inst.allocated > @sizeOf(Oversize.Big));
+    try testing.expectEqual(used[0], used[1]);
+    try testing.expectEqual(used[1], used[2]);
+    try testing.expectEqual(capacity[0], capacity[1]);
+    try testing.expectEqual(capacity[1], capacity[2]);
+}
+
+test "an update-only activation that only rejects updates is not checked against the limit" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const used = try hogUsage(a, 4096, false);
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, MemoryHogWf.registered, .{ .stack_size = hog_stack, .memory_limit = used[0] - 1, .logger = recorder.sink() });
+    defer inst.destroy();
+    try testing.expect((try inst.activate(&try initActivation(a, "MemoryHog", .{ @as(usize, 4096), @as(usize, 3) }), a)).status.? == .failed);
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+
+    // Still over the limit, but no coroutine runs: the update is rejected and the task passes.
+    const rejected = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "nope", .{}, true)), a));
+    try testing.expectEqual(@as(usize, 1), rejected.len);
+    try testing.expectEqualStrings("UpdateNotRegistered", failure_mod.applicationType((try updateResponse(rejected[0], "u1")).rejected).?);
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+
+    // An activation that runs the coroutines is checked.
+    try testing.expect((try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)).status.? == .failed);
+    try testing.expectEqual(@as(usize, 2), recorder.count);
+}
+
+test "a coroutine that refuses to exit on eviction is reported, and the rest of the run is freed" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, StuckWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
+    _ = try inst.activate(&try initActivation(a, "Stuck", .{}), a);
+    try testing.expectEqual(@as(usize, 1), inst.teardown());
+    inst.destroy(); // testing.allocator reports leaks; the stuck stack is the only thing kept
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+    try testing.expectEqualStrings("workflow coroutines did not exit on eviction (blocked with cancel protection on?); leaking their stacks", recorder.message);
+    try testing.expectEqualStrings("1", recorder.get("count").?);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{hog_stack}), recorder.get("stack_bytes").?);
+}
+
+test "eviction sends nothing: commands from unwinding coroutines are dropped" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, TimerAndActivityWf.registered, .{});
+    // Blocked on an activity and on a timer; unwinding cancels both.
+    const first = commandsOf(try inst.activate(&try initActivation(a, "TimerAndActivity", .{}), a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    // Outside eviction, the same cancellation produces commands.
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expect(canceled.len > 0);
+    inst.destroy();
+
+    const evicted = try create(testing.allocator, TimerAndActivityWf.registered, .{});
+    _ = try evicted.activate(&try initActivation(a, "TimerAndActivity", .{}), a);
+    try testing.expectEqual(@as(usize, 0), evicted.teardown());
+    try testing.expectEqual(@as(usize, 0), evicted.commands.items.len);
+    evicted.destroy();
 }

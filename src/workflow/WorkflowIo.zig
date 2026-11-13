@@ -26,7 +26,15 @@ const assert = std.debug.assert;
 const Scheduler = @import("Scheduler.zig");
 const Fiber = Scheduler.Fiber;
 
-gpa: Allocator,
+/// The run's allocator. Task blocks and group state come from it and go back to `free_blocks`
+/// for reuse, never to it: freeing the run's memory frees them, including the blocks of
+/// coroutines that never exited.
+memory: Allocator,
+/// Finished blocks by size class (`block_min << i` bytes), linked through their first word.
+free_blocks: [block_classes]?*FreeBlock = @splat(null),
+/// Finished blocks too large or too aligned for a size class, for reuse by a block of the
+/// same length and alignment. The run's allocator is an arena, which can't reclaim them.
+free_oversize: ?*OversizeBlock = null,
 scheduler: *Scheduler,
 host: Host,
 rng: std.Random.DefaultPrng,
@@ -59,9 +67,9 @@ pub const Timer = struct {
     host_data: usize = 0,
 };
 
-pub fn init(gpa: Allocator, scheduler: *Scheduler, host: Host, random_seed: u64) WorkflowIo {
+pub fn init(memory: Allocator, scheduler: *Scheduler, host: Host, random_seed: u64) WorkflowIo {
     return .{
-        .gpa = gpa,
+        .memory = memory,
         .scheduler = scheduler,
         .host = host,
         .rng = .init(random_seed),
@@ -181,7 +189,7 @@ fn createTask(
     const context_offset = context_alignment.forward(@sizeOf(Task));
     const result_offset = result_alignment.forward(context_offset + context.len);
     const size = result_offset + result_len;
-    const memory = (w.gpa.rawAlloc(size, alignment, @returnAddress()) orelse return error.OutOfMemory)[0..size];
+    const memory = try w.allocBlock(size, alignment);
     const task: *Task = @ptrCast(@alignCast(memory.ptr));
     task.* = .{
         .fiber = undefined,
@@ -200,7 +208,85 @@ fn createTask(
 }
 
 fn destroyTask(w: *WorkflowIo, task: *Task) void {
-    w.gpa.rawFree(task.memory, task.memory_align, @returnAddress());
+    w.freeBlock(task.memory, task.memory_align);
+}
+
+const block_min = 64;
+const block_classes = 11; // 64 bytes to 64 KiB
+const block_max = block_min << (block_classes - 1);
+const block_align: Alignment = .@"16";
+const FreeBlock = struct { next: ?*FreeBlock };
+const OversizeBlock = struct { next: ?*OversizeBlock, len: usize, alignment: Alignment };
+
+fn isOversize(size: usize, alignment: Alignment) bool {
+    return size > block_max or alignment.compare(.gt, block_align);
+}
+
+/// A block of at least `size` bytes. Pooled blocks are a whole size class long, so the
+/// returned slice may be longer than `size`; pass it unchanged to `freeBlock`.
+fn allocBlock(w: *WorkflowIo, size: usize, alignment: Alignment) error{OutOfMemory}![]u8 {
+    if (isOversize(size, alignment)) {
+        var link = &w.free_oversize;
+        while (link.*) |b| : (link = &b.next) {
+            if (b.len == size and b.alignment == alignment) {
+                link.* = b.next;
+                const p: [*]u8 = @ptrCast(b);
+                return p[0..size];
+            }
+        }
+        return (w.memory.rawAlloc(size, alignment, @returnAddress()) orelse return error.OutOfMemory)[0..size];
+    }
+    const class = blockClass(size);
+    const len = @as(usize, block_min) << class;
+    if (w.free_blocks[class]) |b| {
+        w.free_blocks[class] = b.next;
+        const p: [*]u8 = @ptrCast(b);
+        return p[0..len];
+    }
+    return (w.memory.rawAlloc(len, block_align, @returnAddress()) orelse return error.OutOfMemory)[0..len];
+}
+
+fn freeBlock(w: *WorkflowIo, mem: []u8, alignment: Alignment) void {
+    if (isOversize(mem.len, alignment)) {
+        // Only Task blocks are oversize, and a Task has room and alignment for the link.
+        comptime assert(@sizeOf(Task) >= @sizeOf(OversizeBlock) and @alignOf(Task) >= @alignOf(OversizeBlock));
+        const b: *OversizeBlock = @ptrCast(@alignCast(mem.ptr));
+        b.* = .{ .next = w.free_oversize, .len = mem.len, .alignment = alignment };
+        w.free_oversize = b;
+        return;
+    }
+    const class = blockClass(mem.len);
+    assert(mem.len == @as(usize, block_min) << class);
+    const b: *FreeBlock = @ptrCast(@alignCast(mem.ptr));
+    b.next = w.free_blocks[class];
+    w.free_blocks[class] = b;
+}
+
+fn blockLen(size: usize) usize {
+    return @as(usize, block_min) << blockClass(size);
+}
+
+fn blockClass(size: usize) std.math.Log2Int(usize) {
+    if (size <= block_min) return 0;
+    return @intCast(std.math.log2_int_ceil(usize, size) - comptime std.math.log2_int(usize, block_min));
+}
+
+/// Returns the pooled blocks to `memory`. Optional: freeing the run's memory frees them too.
+/// Blocks of coroutines that are still running are not pooled and are not freed here.
+pub fn releasePooledBlocks(w: *WorkflowIo) void {
+    for (&w.free_blocks, 0..) |*head, class| {
+        const len = @as(usize, block_min) << @intCast(class);
+        while (head.*) |b| {
+            head.* = b.next;
+            const p: [*]u8 = @ptrCast(b);
+            w.memory.rawFree(p[0..len], block_align, @returnAddress());
+        }
+    }
+    while (w.free_oversize) |b| {
+        w.free_oversize = b.next;
+        const p: [*]u8 = @ptrCast(b);
+        w.memory.rawFree(p[0..b.len], b.alignment, @returnAddress());
+    }
 }
 
 fn taskMain(w: *WorkflowIo, task: *Task) void {
@@ -381,7 +467,8 @@ fn cancel(userdata: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, _: Ali
 
 fn groupState(w: *WorkflowIo, group: *Io.Group) !*GroupState {
     if (group.token.raw) |t| return @ptrCast(@alignCast(t));
-    const g = try w.gpa.create(GroupState);
+    const mem = try w.allocBlock(@sizeOf(GroupState), .of(GroupState));
+    const g: *GroupState = @ptrCast(@alignCast(mem.ptr));
     g.* = .{};
     group.token.raw = g;
     return g;
@@ -428,7 +515,8 @@ fn groupAsync(
 
 fn finishGroup(w: *WorkflowIo, group: *Io.Group, g: *GroupState) void {
     assert(g.pending == 0);
-    w.gpa.destroy(g);
+    const p: [*]u8 = @ptrCast(g);
+    w.freeBlock(p[0..blockLen(@sizeOf(GroupState))], .of(GroupState));
     group.token.raw = null;
 }
 
@@ -634,6 +722,7 @@ const Env = struct {
     }
 
     fn deinit(e: *Env) void {
+        e.wio.releasePooledBlocks();
         e.fake.deinit();
         e.sched.deinit();
     }

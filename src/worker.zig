@@ -43,6 +43,28 @@ pub const Options = struct {
     identity: []const u8 = "",
     /// Stack size for each workflow coroutine.
     workflow_stack_size: usize = 256 * 1024,
+    /// The most memory, in bytes, one cached workflow run may hold. Null (the default): no
+    /// limit.
+    ///
+    /// Counted: the live bytes the run allocated from `ctx.allocator()` (and the runtime's
+    /// own bookkeeping for the run, which uses the same allocator), plus one
+    /// `workflow_stack_size` for each coroutine stack the run holds, running or kept for
+    /// reuse. The figure depends on what the workflow did, so a run rebuilt by replay counts
+    /// the same as one cached since its start, with one exception: a `ctx.sideEffect` value
+    /// is encoded and recorded only when it first runs, so a cached run counts those
+    /// encodings and a replayed one doesn't. A run within that margin of the limit can fail
+    /// its task on the worker that has it cached and pass once evicted and replayed.
+    ///
+    /// Checked once at the end of each activation that runs workflow code, after every
+    /// coroutine has blocked. A run over the limit fails that workflow task with an
+    /// application failure of type `WorkflowMemoryLimitExceeded` whose message gives the
+    /// numbers; the workflow itself does not fail, and the server retries the task, which
+    /// replays the history and fails at the same point until the limit is raised or the
+    /// workflow keeps less state (for example, continues as new sooner). Allocations are never
+    /// refused, so one activation can go over before the check. Activations that only answer
+    /// queries, and one that finishes the workflow, are not checked. The workflow logger
+    /// also records the failure, except while replaying unless `log_during_replay` is set.
+    workflow_memory_limit: ?usize = null,
     /// How long running activities may keep running after `stop` before they are canceled
     /// with reason `worker_shutdown`.
     graceful_shutdown_period: Io.Duration = .zero,
@@ -522,6 +544,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .task_queue = w.task_queue,
         .namespace = w.client.namespace,
         .stack_size = w.options.workflow_stack_size,
+        .memory_limit = w.options.workflow_memory_limit,
         .codecs = w.client.codecs,
         .propagators = w.client.propagators,
         .interceptors = w.interceptors,
@@ -558,6 +581,8 @@ pub const WorkflowRunner = struct {
     task_queue: []const u8,
     namespace: []const u8,
     stack_size: usize,
+    /// See `Options.workflow_memory_limit`.
+    memory_limit: ?usize = null,
     /// Borrowed; see `client.Options.codecs`.
     codecs: []const converter.PayloadCodec = &.{},
     /// Borrowed; see `client.Options.propagators`.
@@ -658,6 +683,7 @@ pub const WorkflowRunner = struct {
                 .task_queue = r.task_queue,
                 .namespace = r.namespace,
                 .stack_size = r.stack_size,
+                .memory_limit = r.memory_limit,
                 .logger = r.logger,
                 .log_during_replay = r.log_during_replay,
                 .propagators = r.propagators,
@@ -2079,6 +2105,50 @@ const CodecContextTest = struct {
     }
     const Echo = workflow.Def("Echo", echo);
 };
+
+const MemoryLimitTest = struct {
+    fn nap(ctx: *workflow.Context) ![]const u8 {
+        try ctx.io().sleep(.fromSeconds(30), .awake);
+        return "rested";
+    }
+    const Nap = workflow.Def("Nap", nap);
+};
+
+test "the workflow runner passes the memory limit to its runs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, MemoryLimitTest.Nap.workflow_name, MemoryLimitTest.Nap.registered);
+
+    for ([_]?usize{ null, 1 }) |limit| {
+        var runner: WorkflowRunner = .{
+            .gpa = testing.allocator,
+            .workflows = &workflows,
+            .task_queue = "tq",
+            .namespace = "ns",
+            .stack_size = 64 * 1024,
+            .memory_limit = limit,
+            .logger = .{ .ptr = null, .vtable = &.{ .log = struct {
+                fn f(_: ?*anyopaque, _: log_mod.Level, _: []const u8, _: []const log_mod.Field) void {}
+            }.f } },
+        };
+        defer runner.deinit();
+        const init: act_pb.InitializeWorkflow = .{ .workflow_type = "Nap", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+        var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+        try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+        var bytes: Io.Writer.Allocating = .init(a);
+        try act.encode(&bytes.writer, a);
+        const completion = try runner.handle(bytes.written(), a, testing.io);
+        if (limit == null) {
+            try testing.expect(completion.status.?.successful.commands.items[0].variant.? == .start_timer);
+        } else {
+            const f = completion.status.?.failed.failure.?;
+            try testing.expectEqualStrings("WorkflowMemoryLimitExceeded", failure_mod.applicationType(f).?);
+        }
+    }
+}
 
 test "the workflow runner hands codecs the run's propagated values and identity" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
