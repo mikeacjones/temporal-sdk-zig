@@ -303,6 +303,96 @@ pub const ActivityOptions = struct {
     retry_policy: ?RetryPolicy = null,
     cancellation_type: ActivityCancellationType = .try_cancel,
     disable_eager_execution: bool = false,
+    /// Runs the activity in a session (`Context.createSession`): on the session's host, with
+    /// `activity.Info.session_id` set. Leave `task_queue` empty. A failed session makes the
+    /// future's `get` return `error.SessionFailed`, and a closed one `error.InvalidOptions`
+    /// (logged); the activity isn't scheduled then.
+    session: ?*const Session = null,
+};
+
+/// How `Context.createSession` and `recreateSession` open a session. A session is held by a
+/// creation activity that runs on the host for the session's whole life, so its timeouts are
+/// that activity's, and it gets one attempt.
+pub const SessionOptions = struct {
+    /// The task queue whose session workers (`worker.Options.sessions`) may take the session.
+    /// Empty uses the workflow's. `recreateSession` ignores it.
+    task_queue: []const u8 = "",
+    /// How long to wait for a host to take the session: the creation activity's
+    /// schedule-to-start timeout. Past it, creating returns `error.SessionCreationFailed`.
+    creation_timeout: Duration,
+    /// How long the session may stay open: the creation activity's start-to-close timeout.
+    /// Past it, the session fails.
+    execution_timeout: Duration,
+    /// How long the host may go silent before the session fails: the creation activity's
+    /// heartbeat timeout. The host heartbeats every third of it.
+    heartbeat_timeout: Duration = .fromSeconds(20),
+};
+
+/// Where a session is in its life; see `Session.state`.
+pub const SessionState = enum { open, failed, closed };
+
+/// A session as `Session.info` describes it. The strings live as long as the run is cached.
+pub const SessionInfo = struct {
+    /// Unique to the session; activities in it read it from `activity.Info.session_id`.
+    session_id: []const u8,
+    /// The host's own task queue, which the session's activities run on. Pass it to
+    /// `recreateSession` to open another session on the same host, from this run or a later
+    /// one.
+    task_queue: []const u8,
+    /// The host's name, as its operating system reports it.
+    host_name: []const u8,
+    state: SessionState,
+};
+
+/// A group of activities that run on one worker host, for work that needs state local to
+/// that host (files on its disk, a process it started). Open one with `Context.createSession`,
+/// run activities in it with `ActivityOptions.session`, and end it with
+/// `Context.completeSession`. Arena memory of the run; only the workflow reads and changes it.
+///
+/// A session holds one of its host's `worker.SessionWorkerOptions.max_concurrent_sessions`
+/// slots from creation until it is completed or fails. It fails when its host stops, stays
+/// silent past `SessionOptions.heartbeat_timeout`, or `execution_timeout` passes. Neither
+/// completing nor failing cancels the session's running activities: they finish, or time out,
+/// on their own.
+///
+/// Its state comes only from the run's history, so it is the same on replay.
+pub const Session = struct {
+    id: []const u8,
+    /// Set once the host took the session.
+    task_queue: []const u8 = "",
+    host_name: []const u8 = "",
+    heartbeat_timeout: Duration,
+    /// The creation activity; it ends when the session fails or completes.
+    creation: *Instance.ActivityState,
+    opened: bool = false,
+    closed: bool = false,
+
+    /// `closed` after `Context.completeSession`; otherwise `failed` once its creation activity
+    /// has ended; otherwise `open`.
+    pub fn state(s: *const Session) SessionState {
+        if (s.closed) return .closed;
+        if (s.creation.outcome != null) return .failed;
+        return .open;
+    }
+
+    pub fn info(s: *const Session) SessionInfo {
+        return .{ .session_id = s.id, .task_queue = s.task_queue, .host_name = s.host_name, .state = s.state() };
+    }
+
+    /// Why the session failed (for example `SessionWorkerStopped` when its host stopped, or a
+    /// heartbeat timeout), or null while it is open and once it is closed.
+    pub fn failure(s: *const Session) ?*const failure_mod.Failure {
+        if (s.closed) return null;
+        const outcome = s.creation.outcome orelse return null;
+        return switch (outcome) {
+            .completed => null,
+            .failed, .cancelled => |f| f,
+        };
+    }
+
+    fn settled(s: *const Session) bool {
+        return s.opened or s.creation.outcome != null;
+    }
 };
 
 /// How a local activity is scheduled. A local activity runs on the worker running the
@@ -651,13 +741,120 @@ pub const Context = struct {
         const future: ActivityFuture(T) = .{ .ctx = ctx, .state = ctx.instance.sideEffect(value).state };
         return future.get() catch |err| switch (err) {
             error.ActivityFailed => error.SideEffectFailed,
-            error.InvalidOptions => {
+            error.InvalidOptions, error.SessionFailed => {
                 ctx.instance.setLastFailure(null);
                 return error.SideEffectFailed;
             },
             error.WrongArgumentCount => error.InvalidPayload,
             else => |e| e,
         };
+    }
+
+    /// `SessionCreationFailed`: no host took the session within `creation_timeout`, or the host
+    /// refused it (`SessionWorkerFull`: it already runs its maximum of sessions). Returned
+    /// from the workflow, it fails the workflow with the creation activity's failure.
+    /// `Canceled`: the calling coroutine was canceled while waiting for a host.
+    /// `InvalidOptions`: a timeout isn't positive, or `recreateSession` got no task queue
+    /// (logged).
+    pub const SessionError = error{ SessionCreationFailed, Canceled, InvalidOptions, OutOfMemory };
+
+    /// Opens a session (see `Session`) on a worker host polling `options.task_queue` with
+    /// sessions enabled (`worker.Options.sessions`), and returns it once a host has taken
+    /// it. Its ID is a UUID from the workflow's seeded randomness, the same on replay.
+    ///
+    ///     const session = try ctx.createSession(.{ .creation_timeout = .fromSeconds(60), .execution_timeout = .fromSeconds(600) });
+    ///     defer ctx.completeSession(session) catch {};
+    ///     const path = try ctx.executeActivity(Download, .{ .start_to_close_timeout = .fromSeconds(60), .session = session }, .{url}).get();
+    ///     try ctx.executeActivity(Process, .{ .start_to_close_timeout = .fromSeconds(60), .session = session }, .{path}).get();
+    pub fn createSession(ctx: *Context, options: SessionOptions) SessionError!*Session {
+        const task_queue = if (options.task_queue.len > 0) options.task_queue else ctx.info().task_queue;
+        const queue = try std.fmt.allocPrint(ctx.allocator(), "{s}" ++ Instance.session_queue_suffix, .{task_queue});
+        return ctx.openSession(queue, options, "createSession");
+    }
+
+    /// Opens a new session, with a new ID, on the host whose task queue is `task_queue`: the
+    /// `task_queue` of an earlier session's `info()`, from this run or an earlier one (passed
+    /// to it as an argument). The host must still run, and have a free slot: recreated
+    /// sessions count toward its `max_concurrent_sessions`. Otherwise this returns
+    /// `error.SessionCreationFailed`, after `creation_timeout` for a host that is gone.
+    /// `options.task_queue` is ignored. Errors are those of `createSession`.
+    pub fn recreateSession(ctx: *Context, task_queue: []const u8, options: SessionOptions) SessionError!*Session {
+        if (task_queue.len == 0) {
+            ctx.instance.logger.warn("recreateSession: the task queue is empty; pass the task_queue of an earlier session's info()", .{});
+            return error.InvalidOptions;
+        }
+        return ctx.openSession(try ctx.allocator().dupe(u8, task_queue), options, "recreateSession");
+    }
+
+    fn openSession(ctx: *Context, queue: []const u8, options: SessionOptions, comptime what: []const u8) SessionError!*Session {
+        inline for (.{ "creation_timeout", "execution_timeout", "heartbeat_timeout" }) |name| {
+            if (@field(options, name).nanoseconds <= 0) {
+                ctx.instance.logger.warn(what ++ ": SessionOptions." ++ name ++ " must be positive", .{ .TaskQueue = queue });
+                return error.InvalidOptions;
+            }
+        }
+        const a = ctx.allocator();
+        const input: Instance.SessionCreateInput = .{
+            .session_id = try @import("client.zig").uuid(a, ctx.io()),
+            .heartbeat_interval_ms = @max(1, @divTrunc(options.heartbeat_timeout.toMilliseconds(), 3)),
+        };
+        const creation = ctx.executeActivityByName(void, Instance.session_create_activity_type, .{
+            .task_queue = queue,
+            .schedule_to_start_timeout = options.creation_timeout,
+            .start_to_close_timeout = options.execution_timeout,
+            .heartbeat_timeout = options.heartbeat_timeout,
+            .retry_policy = .{ .maximum_attempts = 1 },
+            .disable_eager_execution = true,
+        }, .{input});
+        const state = creation.state catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidOptions, error.SessionFailed => error.InvalidOptions,
+        };
+        const session = try a.create(Session);
+        session.* = .{ .id = input.session_id, .heartbeat_timeout = options.heartbeat_timeout, .creation = state };
+        try ctx.instance.sessions.append(a, session);
+        ctx.await(@as(*const Session, session), Session.settled) catch |err| {
+            if (err == error.Canceled) ctx.instance.cancelActivity(state);
+            session.closed = true;
+            return err;
+        };
+        if (session.opened) return session;
+        session.closed = true;
+        ctx.instance.setLastFailure(creation.failure());
+        return error.SessionCreationFailed;
+    }
+
+    /// Ends `session`: its creation activity is canceled, and an activity on its host frees
+    /// its slot at once. Waits for that activity, even if the calling coroutine is canceled
+    /// meanwhile; if it fails, the slot is freed once the host sees the cancel, and the
+    /// failure is logged. The session's running activities aren't canceled. Afterwards the
+    /// session is `closed`. A closed session is left as it is, and a failed one just closes.
+    pub fn completeSession(ctx: *Context, session: *Session) error{OutOfMemory}!void {
+        if (session.closed) return;
+        const was_open = session.state() == .open;
+        session.closed = true;
+        if (!was_open) return;
+        const inst = ctx.instance;
+        inst.cancelActivity(session.creation);
+        const wio = ctx.io();
+        const protection = wio.swapCancelProtection(.blocked);
+        defer _ = wio.swapCancelProtection(protection);
+        const done = ctx.executeActivityByName(void, Instance.session_complete_activity_type, .{
+            .task_queue = session.task_queue,
+            .schedule_to_start_timeout = session.heartbeat_timeout,
+            .start_to_close_timeout = session.heartbeat_timeout,
+            .retry_policy = .{ .maximum_attempts = 1 },
+            .disable_eager_execution = true,
+        }, .{session.id});
+        const state = done.state catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                inst.logger.warn("completeSession: scheduling the activity that frees the session's slot failed; the host frees it once it sees the session canceled", .{ .SessionID = session.id, .error_name = err });
+                return;
+            },
+        };
+        inst.awaitActivity(state) catch return; // only eviction ends this wait early
+        if (done.failure()) |f| inst.logger.warn("completeSession: the activity that frees the session's slot failed; the host frees it once it sees the session canceled", .{ .SessionID = session.id, .TaskQueue = session.task_queue, .Error = f.message });
     }
 
     /// Starts a child workflow defined with `Def` and returns a future for its start and its
@@ -985,7 +1182,9 @@ pub const Context = struct {
 };
 
 /// `InvalidOptions`: the options were rejected before scheduling (the worker logs why).
-pub const ActivityError = error{ ActivityFailed, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
+/// `SessionFailed`: the activity's session (`ActivityOptions.session`) had failed, so it
+/// wasn't scheduled; read why with the session's `failure`.
+pub const ActivityError = error{ ActivityFailed, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount, SessionFailed };
 
 /// The pending result of an activity. `ActivityFuture(converter.Payload)` returns the result
 /// still encoded, as workflow interceptors (`interceptor.WorkflowOutbound`) handle it.
@@ -995,7 +1194,7 @@ pub fn ActivityFuture(comptime T: type) type {
 
         ctx: *Context,
         /// The scheduling error, if scheduling failed; `get` then returns it.
-        state: Instance.ScheduleError!*Instance.ActivityState,
+        state: Instance.ActivityScheduleError!*Instance.ActivityState,
 
         /// Waits for the activity and returns its result. On `error.ActivityFailed`, read the
         /// failure with `failure`. If the calling coroutine is canceled while waiting (the

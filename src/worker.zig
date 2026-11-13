@@ -67,6 +67,29 @@ pub const Options = struct {
     /// queue's build-ID compatibility or assignment rules, which the server must have
     /// enabled. Superseded by `deployment`; requires `build_id`.
     use_build_id_versioning: bool = false,
+    /// Makes this worker a session host (see `workflow.Session`): it also takes new sessions
+    /// from `<task_queue>__temporal_sessions` and runs session activities on a task queue of
+    /// its own, `<task_queue>@<host name>@<UUID>`, unique to each `run`. Null takes no
+    /// sessions.
+    sessions: ?SessionWorkerOptions = null,
+};
+
+/// How a worker hosts sessions (`Options.sessions`).
+///
+/// Session activities run on the host queue with a slot pool of their own,
+/// `max_concurrent_activity_executions + max_concurrent_sessions` slots, separate from the
+/// main task queue's `max_concurrent_activity_executions`: one host may run both pools'
+/// activities at once.
+pub const SessionWorkerOptions = struct {
+    /// How many sessions this worker holds open at once, recreated ones included; must be
+    /// positive. A full worker stops taking new sessions from the shared queue, and refuses a
+    /// session recreated on its own queue with a non-retryable `SessionWorkerFull` failure.
+    ///
+    /// Known limit: a worker filled by recreated sessions still takes new sessions from the
+    /// shared queue and refuses them the same way, even when another worker has room.
+    ///
+    /// `std.math.maxInt(usize)` means no limit; the host queue's slot count saturates.
+    max_concurrent_sessions: usize = 1000,
 };
 
 /// A worker's Worker Deployment Version and how the server uses it.
@@ -97,10 +120,11 @@ pub const Worker = struct {
     dynamic_workflow: ?workflow.Registered = null,
     /// Runs activity types with no entry in `activities`, if set.
     dynamic_activity: ?activity.Registered = null,
-    /// The core worker while `run` is active, for `stop` on other threads.
-    /// Guards `core_ptr` and `stop_requested`, which `stop` (any thread) and `run` share.
+    /// The core workers while `run` is active, for `stop` on other threads: the task queue's,
+    /// then with sessions, the session queue's and the host queue's.
+    /// Guards `core_ptrs` and `stop_requested`, which `stop` (any thread) and `run` share.
     stop_mutex: Io.Mutex = .init,
-    core_ptr: ?*bridge.c.TemporalCoreWorker = null,
+    core_ptrs: [3]?*bridge.c.TemporalCoreWorker = @splat(null),
     stop_requested: bool = false,
     /// Set once `run` has registered the worker with its client and started polling, or has
     /// failed before getting there (`start_failed`). See `waitUntilRunning`.
@@ -108,6 +132,8 @@ pub const Worker = struct {
     start_failed: bool = false,
     /// The client's worker interceptors, then `options.interceptors`, while `run` is active.
     interceptors: []const interceptor.Worker = &.{},
+    /// The sessions this worker holds, while `run` is active with `options.sessions`.
+    session_host: ?*SessionHost = null,
 
     pub fn init(gpa: Allocator, io: Io, client: *client_mod.Client, task_queue: []const u8, options: Options) error{OutOfMemory}!Worker {
         return .{ .gpa = gpa, .io = io, .client = client, .task_queue = try gpa.dupe(u8, task_queue), .options = options };
@@ -251,6 +277,10 @@ pub const Worker = struct {
             w.started.set(w.io);
         };
         if (!w.hasWorkflows() and !w.hasActivities()) return error.NothingRegistered;
+        if (w.options.sessions) |o| if (o.max_concurrent_sessions == 0) {
+            log.warn("worker for task queue {s}: sessions.max_concurrent_sessions must be positive", .{w.task_queue});
+            return error.InvalidOptions;
+        };
         const interceptors = try std.mem.concat(w.gpa, interceptor.Worker, &.{ w.client.worker_interceptors, w.options.interceptors });
         defer w.gpa.free(interceptors);
         w.interceptors = interceptors;
@@ -260,7 +290,7 @@ pub const Worker = struct {
 
         const strategy = try w.versioningStrategy();
         const created_on = w.client.currentConnection();
-        const core = bridge.Worker.init(w.gpa, created_on, .{
+        const core = try w.createCore(created_on, .{
             .namespace = w.client.namespace,
             .task_queue = w.task_queue,
             .versioning = strategy,
@@ -281,74 +311,132 @@ pub const Worker = struct {
             .workflow_task_pollers = .{ .simple_maximum = w.options.max_concurrent_workflow_task_pollers },
             .activity_task_pollers = .{ .simple_maximum = w.options.max_concurrent_activity_task_pollers },
             .graceful_shutdown_period_ms = std.math.cast(u64, w.options.graceful_shutdown_period.toMilliseconds()) orelse 0,
-        }, &message) catch |err| {
-            log.err("creating the worker failed: {s}", .{message orelse @errorName(err)});
-            return err;
-        };
+        }, &message);
         defer core.deinit();
-        core.validate(w.gpa, w.io, &message) catch |err| {
-            log.err("worker validation failed: {s}", .{message orelse @errorName(err)});
-            return err;
-        };
 
-        // `Client.reconnect` moves the worker to its new connection while it is tracked.
-        try w.client.trackWorker(core.ptr, created_on);
-        defer w.client.untrackWorker(core.ptr);
+        // Polled even without registered activities: a workflow's side effects run as local
+        // activities.
+        var activity_cores: [3]ActivityCore = undefined;
+        activity_cores[0] = .{ .core = core, .task_queue = w.task_queue };
+        var core_count: usize = 1;
+        defer for (activity_cores[1..core_count]) |c| c.core.deinit();
+        var host: ?SessionHost = null;
+        defer if (host) |*h| h.deinit();
+        if (w.options.sessions) |o| {
+            host = try SessionHost.init(w, o.max_concurrent_sessions);
+            // Session queues are unversioned, so a rollout can't strand a host's sessions.
+            for ([_][]const u8{ host.?.creation_queue, host.?.host_queue }, sessionSlots(w.options.max_concurrent_activity_executions, o.max_concurrent_sessions)) |queue, slots| {
+                activity_cores[core_count] = .{ .task_queue = queue, .core = try w.createCore(created_on, .{
+                    .namespace = w.client.namespace,
+                    .task_queue = queue,
+                    .identity_override = w.options.identity,
+                    .max_cached_workflows = w.options.max_cached_workflows,
+                    .tuner = .{ .activity = .{ .fixed = slots } },
+                    .task_types = .{ .workflows = false, .remote_activities = true, .local_activities = false, .nexus = false },
+                    .activity_task_pollers = .{ .simple_maximum = w.options.max_concurrent_activity_task_pollers },
+                    .graceful_shutdown_period_ms = std.math.cast(u64, w.options.graceful_shutdown_period.toMilliseconds()) orelse 0,
+                }, &message) };
+                core_count += 1;
+            }
+        }
+        const cores = activity_cores[0..core_count];
+
+        // `Client.reconnect` moves the workers to its new connection while they are tracked.
+        var tracked: usize = 0;
+        defer for (cores[0..tracked]) |c| w.client.untrackWorker(c.core.ptr);
+        for (cores) |c| {
+            try w.client.trackWorker(c.core.ptr, created_on);
+            tracked += 1;
+        }
+        w.session_host = if (host) |*h| h else null;
+        defer w.session_host = null;
         {
             w.stop_mutex.lockUncancelable(w.io);
             defer w.stop_mutex.unlock(w.io);
-            w.core_ptr = core.ptr;
-            if (w.stop_requested) core.initiateShutdown();
+            for (cores, 0..) |c, i| w.core_ptrs[i] = c.core.ptr;
+            if (w.stop_requested) for (cores) |c| c.core.initiateShutdown();
         }
-        // On early returns, clear the pointer before `core.deinit` (deferred above) so `stop`
-        // never uses a freed worker.
+        // On early returns, clear the pointers before the cores are freed (deferred above) so
+        // `stop` never uses a freed worker.
         defer {
             w.stop_mutex.lockUncancelable(w.io);
-            w.core_ptr = null;
+            w.core_ptrs = @splat(null);
             w.stop_mutex.unlock(w.io);
         }
         log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
+        if (host) |h| log.info("Worker hosts sessions TaskQueue={s} SessionTaskQueue={s} HostTaskQueue={s}", .{ w.task_queue, h.creation_queue, h.host_queue });
         running = true;
         w.started.set(w.io);
 
         var workflows_done = if (w.hasWorkflows()) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
-        // Once a loop polls `core`, returning early would free the core worker under it: shut
-        // down like a normal stop, drain both pollers (finalizing waits for each to return
+        // Once a loop polls a core, returning early would free the core worker under it: shut
+        // down like a normal stop, drain every poller (finalizing waits for each to return
         // null), finalize, then return the error.
         var start_failed: ?RunError = null;
-        // Polled even without registered activities: a workflow's side effects run as local
-        // activities.
-        var activities_done: ?Io.Future(void) = w.io.concurrent(activityLoop, .{ w, core }) catch |err| blk: {
-            if (workflows_done == null) return err;
-            log.warn("starting the activity loop failed, stopping the worker: {t}", .{err});
-            start_failed = err;
-            {
-                w.stop_mutex.lockUncancelable(w.io);
-                defer w.stop_mutex.unlock(w.io);
-                core.initiateShutdown();
+        var activity_loops: [3]?Io.Future(void) = @splat(null);
+        for (cores, activity_loops[0..core_count], 0..) |c, *loop, i| {
+            if (start_failed == null) {
+                if (w.io.concurrent(activityLoop, .{ w, c.core, c.task_queue })) |f| {
+                    loop.* = f;
+                    continue;
+                } else |err| {
+                    if (workflows_done == null and i == 0) return err;
+                    log.warn("starting the activity loop for task queue {s} failed, stopping the worker: {t}", .{ c.task_queue, err });
+                    start_failed = err;
+                    w.stop_mutex.lockUncancelable(w.io);
+                    defer w.stop_mutex.unlock(w.io);
+                    for (cores) |other| other.core.initiateShutdown();
+                }
             }
-            activityLoop(w, core);
-            break :blk null;
-        };
+            activityLoop(w, c.core, c.task_queue);
+        }
         if (workflows_done) |*f| f.await(w.io);
-        if (activities_done) |*f| f.await(w.io);
+        for (activity_loops[0..core_count]) |*loop| if (loop.*) |*f| f.await(w.io);
 
-        // Finalizing moves the core worker out of its handle, without waiting for an
+        // Finalizing moves a core worker out of its handle, without waiting for an
         // initiate_shutdown that `stop` may be running on another thread. A worker moved while
         // that call holds one of its locks keeps the lock held forever, and finalizing then
-        // hangs. Taking the mutex waits for any such call; clearing the pointer stops new ones.
+        // hangs. Taking the mutex waits for any such call; clearing the pointers stops new ones.
         {
             w.stop_mutex.lockUncancelable(w.io);
             defer w.stop_mutex.unlock(w.io);
-            w.core_ptr = null;
+            w.core_ptrs = @splat(null);
         }
-        w.client.untrackWorker(core.ptr);
-        core.finalizeShutdown(w.gpa, w.io, &message) catch |err| {
-            log.err("worker shutdown failed: {s}", .{message orelse @errorName(err)});
-            return start_failed orelse err;
-        };
+        var shutdown_failed: ?RunError = null;
+        for (cores) |c| {
+            w.client.untrackWorker(c.core.ptr);
+            c.core.finalizeShutdown(w.gpa, w.io, &message) catch |err| {
+                log.err("worker shutdown for task queue {s} failed: {s}", .{ c.task_queue, message orelse @errorName(err) });
+                shutdown_failed = shutdown_failed orelse err;
+                // The next core's failure would overwrite it.
+                if (message) |m| w.gpa.free(m);
+                message = null;
+            };
+        }
+        if (shutdown_failed) |err| return start_failed orelse err;
         log.info("Stopped Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
         if (start_failed) |err| return err;
+    }
+
+    /// Creates and validates a core worker; logs and returns the error on failure.
+    /// The activity slots of the session queue and of the host queue, which runs session
+    /// activities beside the main queue's own pool. Saturates, so "unlimited" counts can't
+    /// overflow; the bridge lowers them to what the core takes.
+    fn sessionSlots(max_activities: usize, max_sessions: usize) [2]usize {
+        return .{ max_sessions, max_activities +| max_sessions };
+    }
+
+    fn createCore(w: *Worker, connection: bridge.Connection, options: bridge.Worker.Options, message: *?[]u8) RunError!bridge.Worker {
+        const core = bridge.Worker.init(w.gpa, connection, options, message) catch |err| {
+            log.err("creating the worker for task queue {s} failed: {s}", .{ options.task_queue, message.* orelse @errorName(err) });
+            return err;
+        };
+        errdefer core.deinit();
+        core.validate(w.gpa, w.io, message) catch |err| {
+            log.err("worker validation for task queue {s} failed: {s}", .{ options.task_queue, message.* orelse @errorName(err) });
+            return err;
+        };
+        return core;
     }
 
     /// The core's versioning strategy for `options`, or `error.InvalidOptions` (logged) for
@@ -396,7 +484,7 @@ pub const Worker = struct {
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
         w.stop_requested = true;
-        if (w.core_ptr) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
+        for (w.core_ptrs) |p| if (p) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
     }
 
     /// Waits until `run` (on another task) has registered the worker with its client and
@@ -614,7 +702,10 @@ fn registeredNames(a: Allocator, map: anytype) ![]const u8 {
 
 // ---------------------------------------------------------------- activities
 
-fn activityLoop(w: *Worker, core: bridge.Worker) void {
+/// A core worker that `run` polls for activities, and its task queue.
+const ActivityCore = struct { core: bridge.Worker, task_queue: []const u8 };
+
+fn activityLoop(w: *Worker, core: bridge.Worker, task_queue: []const u8) void {
     var group: Io.Group = .init;
     var running: RunningActivities = .{};
     defer running.map.deinit(w.gpa);
@@ -626,7 +717,7 @@ fn activityLoop(w: *Worker, core: bridge.Worker) void {
             w.stop();
             continue;
         } orelse break;
-        const run = receiveActivityTask(w, &running, polled) orelse continue;
+        const run = receiveActivityTask(w, &running, polled, task_queue) orelse continue;
         // Each activity gets its own thread: `async` would run it inline in this loop once the
         // Io has as many busy threads as CPUs, running activities one at a time. The core's
         // activity slots bound how many run at once.
@@ -651,6 +742,8 @@ const RunningActivities = struct {
 const RunningActivity = struct {
     arena: std.heap.ArenaAllocator,
     polled: bridge.Worker.Polled,
+    /// The task queue of the core that polled the activity; outlives the run.
+    task_queue: []const u8,
     task_token: []const u8,
     start: task_pb.Start,
     ctx: activity.Context,
@@ -669,7 +762,7 @@ const RunningActivity = struct {
 
 /// Decodes a polled activity task. Returns a new run for a Start task; delivers a Cancel
 /// task to its run and returns null.
-fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.Worker.Polled) ?*RunningActivity {
+fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.Worker.Polled, task_queue: []const u8) ?*RunningActivity {
     const run = w.gpa.create(RunningActivity) catch {
         log.err("out of memory receiving an activity task; the core will time it out", .{});
         polled.deinit();
@@ -678,6 +771,7 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
     run.* = .{
         .arena = .init(w.gpa),
         .polled = polled,
+        .task_queue = task_queue,
         .task_token = &.{},
         .start = .{},
         .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = undefined, .logger_ = .{}, .client_ = w.client },
@@ -819,7 +913,9 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         }) } } },
     };
     const side_effect = start.is_local and std.mem.eql(u8, start.activity_type, Instance.side_effect_activity_type);
-    const entry = if (side_effect) side_effect_activity else w.activities.get(start.activity_type) orelse w.dynamic_activity orelse {
+    const session_entry = if (start.is_local) null else if (w.session_host) |h| h.registered(start.activity_type) else null;
+    const internal = side_effect or session_entry != null;
+    const entry = if (side_effect) side_effect_activity else session_entry orelse w.activities.get(start.activity_type) orelse w.dynamic_activity orelse {
         const known = try registeredNames(a, w.activities);
         return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
             .message = try std.fmt.allocPrint(a, "activity type \"{s}\" is not registered on this worker; registered: {s}", .{ start.activity_type, known }),
@@ -828,7 +924,11 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     };
     // The context already exists: a cancel may have set its reason.
     ctx.arena = a;
-    ctx.info_ = activityInfo(start, w.task_queue, run.task_token);
+    ctx.info_ = activityInfo(start, run.task_queue, run.task_token);
+    ctx.info_.session_id = if (ctx.header_.value([]const u8, a, Instance.session_id_header)) |id| id orelse "" else |err| blk: {
+        log.warn("activity {s}: its session ID header doesn't decode: {t}", .{ start.activity_id, err });
+        break :blk "";
+    };
     ctx.logger_ = try (log_mod.Logger{ .sink = w.logSink() }).with(a, .{
         .ActivityID = start.activity_id,
         .ActivityType = start.activity_type,
@@ -839,7 +939,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     });
     ctx.metrics_ = try w.client.metrics().with(.{
         .namespace = w.client.namespace,
-        .task_queue = w.task_queue,
+        .task_queue = run.task_queue,
         .activity_type = start.activity_type,
         .workflow_type = start.workflow_type,
     });
@@ -850,8 +950,9 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     if (!start.is_local) ctx.heartbeat_sink = .{ .gpa = w.gpa, .context = &heartbeats, .record = Heartbeats.record };
     var inbound: std.ArrayList(interceptor.ActivityInbound) = .empty;
     var outbound: std.ArrayList(interceptor.ActivityOutbound) = .empty;
-    // Side effects belong to the SDK: interceptors see their local activity in the workflow.
-    if (!side_effect) for (w.interceptors) |wi| {
+    // Side effects and sessions belong to the SDK: interceptors see their activities in the
+    // workflow.
+    if (!internal) for (w.interceptors) |wi| {
         const attempt = try wi.interceptActivity(ctx);
         if (attempt.inbound) |i| try inbound.append(a, i);
         if (attempt.outbound) |o| try outbound.append(a, o);
@@ -952,6 +1053,136 @@ const side_effect_activity: activity.Registered = .{
             });
         }
     }.echo,
+};
+
+// ---------------------------------------------------------------- sessions
+
+/// The sessions a worker holds open (`Options.sessions`), for one `run`. Its two activities
+/// run on the worker's activity threads; `mutex` guards `open`.
+const SessionHost = struct {
+    gpa: Allocator,
+    io: Io,
+    max_sessions: usize,
+    /// `<task_queue>__temporal_sessions`, shared by the task queue's session workers.
+    creation_queue: []u8,
+    /// `<task_queue>@<host name>@<UUID>`, this worker's own.
+    host_queue: []u8,
+    host_name: []u8,
+    mutex: Io.Mutex = .init,
+    /// The open sessions by ID (keys owned), each with the event its creation activity waits
+    /// on until the session completes.
+    open: std.StringHashMapUnmanaged(*Io.Event) = .empty,
+
+    const Create = activity.Def(Instance.session_create_activity_type, create);
+    const Complete = activity.Def(Instance.session_complete_activity_type, complete);
+    const Opened = workflow.SignalDef(Instance.session_opened_signal, fn (Instance.SessionOpened) void);
+
+    fn init(w: *Worker, max_sessions: usize) error{OutOfMemory}!SessionHost {
+        var name_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const host_name = try w.gpa.dupe(u8, std.posix.gethostname(&name_buf) catch "unknown-host");
+        errdefer w.gpa.free(host_name);
+        const creation_queue = try std.fmt.allocPrint(w.gpa, "{s}" ++ Instance.session_queue_suffix, .{w.task_queue});
+        errdefer w.gpa.free(creation_queue);
+        var scratch: std.heap.ArenaAllocator = .init(w.gpa);
+        defer scratch.deinit();
+        const host_queue = try std.fmt.allocPrint(w.gpa, "{s}@{s}@{s}", .{ w.task_queue, host_name, try client_mod.uuid(scratch.allocator(), w.io) });
+        return .{ .gpa = w.gpa, .io = w.io, .max_sessions = max_sessions, .creation_queue = creation_queue, .host_queue = host_queue, .host_name = host_name };
+    }
+
+    fn deinit(h: *SessionHost) void {
+        var it = h.open.keyIterator();
+        while (it.next()) |k| h.gpa.free(k.*);
+        h.open.deinit(h.gpa);
+        h.gpa.free(h.creation_queue);
+        h.gpa.free(h.host_queue);
+        h.gpa.free(h.host_name);
+    }
+
+    /// The session activity named `activity_type`, bound to this host, if it is one.
+    fn registered(h: *SessionHost, activity_type: []const u8) ?activity.Registered {
+        if (std.mem.eql(u8, activity_type, Create.activity_name)) return Create.with(h);
+        if (std.mem.eql(u8, activity_type, Complete.activity_name)) return Complete.with(h);
+        return null;
+    }
+
+    /// Holds a slot for the session until it completes or is canceled: tells the workflow the
+    /// host's queue, then heartbeats until then.
+    fn create(h: *SessionHost, ctx: *activity.Context, input: Instance.SessionCreateInput) !void {
+        var done: Io.Event = .unset;
+        try h.take(ctx, input.session_id, &done);
+        defer h.release(input.session_id);
+        const info = ctx.info();
+        const client = try ctx.client();
+        client.signalWorkflow(Opened, info.workflow_id, info.workflow_run_id, .{.{
+            .session_id = input.session_id,
+            .task_queue = h.host_queue,
+            .host_name = h.host_name,
+        }}) catch |err| {
+            if (err == error.Canceled) return h.canceled(ctx);
+            return ctx.fail(.{
+                .message = try std.fmt.allocPrint(ctx.allocator(), "session {s}: telling workflow {s} that the session opened on task queue {s} failed: {t}", .{ input.session_id, info.workflow_id, h.host_queue, err }),
+                .type = "SessionSignalFailed",
+                .non_retryable = true,
+            });
+        };
+        const interval: Io.Duration = .fromMilliseconds(@max(1, input.heartbeat_interval_ms));
+        while (true) {
+            ctx.heartbeat({});
+            done.waitTimeout(ctx.io(), .{ .duration = .{ .raw = interval, .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return h.canceled(ctx),
+            };
+            return;
+        }
+    }
+
+    /// The creation activity's outcome on a cancel: the worker stopping fails the session for
+    /// good; any other cancel (the workflow completing it, a timeout) is reported as one.
+    fn canceled(h: *SessionHost, ctx: *activity.Context) anyerror {
+        if (ctx.cancelReason() != .worker_shutdown) return error.Canceled;
+        return ctx.fail(.{
+            .message = try std.fmt.allocPrint(ctx.allocator(), "the session's worker stopped (host task queue {s})", .{h.host_queue}),
+            .type = "SessionWorkerStopped",
+            .non_retryable = true,
+        });
+    }
+
+    /// Frees the session's slot and wakes its creation activity.
+    fn complete(h: *SessionHost, ctx: *activity.Context, session_id: []const u8) !void {
+        _ = ctx;
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        const kv = h.open.fetchRemove(session_id) orelse return;
+        kv.value.set(h.io);
+        h.gpa.free(kv.key);
+    }
+
+    fn take(h: *SessionHost, ctx: *activity.Context, session_id: []const u8, done: *Io.Event) !void {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        if (h.open.count() >= h.max_sessions) return ctx.fail(.{
+            .message = try std.fmt.allocPrint(ctx.allocator(), "session {s}: the worker on host task queue {s} already holds its maximum of {d} sessions (worker.SessionWorkerOptions.max_concurrent_sessions)", .{ session_id, h.host_queue, h.max_sessions }),
+            .type = "SessionWorkerFull",
+            .non_retryable = true,
+        });
+        const gop = try h.open.getOrPut(h.gpa, session_id);
+        if (gop.found_existing) return ctx.fail(.{
+            .message = try std.fmt.allocPrint(ctx.allocator(), "session {s} is already open on host task queue {s}", .{ session_id, h.host_queue }),
+            .type = "SessionAlreadyOpen",
+            .non_retryable = true,
+        });
+        gop.key_ptr.* = h.gpa.dupe(u8, session_id) catch |err| {
+            h.open.removeByPtr(gop.key_ptr);
+            return err;
+        };
+        gop.value_ptr.* = done;
+    }
+
+    fn release(h: *SessionHost, session_id: []const u8) void {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        if (h.open.fetchRemove(session_id)) |kv| h.gpa.free(kv.key);
+    }
 };
 
 // ---------------------------------------------------------------- signals
@@ -1253,6 +1484,22 @@ test "one function registered under two names runs under each" {
     const name: []const u8 = "Temporal";
     try testing.expectEqualStrings("\"Hello Temporal!\"", try invokeRegistered(&w, arena.allocator(), "Greet", .{name}));
     try testing.expectEqualStrings("\"Hello Temporal!\"", try invokeRegistered(&w, arena.allocator(), "LegacyGreet", .{name}));
+}
+
+test "a session worker with no session slots is rejected before it starts" {
+    var client: client_mod.Client = undefined; // rejected before the client is used
+    var w = try Worker.init(testing.allocator, testing.io, &client, "sessions", .{ .sessions = .{ .max_concurrent_sessions = 0 } });
+    defer w.deinit();
+    try w.registerActivity(HelloTest.Greet);
+    try testing.expectError(error.InvalidOptions, w.run());
+    try testing.expectError(error.WorkerFailedToStart, w.waitUntilRunning());
+}
+
+test "session slot counts saturate instead of overflowing" {
+    const max = std.math.maxInt(usize);
+    try testing.expectEqual([2]usize{ 3, 103 }, Worker.sessionSlots(100, 3));
+    try testing.expectEqual([2]usize{ max, max }, Worker.sessionSlots(100, max));
+    try testing.expectEqual([2]usize{ 1, max }, Worker.sessionSlots(max, 1));
 }
 
 test "versioning options map to the core's strategy, and contradictions are rejected" {
@@ -1586,7 +1833,7 @@ test "waitUntilRunning returns once run polls, or fails if run returned first" {
     {
         w.stop_mutex.lockUncancelable(testing.io);
         defer w.stop_mutex.unlock(testing.io);
-        try testing.expect(w.core_ptr != null);
+        try testing.expect(w.core_ptrs[0] != null);
     }
     w.stop();
     try running.await(testing.io);

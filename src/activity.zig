@@ -85,6 +85,9 @@ pub const Info = struct {
     /// When this attempt started, as the server recorded it. Null when the core didn't send
     /// it.
     started_time: ?std.Io.Timestamp = null,
+    /// The session the workflow ran the activity in (`workflow.ActivityOptions.session`), or
+    /// empty.
+    session_id: []const u8 = "",
 };
 
 /// Why an activity was canceled.
