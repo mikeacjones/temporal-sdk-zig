@@ -7,9 +7,11 @@
 //!     try w.registerActivity(Greet);
 //!     try w.runUntilSignal(); // stops on SIGINT or SIGTERM
 //!
-//! Workflow activations are processed one at a time on one thread, each on its run's
-//! deterministic Io. Activities run concurrently on the worker's Io, each on its own task so
-//! a cancel from the core reaches it as `std.Io` cancellation.
+//! Workflow activations of different runs are processed in parallel, each on a task of its
+//! own and on its run's deterministic Io; `max_concurrent_workflow_task_executions` bounds how
+//! many at once. A run is processed by one thread at a time, but may move to another thread
+//! between activations. Activities run concurrently on the worker's Io, each on its own task
+//! so a cancel from the core reaches it as `std.Io` cancellation.
 
 const std = @import("std");
 const bridge = @import("bridge.zig");
@@ -34,7 +36,12 @@ const result_pb = proto.coresdk.activity_result;
 const log = std.log.scoped(.temporal);
 
 pub const Options = struct {
+    /// How many workflow runs the worker keeps in memory between workflow tasks. Over the
+    /// limit, the least recently used run is evicted, and replayed from its history when its
+    /// next task arrives. 0 disables the cache: every task replays its run from the start.
     max_cached_workflows: u32 = 1000,
+    /// How many workflow activations the worker processes at once, each on its own thread,
+    /// for different runs.
     max_concurrent_workflow_task_executions: usize = 100,
     max_concurrent_activity_executions: usize = 100,
     max_concurrent_workflow_task_pollers: usize = 2,
@@ -557,22 +564,37 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
     var message: ?[]u8 = null;
     defer if (message) |m| w.gpa.free(m);
 
+    // The core allows one poll at a time, so this loop is the only poller; each activation
+    // gets its own task. The core's workflow task slots bound how many run at once.
+    var group: Io.Group = .init;
     while (true) {
         const polled = core.pollWorkflowActivation(w.gpa, w.io, &message) catch |err| {
             log.err("polling for workflow tasks failed, stopping the worker: {s}", .{message orelse @errorName(err)});
             w.stop();
             continue;
         } orelse break;
-        defer polled.deinit();
-        runner.process(core, w.io, polled.bytes());
+        group.concurrent(w.io, processActivation, .{ &runner, core, w.io, polled }) catch {
+            log.warn("no thread available for a workflow activation; processing it on the polling thread", .{});
+            processActivation(&runner, core, w.io, polled);
+        };
     }
+    group.await(w.io) catch {};
+}
+
+fn processActivation(runner: *WorkflowRunner, core: bridge.Worker, io: Io, polled: bridge.Worker.Polled) void {
+    defer polled.deinit();
+    runner.process(core, io, polled.bytes());
 }
 
 /// Turns workflow activations into completions for one worker (or replayer): keeps the cache
 /// of running workflow instances, creates them on InitializeWorkflow, and destroys them on
 /// eviction. Decodes each activation's payloads with `codecs` before a workflow sees them and
-/// encodes the completion's after, so codecs never run inside workflow code. Used from a
-/// single thread.
+/// encodes the completion's after, so codecs never run inside workflow code.
+///
+/// `process` and `handle` may be called from several threads at once for different runs. A
+/// run is processed by one thread at a time (the core sends one activation per run at a time;
+/// a second one while the first is processed fails its task), but each activation may run on
+/// a different thread. `deinit` must be called once, after every activation has finished.
 pub const WorkflowRunner = struct {
     gpa: Allocator,
     workflows: *const std.StringHashMapUnmanaged(workflow.Registered),
@@ -589,52 +611,152 @@ pub const WorkflowRunner = struct {
     propagators: []const propagation.ContextPropagator = &.{},
     /// Borrowed; see `Options.interceptors`.
     interceptors: []const interceptor.Worker = &.{},
+    /// Receives the runner's own records (evictions, activations it couldn't answer) and the
+    /// workflows' loggers.
     logger: log_mod.Sink = .std_log,
     log_during_replay: bool = false,
     /// Borrowed; see `Client.metrics`.
     metrics: metrics_mod.Handler = .noop,
     /// See `Instance.Options.send_versioning_behavior`.
     send_versioning_behavior: bool = false,
-    runs: std.StringHashMapUnmanaged(*Instance) = .empty,
-    /// Called for each eviction with the core's reason and message (the replayer uses it to
-    /// detect nondeterminism).
+    /// Guards `runs` and each entry's `busy`. Held only to look up, insert, or remove an entry:
+    /// never across workflow code, codecs, or teardown.
+    mutex: Io.Mutex = .init,
+    /// Keys (run IDs) are owned.
+    runs: std.StringHashMapUnmanaged(CachedRun) = .empty,
+    /// Called for each eviction with the core's reason and message, in place of logging it
+    /// (the replayer uses it to detect nondeterminism).
     on_evict: ?*const fn (ctx: *anyopaque, reason: act_pb.RemoveFromCache.EvictionReason, message: []const u8) void = null,
     on_evict_ctx: *anyopaque = undefined,
 
+    const CachedRun = struct {
+        inst: *Instance,
+        /// Set while one of the run's activations is being processed.
+        busy: bool = false,
+        /// Owned copies, for eviction records: `inst.info` is only set once an activation
+        /// initializes the run.
+        workflow_id: []const u8,
+        workflow_type: []const u8,
+    };
+
+    /// What `process` sends the core for one activation.
+    const Response = union(enum) {
+        completion: struct {
+            bytes: []const u8,
+            /// Completes an eviction: a rejection gets no fallback, the run is already gone.
+            eviction: bool = false,
+            /// The fallback failed completion: a rejection leaves only an eviction request.
+            fallback: bool = false,
+        },
+        /// No completion could be built for the run.
+        evict: struct { run_id: []const u8, reason: []const u8 },
+        /// The activation's run ID can't be read, so nothing can be sent.
+        none,
+    };
+
+    /// Room for the fallback failed completion: half for building it, half for its encoding.
+    const fallback_buffer_size = 1024;
+
     pub fn deinit(r: *WorkflowRunner) void {
         var it = r.runs.iterator();
-        while (it.next()) |kv| {
-            kv.value_ptr.*.destroy();
-            r.gpa.free(kv.key_ptr.*);
-        }
+        while (it.next()) |kv| r.destroyRun(kv.key_ptr.*, kv.value_ptr.*);
         r.runs.deinit(r.gpa);
     }
 
-    /// Handles one serialized activation and sends its completion to `core`.
+    fn destroyRun(r: *WorkflowRunner, key: []const u8, run: CachedRun) void {
+        run.inst.destroy();
+        r.gpa.free(run.workflow_id);
+        r.gpa.free(run.workflow_type);
+        r.gpa.free(key);
+    }
+
+    /// Handles one serialized activation and sends its completion to `core`. Every activation
+    /// whose run ID can be read is answered: one that can't be handled gets a failed completion
+    /// (the core then fails the task and evicts the run), and if even that can't be delivered
+    /// the core is asked to evict the run.
     pub fn process(r: *WorkflowRunner, core: bridge.Worker, io: Io, bytes: []const u8) void {
         var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
         defer arena_state.deinit();
-        const a = arena_state.allocator();
-        const completion = r.handle(bytes, a, io) catch |err| {
-            log.err("processing a workflow activation failed: {t}", .{err});
-            return;
-        };
-        var encoded: Io.Writer.Allocating = .init(a);
-        completion.encode(&encoded.writer, a) catch return;
-        var message: ?[]u8 = null;
-        defer if (message) |m| r.gpa.free(m);
-        core.completeWorkflowActivation(r.gpa, io, encoded.written(), &message) catch |err| {
-            log.err("completing a workflow activation failed: {s}", .{message orelse @errorName(err)});
+        var fallback_buf: [fallback_buffer_size]u8 = undefined;
+        var response = r.respond(bytes, arena_state.allocator(), io, &fallback_buf);
+        while (true) switch (response) {
+            .completion => |c| {
+                var message: ?[]u8 = null;
+                defer if (message) |m| r.gpa.free(m);
+                core.completeWorkflowActivation(r.gpa, io, c.bytes, &message) catch |err| {
+                    const reason = message orelse @errorName(err);
+                    r.logger.log(.err, "the core rejected a workflow activation completion", &.{
+                        .{ .key = "run_id", .value = runId(bytes) orelse "" },
+                        .{ .key = "error", .value = reason },
+                    });
+                    if (c.eviction) return;
+                    if (c.fallback) {
+                        response = .{ .evict = .{ .run_id = runId(bytes).?, .reason = "the core rejected the fallback failed completion" } };
+                        continue;
+                    }
+                    response = fallbackCompletion(bytes, @errorName(err), &fallback_buf);
+                    continue;
+                };
+                return;
+            },
+            .evict => |e| {
+                core.requestWorkflowEviction(e.run_id);
+                r.logger.log(.err, "no completion could be delivered for a workflow activation; asked the core to evict the run", &.{
+                    .{ .key = "run_id", .value = e.run_id },
+                    .{ .key = "reason", .value = e.reason },
+                });
+                return;
+            },
+            .none => {
+                r.logger.log(.err, "a workflow activation has no readable run ID, so no completion can be sent; its run stays stuck until the worker restarts", &.{});
+                return;
+            },
         };
     }
 
-    /// Decodes `act`'s payloads with the codecs, in the context of its run. A run that isn't
-    /// cached yet starts with this activation: its start header is decoded first, without
-    /// propagated values, so the rest is decoded with the values the propagators extract
-    /// from it, the same ones the workflow will see.
-    fn decodeActivation(r: *WorkflowRunner, act: *act_pb.WorkflowActivation, a: Allocator, io: Io) converter.CodecError!void {
+    /// Decides what to send the core for `bytes`, without sending it. Falls back to a failed
+    /// completion built in `fallback_buf` when the activation can't be handled.
+    fn respond(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io, fallback_buf: []u8) Response {
+        const handled = r.handle(bytes, a, io) catch |err| {
+            r.logger.log(.err, "processing a workflow activation failed", &.{
+                .{ .key = "run_id", .value = runId(bytes) orelse "" },
+                .{ .key = "error", .value = @errorName(err) },
+            });
+            return fallbackCompletion(bytes, @errorName(err), fallback_buf);
+        };
+        var encoded: Io.Writer.Allocating = .init(a);
+        handled.completion.encode(&encoded.writer, a) catch |err| {
+            r.logger.log(.err, "encoding a workflow activation completion failed", &.{
+                .{ .key = "run_id", .value = runId(bytes) orelse "" },
+                .{ .key = "error", .value = @errorName(err) },
+            });
+            return fallbackCompletion(bytes, @errorName(err), fallback_buf);
+        };
+        return .{ .completion = .{ .bytes = encoded.written(), .eviction = handled.eviction } };
+    }
+
+    /// A failed completion for the activation's run, built in `buf` without the heap: the
+    /// likeliest reason to need it is running out of memory.
+    fn fallbackCompletion(bytes: []const u8, err_name: []const u8, buf: []u8) Response {
+        const run_id = runId(bytes) orelse return .none;
+        const too_big: Response = .{ .evict = .{ .run_id = run_id, .reason = "the run ID is too long for the fallback failed completion" } };
+        var fba: std.heap.FixedBufferAllocator = .init(buf[0 .. buf.len / 2]);
+        const fa = fba.allocator();
+        const message = std.fmt.allocPrint(fa, "the worker could not process this workflow activation: {s}; see the worker's log", .{err_name}) catch return too_big;
+        const failure = failure_mod.application(fa, .{ .message = message }) catch return too_big;
+        const completion: done_pb.WorkflowActivationCompletion = .{ .run_id = run_id, .status = .{ .failed = .{ .failure = failure } } };
+        var out: Io.Writer = .fixed(buf[buf.len / 2 ..]);
+        completion.encode(&out, fa) catch return too_big;
+        return .{ .completion = .{ .bytes = out.buffered(), .fallback = true } };
+    }
+
+    /// Decodes `act`'s payloads with the codecs, in the context of its run: `cached` if the
+    /// run is cached. A run that isn't cached yet starts with this activation: its start
+    /// header is decoded first, without propagated values, so the rest is decoded with the
+    /// values the propagators extract from it, the same ones the workflow will see.
+    fn decodeActivation(r: *WorkflowRunner, act: *act_pb.WorkflowActivation, cached: ?*const Instance, a: Allocator, io: Io) converter.CodecError!void {
         if (r.codecs.len == 0) return;
-        if (r.runs.get(act.run_id)) |inst| return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &runCodecContext(r.namespace, inst));
+        if (cached) |inst| return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &runCodecContext(r.namespace, inst));
         const index = for (act.jobs.items, 0..) |job, i| {
             if (job.variant) |v| if (v == .initialize_workflow) break i;
         } else return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &.{ .namespace = r.namespace });
@@ -652,59 +774,177 @@ pub const WorkflowRunner = struct {
         act.jobs.items[index].variant.?.initialize_workflow.headers = headers;
     }
 
-    fn handle(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io) !done_pb.WorkflowActivationCompletion {
+    const Handled = struct {
+        completion: done_pb.WorkflowActivationCompletion,
+        /// The activation evicted its run.
+        eviction: bool = false,
+    };
+
+    fn handle(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io) !Handled {
         var reader: Io.Reader = .fixed(bytes);
         var act = try act_pb.WorkflowActivation.decode(&reader, a);
-        r.decodeActivation(&act, a, io) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            // The task fails and is retried; the workflow never sees undecoded payloads.
-            error.Canceled, error.CodecFailed => return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "decoding the workflow activation's payloads with the client's codecs failed: {t}", .{err})),
-        };
 
         // An eviction comes alone; complete it, then drop the run.
         for (act.jobs.items) |job| if (job.variant) |v| if (v == .remove_from_cache) {
-            if (r.on_evict) |cb| cb(r.on_evict_ctx, v.remove_from_cache.reason, v.remove_from_cache.message);
-            if (r.runs.fetchRemove(act.run_id)) |kv| {
-                kv.value.destroy();
-                r.gpa.free(kv.key);
-            }
-            return .{ .run_id = act.run_id, .status = .{ .successful = .{} } };
+            const removed = blk: {
+                r.mutex.lockUncancelable(io);
+                defer r.mutex.unlock(io);
+                if (r.runs.get(act.run_id)) |run| if (run.busy) break :blk error.RunBusy;
+                break :blk r.runs.fetchRemove(act.run_id);
+            } catch return .{ .completion = try busyFailure(a, act.run_id) };
+            const run: ?CachedRun = if (removed) |kv| kv.value else null;
+            if (r.on_evict) |cb|
+                cb(r.on_evict_ctx, v.remove_from_cache.reason, v.remove_from_cache.message)
+            else
+                r.logEviction(act.run_id, run, v.remove_from_cache);
+            if (removed) |kv| r.destroyRun(kv.key, kv.value);
+            return .{ .completion = .{ .run_id = act.run_id, .status = .{ .successful = .{} } }, .eviction = true };
         };
 
-        const inst = r.runs.get(act.run_id) orelse blk: {
-            const workflow_type = for (act.jobs.items) |job| {
-                if (job.variant) |v| if (v == .initialize_workflow) break v.initialize_workflow.workflow_type;
-            } else return try taskFailure(a, act.run_id, "activation for a workflow run that is not cached and has no InitializeWorkflow job");
-            const entry = r.workflows.get(workflow_type) orelse r.dynamic_workflow orelse {
+        const cached = r.acquire(act.run_id, io) catch return .{ .completion = try busyFailure(a, act.run_id) };
+        const inst = cached orelse blk: {
+            const init = for (act.jobs.items) |job| {
+                if (job.variant) |v| if (v == .initialize_workflow) break v.initialize_workflow;
+            } else return .{ .completion = try taskFailure(a, act.run_id, "activation for a workflow run that is not cached and has no InitializeWorkflow job") };
+            const entry = r.workflows.get(init.workflow_type) orelse r.dynamic_workflow orelse {
                 const known = try registeredNames(a, r.workflows.*);
-                return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow type \"{s}\" is not registered on this worker; registered: {s}", .{ workflow_type, known }));
+                return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow type \"{s}\" is not registered on this worker; registered: {s}", .{ init.workflow_type, known })) };
             };
-            const inst = try Instance.create(r.gpa, entry, .{
-                .task_queue = r.task_queue,
-                .namespace = r.namespace,
-                .stack_size = r.stack_size,
-                .memory_limit = r.memory_limit,
-                .logger = r.logger,
-                .log_during_replay = r.log_during_replay,
-                .propagators = r.propagators,
-                .interceptors = r.interceptors,
-                .metrics = r.metrics,
-                .send_versioning_behavior = r.send_versioning_behavior,
-            });
-            errdefer inst.destroy();
-            const key = try r.gpa.dupe(u8, act.run_id);
-            errdefer r.gpa.free(key);
-            try r.runs.put(r.gpa, key, inst);
-            break :blk inst;
+            break :blk r.insert(act.run_id, init, entry, io) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.RunBusy => return .{ .completion = try busyFailure(a, act.run_id) },
+            };
         };
-        var completion = inst.activate(&act, a) catch |err| return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err}));
+        defer r.release(act.run_id, io);
+
+        r.decodeActivation(&act, cached, a, io) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // The task fails and is retried; the workflow never sees undecoded payloads.
+            error.Canceled, error.CodecFailed => return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "decoding the workflow activation's payloads with the client's codecs failed: {t}", .{err})) },
+        };
+        var completion = inst.activate(&act, a) catch |err| return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err})) };
         converter.encodeMessage(done_pb.WorkflowActivationCompletion, &completion, r.codecs, a, io, &runCodecContext(r.namespace, inst)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled, error.CodecFailed => return try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "encoding the workflow activation completion's payloads with the client's codecs failed: {t}", .{err})),
+            error.Canceled, error.CodecFailed => return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "encoding the workflow activation completion's payloads with the client's codecs failed: {t}", .{err})) },
         };
-        return completion;
+        return .{ .completion = completion };
+    }
+
+    /// Marks a cached run busy and returns its instance; null if it isn't cached.
+    fn acquire(r: *WorkflowRunner, run_id: []const u8, io: Io) error{RunBusy}!?*Instance {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        const run = r.runs.getPtr(run_id) orelse return null;
+        if (run.busy) return error.RunBusy;
+        run.busy = true;
+        return run.inst;
+    }
+
+    fn release(r: *WorkflowRunner, run_id: []const u8, io: Io) void {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        if (r.runs.getPtr(run_id)) |run| run.busy = false;
+    }
+
+    /// Creates an instance for a new run and caches it, busy. The instance is created outside
+    /// the lock.
+    fn insert(r: *WorkflowRunner, run_id: []const u8, init: act_pb.InitializeWorkflow, entry: workflow.Registered, io: Io) error{ OutOfMemory, RunBusy }!*Instance {
+        const inst = try Instance.create(r.gpa, entry, .{
+            .task_queue = r.task_queue,
+            .namespace = r.namespace,
+            .stack_size = r.stack_size,
+            .memory_limit = r.memory_limit,
+            .logger = r.logger,
+            .log_during_replay = r.log_during_replay,
+            .propagators = r.propagators,
+            .interceptors = r.interceptors,
+            .metrics = r.metrics,
+            .send_versioning_behavior = r.send_versioning_behavior,
+        });
+        errdefer inst.destroy();
+        const key = try r.gpa.dupe(u8, run_id);
+        errdefer r.gpa.free(key);
+        const workflow_id = try r.gpa.dupe(u8, init.workflow_id);
+        errdefer r.gpa.free(workflow_id);
+        const workflow_type = try r.gpa.dupe(u8, init.workflow_type);
+        errdefer r.gpa.free(workflow_type);
+
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        const gop = try r.runs.getOrPut(r.gpa, key);
+        // Another activation of the same run got here first.
+        if (gop.found_existing) return error.RunBusy;
+        gop.value_ptr.* = .{ .inst = inst, .busy = true, .workflow_id = workflow_id, .workflow_type = workflow_type };
+        return inst;
+    }
+
+    fn busyFailure(a: Allocator, run_id: []const u8) !done_pb.WorkflowActivationCompletion {
+        return taskFailure(a, run_id, try std.fmt.allocPrint(a, "workflow run {s} received an activation while another was still being processed; the core must send one at a time", .{run_id}));
+    }
+
+    /// Logs an eviction at a level that fits its reason: error for what needs a code or
+    /// operator fix, debug for routine cache traffic.
+    fn logEviction(r: *WorkflowRunner, run_id: []const u8, run: ?CachedRun, job: act_pb.RemoveFromCache) void {
+        const level: log_mod.Level, const message: []const u8 = switch (job.reason) {
+            .NONDETERMINISM => .{ .err, "workflow run evicted: its code produced commands that don't match its history (nondeterminism); the workflow task fails and is retried until the code matches" },
+            .FATAL => .{ .err, "workflow run evicted after a fatal error in the core" },
+            .PAGINATION_OR_HISTORY_FETCH => .{ .warn, "workflow run evicted: fetching its history failed" },
+            else => .{ .debug, "workflow run evicted from the cache" },
+        };
+        var reason_buf: [16]u8 = undefined;
+        const reason = std.enums.tagName(act_pb.RemoveFromCache.EvictionReason, job.reason) orelse
+            std.fmt.bufPrint(&reason_buf, "{d}", .{@backingInt(job.reason)}) catch unreachable;
+        var fields: [5]log_mod.Field = .{
+            .{ .key = "run_id", .value = run_id },
+            .{ .key = "reason", .value = reason },
+            .{ .key = "message", .value = job.message },
+            undefined,
+            undefined,
+        };
+        var n: usize = 3;
+        if (run) |c| {
+            fields[3] = .{ .key = "workflow_id", .value = c.workflow_id };
+            fields[4] = .{ .key = "workflow_type", .value = c.workflow_type };
+            n = 5;
+        }
+        r.logger.log(level, message, fields[0..n]);
     }
 };
+
+/// The run ID of a serialized WorkflowActivation (field 1), read without decoding or
+/// allocating; null if it is missing, empty, or the bytes are malformed.
+fn runId(bytes: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const tag = readVarint(bytes, &i) orelse return null;
+        switch (tag & 7) {
+            0 => _ = readVarint(bytes, &i) orelse return null,
+            1 => i = std.math.add(usize, i, 8) catch return null,
+            2 => {
+                const len = std.math.cast(usize, readVarint(bytes, &i) orelse return null) orelse return null;
+                if (len > bytes.len - i) return null;
+                if (tag >> 3 == 1) return if (len > 0) bytes[i..][0..len] else null;
+                i += len;
+            },
+            5 => i = std.math.add(usize, i, 4) catch return null,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn readVarint(bytes: []const u8, i: *usize) ?u64 {
+    var value: u64 = 0;
+    var shift: u7 = 0;
+    while (shift < 64) : (shift += 7) {
+        if (i.* >= bytes.len) return null;
+        const b = bytes[i.*];
+        i.* += 1;
+        value |= @as(u64, b & 0x7f) << @intCast(shift);
+        if (b & 0x80 == 0) return value;
+    }
+    return null;
+}
 
 /// The codec context of a cached run: its identity and the values `ctx.propagated()` returns.
 fn runCodecContext(namespace: []const u8, inst: *const Instance) converter.CodecContext {
@@ -1907,6 +2147,8 @@ const RecordingSink = struct {
     arena: std.heap.ArenaAllocator = .init(testing.allocator),
     records: std.ArrayList(Record) = .empty,
     core_records: usize = 0,
+    /// Broadcast for each record kept.
+    changed: Io.Condition = .init,
 
     const Record = struct { level: log_mod.Level, message: []const u8, fields: []const log_mod.Field };
 
@@ -1930,15 +2172,36 @@ const RecordingSink = struct {
         const copy = a.alloc(log_mod.Field, fields.len) catch return;
         for (fields, copy) |f, *c| c.* = .{ .key = a.dupe(u8, f.key) catch return, .value = a.dupe(u8, f.value) catch return };
         r.records.append(a, .{ .level = level, .message = a.dupe(u8, message) catch return, .fields = copy }) catch return;
+        r.changed.broadcast(testing.io);
     }
 
     /// How many records have `message` and, for each pair in `want`, a field with that value.
     fn count(r: *RecordingSink, message: []const u8, want: []const log_mod.Field) usize {
         r.mutex.lockUncancelable(testing.io);
         defer r.mutex.unlock(testing.io);
+        return r.countLocked(message, want, null);
+    }
+
+    /// Like `count`, only counting records at `level`.
+    fn countAt(r: *RecordingSink, level: log_mod.Level, message: []const u8, want: []const log_mod.Field) usize {
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        return r.countLocked(message, want, level);
+    }
+
+    /// Waits up to `timeout` for a record that `count` would count.
+    fn waitFor(r: *RecordingSink, message: []const u8, want: []const log_mod.Field, timeout: Io.Duration) !void {
+        const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = timeout, .clock = .awake });
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        while (r.countLocked(message, want, null) == 0) try r.changed.waitTimeout(testing.io, &r.mutex, .{ .deadline = deadline });
+    }
+
+    fn countLocked(r: *RecordingSink, message: []const u8, want: []const log_mod.Field, level: ?log_mod.Level) usize {
         var n: usize = 0;
         records: for (r.records.items) |rec| {
             if (!std.mem.eql(u8, rec.message, message)) continue;
+            if (level) |l| if (rec.level != l) continue;
             for (want) |w| {
                 const found = for (rec.fields) |f| {
                     if (std.mem.eql(u8, f.key, w.key)) break std.mem.eql(u8, f.value, w.value);
@@ -2140,7 +2403,7 @@ test "the workflow runner passes the memory limit to its runs" {
         try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
         var bytes: Io.Writer.Allocating = .init(a);
         try act.encode(&bytes.writer, a);
-        const completion = try runner.handle(bytes.written(), a, testing.io);
+        const completion = (try runner.handle(bytes.written(), a, testing.io)).completion;
         if (limit == null) {
             try testing.expect(completion.status.?.successful.commands.items[0].variant.? == .start_timer);
         } else {
@@ -2179,7 +2442,7 @@ test "the workflow runner hands codecs the run's propagated values and identity"
     var bytes: Io.Writer.Allocating = .init(a);
     try act.encode(&bytes.writer, a);
 
-    const completion = try runner.handle(bytes.written(), a, testing.io);
+    const completion = (try runner.handle(bytes.written(), a, testing.io)).completion;
     const commands = completion.status.?.successful.commands.items;
     try testing.expectEqualStrings("\"hi\"", commands[0].variant.?.complete_workflow_execution.result.?.data);
     // The start header is decoded before its values are known; the arguments and the
@@ -2192,5 +2455,499 @@ test "the workflow runner hands codecs the run's propagated values and identity"
     try testing.expectEqual(want.len, recorder.calls.items.len);
     for (want, recorder.calls.items) |w, got| try testing.expectEqualStrings(w, got);
     // The workflow saw the header decoded once, not dropped by the two-step decode.
-    try testing.expectEqualStrings("acme", runner.runs.get("run-1").?.propagated.get(ContextRecordingCodec.tenant).?);
+    try testing.expectEqualStrings("acme", runner.runs.get("run-1").?.inst.propagated.get(ContextRecordingCodec.tenant).?);
+}
+
+/// Workflows that call `hook` from their code, so a test can hold an activation in workflow
+/// code or see two runs' code at the same time. The hook is test code that blocks on the
+/// test's Io, outside the workflow's: real workflow code must never do this.
+const ParallelTest = struct {
+    var hook: *const fn (name: []const u8) bool = noHook;
+
+    fn noHook(_: []const u8) bool {
+        return true;
+    }
+
+    /// Calls the hook, then waits on two timers, so each run has three activations.
+    fn hold(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        _ = hook(name);
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        return name;
+    }
+    const Hold = workflow.Def("ParallelHold", hold);
+
+    fn meet(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        _ = ctx;
+        return if (hook(name)) "met" else "alone";
+    }
+    const Meet = workflow.Def("ParallelMeet", meet);
+
+    /// Holds run "A" in its hook until `release` is set; `entered` says it got there.
+    const Gate = struct {
+        var entered: Io.Event = .unset;
+        var release: Io.Event = .unset;
+
+        fn reset() void {
+            entered = .unset;
+            release = .unset;
+        }
+
+        fn hook(name: []const u8) bool {
+            if (!std.mem.eql(u8, name, "A")) return true;
+            entered.set(testing.io);
+            release.waitUncancelable(testing.io);
+            return true;
+        }
+    };
+
+    /// Two arrivals: each waits, with a timeout below the workflow task timeout, for the other.
+    const Latch = struct {
+        var arrived: std.atomic.Value(u32) = .init(0);
+        var both: Io.Event = .unset;
+
+        fn hook(_: []const u8) bool {
+            if (arrived.fetchAdd(1, .acq_rel) + 1 == 2) both.set(testing.io);
+            both.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch return false;
+            return true;
+        }
+    };
+
+    fn runner(workflows: *const std.StringHashMapUnmanaged(workflow.Registered), sink: log_mod.Sink) WorkflowRunner {
+        return .{ .gpa = testing.allocator, .workflows = workflows, .task_queue = "tq", .namespace = "ns", .stack_size = 64 * 1024, .logger = sink };
+    }
+
+    fn registry(gpa: Allocator) !std.StringHashMapUnmanaged(workflow.Registered) {
+        var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+        errdefer workflows.deinit(gpa);
+        try workflows.put(gpa, Hold.workflow_name, Hold.registered);
+        try workflows.put(gpa, MemoryLimitTest.Nap.workflow_name, MemoryLimitTest.Nap.registered);
+        return workflows;
+    }
+
+    fn encode(a: Allocator, act: act_pb.WorkflowActivation) ![]const u8 {
+        var bytes: Io.Writer.Allocating = .init(a);
+        try act.encode(&bytes.writer, a);
+        return bytes.written();
+    }
+
+    /// An activation starting run `run_id` of `workflow_type` with argument `name`.
+    fn start(a: Allocator, run_id: []const u8, workflow_type: []const u8, name: []const u8) ![]const u8 {
+        var init: act_pb.InitializeWorkflow = .{ .workflow_type = workflow_type, .workflow_id = try std.fmt.allocPrint(a, "wf-{s}", .{run_id}), .randomness_seed = 7, .attempt = 1 };
+        init.arguments = try converter.toPayloads(a, .{name});
+        var act: act_pb.WorkflowActivation = .{ .run_id = run_id, .timestamp = .{ .seconds = 1_700_000_000 } };
+        try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+        return encode(a, act);
+    }
+
+    fn fireTimer(a: Allocator, run_id: []const u8, seq: u32) ![]const u8 {
+        var act: act_pb.WorkflowActivation = .{ .run_id = run_id, .timestamp = .{ .seconds = 1_700_000_001 } };
+        try act.jobs.append(a, .{ .variant = .{ .fire_timer = .{ .seq = seq } } });
+        return encode(a, act);
+    }
+
+    fn evict(a: Allocator, run_id: []const u8, reason: act_pb.RemoveFromCache.EvictionReason) ![]const u8 {
+        var act: act_pb.WorkflowActivation = .{ .run_id = run_id };
+        try act.jobs.append(a, .{ .variant = .{ .remove_from_cache = .{ .message = "core says why", .reason = reason } } });
+        return encode(a, act);
+    }
+
+    /// Handles `bytes` on a thread of its own and stores the encoded completion in `out`.
+    const OnThread = struct {
+        r: *WorkflowRunner,
+        bytes: []const u8,
+        arena: std.heap.ArenaAllocator = .init(testing.allocator),
+        out: anyerror![]const u8 = error.NotRun,
+
+        fn run(t: *OnThread) void {
+            t.out = handleEncoded(t.r, t.bytes, t.arena.allocator());
+        }
+
+        fn deinit(t: *OnThread) void {
+            t.arena.deinit();
+        }
+    };
+
+    fn handleEncoded(r: *WorkflowRunner, bytes: []const u8, a: Allocator) ![]const u8 {
+        const handled = try r.handle(bytes, a, testing.io);
+        var out: Io.Writer.Allocating = .init(a);
+        try handled.completion.encode(&out.writer, a);
+        return out.written();
+    }
+
+    fn decodeCompletion(a: Allocator, bytes: []const u8) !done_pb.WorkflowActivationCompletion {
+        var reader: Io.Reader = .fixed(bytes);
+        return done_pb.WorkflowActivationCompletion.decode(&reader, a);
+    }
+
+    fn timerSeq(completion: done_pb.WorkflowActivationCompletion) !u32 {
+        const commands = completion.status.?.successful.commands.items;
+        try testing.expectEqual(1, commands.len);
+        return commands[0].variant.?.start_timer.seq;
+    }
+};
+
+test "activations of different runs are processed in parallel" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workflows = try ParallelTest.registry(testing.allocator);
+    defer workflows.deinit(testing.allocator);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    defer runner.deinit();
+    ParallelTest.Gate.reset();
+    ParallelTest.hook = ParallelTest.Gate.hook;
+    defer ParallelTest.hook = ParallelTest.noHook;
+
+    var run_a: ParallelTest.OnThread = .{ .r = &runner, .bytes = try ParallelTest.start(a, "A", "ParallelHold", "A") };
+    defer run_a.deinit();
+    const thread = try std.Thread.spawn(.{}, ParallelTest.OnThread.run, .{&run_a});
+    try ParallelTest.Gate.entered.wait(testing.io);
+
+    // A is held in its workflow code; B runs to the end of its activation meanwhile.
+    const b = try ParallelTest.decodeCompletion(a, try ParallelTest.handleEncoded(&runner, try ParallelTest.start(a, "B", "ParallelHold", "B"), a));
+    try testing.expectEqualStrings("B", b.run_id);
+    _ = try ParallelTest.timerSeq(b);
+    try testing.expect(!ParallelTest.Gate.release.isSet());
+
+    ParallelTest.Gate.release.set(testing.io);
+    thread.join();
+    _ = try ParallelTest.timerSeq(try ParallelTest.decodeCompletion(a, try run_a.out));
+}
+
+test "a run's activations may each run on a different thread" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workflows = try ParallelTest.registry(testing.allocator);
+    defer workflows.deinit(testing.allocator);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var same_thread = ParallelTest.runner(&workflows, sink.sink());
+    defer same_thread.deinit();
+    var migrating = ParallelTest.runner(&workflows, sink.sink());
+    defer migrating.deinit();
+
+    var bytes = try ParallelTest.start(a, "run-1", "ParallelHold", "x");
+    for (0..3) |i| {
+        const want = try ParallelTest.handleEncoded(&same_thread, bytes, a);
+        // A new thread for each activation, so the run's coroutine resumes on another stack.
+        var on: ParallelTest.OnThread = .{ .r = &migrating, .bytes = bytes };
+        defer on.deinit();
+        const thread = try std.Thread.spawn(.{}, ParallelTest.OnThread.run, .{&on});
+        thread.join();
+        try testing.expectEqualSlices(u8, want, try on.out);
+
+        const completion = try ParallelTest.decodeCompletion(a, want);
+        if (i < 2) {
+            bytes = try ParallelTest.fireTimer(a, "run-1", try ParallelTest.timerSeq(completion));
+        } else {
+            const result = completion.status.?.successful.commands.items[0].variant.?.complete_workflow_execution.result.?;
+            try testing.expectEqualStrings("\"x\"", result.data);
+        }
+    }
+}
+
+test "a second activation for a busy run fails its task" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workflows = try ParallelTest.registry(testing.allocator);
+    defer workflows.deinit(testing.allocator);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    defer runner.deinit();
+    ParallelTest.Gate.reset();
+    ParallelTest.hook = ParallelTest.Gate.hook;
+    defer ParallelTest.hook = ParallelTest.noHook;
+
+    var run_a: ParallelTest.OnThread = .{ .r = &runner, .bytes = try ParallelTest.start(a, "A", "ParallelHold", "A") };
+    defer run_a.deinit();
+    const thread = try std.Thread.spawn(.{}, ParallelTest.OnThread.run, .{&run_a});
+    try ParallelTest.Gate.entered.wait(testing.io);
+
+    const want = "workflow run A received an activation while another was still being processed; the core must send one at a time";
+    for ([_][]const u8{ try ParallelTest.fireTimer(a, "A", 1), try ParallelTest.evict(a, "A", .CACHE_FULL) }) |bytes| {
+        const handled = try runner.handle(bytes, a, testing.io);
+        try testing.expect(!handled.eviction);
+        try testing.expectEqualStrings(want, handled.completion.status.?.failed.failure.?.message);
+    }
+
+    ParallelTest.Gate.release.set(testing.io);
+    thread.join();
+    _ = try ParallelTest.timerSeq(try ParallelTest.decodeCompletion(a, try run_a.out));
+    // The guard left the run cached and no longer busy.
+    _ = try ParallelTest.timerSeq((try runner.handle(try ParallelTest.fireTimer(a, "A", 1), a, testing.io)).completion);
+}
+
+test "an activation that can't be handled gets a fallback failed completion" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workflows = try ParallelTest.registry(testing.allocator);
+    defer workflows.deinit(testing.allocator);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    runner.gpa = failing.allocator();
+    defer runner.deinit();
+    var buf: [WorkflowRunner.fallback_buffer_size]u8 = undefined;
+
+    const response = runner.respond(try ParallelTest.start(a, "run-1", "ParallelHold", "x"), failing.allocator(), testing.io, &buf);
+    try testing.expect(response.completion.fallback);
+    const completion = try ParallelTest.decodeCompletion(a, response.completion.bytes);
+    try testing.expectEqualStrings("run-1", completion.run_id);
+    try testing.expectEqualStrings("the worker could not process this workflow activation: OutOfMemory; see the worker's log", completion.status.?.failed.failure.?.message);
+    try testing.expectEqual(1, sink.countAt(.err, "processing a workflow activation failed", &.{ .{ .key = "run_id", .value = "run-1" }, .{ .key = "error", .value = "OutOfMemory" } }));
+
+    // No run ID: nothing can be sent.
+    var no_run_id: act_pb.WorkflowActivation = .{ .timestamp = .{ .seconds = 1 } };
+    try no_run_id.jobs.append(a, .{ .variant = .{ .fire_timer = .{ .seq = 1 } } });
+    try testing.expect(runner.respond(try ParallelTest.encode(a, no_run_id), failing.allocator(), testing.io, &buf) == .none);
+
+    // A run ID too long for the buffer: the core is asked to evict the run.
+    const long_id = try a.alloc(u8, 2 * WorkflowRunner.fallback_buffer_size);
+    @memset(long_id, 'r');
+    const evict = runner.respond(try ParallelTest.fireTimer(a, long_id, 1), failing.allocator(), testing.io, &buf).evict;
+    try testing.expectEqualStrings(long_id, evict.run_id);
+}
+
+test "a run ID is read from an activation's bytes without decoding it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("run-1", runId(try ParallelTest.fireTimer(a, "run-1", 3)).?);
+    // Fields before the run ID are skipped.
+    try testing.expectEqualStrings("run-2", runId(&.{ 0x10, 0x96, 0x01, 0x0a, 5, 'r', 'u', 'n', '-', '2' }).?);
+    try testing.expect(runId(&.{}) == null);
+    try testing.expect(runId(&.{ 0x0a, 0 }) == null);
+    try testing.expect(runId(&.{ 0x0a, 9, 'r' }) == null);
+    try testing.expect(runId(&.{ 0x10, 0xff }) == null);
+}
+
+test "evictions are logged by reason unless a callback takes them" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workflows = try ParallelTest.registry(testing.allocator);
+    defer workflows.deinit(testing.allocator);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    defer runner.deinit();
+
+    const Case = struct { reason: act_pb.RemoveFromCache.EvictionReason, name: []const u8, level: log_mod.Level, message: []const u8 };
+    const routine = "workflow run evicted from the cache";
+    const cases = [_]Case{
+        .{ .reason = .NONDETERMINISM, .name = "NONDETERMINISM", .level = .err, .message = "workflow run evicted: its code produced commands that don't match its history (nondeterminism); the workflow task fails and is retried until the code matches" },
+        .{ .reason = .FATAL, .name = "FATAL", .level = .err, .message = "workflow run evicted after a fatal error in the core" },
+        .{ .reason = .PAGINATION_OR_HISTORY_FETCH, .name = "PAGINATION_OR_HISTORY_FETCH", .level = .warn, .message = "workflow run evicted: fetching its history failed" },
+        .{ .reason = .CACHE_FULL, .name = "CACHE_FULL", .level = .debug, .message = routine },
+        .{ .reason = .CACHE_MISS, .name = "CACHE_MISS", .level = .debug, .message = routine },
+        .{ .reason = .LANG_FAIL, .name = "LANG_FAIL", .level = .debug, .message = routine },
+        .{ .reason = .LANG_REQUESTED, .name = "LANG_REQUESTED", .level = .debug, .message = routine },
+        .{ .reason = .TASK_NOT_FOUND, .name = "TASK_NOT_FOUND", .level = .debug, .message = routine },
+        .{ .reason = .UNHANDLED_COMMAND, .name = "UNHANDLED_COMMAND", .level = .debug, .message = routine },
+        .{ .reason = .WORKFLOW_EXECUTION_ENDING, .name = "WORKFLOW_EXECUTION_ENDING", .level = .debug, .message = routine },
+        .{ .reason = .UNSPECIFIED, .name = "UNSPECIFIED", .level = .debug, .message = routine },
+        .{ .reason = @fromBackingInt(99), .name = "99", .level = .debug, .message = routine },
+    };
+    for (cases) |c| {
+        const run_id = try std.fmt.allocPrint(a, "run-{s}", .{c.name});
+        _ = try runner.handle(try ParallelTest.start(a, run_id, "Nap", ""), a, testing.io);
+        const handled = try runner.handle(try ParallelTest.evict(a, run_id, c.reason), a, testing.io);
+        try testing.expect(handled.eviction);
+        try testing.expect(handled.completion.status.? == .successful);
+        try testing.expect(runner.runs.get(run_id) == null);
+        try testing.expectEqual(1, sink.countAt(c.level, c.message, &.{
+            .{ .key = "run_id", .value = run_id },
+            .{ .key = "reason", .value = c.name },
+            .{ .key = "message", .value = "core says why" },
+            .{ .key = "workflow_id", .value = try std.fmt.allocPrint(a, "wf-{s}", .{run_id}) },
+            .{ .key = "workflow_type", .value = "Nap" },
+        }));
+    }
+    // A run that isn't cached is logged without its workflow.
+    _ = try runner.handle(try ParallelTest.evict(a, "unknown", .NONDETERMINISM), a, testing.io);
+    try testing.expectEqual(1, sink.countAt(.err, cases[0].message, &.{.{ .key = "run_id", .value = "unknown" }}));
+
+    const Evictions = struct {
+        n: usize = 0,
+        fn record(ctx: *anyopaque, reason: act_pb.RemoveFromCache.EvictionReason, message: []const u8) void {
+            const e: *@This() = @ptrCast(@alignCast(ctx));
+            if (reason == .NONDETERMINISM and std.mem.eql(u8, message, "core says why")) e.n += 1;
+        }
+    };
+    var evictions: Evictions = .{};
+    runner.on_evict = Evictions.record;
+    runner.on_evict_ctx = &evictions;
+    _ = try runner.handle(try ParallelTest.start(a, "run-cb", "Nap", ""), a, testing.io);
+    _ = try runner.handle(try ParallelTest.evict(a, "run-cb", .NONDETERMINISM), a, testing.io);
+    try testing.expectEqual(1, evictions.n);
+    try testing.expectEqual(0, sink.count(cases[0].message, &.{.{ .key = "run_id", .value = "run-cb" }}));
+}
+
+const CacheTest = struct {
+    const Release = workflow.SignalDef("release", fn () void);
+
+    const State = struct {
+        released: bool = false,
+        fn release(s: *State) void {
+            s.released = true;
+        }
+        fn isReleased(s: *State) bool {
+            return s.released;
+        }
+    };
+
+    fn waitForRelease(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const state = try ctx.allocator().create(State);
+        state.* = .{};
+        try ctx.setSignalHandler(Release, state, State.release);
+        try ctx.await(state, State.isReleased);
+        return name;
+    }
+    const WaitForRelease = workflow.Def("WaitForRelease", waitForRelease);
+
+    /// Waits on a long timer the first time any run executes, and schedules an activity every
+    /// time after: a replay of the first run's history doesn't match. Test-only global state.
+    var executed: std.atomic.Value(bool) = .init(false);
+
+    fn drift(ctx: *workflow.Context) ![]const u8 {
+        if (!executed.swap(true, .acq_rel)) {
+            try ctx.io().sleep(.fromSeconds(3600), .awake);
+        } else {
+            _ = try ctx.executeActivity(HelloTest.Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"drift"}).get();
+        }
+        return "done";
+    }
+    const Drift = workflow.Def("Drift", drift);
+};
+
+test "a full cache evicts a waiting run, which replays when signaled" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var w = try Worker.init(testing.allocator, testing.io, &client, "cache-full", .{ .max_cached_workflows = 1, .logger = sink.sink() });
+    defer w.deinit();
+    try w.registerWorkflow(CacheTest.WaitForRelease);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var first = try client.executeWorkflow(CacheTest.WaitForRelease, .{ .id = "cache-full-1", .task_queue = "cache-full" }, .{"first"});
+    defer first.deinit();
+    var second = try client.executeWorkflow(CacheTest.WaitForRelease, .{ .id = "cache-full-2", .task_queue = "cache-full" }, .{"second"});
+    defer second.deinit();
+    // Two runs, one cache slot: whichever ran first is evicted for the other.
+    try sink.waitFor("workflow run evicted from the cache", &.{.{ .key = "reason", .value = "CACHE_FULL" }}, .fromSeconds(30));
+
+    try client.signalWorkflow(CacheTest.Release, "cache-full-1", first.run_id, .{});
+    try client.signalWorkflow(CacheTest.Release, "cache-full-2", second.run_id, .{});
+    try testing.expectEqualStrings("first", try first.get(arena.allocator()));
+    try testing.expectEqualStrings("second", try second.get(arena.allocator()));
+}
+
+// With no cache at all the core asks for a CACHE_FULL eviction on every activation, and that
+// reason sticks, so the run is pushed out of a one-run cache by another run instead.
+test "a run evicted for nondeterminism is logged with the core's message" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    // The core's own warnings about the failing task go here, not to std.log.
+    var client_sink: RecordingSink = .{};
+    defer client_sink.deinit();
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target, .logger = client_sink.sink() });
+    defer client.close();
+
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var w = try Worker.init(testing.allocator, testing.io, &client, "nondeterminism", .{ .max_cached_workflows = 1, .logger = sink.sink() });
+    defer w.deinit();
+    try w.registerWorkflow(CacheTest.Drift);
+    try w.registerWorkflow(CacheTest.WaitForRelease);
+    CacheTest.executed.store(false, .release);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+
+    var drift = try client.executeWorkflow(CacheTest.Drift, .{ .id = "nondeterminism-wf", .task_queue = "nondeterminism" }, .{});
+    defer drift.deinit();
+    var other = try client.executeWorkflow(CacheTest.WaitForRelease, .{ .id = "nondeterminism-other", .task_queue = "nondeterminism" }, .{"other"});
+    defer other.deinit();
+    defer client.terminateWorkflow("nondeterminism-other", other.run_id, "test done") catch {};
+    try sink.waitFor("workflow run evicted from the cache", &.{ .{ .key = "run_id", .value = drift.run_id }, .{ .key = "reason", .value = "CACHE_FULL" } }, .fromSeconds(30));
+
+    // The signal's task replays the run, whose code now schedules an activity, not a timer.
+    try client.signalWorkflow(CacheTest.Release, "nondeterminism-wf", drift.run_id, .{});
+    const message = "workflow run evicted: its code produced commands that don't match its history (nondeterminism); the workflow task fails and is retried until the code matches";
+    const fields = [_]log_mod.Field{
+        .{ .key = "run_id", .value = drift.run_id },
+        .{ .key = "reason", .value = "NONDETERMINISM" },
+        .{ .key = "workflow_id", .value = "nondeterminism-wf" },
+        .{ .key = "workflow_type", .value = "Drift" },
+    };
+    try sink.waitFor(message, &fields, .fromSeconds(30));
+    try testing.expect(sink.countAt(.err, message, &fields) >= 1);
+    {
+        sink.mutex.lockUncancelable(testing.io);
+        defer sink.mutex.unlock(testing.io);
+        const rec = for (sink.records.items) |rec| {
+            if (std.mem.eql(u8, rec.message, message)) break rec;
+        } else unreachable;
+        const core_message = for (rec.fields) |f| {
+            if (std.mem.eql(u8, f.key, "message")) break f.value;
+        } else "";
+        try testing.expect(std.mem.indexOf(u8, core_message, "ondeterminism") != null);
+    }
+    try client.terminateWorkflow("nondeterminism-wf", drift.run_id, "test done");
+}
+
+test "two workflows run their code at the same time on one worker" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, testing.io, &client, "parallel", .{});
+    defer w.deinit();
+    try w.registerWorkflow(ParallelTest.Meet);
+    ParallelTest.Latch.arrived.store(0, .release);
+    ParallelTest.Latch.both = .unset;
+    ParallelTest.hook = ParallelTest.Latch.hook;
+    defer ParallelTest.hook = ParallelTest.noHook;
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var first = try client.executeWorkflow(ParallelTest.Meet, .{ .id = "parallel-1", .task_queue = "parallel" }, .{"first"});
+    defer first.deinit();
+    var second = try client.executeWorkflow(ParallelTest.Meet, .{ .id = "parallel-2", .task_queue = "parallel" }, .{"second"});
+    defer second.deinit();
+    // Each run's code waits for the other's: processed one at a time, both would time out.
+    try testing.expectEqualStrings("met", try first.get(arena.allocator()));
+    try testing.expectEqualStrings("met", try second.get(arena.allocator()));
 }
