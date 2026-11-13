@@ -1,7 +1,9 @@
 {
   "database": "dolt",
   "backend": "dolt",
-  "dolt_mode": "proxied-server",
-  "dolt_database": "temporal_sdk_zig",
+  "dolt_mode": "server",
+  "dolt_server_host": "127.0.0.1",
+  "dolt_server_port": 3307,
+  "dolt_database": "temporal-sdk-zig",
   "project_id": "deb25d60-8bbe-4cd7-b166-3604ab2426a5"
 }
