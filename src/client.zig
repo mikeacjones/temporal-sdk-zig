@@ -727,8 +727,20 @@ pub const Client = struct {
         // for a plain start, so signal-with-start and update-with-start never ask for it.
         request.request_eager_execution = options.enable_eager_start;
         var header = try c.outgoingHeader(a, options.context);
-        const response = c.rpcCall(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a, null, &header, options.context) catch |err| switch (err) {
-            error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
+        // The status is only needed to find the existing run; without it `send` logs failures.
+        var status: ?RpcStatus = null;
+        const status_out: ?*?RpcStatus = if (options.error_when_already_started) null else &status;
+        const response = c.rpcCall(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, a, status_out, &header, options.context) catch |err| switch (err) {
+            error.AlreadyExists => {
+                const s = status orelse return error.WorkflowExecutionAlreadyStarted;
+                const run_id = s.alreadyStartedRunId(a) orelse return error.WorkflowExecutionAlreadyStarted;
+                return .{ .run_id = try c.gpa.dupe(u8, run_id), .eager = false };
+            },
+            error.RpcFailed => {
+                const s = status orelse return error.RpcFailed;
+                log.err("StartWorkflowExecution failed: {s} (gRPC status {d})", .{ s.message, s.code });
+                return error.RpcFailed;
+            },
             else => |e| return e,
         };
         // The core has already handed the eager task to the worker; the response keeps a copy.
@@ -736,7 +748,11 @@ pub const Client = struct {
     }
 
     /// The start request for `options`, allocated from `a`. Signal-with-start copies it.
-    fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) search_attributes.EncodeError!wfs.StartWorkflowExecutionRequest {
+    fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) (search_attributes.EncodeError || error{InvalidOptions})!wfs.StartWorkflowExecutionRequest {
+        if (options.task_queue.len == 0) {
+            log.warn("starting workflow \"{s}\" of type \"{s}\": StartWorkflowOptions.task_queue is empty; set it to the task queue a worker polls (WorkflowEnvironment fills in its own)", .{ id, workflow_type });
+            return error.InvalidOptions;
+        }
         var request: wfs.StartWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_id = id,
@@ -770,7 +786,31 @@ pub const Client = struct {
             request.memo = memo;
         }
         if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
+        if (options.retry_policy) |rp| request.retry_policy = try protoRetryPolicy(a, rp);
+        if (options.static_summary.len > 0 or options.static_details.len > 0) request.user_metadata = .{
+            .summary = if (options.static_summary.len > 0) try converter.toPayload(a, options.static_summary) else null,
+            .details = if (options.static_details.len > 0) try converter.toPayload(a, options.static_details) else null,
+        };
+        if (options.versioning_override) |o| request.versioning_override = .{ .override = switch (o) {
+            .pinned => |v| .{ .pinned = .{
+                .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED,
+                .version = .{ .deployment_name = v.deployment_name, .build_id = v.build_id },
+            } },
+            .auto_upgrade => .{ .auto_upgrade = true },
+        } };
+        if (options.priority) |p| request.priority = .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight };
         return request;
+    }
+
+    fn protoRetryPolicy(a: Allocator, rp: workflow.RetryPolicy) error{OutOfMemory}!proto.temporal.api.common.v1.RetryPolicy {
+        var p: proto.temporal.api.common.v1.RetryPolicy = .{
+            .initial_interval = protoDuration(rp.initial_interval),
+            .backoff_coefficient = rp.backoff_coefficient,
+            .maximum_interval = protoDuration(rp.maximum_interval),
+            .maximum_attempts = rp.maximum_attempts,
+        };
+        try p.non_retryable_error_types.appendSlice(a, rp.non_retryable_error_types);
+        return p;
     }
 
     /// Sends `Signal` (a `workflow.SignalDef`) with `args` to a workflow. An empty `run_id`
@@ -1154,16 +1194,7 @@ pub const Client = struct {
                 .use_existing => .ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING,
             },
         };
-        if (options.retry_policy) |rp| {
-            var p: proto.temporal.api.common.v1.RetryPolicy = .{
-                .initial_interval = protoDuration(rp.initial_interval),
-                .backoff_coefficient = rp.backoff_coefficient,
-                .maximum_interval = protoDuration(rp.maximum_interval),
-                .maximum_attempts = rp.maximum_attempts,
-            };
-            try p.non_retryable_error_types.appendSlice(a, rp.non_retryable_error_types);
-            request.retry_policy = p;
-        }
+        if (options.retry_policy) |rp| request.retry_policy = try protoRetryPolicy(a, rp);
         if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
         var status: ?RpcStatus = null;
         var header = try c.outgoingHeader(a, options.context);
@@ -1618,6 +1649,21 @@ pub const Client = struct {
             }
             return false;
         }
+
+        /// The run ID an ALREADY_EXISTS start status names as holding the workflow ID, or
+        /// null if it names none.
+        fn alreadyStartedRunId(s: RpcStatus, arena: Allocator) ?[]const u8 {
+            const full_name = "temporal.api.errordetails.v1.WorkflowExecutionAlreadyStartedFailure";
+            var reader: Io.Reader = .fixed(s.details);
+            const decoded = proto.google.rpc.Status.decode(&reader, arena) catch return null;
+            for (decoded.details.items) |any| {
+                if (!std.mem.endsWith(u8, any.type_url, "/" ++ full_name)) continue;
+                var detail_reader: Io.Reader = .fixed(any.value);
+                const detail = proto.temporal.api.errordetails.v1.WorkflowExecutionAlreadyStartedFailure.decode(&detail_reader, arena) catch return null;
+                return if (detail.run_id.len > 0) detail.run_id else null;
+            }
+            return null;
+        }
     };
 
     /// The deadline `send` gives a call: `rpc_timeout_ms`, or 0 (sdk-core's default) for a
@@ -1632,8 +1678,9 @@ pub const Client = struct {
     }
 
     /// Sends the request to the server: the end of the interceptor chain. When `status` is
-    /// given, a failure other than ALREADY_EXISTS or NOT_FOUND is stored there (allocated from
-    /// `arena`) for the caller to report instead of being logged. The codecs encode the
+    /// given, a failure other than NOT_FOUND is stored there (allocated from `arena`) for the
+    /// caller to report instead of being logged; ALREADY_EXISTS still returns
+    /// `error.AlreadyExists`. The codecs encode the
     /// request and decode the response with `values` and the workflow or activity the request
     /// names.
     fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values) RpcError!Response {
@@ -1653,12 +1700,12 @@ pub const Client = struct {
             error.RpcFailed => {
                 const f = failure.?;
                 // gRPC ALREADY_EXISTS and NOT_FOUND are expected outcomes callers handle.
-                if (f.status_code == 6) return error.AlreadyExists;
                 if (f.status_code == 5) return error.NotFound;
                 if (status) |out| {
                     out.* = .{ .code = f.status_code, .message = try arena.dupe(u8, f.message), .details = try arena.dupe(u8, f.details) };
-                    return error.RpcFailed;
+                    return if (f.status_code == 6) error.AlreadyExists else error.RpcFailed;
                 }
+                if (f.status_code == 6) return error.AlreadyExists;
                 log.err("{s} failed: {s} (gRPC status {d})", .{ method, f.message, f.status_code });
                 return error.RpcFailed;
             },
@@ -1683,7 +1730,9 @@ pub const Client = struct {
 pub const StartWorkflowOptions = struct {
     /// Workflow ID. Empty generates a random UUID; read it from the run.
     id: []const u8 = "",
-    task_queue: []const u8,
+    /// Task queue a worker polls for the workflow's tasks. Required for client starts, which
+    /// return `error.InvalidOptions` when it is empty; `WorkflowEnvironment` fills in its own.
+    task_queue: []const u8 = "",
     execution_timeout: ?Duration = null,
     run_timeout: ?Duration = null,
     task_timeout: ?Duration = null,
@@ -1692,8 +1741,34 @@ pub const StartWorkflowOptions = struct {
     /// Runs the workflow on a cron schedule ("* * * * *"); each run starts a new run of the
     /// same workflow ID. Prefer Schedules for new code.
     cron_schedule: []const u8 = "",
+    /// Whether a closed run's ID may be used again. `.unspecified` uses the server's default,
+    /// `.allow_duplicate`.
     id_reuse_policy: enum { unspecified, allow_duplicate, allow_duplicate_failed_only, reject_duplicate } = .unspecified,
+    /// What a start does when a run with the same ID is running. `.unspecified` and `.fail`
+    /// fail the start with `error.WorkflowExecutionAlreadyStarted` (unless
+    /// `error_when_already_started` is false), `.use_existing` returns the running run, and
+    /// `.terminate_existing` terminates it and starts a new one.
     id_conflict_policy: enum { unspecified, fail, use_existing, terminate_existing } = .unspecified,
+    /// When false, a start the server refuses because the workflow ID is taken returns a
+    /// handle to the run that holds it instead of `error.WorkflowExecutionAlreadyStarted`:
+    /// a running run under `id_conflict_policy` `.unspecified` or `.fail`, or a closed run
+    /// `id_reuse_policy` keeps from being reused. Unlike `.use_existing`, the start request
+    /// itself is unchanged. Only `executeWorkflow` and `executeWorkflowByName` use it.
+    error_when_already_started: bool = true,
+    /// How the server retries the whole workflow when a run fails or times out; each retry is
+    /// a new run of the same ID. Null retries none.
+    retry_policy: ?workflow.RetryPolicy = null,
+    /// A short single-line description of the workflow, shown in the UI and CLI. Sent as a
+    /// JSON string payload (through the codecs); empty sends none.
+    static_summary: []const u8 = "",
+    /// A longer description of the workflow, shown in the UI and CLI. Sent as a JSON string
+    /// payload (through the codecs); empty sends none.
+    static_details: []const u8 = "",
+    /// Runs the workflow with a versioning behavior other than its definition's: pinned to a
+    /// worker deployment version, or auto-upgrading. Null keeps the definition's.
+    versioning_override: ?deployment.VersioningOverride = null,
+    /// The workflow's task priority and fairness. Null uses the server's defaults.
+    priority: ?workflow.Priority = null,
     /// Non-indexed values recorded with the workflow, such as a description. Build them with
     /// `converter.toFields`; they are only read while starting.
     memo: []const converter.Field = &.{},
@@ -1751,6 +1826,8 @@ pub const StartError = error{
     WorkflowExecutionAlreadyStarted,
     /// `StartWorkflowOptions.search_attributes` holds a value the server can't index (logged).
     InvalidSearchAttribute,
+    /// `StartWorkflowOptions.task_queue` is empty (logged). Returned before any call.
+    InvalidOptions,
 };
 
 pub const SignalError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };
@@ -3059,7 +3136,8 @@ pub const UpdateWithStartError = error{
     RpcFailed,
     NotFound,
     InvalidResponse,
-    /// `StartWorkflowOptions.id_conflict_policy` is unspecified.
+    /// `StartWorkflowOptions.id_conflict_policy` is unspecified or `task_queue` is empty
+    /// (logged). Returned before any call.
     InvalidOptions,
     /// The workflow is running and `id_conflict_policy` is `.fail`.
     WorkflowExecutionAlreadyStarted,

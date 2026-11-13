@@ -364,7 +364,7 @@ pub const WorkflowEnvironment = struct {
         arena: Allocator,
         failure: ?*?failure_mod.Failure,
     ) !Workflow.Result {
-        return env.executeWorkflowWithOptions(Workflow, .{ .task_queue = "" }, args, arena, failure);
+        return env.executeWorkflowWithOptions(Workflow, .{}, args, arena, failure);
     }
 
     /// `executeWorkflow` with start options. `id` and `task_queue` default to a unique ID and
@@ -2810,6 +2810,277 @@ test "client: a memo set at start is recorded in the started event" {
     const owner = (try converter.fieldValue(Owner, a, &fields, "owner")).?;
     try testing.expectEqualStrings("data", owner.team);
     try testing.expect(owner.oncall);
+}
+
+const StartOptionFixtures = struct {
+    fn failFirstAttempt(ctx: *workflow.Context) !u32 {
+        if (ctx.info().attempt == 1) return error.FirstAttemptFails;
+        return ctx.info().attempt;
+    }
+    const FailFirstAttempt = workflow.Def("FailFirstAttempt", failFirstAttempt);
+
+    fn startedEvent(c: *client_mod.Client, a: Allocator, id: []const u8, run_id: []const u8) !proto.temporal.api.history.v1.HistoryEvent {
+        const history = try c.fetchHistory(a, id, run_id);
+        try testing.expect(history.events.items[0].attributes.? == .workflow_execution_started_event_attributes);
+        return history.events.items[0];
+    }
+
+    fn expectMetadata(a: Allocator, event: proto.temporal.api.history.v1.HistoryEvent, summary: []const u8, details: []const u8) !void {
+        const metadata = event.user_metadata.?;
+        try testing.expectEqualStrings(summary, try converter.fromPayload([]const u8, a, metadata.summary.?));
+        if (details.len > 0) {
+            try testing.expectEqualStrings(details, try converter.fromPayload([]const u8, a, metadata.details.?));
+        } else try testing.expect(metadata.details == null);
+    }
+};
+
+test "client: a retry policy set at start retries a failed run" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(StartOptionFixtures.FailFirstAttempt);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(StartOptionFixtures.FailFirstAttempt, .{
+        .task_queue = "",
+        .retry_policy = .{ .initial_interval = .fromSeconds(1), .backoff_coefficient = 2, .maximum_attempts = 2, .non_retryable_error_types = &.{"Fatal"} },
+    }, .{});
+    defer run.deinit();
+    try testing.expectEqual(@as(u32, 2), try run.get(a));
+
+    const started = (try StartOptionFixtures.startedEvent(&env.client, a, run.id, run.run_id)).attributes.?.workflow_execution_started_event_attributes;
+    const policy = started.retry_policy.?;
+    try testing.expectEqual(@as(i32, 2), policy.maximum_attempts);
+    try testing.expectEqual(@as(f64, 2), policy.backoff_coefficient);
+    try testing.expectEqual(@as(i64, 1), policy.initial_interval.?.seconds);
+    try testing.expectEqualStrings("Fatal", policy.non_retryable_error_types.items[0]);
+}
+
+test "client: summary, details, priority and a versioning override set at start are recorded in the started event" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The server only pins to a version that has polled the task queue.
+    var rollout = try env.client.workerDeployment("rollout");
+    defer rollout.deinit();
+    var v1: VersionFixtures.VersionWorker = undefined;
+    try v1.start(&env.client, "start-override", "v1");
+    defer v1.stop();
+    try VersionFixtures.awaitVersion(&rollout, "v1");
+    while (true) {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        // The version can be missing here for a moment after the deployment lists it.
+        const version = rollout.describeVersion(scratch.allocator(), "v1") catch |err| switch (err) {
+            error.NotFound => {
+                try testing.io.sleep(.fromMilliseconds(100), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        const polled = for (version.task_queues) |q| {
+            if (q.type == .workflow and std.mem.eql(u8, q.name, "start-override")) break true;
+        } else false;
+        if (polled) break;
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+
+    // The auto-upgrade workflow is pinned, the pinned one auto-upgrades. Both wait for a
+    // signal that never comes; the started event is all the test needs.
+    var pinned = try env.client.executeWorkflow(VersionFixtures.AutoRollout, .{
+        .task_queue = "start-override",
+        .static_summary = "Nightly import",
+        .static_details = "Imports **yesterday's** orders.",
+        .priority = .{ .priority_key = 2, .fairness_key = "tenant-a", .fairness_weight = 1.5 },
+        .versioning_override = .{ .pinned = .{ .deployment_name = "rollout", .build_id = "v1" } },
+    }, .{});
+    defer pinned.deinit();
+    defer env.client.terminateWorkflow(pinned.id, pinned.run_id, "test cleanup") catch {};
+    const event = try StartOptionFixtures.startedEvent(&env.client, a, pinned.id, pinned.run_id);
+    try StartOptionFixtures.expectMetadata(a, event, "Nightly import", "Imports **yesterday's** orders.");
+    const started = event.attributes.?.workflow_execution_started_event_attributes;
+    const priority = started.priority.?;
+    try testing.expectEqual(@as(i32, 2), priority.priority_key);
+    try testing.expectEqualStrings("tenant-a", priority.fairness_key);
+    try testing.expectEqual(@as(f32, 1.5), priority.fairness_weight);
+    const override = started.versioning_override.?.override.?.pinned;
+    try testing.expectEqual(.PINNED_OVERRIDE_BEHAVIOR_PINNED, override.behavior);
+    try testing.expectEqualStrings("rollout", override.version.?.deployment_name);
+    try testing.expectEqualStrings("v1", override.version.?.build_id);
+
+    var auto = try env.client.executeWorkflow(VersionFixtures.PinnedRollout, .{
+        .task_queue = "start-override",
+        .static_summary = "Summary only",
+        .versioning_override = .auto_upgrade,
+    }, .{});
+    defer auto.deinit();
+    defer env.client.terminateWorkflow(auto.id, auto.run_id, "test cleanup") catch {};
+    const auto_event = try StartOptionFixtures.startedEvent(&env.client, a, auto.id, auto.run_id);
+    try StartOptionFixtures.expectMetadata(a, auto_event, "Summary only", "");
+    try testing.expect(auto_event.attributes.?.workflow_execution_started_event_attributes.versioning_override.?.override.?.auto_upgrade);
+
+    // The defaults send none of them. No worker polls this task queue.
+    var plain = try env.client.executeWorkflow(Fixtures.Hello, .{ .task_queue = "nobody-polls-this" }, .{"plain"});
+    defer plain.deinit();
+    defer env.client.terminateWorkflow(plain.id, plain.run_id, "test cleanup") catch {};
+    const plain_event = try StartOptionFixtures.startedEvent(&env.client, a, plain.id, plain.run_id);
+    try testing.expect(plain_event.user_metadata == null);
+    const plain_started = plain_event.attributes.?.workflow_execution_started_event_attributes;
+    try testing.expect(plain_started.versioning_override == null);
+    try testing.expect(plain_started.retry_policy == null);
+    try testing.expect(plain_started.priority == null);
+}
+
+test "client: an empty task queue fails every client start before any call; the environment fills in its own" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("Hello default!", try env.executeWorkflowWithOptions(Fixtures.Hello, .{}, .{"default"}, a, null));
+
+    const options: client_mod.StartWorkflowOptions = .{ .id = "no-task-queue", .id_conflict_policy = .use_existing };
+    try testing.expectError(error.InvalidOptions, env.client.executeWorkflow(Fixtures.Hello, options, .{"typed"}));
+    try testing.expectError(error.InvalidOptions, env.client.executeWorkflowByName([]const u8, Fixtures.Hello.workflow_name, options, .{"by name"}));
+    try testing.expectError(error.InvalidOptions, env.client.signalWithStartWorkflow(SignalFixtures.AwaitApprovals, options, .{1}, SignalFixtures.Approve, .{"ann"}));
+    try testing.expectError(error.InvalidOptions, env.client.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, options, .{}, UpdateFixtures.Set, .{3}, .{}));
+    // None of them reached the server.
+    try testing.expectError(error.NotFound, env.client.describeWorkflow(a, "no-task-queue", ""));
+}
+
+test "client: signal-with-start sends the retry policy, summary and priority" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No worker polls this task queue; the started event is all the test needs.
+    var run = try env.client.signalWithStartWorkflow(SignalFixtures.AwaitApprovals, .{
+        .task_queue = "nobody-polls-this",
+        .retry_policy = .{ .maximum_attempts = 5 },
+        .static_summary = "Approval",
+        .priority = .{ .priority_key = 3 },
+    }, .{1}, SignalFixtures.Approve, .{"ann"});
+    defer run.deinit();
+    defer env.client.terminateWorkflow(run.id, run.run_id, "test cleanup") catch {};
+    const event = try StartOptionFixtures.startedEvent(&env.client, a, run.id, run.run_id);
+    try StartOptionFixtures.expectMetadata(a, event, "Approval", "");
+    const started = event.attributes.?.workflow_execution_started_event_attributes;
+    try testing.expectEqual(@as(i32, 5), started.retry_policy.?.maximum_attempts);
+    try testing.expectEqual(@as(i32, 3), started.priority.?.priority_key);
+}
+
+test "client: update-with-start sends the retry policy, summary and priority" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFixtures.HandleUpdates);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var handle = try env.updateWithStartWorkflow(UpdateFixtures.HandleUpdates, .{
+        .id_conflict_policy = .use_existing,
+        .retry_policy = .{ .maximum_attempts = 5 },
+        .static_summary = "Updates",
+        .priority = .{ .priority_key = 3 },
+    }, .{}, UpdateFixtures.Set, .{3}, .{});
+    defer handle.deinit();
+    try testing.expectEqual(@as(i64, 0), try handle.get(a));
+    defer env.client.terminateWorkflow(handle.workflow_id, handle.run_id, "test cleanup") catch {};
+    const event = try StartOptionFixtures.startedEvent(&env.client, a, handle.workflow_id, handle.run_id);
+    try StartOptionFixtures.expectMetadata(a, event, "Updates", "");
+    const started = event.attributes.?.workflow_execution_started_event_attributes;
+    try testing.expectEqual(@as(i32, 5), started.retry_policy.?.maximum_attempts);
+    try testing.expectEqual(@as(i32, 3), started.priority.?.priority_key);
+}
+
+test "client: start options reach by-name, eager, and environment starts" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const options: client_mod.StartWorkflowOptions = .{
+        .task_queue = "",
+        .retry_policy = .{ .maximum_attempts = 3 },
+        .static_summary = "Greets someone",
+        .priority = .{ .priority_key = 4 },
+    };
+    // The environment's worker is unversioned, so no versioning override here.
+    var eager_options = options;
+    eager_options.enable_eager_start = true;
+    var eager = try env.startWorkflow(Fixtures.Hello, eager_options, .{"eager"});
+    defer eager.deinit();
+    try testing.expect(eager.eagerly_started);
+    try testing.expectEqualStrings("Hello eager!", try env.getResult(Fixtures.Hello, &eager, a, null));
+
+    var by_name = try env.startWorkflowByName([]const u8, Fixtures.Hello.workflow_name, options, .{"by name"});
+    defer by_name.deinit();
+    try testing.expectEqualStrings("Hello by name!", try env.getResultByName([]const u8, &by_name, a, null));
+
+    for ([_][2][]const u8{ .{ eager.id, eager.run_id }, .{ by_name.id, by_name.run_id } }) |run| {
+        const event = try StartOptionFixtures.startedEvent(&env.client, a, run[0], run[1]);
+        try StartOptionFixtures.expectMetadata(a, event, "Greets someone", "");
+        const started = event.attributes.?.workflow_execution_started_event_attributes;
+        try testing.expectEqual(@as(i32, 3), started.retry_policy.?.maximum_attempts);
+        try testing.expectEqual(@as(i32, 4), started.priority.?.priority_key);
+    }
+}
+
+test "client: error_when_already_started = false returns the run holding the workflow ID" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = try std.fmt.allocPrint(a, "already-started-{s}", .{env.task_queue});
+    const queue = "nobody-polls-this";
+
+    var first = try env.client.executeWorkflow(Fixtures.Hello, .{ .id = id, .task_queue = queue }, .{"first"});
+    defer first.deinit();
+
+    // A running run.
+    try testing.expectError(error.WorkflowExecutionAlreadyStarted, env.client.executeWorkflow(Fixtures.Hello, .{ .id = id, .task_queue = queue }, .{"again"}));
+    try testing.expectError(error.WorkflowExecutionAlreadyStarted, env.client.executeWorkflow(Fixtures.Hello, .{ .id = id, .task_queue = queue, .id_conflict_policy = .fail }, .{"again"}));
+    var running = try env.client.executeWorkflow(Fixtures.Hello, .{ .id = id, .task_queue = queue, .error_when_already_started = false }, .{"again"});
+    defer running.deinit();
+    try testing.expectEqualStrings(first.run_id, running.run_id);
+    try testing.expect(!running.eagerly_started);
+    var running_by_name = try env.client.executeWorkflowByName([]const u8, Fixtures.Hello.workflow_name, .{ .id = id, .task_queue = queue, .id_conflict_policy = .fail, .error_when_already_started = false }, .{"again"});
+    defer running_by_name.deinit();
+    try testing.expectEqualStrings(first.run_id, running_by_name.run_id);
+    var existing = try env.client.executeWorkflow(Fixtures.Hello, .{ .id = id, .task_queue = queue, .id_conflict_policy = .use_existing }, .{"again"});
+    defer existing.deinit();
+    try testing.expectEqualStrings(first.run_id, existing.run_id);
+
+    // A closed run whose ID the reuse policy keeps.
+    try env.client.terminateWorkflow(id, first.run_id, "test");
+    const closed: client_mod.StartWorkflowOptions = .{ .id = id, .task_queue = queue, .id_reuse_policy = .reject_duplicate };
+    try testing.expectError(error.WorkflowExecutionAlreadyStarted, env.client.executeWorkflow(Fixtures.Hello, closed, .{"again"}));
+    var use_existing = closed;
+    use_existing.id_conflict_policy = .use_existing;
+    try testing.expectError(error.WorkflowExecutionAlreadyStarted, env.client.executeWorkflow(Fixtures.Hello, use_existing, .{"again"}));
+    use_existing.error_when_already_started = false;
+    var closed_existing = try env.client.executeWorkflow(Fixtures.Hello, use_existing, .{"again"});
+    defer closed_existing.deinit();
+    try testing.expectEqualStrings(first.run_id, closed_existing.run_id);
+    var lenient = closed;
+    lenient.error_when_already_started = false;
+    var closed_by_name = try env.client.executeWorkflowByName([]const u8, Fixtures.Hello.workflow_name, lenient, .{"again"});
+    defer closed_by_name.deinit();
+    try testing.expectEqualStrings(first.run_id, closed_by_name.run_id);
+    try testing.expectError(error.WorkflowTerminated, closed_by_name.get(a));
 }
 
 test "client: describe reads status and the memo set at start, while running and after" {
