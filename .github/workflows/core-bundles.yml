@@ -114,16 +114,39 @@ jobs:
           cat "$RUNNER_TEMP/bundle/manifest.json"
           echo "dir=$RUNNER_TEMP/bundle" >> "$GITHUB_OUTPUT"
 
-      # Removes cargo from PATH so the build can only use the bundle.
+      # Removes every PATH directory that holds cargo (rustup can live outside ~/.cargo/bin, as
+      # Homebrew's does on macOS runners), so the build can only use the bundle. The macOS rows
+      # build for the native target: an explicit -Dtarget makes Zig treat the build as
+      # cross-compiled and drops the macOS SDK's library and framework search paths.
       - name: Unit tests against the bundle, without cargo
+        env:
+          TARGET: ${{ matrix.platform.target }}
         run: |
-          PATH="$(echo "$PATH" | tr : '\n' | grep -v '/\.cargo/bin$' | paste -sd: -)"
-          if command -v cargo; then
-            echo "::error::cargo is still on PATH; the bundle test must not be able to run it"
+          no_cargo_path=""
+          IFS=: read -ra dirs <<< "$PATH"
+          for d in "${dirs[@]}"; do
+            if [ -n "$d" ] && [ -x "$d/cargo" ]; then
+              echo "Removing $d from PATH: it holds cargo"
+              continue
+            fi
+            no_cargo_path="${no_cargo_path:+$no_cargo_path:}$d"
+          done
+          PATH="$no_cargo_path"
+          if cargo_path=$(command -v cargo); then
+            echo "::error::cargo is still on PATH at $cargo_path (directory $(dirname "$cargo_path")); the bundle test must not be able to run it"
             exit 1
           fi
+          target_args=(-Dtarget="$TARGET")
+          if [[ "$TARGET" == *-macos ]]; then
+            native="$(uname -m | sed 's/^arm64$/aarch64/')-macos"
+            if [ "$native" != "$TARGET" ]; then
+              echo "::error::the $TARGET bundle must be tested on a $TARGET runner, but this runner is $native"
+              exit 1
+            fi
+            target_args=()
+          fi
           rm -rf .zig-cache/cargo-target
-          zig build test -Dtarget=${{ matrix.platform.target }} -Dcore-bundle="${{ steps.extract.outputs.dir }}" --summary all
+          zig build test ${target_args[@]+"${target_args[@]}"} -Dcore-bundle="${{ steps.extract.outputs.dir }}" --summary all
 
       - name: Check the test binary's linking
         run: |
