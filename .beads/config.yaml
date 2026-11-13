@@ -1,2 +1,8 @@
 sync:
-    # remote: "git+https://github.com/mikeacjones/temporal-sdk-zig.git"
+dolt:
+    host: 127.0.0.1
+    port: 3307
+    user: root
+    database: temporal-sdk-zig
+
+# remote: "git+https://github.com/mikeacjones/temporal-sdk-zig.git"
