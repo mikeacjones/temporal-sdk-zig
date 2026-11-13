@@ -273,7 +273,7 @@ pub const Info = struct {
     /// memory of the run.
     priority: Priority = .{},
     /// The run ID before any reset of this run, or empty when the server didn't send one. A
-    /// run that was never reset has its own run ID here.
+    /// run that was never reset has its own run ID here. Arena memory of the run.
     original_run_id: []const u8 = "",
 };
 
