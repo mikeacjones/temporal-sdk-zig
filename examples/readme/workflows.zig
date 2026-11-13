@@ -50,6 +50,7 @@ fn greetTwice(ctx: *workflow.Context, name: []const u8) ![]const u8 {
         .retry_policy = .{ .maximum_attempts = 3 },
         .summary = "greet the caller", // shown on the scheduled event in the UI
         .priority = .{ .priority_key = 2, .fairness_key = "tenant-a" },
+        .versioning_intent = .compatible, // with build-ID versioning: this workflow's build
     }, .{name});
     const local = ctx.executeLocalActivityByName([]const u8, "greet", .{
         .start_to_close_timeout = .fromSeconds(5),

@@ -84,19 +84,21 @@ pub const Finish = workflow.SignalDef("finish", fn () void);
 pub const CurrentGreeting = workflow.QueryDef("current_greeting", fn () []const u8);
 pub const SetGreeting = workflow.UpdateDef("set_greeting", fn (greeting: []const u8) []const u8);
 
-pub fn sendMessages(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
+pub const Replies = struct { previous: []const u8, current: []const u8, result: []const u8 };
+
+pub fn sendMessages(client: *temporal.client.Client, arena: Allocator) !Replies {
     var run = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-1", .task_queue = "greetings" }, .{"World"});
     defer run.deinit();
     var update = try client.updateWorkflow(SetGreeting, run.id, "", .{"Hi"}, .{});
     defer update.deinit();
-    _ = try update.get(arena); // the previous greeting, "Hello"
-    _ = try client.queryWorkflow(CurrentGreeting, arena, run.id, "", .{}); // "Hi"
+    const previous = try update.get(arena); // the previous greeting, "Hello"
+    const current = try client.queryWorkflow(CurrentGreeting, arena, run.id, "", .{}); // "Hi"
     try client.signalWorkflow(Finish, run.id, "", .{});
     var signaled = try client.signalWithStartWorkflow(GreeterWorkflow, .{ .id = "greeter-2", .task_queue = "greetings" }, .{"Zig"}, Finish, .{});
     defer signaled.deinit();
     var updated = try client.updateWithStartWorkflow(GreeterWorkflow, .{ .id = "greeter-3", .task_queue = "greetings", .id_conflict_policy = .use_existing }, .{"Ziggy"}, SetGreeting, .{"Howdy"}, .{});
     defer updated.deinit();
-    return run.get(arena); // "Hi, World!"
+    return .{ .previous = previous, .current = current, .result = try run.get(arena) }; // result: "Hi, World!"
 }
 // end-example
 
@@ -215,7 +217,10 @@ test "client: examples against a dev server" {
 
     try std.testing.expectEqualStrings("Hello, Ada!", try startWorkflows(&client, arena));
 
-    try std.testing.expectEqualStrings("Hi, World!", try sendMessages(&client, arena));
+    const replies = try sendMessages(&client, arena);
+    try std.testing.expectEqualStrings("Hello", replies.previous);
+    try std.testing.expectEqualStrings("Hi", replies.current);
+    try std.testing.expectEqualStrings("Hi, World!", replies.result);
     var signaled = try client.getWorkflow([]const u8, "greeter-2", "");
     defer signaled.deinit();
     try std.testing.expectEqualStrings("Hello, Zig!", try signaled.get(arena));

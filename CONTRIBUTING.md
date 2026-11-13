@@ -35,7 +35,7 @@ The [bug report template](.github/ISSUE_TEMPLATE/bug_report.md) asks for these.
 
 Open or join an issue before starting substantial feature work, behavior changes, or API design changes. This gives maintainers and other users a chance to discuss the approach before you invest in a larger implementation.
 
-Check what is already planned first. [PARITY.md](PARITY.md) lists the samples the SDK measures its coverage against and which of them pass, and README.md has a section marked "Not implemented yet" for each planned capability that hasn't landed. A request for one of those is best made on its existing issue, or as a new issue that refers to the README section.
+Check what is already planned first. [PARITY.md](PARITY.md) lists the Zig samples that exist and the sample each one matches (whether they pass is the Samples badge on README.md, from `zig build samples-test`), and README.md has a section marked "Not implemented yet" for each planned capability that hasn't landed. A request for one of those is best made on its existing issue, or as a new issue that refers to the README section.
 
 Small bug fixes, documentation fixes, and narrowly scoped maintenance changes can go straight to a pull request.
 
