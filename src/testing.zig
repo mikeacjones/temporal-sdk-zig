@@ -763,6 +763,10 @@ pub const WorkflowReplayer = struct {
         /// (`worker.Options.interceptors`): workflow interceptors run during replay, and
         /// those that change commands must be present for the history to match.
         interceptors: []const interceptor.Worker = &.{},
+        /// The per-run memory limit to replay with (`worker.Options.workflow_memory_limit`).
+        /// A history whose run goes over it fails with `error.ReplayFailed`: set it to the
+        /// worker's value to check that its histories fit.
+        workflow_memory_limit: ?usize = null,
     };
 
     pub fn init(gpa: Allocator, io: Io) WorkflowReplayer {
@@ -955,6 +959,7 @@ pub const WorkflowReplayer = struct {
                     .task_queue = r.options.task_queue,
                     .namespace = r.options.namespace,
                     .stack_size = 256 * 1024,
+                    .memory_limit = r.options.workflow_memory_limit,
                     .codecs = r.options.codecs,
                     .propagators = r.options.propagators,
                     .interceptors = r.options.interceptors,
@@ -2116,6 +2121,20 @@ test "WorkflowReplayer replays a matching history and catches a nondeterministic
     defer changed.deinit();
     try changed.registerWorkflow(Fixtures.Different);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(hello_history));
+}
+
+test "WorkflowReplayer applies workflow_memory_limit: a history fits a generous limit and fails a tiny one" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    ok.options.workflow_memory_limit = 64 * 1024 * 1024;
+    try ok.registerWorkflow(Fixtures.Hello);
+    try ok.replayHistoryJson(hello_history);
+
+    var tiny: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer tiny.deinit();
+    tiny.options.workflow_memory_limit = 1;
+    try tiny.registerWorkflow(Fixtures.Hello);
+    try testing.expectError(error.ReplayFailed, tiny.replayHistoryJson(hello_history));
 }
 
 // Queries leave no trace in history, so registering query handlers must not change the
