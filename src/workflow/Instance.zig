@@ -7,11 +7,13 @@
 //! The run's memory (workflow state, decoded arguments, results kept by futures, and the
 //! coroutines' Task blocks) lives in an arena owned by the instance, reached through
 //! `arena()`, which counts the bytes requested from it. `memoryUsed` adds the coroutine
-//! stacks the run holds (in use or pooled) at the configured stack size. Both depend only on
-//! what the run did, so the same activations give the same figure on any worker and on
-//! replay. With `Options.memory_limit` set, `activate` compares the figure with the limit
-//! once all coroutines have blocked, and fails the workflow task (not the workflow) when the
-//! run is over it.
+//! stacks the run holds (in use or pooled) at the configured stack size. Both depend on what
+//! the run did, so the same activations give the same figure on any worker and on replay,
+//! except for allocations made only when not replaying: a side effect's encoded value (and
+//! the argument list carrying it) is counted where it first ran, and not when replayed. With
+//! `Options.memory_limit` set, `activate` compares the figure with the limit once all
+//! coroutines have blocked in an activation that ran them, and fails the workflow task (not
+//! the workflow) when the run is over it.
 //!
 //! When the core evicts the run, `destroy` tears it down in order: `teardown` marks the run
 //! evicting (from then on `emit` drops every command, so nothing reaches the core), cancels
@@ -571,11 +573,14 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     // An update-only activation whose updates were all rejected is not in history, so on
     // replay its coroutines could not run: they run only once an update is accepted (and core
     // rejects anything but rejections from it).
+    // The memory check, too, runs only when coroutines ran: an activation that only rejected
+    // updates is not in history either, so failing it would fail the task on this worker only.
     if (inst.task_failure == null and !query_only and !inst.finished) {
-        if (!update_only or inst.accepted_update) inst.runUntilQuiet();
+        const ran = !update_only or inst.accepted_update;
+        if (ran) inst.runUntilQuiet();
         try inst.rejectUnhandledUpdates();
         try inst.finishIfDone();
-        if (!inst.finished and inst.task_failure == null) try inst.checkMemoryLimit(out);
+        if (ran and !inst.finished and inst.task_failure == null) try inst.checkMemoryLimit(out);
     }
 
     var completion: done_pb.WorkflowActivationCompletion = .{ .run_id = act.run_id };
@@ -593,7 +598,8 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
 
 /// Fails the workflow task when the run holds more than `memory_limit`. Called once per
 /// activation that ran workflow code, after every coroutine blocked, so the figure is the
-/// same on every execution of the activation, replay included.
+/// same on every execution of the activation, replay included, apart from the side-effect
+/// values a cached run encoded when they first ran (see the namespace docs).
 fn checkMemoryLimit(inst: *Instance, out: Allocator) error{OutOfMemory}!void {
     const limit = inst.memory_limit orelse return;
     const used = inst.memoryUsed();
@@ -603,7 +609,7 @@ fn checkMemoryLimit(inst: *Instance, out: Allocator) error{OutOfMemory}!void {
     const message = try std.fmt.allocPrint(out, "workflow run holds {d} bytes ({d} allocated from ctx.allocator() and the runtime, {d} in {d} coroutine stacks), over worker.Options.workflow_memory_limit = {d}; raise the limit, or keep less state in the run (continue-as-new sooner)", .{ used, inst.allocated, stack_bytes, stacks, limit });
     inst.task_failure = message;
     inst.task_failure_type = "WorkflowMemoryLimitExceeded";
-    inst.logger.err("workflow run holds more memory than worker.Options.workflow_memory_limit; failing the workflow task. Raise the limit, or keep less state in the run (continue-as-new sooner)", .{
+    inst.logger.log(.err, message, .{
         .used = used,
         .allocated = inst.allocated,
         .stack_bytes = stack_bytes,
@@ -4753,6 +4759,44 @@ const MemoryHog = struct {
         return "woke";
     }
 };
+const Oversize = struct {
+    /// More than the largest pooled block size class.
+    const Big = [100_000]u8;
+    /// More aligned than pooled blocks.
+    const Wide = struct { v: u64 align(64) };
+
+    /// `rounds` times: starts and awaits, one after another, `n` coroutines with an oversize
+    /// result and `n` with an over-aligned argument, then sleeps.
+    fn run(ctx: *workflow.Context, n: usize, rounds: usize) !u64 {
+        const io = ctx.io();
+        var sum: u64 = 0;
+        for (0..rounds) |_| {
+            for (0..n) |i| {
+                var big = io.async(fill, .{ io, @as(u64, i) });
+                sum += big.await(io)[@sizeOf(Big) - 1];
+                var wide = io.async(widen, .{ io, Wide{ .v = i } });
+                sum += wide.await(io);
+            }
+            try io.sleep(.fromSeconds(1), .awake);
+        }
+        return sum;
+    }
+
+    // Each starts a small coroutine whose block, pooled once it finishes, is allocated after
+    // the oversize block: an arena can't reclaim a block with a later allocation behind it.
+    fn fill(io: std.Io, i: u64) Big {
+        var inner = io.async(MemoryHog.square, .{i});
+        var b: Big = undefined;
+        @memset(&b, @truncate(inner.await(io)));
+        return b;
+    }
+
+    fn widen(io: std.Io, w: Wide) u64 {
+        var inner = io.async(MemoryHog.square, .{w.v});
+        return inner.await(io);
+    }
+};
+const OversizeWf = workflow.Def("Oversize", Oversize.run);
 const MemoryHogWf = workflow.Def("MemoryHog", MemoryHog.run);
 const FuturesWf = workflow.Def("Futures", MemoryHog.futures);
 const StuckWf = workflow.Def("Stuck", MemoryHog.stuck);
@@ -4837,6 +4881,7 @@ test "a run over its memory limit fails the workflow task, the same way when rep
         const want = try std.fmt.allocPrint(a, "workflow run holds {d} bytes ({d} allocated from ctx.allocator() and the runtime, {d} in 1 coroutine stacks), over worker.Options.workflow_memory_limit = {d}; raise the limit, or keep less state in the run (continue-as-new sooner)", .{ used[2], used[2] - hog_stack, hog_stack, limit });
         try testing.expectEqualStrings(want, f.message);
         try testing.expectEqual(@as(usize, 1), recorder.count);
+        try testing.expectEqualStrings(want, recorder.message);
         try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{used[2]}), recorder.get("used").?);
         try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{limit}), recorder.get("limit").?);
     }
@@ -4882,6 +4927,56 @@ test "finished coroutines' blocks and stacks are reused" {
         u.* = inst.memoryUsed();
     }
     try testing.expectEqual(used[0], used[1]);
+}
+
+test "oversize and over-aligned coroutine blocks are reused: neither memoryUsed nor the arena grows" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, OversizeWf.registered, .{ .stack_size = 2 * 1024 * 1024 });
+    defer inst.destroy();
+    // Each activation runs 20 of each coroutine. Freed blocks that an arena couldn't reclaim
+    // would add 2 MB of arena per activation while memoryUsed() stayed flat.
+    var used: [3]usize = undefined;
+    var capacity: [3]usize = undefined;
+    for (&used, &capacity, 0..) |*u, *cap, i| {
+        const act = if (i == 0)
+            try initActivation(a, "Oversize", .{ @as(usize, 20), @as(usize, 3) })
+        else
+            try oneJob(a, .{ .fire_timer = .{ .seq = @intCast(i) } });
+        try testing.expect((try inst.activate(&act, a)).status.? == .successful);
+        u.* = inst.memoryUsed();
+        cap.* = inst.arena_state.queryCapacity();
+    }
+    // The finished oversize block is held for reuse, and counted.
+    try testing.expect(inst.allocated > @sizeOf(Oversize.Big));
+    try testing.expectEqual(used[0], used[1]);
+    try testing.expectEqual(used[1], used[2]);
+    try testing.expectEqual(capacity[0], capacity[1]);
+    try testing.expectEqual(capacity[1], capacity[2]);
+}
+
+test "an update-only activation that only rejects updates is not checked against the limit" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const used = try hogUsage(a, 4096, false);
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, MemoryHogWf.registered, .{ .stack_size = hog_stack, .memory_limit = used[0] - 1, .logger = recorder.sink() });
+    defer inst.destroy();
+    try testing.expect((try inst.activate(&try initActivation(a, "MemoryHog", .{ @as(usize, 4096), @as(usize, 3) }), a)).status.? == .failed);
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+
+    // Still over the limit, but no coroutine runs: the update is rejected and the task passes.
+    const rejected = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "nope", .{}, true)), a));
+    try testing.expectEqual(@as(usize, 1), rejected.len);
+    try testing.expectEqualStrings("UpdateNotRegistered", failure_mod.applicationType((try updateResponse(rejected[0], "u1")).rejected).?);
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+
+    // An activation that runs the coroutines is checked.
+    try testing.expect((try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)).status.? == .failed);
+    try testing.expectEqual(@as(usize, 2), recorder.count);
 }
 
 test "a coroutine that refuses to exit on eviction is reported, and the rest of the run is freed" {

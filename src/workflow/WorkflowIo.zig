@@ -32,6 +32,9 @@ const Fiber = Scheduler.Fiber;
 memory: Allocator,
 /// Finished blocks by size class (`block_min << i` bytes), linked through their first word.
 free_blocks: [block_classes]?*FreeBlock = @splat(null),
+/// Finished blocks too large or too aligned for a size class, for reuse by a block of the
+/// same length and alignment. The run's allocator is an arena, which can't reclaim them.
+free_oversize: ?*OversizeBlock = null,
 scheduler: *Scheduler,
 host: Host,
 rng: std.Random.DefaultPrng,
@@ -213,11 +216,24 @@ const block_classes = 11; // 64 bytes to 64 KiB
 const block_max = block_min << (block_classes - 1);
 const block_align: Alignment = .@"16";
 const FreeBlock = struct { next: ?*FreeBlock };
+const OversizeBlock = struct { next: ?*OversizeBlock, len: usize, alignment: Alignment };
+
+fn isOversize(size: usize, alignment: Alignment) bool {
+    return size > block_max or alignment.compare(.gt, block_align);
+}
 
 /// A block of at least `size` bytes. Pooled blocks are a whole size class long, so the
 /// returned slice may be longer than `size`; pass it unchanged to `freeBlock`.
 fn allocBlock(w: *WorkflowIo, size: usize, alignment: Alignment) error{OutOfMemory}![]u8 {
-    if (size > block_max or alignment.compare(.gt, block_align)) {
+    if (isOversize(size, alignment)) {
+        var link = &w.free_oversize;
+        while (link.*) |b| : (link = &b.next) {
+            if (b.len == size and b.alignment == alignment) {
+                link.* = b.next;
+                const p: [*]u8 = @ptrCast(b);
+                return p[0..size];
+            }
+        }
         return (w.memory.rawAlloc(size, alignment, @returnAddress()) orelse return error.OutOfMemory)[0..size];
     }
     const class = blockClass(size);
@@ -231,8 +247,12 @@ fn allocBlock(w: *WorkflowIo, size: usize, alignment: Alignment) error{OutOfMemo
 }
 
 fn freeBlock(w: *WorkflowIo, mem: []u8, alignment: Alignment) void {
-    if (mem.len > block_max or alignment.compare(.gt, block_align)) {
-        w.memory.rawFree(mem, alignment, @returnAddress());
+    if (isOversize(mem.len, alignment)) {
+        // Only Task blocks are oversize, and a Task has room and alignment for the link.
+        comptime assert(@sizeOf(Task) >= @sizeOf(OversizeBlock) and @alignOf(Task) >= @alignOf(OversizeBlock));
+        const b: *OversizeBlock = @ptrCast(@alignCast(mem.ptr));
+        b.* = .{ .next = w.free_oversize, .len = mem.len, .alignment = alignment };
+        w.free_oversize = b;
         return;
     }
     const class = blockClass(mem.len);
@@ -261,6 +281,11 @@ pub fn releasePooledBlocks(w: *WorkflowIo) void {
             const p: [*]u8 = @ptrCast(b);
             w.memory.rawFree(p[0..len], block_align, @returnAddress());
         }
+    }
+    while (w.free_oversize) |b| {
+        w.free_oversize = b.next;
+        const p: [*]u8 = @ptrCast(b);
+        w.memory.rawFree(p[0..b.len], b.alignment, @returnAddress());
     }
 }
 
