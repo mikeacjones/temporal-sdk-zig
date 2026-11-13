@@ -82,6 +82,7 @@ pub const Options = struct {
     };
 
     pub const SlotSupplier = union(enum) {
+        /// Counts above `max_fixed_slots` are lowered to it.
         fixed: usize,
         resource_based: struct {
             minimum_slots: usize,
@@ -368,12 +369,17 @@ fn finishDone(gpa: Allocator, fail: ?bytes.Owned, failure: ?*?[]u8, comptime err
     return err;
 }
 
+/// The most slots a fixed slot supplier takes: the core's semaphore panics above it (tokio's
+/// `Semaphore::MAX_PERMITS`), and a panic across the C boundary aborts the process. Larger
+/// counts mean "unlimited" just the same.
+pub const max_fixed_slots: usize = std.math.maxInt(usize) >> 3;
+
 fn slotSupplier(s: Options.SlotSupplier) c.TemporalCoreSlotSupplier {
     var out = std.mem.zeroes(c.TemporalCoreSlotSupplier);
     switch (s) {
         .fixed => |n| {
             out.tag = c.TemporalCoreSlotSupplier_FixedSize;
-            out.unnamed_0.unnamed_0.fixed_size = .{ .num_slots = n };
+            out.unnamed_0.unnamed_0.fixed_size = .{ .num_slots = @min(n, max_fixed_slots) };
         },
         .resource_based => |r| {
             out.tag = c.TemporalCoreSlotSupplier_ResourceBased;
@@ -431,6 +437,13 @@ fn encode(msg: anytype, a: Allocator) ![]const u8 {
 fn decode(comptime T: type, data: []const u8, a: Allocator) !T {
     var r: std.Io.Reader = .fixed(data);
     return T.decode(&r, a);
+}
+
+test "a fixed slot count above the core's limit is lowered to it" {
+    const huge = slotSupplier(.{ .fixed = std.math.maxInt(usize) });
+    try std.testing.expect(huge.tag == c.TemporalCoreSlotSupplier_FixedSize);
+    try std.testing.expectEqual(max_fixed_slots, huge.unnamed_0.unnamed_0.fixed_size.num_slots);
+    try std.testing.expectEqual(5, slotSupplier(.{ .fixed = 5 }).unnamed_0.unnamed_0.fixed_size.num_slots);
 }
 
 test "a workflow started by RPC is polled, completed, and shut down through the core" {

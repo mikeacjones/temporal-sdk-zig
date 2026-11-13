@@ -75,6 +75,11 @@ pub const Options = struct {
 };
 
 /// How a worker hosts sessions (`Options.sessions`).
+///
+/// Session activities run on the host queue with a slot pool of their own,
+/// `max_concurrent_activity_executions + max_concurrent_sessions` slots, separate from the
+/// main task queue's `max_concurrent_activity_executions`: one host may run both pools'
+/// activities at once.
 pub const SessionWorkerOptions = struct {
     /// How many sessions this worker holds open at once, recreated ones included; must be
     /// positive. A full worker stops taking new sessions from the shared queue, and refuses a
@@ -82,6 +87,8 @@ pub const SessionWorkerOptions = struct {
     ///
     /// Known limit: a worker filled by recreated sessions still takes new sessions from the
     /// shared queue and refuses them the same way, even when another worker has room.
+    ///
+    /// `std.math.maxInt(usize)` means no limit; the host queue's slot count saturates.
     max_concurrent_sessions: usize = 1000,
 };
 
@@ -318,7 +325,7 @@ pub const Worker = struct {
         if (w.options.sessions) |o| {
             host = try SessionHost.init(w, o.max_concurrent_sessions);
             // Session queues are unversioned, so a rollout can't strand a host's sessions.
-            for ([_][]const u8{ host.?.creation_queue, host.?.host_queue }, [_]usize{ o.max_concurrent_sessions, w.options.max_concurrent_activity_executions + o.max_concurrent_sessions }) |queue, slots| {
+            for ([_][]const u8{ host.?.creation_queue, host.?.host_queue }, sessionSlots(w.options.max_concurrent_activity_executions, o.max_concurrent_sessions)) |queue, slots| {
                 activity_cores[core_count] = .{ .task_queue = queue, .core = try w.createCore(created_on, .{
                     .namespace = w.client.namespace,
                     .task_queue = queue,
@@ -412,6 +419,13 @@ pub const Worker = struct {
     }
 
     /// Creates and validates a core worker; logs and returns the error on failure.
+    /// The activity slots of the session queue and of the host queue, which runs session
+    /// activities beside the main queue's own pool. Saturates, so "unlimited" counts can't
+    /// overflow; the bridge lowers them to what the core takes.
+    fn sessionSlots(max_activities: usize, max_sessions: usize) [2]usize {
+        return .{ max_sessions, max_activities +| max_sessions };
+    }
+
     fn createCore(w: *Worker, connection: bridge.Connection, options: bridge.Worker.Options, message: *?[]u8) RunError!bridge.Worker {
         const core = bridge.Worker.init(w.gpa, connection, options, message) catch |err| {
             log.err("creating the worker for task queue {s} failed: {s}", .{ options.task_queue, message.* orelse @errorName(err) });
@@ -1479,6 +1493,13 @@ test "a session worker with no session slots is rejected before it starts" {
     try w.registerActivity(HelloTest.Greet);
     try testing.expectError(error.InvalidOptions, w.run());
     try testing.expectError(error.WorkerFailedToStart, w.waitUntilRunning());
+}
+
+test "session slot counts saturate instead of overflowing" {
+    const max = std.math.maxInt(usize);
+    try testing.expectEqual([2]usize{ 3, 103 }, Worker.sessionSlots(100, 3));
+    try testing.expectEqual([2]usize{ max, max }, Worker.sessionSlots(100, max));
+    try testing.expectEqual([2]usize{ 1, max }, Worker.sessionSlots(max, 1));
 }
 
 test "versioning options map to the core's strategy, and contradictions are rejected" {
