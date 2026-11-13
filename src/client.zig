@@ -51,7 +51,8 @@ pub const Options = struct {
     /// and activity payloads. Search attributes are never encoded. A codec that sets
     /// `encodeWithContext` and `decodeWithContext` sees each call's `converter.CodecContext`:
     /// its propagated values and the workflow or activity it is for. Borrowed: the slice and
-    /// the codecs must outlive the client and its workers.
+    /// the codecs must outlive the client and its workers. Called concurrently: workers run
+    /// them from the threads that process workflow activations and run activities.
     codecs: []const converter.PayloadCodec = &.{},
     /// Where sdk-core's logs go, and the default for every worker on this client (see
     /// `worker.Options.logger`). Null uses `log.Sink.std_log`. Borrowed: it must outlive the

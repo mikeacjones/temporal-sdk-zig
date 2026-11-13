@@ -1336,6 +1336,47 @@ const Fixtures = struct {
     }
     const LocalGreetingsChanged = workflow.Def("LocalGreetings", remoteGreetings);
 
+    /// `waitCancellation` with a summary, a priority, and a versioning intent on its activity.
+    fn waitCancellationDescribed(ctx: *workflow.Context) ![]const u8 {
+        try ctx.executeActivity(HeartbeatUntilCanceled, .{
+            .start_to_close_timeout = .fromSeconds(60),
+            .heartbeat_timeout = .fromSeconds(5),
+            .cancellation_type = .wait_cancellation_completed,
+            .summary = "heartbeat until canceled",
+            .priority = .{ .priority_key = 2, .fairness_key = "tenant-a" },
+            .versioning_intent = .default,
+        }, .{}).get();
+        return "not canceled";
+    }
+    const WaitCancellationDescribed = workflow.Def("WaitCancellation", waitCancellationDescribed);
+
+    /// `localGreetings` with a summary on each local activity.
+    fn localGreetingsDescribed(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const first = try ctx.executeLocalActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10), .summary = "greet" }, .{name}).get();
+        const second = try ctx.executeLocalActivity(FlakyGreet, .{
+            .start_to_close_timeout = .fromSeconds(10),
+            .retry_policy = .{ .initial_interval = .fromSeconds(1), .backoff_coefficient = 1 },
+            .local_retry_threshold = .fromMilliseconds(500),
+            .summary = "greet, eventually",
+        }, .{name}).get();
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ first, second });
+    }
+    const LocalGreetingsDescribed = workflow.Def("LocalGreetings", localGreetingsDescribed);
+
+    /// Runs `Greet` with a summary, a priority, and the default build's versioning intent, then
+    /// as a local activity with a summary.
+    fn describedGreetings(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const remote = try ctx.executeActivity(Greet, .{
+            .start_to_close_timeout = .fromSeconds(10),
+            .summary = "greet remotely",
+            .priority = .{ .priority_key = 2, .fairness_key = "tenant-a", .fairness_weight = 1.5 },
+            .versioning_intent = .default,
+        }, .{name}).get();
+        const local = try ctx.executeLocalActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10), .summary = "greet locally" }, .{name}).get();
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ remote, local });
+    }
+    const DescribedGreetings = workflow.Def("DescribedGreetings", describedGreetings);
+
     /// Waits on a timer only when run on an environment's task queue ("test-..."), so its
     /// history replays only with that task queue.
     fn queueDependent(ctx: *workflow.Context) ![]const u8 {
@@ -2222,6 +2263,53 @@ test "WorkflowReplayer replays a workflow that waits for its activity's cancella
     defer ok.deinit();
     try ok.registerWorkflow(Fixtures.WaitCancellation);
     try ok.replayHistoryJson(wait_cancellation_history);
+}
+
+test "WorkflowReplayer: an activity's summary, priority and versioning intent don't affect replay" {
+    var remote: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer remote.deinit();
+    try remote.registerWorkflow(Fixtures.WaitCancellationDescribed);
+    try remote.replayHistoryJson(wait_cancellation_history);
+
+    var local: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer local.deinit();
+    try local.registerWorkflow(Fixtures.LocalGreetingsDescribed);
+    try local.replayHistoryJson(local_activity_history);
+}
+
+test "activity summary, priority and versioning intent are recorded in history" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.DescribedGreetings);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(Fixtures.DescribedGreetings, .{}, .{"Ann"});
+    defer run.deinit();
+    // Replays the run too.
+    try testing.expectEqualStrings("Hello Ann! Hello Ann!", try env.getResult(Fixtures.DescribedGreetings, &run, a, null));
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var scheduled_seen = false;
+    var marker_seen = false;
+    for (history.events.items) |event| switch (event.attributes.?) {
+        .activity_task_scheduled_event_attributes => |attrs| {
+            scheduled_seen = true;
+            try StartOptionFixtures.expectMetadata(a, event, "greet remotely", "");
+            try testing.expectEqual(@as(i32, 2), attrs.priority.?.priority_key);
+            try testing.expectEqualStrings("tenant-a", attrs.priority.?.fairness_key);
+            try testing.expectEqual(@as(f32, 1.5), attrs.priority.?.fairness_weight);
+            try testing.expect(!attrs.use_workflow_build_id);
+        },
+        .marker_recorded_event_attributes => {
+            marker_seen = true;
+            try StartOptionFixtures.expectMetadata(a, event, "greet locally", "");
+        },
+        else => {},
+    };
+    try testing.expect(scheduled_seen and marker_seen);
 }
 
 /// A dev-server run of `SignalFixtures.CollectApprovals` signaled "ann" while it slept, before
