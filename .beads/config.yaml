@@ -1,2 +1,2 @@
 sync:
-    remote: "git+https://github.com/mikeacjones/temporal-sdk-zig.git"
+    # remote: "git+https://github.com/mikeacjones/temporal-sdk-zig.git"
