@@ -23,6 +23,7 @@ zig fetch --save=temporal https://github.com/mikeacjones/temporal-sdk-zig/releas
 
 and import the module in `build.zig`:
 
+<!-- example: unchecked -->
 ```zig
 const temporal = b.dependency("temporal", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("temporal", temporal.module("temporal"));
@@ -36,6 +37,7 @@ To build from source instead, for another target or for unreleased changes, clon
 git clone --recursive https://github.com/mikeacjones/temporal-sdk-zig
 ```
 
+<!-- example: unchecked -->
 ```zig
 .dependencies = .{
     .temporal = .{ .path = "../temporal-sdk-zig" },
@@ -75,7 +77,11 @@ The SDK measures its feature coverage with a set of samples, each demonstrating 
 zig build test           # unit tests; builds the Rust core with cargo on first run
 zig build fmt            # check formatting
 zig build samples-test   # build the samples and validate them against a dev server
+zig build readme-check   # check that README.md's code blocks equal their examples
+zig build readme         # rewrite README.md's code blocks from examples/readme
 ```
+
+README.md's code blocks are copies of regions in `examples/readme/`, which `zig build test` compiles and runs, and `zig build test` fails when a copy differs from its region.
 
 A clean build of the Rust core takes a minute or two. Later builds reuse it from `.zig-cache/cargo-target`. To skip cargo, pass a prebuilt core library with `-Dcore-lib=<path>`, or an extracted core bundle (library and header, from `scripts/package-core-bundle.sh`) with `-Dcore-bundle=<dir>`.
 
