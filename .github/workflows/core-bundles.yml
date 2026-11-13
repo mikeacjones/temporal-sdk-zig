@@ -1,0 +1,239 @@
+name: Core bundles
+# Builds a core bundle (scripts/package-core-bundle.sh) per tier-1 target, tests the SDK
+# against each one without cargo, and publishes them as a pre-release tagged
+# core-<CORE_VERSION>-r<revision>. build.zig.zon pins the bundles as core-<CORE_VERSION>-<target>.
+# The job summary lists each bundle's hashes and build.zig.zon entry, in dry runs too.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Bundle revision for this CORE_VERSION (positive integer; the tag is core-<CORE_VERSION>-r<revision>)
+        required: true
+        type: string
+      dry_run:
+        description: Build and test the bundles without publishing them
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-bundles
+  cancel-in-progress: false
+
+# An explicit bash runs with -o pipefail, so a step that pipes a build into tee fails with it.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the inputs and the tag
+        id: tag
+        env:
+          REVISION: ${{ inputs.revision }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if ! [[ "$REVISION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::revision must be a positive integer, got '$REVISION'"
+            exit 1
+          fi
+          tag="core-$(tr -d '[:space:]' < CORE_VERSION)-r$REVISION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::tag $tag already exists; dispatch again with a higher revision"
+            exit 1
+          fi
+          if [ "$DRY_RUN" != true ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::bundles are published only from main, not $GITHUB_REF; dispatch on main or set dry_run"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  bundle:
+    name: bundle (${{ matrix.platform.target }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each bundle is built and tested on a runner of its own target. The musl rows build on
+        # a glibc runner and run the static test binary natively.
+        platform:
+          - { target: x86_64-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: aarch64-macos, os: macos-latest }
+          - { target: x86_64-macos, os: macos-26-intel }
+          - { target: x86_64-linux-musl, os: ubuntu-latest, rust-target: x86_64-unknown-linux-musl }
+          - { target: aarch64-linux-musl, os: ubuntu-24.04-arm, rust-target: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+          use-cache: false
+
+      - name: Install the Rust toolchain pinned in deps/rust-toolchain.toml
+        run: rustup toolchain install --profile minimal
+        working-directory: deps
+
+      # cc-rs compiles the core's C dependencies (aws-lc, ring, zstd) with CC_<rust target>.
+      - name: Install the musl Rust target and C compiler
+        if: matrix.platform.rust-target
+        working-directory: deps
+        run: |
+          rustup target add ${{ matrix.platform.rust-target }}
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          echo "CC_$(echo '${{ matrix.platform.rust-target }}' | tr - _)=musl-gcc" >> "$GITHUB_ENV"
+
+      # A bundle is built from scratch: reusing CI's cargo cache would tie a published library
+      # to whatever an earlier run left in the target directory.
+      - name: Pack the core bundle
+        id: pack
+        run: |
+          scripts/package-core-bundle.sh ${{ matrix.platform.target }} "$RUNNER_TEMP/dist" | tee "$RUNNER_TEMP/pack.txt"
+          awk -F': ' '{ key = $1; sub(/-/, "_", key); print key "=" $2 }' "$RUNNER_TEMP/pack.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Extract the bundle
+        id: extract
+        run: |
+          mkdir -p "$RUNNER_TEMP/bundle"
+          tar -xJf "${{ steps.pack.outputs.archive }}" -C "$RUNNER_TEMP/bundle" --strip-components=1
+          cat "$RUNNER_TEMP/bundle/manifest.json"
+          echo "dir=$RUNNER_TEMP/bundle" >> "$GITHUB_OUTPUT"
+
+      # Removes cargo from PATH so the build can only use the bundle.
+      - name: Unit tests against the bundle, without cargo
+        run: |
+          PATH="$(echo "$PATH" | tr : '\n' | grep -v '/\.cargo/bin$' | paste -sd: -)"
+          if command -v cargo; then
+            echo "::error::cargo is still on PATH; the bundle test must not be able to run it"
+            exit 1
+          fi
+          rm -rf .zig-cache/cargo-target
+          zig build test -Dtarget=${{ matrix.platform.target }} -Dcore-bundle="${{ steps.extract.outputs.dir }}" --summary all
+
+      - name: Check the test binary's linking
+        run: |
+          bin=$(ls -t .zig-cache/o/*/test | head -1)
+          file "$bin"
+          case "${{ matrix.platform.target }}" in
+            *-linux-musl)
+              file "$bin" | grep -Eq 'statically linked|static-pie linked' ;;
+            *-linux-gnu)
+              glibc=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
+              echo "${{ matrix.platform.target }} needs $glibc" | tee -a "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
+      - name: Record the bundle's hashes
+        run: |
+          printf '%s %s %s %s\n' "${{ matrix.platform.target }}" "$(basename "${{ steps.pack.outputs.archive }}")" \
+            "${{ steps.pack.outputs.sha256 }}" "${{ steps.pack.outputs.zig_hash }}" > "$RUNNER_TEMP/dist/${{ matrix.platform.target }}.hashes"
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: core-bundle-${{ matrix.platform.target }}
+          path: |
+            ${{ steps.pack.outputs.archive }}
+            ${{ runner.temp }}/dist/${{ matrix.platform.target }}.hashes
+          if-no-files-found: error
+          compression-level: 0
+
+  summary:
+    needs: [check, bundle]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the bundles' hashes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: core-bundle-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write the hashes and build.zig.zon entries
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          version=$(tr -d '[:space:]' < CORE_VERSION)
+          {
+            echo "## Core bundles for sdk-core $version ($TAG)"
+            if [ "$DRY_RUN" = true ]; then echo "Dry run: nothing is published."; fi
+            echo
+            echo '| Target | Archive | SHA-256 | Zig hash |'
+            echo '| --- | --- | --- | --- |'
+            sort dist/*.hashes | while read -r target archive sha zig_hash; do
+              echo "| $target | $archive | \`$sha\` | \`$zig_hash\` |"
+            done
+            echo
+            echo 'build.zig.zon entries:'
+            echo
+            echo '```zig'
+            sort dist/*.hashes | while read -r target archive sha zig_hash; do
+              echo "        .@\"core-$version-$target\" = .{"
+              echo "            .url = \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG/$archive\","
+              echo "            .hash = \"$zig_hash\","
+              echo "            .lazy = true,"
+              echo "        },"
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: [check, bundle, summary]
+    if: inputs.dry_run == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the bundles
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: core-bundle-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          rm -- *.hashes
+          sha256sum -- *.tar.xz > SHA256SUMS
+          cat SHA256SUMS
+
+      # The release is created as a draft so it never shows up without all of its assets.
+      # gh would reuse an existing tag, so check again that the tag is still free.
+      - name: Publish the pre-release
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG was created while this run was building; dispatch again with a higher revision"
+            exit 1
+          fi
+          version=$(tr -d '[:space:]' < CORE_VERSION)
+          gh release create "$TAG" --draft --prerelease --target "$GITHUB_SHA" \
+            --title "Core bundles: sdk-core $version (r${{ inputs.revision }})" \
+            --notes "Prebuilt sdk-core C bridge libraries for sdk-core $version, one per tier-1 target. build.zig.zon pins them as core-$version-<target>; the workflow run's summary lists the entries." \
+            dist/*
+          gh release edit "$TAG" --draft=false

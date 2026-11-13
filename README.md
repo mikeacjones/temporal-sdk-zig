@@ -130,7 +130,7 @@ zig build fmt            # check formatting
 zig build samples-test   # build the samples and validate them against a dev server
 ```
 
-A clean build of the Rust core takes a minute or two. Later builds reuse it from `.zig-cache/cargo-target`. To skip cargo, pass a prebuilt core library with `-Dcore-lib=<path>`.
+A clean build of the Rust core takes a minute or two. Later builds reuse it from `.zig-cache/cargo-target`. To skip cargo, pass a prebuilt core library with `-Dcore-lib=<path>`, or an extracted core bundle (library and header, from `scripts/package-core-bundle.sh`) with `-Dcore-bundle=<dir>`.
 
 Fiber and workflow runtime code must pass in optimized builds too:
 

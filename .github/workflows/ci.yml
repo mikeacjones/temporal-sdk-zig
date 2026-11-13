@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# An explicit bash runs with -o pipefail, so a step that pipes a build into tee fails with it.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   check:
     runs-on: ubuntu-latest

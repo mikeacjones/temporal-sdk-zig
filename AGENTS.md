@@ -34,7 +34,7 @@ zig build samples-test
 scripts/check-core-version.sh
 ```
 
-A clean build of the Rust core takes a minute or two; later builds reuse `.zig-cache/cargo-target`. Pass `-Dcore-lib=<path>` to link a prebuilt core library instead, and `-Dprotoc=<path>` to override the pinned `protoc` that cargo uses.
+A clean build of the Rust core takes a minute or two; later builds reuse `.zig-cache/cargo-target`. Pass `-Dcore-lib=<path>` to link a prebuilt core library instead (the header still comes from the submodule), `-Dcore-bundle=<dir>` to link an extracted core bundle from `scripts/package-core-bundle.sh` (library and header), and `-Dprotoc=<path>` to override the pinned `protoc` that cargo uses. Without the submodule and either option, build.zig links the bundle that build.zig.zon pins as `core-<CORE_VERSION>-<target>`, and fails naming the target if there is none. `.github/workflows/core-bundles.yml` builds and publishes the bundles.
 
 Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md).
 
