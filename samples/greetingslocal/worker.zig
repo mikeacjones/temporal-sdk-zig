@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     // Local activities are registered like any other activity; the workflow chooses to run
     // them locally.
     var activities: greetingslocal.Activities = .{ .name = "Temporal", .greeting = "Hello" };
-    try w.registerActivitiesWith(&activities, .{ greetingslocal.GetGreeting, greetingslocal.GetName, greetingslocal.SayGreeting });
+    try w.registerActivities(&activities, greetingslocal.activities);
 
     w.runUntilSignal() catch |err| {
         std.log.err("Unable to start worker: {t}", .{err});

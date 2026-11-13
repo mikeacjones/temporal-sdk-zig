@@ -27,9 +27,9 @@ test "workflow with test doubles for its activities" {
     const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
     try env.registerWorkflow(greetings.Greetings);
-    try env.registerActivityAs(greetings.GetGreeting, Doubles.getGreeting);
-    try env.registerActivityAs(greetings.GetName, Doubles.getName);
-    try env.registerActivityAs(greetings.SayGreeting, Doubles.sayGreeting);
+    try env.registerActivityAs(greetings.activities.getGreeting, Doubles.getGreeting);
+    try env.registerActivityAs(greetings.activities.getName, Doubles.getName);
+    try env.registerActivityAs(greetings.activities.sayGreeting, Doubles.sayGreeting);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -42,6 +42,6 @@ test "activities read their shared state" {
     defer arena.deinit();
     var activities: greetings.Activities = .{ .name = "Temporal", .greeting = "Hello" };
     const env: temporal.testing.ActivityEnvironment = .init(testing.io);
-    try testing.expectEqualStrings("Hello", try env.executeActivityWith(greetings.GetGreeting, &activities, .{}, arena.allocator()));
-    try testing.expectEqualStrings("Greeting: Hello Temporal!\n", try env.executeActivityWith(greetings.SayGreeting, &activities, .{ "Hello", "Temporal" }, arena.allocator()));
+    try testing.expectEqualStrings("Hello", try env.executeActivityWith(greetings.activities.getGreeting, &activities, .{}, arena.allocator()));
+    try testing.expectEqualStrings("Greeting: Hello Temporal!\n", try env.executeActivityWith(greetings.activities.sayGreeting, &activities, .{ "Hello", "Temporal" }, arena.allocator()));
 }
