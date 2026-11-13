@@ -126,6 +126,14 @@ accepted_update: bool = false,
 /// Signal and update handler coroutines that have not returned, in start order. Each removes
 /// itself when its handler returns; `destroy` cancels the rest.
 handlers: std.ArrayList(*HandlerRun) = .empty,
+/// A struct workflow's state (`W`), from `workflow.Registered.init_run`. Arena memory.
+run_state: ?*anyopaque = null,
+/// Set from a struct workflow's initialization until its `run` is called: handler runs go to
+/// `held_handlers` instead of starting, so none runs before `run` or for a run whose
+/// arguments didn't decode.
+holding_handlers: bool = false,
+/// Signal and update handler runs waiting for `releaseHandlers`, in arrival order. Arena memory.
+held_handlers: std.ArrayList(*HandlerRun) = .empty,
 /// The latest `requestContinueAsNew`, sent if the workflow function returns
 /// error.ContinueAsNew. Arena memory.
 continue_as_new: ?cmd_pb.ContinueAsNewWorkflowExecution = null,
@@ -663,14 +671,26 @@ fn respondToUpdate(inst: *Instance, protocol_instance_id: []const u8, response: 
     } } });
 }
 
-/// Spawns a handler coroutine for `run` and tracks it in `handlers`.
+/// Spawns a handler coroutine for `run` and tracks it in `handlers`, or holds it until
+/// `releaseHandlers`.
 fn startHandler(inst: *Instance, run: *HandlerRun) error{OutOfMemory}!void {
+    if (inst.holding_handlers) return inst.held_handlers.append(inst.arena(), run);
     try inst.handlers.ensureUnusedCapacity(inst.arena(), 1);
     run.task = inst.wio.spawn(@tagName(run.kind), handlerMain, .{ inst, run }) catch |err| {
         inst.logger.warn("starting a handler coroutine failed", .{ .HandlerName = run.name, .error_name = err });
         return error.OutOfMemory;
     };
     inst.handlers.appendAssumeCapacity(run);
+}
+
+/// Starts the handler runs held since a struct workflow's initialization, in arrival order;
+/// later ones start on delivery. Called by the struct workflow's `invoke` before `run`.
+pub fn releaseHandlers(inst: *Instance) error{OutOfMemory}!void {
+    if (!inst.holding_handlers) return;
+    inst.holding_handlers = false;
+    const held = inst.held_handlers.items;
+    inst.held_handlers = .empty;
+    for (held) |run| try inst.startHandler(run);
 }
 
 fn handlerMain(inst: *Instance, run: *HandlerRun) void {
@@ -861,6 +881,12 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
     inst.inbound = inbound.items;
     inst.outbound = outbound.items;
     inst.wio.setRandomSeed(init.randomness_seed);
+    // Registered before the activation's signals and updates, which core delivers after
+    // InitializeWorkflow, so they reach the declared handlers.
+    if (inst.entry.init_run) |init_run| {
+        inst.holding_handlers = true;
+        inst.run_state = try init_run(&inst.ctx);
+    }
     inst.root = try inst.wio.spawn("workflow", rootMain, .{inst});
 }
 
@@ -893,6 +919,14 @@ fn finishIfDone(inst: *Instance) !void {
             try names.appendSlice(a, signal.name);
         }
         inst.logger.warn("the workflow finished with signals no handler was registered for; they are dropped", .{ .count = inst.buffered_signals.items.len, .SignalNames = names.items });
+    }
+    if (inst.held_handlers.items.len > 0) {
+        var names: std.ArrayList(u8) = .empty;
+        for (inst.held_handlers.items, 0..) |run, i| {
+            if (i > 0) try names.appendSlice(a, ", ");
+            try names.appendSlice(a, run.name);
+        }
+        inst.logger.warn("the workflow finished before its run method was called (its arguments didn't decode, or an interceptor didn't call next); its signals and updates are dropped", .{ .count = inst.held_handlers.items.len, .HandlerNames = names.items });
     }
     switch (outcome) {
         .completed => |result| try inst.commands.append(a, .{ .variant = .{
@@ -4223,4 +4257,196 @@ test "continue-as-new: history length, size and suggestion follow each activatio
     try testing.expectEqual(@as(u32, 8), inst.ctx.historyLength());
     try testing.expectEqual(@as(u64, 800), inst.ctx.historySizeBytes());
     try testing.expect(inst.ctx.continueAsNewSuggested());
+}
+
+// Struct workflows: handlers declared on the workflow type and registered at initialization.
+// `Account.events` records what `run` and the handlers did, in order.
+const StructWorkflows = struct {
+    const Deposit = workflow.SignalDef("deposit", fn (amount: i64) void);
+    const Withdraw = workflow.SignalDef("withdraw", fn (amount: i64) void);
+    const Close = workflow.SignalDef("close", fn () void);
+    const Balance = workflow.QueryDef("balance", fn () i64);
+    const SetLimit = workflow.UpdateDef("set_limit", fn (limit: i64) i64);
+
+    const Account = struct {
+        ctx: *workflow.Context = undefined,
+        events: std.ArrayList(u8) = .empty,
+        balance: i64 = 0,
+        limit: i64 = 100,
+        closed: bool = false,
+
+        // `deposit` is declared before `withdraw`, so arrival order differs from declaration
+        // order in the tests that send `withdraw` first.
+        pub const queries = .{ .currentBalance = Balance };
+        pub const signals = .{ .deposit = Deposit, .withdraw = Withdraw, .close = Close };
+        pub const updates = .{ .setLimit = .{ SetLimit, .checkLimit } };
+
+        pub fn run(s: *Account, ctx: *workflow.Context, opening: i64) ![]const u8 {
+            s.ctx = ctx;
+            try s.note("run {d}", .{opening});
+            s.balance += opening;
+            try ctx.await(s, isClosed);
+            try ctx.await(ctx, workflow.Context.allHandlersFinished);
+            return s.events.items;
+        }
+        fn note(s: *Account, comptime fmt: []const u8, args: anytype) !void {
+            const a = s.ctx.allocator();
+            if (s.events.items.len > 0) try s.events.append(a, ',');
+            try s.events.print(a, fmt, args);
+        }
+        pub fn currentBalance(s: *Account) i64 {
+            return s.balance;
+        }
+        pub fn deposit(s: *Account, amount: i64) !void {
+            try s.note("deposit {d}", .{amount});
+            s.balance += amount;
+        }
+        pub fn withdraw(s: *Account, amount: i64) !void {
+            try s.note("withdraw {d}", .{amount});
+            s.balance -= amount;
+        }
+        pub fn close(s: *Account) void {
+            s.closed = true;
+        }
+        /// Returns the previous limit.
+        pub fn setLimit(s: *Account, limit: i64) !i64 {
+            try s.note("limit {d}", .{limit});
+            defer s.limit = limit;
+            return s.limit;
+        }
+        /// Reads only `balance`, which is 0 in `Account{}` and set by `run`.
+        pub fn checkLimit(s: *Account, limit: i64) error{LimitBelowBalance}!void {
+            if (limit < s.balance) return error.LimitBelowBalance;
+        }
+        fn isClosed(s: *Account) bool {
+            return s.closed;
+        }
+    };
+
+    const Ping = workflow.SignalDef("ping", fn () void);
+    const Extra = workflow.SignalDef("extra", fn () void);
+
+    /// Declares `ping`, then replaces its handler from `run` and adds `extra` at run time.
+    const Rewired = struct {
+        pings: []const u8 = "",
+        extras: u32 = 0,
+
+        pub const signals = .{ .declaredPing = Ping };
+
+        pub fn run(s: *Rewired, ctx: *workflow.Context) ![]const u8 {
+            try ctx.setSignalHandler(Ping, s, Rewired.runtimePing);
+            try ctx.setSignalHandler(Extra, s, Rewired.extra);
+            try ctx.await(s, twoExtras);
+            return s.pings;
+        }
+        pub fn declaredPing(s: *Rewired) void {
+            s.pings = "declared";
+        }
+        fn runtimePing(s: *Rewired) void {
+            s.pings = "runtime";
+        }
+        fn extra(s: *Rewired) void {
+            s.extras += 1;
+        }
+        fn twoExtras(s: *Rewired) bool {
+            return s.extras == 2;
+        }
+    };
+};
+const AccountWf = workflow.Def("Account", StructWorkflows.Account);
+const RewiredWf = workflow.Def("Rewired", StructWorkflows.Rewired);
+
+fn accountOf(inst: *Instance) *StructWorkflows.Account {
+    return @ptrCast(@alignCast(inst.run_state.?));
+}
+
+test "struct workflow: signals and updates sent with the start reach the declared handlers in arrival order, once run blocks" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, AccountWf.registered, .{});
+    defer inst.destroy();
+
+    // The validator runs on delivery, before `run`, and sees Account{} (balance 0), so a limit
+    // of 10 passes it although `run` makes the balance 50.
+    var start = try initActivation(a, "Account", .{@as(i64, 50)});
+    try start.jobs.append(a, .{ .variant = try signalJob(a, "withdraw", .{@as(i64, 20)}) });
+    try start.jobs.append(a, .{ .variant = try updateJob(a, "u1", "set_limit", .{@as(i64, 10)}, true) });
+    try start.jobs.append(a, .{ .variant = try signalJob(a, "deposit", .{@as(i64, 5)}) });
+    const first = commandsOf(try inst.activate(&start, a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expect(try updateResponse(first[0], "u1") == .accepted);
+    try testing.expectEqualStrings("100", (try updateResponse(first[1], "u1")).completed.data);
+    try testing.expectEqual(@as(usize, 0), inst.buffered_signals.items.len);
+    try testing.expectEqual(@as(usize, 0), inst.buffered_updates.items.len);
+    try testing.expectEqualStrings("run 50,withdraw 20,limit 10,deposit 5", accountOf(inst).events.items);
+
+    // Now the validator sees the balance `run` and the handlers left (35). On replay it
+    // doesn't run, so the same update is accepted.
+    var later = try oneJob(a, try updateJob(a, "u2", "set_limit", .{@as(i64, 10)}, true));
+    try later.jobs.append(a, .{ .variant = try updateJob(a, "u3", "set_limit", .{@as(i64, 20)}, false) });
+    const second = commandsOf(try inst.activate(&later, a));
+    try testing.expectEqual(@as(usize, 3), second.len);
+    try testing.expectEqualStrings("LimitBelowBalance", (try updateResponse(second[0], "u2")).rejected.message);
+    try testing.expect(try updateResponse(second[1], "u3") == .accepted);
+    try testing.expectEqualStrings("10", (try updateResponse(second[2], "u3")).completed.data);
+
+    const balance = try inst.activate(&try queryActivation(a, &.{.{ "q1", "balance", &.{} }}), a);
+    try testing.expectEqualStrings("35", answer(balance, 0).variant.?.succeeded.response.?.data);
+
+    try testing.expectEqualStrings("\"run 50,withdraw 20,limit 10,deposit 5,limit 20\"", completedWith(try inst.activate(&try oneJob(a, try signalJob(a, "close", .{})), a)));
+    // The declared query handler still answers after `run` returned.
+    const after = try inst.activate(&try queryActivation(a, &.{.{ "q2", "balance", &.{} }}), a);
+    try testing.expectEqualStrings("35", answer(after, 0).variant.?.succeeded.response.?.data);
+}
+
+test "struct workflow: undecodable start arguments fail the run without running its handlers" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, AccountWf.registered, .{});
+    defer inst.destroy();
+
+    var start = try initActivation(a, "Account", .{@as([]const u8, "fifty")});
+    try start.jobs.append(a, .{ .variant = try signalJob(a, "deposit", .{@as(i64, 5)}) });
+    try start.jobs.append(a, .{ .variant = try updateJob(a, "u1", "set_limit", .{@as(i64, 10)}, true) });
+    const cmds = commandsOf(try inst.activate(&start, a));
+    try testing.expectEqual(@as(usize, 2), cmds.len);
+    try testing.expect(try updateResponse(cmds[0], "u1") == .accepted);
+    try testing.expect(cmds[1].variant.? == .fail_workflow_execution);
+    try testing.expectEqual(@as(usize, 0), accountOf(inst).events.items.len);
+    try testing.expectEqual(@as(i64, 0), accountOf(inst).balance);
+    try testing.expect(inst.ctx.allHandlersFinished());
+}
+
+test "struct workflow: each run starts from W{}, and eviction frees it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const first = try create(testing.allocator, AccountWf.registered, .{});
+    _ = try first.activate(&try initActivation(a, "Account", .{@as(i64, 50)}), a);
+    _ = try first.activate(&try oneJob(a, try signalJob(a, "deposit", .{@as(i64, 5)})), a);
+    try testing.expectEqual(@as(i64, 55), accountOf(first).balance);
+    first.destroy(); // testing.allocator fails the test if the state or its events leak
+
+    const second = try create(testing.allocator, AccountWf.registered, .{});
+    defer second.destroy();
+    _ = try second.activate(&try initActivation(a, "Account", .{@as(i64, 7)}), a);
+    try testing.expectEqual(@as(i64, 7), accountOf(second).balance);
+    try testing.expectEqualStrings("run 7", accountOf(second).events.items);
+}
+
+test "struct workflow: run may register handlers at run time and replace a declared one" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, RewiredWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Rewired", .{}), a);
+    var act = try oneJob(a, try signalJob(a, "ping", .{}));
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "extra", .{}) });
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "extra", .{}) });
+    try testing.expectEqualStrings("\"runtime\"", completedWith(try inst.activate(&act, a)));
 }

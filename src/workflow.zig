@@ -8,6 +8,37 @@
 //!     }
 //!     pub const HelloWorld = temporal.workflow.Def("Workflow", helloWorld);
 //!
+//! A workflow with queries, signals, or updates can instead be a struct type: its fields are
+//! the run's state, `pub fn run` is the workflow, and `pub const queries`, `signals`, and
+//! `updates` declare which methods handle what. Each run starts from `Approval{}` (so every
+//! field needs a default), and the SDK registers the declared handlers before the run's first
+//! signal or update is delivered. Handler methods take no context; one that needs it reads a
+//! field that `run` sets before it first blocks. `Def` lists the rules:
+//!
+//!     pub const Approval = struct {
+//!         ctx: *temporal.workflow.Context = undefined, // run sets it before any handler runs
+//!         approver: ?[]const u8 = null,
+//!
+//!         pub const queries = .{ .currentApprover = CurrentApprover };
+//!         pub const signals = .{ .approve = Approve };
+//!
+//!         pub fn run(a: *Approval, ctx: *temporal.workflow.Context) ![]const u8 {
+//!             a.ctx = ctx;
+//!             try ctx.await(a, approved);
+//!             return a.approver.?;
+//!         }
+//!         pub fn currentApprover(a: *Approval) ?[]const u8 {
+//!             return a.approver;
+//!         }
+//!         pub fn approve(a: *Approval, approver: []const u8) void {
+//!             a.approver = approver;
+//!         }
+//!         fn approved(a: *Approval) bool {
+//!             return a.approver != null;
+//!         }
+//!     };
+//!     pub const ApprovalWorkflow = temporal.workflow.Def("Approval", Approval);
+//!
 //! Workflow code must be deterministic: it is replayed from history. Use `ctx.io()` for
 //! concurrency, timers (`io.sleep`), time (`io.now`), and randomness; everything on it is
 //! recorded or derived from history. Memory from `ctx.allocator()` lives as long as the
@@ -51,6 +82,10 @@
 //!     state.* = .{};
 //!     try ctx.setQueryHandler(Greeting, state, State.current);
 //!
+//! A struct workflow declares it instead: `pub const queries = .{ .current = Greeting };`
+//! with `pub fn current(self: *W) []const u8`. A query can arrive before `run` starts, so its
+//! handler may see `W{}`.
+//!
 //! Signals change a workflow's state from outside. Name one with `SignalDef` and handle it
 //! with `ctx.setSignalHandler`. Each signal runs its handler in a coroutine of its own, so a
 //! handler may block (on `ctx.await`, an activity, a timer, a `std.Io.Mutex`). Handlers start
@@ -72,6 +107,10 @@
 //!     state.* = .{};
 //!     try ctx.setSignalHandler(Approve, state, State.approve);
 //!     try ctx.await(state, State.approved);
+//!
+//! A struct workflow declares it as `pub const signals = .{ .approve = Approve };`. Its
+//! handler is registered before the run's first signal arrives, so even a signal sent with the
+//! start (signal-with-start) goes straight to it; it starts once `run` is called.
 //!
 //! A signal whose name is only known at run time, such as one that includes a workflow ID,
 //! is handled with `ctx.setSignalHandlerByName`, which takes the argument tuple type in place
@@ -130,6 +169,11 @@
 //!     const state = try ctx.allocator().create(State);
 //!     state.* = .{};
 //!     try ctx.setUpdateHandlerWithValidator(SetLimit, state, State.set, State.check);
+//!
+//! A struct workflow declares it as `pub const updates = .{ .set = .{ SetLimit, .check } };`
+//! (or `.{ .set = SetLimit }` without a validator). An update sent with the start
+//! (update-with-start) reaches its handler rather than being rejected as unregistered. Its
+//! validator runs on delivery, before `run` starts, so it may see `W{}`.
 //!
 //! The workflow ends when its function returns, even while signal or update handlers are still
 //! running; to let them finish first,
@@ -1139,16 +1183,18 @@ const ExternalFuture = struct {
 pub const default_version: i32 = -1;
 
 /// What a worker registers: a name, a type-erased call that decodes arguments, runs the
-/// workflow function, and encodes its result, and the workflow's versioning behavior.
+/// workflow, and encodes its result, and the workflow's versioning behavior.
 pub const Registered = struct {
     name: []const u8,
     invoke: *const fn (ctx: *Context, args: []const converter.Payload) anyerror!converter.Payload,
     versioning_behavior: VersioningBehavior = .unspecified,
+    /// Set for a struct workflow: called when each run is initialized, before its first
+    /// coroutine starts and before the activation's signals and updates are delivered. It
+    /// allocates the run's state in `ctx.allocator()`, registers the declared handlers, and
+    /// returns the state, which `invoke` reads back. Null for function and dynamic workflows.
+    init_run: ?*const fn (ctx: *Context) anyerror!*anyopaque = null,
 };
 
-/// How a workflow's runs move between the versions of a Worker Deployment (see
-/// `temporal.deployment`) when the deployment's current version changes. Only workers with
-/// `worker.Options.deployment` and `use_worker_versioning` send it.
 pub const VersioningBehavior = enum(i32) {
     /// The worker's `default_versioning_behavior` applies. A versioned worker without one
     /// refuses to run a workflow with this behavior.
@@ -1168,24 +1214,69 @@ pub const DefOptions = struct {
     versioning_behavior: VersioningBehavior = .unspecified,
 };
 
-/// Names a workflow function. The result is a type that clients pass to `executeWorkflow` and
-/// workers pass to `registerWorkflow`.
-pub fn Def(comptime name: []const u8, comptime func: anytype) type {
-    return DefWithOptions(name, func, .{});
+/// Names a workflow. The result is a type that clients pass to `executeWorkflow` and workers
+/// pass to `registerWorkflow`. `definition` takes one of two forms:
+///
+/// - A function `fn (ctx: *Context, args...) !Result`.
+/// - A struct type `W` whose `pub fn run(self: *W, ctx: *Context, args...) !Result` is the
+///   workflow and whose fields are the run's state. `Args` and `Result` come from `run` as
+///   they do from a function.
+///
+/// Rules of the struct form, each checked at compile time with an error that names the
+/// workflow, the declaration, and the signature to write:
+///
+/// - Each run gets one `W`, initialized as `W{}` in `ctx.allocator()`, so every field needs a
+///   default value. It lives as long as the run stays cached.
+/// - `pub const queries`, `signals`, and `updates`, each optional, are struct literals that map
+///   a pub method of `W` to a `QueryDef`, `SignalDef`, or `UpdateDef`. An update entry may also
+///   name a validator method: `.{ UpdateDef, .validatorMethod }`.
+/// - A handler method takes `self: *W` followed by the Def's arguments and returns what
+///   `Context.setQueryHandler`, `setSignalHandler`, or `setUpdateHandler` accepts. A
+///   validator returns `void` or `!void`. Each Def appears once per declaration.
+/// - Other pub declarations of `W` are ignored.
+///
+///     pub const Counter = struct {
+///         ctx: *temporal.workflow.Context = undefined, // run sets it before any handler runs
+///         value: i64 = 0,
+///
+///         pub const queries = .{ .current = Current };
+///         pub const signals = .{ .add = Add };
+///         pub const updates = .{ .reset = .{ Reset, .checkReset } };
+///
+///         pub fn run(c: *Counter, ctx: *temporal.workflow.Context) !i64 { ... }
+///         pub fn current(c: *Counter) i64 { ... }
+///         pub fn add(c: *Counter, amount: i64) void { ... }
+///         pub fn reset(c: *Counter, to: i64) i64 { ... }
+///         pub fn checkReset(_: *Counter, to: i64) error{Negative}!void { ... }
+///     };
+///     pub const CounterWorkflow = temporal.workflow.Def("Counter", Counter);
+///
+/// The declared handlers are registered as each run is initialized, before the signals and
+/// updates of its first workflow task are delivered. So those sent with the start
+/// (signal-with-start, update-with-start) reach their handlers in arrival order, and none
+/// waits in a buffer or is rejected as unregistered. Validators and query handlers run when
+/// their requests arrive, possibly before `run` starts, so they may see `W{}`. Signal and
+/// update handlers start, in arrival order, only once `run` is called, and run when it first
+/// blocks or returns. `run` can finish setting up `W` first, and no handler runs for a run
+/// whose arguments didn't decode. Handler methods take no `Context`: a handler that logs, runs
+/// an activity, or allocates reads a `*Context` field that `run` sets before it first blocks.
+/// `run` may call the `Context` setters too, with `self` as the context; registering a
+/// declared name again replaces its handler.
+pub fn Def(comptime name: []const u8, comptime definition: anytype) type {
+    return DefWithOptions(name, definition, .{});
 }
 
 /// `Def` with options, such as the workflow's versioning behavior on versioned workers:
 ///
 ///     pub const Checkout = temporal.workflow.DefWithOptions("Checkout", checkout, .{ .versioning_behavior = .pinned });
-pub fn DefWithOptions(comptime name: []const u8, comptime func: anytype, comptime options: DefOptions) type {
-    const F = @TypeOf(func);
-    const fn_info = @typeInfo(F).@"fn";
-    if (fn_info.param_types.len == 0 or fn_info.param_types[0] != *Context)
-        @compileError("workflow " ++ name ++ " must take *temporal.workflow.Context as its first parameter");
-    const Ret = fn_info.return_type.?;
+pub fn DefWithOptions(comptime name: []const u8, comptime definition: anytype, comptime options: DefOptions) type {
+    if (comptime defError(name, definition)) |message| @compileError(message);
+    if (@TypeOf(definition) == type) return StructDef(name, definition, options);
+    const F = @TypeOf(definition);
+    const Ret = @typeInfo(F).@"fn".return_type.?;
     return struct {
         pub const workflow_name = name;
-        pub const function = func;
+        pub const function = definition;
         pub const Args = @import("activity.zig").ArgsOf(F);
         pub const Result = switch (@typeInfo(Ret)) {
             .error_union => |eu| eu.payload,
@@ -1194,13 +1285,201 @@ pub fn DefWithOptions(comptime name: []const u8, comptime func: anytype, comptim
 
         pub fn invoke(ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
             const args = try converter.fromPayloads(Args, ctx.allocator(), payloads);
-            const result = try @call(.auto, func, .{ctx} ++ args);
+            const result = try @call(.auto, definition, .{ctx} ++ args);
             return converter.toPayload(ctx.allocator(), result);
         }
 
         pub const versioning_behavior = options.versioning_behavior;
         pub const registered: Registered = .{ .name = name, .invoke = invoke, .versioning_behavior = options.versioning_behavior };
     };
+}
+
+fn StructDef(comptime name: []const u8, comptime W: type, comptime options: DefOptions) type {
+    const params = @typeInfo(@TypeOf(W.run)).@"fn".param_types;
+    const Ret = @typeInfo(@TypeOf(W.run)).@"fn".return_type.?;
+    return struct {
+        pub const workflow_name = name;
+        pub const Args = Args: {
+            var types: [params.len - 2]type = undefined;
+            for (params[2..], &types) |p, *t| t.* = p.?;
+            break :Args @Tuple(&types);
+        };
+        pub const Result = switch (@typeInfo(Ret)) {
+            .error_union => |eu| eu.payload,
+            else => Ret,
+        };
+
+        pub fn invoke(ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
+            const args = try converter.fromPayloads(Args, ctx.allocator(), payloads);
+            const state = ctx.instance.run_state orelse return error.StructWorkflowNotInitialized;
+            try ctx.instance.releaseHandlers();
+            const w: *W = @ptrCast(@alignCast(state));
+            const result = try @call(.auto, W.run, .{ w, ctx } ++ args);
+            return converter.toPayload(ctx.allocator(), result);
+        }
+
+        fn initRun(ctx: *Context) anyerror!*anyopaque {
+            const w = try ctx.allocator().create(W);
+            w.* = .{};
+            inline for (comptime entryNames(W, "queries")) |entry| {
+                const D = comptime handlerEntry("queries", @field(W.queries, entry)).?.def;
+                try ctx.setQueryHandler(D, w, @field(W, entry));
+            }
+            inline for (comptime entryNames(W, "signals")) |entry| {
+                const D = comptime handlerEntry("signals", @field(W.signals, entry)).?.def;
+                try ctx.setSignalHandler(D, w, @field(W, entry));
+            }
+            inline for (comptime entryNames(W, "updates")) |entry| {
+                const e = comptime handlerEntry("updates", @field(W.updates, entry)).?;
+                if (e.validator) |v|
+                    try ctx.setUpdateHandlerWithValidator(e.def, w, @field(W, entry), @field(W, v))
+                else
+                    try ctx.setUpdateHandler(e.def, w, @field(W, entry));
+            }
+            return w;
+        }
+
+        pub const versioning_behavior = options.versioning_behavior;
+        pub const registered: Registered = .{
+            .name = name,
+            .invoke = invoke,
+            .versioning_behavior = options.versioning_behavior,
+            .init_run = initRun,
+        };
+    };
+}
+
+/// Why `definition` can't define workflow `name`, as the compile error `DefWithOptions`
+/// reports, or null if it can.
+fn defError(comptime name: []const u8, comptime definition: anytype) ?[]const u8 {
+    const prefix = "workflow \"" ++ name ++ "\": ";
+    if (@TypeOf(definition) == type) return structDefError(prefix, definition);
+    const F = @TypeOf(definition);
+    const want = "a function fn (ctx: *temporal.workflow.Context, args...) !Result or a struct type with pub fn run";
+    const f = switch (@typeInfo(F)) {
+        .@"fn" => |f| f,
+        else => return prefix ++ "Def takes " ++ want ++ ", not " ++ @typeName(F),
+    };
+    if (f.param_types.len == 0 or f.param_types[0] != *Context)
+        return prefix ++ "the workflow function must take *temporal.workflow.Context as its first parameter";
+    if (f.is_generic or f.return_type == null)
+        return prefix ++ "the workflow function must not be generic: give every parameter a concrete type, not " ++ @typeName(F);
+    return null;
+}
+
+const handler_declarations = [_][]const u8{ "queries", "signals", "updates" };
+
+fn structDefError(comptime prefix: []const u8, comptime W: type) ?[]const u8 {
+    const info = switch (@typeInfo(W)) {
+        .@"struct" => |s| s,
+        else => return prefix ++ "Def takes a function or a struct type with pub fn run, not " ++ @typeName(W),
+    };
+    if (info.is_tuple) return prefix ++ "Def takes a function or a struct type with pub fn run, not the tuple " ++ @typeName(W);
+    for (info.field_names, info.field_attrs) |field, attrs| if (attrs.default_value_ptr == null)
+        return prefix ++ "field " ++ field ++ " of " ++ @typeName(W) ++ " has no default value; each run starts from " ++ @typeName(W) ++
+            "{}, so give every field one (`= undefined` for one that run sets before it is read)";
+
+    const want_run = "pub fn run(self: *" ++ @typeName(W) ++ ", ctx: *temporal.workflow.Context, args...) !Result";
+    if (!@hasDecl(W, "run")) return prefix ++ @typeName(W) ++ " has no pub fn run; declare " ++ want_run;
+    const Run = @TypeOf(W.run);
+    const bad_run = prefix ++ @typeName(W) ++ ".run must be " ++ want_run ++ " with concrete argument types, not " ++ @typeName(Run);
+    const f = switch (@typeInfo(Run)) {
+        .@"fn" => |f| f,
+        else => return bad_run,
+    };
+    if (f.is_generic or f.return_type == null or f.param_types.len < 2 or f.param_types[0] != *W or f.param_types[1] != *Context)
+        return bad_run;
+
+    for (handler_declarations) |decl| {
+        if (!@hasDecl(W, decl)) continue;
+        const entries = @field(W, decl);
+        const bad_decl = prefix ++ @typeName(W) ++ "." ++ decl ++ " must be a struct literal that maps pub method names to " ++
+            defKind(decl).def ++ "s, such as " ++ defKind(decl).example ++ ", not " ++ @typeName(@TypeOf(entries));
+        const e_info = switch (@typeInfo(@TypeOf(entries))) {
+            .@"struct" => |s| s,
+            else => return bad_decl,
+        };
+        if (e_info.is_tuple and e_info.field_names.len > 0) return bad_decl;
+        for (e_info.field_names, 0..) |entry, i| {
+            const where = prefix ++ decl ++ "." ++ entry;
+            const value = @field(entries, entry);
+            const e = handlerEntry(decl, value) orelse return where ++ " must be " ++ defKind(decl).want ++ ", not " ++ describe(value);
+            const def_name = @field(e.def, defKind(decl).name_decl);
+            for (e_info.field_names[0..i]) |earlier| {
+                const other = handlerEntry(decl, @field(entries, earlier)).?.def;
+                if (std.mem.eql(u8, @field(other, defKind(decl).name_decl), def_name))
+                    return where ++ " and " ++ decl ++ "." ++ earlier ++ " both handle " ++ defKind(decl).noun ++ " \"" ++ def_name ++ "\"; keep one";
+            }
+            const Result = if (std.mem.eql(u8, decl, "signals")) void else e.def.Result;
+            const want = handlerSignature(e.def.Args, *W, Result);
+            if (!@hasDecl(W, entry))
+                return where ++ " names no pub method of " ++ @typeName(W) ++ "; declare pub fn " ++ entry ++ " as " ++ want;
+            if (handlerMismatch(where, e.def.Args, *W, @TypeOf(@field(W, entry)), Result)) |message| return message;
+            const v = e.validator orelse continue;
+            const v_where = where ++ " validator ." ++ v;
+            if (!@hasDecl(W, v))
+                return v_where ++ " names no pub method of " ++ @typeName(W) ++ "; declare pub fn " ++ v ++ " as " ++ handlerSignature(e.def.Args, *W, void);
+            if (handlerMismatch(v_where, e.def.Args, *W, @TypeOf(@field(W, v)), void)) |message| return message;
+        }
+    }
+    return null;
+}
+
+fn defKind(comptime decl: []const u8) struct { def: []const u8, name_decl: []const u8, noun: []const u8, example: []const u8, want: []const u8 } {
+    if (std.mem.eql(u8, decl, "queries")) return .{
+        .def = "QueryDef",
+        .name_decl = "query_name",
+        .noun = "query",
+        .example = "`.{ .status = Status }`",
+        .want = "a QueryDef (temporal.workflow.QueryDef(name, fn (args...) Result))",
+    };
+    if (std.mem.eql(u8, decl, "signals")) return .{
+        .def = "SignalDef",
+        .name_decl = "signal_name",
+        .noun = "signal",
+        .example = "`.{ .approve = Approve }`",
+        .want = "a SignalDef (temporal.workflow.SignalDef(name, fn (args...) void))",
+    };
+    return .{
+        .def = "UpdateDef",
+        .name_decl = "update_name",
+        .noun = "update",
+        .example = "`.{ .setLimit = SetLimit }` or `.{ .setLimit = .{ SetLimit, .checkLimit } }`",
+        .want = "an UpdateDef (temporal.workflow.UpdateDef(name, fn (args...) Result)), or .{ UpdateDef, .validatorMethod }",
+    };
+}
+
+/// The Def of an entry of `W.queries`, `signals`, or `updates`, and the name of its validator
+/// method, or null if the entry isn't one of `decl`'s kind.
+fn handlerEntry(comptime decl: []const u8, comptime value: anytype) ?struct { def: type, validator: ?[]const u8 } {
+    const name_decl = defKind(decl).name_decl;
+    if (@TypeOf(value) == type) return if (isDef(value, name_decl)) .{ .def = value, .validator = null } else null;
+    if (!std.mem.eql(u8, decl, "updates")) return null;
+    const s = switch (@typeInfo(@TypeOf(value))) {
+        .@"struct" => |s| s,
+        else => return null,
+    };
+    if (!s.is_tuple or s.field_types.len != 2 or s.field_types[0] != type or @typeInfo(s.field_types[1]) != .enum_literal) return null;
+    if (!isDef(value[0], name_decl)) return null;
+    return .{ .def = value[0], .validator = @tagName(value[1]) };
+}
+
+fn isDef(comptime T: type, comptime name_decl: []const u8) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasDecl(T, name_decl),
+        else => false,
+    };
+}
+
+fn describe(comptime value: anytype) []const u8 {
+    return if (@TypeOf(value) == type) @typeName(value) else "a value of type " ++ @typeName(@TypeOf(value));
+}
+
+/// The entry names of `W`'s `decl` declaration (`queries`, `signals`, or `updates`), in
+/// declaration order; none if `W` doesn't declare it.
+fn entryNames(comptime W: type, comptime decl: []const u8) []const [:0]const u8 {
+    if (!@hasDecl(W, decl)) return &.{};
+    return @typeInfo(@TypeOf(@field(W, decl))).@"struct".field_names;
 }
 
 /// Defines a dynamic workflow: one function that runs every workflow type the worker has no
@@ -1313,28 +1592,222 @@ fn contextAddress(context: anytype) ?usize {
 /// Compile error unless `H` is `fn (C, Args...) Result` or returns an error union of
 /// `Result`. `what` names the handler in the message, such as `query handler for "status"`.
 fn checkHandler(comptime what: []const u8, comptime Args: type, comptime C: type, comptime H: type, comptime Result: type) void {
-    const arg_types = @typeInfo(Args).@"struct".field_types;
+    if (handlerMismatch(what, Args, C, H, Result)) |message| @compileError(message);
+}
+
+/// The signature `checkHandler` wants, such as `fn (*State, u32) u32 (or an error union of it)`.
+fn handlerSignature(comptime Args: type, comptime C: type, comptime Result: type) []const u8 {
     var want: []const u8 = "fn (" ++ @typeName(C);
-    for (arg_types) |T| want = want ++ ", " ++ @typeName(T);
-    want = want ++ ") " ++ @typeName(Result) ++ (if (Result == void) " (or !void)" else " (or an error union of it)");
-    const bad = what ++ " must be " ++ want ++ ", not " ++ @typeName(H);
+    for (@typeInfo(Args).@"struct".field_types) |T| want = want ++ ", " ++ @typeName(T);
+    return want ++ ") " ++ @typeName(Result) ++ (if (Result == void) " (or !void)" else " (or an error union of it)");
+}
+
+/// `checkHandler`'s message for a handler `H` of the wrong shape, or null if it fits.
+fn handlerMismatch(comptime what: []const u8, comptime Args: type, comptime C: type, comptime H: type, comptime Result: type) ?[]const u8 {
+    const arg_types = @typeInfo(Args).@"struct".field_types;
+    const bad = what ++ " must be " ++ handlerSignature(Args, C, Result) ++ ", not " ++ @typeName(H);
     const info = switch (@typeInfo(H)) {
         .@"fn" => |f| f,
-        else => @compileError(bad),
+        else => return bad,
     };
-    if (info.param_types.len != 1 + arg_types.len) @compileError(bad);
-    if (info.param_types[0] != C) @compileError(bad);
-    for (arg_types, info.param_types[1..]) |want_t, got| if (got != want_t) @compileError(bad);
-    const Ret = info.return_type orelse @compileError(bad);
+    if (info.param_types.len != 1 + arg_types.len) return bad;
+    if (info.param_types[0] != C) return bad;
+    for (arg_types, info.param_types[1..]) |want_t, got| if (got != want_t) return bad;
+    const Ret = info.return_type orelse return bad;
     const payload = switch (@typeInfo(Ret)) {
         .error_union => |eu| eu.payload,
         else => Ret,
     };
-    if (payload != Result) @compileError(bad);
+    if (payload != Result) return bad;
+    return null;
 }
 
 test {
     _ = @import("workflow/Scheduler.zig");
     _ = WorkflowIo;
     _ = Instance;
+}
+
+const StructDefTests = struct {
+    const Add = SignalDef("add", fn (amount: i64) void);
+    const Total = QueryDef("total", fn () i64);
+    const Reset = UpdateDef("reset", fn (to: i64) i64);
+
+    const Counter = struct {
+        total: i64 = 0,
+        ctx: *Context = undefined,
+
+        pub const queries = .{ .currentTotal = Total };
+        pub const signals = .{ .add = Add };
+        pub const updates = .{ .reset = .{ Reset, .checkReset } };
+        pub const not_a_handler = 42;
+
+        pub fn run(c: *Counter, ctx: *Context, start: i64, label: []const u8) !i64 {
+            _ = ctx;
+            _ = label;
+            return c.total + start;
+        }
+        pub fn currentTotal(c: *Counter) i64 {
+            return c.total;
+        }
+        pub fn add(c: *Counter, amount: i64) void {
+            c.total += amount;
+        }
+        pub fn reset(c: *Counter, to: i64) i64 {
+            defer c.total = to;
+            return c.total;
+        }
+        pub fn checkReset(_: *Counter, to: i64) error{Negative}!void {
+            if (to < 0) return error.Negative;
+        }
+    };
+
+    fn expectMessage(comptime message: ?[]const u8, comptime parts: []const []const u8) !void {
+        const m = message orelse return error.TestExpectedCompileError;
+        inline for (parts) |part| if (std.mem.indexOf(u8, m, part) == null) {
+            std.debug.print("message {s}\n  lacks {s}\n", .{ m, part });
+            return error.TestUnexpectedMessage;
+        };
+    }
+};
+
+test "a struct Def declares the same interface as a function Def, from run" {
+    const D = DefWithOptions("Counter", StructDefTests.Counter, .{ .versioning_behavior = .pinned });
+    try std.testing.expectEqualStrings("Counter", D.workflow_name);
+    try std.testing.expect(D.Args == struct { i64, []const u8 });
+    try std.testing.expect(D.Result == i64);
+    try std.testing.expectEqual(VersioningBehavior.pinned, D.versioning_behavior);
+    try std.testing.expectEqual(VersioningBehavior.pinned, D.registered.versioning_behavior);
+    try std.testing.expectEqualStrings("Counter", D.registered.name);
+    try std.testing.expect(D.registered.init_run != null);
+    try std.testing.expect(Def("Plain", StructDefTests.Counter).versioning_behavior == .unspecified);
+
+    const F = Def("Fn", struct {
+        fn f(_: *Context) !void {}
+    }.f);
+    try std.testing.expect(F.registered.init_run == null);
+    try std.testing.expect(comptime defError("Counter", StructDefTests.Counter) == null);
+}
+
+test "a struct Def's compile errors name the workflow and what to write" {
+    const T = StructDefTests;
+    try T.expectMessage(comptime defError("W", @as(u32, 5)), &.{ "workflow \"W\"", "Def takes a function", "struct type with pub fn run", "u32" });
+    try T.expectMessage(comptime defError("W", enum { a }), &.{ "workflow \"W\"", "Def takes a function or a struct type" });
+    try T.expectMessage(comptime defError("W", struct { u8 }), &.{ "workflow \"W\"", "not the tuple" });
+    try T.expectMessage(comptime defError("W", struct {
+        fn f(_: u8) !void {}
+    }.f), &.{ "workflow \"W\"", "*temporal.workflow.Context as its first parameter" });
+
+    // Fields need defaults.
+    const NoDefault = struct {
+        value: i64,
+        pub fn run(_: *@This(), _: *Context) !void {}
+    };
+    try T.expectMessage(comptime defError("Counter", NoDefault), &.{ "workflow \"Counter\"", "field value", "has no default value" });
+
+    // `run`: missing, of the wrong shape, or generic.
+    try T.expectMessage(comptime defError("W", struct {
+        x: u8 = 0,
+    }), &.{ "workflow \"W\"", "has no pub fn run", "pub fn run(self: *", "ctx: *temporal.workflow.Context, args...) !Result" });
+    const NoCtx = struct {
+        pub fn run(_: *@This(), _: i64) !void {}
+    };
+    try T.expectMessage(comptime defError("W", NoCtx), &.{ "workflow \"W\"", ".run must be pub fn run(self: *", "not fn (*" });
+    const ConstSelf = struct {
+        pub fn run(_: *const @This(), _: *Context) !void {}
+    };
+    try T.expectMessage(comptime defError("W", ConstSelf), &.{".run must be pub fn run(self: *"});
+    const Generic = struct {
+        pub fn run(_: *@This(), _: *Context, x: anytype) !void {
+            _ = x;
+        }
+    };
+    try T.expectMessage(comptime defError("W", Generic), &.{ ".run must be", "concrete argument types" });
+    const NotFn = struct {
+        pub const run = 5;
+    };
+    try T.expectMessage(comptime defError("W", NotFn), &.{ ".run must be", "comptime_int" });
+}
+
+test "a struct Def's handler declaration errors name the workflow, the entry, and the signature" {
+    const T = StructDefTests;
+    const Base = struct {
+        fn With(comptime decls: type) type {
+            return struct {
+                pub const signals = if (@hasDecl(decls, "signals")) decls.signals else .{};
+                pub const queries = if (@hasDecl(decls, "queries")) decls.queries else .{};
+                pub const updates = if (@hasDecl(decls, "updates")) decls.updates else .{};
+                pub fn run(_: *@This(), _: *Context) !void {}
+                pub fn add(_: *@This(), _: i64) void {}
+                pub fn wrongAdd(_: *@This(), _: []const u8) void {}
+                pub fn currentTotal(_: *@This()) i64 {
+                    return 0;
+                }
+                pub fn reset(_: *@This(), to: i64) i64 {
+                    return to;
+                }
+                pub fn badCheck(_: *@This(), _: i64) bool {
+                    return true;
+                }
+            };
+        }
+    };
+
+    // A declaration that isn't a struct literal mapping names.
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const signals = 3;
+    })), &.{ "workflow \"W\"", ".signals must be a struct literal", "SignalDefs", ".{ .approve = Approve }" });
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const updates = .{ T.Reset, T.Reset };
+    })), &.{ ".updates must be a struct literal", "UpdateDefs" });
+
+    // An entry of the wrong kind.
+    try T.expectMessage(comptime defError("Counter", Base.With(struct {
+        pub const signals = .{ .add = T.Reset };
+    })), &.{ "workflow \"Counter\"", "signals.add must be a SignalDef", "UpdateDef(\"reset\"" });
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const queries = .{ .currentTotal = 7 };
+    })), &.{ "queries.currentTotal must be a QueryDef", "a value of type comptime_int" });
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const signals = .{ .add = .{ T.Add, .add } };
+    })), &.{"signals.add must be a SignalDef"});
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const updates = .{ .reset = .{ T.Reset, "checkReset" } };
+    })), &.{ "updates.reset must be an UpdateDef", ".{ UpdateDef, .validatorMethod }" });
+
+    // An entry that names no pub method.
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const signals = .{ .missing = T.Add };
+    })), &.{ "workflow \"W\"", "signals.missing names no pub method of", "declare pub fn missing as fn (*", ", i64) void (or !void)" });
+
+    // Two entries for the same name.
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const signals = .{ .add = T.Add, .wrongAdd = SignalDef("add", fn ([]const u8) void) };
+    })), &.{"signals.wrongAdd and signals.add both handle signal \"add\""});
+
+    // A method with the wrong signature.
+    try T.expectMessage(comptime defError("Counter", Base.With(struct {
+        pub const signals = .{ .wrongAdd = T.Add };
+    })), &.{ "workflow \"Counter\": signals.wrongAdd must be fn (*", ", i64) void (or !void), not fn (*", "[]const u8) void" });
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const queries = .{ .add = T.Total };
+    })), &.{ "queries.add must be fn (*", ") i64 (or an error union of it)" });
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const updates = .{ .currentTotal = T.Reset };
+    })), &.{"updates.currentTotal must be fn (*"});
+
+    // Validators: missing, or of the wrong signature.
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const updates = .{ .reset = .{ T.Reset, .checkReset } };
+    })), &.{ "updates.reset validator .checkReset names no pub method of", "declare pub fn checkReset as fn (*", ", i64) void (or !void)" });
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const updates = .{ .reset = .{ T.Reset, .badCheck } };
+    })), &.{ "workflow \"W\": updates.reset validator .badCheck must be fn (*", ", i64) void (or !void), not fn (*" });
+
+    // Valid entries pass; other pub declarations are ignored.
+    try std.testing.expect(comptime defError("W", Base.With(struct {
+        pub const signals = .{ .add = T.Add };
+        pub const queries = .{ .currentTotal = T.Total };
+        pub const updates = .{ .reset = T.Reset };
+    })) == null);
 }
