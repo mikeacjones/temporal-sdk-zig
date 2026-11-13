@@ -27,9 +27,9 @@ test "workflow runs its activities locally with test doubles" {
     const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
     try env.registerWorkflow(greetingslocal.GreetingSample);
-    try env.registerActivityAs(greetingslocal.GetGreeting, Doubles.getGreeting);
-    try env.registerActivityAs(greetingslocal.GetName, Doubles.getName);
-    try env.registerActivityAs(greetingslocal.SayGreeting, Doubles.sayGreeting);
+    try env.registerActivityAs(greetingslocal.activities.getGreeting, Doubles.getGreeting);
+    try env.registerActivityAs(greetingslocal.activities.getName, Doubles.getName);
+    try env.registerActivityAs(greetingslocal.activities.sayGreeting, Doubles.sayGreeting);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -42,7 +42,7 @@ test "workflow with the real activities" {
     defer env.deinit();
     var activities: greetingslocal.Activities = .{ .name = "Temporal", .greeting = "Hello" };
     try env.registerWorkflow(greetingslocal.GreetingSample);
-    try env.registerActivitiesWith(&activities, .{ greetingslocal.GetGreeting, greetingslocal.GetName, greetingslocal.SayGreeting });
+    try env.registerActivities(&activities, greetingslocal.activities);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -55,7 +55,7 @@ test "activities read their shared state" {
     defer arena.deinit();
     var activities: greetingslocal.Activities = .{ .name = "Temporal", .greeting = "Hello" };
     const env: temporal.testing.ActivityEnvironment = .init(testing.io);
-    try testing.expectEqualStrings("Hello", try env.executeActivityWith(greetingslocal.GetGreeting, &activities, .{}, arena.allocator()));
-    try testing.expectEqualStrings("Temporal", try env.executeActivityWith(greetingslocal.GetName, &activities, .{}, arena.allocator()));
-    try testing.expectEqualStrings("Greeting: Hello Temporal!\n", try env.executeActivityWith(greetingslocal.SayGreeting, &activities, .{ "Hello", "Temporal" }, arena.allocator()));
+    try testing.expectEqualStrings("Hello", try env.executeActivityWith(greetingslocal.activities.getGreeting, &activities, .{}, arena.allocator()));
+    try testing.expectEqualStrings("Temporal", try env.executeActivityWith(greetingslocal.activities.getName, &activities, .{}, arena.allocator()));
+    try testing.expectEqualStrings("Greeting: Hello Temporal!\n", try env.executeActivityWith(greetingslocal.activities.sayGreeting, &activities, .{ "Hello", "Temporal" }, arena.allocator()));
 }

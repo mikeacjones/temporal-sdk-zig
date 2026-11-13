@@ -37,6 +37,16 @@ pub const Version = struct {
     }
 };
 
+/// Overrides the versioning behavior a workflow's definition declares, for one execution.
+pub const VersioningOverride = union(enum) {
+    /// Keeps the workflow on this version until the override is removed. The version need not
+    /// be current or ramping.
+    pinned: Version,
+    /// Moves the workflow to its deployment's current (or ramping) version at its next
+    /// workflow task, like an auto-upgrade workflow.
+    auto_upgrade,
+};
+
 /// Where a version stands in its deployment's rollout.
 pub const VersionStatus = enum {
     unspecified,

@@ -40,6 +40,14 @@ pub const Unlock = struct {
     }
 };
 
+/// How the lock's local activity and the mutex workflow it starts are retried.
+const retry_policy: workflow.RetryPolicy = .{
+    .initial_interval = .fromSeconds(1),
+    .backoff_coefficient = 2.0,
+    .maximum_interval = .fromSeconds(60),
+    .maximum_attempts = 5,
+};
+
 pub const Mutex = struct {
     current_workflow_id: []const u8,
     lock_namespace: []const u8,
@@ -49,12 +57,7 @@ pub const Mutex = struct {
     pub fn lock(m: Mutex, ctx: *workflow.Context, resource_id: []const u8, unlock_timeout: Duration) !Unlock {
         const lao: workflow.LocalActivityOptions = .{
             .schedule_to_close_timeout = .fromSeconds(60),
-            .retry_policy = .{
-                .initial_interval = .fromSeconds(1),
-                .backoff_coefficient = 2.0,
-                .maximum_interval = .fromSeconds(60),
-                .maximum_attempts = 5,
-            },
+            .retry_policy = retry_policy,
         };
         const execution = try ctx.executeLocalActivity(SignalWithStartMutexWorkflowActivity, lao, .{
             m.lock_namespace, resource_id, m.current_workflow_id, unlock_timeout,
@@ -175,6 +178,7 @@ pub const Activities = struct {
         var run = a.client.signalWithStartWorkflow(MutexWorkflow, .{
             .id = workflow_id,
             .task_queue = task_queue,
+            .retry_policy = retry_policy,
         }, .{ namespace, resource_id, unlock_timeout }, RequestLock, .{sender_workflow_id}) catch |err| {
             logger.err("Unable to signal with start workflow", .{ .err = err });
             return err;
