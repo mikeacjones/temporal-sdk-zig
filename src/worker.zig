@@ -683,12 +683,16 @@ pub const WorkflowRunner = struct {
             .completion => |c| {
                 var message: ?[]u8 = null;
                 defer if (message) |m| r.gpa.free(m);
-                core.completeWorkflowActivation(r.gpa, io, c.bytes, &message) catch |err| {
-                    const reason = message orelse @errorName(err);
-                    r.logger.log(.err, "the core rejected a workflow activation completion", &.{
+                r.sendCompletion(core, io, c.bytes, &message) catch |err| {
+                    r.logger.log(.err, switch (err) {
+                        error.CompletionFailed => "the core rejected a workflow activation completion",
+                        error.OutOfMemory => "a workflow activation completion could not be sent to the core: out of memory",
+                    }, &.{
                         .{ .key = "run_id", .value = runId(bytes) orelse "" },
-                        .{ .key = "error", .value = reason },
+                        .{ .key = "error", .value = message orelse @errorName(err) },
                     });
+                    // An eviction has nothing to fall back to: a failed completion or an
+                    // eviction request for a run that is being evicted changes nothing.
                     if (c.eviction) return;
                     if (c.fallback) {
                         response = .{ .evict = .{ .run_id = runId(bytes).?, .reason = "the core rejected the fallback failed completion" } };
@@ -710,6 +714,22 @@ pub const WorkflowRunner = struct {
             .none => {
                 r.logger.log(.err, "a workflow activation has no readable run ID, so no completion can be sent; its run stays stuck until the worker restarts", &.{});
                 return;
+            },
+        };
+    }
+
+    /// Sends `completion` to the core. The bridge allocates the cell it waits in before the
+    /// core sees the completion, so `error.OutOfMemory` means the core never got it; it is sent
+    /// again with the cell on the stack, which is safe because completions are always waited
+    /// for and the cell freed before the bridge returns. The core's rejection text is dropped
+    /// on that second try, since it would come from the stack buffer too.
+    fn sendCompletion(r: *WorkflowRunner, core: bridge.Worker, io: Io, completion: []const u8, message: *?[]u8) bridge.Worker.CompleteError!void {
+        core.completeWorkflowActivation(r.gpa, io, completion, message) catch |err| switch (err) {
+            error.CompletionFailed => return err,
+            error.OutOfMemory => {
+                var cell: [256]u8 = undefined;
+                var fba: std.heap.FixedBufferAllocator = .init(&cell);
+                return core.completeWorkflowActivation(fba.allocator(), io, completion, null);
             },
         };
     }
@@ -2716,6 +2736,68 @@ test "an activation that can't be handled gets a fallback failed completion" {
     try testing.expectEqualStrings(long_id, evict.run_id);
 }
 
+// A core worker with workflows disabled rejects every workflow completion, which drives
+// `process` through each of its send paths with a real core.
+test "a completion the core rejects falls back to a failed completion, then to an eviction request" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    // The core logs the eviction request it can't act on; that goes here, not to std.log.
+    var client_sink: RecordingSink = .{};
+    defer client_sink.deinit();
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target, .logger = client_sink.sink() });
+    defer client.close();
+    var message: ?[]u8 = null;
+    defer if (message) |m| testing.allocator.free(m);
+    const core = try bridge.Worker.init(testing.allocator, client.connection, .{
+        .namespace = "default",
+        .task_queue = "rejecting",
+        .task_types = .{ .workflows = false, .remote_activities = true, .local_activities = false, .nexus = false },
+    }, &message);
+    defer core.deinit();
+    defer {
+        core.initiateShutdown();
+        while (core.pollActivityTask(testing.allocator, testing.io, null) catch null) |polled| polled.deinit();
+        core.finalizeShutdown(testing.allocator, testing.io, null) catch {};
+    }
+
+    var workflows = try ParallelTest.registry(testing.allocator);
+    defer workflows.deinit(testing.allocator);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    defer runner.deinit();
+
+    // Handled normally, rejected; the fallback, rejected; then the eviction request.
+    runner.process(core, testing.io, try ParallelTest.start(a, "run-1", "ParallelHold", "x"));
+    const run_1 = [_]log_mod.Field{.{ .key = "run_id", .value = "run-1" }};
+    try testing.expectEqual(2, sink.countAt(.err, "the core rejected a workflow activation completion", &run_1));
+    try testing.expectEqual(1, sink.countAt(.err, "no completion could be delivered for a workflow activation; asked the core to evict the run", &.{
+        .{ .key = "run_id", .value = "run-1" },
+        .{ .key = "reason", .value = "the core rejected the fallback failed completion" },
+    }));
+
+    // An eviction's completion that is rejected is only logged.
+    runner.process(core, testing.io, try ParallelTest.evict(a, "run-1", .CACHE_FULL));
+    try testing.expectEqual(3, sink.countAt(.err, "the core rejected a workflow activation completion", &run_1));
+    try testing.expectEqual(1, sink.count("no completion could be delivered for a workflow activation; asked the core to evict the run", &.{}));
+
+    // Out of memory before the core saw the completion: it is sent again with the bridge's
+    // cell on the stack, and reaches the core, which rejects it here.
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    runner.gpa = failing.allocator();
+    defer runner.gpa = testing.allocator;
+    var completion: Io.Writer.Allocating = .init(a);
+    try (done_pb.WorkflowActivationCompletion{ .run_id = "run-2", .status = .{ .successful = .{} } }).encode(&completion.writer, a);
+    var no_message: ?[]u8 = null;
+    try testing.expectError(error.CompletionFailed, runner.sendCompletion(core, testing.io, completion.written(), &no_message));
+    try testing.expect(no_message == null);
+}
+
 test "a run ID is read from an activation's bytes without decoding it" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -2826,6 +2908,22 @@ const CacheTest = struct {
         return "done";
     }
     const Drift = workflow.Def("Drift", drift);
+
+    /// Waits until the run's history has a started timer: its first workflow task completed.
+    fn waitForTimer(c: *client_mod.Client, id: []const u8, run_id: []const u8) !void {
+        const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = .fromSeconds(30), .clock = .awake });
+        while (true) {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            const history = try c.fetchHistory(scratch.allocator(), id, run_id);
+            for (history.events.items) |event| switch (event.attributes orelse continue) {
+                .timer_started_event_attributes => return,
+                else => {},
+            };
+            if (deadline.durationFromNow(testing.io).raw.nanoseconds <= 0) return error.Timeout;
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+    }
 };
 
 test "a full cache evicts a waiting run, which replays when signaled" {
@@ -2862,8 +2960,10 @@ test "a full cache evicts a waiting run, which replays when signaled" {
     try testing.expectEqualStrings("second", try second.get(arena.allocator()));
 }
 
-// With no cache at all the core asks for a CACHE_FULL eviction on every activation, and that
-// reason sticks, so the run is pushed out of a one-run cache by another run instead.
+// The cache holds one run, not none: with max_cached_workflows = 0 the core requests a
+// CACHE_FULL eviction after every completion, including the one in which it finds the
+// nondeterminism, and it keeps only the most recent reason requested for a run, so the eviction
+// would arrive as CACHE_FULL. Here the run is pushed out by another run and replayed later.
 test "a run evicted for nondeterminism is logged with the core's message" {
     const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
     defer rt.deinit();
@@ -2890,6 +2990,9 @@ test "a run evicted for nondeterminism is logged with the core's message" {
 
     var drift = try client.executeWorkflow(CacheTest.Drift, .{ .id = "nondeterminism-wf", .task_queue = "nondeterminism" }, .{});
     defer drift.deinit();
+    // Started before Drift's first task completed, the other run could take the cache slot
+    // first, and Drift's task would evict it instead of the other way round.
+    try CacheTest.waitForTimer(&client, "nondeterminism-wf", drift.run_id);
     var other = try client.executeWorkflow(CacheTest.WaitForRelease, .{ .id = "nondeterminism-other", .task_queue = "nondeterminism" }, .{"other"});
     defer other.deinit();
     defer client.terminateWorkflow("nondeterminism-other", other.run_id, "test done") catch {};
