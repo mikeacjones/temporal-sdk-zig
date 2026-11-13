@@ -102,7 +102,11 @@ inbound: []const interceptor.WorkflowInbound = &.{},
 outbound: []const interceptor.WorkflowOutbound = &.{},
 /// The handler of the update being validated, for the validation chain's end.
 validating: ?UpdateHandler = null,
+/// The update being validated, for `currentUpdate` in its validator.
+validating_update: ?*const Update = null,
 last_completion_result: ?converter.Payload = null,
+/// The failure the previous run of a retried or cron workflow ended with. Arena memory.
+previous_run_failure: ?*const Failure = null,
 /// The memo as the workflow sees it: the start memo with this run's upserts applied, sorted
 /// by name so its order doesn't depend on the wire order of the start memo's map. Each upsert
 /// replaces the slice, so a slice handed out earlier keeps its contents. Arena memory.
@@ -675,7 +679,9 @@ fn startUpdate(inst: *Instance, handler: UpdateHandler, update: *const Update) e
     const a = inst.arena();
     if (update.run_validator) {
         inst.validating = handler;
+        inst.validating_update = update;
         defer inst.validating = null;
+        defer inst.validating_update = null;
         inst.inboundNext().validateUpdate(update.input()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try failure_mod.fromError(a, err) }),
@@ -785,6 +791,18 @@ fn currentHandler(inst: *Instance) ?*HandlerRun {
     return null;
 }
 
+/// The update whose handler is running now, or else the update being validated. The handler
+/// comes first: a handler can register another update handler, which validates buffered
+/// updates from inside it.
+pub fn currentUpdate(inst: *Instance) ?workflow.UpdateInfo {
+    if (inst.currentHandler()) |run| switch (run.kind) {
+        .update => |u| return .{ .id = u.update.id, .name = u.update.name },
+        .signal => return null,
+    };
+    const u = inst.validating_update orelse return null;
+    return .{ .id = u.id, .name = u.name };
+}
+
 /// Records `Context.fail`'s failure for the running coroutine: its handler run's, or the
 /// workflow function's.
 pub fn setPendingFailure(inst: *Instance, a: failure_mod.Application) void {
@@ -880,9 +898,21 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         .workflow_id = try a.dupe(u8, r.workflow_id),
         .run_id = try a.dupe(u8, r.run_id),
     };
+    if (init.retry_policy) |p| inst.info.retry_policy = try zigRetryPolicy(a, p);
+    if (init.priority) |p| inst.info.priority = .{
+        .priority_key = p.priority_key,
+        .fairness_key = try a.dupe(u8, p.fairness_key),
+        .fairness_weight = p.fairness_weight,
+    };
+    inst.info.original_run_id = try a.dupe(u8, init.original_execution_run_id);
     if (init.last_completion_result) |r| if (r.payloads.items.len > 0) {
         inst.last_completion_result = try r.payloads.items[0].dupe(a);
     };
+    if (init.continued_failure) |f| {
+        const copy = try a.create(Failure);
+        copy.* = try f.dupe(a);
+        inst.previous_run_failure = copy;
+    }
     inst.logger = try inst.logger.with(a, .{
         .WorkflowType = inst.info.workflow_type,
         .WorkflowID = inst.info.workflow_id,
@@ -1394,6 +1424,25 @@ fn protoCancellationType(t: ActivityState.CancellationType) cmd_pb.ActivityCance
         .wait_cancellation_completed => .WAIT_CANCELLATION_COMPLETED,
         .abandon => .ABANDON,
     };
+}
+
+/// A start's retry policy as the workflow sees it: absent and zero intervals are null, which
+/// is what `workflow.RetryPolicy` means by unset. Type names are copied into `a`.
+fn zigRetryPolicy(a: Allocator, p: common.RetryPolicy) error{OutOfMemory}!workflow.RetryPolicy {
+    const types = try a.alloc([]const u8, p.non_retryable_error_types.items.len);
+    for (p.non_retryable_error_types.items, types) |t, *d| d.* = try a.dupe(u8, t);
+    return .{
+        .initial_interval = positiveDuration(p.initial_interval),
+        .backoff_coefficient = p.backoff_coefficient,
+        .maximum_interval = positiveDuration(p.maximum_interval),
+        .maximum_attempts = p.maximum_attempts,
+        .non_retryable_error_types = types,
+    };
+}
+
+fn positiveDuration(d: ?proto.google.protobuf.Duration) ?std.Io.Duration {
+    const v = zigDuration(d) orelse return null;
+    return if (v.nanoseconds > 0) v else null;
 }
 
 fn protoRetryPolicy(a: Allocator, rp: workflow.RetryPolicy) !common.RetryPolicy {
@@ -3421,6 +3470,183 @@ test "info: parent and root are null for a top-level workflow and set for a chil
     try testing.expectEqualStrings("parent-ns", root.namespace);
     try testing.expectEqualStrings("root-id", root.workflow_id);
     try testing.expectEqualStrings("root-run", root.run_id);
+}
+
+const StartInfoWf = struct {
+    /// Returns what the run reads of its start:
+    /// "<retry policy>|<priority>|<original run ID>|<previous failure> <- <its cause>".
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const a = ctx.allocator();
+        const info = ctx.info();
+        const policy = if (info.retry_policy) |p| try std.fmt.allocPrint(a, "attempts={d},initial={?d},max={?d},types={s}", .{
+            p.maximum_attempts,
+            if (p.initial_interval) |d| @divTrunc(d.nanoseconds, std.time.ns_per_s) else null,
+            if (p.maximum_interval) |d| @divTrunc(d.nanoseconds, std.time.ns_per_s) else null,
+            try std.mem.join(a, ",", p.non_retryable_error_types),
+        }) else "none";
+        const previous = if (ctx.previousRunFailure()) |f|
+            try std.fmt.allocPrint(a, "{s} <- {s}", .{ f.message, if (f.cause) |c| c.message else "none" })
+        else
+            "none";
+        return std.fmt.allocPrint(a, "{s}|{d}/{s}/{d}|{s}|{s}", .{
+            policy,
+            info.priority.priority_key,
+            info.priority.fairness_key,
+            info.priority.fairness_weight,
+            info.original_run_id,
+            previous,
+        });
+    }
+};
+const StartInfoWfDef = workflow.Def("StartInfo", StartInfoWf.run);
+
+/// A start activation with a retry policy, a priority, an original run ID, and a previous
+/// failure with a cause, every string allocated in `a`.
+fn startWithEverything(a: Allocator, replaying: bool) !act_pb.WorkflowActivation {
+    var act = try initActivation(a, "StartInfo", .{});
+    act.is_replaying = replaying;
+    const init = &act.jobs.items[0].variant.?.initialize_workflow;
+    init.retry_policy = .{
+        .initial_interval = .{ .seconds = 1 },
+        .backoff_coefficient = 2,
+        .maximum_interval = .{ .seconds = 0 },
+        .maximum_attempts = 3,
+    };
+    try init.retry_policy.?.non_retryable_error_types.append(a, try a.dupe(u8, "Fatal"));
+    init.priority = .{ .priority_key = 2, .fairness_key = try a.dupe(u8, "tenant-a"), .fairness_weight = 1.5 };
+    init.original_execution_run_id = try a.dupe(u8, "run-0");
+    const cause = try a.create(Failure);
+    cause.* = .{ .message = try a.dupe(u8, "root cause") };
+    init.continued_failure = try failure_mod.application(a, .{ .message = try a.dupe(u8, "first attempt"), .type = try a.dupe(u8, "Flaky") });
+    init.continued_failure.?.cause = cause;
+    return act;
+}
+
+test "info: retry policy, priority, original run ID, and the previous run's failure from the start" {
+    const want = "\"attempts=3,initial=1,max=null,types=Fatal|2/tenant-a/1.5|run-0|first attempt <- root cause\"";
+    for ([_]bool{ false, true }) |replaying| {
+        var source: std.heap.ArenaAllocator = .init(testing.allocator);
+        var source_freed = false;
+        defer if (!source_freed) source.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const inst = try create(testing.allocator, StartInfoWfDef.registered, .{});
+        defer inst.destroy();
+
+        try testing.expectEqualStrings(want, completedWith(try inst.activate(&try startWithEverything(source.allocator(), replaying), scratch.allocator())));
+        // The run keeps its own copies once the activation is gone.
+        source.deinit();
+        source_freed = true;
+        const info = inst.ctx.info();
+        const policy = info.retry_policy.?;
+        try testing.expectEqual(@as(i32, 3), policy.maximum_attempts);
+        try testing.expectEqual(@as(f64, 2), policy.backoff_coefficient);
+        try testing.expectEqual(@as(i96, std.time.ns_per_s), policy.initial_interval.?.nanoseconds);
+        try testing.expect(policy.maximum_interval == null);
+        try testing.expectEqual(@as(usize, 1), policy.non_retryable_error_types.len);
+        try testing.expectEqualStrings("Fatal", policy.non_retryable_error_types[0]);
+        try testing.expectEqual(@as(i32, 2), info.priority.priority_key);
+        try testing.expectEqualStrings("tenant-a", info.priority.fairness_key);
+        try testing.expectEqual(@as(f32, 1.5), info.priority.fairness_weight);
+        try testing.expectEqualStrings("run-0", info.original_run_id);
+        const previous = inst.ctx.previousRunFailure().?;
+        try testing.expectEqualStrings("first attempt", previous.message);
+        try testing.expectEqualStrings("Flaky", failure_mod.applicationType(previous.*).?);
+        try testing.expectEqualStrings("root cause", previous.cause.?.message);
+    }
+
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, StartInfoWfDef.registered, .{});
+    defer inst.destroy();
+    try testing.expectEqualStrings("\"none|0//0||none\"", completedWith(try inst.activate(&try initActivation(a, "StartInfo", .{}), a)));
+    try testing.expect(inst.ctx.info().retry_policy == null);
+    try testing.expectEqualDeep(workflow.Priority{}, inst.ctx.info().priority);
+    try testing.expect(inst.ctx.previousRunFailure() == null);
+}
+
+const CurrentUpdateWf = struct {
+    const Who = workflow.UpdateDef("who", fn (expected_id: []const u8) []const u8);
+    const Probe = workflow.SignalDef("probe", fn () void);
+    const Done = workflow.SignalDef("done", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        /// What the workflow function, the signal handler, and the coroutine an update
+        /// handler starts saw, in that order: 'n' for no update, 'u' for an update.
+        seen: std.ArrayList(u8) = .empty,
+        done: bool = false,
+
+        fn note(s: *State) !void {
+            try s.seen.append(s.ctx.allocator(), if (s.ctx.currentUpdate() == null) 'n' else 'u');
+        }
+        fn check(s: *State, expected_id: []const u8) error{ NoUpdate, WrongUpdate }!void {
+            const u = s.ctx.currentUpdate() orelse return error.NoUpdate;
+            if (!std.mem.eql(u8, u.id, expected_id) or !std.mem.eql(u8, u.name, "who")) return error.WrongUpdate;
+        }
+        /// Returns "<ID>/<name>" as read after a timer, so concurrent handlers interleave.
+        fn who(s: *State, _: []const u8) ![]const u8 {
+            try s.ctx.io().sleep(.fromSeconds(5), .awake);
+            var inner = s.ctx.io().async(note, .{s});
+            try inner.await(s.ctx.io());
+            const u = s.ctx.currentUpdate() orelse return error.NoUpdate;
+            return std.fmt.allocPrint(s.ctx.allocator(), "{s}/{s}", .{ u.id, u.name });
+        }
+        fn probe(s: *State) void {
+            s.note() catch {};
+        }
+        fn finish(s: *State) void {
+            s.done = true;
+        }
+        fn finished(s: *State) bool {
+            return s.done;
+        }
+    };
+
+    /// Returns what the coroutines without an update saw.
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try s.note();
+        try ctx.setUpdateHandlerWithValidator(Who, s, State.who, State.check);
+        try ctx.setSignalHandler(Probe, s, State.probe);
+        try ctx.setSignalHandler(Done, s, State.finish);
+        try ctx.await(s, State.finished);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return s.seen.items;
+    }
+};
+const CurrentUpdateWfDef = workflow.Def("CurrentUpdate", CurrentUpdateWf.run);
+
+test "update: the validator and the handler see the current update; other coroutines see none" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, CurrentUpdateWfDef.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "CurrentUpdate", .{}), a);
+    try testing.expect(inst.ctx.currentUpdate() == null);
+    // u-3's validator expects another ID, so it sees its own and rejects the update.
+    var act = try oneJob(a, try updateJob(a, "u-1", "who", .{@as([]const u8, "u-1")}, true));
+    try act.jobs.append(a, .{ .variant = try updateJob(a, "u-2", "who", .{@as([]const u8, "u-2")}, true) });
+    try act.jobs.append(a, .{ .variant = try updateJob(a, "u-3", "who", .{@as([]const u8, "u-1")}, true) });
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "probe", .{}) });
+    const blocked = commandsOf(try inst.activate(&act, a));
+    try testing.expect(try updateResponse(blocked[0], "u-1") == .accepted);
+    try testing.expect(try updateResponse(blocked[1], "u-2") == .accepted);
+    try testing.expectEqualStrings("WrongUpdate", (try updateResponse(blocked[2], "u-3")).rejected.message);
+    try testing.expect(inst.ctx.currentUpdate() == null);
+
+    var fire = try oneJob(a, .{ .fire_timer = .{ .seq = 2 } });
+    try fire.jobs.append(a, .{ .variant = .{ .fire_timer = .{ .seq = 1 } } });
+    try fire.jobs.append(a, .{ .variant = try signalJob(a, "done", .{}) });
+    const done = commandsOf(try inst.activate(&fire, a));
+    try testing.expectEqual(@as(usize, 3), done.len);
+    try testing.expectEqualStrings("\"u-2/who\"", (try updateResponse(done[0], "u-2")).completed.data);
+    try testing.expectEqualStrings("\"u-1/who\"", (try updateResponse(done[1], "u-1")).completed.data);
+    try testing.expectEqualStrings("\"nnnn\"", done[2].variant.?.complete_workflow_execution.result.?.data);
 }
 
 const MemoWf = struct {

@@ -175,6 +175,11 @@
 //! (update-with-start) reaches its handler rather than being rejected as unregistered. Its
 //! validator runs on delivery, before `run` starts, so it may see `W{}`.
 //!
+//! A handler or validator reads which update it is running for with `ctx.currentUpdate()`.
+//! An update's ID is unique within the workflow execution, so it serves as an idempotency key:
+//!
+//!     const id = ctx.currentUpdate().?.id;
+//!
 //! The workflow ends when its function returns, even while signal or update handlers are still
 //! running; to let them finish first,
 //! `try ctx.await(ctx, temporal.workflow.Context.allHandlersFinished)`.
@@ -259,6 +264,27 @@ pub const Info = struct {
     /// When this run started, as the server recorded it; the same on every replay. Null when
     /// the server didn't send it.
     start_time: ?std.Io.Timestamp = null,
+    /// The retry policy the workflow was started with, or null without one. With `attempt`, it
+    /// tells a run whether it is the last attempt. Intervals the server didn't set (or set to
+    /// zero) are null. Arena memory of the run.
+    retry_policy: ?RetryPolicy = null,
+    /// The priority the workflow was started with. All fields are zero when it was started
+    /// without one, which means the same as the server's default. `fairness_key` is arena
+    /// memory of the run.
+    priority: Priority = .{},
+    /// The run ID before any reset of this run, or empty when the server didn't send one. A
+    /// run that was never reset has its own run ID here.
+    original_run_id: []const u8 = "",
+};
+
+/// The update a handler or validator is running for (`Context.currentUpdate`). Both strings
+/// live as long as the run is cached.
+pub const UpdateInfo = struct {
+    /// The update's ID: unique within the workflow execution, so it serves as an idempotency
+    /// key.
+    id: []const u8,
+    /// The update's name, which selected the handler.
+    name: []const u8,
 };
 
 pub const RetryPolicy = struct {
@@ -1164,8 +1190,17 @@ pub const Context = struct {
         return ctx.instance.handlers.items.len == 0;
     }
 
+    /// The update being handled: its ID and name, read from the update's handler or its
+    /// validator. Null in the workflow function, in signal and query handlers, and outside any
+    /// coroutine. It is also null in a coroutine an update handler starts with `io.async` or a
+    /// `Group`: read it in the handler and pass it down. On replay the validator doesn't run,
+    /// and the handler sees the same ID and name. The strings live as long as the run is cached.
+    pub fn currentUpdate(ctx: *const Context) ?UpdateInfo {
+        return ctx.instance.currentUpdate();
+    }
+
     /// Whether the previous run of this cron (or retried) workflow completed with a result.
-    ///
+    /// When the previous run failed instead, `previousRunFailure` returns its failure.
     pub fn hasLastCompletionResult(ctx: *const Context) bool {
         return ctx.instance.last_completion_result != null;
     }
@@ -1178,6 +1213,14 @@ pub const Context = struct {
             error.WrongArgumentCount => error.InvalidPayload,
             else => |e| e,
         };
+    }
+
+    /// The failure the previous run of this retried (or cron) workflow ended with, or null when
+    /// there was no previous run or it didn't fail. It comes from the run's start, so it is the
+    /// same on every replay, and reading it emits no command. Lives as long as the run is
+    /// cached. `temporal.failure.applicationType` reads an application failure's type.
+    pub fn previousRunFailure(ctx: *const Context) ?*const failure_mod.Failure {
+        return ctx.instance.previous_run_failure;
     }
 };
 

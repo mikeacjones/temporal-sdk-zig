@@ -1493,6 +1493,40 @@ const UpdateFixtures = struct {
     }
     const HandleUpdatesChanged = workflow.Def("HandleUpdates", handleUpdatesWithoutActivity);
 
+    /// Fails unless `ctx.currentUpdate()` names update `name`.
+    fn expectUpdate(s: *State, name: []const u8) error{WrongUpdate}!void {
+        const u = s.ctx.currentUpdate() orelse return error.WrongUpdate;
+        if (!std.mem.eql(u8, u.name, name) or u.id.len == 0) return error.WrongUpdate;
+    }
+    fn setChecked(s: *State, value: i64) !i64 {
+        try expectUpdate(s, "set");
+        return s.set(value);
+    }
+    fn positiveChecked(s: *State, value: i64) !void {
+        try expectUpdate(s, "set");
+        return s.positive(value);
+    }
+    /// Checks the update before and after the activity it waits for.
+    fn greetChecked(s: *State, name: []const u8) ![]const u8 {
+        try expectUpdate(s, "greet");
+        const greeting = try s.greet(name);
+        try expectUpdate(s, "greet");
+        return greeting;
+    }
+    /// `handleUpdates` with handlers that fail unless they see their own update.
+    fn handleUpdatesChecked(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandlerWithValidator(Set, s, setChecked, positiveChecked);
+        try ctx.setUpdateHandler(Greet, s, greetChecked);
+        try ctx.setSignalHandler(Done, s, State.finish);
+        try ctx.await(s, State.finished);
+        if (ctx.currentUpdate() != null) return error.WrongUpdate;
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return std.fmt.allocPrint(ctx.allocator(), "{d} {s}", .{ s.value, try std.mem.join(ctx.allocator(), " ", s.greetings.items) });
+    }
+    const HandleUpdatesChecked = workflow.Def("HandleUpdates", handleUpdatesChecked);
+
     const Nap = workflow.UpdateDef("nap", fn (seconds: i64) i64);
     /// Sleeps in the handler; returns how many seconds of workflow time passed.
     fn nap(s: *State, seconds: i64) !i64 {
@@ -2203,6 +2237,13 @@ test "WorkflowReplayer replays update handlers and catches a handler that change
     defer changed.deinit();
     try changed.registerWorkflow(UpdateFixtures.HandleUpdatesChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(update_history));
+}
+
+test "WorkflowReplayer replays update_history.json with handlers that read the current update" {
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    try r.registerWorkflow(UpdateFixtures.HandleUpdatesChecked);
+    try r.replayHistoryJson(update_history);
 }
 
 test "WorkflowReplayer replays update_history.json with the handlers declared on a struct workflow" {
@@ -2943,6 +2984,21 @@ const StartOptionFixtures = struct {
     }
     const FailFirstAttempt = workflow.Def("FailFirstAttempt", failFirstAttempt);
 
+    /// Fails its first attempt; the second returns
+    /// "<previous failure>|<maximum attempts>|<priority key>".
+    fn retryInfo(ctx: *workflow.Context) ![]const u8 {
+        const info = ctx.info();
+        if (info.attempt == 1) return ctx.fail(.{ .message = "first attempt", .type = "Flaky" });
+        const previous = ctx.previousRunFailure() orelse return error.NoPreviousFailure;
+        return std.fmt.allocPrint(ctx.allocator(), "{s}/{s}|{d}|{d}", .{
+            previous.message,
+            failure_mod.applicationType(previous.*) orelse "",
+            info.retry_policy.?.maximum_attempts,
+            info.priority.priority_key,
+        });
+    }
+    const RetryInfo = workflow.Def("RetryInfo", retryInfo);
+
     fn startedEvent(c: *client_mod.Client, a: Allocator, id: []const u8, run_id: []const u8) !proto.temporal.api.history.v1.HistoryEvent {
         const history = try c.fetchHistory(a, id, run_id);
         try testing.expect(history.events.items[0].attributes.? == .workflow_execution_started_event_attributes);
@@ -2979,6 +3035,21 @@ test "client: a retry policy set at start retries a failed run" {
     try testing.expectEqual(@as(f64, 2), policy.backoff_coefficient);
     try testing.expectEqual(@as(i64, 1), policy.initial_interval.?.seconds);
     try testing.expectEqualStrings("Fatal", policy.non_retryable_error_types.items[0]);
+}
+
+test "workflow: a retried run reads its retry policy, priority, and the previous attempt's failure" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(StartOptionFixtures.RetryInfo);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Replaying the last run's history covers replay of these reads.
+    try testing.expectEqualStrings("first attempt/Flaky|2|2", try env.executeWorkflowWithOptions(StartOptionFixtures.RetryInfo, .{
+        .retry_policy = .{ .initial_interval = .fromSeconds(1), .maximum_attempts = 2 },
+        .priority = .{ .priority_key = 2 },
+    }, .{}, a, null));
 }
 
 test "client: summary, details, priority and a versioning override set at start are recorded in the started event" {
