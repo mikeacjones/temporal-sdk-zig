@@ -7,6 +7,15 @@
 //!     try w.registerActivity(Greet);
 //!     try w.runUntilSignal(); // stops on SIGINT or SIGTERM
 //!
+//! To start and stop a worker without blocking, run `run` on a concurrent task; there is no
+//! separate start function. `run`'s error, such as `error.PollFailed`, arrives at `await`:
+//!
+//!     var running = try io.concurrent(temporal.worker.Worker.run, .{&w});
+//!     try w.waitUntilRunning();
+//!     // ... the worker polls while this code does other work ...
+//!     w.stop();
+//!     try running.await(io); // error.PollFailed if polling failed; see fatalMessage
+//!
 //! Workflow activations of different runs are processed in parallel, each on a task of its
 //! own and on its run's deterministic Io; `max_concurrent_workflow_task_executions` bounds how
 //! many at once. A run is processed by one thread at a time, but may move to another thread
@@ -151,10 +160,15 @@ pub const Worker = struct {
     dynamic_activity: ?activity.Registered = null,
     /// The core workers while `run` is active, for `stop` on other threads: the task queue's,
     /// then with sessions, the session queue's and the host queue's.
-    /// Guards `core_ptrs` and `stop_requested`, which `stop` (any thread) and `run` share.
+    /// Guards `core_ptrs`, `stop_requested`, `fatal` and `fatal_message`, which `stop` (any
+    /// thread), the poll loops and `run` share.
     stop_mutex: Io.Mutex = .init,
     core_ptrs: [3]?*bridge.c.TemporalCoreWorker = @splat(null),
     stop_requested: bool = false,
+    /// The first poll failure of the current or last run, and its text (owned; null if it
+    /// couldn't be allocated). See `fatalMessage`.
+    fatal: ?PollError = null,
+    fatal_message: ?[]u8 = null,
     /// Set once `run` has registered the worker with its client and started polling, or has
     /// failed before getting there (`start_failed`). See `waitUntilRunning`.
     started: Io.Event = .unset,
@@ -172,6 +186,7 @@ pub const Worker = struct {
         w.workflows.deinit(w.gpa);
         w.activities.deinit(w.gpa);
         w.gpa.free(w.task_queue);
+        if (w.fatal_message) |m| w.gpa.free(m);
         w.* = undefined;
     }
 
@@ -296,10 +311,34 @@ pub const Worker = struct {
         return w.activities.count() > 0 or w.dynamic_activity != null;
     }
 
-    pub const RunError = error{ OutOfMemory, NothingRegistered, WorkerInitFailed, InvalidOptions, ValidationFailed, ShutdownFailed, ConcurrencyUnavailable };
+    const PollError = bridge.Worker.PollError;
 
-    /// Polls and runs tasks until `stop` is called. Returns after in-flight work finishes.
+    /// Errors from `run`:
+    /// - `NothingRegistered`, `InvalidOptions`: the worker's registrations or options, before
+    ///   anything starts (the reason is logged).
+    /// - `WorkerInitFailed`, `ValidationFailed`: the core rejected the worker or the server
+    ///   rejected its namespace or task queue (the core's message is logged).
+    /// - `ConcurrencyUnavailable`: the worker's Io couldn't start a poll loop.
+    /// - `PollFailed`: the core gave up polling for tasks; `fatalMessage` has its text.
+    /// - `ShutdownFailed`: finalizing a core worker failed (logged).
+    /// - `OutOfMemory`.
+    pub const RunError = error{ OutOfMemory, NothingRegistered, WorkerInitFailed, InvalidOptions, ValidationFailed, ShutdownFailed, ConcurrencyUnavailable, PollFailed };
+
+    /// Polls and runs tasks until `stop` is called, or until polling fails for good. Returns
+    /// after in-flight work finishes and every core worker is shut down:
+    /// - success after `stop` (or a signal, with `runUntilSignal`);
+    /// - `error.PollFailed` (or `error.OutOfMemory`) when the core gave up polling, after
+    ///   shutting down as `stop` does; `fatalMessage` has the task queue and the core's text;
+    /// - an error from starting the worker or from shutting it down. A loop that couldn't
+    ///   start is returned before a poll failure, and a poll failure before a failed shutdown.
     pub fn run(w: *Worker) RunError!void {
+        {
+            w.stop_mutex.lockUncancelable(w.io);
+            defer w.stop_mutex.unlock(w.io);
+            if (w.fatal_message) |m| w.gpa.free(m);
+            w.fatal_message = null;
+            w.fatal = null;
+        }
         var running = false;
         defer if (!running) {
             w.start_failed = true;
@@ -442,9 +481,15 @@ pub const Worker = struct {
                 message = null;
             };
         }
-        if (shutdown_failed) |err| return start_failed orelse err;
-        log.info("Stopped Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
+        const poll_failed = poll_failed: {
+            w.stop_mutex.lockUncancelable(w.io);
+            defer w.stop_mutex.unlock(w.io);
+            break :poll_failed w.fatal;
+        };
+        if (shutdown_failed == null) log.info("Stopped Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
         if (start_failed) |err| return err;
+        if (poll_failed) |err| return err;
+        if (shutdown_failed) |err| return err;
     }
 
     /// Creates and validates a core worker; logs and returns the error on failure.
@@ -516,6 +561,40 @@ pub const Worker = struct {
         for (w.core_ptrs) |p| if (p) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
     }
 
+    /// The first poll failure of the last `run`, as `polling for <workflow|activity> tasks on
+    /// task queue <queue> failed: <the core's message>`, or null if that run had none (or its
+    /// text couldn't be allocated). Owned by the worker: valid until the next `run` starts or
+    /// `deinit`. Safe to call from any thread.
+    pub fn fatalMessage(w: *Worker) ?[]const u8 {
+        w.stop_mutex.lockUncancelable(w.io);
+        defer w.stop_mutex.unlock(w.io);
+        return w.fatal_message;
+    }
+
+    const PollKind = enum { workflow, activity };
+
+    /// Reports a failed poll from a poll loop: the core has already retried what it considers
+    /// transient, so the worker logs it, records it for `run` to return, and stops.
+    fn pollFailed(w: *Worker, kind: PollKind, task_queue: []const u8, err: PollError, detail: ?[]const u8) void {
+        log.err("polling for {t} tasks on task queue {s} failed: {s}; stopping the worker", .{ kind, task_queue, detail orelse @errorName(err) });
+        w.recordPollFailure(kind, task_queue, err, detail);
+    }
+
+    /// `pollFailed` without the log line (the test runner fails any test that logs an error):
+    /// keeps the run's first failure and its text, and stops the worker.
+    fn recordPollFailure(w: *Worker, kind: PollKind, task_queue: []const u8, err: PollError, detail: ?[]const u8) void {
+        const text = std.fmt.allocPrint(w.gpa, "polling for {t} tasks on task queue {s} failed: {s}", .{ kind, task_queue, detail orelse @errorName(err) }) catch null;
+        {
+            w.stop_mutex.lockUncancelable(w.io);
+            defer w.stop_mutex.unlock(w.io);
+            if (w.fatal == null) {
+                w.fatal = err;
+                w.fatal_message = text;
+            } else if (text) |t| w.gpa.free(t);
+        }
+        w.stop();
+    }
+
     /// Waits until `run` (on another task) has registered the worker with its client and
     /// started polling, for example before an eager workflow start, which only reaches a worker
     /// the client already knows. Returns `error.WorkerFailedToStart` if `run` returned before
@@ -532,7 +611,7 @@ pub const Worker = struct {
 
     /// Runs until the process receives SIGINT or SIGTERM. One signal stops every worker in
     /// the process that is running this way; while any is, the previous handlers for those
-    /// signals are replaced.
+    /// signals are replaced. Returns what `run` returns.
     pub fn runUntilSignal(w: *Worker) RunError!void {
         var node: SignalWatcher.Node = .{ .worker = w };
         try SignalWatcher.register(&node);
@@ -569,8 +648,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
     var group: Io.Group = .init;
     while (true) {
         const polled = core.pollWorkflowActivation(w.gpa, w.io, &message) catch |err| {
-            log.err("polling for workflow tasks failed, stopping the worker: {s}", .{message orelse @errorName(err)});
-            w.stop();
+            w.pollFailed(.workflow, w.task_queue, err, message);
             continue;
         } orelse break;
         group.concurrent(w.io, processActivation, .{ &runner, core, w.io, polled }) catch {
@@ -979,8 +1057,7 @@ fn activityLoop(w: *Worker, core: bridge.Worker, task_queue: []const u8) void {
     defer if (message) |m| w.gpa.free(m);
     while (true) {
         const polled = core.pollActivityTask(w.gpa, w.io, &message) catch |err| {
-            log.err("polling for activity tasks failed, stopping the worker: {s}", .{message orelse @errorName(err)});
-            w.stop();
+            w.pollFailed(.activity, task_queue, err, message);
             continue;
         } orelse break;
         const run = receiveActivityTask(w, &running, polled, task_queue) orelse continue;
@@ -1996,9 +2073,28 @@ const CancelTest = struct {
     }
     const RunBeat = workflow.Def("RunBeat", runBeat);
 
+    var release: Io.Event = .unset;
+
+    /// Runs until `release` is set, then returns a value; records a cancel in `seen_reason`.
+    fn finish(ctx: *activity.Context) ![]const u8 {
+        started.set(ctx.io());
+        release.wait(ctx.io()) catch |err| {
+            seen_reason = ctx.cancelReason();
+            return err;
+        };
+        return "finished";
+    }
+    const Finish = activity.Def("Finish", finish);
+
+    fn runFinish(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(Finish, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const RunFinish = workflow.Def("RunFinish", runFinish);
+
     fn reset() void {
         started = .unset;
         observed = .unset;
+        release = .unset;
         seen_reason = null;
     }
 
@@ -2019,6 +2115,8 @@ const CancelTest = struct {
         try env.registerWorkflow(RunBeat);
         try env.registerActivity(Beat);
         try env.registerActivity(WaitStarted);
+        try env.registerWorkflow(RunFinish);
+        try env.registerActivity(Finish);
         return env;
     }
 };
@@ -2078,6 +2176,27 @@ test "stopping the worker cancels running activities with reason worker_shutdown
     try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
 }
 
+test "a graceful shutdown period lets a running activity finish" {
+    const env = try CancelTest.start();
+    defer env.deinit();
+    const period: Io.Duration = .fromSeconds(30);
+    env.worker.options.graceful_shutdown_period = period;
+
+    var run = try env.startWorkflow(CancelTest.RunFinish, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try CancelTest.started.wait(testing.io);
+    const stopped_at = Io.Timestamp.now(testing.io, .awake);
+    env.worker.stop();
+    CancelTest.release.set(testing.io);
+    try env.running.?.await(testing.io);
+    env.running = null;
+    const elapsed = stopped_at.durationTo(Io.Timestamp.now(testing.io, .awake));
+
+    try testing.expectEqual(@as(?activity.CancelReason, null), CancelTest.seen_reason);
+    try testing.expectEqual(1, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_COMPLETED));
+    try testing.expect(elapsed.nanoseconds < period.nanoseconds);
+}
+
 test "waitUntilRunning returns once run polls, or fails if run returned first" {
     const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
     defer rt.deinit();
@@ -2103,6 +2222,64 @@ test "waitUntilRunning returns once run polls, or fails if run returned first" {
     }
     w.stop();
     try running.await(testing.io);
+    try testing.expectEqual(@as(?[]const u8, null), w.fatalMessage());
+}
+
+test "the first poll failure is recorded with its kind, task queue and detail" {
+    var client: client_mod.Client = undefined; // never touched: nothing is registered
+    var w = try Worker.init(testing.allocator, testing.io, &client, "fatal", .{});
+    defer w.deinit();
+    w.recordPollFailure(.activity, "q1", error.PollFailed, "permission denied");
+    w.recordPollFailure(.workflow, "q2", error.PollFailed, "later");
+    try testing.expectEqualStrings("polling for activity tasks on task queue q1 failed: permission denied", w.fatalMessage().?);
+    try testing.expectEqual(@as(?Worker.PollError, error.PollFailed), w.fatal);
+
+    // Without a message from the core, the error's name is the detail.
+    var bare = try Worker.init(testing.allocator, testing.io, &client, "bare", .{});
+    defer bare.deinit();
+    bare.recordPollFailure(.workflow, "q3", error.OutOfMemory, null);
+    try testing.expectEqualStrings("polling for workflow tasks on task queue q3 failed: OutOfMemory", bare.fatalMessage().?);
+
+    // A run clears the last run's failure first, even one that returns early.
+    try testing.expectError(error.NothingRegistered, w.run());
+    try testing.expectEqual(@as(?[]const u8, null), w.fatalMessage());
+}
+
+/// Runs a worker on a dev server, reports a poll failure to it as a poll loop does, and
+/// expects `run` (through `runFn`) to shut down and return it.
+fn expectPollFailureReturned(comptime runFn: fn (*Worker) Worker.RunError!void, task_queue: []const u8) !void {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, testing.io, &client, task_queue, .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    var running = try testing.io.concurrent(runFn, .{&w});
+    try w.waitUntilRunning();
+    w.recordPollFailure(.activity, w.task_queue, error.PollFailed, "boom");
+    try testing.expectError(error.PollFailed, running.await(testing.io));
+    const expected = try std.fmt.allocPrint(testing.allocator, "polling for activity tasks on task queue {s} failed: boom", .{task_queue});
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, w.fatalMessage().?);
+    w.stop_mutex.lockUncancelable(testing.io);
+    defer w.stop_mutex.unlock(testing.io);
+    try testing.expectEqual(@as(?*bridge.c.TemporalCoreWorker, null), w.core_ptrs[0]);
+}
+
+test "run returns a poll failure after shutting down" {
+    try expectPollFailureReturned(HelloTest.runWorker, "poll-failure");
+}
+
+test "runUntilSignal returns a poll failure after shutting down" {
+    try expectPollFailureReturned(HelloTest.runWorkerUntilSignal, "poll-failure-signal");
+    SignalWatcher.mutex.lockUncancelable(testing.io);
+    defer SignalWatcher.mutex.unlock(testing.io);
+    try testing.expectEqual(0, SignalWatcher.workers.len());
 }
 
 test "one SIGTERM stops every worker running until a signal, then the previous handler is back" {
