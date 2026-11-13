@@ -42,7 +42,11 @@
 //! Workflow code must be deterministic: it is replayed from history. Use `ctx.io()` for
 //! concurrency, timers (`io.sleep`), time (`io.now`), and randomness; everything on it is
 //! recorded or derived from history. Memory from `ctx.allocator()` lives as long as the
-//! workflow run stays cached on the worker.
+//! workflow run stays cached on the worker. A worker can cap what one run holds
+//! (`worker.Options.workflow_memory_limit`, counting that memory and the run's coroutine
+//! stacks). Workflow code sees nothing when a run goes over it: allocations still succeed,
+//! and the workflow task fails at the end of the activation and is retried, until the limit
+//! is raised or the workflow keeps less state.
 //!
 //! A value the workflow can't derive deterministically, such as an ID from an outside
 //! generator, is computed once with `ctx.sideEffect`, recorded in history, and read back from
