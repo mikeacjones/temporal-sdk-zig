@@ -3279,6 +3279,44 @@ test "local activity without close timeouts: get returns error.InvalidOptions" {
     try testing.expectEqualStrings("InvalidOptions", cmds[0].variant.?.fail_workflow_execution.failure.?.message);
 }
 
+// Each mode passes options that the session API rejects before scheduling anything.
+const SessionOptionsCheck = struct {
+    const valid: workflow.SessionOptions = .{ .creation_timeout = .fromSeconds(10), .execution_timeout = .fromSeconds(60) };
+
+    fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        var opts = valid;
+        if (std.mem.eql(u8, mode, "session_and_task_queue")) {
+            // Rejected before the session's state is read, so its creation activity is unused.
+            const session: workflow.Session = .{ .id = "s1", .heartbeat_timeout = .fromSeconds(20), .creation = undefined, .opened = true };
+            return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(5), .task_queue = "elsewhere", .session = &session }, .{"x"}).get();
+        } else if (std.mem.eql(u8, mode, "empty_recreate_queue")) {
+            _ = try ctx.recreateSession("", valid);
+        } else if (std.mem.eql(u8, mode, "zero_creation_timeout")) {
+            opts.creation_timeout = .zero;
+        } else if (std.mem.eql(u8, mode, "negative_execution_timeout")) {
+            opts.execution_timeout = .fromSeconds(-1);
+        } else if (std.mem.eql(u8, mode, "zero_heartbeat_timeout")) {
+            opts.heartbeat_timeout = .zero;
+        } else return error.InvalidPayload;
+        _ = try ctx.createSession(opts);
+        return "created";
+    }
+};
+const SessionOptionsCheckWf = workflow.Def("SessionOptionsCheck", SessionOptionsCheck.run);
+
+test "sessions: invalid options fail with error.InvalidOptions and schedule nothing" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "session_and_task_queue", "empty_recreate_queue", "zero_creation_timeout", "negative_execution_timeout", "zero_heartbeat_timeout" }) |mode| {
+        const inst = try create(testing.allocator, SessionOptionsCheckWf.registered, .{});
+        defer inst.destroy();
+        const cmds = commandsOf(try inst.activate(&try initActivation(a, "SessionOptionsCheck", .{mode}), a));
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqualStrings("InvalidOptions", cmds[0].variant.?.fail_workflow_execution.failure.?.message);
+    }
+}
+
 test "eviction while a local activity backs off frees everything" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();

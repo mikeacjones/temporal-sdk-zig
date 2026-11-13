@@ -5299,6 +5299,17 @@ test "sessions: activities run on the session's host and see its ID, until the s
     try testing.expect(found);
 }
 
+test "sessions: unlimited session and activity slots don't overflow, and sessions still run" {
+    const env = try SessionFixtures.start(std.math.maxInt(usize));
+    defer env.deinit();
+    env.worker.options.max_concurrent_activity_executions = std.math.maxInt(usize);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const report = try env.executeWorkflow(SessionFixtures.Happy, .{}, arena.allocator(), null);
+    try testing.expect(report.activities_in_session);
+    try testing.expectEqualStrings("closed", report.closed);
+}
+
 test "sessions: a full host takes no more sessions until one completes" {
     const env = try SessionFixtures.start(1);
     defer env.deinit();
