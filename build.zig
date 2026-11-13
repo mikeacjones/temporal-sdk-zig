@@ -225,6 +225,9 @@ fn buildCoreLib(b: *std.Build, target: std.Build.ResolvedTarget, protoc_opt: ?[]
     if (protoc) |p| {
         cargo.addFileArg2(p, .{ .prefix = "--config=env.PROTOC='", .suffix = "'", .make_absolute = true });
     }
+    // Whenever rustc compiles the bridge crate it prints the system libraries linkCoreLib must
+    // link; CI records them per target. Passing it every time keeps cargo's fingerprint stable.
+    cargo.addArgs(&.{ "--", "--print", "native-static-libs" });
     cargo.has_side_effects = true;
 
     // Copy the library into a tracked output so every artifact that links it waits for cargo.
@@ -314,12 +317,18 @@ fn linkCoreLib(m: *std.Build.Module, target: std.Build.ResolvedTarget, lib: std.
             m.linkSystemLibrary("iconv", .{});
         },
         .linux => {
-            // Rust's std needs the _Unwind_* functions (libgcc_s on glibc). link_libcpp makes
-            // Zig build and link LLVM's libunwind, which provides them without a system lib.
+            // `cargo rustc ... -- --print native-static-libs` (sdk-core c-bridge, Rust 1.95,
+            // aarch64; CI's core step records each Linux target in its job summary):
+            //   gnu:  -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
+            //   musl: -lunwind -lc
+            // gcc_s and unwind supply Rust's _Unwind_* functions. link_libcpp makes Zig build
+            // and link LLVM's libunwind, which provides them without a system library.
             m.link_libcpp = true;
-            m.linkSystemLibrary("pthread", .{});
-            m.linkSystemLibrary("dl", .{});
-            m.linkSystemLibrary("m", .{});
+            if (target.result.abi.isGnu()) {
+                for ([_][]const u8{ "util", "rt", "pthread", "m", "dl" }) |name| {
+                    m.linkSystemLibrary(name, .{});
+                }
+            }
         },
         .windows => {
             for ([_][]const u8{ "ws2_32", "userenv", "ntdll", "bcrypt", "advapi32", "kernel32", "secur32", "crypt32", "ncrypt" }) |name| {
