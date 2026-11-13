@@ -1413,6 +1413,8 @@ Releases follow [SemVer 2.0](https://semver.org/spec/v2.0.0.html) and are tagged
 
 ## Development
 
+[CONTRIBUTING.md](CONTRIBUTING.md) describes how to report bugs, propose features, and open pull requests.
+
 ### Prerequisites
 
 - [Zig](https://ziglang.org/download/) 0.17.1
@@ -1456,7 +1458,7 @@ zig build test -Doptimize=ReleaseSafe
 
 ## Contributing
 
-See [AGENTS.md](AGENTS.md) for how the project is built, tested, and reviewed. Work is tracked with [beads](https://github.com/gastownhall/beads) (`bd ready` lists open work).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for issues and pull requests, and [AGENTS.md](AGENTS.md) for how the project is built, tested, and reviewed. Work is tracked with [beads](https://github.com/gastownhall/beads) (`bd ready` lists open work).
 
 ## License
 

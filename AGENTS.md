@@ -76,7 +76,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - Update README.md when the public API changes.
 - Run `zig build fmt`, `zig build test`, and `zig build test -Doptimize=ReleaseSafe`.
 - Run `zig build samples-test` when the change touches the client, worker, workflow runtime, activities, Nexus, payload conversion, or interceptors.
-- Commit messages: a short imperative subject, and a body that explains why.
+- Commit messages: a short imperative subject, and a body that explains why. CONTRIBUTING.md has the full commit and pull request description style, and `.github/PULL_REQUEST_TEMPLATE.md` carries the description's sections.
 
 ## Where things are
 
@@ -90,6 +90,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `examples/readme/` holds the compiled examples that README.md's code blocks copy, and `tools/readme_examples.zig` checks or rewrites the copies.
 - `scripts/` holds maintenance scripts, each with usage in its header.
 - `docs/` holds maintainer documentation.
+- `CONTRIBUTING.md` is the guide for issues and pull requests; `.github/PULL_REQUEST_TEMPLATE.md` and `.github/ISSUE_TEMPLATE/` hold the pull request and issue templates.
 - `.github/workflows/` runs CI (`ci.yml`) and the samples suite (`samples.yml`), and, when dispatched by hand, builds and publishes the core bundles (`core-bundles.yml`) and releases the SDK (`release.yml`).
 - `tools/release-smoke/` is a project that depends on a release tarball, built by `scripts/smoke-release.sh`.
 - `CHANGELOG.md` is written when a release is prepared, not by ordinary changes. [docs/releasing.md](docs/releasing.md) has the version and support policy and the release sequence.
