@@ -791,16 +791,16 @@ fn currentHandler(inst: *Instance) ?*HandlerRun {
     return null;
 }
 
-/// The update whose handler is running now, or else the update being validated. The handler
-/// comes first: a handler can register another update handler, which validates buffered
-/// updates from inside it.
+/// The update being validated, or else the update whose handler is running now. The
+/// validator comes first: a handler that registers an update handler validates buffered
+/// updates inline in its own coroutine, and `validating_update` is set only for that call.
 pub fn currentUpdate(inst: *Instance) ?workflow.UpdateInfo {
-    if (inst.currentHandler()) |run| switch (run.kind) {
-        .update => |u| return .{ .id = u.update.id, .name = u.update.name },
-        .signal => return null,
+    if (inst.validating_update) |u| return .{ .id = u.id, .name = u.name };
+    const run = inst.currentHandler() orelse return null;
+    return switch (run.kind) {
+        .update => |u| .{ .id = u.update.id, .name = u.update.name },
+        .signal => null,
     };
-    const u = inst.validating_update orelse return null;
-    return .{ .id = u.id, .name = u.name };
 }
 
 /// Records `Context.fail`'s failure for the running coroutine: its handler run's, or the
@@ -3647,6 +3647,99 @@ test "update: the validator and the handler see the current update; other corout
     try testing.expectEqualStrings("\"u-2/who\"", (try updateResponse(done[0], "u-2")).completed.data);
     try testing.expectEqualStrings("\"u-1/who\"", (try updateResponse(done[1], "u-1")).completed.data);
     try testing.expectEqualStrings("\"nnnn\"", done[2].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// A handler that registers an update handler validates the buffered updates of that name
+// inline in its own coroutine; the validator must still see its own update.
+const NestedValidatorWf = struct {
+    const Register = workflow.SignalDef("register", fn () void);
+    const Set = workflow.UpdateDef("set", fn () void);
+    const A = workflow.UpdateDef("a", fn () []const u8);
+    const B = workflow.UpdateDef("b", fn () void);
+    const Done = workflow.SignalDef("done", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        /// What each coroutine saw as "<ID>/<name>", or "none" for no update.
+        set_validator: []const u8 = "",
+        signal_after: []const u8 = "",
+        b_validator: []const u8 = "",
+        done: bool = false,
+
+        fn seen(s: *State) ![]const u8 {
+            const u = s.ctx.currentUpdate() orelse return "none";
+            return std.fmt.allocPrint(s.ctx.allocator(), "{s}/{s}", .{ u.id, u.name });
+        }
+        fn register(s: *State) !void {
+            try s.ctx.setUpdateHandlerWithValidator(Set, s, State.noop, State.validateSet);
+            s.signal_after = try s.seen();
+        }
+        fn validateSet(s: *State) !void {
+            s.set_validator = try s.seen();
+        }
+        fn handleA(s: *State) ![]const u8 {
+            try s.ctx.setUpdateHandlerWithValidator(B, s, State.noop, State.validateB);
+            return s.seen();
+        }
+        fn validateB(s: *State) !void {
+            s.b_validator = try s.seen();
+        }
+        fn noop(_: *State) void {}
+        fn finish(s: *State) void {
+            s.done = true;
+        }
+        fn finished(s: *State) bool {
+            return s.done;
+        }
+    };
+
+    /// Returns "<set's validator>|<the signal handler after registering>|<b's validator>".
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setSignalHandler(Register, s, State.register);
+        try ctx.setUpdateHandler(A, s, State.handleA);
+        try ctx.setSignalHandler(Done, s, State.finish);
+        try ctx.await(s, State.finished);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|{s}|{s}", .{ s.set_validator, s.signal_after, s.b_validator });
+    }
+};
+const NestedValidatorWfDef = workflow.Def("NestedValidator", NestedValidatorWf.run);
+
+test "update: a validator run from inside another handler sees its own update" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NestedValidatorWfDef.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "NestedValidator", .{}), a);
+    // u-1 and u-2 wait for their handlers, which the signal handler and u-3's handler register.
+    var act = try oneJob(a, try updateJob(a, "u-1", "set", .{}, true));
+    try act.jobs.append(a, .{ .variant = try updateJob(a, "u-2", "b", .{}, true) });
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "register", .{}) });
+    try act.jobs.append(a, .{ .variant = try updateJob(a, "u-3", "a", .{}, true) });
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "done", .{}) });
+    const cmds = commandsOf(try inst.activate(&act, a));
+    var accepted: usize = 0;
+    var completed: usize = 0;
+    var result: []const u8 = "";
+    for (cmds) |c| switch (c.variant.?) {
+        .update_response => |r| switch (r.response.?) {
+            .accepted => accepted += 1,
+            .completed => |p| {
+                completed += 1;
+                if (std.mem.eql(u8, r.protocol_instance_id, "u-3")) try testing.expectEqualStrings("\"u-3/a\"", p.data);
+            },
+            .rejected => return error.TestUnexpectedResult,
+        },
+        .complete_workflow_execution => |c2| result = c2.result.?.data,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 3), completed);
+    try testing.expectEqualStrings("\"u-1/set|none|u-2/b\"", result);
 }
 
 const MemoWf = struct {
