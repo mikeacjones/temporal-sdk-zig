@@ -3,7 +3,8 @@ const builtin = @import("builtin");
 const protobuf = @import("protobuf");
 const protos = @import("deps/protos.zig");
 
-const core_header = "deps/sdk-core/crates/sdk-core-c-bridge/include/temporal-sdk-core-c-bridge.h";
+const core_header_name = "temporal-sdk-core-c-bridge.h";
+const core_header = "deps/sdk-core/crates/sdk-core-c-bridge/include/" ++ core_header_name;
 const core_lib_name = "libtemporalio_sdk_core_c_bridge.a";
 
 pub fn build(b: *std.Build) void {
@@ -13,15 +14,20 @@ pub fn build(b: *std.Build) void {
     const core_lib_opt = b.option(
         []const u8,
         "core-lib",
-        "Path to a prebuilt sdk-core C bridge static library (skips the cargo build)",
+        "Path to a prebuilt sdk-core C bridge static library (skips the cargo build; the header comes from deps/sdk-core)",
+    );
+    const core_bundle_opt = b.option(
+        []const u8,
+        "core-bundle",
+        "Path to an extracted core bundle (lib/ and include/, from scripts/package-core-bundle.sh) to link instead of building the core",
     );
     const protoc_opt = b.option([]const u8, "protoc", "Path to protoc used by the cargo build (default: pinned download)");
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
 
-    const core_c = b.addTranslateC(.{
-        .root_source_file = b.path(core_header),
-        .target = target,
-        .optimize = optimize,
-    }).createModule();
+    // A fetched package has neither the submodule nor samples/, so the steps that need them
+    // exist only in a checkout.
+    const have_submodule = pathExists(b, core_header);
+    const have_samples = pathExists(b, "samples");
 
     const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
 
@@ -31,31 +37,45 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "core_c", .module = core_c },
             .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
         },
     });
 
     // zig build gen-proto: regenerate src/proto from the sdk-core .proto files.
-    const gen_proto = b.step("gen-proto", "Regenerate src/proto from deps/sdk-core protos");
-    gen_proto.dependOn(genProto(b, protobuf_dep, protoc_opt));
+    if (have_submodule) {
+        const gen_proto = b.step("gen-proto", "Regenerate src/proto from deps/sdk-core protos");
+        gen_proto.dependOn(genProto(b, protobuf_dep, protoc_opt));
+    }
 
-    const core_lib: std.Build.LazyPath = if (core_lib_opt) |p|
-        .{ .cwd_relative = p }
-    else
-        buildCoreLib(b, target, protoc_opt);
-    linkCoreLib(temporal, target, core_lib);
+    // Null only while the core bundle dependency is still being fetched: the build runner
+    // fetches it and configures again before building anything.
+    const core = selectCore(b, target, .{
+        .core_lib = core_lib_opt,
+        .core_bundle = core_bundle_opt,
+        .protoc = protoc_opt,
+        .have_submodule = have_submodule,
+    }) orelse return;
+    temporal.addImport("core_c", b.addTranslateC(.{
+        .root_source_file = core.header,
+        .target = target,
+        .optimize = optimize,
+    }).createModule());
+    linkCoreLib(temporal, target, core.lib);
 
     // zig build core: build only the Rust core library
     const core_step = b.step("core", "Build the sdk-core C bridge static library");
-    core_step.dependOn(&b.addInstallFile(core_lib, "lib/" ++ core_lib_name).step);
+    core_step.dependOn(&b.addInstallFile(core.lib, "lib/" ++ core_lib_name).step);
+    core_step.dependOn(&b.addInstallFile(core.header, "include/" ++ core_header_name).step);
 
     // zig build test
-    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
     const unit_tests = b.addTest(.{ .root_module = temporal, .filters = test_filters });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
+    if (have_samples) addSampleSteps(b, target, optimize, temporal);
+}
+
+fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module) void {
     // zig build fmt
     const fmt_paths: []const std.Build.LazyPath = &.{
         b.path("build.zig"),
@@ -200,6 +220,94 @@ fn findSamples(b: *std.Build) []const Sample {
     return found.items;
 }
 
+const Core = struct { lib: std.Build.LazyPath, header: std.Build.LazyPath };
+
+/// Picks the core library and the header that matches it: -Dcore-lib (header from the
+/// submodule) or -Dcore-bundle, then cargo in a checkout with the submodule, then the bundle
+/// that build.zig.zon pins for this target at CORE_VERSION. Returns null while that bundle
+/// is still to be fetched.
+fn selectCore(b: *std.Build, target: std.Build.ResolvedTarget, opts: struct {
+    core_lib: ?[]const u8,
+    core_bundle: ?[]const u8,
+    protoc: ?[]const u8,
+    have_submodule: bool,
+}) ?Core {
+    if (opts.core_lib != null and opts.core_bundle != null) {
+        std.process.fatal("-Dcore-lib and -Dcore-bundle both name a core library; pass only one", .{});
+    }
+    if (opts.core_lib) |lib| {
+        if (!opts.have_submodule) std.process.fatal(
+            "-Dcore-lib needs the C header from the deps/sdk-core submodule, which is missing ({s}); pass -Dcore-bundle=<dir> with a bundle that has lib/ and include/ instead",
+            .{core_header},
+        );
+        return .{ .lib = .{ .cwd_relative = lib }, .header = b.path(core_header) };
+    }
+    if (opts.core_bundle) |dir| {
+        const lib = b.pathJoin(&.{ dir, "lib", core_lib_name });
+        const header = b.pathJoin(&.{ dir, "include", core_header_name });
+        for ([_][]const u8{ lib, header }) |p| {
+            std.Io.Dir.cwd().access(b.graph.io, p, .{}) catch |err| std.process.fatal(
+                "-Dcore-bundle={s}: cannot open {s} ({t}); a core bundle has lib/{s} and include/{s}",
+                .{ dir, p, err, core_lib_name, core_header_name },
+            );
+        }
+        return .{ .lib = .{ .cwd_relative = lib }, .header = .{ .cwd_relative = header } };
+    }
+    if (opts.have_submodule) {
+        return .{ .lib = buildCoreLib(b, target, opts.protoc), .header = b.path(core_header) };
+    }
+
+    b.dependOnFileContents(b.path("CORE_VERSION"));
+    const version_file = b.root.root_dir.handle.readFileAlloc(b.graph.io, b.pathJoin(&.{ b.root.sub_path, "CORE_VERSION" }), b.allocator, .limited(256)) catch |err|
+        std.process.fatal("cannot read CORE_VERSION, which names the sdk-core release to link: {t}", .{err});
+    const version = std.mem.trim(u8, version_file, " \t\r\n");
+    const target_name = bundleTargetName(b, target.result);
+    const dep_name = b.fmt("core-{s}-{s}", .{ version, target_name });
+    // lazyDependency panics on a name build.zig.zon doesn't declare, so look first.
+    for (b.available_deps) |dep| {
+        if (!std.mem.eql(u8, dep[0], dep_name)) continue;
+        const bundle = b.lazyDependency(dep_name, .{}) orelse return null;
+        return .{
+            .lib = bundle.path("lib/" ++ core_lib_name),
+            .header = bundle.path("include/" ++ core_header_name),
+        };
+    }
+    std.process.fatal(
+        "no prebuilt core for {s} at sdk-core {s}: build.zig.zon has no dependency {s}. " ++
+            "Build from a checkout with the deps/sdk-core submodule (cargo builds the core), " ++
+            "or pass -Dcore-bundle=<dir> (an extracted bundle from scripts/package-core-bundle.sh)",
+        .{ target_name, version, dep_name },
+    );
+}
+
+/// The Zig target a core bundle is built for, as its name spells it: aarch64-macos,
+/// x86_64-linux-gnu, x86_64-linux-musl.
+fn bundleTargetName(b: *std.Build, t: std.Target) []const u8 {
+    return switch (t.os.tag) {
+        .linux => b.fmt("{t}-linux-{t}", .{ t.cpu.arch, t.abi }),
+        else => b.fmt("{t}-{t}", .{ t.cpu.arch, t.os.tag }),
+    };
+}
+
+/// Whether `sub_path` exists in this package, recorded so configuration runs again when that
+/// changes. The configure cache fails on a dependency that doesn't exist, so a missing path
+/// depends on its nearest existing parent directory instead.
+fn pathExists(b: *std.Build, sub_path: []const u8) bool {
+    var p = sub_path;
+    while (true) {
+        const stat = b.root.root_dir.handle.statFile(b.graph.io, b.pathJoin(&.{ b.root.sub_path, p }), .{}) catch {
+            p = std.fs.path.dirname(p) orelse "";
+            if (p.len == 0) {
+                b.dependOnDirectoryMetadata(b.path(""));
+                return false;
+            }
+            continue;
+        };
+        if (stat.kind == .directory) b.dependOnDirectoryMetadata(b.path(p)) else b.dependOnFileMetadata(b.path(p));
+        return p.len == sub_path.len;
+    }
+}
+
 /// Runs cargo to build the C bridge as a static library for `target` and returns its path.
 ///
 /// Cargo runs on every build and decides itself whether anything changed (about a second
@@ -225,6 +333,9 @@ fn buildCoreLib(b: *std.Build, target: std.Build.ResolvedTarget, protoc_opt: ?[]
     if (protoc) |p| {
         cargo.addFileArg2(p, .{ .prefix = "--config=env.PROTOC='", .suffix = "'", .make_absolute = true });
     }
+    // Whenever rustc compiles the bridge crate it prints the system libraries linkCoreLib must
+    // link; CI records them per target. Passing it every time keeps cargo's fingerprint stable.
+    cargo.addArgs(&.{ "--", "--print", "native-static-libs" });
     cargo.has_side_effects = true;
 
     // Copy the library into a tracked output so every artifact that links it waits for cargo.
@@ -314,12 +425,18 @@ fn linkCoreLib(m: *std.Build.Module, target: std.Build.ResolvedTarget, lib: std.
             m.linkSystemLibrary("iconv", .{});
         },
         .linux => {
-            // Rust's std needs the _Unwind_* functions (libgcc_s on glibc). link_libcpp makes
-            // Zig build and link LLVM's libunwind, which provides them without a system lib.
+            // `cargo rustc ... -- --print native-static-libs` (sdk-core c-bridge, Rust 1.95,
+            // aarch64; CI's core step records each Linux target in its job summary):
+            //   gnu:  -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
+            //   musl: -lunwind -lc
+            // gcc_s and unwind supply Rust's _Unwind_* functions. link_libcpp makes Zig build
+            // and link LLVM's libunwind, which provides them without a system library.
             m.link_libcpp = true;
-            m.linkSystemLibrary("pthread", .{});
-            m.linkSystemLibrary("dl", .{});
-            m.linkSystemLibrary("m", .{});
+            if (target.result.abi.isGnu()) {
+                for ([_][]const u8{ "util", "rt", "pthread", "m", "dl" }) |name| {
+                    m.linkSystemLibrary(name, .{});
+                }
+            }
         },
         .windows => {
             for ([_][]const u8{ "ws2_32", "userenv", "ntdll", "bcrypt", "advapi32", "kernel32", "secur32", "crypt32", "ncrypt" }) |name| {

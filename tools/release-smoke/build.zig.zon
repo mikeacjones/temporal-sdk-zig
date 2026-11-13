@@ -1,0 +1,9 @@
+.{
+    .name = .release_smoke,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0xcad89b0d200f0521,
+    // scripts/smoke-release.sh adds the release tarball as .temporal with `zig fetch --save`.
+    .dependencies = .{},
+    .paths = .{""},
+}

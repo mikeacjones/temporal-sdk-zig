@@ -34,9 +34,9 @@ zig build samples-test
 scripts/check-core-version.sh
 ```
 
-A clean build of the Rust core takes a minute or two; later builds reuse `.zig-cache/cargo-target`. Pass `-Dcore-lib=<path>` to link a prebuilt core library instead, and `-Dprotoc=<path>` to override the pinned `protoc` that cargo uses.
+A clean build of the Rust core takes a minute or two; later builds reuse `.zig-cache/cargo-target`. Pass `-Dcore-lib=<path>` to link a prebuilt core library instead (the header still comes from the submodule), `-Dcore-bundle=<dir>` to link an extracted core bundle from `scripts/package-core-bundle.sh` (library and header), and `-Dprotoc=<path>` to override the pinned `protoc` that cargo uses. Without the submodule and either option, build.zig links the bundle that build.zig.zon pins as `core-<CORE_VERSION>-<target>`, and fails naming the target if there is none. `.github/workflows/core-bundles.yml` builds and publishes the bundles.
 
-Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md).
+Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md), and releases follow [docs/releasing.md](docs/releasing.md).
 
 ## Samples are the parity bar
 
@@ -78,9 +78,11 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `samples/` holds the samples, and `tools/samples_runner.zig` validates them.
 - `scripts/` holds maintenance scripts, each with usage in its header.
 - `docs/` holds maintainer documentation.
-- `.github/workflows/` runs CI (`ci.yml`) and the samples suite (`samples.yml`).
+- `.github/workflows/` runs CI (`ci.yml`) and the samples suite (`samples.yml`), and, when dispatched by hand, builds and publishes the core bundles (`core-bundles.yml`) and releases the SDK (`release.yml`).
+- `tools/release-smoke/` is a project that depends on a release tarball, built by `scripts/smoke-release.sh`.
+- `CHANGELOG.md` is written when a release is prepared, not by ordinary changes. [docs/releasing.md](docs/releasing.md) has the version and support policy and the release sequence.
 
 ## Notes
 
-- `zig fetch` doesn't fetch git submodules, so a project that depends on this SDK by git URL can't build the Rust core from source yet. Use a recursive clone and a path dependency until prebuilt core libraries ship.
+- `zig fetch` doesn't fetch git submodules, so a project that depends on this SDK by git URL gets no sdk-core and can't build the core. Users fetch a release tarball instead, whose build links the core bundle `build.zig.zon` pins; building from source takes a recursive clone and a path dependency.
 - The generated protobuf code uses zig-protobuf with unknown-field preservation on. Encode ProtoJSON with `.emit_oneof_field_name = false` to get standard ProtoJSON.

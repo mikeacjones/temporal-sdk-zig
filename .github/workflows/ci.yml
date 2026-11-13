@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# An explicit bash runs with -o pipefail, so a step that pipes a build into tee fails with it.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -32,27 +37,51 @@ jobs:
         run: zig build samples-index && git diff --exit-code samples/dispatch.zig
 
   unit-test:
+    name: unit-test (${{ matrix.platform.name }}, ${{ matrix.optimize }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        # Rows without a target test the runner's native target. The musl rows build for musl
+        # on a glibc runner and run the static test binary natively.
+        platform:
+          - { name: x86_64-linux-gnu, os: ubuntu-latest }
+          - { name: aarch64-linux-gnu, os: ubuntu-24.04-arm }
+          - { name: aarch64-macos, os: macos-latest }
+          - { name: x86_64-macos, os: macos-26-intel }
+          - { name: x86_64-linux-musl, os: ubuntu-latest, target: x86_64-linux-musl, rust-target: x86_64-unknown-linux-musl }
+          - { name: aarch64-linux-musl, os: ubuntu-24.04-arm, target: aarch64-linux-musl, rust-target: aarch64-unknown-linux-musl }
         # Fiber code has broken only under optimization before, so test both.
         optimize: [Debug, ReleaseSafe]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
+    env:
+      TARGET_ARGS: ${{ matrix.platform.target && format('-Dtarget={0}', matrix.platform.target) || '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
+      # setup-zig points the global and local Zig caches at .zig-cache in the workspace. Its own
+      # caching saves that directory, cargo build included, and empties it past 2 GiB, so the
+      # steps below cache it instead.
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
+          use-cache: false
 
       - name: Install the Rust toolchain pinned in deps/rust-toolchain.toml
         run: rustup toolchain install --profile minimal
         working-directory: deps
+
+      # cc-rs compiles the core's C dependencies (aws-lc, ring, zstd) with CC_<rust target>.
+      - name: Install the musl Rust target and C compiler
+        if: matrix.platform.rust-target
+        working-directory: deps
+        run: |
+          rustup target add ${{ matrix.platform.rust-target }}
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          echo "CC_$(echo '${{ matrix.platform.rust-target }}' | tr - _)=musl-gcc" >> "$GITHUB_ENV"
 
       # Checkout stamps every file with the current time, so cargo would rebuild the sdk-core
       # crates even on a cache hit. The cache key pins those sources (CORE_VERSION), so give
@@ -60,14 +89,82 @@ jobs:
       - name: Date the sdk-core sources so cargo reuses the cached build
         run: find deps -exec touch -h -t 200001010000 {} +
 
-      - name: Cache the sdk-core cargo build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore the sdk-core cargo build
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             .zig-cache/cargo-target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CORE_VERSION', 'deps/Cargo.lock', 'deps/rust-toolchain.toml') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform.target || 'native' }}-${{ hashFiles('CORE_VERSION', 'deps/Cargo.lock', 'deps/rust-toolchain.toml') }}
+
+      # Everything in .zig-cache but the cargo build (compiled std, libc and libc++, and earlier
+      # builds), and the packages Zig fetched into zig-pkg. A `!` pattern can't exclude part of
+      # a listed directory, so list the directory's entries instead. build.zig.zon's hash starts
+      # a new cache when the Zig version or a dependency changes.
+      - name: Restore the Zig cache
+        id: zig-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .zig-cache/*
+            !.zig-cache/cargo-target
+            zig-pkg
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform.name }}-${{ matrix.optimize }}-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          restore-keys: zig-${{ runner.os }}-${{ runner.arch }}-${{ matrix.platform.name }}-${{ matrix.optimize }}-${{ hashFiles('build.zig.zon') }}-
+
+      # Rustc prints the system libraries the core needs only when it compiles the C bridge
+      # crate, so recompile it once per Linux target. linkCoreLib in build.zig must link these.
+      - name: Recompile the C bridge crate to print its system libraries
+        if: runner.os == 'Linux' && matrix.optimize == 'Debug'
+        run: touch deps/sdk-core/crates/sdk-core-c-bridge/src/lib.rs
+
+      - name: Build the core
+        id: core
+        run: |
+          zig build core $TARGET_ARGS --summary all 2>&1 | tee "$RUNNER_TEMP/core.log"
+          libs=$(grep -o 'native-static-libs: .*' "$RUNNER_TEMP/core.log" || true)
+          if [ -n "$libs" ]; then echo "${{ matrix.platform.name }} $libs" >> "$GITHUB_STEP_SUMMARY"; fi
 
       - name: Unit tests
-        run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+        run: zig build test $TARGET_ARGS -Doptimize=${{ matrix.optimize }} --summary all
+
+      - name: Check that the test binary is statically linked
+        if: matrix.platform.target && contains(matrix.platform.target, 'musl')
+        run: |
+          bin=$(ls -t .zig-cache/o/*/test | head -1)
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+
+      # Saved even when the tests fail, so the next run doesn't rebuild the core. A cargo build
+      # that didn't finish isn't saved: its key would stay taken by a partial build.
+      - name: Save the sdk-core cargo build
+        if: always() && steps.core.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .zig-cache/cargo-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      # Each run restores the newest cache and adds this commit's builds to it. Past 2 GiB it
+      # isn't saved, so later runs keep restoring the last cache under the limit.
+      - name: Measure the Zig cache
+        id: zig-size
+        if: always() && steps.zig-cache.outcome == 'success' && steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          kib=$( (find .zig-cache -mindepth 1 -maxdepth 1 ! -name cargo-target; ls -d zig-pkg 2>/dev/null) | xargs du -sk | awk '{ n += $1 } END { print n + 0 }')
+          echo "Zig cache without the cargo build: $((kib / 1024)) MiB"
+          echo "fits=$([ "$kib" -le 2097152 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Save the Zig cache
+        if: always() && steps.zig-size.outputs.fits == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .zig-cache/*
+            !.zig-cache/cargo-target
+            zig-pkg
+          key: ${{ steps.zig-cache.outputs.cache-primary-key }}
