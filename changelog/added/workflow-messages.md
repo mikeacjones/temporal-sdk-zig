@@ -1,0 +1,1 @@
+Workflows handle signals, queries and updates with typed handlers, as declarations on a struct workflow or through `ctx.setSignalHandler`, `setQueryHandler`, `setUpdateHandler` and `setUpdateHandlerWithValidator`; `setSignalHandlerByName` and `setDynamicSignalHandler` handle signals named at run time, and `workflow.Context.allHandlersFinished` waits for running handlers.

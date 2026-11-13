@@ -1,0 +1,1 @@
+The SDK is a Zig package built on Temporal's Rust Core SDK (sdk-core), for Zig 0.17.1. A release tarball fetched with `zig fetch --save` links a prebuilt core library for `aarch64-macos`, `x86_64-macos`, `aarch64-linux-gnu`, `x86_64-linux-gnu`, `aarch64-linux-musl` and `x86_64-linux-musl`, so it needs no Rust toolchain; a recursive clone builds the core from source with cargo.

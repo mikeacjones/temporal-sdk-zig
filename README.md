@@ -1423,7 +1423,7 @@ The SDK measures its feature coverage with a set of samples, each demonstrating 
 
 ## Versioning
 
-Releases follow [SemVer 2.0](https://semver.org/spec/v2.0.0.html) and are tagged `v<version>`. Until the SDK reaches parity, releases are 0.x pre-releases starting at `0.1.0-alpha.1`, and a minor version may break the API. Each release supports one Zig version and one sdk-core release (`CORE_VERSION`). [CHANGELOG.md](CHANGELOG.md) lists the changes in each release, and [docs/releasing.md](docs/releasing.md) describes the policy and how releases are made.
+Releases follow [SemVer 2.0](https://semver.org/spec/v2.0.0.html) and are tagged `v<version>`. Until the SDK reaches parity, releases are 0.x pre-releases starting at `0.1.0-alpha.1`, and a minor version may break the API. Each release supports one Zig version and one sdk-core release (`CORE_VERSION`). [CHANGELOG.md](CHANGELOG.md) lists the changes in each release, breaking changes first, and [docs/upgrading.md](docs/upgrading.md) shows how to move code across a release with breaking changes. [docs/releasing.md](docs/releasing.md) describes the policy, what counts as a breaking change, how deprecated and experimental declarations are marked, and how releases are made.
 
 ## Development
 

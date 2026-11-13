@@ -62,7 +62,9 @@ Good pull requests are focused and easy to review:
 - Keep each pull request scoped to one logical change.
 - Include tests for behavior changes. A change to the workflow runtime, commands, patching, updates, local activities, or Nexus workflows also needs replay coverage with `testing.WorkflowReplayer`, so existing histories keep replaying.
 - Update README.md in the same change when the public API changes or a capability lands. README.md is the API documentation: its examples live in `examples/readme/`, and `zig build readme` copies them into README.md. A new feature also needs its sample (see AGENTS.md).
-- Describe user-facing changes in the commit and the pull request so they can be written up for users. Pull requests don't edit CHANGELOG.md: the maintainer writes each release's section from the merged work when the release is prepared (see [docs/releasing.md](docs/releasing.md)).
+- Add a changelog fragment for a user-visible change: `changelog/<category>/<short-kebab-name>.md`, one line per entry, in one of the categories [changelog/README.md](changelog/README.md) lists. A change users can't observe adds none, and its commit message ends with a trailer giving the reason, such as `Changelog: none (tests only)`. Don't edit CHANGELOG.md: the release's section is assembled from the fragments when it is prepared (see [docs/releasing.md](docs/releasing.md)).
+- Mark a breaking change, as [docs/releasing.md](docs/releasing.md#breaking-changes) defines it: a fragment under `changelog/breaking-changes/` saying what changed, what it did before, and what to do, with before and after code in [docs/upgrading.md](docs/upgrading.md) when one line isn't enough; a commit subject that starts with 💥; and a `Breaking-Change: <what breaks>` trailer. CI checks that the fragment and the trailer come together.
+- Rename or replace a public declaration by keeping the old name as an alias whose doc comment begins `Deprecated: use <new name>.`, with a `deprecated` fragment. The alias is removed no sooner than the next minor release, as a breaking change that names the release that deprecated it. A declaration whose doc comment begins `Experimental: may change or be removed without notice.` may change without that step, but the change still gets a fragment starting with `**Experimental**:`, and removing the label is a `stabilized` fragment.
 - Write the commit message and the pull request description in the style below.
 
 Run the checks above before asking for review. CI must pass before a pull request can be merged.
@@ -74,7 +76,8 @@ There is no contributor license agreement to sign. Contributions are accepted un
 - The subject is one imperative sentence that names the behavior that changed, capitalized, with no trailing period, about 72 characters at most: "Fix stale worker slot metrics during polling", not "Fix bug" or "Updates".
 - The body is plain prose wrapped at 72 columns, separated from the subject by a blank line. It says what was wrong or missing and who it affects, then what the code does now and why this approach, then what deliberately stays the same (compatibility, replay impact, limits). Name the real types, functions, options, and files.
 - A commit that fixes review findings or a failed check describes the defect and the fix, not "address review".
-- A trivial change (a typo, a version bump) can be a subject alone.
+- A trivial change (a typo, a version bump) can be a subject alone, apart from the trailers below.
+- Trailers go in the last paragraph: `Changelog: none (<reason>)` for a change without a fragment, and `Breaking-Change: <what breaks>` for a breaking change.
 
 ### Pull request descriptions
 
@@ -86,6 +89,8 @@ The title reads like a commit subject. The body has these sections, which the [p
   1. Closes: the issue this resolves, or "N/A" and why.
   2. How was this tested: the exact commands you ran and their results, on which platforms and in which optimize modes, and plainly what you didn't run.
   3. Any docs updates needed: what you updated in README.md or elsewhere, or what still needs it.
+  4. Changelog fragment: its path, or "none, because" and the reason.
+  5. Breaking change: "none", or the old behavior, the new one, and what users must do.
 
 When the branch changes after the pull request is opened, update the description so it still describes what the pull request contains.
 
@@ -117,7 +122,7 @@ Don't open a public issue for a suspected security vulnerability. Report it priv
 
 Maintainers review pull requests for correctness, determinism, compatibility with existing workflow histories, test coverage, documentation, and long-term maintainability. Review may ask for changes before a pull request can be merged, and it may take some time.
 
-CI is the final gate. `.github/workflows/ci.yml` checks formatting, the core version pins, the generated samples index, and README.md's examples, and runs `zig build test` in Debug and ReleaseSafe; `.github/workflows/samples.yml` runs `zig build samples-test` on Linux and macOS. If CI fails, update the pull request, or ask for help if the failure looks unrelated to your change. Some CI runs may wait for a maintainer to approve them.
+CI is the final gate. `.github/workflows/ci.yml` checks formatting, the core version pins, the generated samples index, README.md's examples, and the changelog fragments and trailers, and runs `zig build test` in Debug and ReleaseSafe; `.github/workflows/samples.yml` runs `zig build samples-test` on Linux and macOS. If CI fails, update the pull request, or ask for help if the failure looks unrelated to your change. Some CI runs may wait for a maintainer to approve them.
 
 ## Inactive Pull Requests
 

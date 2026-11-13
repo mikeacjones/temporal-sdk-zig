@@ -1,0 +1,3 @@
+`converter.toPayload` and `converter.fromPayload` encode and decode arguments, results and details as JSON, plain bytes (`converter.Bytes`), null, protobuf messages (ProtoJSON or `converter.ProtoBinary`) and `converter.Time`; `converter.EncodedValue` and `converter.EncodedValues` decode payloads lazily.
+`converter.PayloadCodec`, set with `client.Options.codecs`, transforms every payload the client and its workers send, with `converter.ZlibCodec` for compression and a `converter.CodecContext` for each call; `converter.codecHandler` serves a codec to the Web UI and CLI.
+Failures carry a message, type, details and cause chain, read from the future or handle after a Zig error such as `error.ActivityFailed` or `error.WorkflowFailed`.

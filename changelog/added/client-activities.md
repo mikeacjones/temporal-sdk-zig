@@ -1,0 +1,2 @@
+`Client.executeActivity` runs a standalone activity with no workflow and returns a `client.ActivityHandle` to wait for, describe, cancel or terminate it; `Client.listActivities` and `Client.countActivities` find them.
+`Client.completeActivity`, `failActivity`, `recordActivityHeartbeat` and `reportActivityCancellation`, each with a `ById` variant, finish an activity that returned `activity.Context.completeAsync` from any process.

@@ -17,3 +17,7 @@
 2. How was this tested: <!-- the exact commands you ran and their results (for example `zig build test -Doptimize=ReleaseSafe`), on which platforms, and what you didn't run -->
 
 3. Any docs updates needed? <!-- what you updated in README.md or elsewhere, or what still needs it -->
+
+4. Changelog fragment: <!-- the fragment's path under changelog/ (see changelog/README.md), or "none, because ..." with the reason, matching the commit's `Changelog: none` trailer -->
+
+5. Breaking change: <!-- "none", or what the old behavior or API was, what it is now, and what users must do; the commit carries a `Breaking-Change:` trailer and its subject starts with 💥 -->

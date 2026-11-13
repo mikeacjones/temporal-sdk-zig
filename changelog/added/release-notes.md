@@ -1,0 +1,1 @@
+Each release's notes list breaking changes first, each saying what to do, and the [upgrade guide](https://github.com/mikeacjones/temporal-sdk-zig/blob/main/docs/upgrading.md) gives the before and after code for releases with breaking changes.

@@ -1,0 +1,1 @@
+`Client.workerDeployment` and `Client.listWorkerDeployments` manage Worker Deployments: describe them and set the current or ramping version, version metadata and manager identity; `StartWorkflowOptions.versioning_override` pins a workflow to a version.

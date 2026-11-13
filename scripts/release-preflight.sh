@@ -3,7 +3,8 @@
 # runs before anything that needs GitHub (the tag, main's HEAD, CI results):
 #   semver     <version> is a SemVer 2.0 version, without a leading v
 #   zon        build.zig.zon's .version is <version>
-#   changelog  CHANGELOG.md has a "## [<version>]" section
+#   changelog  CHANGELOG.md has a "## [<version>]" section with at least one entry
+#   fragments  no changelog fragments remain under changelog/<category>/
 #   core-pins  build.zig.zon pins a core bundle, core-<CORE_VERSION>-<target>, per tier-1 target
 # Every failing check is reported, each named, and the script exits 1 if any failed.
 #
@@ -37,13 +38,24 @@ fi
 zon="$root/build.zig.zon"
 zon_version="$(sed -nE 's/^    \.version = "([^"]*)",$/\1/p' "$zon")"
 if [ "$zon_version" != "$version" ]; then
-  fail zon "build.zig.zon's .version is '$zon_version', not '$version'; set .version = \"$version\" and add the CHANGELOG.md section in one commit"
+  fail zon "build.zig.zon's .version is '$zon_version', not '$version'; set .version = \"$version\" in the release preparation commit"
 fi
 
-if ! awk -v h="## [$version]" '
-    substr($0, 1, length(h)) == h && (length($0) == length(h) || substr($0, length(h) + 1, 1) == " ") { found = 1 }
-    END { exit !found }' "$root/CHANGELOG.md"; then
-  fail changelog "CHANGELOG.md has no '## [$version]' section; draft it with scripts/changelog-draft.sh <previous tag> and rename [Unreleased]"
+# The version's section, from its heading to the next release heading or the link list.
+section="$(awk -v h="## [$version]" '
+    substr($0, 1, length(h)) == h && (length($0) == length(h) || substr($0, length(h) + 1, 1) == " ") { on = 1; found = 1; next }
+    on && (/^## \[/ || /^\[[^]]*\]: /) { exit }
+    on { print }
+    END { if (!found) print "missing" }' "$root/CHANGELOG.md")"
+if [ "$section" = missing ]; then
+  fail changelog "CHANGELOG.md has no '## [$version]' section; write it from the fragments with scripts/changelog-assemble.sh $version"
+elif ! grep -q '^- ' <<<"$section"; then
+  fail changelog "CHANGELOG.md's '## [$version]' section has no entries; a release lists at least one change"
+fi
+
+remaining="$(cd "$root" && { find changelog -type f ! -path changelog/README.md 2>/dev/null || true; } | sort)"
+if [ -n "$remaining" ]; then
+  fail fragments "changelog fragments remain: $(echo "$remaining" | tr '\n' ' ')- assemble them with scripts/changelog-assemble.sh, or, for a section that is already written, move their entries into it and delete them"
 fi
 
 core_version="$(tr -d '[:space:]' < "$root/CORE_VERSION")"

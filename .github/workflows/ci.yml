@@ -39,6 +39,29 @@ jobs:
       - name: Check that README.md's examples match examples/readme
         run: zig build readme-check
 
+  # changelog/README.md has the rules. A pull request needs the full history for its range.
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Test the changelog scripts
+        run: scripts/changelog-test.sh
+
+      - name: Check the changelog fragments
+        if: github.event_name != 'pull_request'
+        run: scripts/changelog-check.sh
+
+      - name: Check that the pull request adds a changelog fragment or says why not
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: scripts/changelog-check.sh "$BASE" "$HEAD"
+
   unit-test:
     name: unit-test (${{ matrix.platform.name }}, ${{ matrix.optimize }})
     strategy:

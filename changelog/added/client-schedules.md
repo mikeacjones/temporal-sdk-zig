@@ -1,0 +1,1 @@
+`Client.createSchedule` creates a schedule from a `schedule.Schedule` (calendar, interval or cron specs) and returns a `client.ScheduleHandle` that describes, updates, pauses, triggers, backfills and deletes it; `Client.getScheduleHandle` and `Client.listSchedules` find existing ones.

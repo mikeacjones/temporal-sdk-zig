@@ -13,6 +13,7 @@ This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust 
   - `zig build samples-test` builds the samples and validates them against a dev server.
   - `zig build readme-check` checks that README.md's code blocks equal their regions in `examples/readme/` (`zig build test` runs it too), and `zig build readme` rewrites them.
   - `scripts/check-core-version.sh` checks that the sdk-core pin, the cargo workspace in `deps/`, and the proto list agree.
+  - `scripts/changelog-check.sh [<base>]` checks the changelog fragments, and the commits since `<base>` for a fragment or trailer; `scripts/changelog-test.sh` tests the changelog scripts.
 - For focused tests, use `-Dtest-filter` (repeatable): `zig build test -Dtest-filter="fibers interleave"`.
 - Use `std.testing.allocator` in tests so leaks fail them. Avoid fixed sleeps in tests: wait on the condition itself.
 - Keep comments sparse. Comments explain non-obvious reasons, invariants, and ownership, not what the code already says.
@@ -34,6 +35,8 @@ zig build fmt
 zig build samples-test
 zig build readme-check
 scripts/check-core-version.sh
+scripts/changelog-test.sh
+scripts/changelog-check.sh origin/main
 ```
 
 A clean build of the Rust core takes a minute or two; later builds reuse `.zig-cache/cargo-target`. Pass `-Dcore-lib=<path>` to link a prebuilt core library instead (the header still comes from the submodule), `-Dcore-bundle=<dir>` to link an extracted core bundle from `scripts/package-core-bundle.sh` (library and header), and `-Dprotoc=<path>` to override the pinned `protoc` that cargo uses. Without the submodule and either option, build.zig links the bundle that build.zig.zon pins as `core-<CORE_VERSION>-<target>`, and fails naming the target if there is none. `.github/workflows/core-bundles.yml` builds and publishes the bundles.
@@ -76,6 +79,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - Update README.md when the public API changes.
 - Run `zig build fmt`, `zig build test`, and `zig build test -Doptimize=ReleaseSafe`.
 - Run `zig build samples-test` when the change touches the client, worker, workflow runtime, activities, Nexus, payload conversion, or interceptors.
+- A user-visible change adds a fragment `changelog/<category>/<name>.md` (changelog/README.md has the rules); otherwise its commit message ends with a `Changelog: none (<reason>)` trailer. A breaking change (docs/releasing.md) adds a `breaking-changes/` fragment, a `Breaking-Change:` trailer, and a subject starting with 💥.
 - Commit messages: a short imperative subject, and a body that explains why. CONTRIBUTING.md has the full commit and pull request description style, and `.github/PULL_REQUEST_TEMPLATE.md` carries the description's sections.
 
 ## Where things are
@@ -93,7 +97,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `CONTRIBUTING.md` is the guide for issues and pull requests; `.github/PULL_REQUEST_TEMPLATE.md` and `.github/ISSUE_TEMPLATE/` hold the pull request and issue templates.
 - `.github/workflows/` runs CI (`ci.yml`) and the samples suite (`samples.yml`), and, when dispatched by hand, builds and publishes the core bundles (`core-bundles.yml`) and releases the SDK (`release.yml`).
 - `tools/release-smoke/` is a project that depends on a release tarball, built by `scripts/smoke-release.sh`.
-- `CHANGELOG.md` is written when a release is prepared, not by ordinary changes. [docs/releasing.md](docs/releasing.md) has the version and support policy and the release sequence.
+- `CHANGELOG.md` is assembled from the `changelog/` fragments when a release is prepared, not edited by ordinary changes; `docs/upgrading.md` holds the before and after code for breaking changes. [docs/releasing.md](docs/releasing.md) has the version and support policy and the release sequence.
 
 ## Notes
 

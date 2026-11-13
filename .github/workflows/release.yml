@@ -2,8 +2,9 @@ name: Release
 # Releases the SDK as v<version>: gates the commit (scripts/release-preflight.sh, the tag,
 # main's HEAD, and the commit's CI and Samples runs), packs the release tarball
 # (scripts/package-release.sh), builds and runs a project that depends on it with the pinned
-# core bundles and no cargo (scripts/smoke-release.sh), and, unless dry_run, publishes a
-# GitHub release with the tarball. docs/releasing.md describes the release sequence.
+# core bundles and no cargo (scripts/smoke-release.sh), and, unless dry_run, creates a draft
+# GitHub release with the tarball and the notes, which it publishes only with publish_draft.
+# docs/releasing.md describes the release sequence.
 # Nothing here creates, moves or deletes a tag by hand: publishing the release creates
 # v<version> at the gated commit.
 on:
@@ -21,6 +22,10 @@ on:
         description: Mark the GitHub release as a pre-release
         type: boolean
         default: true
+      publish_draft:
+        description: Publish the draft release, creating the tag; off leaves the draft for the notes to be read and published by hand
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -171,6 +176,7 @@ jobs:
       VERSION: ${{ inputs.version }}
       TAG: ${{ needs.gate.outputs.tag }}
       PRERELEASE: ${{ inputs.prerelease }}
+      PUBLISH_DRAFT: ${{ inputs.publish_draft }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout repository
@@ -193,6 +199,15 @@ jobs:
             substr($0, 1, length(h)) == h { on = 1; next }
             on && (/^## \[/ || /^\[[^]]*\]: /) { exit }
             on { print }' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          # The release below this one in CHANGELOG.md, for the compare link.
+          previous=$(awk -v h="## [$VERSION]" '
+            substr($0, 1, length(h)) == h { on = 1; next }
+            on && /^## \[/ { sub(/^## \[/, ""); sub(/\].*/, ""); print; exit }' CHANGELOG.md)
+          if [ -n "$previous" ]; then
+            full="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/v$previous...$TAG"
+          else
+            full="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commits/$TAG"
+          fi
           {
             echo
             echo "## Install"
@@ -204,13 +219,16 @@ jobs:
             echo '```'
             echo
             echo "Zig hash: \`$zig_hash\`. See README.md for the supported targets."
+            echo
+            echo "**Full Changelog**: $full"
           } >> "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
 
-      # The release is created as a draft so it never shows up without its assets. Publishing
-      # it creates the tag at the gated commit; if the tag appeared in the meantime, publishing
-      # would attach the release to it, so check again first and leave the draft instead.
-      - name: Publish the release
+      # The release is created as a draft so it never shows up without its assets, and stays
+      # one unless publish_draft is set, so the notes can be read first. Publishing it creates
+      # the tag at the gated commit; if the tag appeared in the meantime, publishing would
+      # attach the release to it, so check again first and leave the draft instead.
+      - name: Create the draft release and publish it if asked
         run: |
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
             echo "::error::tag $TAG was created while this run was checking; release a new version instead"
@@ -224,5 +242,10 @@ jobs:
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
             echo "::error::tag $TAG was created while the release was uploading; the draft release is left for the maintainer to delete"
             exit 1
+          fi
+          if [ "$PUBLISH_DRAFT" != true ]; then
+            url=$(gh release view "$TAG" --json url --jq .url)
+            echo "Draft release $TAG is ready: $url. Read its notes, then publish it from that page." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           gh release edit "$TAG" --draft=false

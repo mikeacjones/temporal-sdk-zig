@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Drafts a CHANGELOG.md section from the work merged since <since-ref>: one line per
-# first-parent "Merge bead/<id>: <summary>" commit, oldest first, as "- <summary> (<id>)".
-# Other first-parent commits (direct fixes, index regenerations) are left out; check them in
-# `git log --first-parent <since-ref>..HEAD`. The draft goes to stdout for the maintainer to
-# sort into Added, Changed, Fixed and so on; the script never edits CHANGELOG.md.
+# Cross-checks the changelog fragments against the history: lists each commit on main's
+# first-parent history since <since-ref> that added no fragment under changelog/<category>/
+# and carries no "Changelog: none" trailer. For a merge, the fragment may come from any of
+# its branch's commits and the trailer may be on the merge or on any branch commit. Commits
+# from before changelog/ existed are left out: the fragments that introduced it cover them.
+# A "Prepare release <version>" commit is left out too.
+#
+# Read each listed commit and add the fragment it is missing before running
+# scripts/changelog-assemble.sh. The script changes nothing, and it exits 0 whatever it
+# lists.
 #
 # Usage: scripts/changelog-draft.sh <since-ref>
 #   <since-ref>: the previous release tag (v0.1.0-alpha.1), or any commit
@@ -18,12 +23,34 @@ if ! git rev-parse --verify --quiet "$since^{commit}" >/dev/null; then
   exit 2
 fi
 
-entries="$(git log --first-parent --reverse --format=%s "$since..HEAD" |
-  sed -nE 's/^Merge bead\/([^:]+): (.+)$/- \2 (\1)/p')"
-echo "## [Unreleased]"
-echo
-if [ -n "$entries" ]; then
-  echo "$entries"
+# The first commit that added changelog/README.md; earlier ones predate fragments.
+start="$(git log --first-parent --diff-filter=A --format=%H -- changelog/README.md | tail -1)"
+
+missing=0
+total=0
+while IFS= read -r commit; do
+  if [ -n "$start" ] && [ "$commit" != "$start" ] && ! git merge-base --is-ancestor "$start" "$commit"; then
+    continue
+  fi
+  subject="$(git log -1 --format=%s "$commit")"
+  [[ "$subject" =~ ^Prepare\ release\  ]] && continue
+  total=$((total + 1))
+  if git rev-parse --verify --quiet "$commit^1" >/dev/null; then
+    parent="$commit^1"
+    fragments="$(git diff --no-renames --diff-filter=A --name-only "$parent" "$commit" -- changelog | grep -v '^changelog/README\.md$' || true)"
+    trailers="$(git log --format='%(trailers:key=Changelog,valueonly)' "$parent..$commit" | grep -E '^none' || true)"
+  else
+    fragments="$(git show --no-renames --diff-filter=A --name-only --format= "$commit" -- changelog | grep -v '^changelog/README\.md$' || true)"
+    trailers="$(git log -1 --format='%(trailers:key=Changelog,valueonly)' "$commit" | grep -E '^none' || true)"
+  fi
+  if [ -z "$fragments" ] && [ -z "$trailers" ]; then
+    echo "- $(git log -1 --format=%h "$commit") $subject"
+    missing=$((missing + 1))
+  fi
+done < <(git rev-list --first-parent --reverse "$since..HEAD")
+
+if [ "$missing" -eq 0 ]; then
+  echo "every one of the $total commits since $since has a changelog fragment or a 'Changelog: none' trailer"
 else
-  echo "(no bead merges since $since)"
+  echo "$missing of the $total commits since $since have neither a changelog fragment nor a 'Changelog: none' trailer" >&2
 fi
