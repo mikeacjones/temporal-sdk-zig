@@ -1,6 +1,6 @@
 # Contributor guidance for `temporal-sdk-zig`
 
-This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust Core SDK. It is a standalone, Zig-first SDK: it aims for feature parity with Temporal's other SDKs, with every feature expressed the Zig way rather than copied from another language. README.md explains how parity is measured; nothing else in the repository refers to other SDKs' APIs or samples. Use this document as the quick reference for coding-agent work and pull requests. Task tracking with beads is described in `CLAUDE.md`.
+This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust Core SDK. It is a standalone, Zig-first SDK: it aims for feature parity with Temporal's other SDKs, with every feature expressed the Zig way rather than copied from another language. PARITY.md explains how parity is measured; nothing else in the repository refers to other SDKs' APIs or samples. Use this document as the quick reference for coding-agent work and pull requests. Task tracking with beads is described in `CLAUDE.md`.
 
 ## Requirements for coding agents
 
@@ -11,13 +11,14 @@ This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust 
   - `zig build test -Doptimize=ReleaseSafe` is required for changes to the workflow runtime, fibers, or the bridge. Fiber code has failed only under optimization before.
   - `zig build fmt` checks formatting.
   - `zig build samples-test` builds the samples and validates them against a dev server.
+  - `zig build readme-check` checks that README.md's code blocks equal their regions in `examples/readme/` (`zig build test` runs it too), and `zig build readme` rewrites them.
   - `scripts/check-core-version.sh` checks that the sdk-core pin, the cargo workspace in `deps/`, and the proto list agree.
 - For focused tests, use `-Dtest-filter` (repeatable): `zig build test -Dtest-filter="fibers interleave"`.
 - Use `std.testing.allocator` in tests so leaks fail them. Avoid fixed sleeps in tests: wait on the condition itself.
 - Keep comments sparse. Comments explain non-obvious reasons, invariants, and ownership, not what the code already says.
 - Error messages must be actionable: include the operation, option, input, or state that helps the caller diagnose the problem.
 - Don't add abstractions for one-off helpers. Follow the style of the file you are changing.
-- Behavior changes need tests. A user-facing feature also needs its samples (see below) or documentation.
+- Behavior changes need tests. A user-facing feature also needs its README.md section and its samples (see below).
 - Don't hand-edit generated files. Regenerate them:
   - `src/proto/` and `src/proto.zig`: `zig build gen-proto`
   - `deps/protos.zig`: `scripts/list-protos.sh`
@@ -31,6 +32,7 @@ zig build test
 zig build test -Doptimize=ReleaseSafe
 zig build fmt
 zig build samples-test
+zig build readme-check
 scripts/check-core-version.sh
 ```
 
@@ -38,16 +40,24 @@ A clean build of the Rust core takes a minute or two; later builds reuse `.zig-c
 
 Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md), and releases follow [docs/releasing.md](docs/releasing.md).
 
+## README.md is the API documentation
+
+- README.md documents the public API area by area. A commit that changes the shape of the public API (a public function, type, option, error, or default in `src/`'s public namespaces) or adds a capability updates the matching README.md section in the same commit.
+- A planned capability has a stub in README.md, marked `<!-- stub: <bead id> -->`. The commit that lands the capability replaces the stub with a full section: explanation, example, and notes. A newly planned capability gets a stub when its bead is created.
+- Never edit README.md's code in place. Examples live in `examples/readme/` between `// example: <id>` and `// end-example`: change the region, then run `zig build readme`. `zig build test` compiles and runs the examples, and `zig build readme-check` fails when README.md and the regions differ.
+- Sample status goes in PARITY.md, not README.md: a new sample adds a row there, and a sample with no Zig equivalent is listed there with the reason.
+- README.md names no other SDK. PARITY.md is the only file that names the parity target.
+
 ## Samples are the parity bar
 
-Each feature is demonstrated by a sample under `samples/`, validated against a dev server by `zig build samples-test`. README.md lists the parity samples; they land from the simplest to the most complex as their SDK features land.
+Each feature is demonstrated by a sample under `samples/`, validated against a dev server by `zig build samples-test`. PARITY.md lists the parity samples; they land from the simplest to the most complex as their SDK features land.
 
 - A sample is a directory `samples/<name>/` with `worker.zig`, `starter.zig`, and `sample.zon`, which lists the starter output to expect, the sample's test files, other samples it imports, and any extra programs to build (such as a server the sample talks to). build.zig finds samples by their `sample.zon`. A sample that needs TLS, client certificates, or JWT authorization sets `.docker_server = .{ .require_client_cert = true, .jwt = true }` in `sample.zon`: samples-test then runs it against its own `temporalio/server` container and passes the connection settings in environment variables (see `DockerServer` in `tools/samples_runner.zig`), and reports it as skipped where Docker isn't available. samples-test runs most samples from one program, `samples/dispatch.zig`, generated by `zig build samples-index`; rerun it after adding or removing a sample (CI checks it).
 - Samples are idiomatic Zig: Zig names for workflows, activities, and payload fields (snake_case), Zig types for durations and times, and the Zig equivalent of each concept (for example `std.Io.Group` for concurrent workflow coroutines).
 - Each sample has tests covering its behavior, run in `samples-test`.
 - Comments and docs describe what the code does in Zig terms, without referring to other SDKs.
 - A finished sample stays in the suite. A change that breaks a passing sample is a regression, even if the unit tests pass.
-- A parity sample with no Zig equivalent is listed in README.md with the reason.
+- A parity sample with no Zig equivalent is listed in PARITY.md with the reason.
 
 ## Zig SDK review and implementation focus
 
@@ -63,9 +73,10 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 ## Pull request expectations
 
 - Keep changes focused and include tests for behavior changes.
+- Update README.md when the public API changes.
 - Run `zig build fmt`, `zig build test`, and `zig build test -Doptimize=ReleaseSafe`.
 - Run `zig build samples-test` when the change touches the client, worker, workflow runtime, activities, Nexus, payload conversion, or interceptors.
-- Commit messages: a short imperative subject, and a body that explains why.
+- Commit messages: a short imperative subject, and a body that explains why. CONTRIBUTING.md has the full commit and pull request description style, and `.github/PULL_REQUEST_TEMPLATE.md` carries the description's sections.
 
 ## Where things are
 
@@ -75,9 +86,11 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `src/bridge.zig` wraps the sdk-core C API; `src/bridge_abi.txt` is its struct layout snapshot.
 - `src/proto/` and `src/proto.zig` are the generated protobuf types (`temporal.proto`).
 - `deps/sdk-core/` is the pinned sdk-core submodule. `deps/Cargo.toml` and `deps/Cargo.lock` build its C bridge.
-- `samples/` holds the samples, and `tools/samples_runner.zig` validates them.
+- `samples/` holds the samples, and `tools/samples_runner.zig` validates them. PARITY.md lists them and explains how parity is measured.
+- `examples/readme/` holds the compiled examples that README.md's code blocks copy, and `tools/readme_examples.zig` checks or rewrites the copies.
 - `scripts/` holds maintenance scripts, each with usage in its header.
 - `docs/` holds maintainer documentation.
+- `CONTRIBUTING.md` is the guide for issues and pull requests; `.github/PULL_REQUEST_TEMPLATE.md` and `.github/ISSUE_TEMPLATE/` hold the pull request and issue templates.
 - `.github/workflows/` runs CI (`ci.yml`) and the samples suite (`samples.yml`), and, when dispatched by hand, builds and publishes the core bundles (`core-bundles.yml`) and releases the SDK (`release.yml`).
 - `tools/release-smoke/` is a project that depends on a release tarball, built by `scripts/smoke-release.sh`.
 - `CHANGELOG.md` is written when a release is prepared, not by ordinary changes. [docs/releasing.md](docs/releasing.md) has the version and support policy and the release sequence.

@@ -36,6 +36,9 @@ jobs:
       - name: Check that samples/dispatch.zig lists every sample
         run: zig build samples-index && git diff --exit-code samples/dispatch.zig
 
+      - name: Check that README.md's examples match examples/readme
+        run: zig build readme-check
+
   unit-test:
     name: unit-test (${{ matrix.platform.name }}, ${{ matrix.optimize }})
     strategy:

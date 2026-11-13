@@ -7,7 +7,7 @@ Two workflows do the work, both started by hand (`workflow_dispatch`) and both d
 ## Version policy
 
 - Versions follow [SemVer 2.0](https://semver.org/spec/v2.0.0.html). The tag is the version with a `v` in front (`v0.1.0-alpha.1`); `build.zig.zon`'s `.version` and the `CHANGELOG.md` heading are the version without it.
-- Until the SDK reaches parity (README.md's Parity table), releases are 0.x pre-releases, starting at `0.1.0-alpha.1` and counting up through `alpha.N`, `beta.N` and `rc.N`. 1.0.0 follows parity.
+- Until the SDK reaches parity (PARITY.md), releases are 0.x pre-releases, starting at `0.1.0-alpha.1` and counting up through `alpha.N`, `beta.N` and `rc.N`. 1.0.0 follows parity.
 - In 0.x, a minor version may break the API, and a patch version only fixes bugs. A change of the supported Zig version or of the sdk-core release is at least a minor version.
 - A published tag is never moved or deleted. A bad release is followed by a new version.
 - Core bundle releases are tagged `core-<CORE_VERSION>-r<revision>` (`core-v1.2.0-r1`). The revision counts rebuilds of the same sdk-core release, for example after a Rust toolchain change.

@@ -73,6 +73,64 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
     if (have_samples) addSampleSteps(b, target, optimize, temporal);
+    if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters);
+}
+
+/// The files under examples/readme whose regions README.md copies, in a fixed order.
+const readme_example_files = [_][]const u8{
+    "examples/readme/quickstart.zig",
+    "examples/readme/client.zig",
+    "examples/readme/workflows.zig",
+    "examples/readme/activities.zig",
+    "examples/readme/workers.zig",
+    "examples/readme/converter.zig",
+    "examples/readme/testing.zig",
+    "examples/readme/observability.zig",
+};
+
+/// README.md's code blocks are copies of regions in examples/readme, which `test` compiles and
+/// runs; `readme-check` fails when a copy differs, and `readme` rewrites the copies. A fetched
+/// package has no examples/, so these steps exist only in a checkout.
+fn addReadmeSteps(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    temporal: *std.Build.Module,
+    test_step: *std.Build.Step,
+    test_filters: []const []const u8,
+) void {
+    const examples = b.addTest(.{
+        .name = "readme-examples",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/readme/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "temporal", .module = temporal }},
+        }),
+        .filters = test_filters,
+    });
+    test_step.dependOn(&b.addRunArtifact(examples).step);
+
+    const tool_module = b.createModule(.{
+        .root_source_file = b.path("tools/readme_examples.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const tool = b.addExecutable(.{ .name = "readme-examples", .root_module = tool_module });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "readme-examples-tool", .root_module = tool_module, .filters = test_filters })).step);
+
+    inline for (.{ .{ "readme-check", "check", "Check that README.md's code blocks equal their regions in examples/readme" }, .{ "readme", "update", "Rewrite README.md's code blocks from their regions in examples/readme" } }) |s| {
+        const run = b.addRunArtifact(tool);
+        run.addArg(s[1]);
+        run.addDirectoryArg(b.path("."));
+        run.addArg("README.md");
+        run.addArgs(&readme_example_files);
+        // The tool reads the files itself, by path, so the run must not be cached.
+        run.has_side_effects = true;
+        const step = b.step(s[0], s[2]);
+        step.dependOn(&run.step);
+        if (std.mem.eql(u8, s[1], "check")) test_step.dependOn(&run.step);
+    }
 }
 
 fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module) void {
@@ -83,6 +141,7 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         b.path("src"),
         b.path("samples"),
         b.path("tools"),
+        b.path("examples"),
     };
     const fmt_step = b.step("fmt", "Check formatting");
     fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_paths, .check = true }).step);
