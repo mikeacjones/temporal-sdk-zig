@@ -246,7 +246,7 @@ defer staging.close();
 ```
 Notes:
 - `connect` checks the connection. It returns `error.ConnectFailed`, `error.InvalidOptions`, or `error.RuntimeInitFailed` (sdk-core's runtime couldn't be created), logged with the reason, or `error.OutOfMemory`. Free the client with `close`.
-- `api_key` alone doesn't turn TLS on; `loadOptions` does for a profile with an API key or TLS settings, and returns `error.InvalidConfig`, logged, for a named profile that doesn't exist (in a config file or a missing one), a config file it can't parse, a key `strict` rejects, a certificate given as both a path and data, or both `disable_file` and `disable_env` set. A missing config file without a named profile isn't an error: its defaults are used. TLS file paths are read on each connect, so `Client.reconnect` picks up rotated certificates.
+- `api_key` alone doesn't turn TLS on; `loadOptions` does for a profile with an API key or TLS settings, and returns `error.InvalidConfig`, logged, for a named profile that doesn't exist (in a config file or a missing one), a config file that exists but can't be read or parsed, a key `strict` rejects, a certificate given as both a path and data, or both `disable_file` and `disable_env` set. A missing config file without a named profile isn't an error: its defaults are used. TLS file paths are read on each connect, so `Client.reconnect` picks up rotated certificates.
 - `Options.rpc_timeout` (default 30 s) bounds each call, but not waits for a result. `connect` copies `namespace` and `identity`; `codecs`, `logger`, `propagators`, `worker_interceptors`, and `interceptors` are borrowed and must outlive the client and its workers.
 
 #### Starting workflows
@@ -478,7 +478,7 @@ pub const GreetTwice = workflow.Def("greet_twice", greetTwice);
 ```
 
 Notes:
-- `start_to_close_timeout` or `schedule_to_close_timeout` is required. Without either, a local activity's `get` returns `error.InvalidOptions` (logged); `executeActivity` doesn't check and sends the command as given; the server validates it, and the workflow task then fails, again on every retry until the code sets a timeout.
+- `start_to_close_timeout` or `schedule_to_close_timeout` is required. Without either, a local activity's `get` returns `error.InvalidOptions` (logged); `executeActivity` doesn't check and sends the command as given, leaving validation to the server.
 - On `error.ActivityFailed`, `future.failure()` has the failure; returning the error fails the workflow with that failure.
 - `future.cancel()`, or canceling the waiting coroutine, cancels the activity as `cancellation_type` says.
 - `summary` (on `workflow.ActivityOptions` and `workflow.LocalActivityOptions`) is a single line the UI and CLI show on the activity's scheduled or marker event. It is sent as a JSON string payload through the worker's codecs; empty sends none.
@@ -1143,7 +1143,7 @@ fn greeting(ctx: *workflow.Context, name: []const u8) ![]const u8 {
 
 Notes:
 
-- A plain error becomes an application failure whose message and type are the error's name. A workflow or activity attempt that called `ctx.fail` earlier fails with that failure instead, whatever error it returns. An update handler uses its `ctx.fail` failure only when it returns `error.ApplicationFailure`; any other error rejects the update with the error's name. In a workflow, `error.Canceled` cancels it and `error.OutOfMemory` fails the workflow task for a retry; in an activity, `error.Canceled` after a cancel reports it canceled.
+- A plain error becomes an application failure whose message and type are the error's name. An earlier `ctx.fail` replaces that failure, whatever the error, only for the code it was called in: one in the workflow function, or in a coroutine that it or a handler starts, applies to the error the workflow function returns; one in a signal handler applies to that handler's error when the error fails the workflow; one in an activity attempt applies to the error that attempt returns. An update handler uses its `ctx.fail` failure only when it returns `error.ApplicationFailure`; any other error rejects the update with the error's name. In a workflow, `error.Canceled` cancels it and `error.OutOfMemory` fails the workflow task for a retry; in an activity, `error.Canceled` after a cancel reports it canceled.
 - `ctx.fail` takes a `failure.Application` (`type`, `non_retryable`, `details`, `category`, `next_retry_delay`) and returns `error.ApplicationFailure`.
 - On the client, `run.failure()` reads the failure after `error.WorkflowFailed`; it borrows the arena passed to `get`.
 - A workflow that returns `error.ActivityFailed` (or a child, external, or session error) fails with the last failure a `get` returned, so return the error as soon as `get` gives it; `failure.rootCause` then reaches the original one. The last failure is kept per signal or update handler run, and once for the workflow function and every coroutine it or a handler starts, so a failed `get` in a sibling coroutine can supply it.
