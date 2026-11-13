@@ -1512,6 +1512,104 @@ const UpdateFixtures = struct {
     const Napper = workflow.Def("Napper", napper);
 };
 
+// Struct workflows: handlers declared on the workflow type.
+const StructFixtures = struct {
+    /// `UpdateFixtures.HandleUpdates` with its handlers declared instead of registered from
+    /// the workflow function; it replays the same history.
+    const HandleUpdates = struct {
+        ctx: *workflow.Context = undefined,
+        value: i64 = 0,
+        greetings: std.ArrayList([]const u8) = .empty,
+        done: bool = false,
+
+        pub const updates = .{ .set = .{ UpdateFixtures.Set, .positive }, .greet = UpdateFixtures.Greet };
+        pub const signals = .{ .finish = UpdateFixtures.Done };
+
+        pub fn run(h: *HandleUpdates, ctx: *workflow.Context) ![]const u8 {
+            h.ctx = ctx;
+            try ctx.await(h, finished);
+            try ctx.await(ctx, workflow.Context.allHandlersFinished);
+            return std.fmt.allocPrint(ctx.allocator(), "{d} {s}", .{ h.value, try std.mem.join(ctx.allocator(), " ", h.greetings.items) });
+        }
+        /// Returns the previous value.
+        pub fn set(h: *HandleUpdates, value: i64) i64 {
+            defer h.value = value;
+            return h.value;
+        }
+        pub fn positive(_: *HandleUpdates, value: i64) error{NotPositive}!void {
+            if (value <= 0) return error.NotPositive;
+        }
+        pub fn greet(h: *HandleUpdates, name: []const u8) ![]const u8 {
+            const greeting = try h.ctx.executeActivity(Fixtures.Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get();
+            try h.greetings.append(h.ctx.allocator(), greeting);
+            return greeting;
+        }
+        pub fn finish(h: *HandleUpdates) void {
+            h.done = true;
+        }
+        fn finished(h: *HandleUpdates) bool {
+            return h.done;
+        }
+    };
+    const HandleUpdatesWf = workflow.Def("HandleUpdates", HandleUpdates);
+
+    const Record = workflow.SignalDef("record", fn (name: []const u8) void);
+    const Close = workflow.SignalDef("close", fn () void);
+    const Count = workflow.QueryDef("count", fn () usize);
+    const SetLimit = workflow.UpdateDef("set_limit", fn (limit: i64) i64);
+
+    /// Records greetings for the names it is signaled, each from an activity (or, changed,
+    /// without one), until `close`; returns them and its limit. The validator of `set_limit`
+    /// rejects a limit that isn't positive.
+    fn LedgerOf(comptime greet_with_activity: bool) type {
+        return struct {
+            const State = @This();
+            ctx: *workflow.Context = undefined,
+            entries: std.ArrayList([]const u8) = .empty,
+            limit: i64 = 10,
+            closed: bool = false,
+
+            pub const queries = .{ .count = Count };
+            pub const signals = .{ .record = Record, .close = Close };
+            pub const updates = .{ .setLimit = .{ SetLimit, .checkLimit } };
+
+            pub fn run(l: *State, ctx: *workflow.Context, owner: []const u8) ![]const u8 {
+                l.ctx = ctx;
+                try ctx.await(l, isClosed);
+                try ctx.await(ctx, workflow.Context.allHandlersFinished);
+                const entries = try std.mem.join(ctx.allocator(), ", ", l.entries.items);
+                return std.fmt.allocPrint(ctx.allocator(), "{s}: {s} (limit {d})", .{ owner, entries, l.limit });
+            }
+            pub fn record(l: *State, name: []const u8) !void {
+                const entry = if (greet_with_activity)
+                    try l.ctx.executeActivity(Fixtures.Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get()
+                else
+                    name;
+                try l.entries.append(l.ctx.allocator(), entry);
+            }
+            pub fn count(l: *State) usize {
+                return l.entries.items.len;
+            }
+            /// Returns the previous limit.
+            pub fn setLimit(l: *State, limit: i64) i64 {
+                defer l.limit = limit;
+                return l.limit;
+            }
+            pub fn checkLimit(_: *State, limit: i64) error{LimitNotPositive}!void {
+                if (limit <= 0) return error.LimitNotPositive;
+            }
+            pub fn close(l: *State) void {
+                l.closed = true;
+            }
+            fn isClosed(l: *State) bool {
+                return l.closed;
+            }
+        };
+    }
+    const Ledger = workflow.Def("Ledger", LedgerOf(true));
+    const LedgerChanged = workflow.Def("Ledger", LedgerOf(false));
+};
+
 // An update handler whose local activity fails, and one that calls ctx.fail.
 const UpdateFailureFixtures = struct {
     fn chargeActivity(ctx: *activity.Context, amount: i64) !i64 {
@@ -2105,6 +2203,32 @@ test "WorkflowReplayer replays update handlers and catches a handler that change
     defer changed.deinit();
     try changed.registerWorkflow(UpdateFixtures.HandleUpdatesChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(update_history));
+}
+
+test "WorkflowReplayer replays update_history.json with the handlers declared on a struct workflow" {
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    try r.registerWorkflow(StructFixtures.HandleUpdatesWf);
+    try r.replayHistoryJson(update_history);
+}
+
+/// A dev-server run of the struct workflow `StructFixtures.Ledger` signal-with-started with
+/// owner "ledger" and `record "ann"` (whose handler runs an activity), then sent `set_limit 0`
+/// (rejected by the validator, so it left no events), `set_limit 25` (accepted), and `close`.
+/// Recorded from a `WorkflowEnvironment` dev server and exported with `temporal workflow show
+/// --output json`.
+const struct_workflow_history = @embedFile("testdata/struct_workflow_history.json");
+
+test "WorkflowReplayer replays a struct workflow's history and catches a handler that changed" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(StructFixtures.Ledger);
+    try ok.replayHistoryJson(struct_workflow_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(StructFixtures.LedgerChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(struct_workflow_history));
 }
 
 /// The first run of a dev-server run of `ContinueFixtures.CountUp` started with
@@ -3493,6 +3617,44 @@ test "time-skipping WorkflowEnvironment: a workflow mid-timer answers a query wh
 
     try testing.expectEqualStrings("finished", try env.getResult(Fixtures.Queryable, &run, a, null));
     try testing.expectEqualStrings("done", try env.client.queryWorkflow(Fixtures.Status, a, run.id, run.run_id, .{}));
+}
+
+test "WorkflowEnvironment: a struct workflow's declared handlers take signal-with-start, update-with-start, and queries" {
+    for (env_kinds) |kind| {
+        const env = try startEnv(kind);
+        defer env.deinit();
+        try env.registerWorkflow(StructFixtures.Ledger);
+        try env.registerActivity(Fixtures.Greet);
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // The signal sent with the start reaches its declared handler, which runs an activity.
+        var signaled = try env.signalWithStartWorkflow(StructFixtures.Ledger, .{ .task_queue = "" }, .{"ann"}, StructFixtures.Record, .{"bob"});
+        defer signaled.deinit();
+        try env.client.signalWorkflow(StructFixtures.Close, signaled.id, signaled.run_id, .{});
+        try testing.expectEqualStrings("ann: Hello bob! (limit 10)", try env.getResult(StructFixtures.Ledger, &signaled, a, null));
+        try testing.expectEqual(@as(usize, 1), try env.client.queryWorkflow(StructFixtures.Count, a, signaled.id, signaled.run_id, .{}));
+
+        // The validator rejects the update sent with the start; the workflow starts anyway,
+        // and the next update-with-start reaches the running workflow and is accepted.
+        const options: client_mod.StartWorkflowOptions = .{ .id = "struct-ledger", .task_queue = "", .id_conflict_policy = .use_existing };
+        var rejected = try env.updateWithStartWorkflow(StructFixtures.Ledger, options, .{"cy"}, StructFixtures.SetLimit, .{0}, .{});
+        defer rejected.deinit();
+        try testing.expectError(error.UpdateFailed, rejected.get(a));
+        try testing.expectEqualStrings("LimitNotPositive", rejected.failure().?.message);
+        var accepted = try env.updateWithStartWorkflow(StructFixtures.Ledger, options, .{"cy"}, StructFixtures.SetLimit, .{25}, .{});
+        defer accepted.deinit();
+        try testing.expectEqual(@as(i64, 10), try accepted.get(a));
+        try testing.expectEqualStrings(rejected.run_id, accepted.run_id);
+        try testing.expectEqual(@as(usize, 0), try env.client.queryWorkflow(StructFixtures.Count, a, options.id, accepted.run_id, .{}));
+
+        try env.client.signalWorkflow(StructFixtures.Record, options.id, accepted.run_id, .{"dee"});
+        try env.client.signalWorkflow(StructFixtures.Close, options.id, accepted.run_id, .{});
+        var run = try env.client.getWorkflow([]const u8, options.id, accepted.run_id);
+        defer run.deinit();
+        try testing.expectEqualStrings("cy: Hello dee! (limit 25)", try env.getResult(StructFixtures.Ledger, &run, a, null));
+    }
 }
 
 /// Both kinds of `WorkflowEnvironment`, for tests that run on each.

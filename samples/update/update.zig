@@ -16,29 +16,37 @@ pub const Done = workflow.SignalDef("done", fn () void);
 /// The validator's error, the message of a rejected update's failure.
 pub const ValidationError = error{NegativeAddend};
 
-/// The counter, shared by the workflow function and the handlers. It lives in
-/// `ctx.allocator()` memory so the handlers can outlive the function's stack frame.
-const Counter = struct {
-    ctx: *workflow.Context,
+/// The counter workflow. Each run starts from `Counter{}`; the SDK registers the declared
+/// update and signal handlers before the run's first workflow task delivers anything to them.
+pub const Counter = struct {
+    /// Set by `run` before it first blocks, which is before any handler runs.
+    ctx: *workflow.Context = undefined,
     value: i64 = 0,
     done: bool = false,
 
-    fn fetchAndAdd(c: *Counter, addend: i64) i64 {
+    pub const updates = .{ .fetchAndAdd = .{ FetchAndAdd, .nonNegative } };
+    pub const signals = .{ .finish = Done };
+
+    pub fn run(c: *Counter, ctx: *workflow.Context) !i64 {
+        c.ctx = ctx;
+        try ctx.await(c, isDone);
+        return c.value;
+    }
+
+    pub fn fetchAndAdd(c: *Counter, addend: i64) i64 {
         const previous = c.value;
         c.value += addend;
         c.ctx.logger().info("counter updated", .{ .addend = addend, .new_value = c.value });
         return previous;
     }
 
-    fn nonNegative(c: *Counter, addend: i64) ValidationError!void {
-        if (addend < 0) {
-            c.ctx.logger().debug("Rejecting negative update", .{ .addend = addend });
-            return error.NegativeAddend;
-        }
-        c.ctx.logger().debug("Accepting update", .{ .addend = addend });
+    /// Reads only its argument: an update sent with the start is validated before `run`
+    /// has set `ctx`.
+    pub fn nonNegative(_: *Counter, addend: i64) ValidationError!void {
+        if (addend < 0) return error.NegativeAddend;
     }
 
-    fn finish(c: *Counter) void {
+    pub fn finish(c: *Counter) void {
         c.done = true;
     }
 
@@ -47,15 +55,5 @@ const Counter = struct {
     }
 };
 
-fn counterWorkflow(ctx: *workflow.Context) !i64 {
-    const c = try ctx.allocator().create(Counter);
-    c.* = .{ .ctx = ctx };
-    try ctx.setUpdateHandlerWithValidator(FetchAndAdd, c, Counter.fetchAndAdd, Counter.nonNegative);
-    try ctx.setSignalHandler(Done, c, Counter.finish);
-
-    try ctx.await(c, Counter.isDone);
-    return c.value;
-}
-
 /// Holds a counter that starts at zero, and returns its value once it receives "done".
-pub const CounterWorkflow = workflow.Def("Counter", counterWorkflow);
+pub const CounterWorkflow = workflow.Def("Counter", Counter);
