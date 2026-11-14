@@ -44,6 +44,11 @@ pub const Options = struct {
     /// connects to one address.
     dns_load_balancing_interval_ms: ?u64 = null,
     compression: enum { gzip, none } = .gzip,
+    /// Serves every gRPC call of the connection, including the GetSystemInfo that `connect`
+    /// makes, in Zig instead of over the network. `target_url` must still be a valid URL;
+    /// TLS, keep-alive, proxy, DNS load balancing and compression are ignored. The pointee
+    /// must outlive the connection.
+    grpc_override: ?*const GrpcOverride = null,
 
     pub const Tls = struct {
         /// PEM. Empty uses the system roots.
@@ -81,6 +86,117 @@ pub const Options = struct {
         username: []const u8 = "",
         password: []const u8 = "",
     };
+};
+
+/// A handler for all of a connection's gRPC calls (see `Options.grpc_override`).
+///
+/// `handle` runs on one of the core's blocking threads, once per call and possibly
+/// concurrently, so it and `ctx` must be thread-safe. It must call `GrpcRequest.respond`
+/// exactly once for each request, during the call or later from any thread: until then the
+/// caller waits and the request's memory stays allocated. It should return quickly and do
+/// slow work elsewhere.
+pub const GrpcOverride = struct {
+    ctx: ?*anyopaque = null,
+    handle: *const fn (ctx: ?*anyopaque, request: GrpcRequest) void,
+
+    fn onRequest(req: ?*c.TemporalCoreClientGrpcOverrideRequest, user_data: ?*anyopaque) callconv(.c) void {
+        const o: *const GrpcOverride = @ptrCast(@alignCast(user_data.?));
+        o.handle(o.ctx, .{ .ptr = req.? });
+    }
+};
+
+/// One gRPC call handed to a `GrpcOverride`. Everything read from it is borrowed from the
+/// core and valid only until `respond`.
+pub const GrpcRequest = struct {
+    ptr: *c.TemporalCoreClientGrpcOverrideRequest,
+
+    /// Fully qualified service name, such as "temporal.api.workflowservice.v1.WorkflowService".
+    pub fn service(r: GrpcRequest) []const u8 {
+        return bytes.slice(c.temporal_core_client_grpc_override_request_service(r.ptr));
+    }
+
+    /// Method name, such as "GetSystemInfo".
+    pub fn rpc(r: GrpcRequest) []const u8 {
+        return bytes.slice(c.temporal_core_client_grpc_override_request_rpc(r.ptr));
+    }
+
+    /// Serialized request message.
+    pub fn proto(r: GrpcRequest) []const u8 {
+        return bytes.slice(c.temporal_core_client_grpc_override_request_proto(r.ptr));
+    }
+
+    /// The call's ASCII headers (the core leaves out values that aren't visible ASCII).
+    pub fn headers(r: GrpcRequest) HeaderIterator {
+        const md = c.temporal_core_client_grpc_override_request_headers(r.ptr);
+        return .{ .refs = if (md.size == 0) &.{} else md.data[0..md.size] };
+    }
+
+    /// The value of the first header named `key` (lower-case, as gRPC sends names), or null.
+    pub fn header(r: GrpcRequest, key: []const u8) ?[]const u8 {
+        var it = r.headers();
+        while (it.next()) |e| if (std.mem.eql(u8, e.key, key)) return e.value;
+        return null;
+    }
+
+    pub const HeaderIterator = struct {
+        refs: []const bytes.Ref,
+        i: usize = 0,
+
+        pub fn next(it: *HeaderIterator) ?bytes.MetadataEntry {
+            while (it.i < it.refs.len) {
+                const entry = bytes.slice(it.refs[it.i]);
+                it.i += 1;
+                const nl = std.mem.indexOfScalar(u8, entry, '\n') orelse continue;
+                return .{ .key = entry[0..nl], .value = entry[nl + 1 ..] };
+            }
+            return null;
+        }
+    };
+
+    /// Completes the call and frees the request; `r` and everything read from it is invalid
+    /// afterwards. The core copies `response` before this returns. `gpa` is used only while
+    /// encoding the response headers: if that fails (out of memory, or a newline in a key),
+    /// the call fails with INTERNAL instead.
+    pub fn respond(r: GrpcRequest, gpa: Allocator, response: GrpcResponse) void {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        const md = bytes.metadata(arena_state.allocator(), response.headers) catch |err| {
+            c.temporal_core_client_grpc_override_request_respond(r.ptr, .{
+                .status_code = grpc_internal,
+                .headers = bytes.refArray(&.{}),
+                .success_proto = bytes.ref(""),
+                .fail_message = bytes.ref(switch (err) {
+                    error.OutOfMemory => "gRPC override response: out of memory encoding the response headers",
+                    error.NewlineInKey, error.NewlineInValue => "gRPC override response: a response header key contains a newline",
+                }),
+                .fail_details = bytes.ref(""),
+            });
+            return;
+        };
+        c.temporal_core_client_grpc_override_request_respond(r.ptr, .{
+            .status_code = @bitCast(response.status_code),
+            .headers = md,
+            .success_proto = bytes.ref(response.proto),
+            .fail_message = bytes.ref(response.message),
+            .fail_details = bytes.ref(response.details),
+        });
+    }
+
+    const grpc_internal = 13;
+};
+
+/// The answer to a `GrpcRequest`. Borrowed by `GrpcRequest.respond` until it returns.
+pub const GrpcResponse = struct {
+    /// gRPC status code; 0 is success.
+    status_code: u32 = 0,
+    /// Response headers (user metadata, not gRPC's own like content-type).
+    headers: []const bytes.MetadataEntry = &.{},
+    /// Serialized response message. Ignored unless `status_code` is 0.
+    proto: []const u8 = "",
+    /// Failure message. Ignored when `status_code` is 0.
+    message: []const u8 = "",
+    /// Serialized google.rpc.Status, or empty. Ignored when `status_code` is 0.
+    details: []const u8 = "",
 };
 
 pub const ConnectError = error{ OutOfMemory, InvalidOptions, ConnectFailed };
@@ -158,6 +274,10 @@ const CoreOptions = struct {
         if (options.dns_load_balancing_interval_ms) |ms| {
             o.dns = .{ .resolution_interval_millis = ms };
             core.dns_load_balancing_options = &o.dns;
+        }
+        if (options.grpc_override) |handler| {
+            core.grpc_override_callback = GrpcOverride.onRequest;
+            core.grpc_override_callback_user_data = @constCast(handler);
         }
         core.grpc_compression = switch (options.compression) {
             .gzip => c.TemporalCoreClientGrpcCompression_Gzip,
@@ -482,6 +602,133 @@ test "connection options reach the core's C structs" {
     try core.init(a, .{ .target_url = "http://localhost:7233", .identity = "id", .keep_alive = .{ .interval_ms = 10_000, .timeout_ms = 2_000 } });
     try testing.expectEqual(@as(u64, 10_000), core.connection.keep_alive_options.*.interval_millis);
     try testing.expectEqual(@as(u64, 2_000), core.connection.keep_alive_options.*.timeout_millis);
+}
+
+/// Answers calls from Zig: GetSystemInfo, DescribeNamespace (found only for "fake"), and
+/// SignalWorkflowExecution, which it leaves pending for the test to answer.
+const FakeService = struct {
+    requests: std.atomic.Value(u32) = .init(0),
+    responses: std.atomic.Value(u32) = .init(0),
+    system_info_calls: std.atomic.Value(u32) = .init(0),
+    pending: ?GrpcRequest = null,
+    pending_set: std.Io.Event = .unset,
+    override: GrpcOverride = .{ .handle = handle },
+
+    fn respond(f: *FakeService, req: GrpcRequest, response: GrpcResponse) void {
+        _ = f.responses.fetchAdd(1, .monotonic);
+        req.respond(testing.allocator, response);
+    }
+
+    fn handle(ctx: ?*anyopaque, req: GrpcRequest) void {
+        const f: *FakeService = @ptrCast(@alignCast(ctx.?));
+        _ = f.requests.fetchAdd(1, .monotonic);
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const service = "temporal.api.workflowservice.v1.WorkflowService";
+        if (!std.mem.eql(u8, req.service(), service))
+            return f.respond(req, .{ .status_code = 12, .message = "unexpected service" });
+
+        const rpc = req.rpc();
+        if (std.mem.eql(u8, rpc, "GetSystemInfo")) {
+            _ = f.system_info_calls.fetchAdd(1, .monotonic);
+            const resp = encode(wfs.GetSystemInfoResponse{ .server_version = "zig-fake" }, a) catch
+                return f.respond(req, .{ .status_code = 13, .message = "encode failed" });
+            return f.respond(req, .{ .proto = resp, .headers = &.{.{ .key = "x-fake", .value = "1" }} });
+        }
+        if (std.mem.eql(u8, rpc, "DescribeNamespace")) {
+            var r: std.Io.Reader = .fixed(req.proto());
+            const in = wfs.DescribeNamespaceRequest.decode(&r, a) catch
+                return f.respond(req, .{ .status_code = 3, .message = "bad request" });
+            if (!std.mem.eql(u8, in.namespace, "fake")) {
+                const message = std.fmt.allocPrint(a, "namespace {s} not found (x-call={s})", .{ in.namespace, req.header("x-call") orelse "" }) catch "oom";
+                return f.respond(req, .{ .status_code = 5, .message = message, .details = "\x08\x05" });
+            }
+            const resp = encode(wfs.DescribeNamespaceResponse{ .namespace_info = .{ .name = "fake" } }, a) catch
+                return f.respond(req, .{ .status_code = 13, .message = "encode failed" });
+            return f.respond(req, .{ .proto = resp });
+        }
+        if (std.mem.eql(u8, rpc, "SignalWorkflowExecution")) {
+            f.pending = req;
+            f.pending_set.set(testing.io);
+            return;
+        }
+        if (std.mem.eql(u8, rpc, "DeleteWorkflowExecution"))
+            return f.respond(req, .{ .headers = &.{.{ .key = "bad\nkey", .value = "v" }} });
+        f.respond(req, .{ .status_code = 12, .message = "unimplemented" });
+    }
+};
+
+fn signalCall(conn: Connection, request: []const u8) CallError!void {
+    const resp = try conn.call(testing.allocator, testing.io, .workflow, "SignalWorkflowExecution", request, .{}, null);
+    testing.allocator.free(resp);
+}
+
+test "a gRPC override serves the connection's calls from Zig and answers each once" {
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var fake: FakeService = .{};
+    fake.override.ctx = &fake;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    {
+        // Nothing listens on this port: every call, including connect's, goes to the fake.
+        const conn = try connect(testing.allocator, testing.io, rt, .{
+            .target_url = "http://127.0.0.1:1",
+            .identity = "test@zig",
+            .grpc_override = &fake.override,
+        }, null);
+        defer conn.deinit();
+        try testing.expect(fake.system_info_calls.load(.monotonic) >= 1);
+
+        const info_bytes = try conn.call(testing.allocator, testing.io, .workflow, "GetSystemInfo", try encode(wfs.GetSystemInfoRequest{}, a), .{}, null);
+        defer testing.allocator.free(info_bytes);
+        var r: std.Io.Reader = .fixed(info_bytes);
+        try testing.expectEqualStrings("zig-fake", (try wfs.GetSystemInfoResponse.decode(&r, a)).server_version);
+
+        // The request bytes reach the handler and its response comes back.
+        const ns_bytes = try conn.call(testing.allocator, testing.io, .workflow, "DescribeNamespace", try encode(wfs.DescribeNamespaceRequest{ .namespace = "fake" }, a), .{}, null);
+        defer testing.allocator.free(ns_bytes);
+        r = .fixed(ns_bytes);
+        try testing.expectEqualStrings("fake", (try wfs.DescribeNamespaceResponse.decode(&r, a)).namespace_info.?.name);
+
+        // A failure carries the handler's status, message (which saw the call's header) and details.
+        var failure: ?RpcFailure = null;
+        defer if (failure) |f| f.deinit(testing.allocator);
+        try testing.expectError(error.RpcFailed, conn.call(testing.allocator, testing.io, .workflow, "DescribeNamespace", try encode(wfs.DescribeNamespaceRequest{ .namespace = "other" }, a), .{ .metadata = &.{.{ .key = "x-call", .value = "42" }} }, &failure));
+        try testing.expectEqual(@as(u32, 5), failure.?.status_code);
+        try testing.expectEqualStrings("namespace other not found (x-call=42)", failure.?.message);
+        try testing.expectEqualStrings("\x08\x05", failure.?.details);
+
+        // A response header that can't be encoded fails the call with INTERNAL.
+        var bad: ?RpcFailure = null;
+        defer if (bad) |f| f.deinit(testing.allocator);
+        try testing.expectError(error.RpcFailed, conn.call(testing.allocator, testing.io, .workflow, "DeleteWorkflowExecution", "", .{}, &bad));
+        try testing.expectEqual(@as(u32, 13), bad.?.status_code);
+        try testing.expect(std.mem.indexOf(u8, bad.?.message, "newline") != null);
+
+        // A request answered after the handler returned, from another thread.
+        var signal = try testing.io.concurrent(signalCall, .{ conn, try encode(wfs.SignalWorkflowExecutionRequest{ .namespace = "fake" }, a) });
+        try fake.pending_set.wait(testing.io);
+        fake.respond(fake.pending.?, .{});
+        try signal.await(testing.io);
+    }
+    try testing.expectEqual(fake.requests.load(.monotonic), fake.responses.load(.monotonic));
+    try testing.expect(fake.requests.load(.monotonic) >= 6);
+}
+
+test "connection options pass a gRPC override to the core" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var core: CoreOptions = undefined;
+    try core.init(arena.allocator(), .{ .target_url = "http://localhost:7233", .identity = "id" });
+    try testing.expect(core.connection.grpc_override_callback == null);
+    var fake: FakeService = .{};
+    try core.init(arena.allocator(), .{ .target_url = "http://localhost:7233", .identity = "id", .grpc_override = &fake.override });
+    try testing.expect(core.connection.grpc_override_callback == GrpcOverride.onRequest);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&fake.override)), core.connection.grpc_override_callback_user_data);
 }
 
 test "Retry defaults are the core's default policy" {
