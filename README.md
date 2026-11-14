@@ -81,6 +81,8 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Context propagation](#context-propagation)
     - [Tracing](#tracing)
   - [Nexus](#nexus)
+    - [Services and handlers](#services-and-handlers)
+    - [Serving and calling operations](#serving-and-calling-operations)
   - [Contrib](#contrib)
 - [Parity](#parity)
 - [Versioning](#versioning-1)
@@ -1408,9 +1410,60 @@ Not implemented yet.
 A tracing interceptor that creates spans around workflow, activity, and client calls and exports them to OpenTelemetry.
 
 ### Nexus
-<!-- stub: temporal-sdk-zig-d51.10.1, temporal-sdk-zig-d51.10.2, temporal-sdk-zig-d51.10.3, temporal-sdk-zig-d51.5.12 -->
+
+A Nexus service is a named set of operations that one worker handles and that workflows call through a Nexus endpoint, often from another namespace.
+
+#### Services and handlers
+
+`nexus.OperationDef` names an operation with its input and output types, and `nexus.ServiceDef` names a service and lists its operations. This contract holds only names and types, so a calling program imports it without the handlers. `nexus.ServiceHandler` binds each operation to a handler function, and `Worker.registerNexusService` registers the result.
+
+<!-- example: nexus-service -->
+```zig
+const nexus = temporal.nexus;
+
+// The contract: names and types only, shared by the handling worker and its callers.
+pub const Echo = nexus.OperationDef("echo", []const u8, []const u8);
+pub const Greet = nexus.OperationDef("greet", []const u8, []const u8);
+pub const GreetingService = nexus.ServiceDef("greeting-service", .{ Echo, Greet });
+
+// A synchronous operation returns its output.
+fn echo(ctx: *nexus.Context, message: []const u8) ![]const u8 {
+    if (message.len == 0) return ctx.handlerError(.{ .type = .bad_request, .message = "the message is empty" });
+    return message;
+}
+
+// A workflow-run operation returns the workflow to start, and completes with its result.
+fn greet(ctx: *nexus.Context, name: []const u8) !nexus.WorkflowStart(Greeting) {
+    const id = try std.fmt.allocPrint(ctx.allocator(), "greet-{s}", .{ctx.info().request_id});
+    return .{ .options = .{ .id = id }, .args = .{name} };
+}
+
+pub const GreetingHandler = nexus.ServiceHandler(GreetingService, .{
+    nexus.OperationHandler(Echo, echo),
+    nexus.OperationHandler(Greet, greet),
+});
+
+fn registerGreetingService(w: *temporal.worker.Worker) !void {
+    try w.registerWorkflow(Greeting);
+    try w.registerNexusService(GreetingHandler);
+}
+```
+
+Notes:
+
+- A handler is `fn (ctx: *nexus.Context, input: Input) !Output`, or takes a receiver pointer first to share state; register those with `Worker.registerNexusServiceWith` and an instance that outlives the worker. An operation whose input is `void` may leave the input parameter out. Handlers run on the worker's `std.Io`, like activities, and may do any I/O.
+- A handler that returns `nexus.WorkflowStart(W)` makes a workflow-run operation: the worker's client starts workflow `W` with the returned options and arguments, and the operation completes with the workflow's result when it closes. The start carries the Nexus request ID, so a retried start finds the workflow the first one started. An empty `options.id` uses the request ID and an empty `options.task_queue` the worker's task queue. Canceling the operation requests cancellation of the workflow.
+- A missing handler, a handler for an operation the service doesn't have, two operations with one name, a handler whose input or output type differs from the operation's, or a workflow whose result type isn't the operation's output is a compile error that names the service and the operation.
+- `ctx.fail` and `ctx.failCanceled` end the operation as failed or canceled, which the caller doesn't retry. `ctx.handlerError` fails the request with a `nexus.HandlerErrorType`; `bad_request`, `unauthenticated`, `unauthorized`, `not_found`, `conflict`, and `not_implemented` aren't retried by default, the others are, and `retry` overrides the default. Any other error a handler returns is a retried `internal` handler error named after it, except `error.NotFound`, which is `not_found`, and `error.WorkflowExecutionAlreadyStarted`, which is `internal` and not retried.
+- What a handler passes to `ctx.fail`, `ctx.failCanceled`, and `ctx.handlerError`, and the strings in a `WorkflowStart`, are stored as given: they must live until the response has been sent, as memory from `ctx.allocator()` does.
+- `ctx.info()` gives the service, operation, request ID, headers (`Info.header` looks one up by name, ignoring case), and the caller's links; `ctx.client()` gives the worker's client.
+- Registering a service name twice returns `error.AlreadyRegistered`.
+- Workers don't poll for Nexus tasks yet (see the next section), so a registered service isn't served: `Worker.run` on a worker with only Nexus services returns `error.NothingRegistered`.
+
+#### Serving and calling operations
+<!-- stub: temporal-sdk-zig-d51.10.2, temporal-sdk-zig-d51.10.3, temporal-sdk-zig-d51.5.12 -->
 Not implemented yet.
-Planned: service and operation definitions and handlers, calling operations from workflows, and standalone operations from a client.
+Planned: workers serving their registered services, calling operations from workflows, and standalone operations from a client.
 
 ### Contrib
 <!-- stub: temporal-sdk-zig-d51.13.2, temporal-sdk-zig-d51.13.4, temporal-sdk-zig-d51.13.5, temporal-sdk-zig-d51.13.6 -->
