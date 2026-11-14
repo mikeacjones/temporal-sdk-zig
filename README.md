@@ -83,7 +83,8 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
   - [Nexus](#nexus)
     - [Services and handlers](#services-and-handlers)
     - [Calling operations from workflows](#calling-operations-from-workflows)
-    - [Serving operations and standalone calls](#serving-operations-and-standalone-calls)
+    - [Serving operations](#serving-operations)
+    - [Standalone operations](#standalone-operations)
   - [Contrib](#contrib)
 - [Parity](#parity)
 - [Versioning](#versioning-1)
@@ -932,7 +933,7 @@ Notes:
 
 #### Running and stopping
 
-A `worker.Worker` polls one task queue and runs the workflows and activities registered on it. `Worker.run` polls until `Worker.stop` is called; a program's `main` usually calls `Worker.runUntilSignal`, which stops on SIGINT or SIGTERM.
+A `worker.Worker` polls one task queue and runs the workflows, activities, and [Nexus services](#serving-operations) registered on it. `Worker.run` polls until `Worker.stop` is called; a program's `main` usually calls `Worker.runUntilSignal`, which stops on SIGINT or SIGTERM.
 
 <!-- example: worker-run -->
 ```zig
@@ -959,7 +960,7 @@ Notes:
 - The client must outlive the worker; call `deinit` after `run` has returned.
 - There is no separate start function: to keep working while the worker polls, run `run` on `io.concurrent` as above, and read its error from `await`.
 - `run` returns `error.NothingRegistered`, `error.InvalidOptions`, `error.WorkerInitFailed`, or `error.ValidationFailed` before polling starts (the last three logged with the reason); `Worker.RunError` lists every error.
-- When sdk-core gives up polling for tasks, the worker logs it, shuts down as `stop` does, and `run` (or `runUntilSignal`) returns `error.PollFailed`, or `error.OutOfMemory` when the poll itself ran out of memory. `Worker.fatalMessage` then has `polling for <workflow|activity> tasks on task queue <queue> failed: <reason>`, owned by the worker until the next `run` or `deinit`; it is null if that text couldn't be allocated.
+- When sdk-core gives up polling for tasks, the worker logs it, shuts down as `stop` does, and `run` (or `runUntilSignal`) returns `error.PollFailed`, or `error.OutOfMemory` when the poll itself ran out of memory. `Worker.fatalMessage` then has `polling for <workflow|activity|nexus> tasks on task queue <queue> failed: <reason>`, owned by the worker until the next `run` or `deinit`; it is null if that text couldn't be allocated.
 - `stop` is safe from any thread, before or during `run`. `waitUntilRunning` returns `error.WorkerFailedToStart` when `run` failed first.
 - Several workers can share a process and a client, one per task queue; one signal stops every worker in `runUntilSignal`.
 
@@ -970,7 +971,8 @@ Notes:
 Notes:
 - `max_concurrent_workflow_task_executions` (100): workflow activations processed at once. Activations of different runs run in parallel, each on its own thread; one run's activations run one at a time, possibly on different threads. Payload codecs, interceptors, and log sinks are therefore called concurrently.
 - `max_concurrent_activity_executions` (100): activities run at once, each on its own task.
-- `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers` (2 each): polls in flight at once. Each must be at least 1, and the workflow pollers at least 2 while `max_cached_workflows` isn't 0; sdk-core rejects other values and `run` returns `error.WorkerInitFailed`, logged.
+- `max_concurrent_nexus_task_executions` (100): Nexus requests (starts and cancels of operations) handled at once, each on its own task. Used only with a registered Nexus service.
+- `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers`, `max_concurrent_nexus_task_pollers` (2 each): polls in flight at once. Each must be at least 1, and the workflow pollers at least 2 while `max_cached_workflows` isn't 0; sdk-core rejects other values and `run` returns `error.WorkerInitFailed`, logged. The Nexus pollers are checked only with a registered Nexus service.
 - `max_cached_workflows` (1000): runs kept in memory between tasks. Over the limit the least recently used run is evicted and replayed from its history at its next task; 0 replays every task from the start. `workflow_stack_size` (256 KiB): each coroutine's stack.
 - `identity`: the worker's name to the server; empty uses the client's.
 - `graceful_shutdown_period` (zero) and `workflow_memory_limit` (null): see below.
@@ -980,10 +982,10 @@ Notes:
 
 #### Shutdown
 
-`Worker.stop` begins a graceful shutdown: polling ends, in-flight workflow tasks finish, and running activities get `graceful_shutdown_period` before they are canceled. `run` returns once all of that is done.
+`Worker.stop` begins a graceful shutdown: polling ends, in-flight workflow tasks finish, and running activities and Nexus handlers get `graceful_shutdown_period` before they are canceled. `run` returns once all of that is done.
 
 Notes:
-- With the default period of zero, running activities are canceled at once, with `cancelReason()` `worker_shutdown`.
+- With the default period of zero, running activities and Nexus handlers are canceled at once, with `cancelReason()` `worker_shutdown`.
 - `runUntilSignal` replaces the SIGINT and SIGTERM handlers while any worker runs that way, and restores them afterwards.
 - A failed core shutdown is logged, and `run` returns `error.ShutdownFailed`.
 
@@ -1456,11 +1458,12 @@ Notes:
 - A handler is `fn (ctx: *nexus.Context, input: Input) !Output`, or takes a receiver pointer first to share state; register those with `Worker.registerNexusServiceWith` and an instance that outlives the worker. An operation whose input is `void` may leave the input parameter out. Handlers run on the worker's `std.Io`, like activities, and may do any I/O.
 - A handler that returns `nexus.WorkflowStart(W)` makes a workflow-run operation: the worker's client starts workflow `W` with the returned options and arguments, and the operation completes with the workflow's result when it closes. The start carries the Nexus request ID, so a retried start finds the workflow the first one started. An empty `options.id` uses the request ID and an empty `options.task_queue` the worker's task queue. Canceling the operation requests cancellation of the workflow.
 - A missing handler, a handler for an operation the service doesn't have, two operations with one name, a handler whose input or output type differs from the operation's, or a workflow whose result type isn't the operation's output is a compile error that names the service and the operation.
-- `ctx.fail` and `ctx.failCanceled` end the operation as failed or canceled, which the caller doesn't retry. `ctx.handlerError` fails the request with a `nexus.HandlerErrorType`; `bad_request`, `unauthenticated`, `unauthorized`, `not_found`, `conflict`, and `not_implemented` aren't retried by default, the others are, and `retry` overrides the default. Any other error a handler returns is a retried `internal` handler error named after it, except `error.NotFound`, which is `not_found`, and `error.WorkflowExecutionAlreadyStarted`, which is `internal` and not retried.
+- `ctx.fail` and `ctx.failCanceled` end the operation as failed or canceled, which the caller doesn't retry. `ctx.handlerError` fails the request with a `nexus.HandlerErrorType`; `bad_request`, `unauthenticated`, `unauthorized`, `not_found`, `conflict`, and `not_implemented` aren't retried by default, the others are, and `retry` overrides the default. Any other error a handler returns is a retried `internal` handler error named after it, except `error.NotFound`, which is `not_found`, and `error.WorkflowExecutionAlreadyStarted`, `error.InvalidOptions`, and `error.InvalidSearchAttribute`, which are `internal` and not retried.
+- When the server rejects a workflow-run operation's start or cancel, the handler error follows the gRPC status and carries the server's message: INVALID_ARGUMENT is `bad_request`; NOT_FOUND `not_found`; ALREADY_EXISTS, FAILED_PRECONDITION, and OUT_OF_RANGE an `internal` that isn't retried; ABORTED and UNAVAILABLE `unavailable`; RESOURCE_EXHAUSTED `resource_exhausted`; UNIMPLEMENTED `not_implemented`; DEADLINE_EXCEEDED `upstream_timeout`; any other a retried `internal`.
 - What a handler passes to `ctx.fail`, `ctx.failCanceled`, and `ctx.handlerError`, and the strings in a `WorkflowStart`, are stored as given: they must live until the response has been sent, as memory from `ctx.allocator()` does.
-- `ctx.info()` gives the service, operation, request ID, headers (`Info.header` looks one up by name, ignoring case), and the caller's links; `ctx.client()` gives the worker's client.
+- `ctx.info()` gives the service, operation, endpoint, namespace, task queue, request ID, request deadline, headers (`Info.header` looks one up by name, ignoring case), and the caller's links; `ctx.client()` gives the worker's client, and `ctx.logger()` a logger that adds the service, operation, endpoint, and task queue to each message.
 - Registering a service name twice returns `error.AlreadyRegistered`.
-- Workers don't poll for Nexus tasks yet (see [Serving operations and standalone calls](#serving-operations-and-standalone-calls)), so a registered service isn't served: `Worker.run` on a worker with only Nexus services returns `error.NothingRegistered`.
+- A worker with a registered service polls its task queue for Nexus tasks: see [Serving operations](#serving-operations).
 
 #### Calling operations from workflows
 
@@ -1486,14 +1489,63 @@ Notes:
 - `get` returns `error.NexusOperationFailed` when the operation failed, timed out, was canceled, or didn't start; `future.failure()` is then a Nexus operation failure whose cause is the handler's failure, a timeout, or a cancellation. `started` waits for the start and returns the operation token, or null when the result arrived with the start.
 - `schedule_to_close_timeout` bounds the whole operation, `schedule_to_start_timeout` the time until the handler starts it, and `start_to_close_timeout` an asynchronous operation's run; each is optional. `headers` are sent to the handler as Nexus headers and recorded in history without the payload codecs, and `summary` describes the operation in the UI.
 - `future.cancel()`, or canceling the coroutine that waits in `get` or `started`, requests cancellation as `options.cancellation_type` says, and the future resolves when the core reports it. `wait_cancellation_completed` (the default) resolves once the operation has ended, `wait_cancellation_requested` once the handler has accepted the request, and `try_cancel` and `abandon` in the next activation, `abandon` without telling the handler. After `future.cancel()`, `get` returns `error.NexusOperationFailed` with the cancellation as the failure; a canceled coroutine gets `error.Canceled`.
+- With `try_cancel`, a workflow that closes right after canceling may close before the server has sent the cancel to the handler, which then never receives it; use `wait_cancellation_requested` when the handler must see the cancel.
 - With sdk-core v1.2.0, a workflow that is still running when an operation it abandoned ends fails its workflow tasks from then on: use `abandon` only when the workflow closes first, or use `try_cancel`.
 - A service that lacks the operation, or an operation whose types differ from the service's, is a compile error naming the service and the operation. `executeNexusOperationByName` calls a service this program has no contract for, by service and operation name.
 - Workflow interceptors don't see Nexus calls.
 
-#### Serving operations and standalone calls
-<!-- stub: temporal-sdk-zig-d51.10.2, temporal-sdk-zig-d51.5.12 -->
+#### Serving operations
+
+A worker with a registered Nexus service polls its task queue for Nexus tasks, beside any workflows and activities it has, and runs each request (a start or a cancel of an operation) on a task of its own on the worker's `std.Io`. A worker with only Nexus services runs too. Callers reach it through a Nexus endpoint that routes to the worker's namespace and task queue.
+
+<!-- example: nexus-serve -->
+```zig
+/// A worker that serves `GreetingService` on task queue "greetings" until SIGINT or SIGTERM.
+fn serveGreetings(gpa: std.mem.Allocator, io: std.Io, client: *temporal.client.Client) !void {
+    var w = try temporal.worker.Worker.init(gpa, io, client, "greetings", .{
+        .max_concurrent_nexus_task_executions = 20,
+    });
+    defer w.deinit();
+    try registerGreetingService(&w);
+    try w.runUntilSignal();
+}
+```
+
+`testing.WorkflowEnvironment.registerNexusService` (and `registerNexusServiceWith`) registers a service on the environment's worker, and `createNexusEndpoint` creates the endpoint, so a test runs a caller workflow against real handlers:
+
+<!-- example: nexus-test -->
+```zig
+test "a workflow greets through the Nexus endpoint" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(GreetThroughNexus);
+    try env.registerWorkflow(Greeting);
+    try env.registerNexusService(GreetingHandler);
+    // Routes to the environment's namespace and task queue, where its worker serves the service.
+    try env.createNexusEndpoint("greeting-endpoint", .{});
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(GreetThroughNexus, .{"Ziggy"}, arena.allocator(), null);
+    try testing.expectEqualStrings("Hello, Ziggy!", result);
+}
+```
+
+Notes:
+
+- The endpoint is created on the server by an operator (`temporal operator nexus endpoint create`, or the operator service's `CreateNexusEndpoint`), not by the worker. The caller's namespace may differ from the handler's; the dev server takes `--namespace` for a second one.
+- The worker cancels a handler through its `std.Io` when the request's deadline passes or the worker shuts down after `graceful_shutdown_period`; `ctx.cancelReason()` is then `timed_out` or `worker_shutdown`. A canceled handler that returns `error.Canceled` sends no response: the caller's attempt times out and the server retries the request until the operation's timeout. Anything else it returns after the cancel is reported as usual.
+- A request for a service or an operation the worker doesn't have fails as `not_found`, naming both; one the worker can't decode fails as `bad_request`. Neither is retried.
+- A request the worker's Io has no thread for fails as `resource_exhausted`, which the server retries.
+- The client's payload codecs apply to an operation's input, its result, and the details of its failure.
+- The caller's links arrive in `ctx.info().links`, and a workflow-run operation's start returns a link to its workflow, which the caller's history records. Only workflow-event links are converted; a link of another kind, or one that doesn't parse, is logged and dropped.
+- `max_concurrent_nexus_task_executions` and `max_concurrent_nexus_task_pollers` bound the requests handled and the polls open at once (see [Options](#options)).
+- Worker interceptors don't see Nexus requests.
+
+#### Standalone operations
+<!-- stub: temporal-sdk-zig-d51.5.12 -->
 Not implemented yet.
-Planned: workers serving their registered services, and standalone operations from a client.
+Planned: starting, describing, and canceling Nexus operations from a client, outside a workflow.
 
 ### Contrib
 <!-- stub: temporal-sdk-zig-d51.13.2, temporal-sdk-zig-d51.13.4, temporal-sdk-zig-d51.13.5, temporal-sdk-zig-d51.13.6 -->

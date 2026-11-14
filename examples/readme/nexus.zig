@@ -56,13 +56,42 @@ fn greetThroughNexus(ctx: *workflow.Context, name: []const u8) ![]const u8 {
 pub const GreetThroughNexus = workflow.Def("greet_through_nexus", greetThroughNexus);
 // end-example
 
+// example: nexus-serve
+/// A worker that serves `GreetingService` on task queue "greetings" until SIGINT or SIGTERM.
+fn serveGreetings(gpa: std.mem.Allocator, io: std.Io, client: *temporal.client.Client) !void {
+    var w = try temporal.worker.Worker.init(gpa, io, client, "greetings", .{
+        .max_concurrent_nexus_task_executions = 20,
+    });
+    defer w.deinit();
+    try registerGreetingService(&w);
+    try w.runUntilSignal();
+}
+// end-example
+
+// example: nexus-test
+test "a workflow greets through the Nexus endpoint" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(GreetThroughNexus);
+    try env.registerWorkflow(Greeting);
+    try env.registerNexusService(GreetingHandler);
+    // Routes to the environment's namespace and task queue, where its worker serves the service.
+    try env.createNexusEndpoint("greeting-endpoint", .{});
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(GreetThroughNexus, .{"Ziggy"}, arena.allocator(), null);
+    try testing.expectEqualStrings("Hello, Ziggy!", result);
+}
+// end-example
+
 test "nexus: a caller workflow is checked against the service contract" {
     try testing.expectEqualStrings("greet_through_nexus", GreetThroughNexus.workflow_name);
     try testing.expect(GreetThroughNexus.Result == Greet.Output);
 }
 
 test "nexus: a synchronous operation runs from the handler's dispatch table, and fails as the handler says" {
-    _ = &registerGreetingService;
+    _ = &serveGreetings;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

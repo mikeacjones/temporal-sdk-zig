@@ -35,4 +35,5 @@ test {
     _ = @import("interceptor_test.zig");
     _ = @import("metrics_test.zig");
     _ = @import("client_tls_test.zig");
+    _ = @import("nexus_test.zig");
 }

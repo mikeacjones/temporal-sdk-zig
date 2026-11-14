@@ -507,9 +507,21 @@ pub const CancelReason = enum(u8) {
 /// Any other error the handler returns is a handler error of type `internal` (retried) whose
 /// cause is an application failure named after the error, except: `error.NotFound` (as the
 /// client returns it for a workflow that doesn't exist) is `not_found`, and
-/// `error.WorkflowExecutionAlreadyStarted` is a non-retryable `internal`. `error.Canceled`
-/// from a canceled `io()` is an `internal` like any other. Errors from starting
-/// or canceling a workflow-run operation's workflow map the same way.
+/// `error.WorkflowExecutionAlreadyStarted`, `error.InvalidOptions` and
+/// `error.InvalidSearchAttribute` are a non-retryable `internal`. Errors from starting or
+/// canceling a workflow-run operation's workflow map the same way, and a start or cancel the
+/// server rejects maps by its gRPC status: INVALID_ARGUMENT is `bad_request`; ALREADY_EXISTS,
+/// FAILED_PRECONDITION and OUT_OF_RANGE a non-retryable `internal`; ABORTED and UNAVAILABLE
+/// `unavailable`; RESOURCE_EXHAUSTED `resource_exhausted`; UNIMPLEMENTED `not_implemented`;
+/// DEADLINE_EXCEEDED `upstream_timeout`; NOT_FOUND `not_found`; any other a retried
+/// `internal`.
+///
+/// A handler the worker cancels (`cancelReason` set: the request's deadline passed, or the
+/// worker is shutting down) whose request comes to a handler error caused by `error.Canceled`
+/// (the handler returned it, or a workflow start or cancel failed with it) sends no response:
+/// the worker acknowledges the cancel to the core, the caller's attempt times out, and the
+/// server retries the request until the caller's timeout. A handler that returns anything
+/// else after a cancel has that reported as usual.
 pub const Context = struct {
     arena: Allocator,
     io_: Io,
@@ -625,12 +637,34 @@ const HandlerOutcome = union(enum) { operation_error: OperationError, handler_er
 
 /// The handler error for a plain Zig error (see `Context`). `what` says what failed.
 fn plainError(arena: Allocator, what: []const u8, err: anyerror) HandlerError {
-    return .{
+    return rpcError(arena, what, err, null);
+}
+
+/// The handler error for `err` from a client call, which the server rejected with gRPC
+/// status `rejected` when `err` is `error.RpcFailed` and the status is known (see `Context`).
+/// Its message carries the server's.
+fn rpcError(arena: Allocator, what: []const u8, err: anyerror, rejected: ?client_mod.RpcRejection) HandlerError {
+    const plain = err == error.WorkflowExecutionAlreadyStarted or err == error.InvalidOptions or err == error.InvalidSearchAttribute;
+    var e: HandlerError = .{
         .type = if (err == error.NotFound) .not_found else .internal,
         .message = std.fmt.allocPrint(arena, "{s}: {t}", .{ what, err }) catch @errorName(err),
-        .retry = if (err == error.WorkflowExecutionAlreadyStarted) .non_retryable else .default,
+        .retry = if (plain) .non_retryable else .default,
         .cause = .{ .message = @errorName(err), .type = @errorName(err) },
     };
+    if (err != error.RpcFailed) return e;
+    const r = rejected orelse return e;
+    e.message = std.fmt.allocPrint(arena, "{s}: the server rejected the call with gRPC status {t}: {s}", .{ what, r.code, r.message }) catch e.message;
+    switch (r.code) {
+        .invalid_argument => e.type = .bad_request,
+        .already_exists, .failed_precondition, .out_of_range => e.retry = .non_retryable,
+        .aborted, .unavailable => e.type = .unavailable,
+        .resource_exhausted => e.type = .resource_exhausted,
+        .unimplemented => e.type = .not_implemented,
+        .deadline_exceeded => e.type = .upstream_timeout,
+        .not_found => e.type = .not_found,
+        else => {},
+    }
+    return e;
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -843,12 +877,14 @@ fn startWorkflow(comptime W: type, comptime what: []const u8, ctx: *Context, sta
     for (i.callback_headers) |h| if (!std.ascii.eqlIgnoreCase(h.name, token_header)) headers.appendAssumeCapacity(h);
     headers.appendAssumeCapacity(.{ .name = token_header, .value = token });
 
+    var rejected: ?client_mod.RpcRejection = null;
     const started = c.startNexusWorkflow(a, W.workflow_name, options, start.args, .{
         .request_id = request_id,
         .callback_url = i.callback_url,
         .callback_headers = if (i.callback_url.len > 0) headers.items else &.{},
         .links = i.links,
-    }) catch |err| return .{ .handler_error = plainError(a, what ++ ": starting workflow \"" ++ W.workflow_name ++ "\" failed", err) };
+        .rejection = &rejected,
+    }) catch |err| return .{ .handler_error = rpcError(a, what ++ ": starting workflow \"" ++ W.workflow_name ++ "\" failed", err, rejected) };
     const links = a.dupe(Link, &.{started.link}) catch return outOfMemory(what);
     return .{ .started = .{ .token = token, .links = links } };
 }
@@ -879,8 +915,9 @@ fn cancelWorkflow(comptime what: []const u8, ctx: *Context, token: []const u8) C
         .message = std.fmt.allocPrint(a, "{s}: the operation token names workflow \"{s}\" in namespace \"{s}\", but this worker's client is in namespace \"{s}\"", .{ what, t.workflow_id, t.namespace, c.namespace }) catch what ++ ": the operation token names another namespace",
         .retry = .non_retryable,
     } };
-    c.cancelWorkflow(t.workflow_id, "", "") catch |err|
-        return .{ .handler_error = plainError(a, std.fmt.allocPrint(a, "{s}: canceling workflow \"{s}\" failed", .{ what, t.workflow_id }) catch what ++ ": canceling its workflow failed", err) };
+    var rejected: ?client_mod.RpcRejection = null;
+    c.cancelNexusWorkflow(a, t.workflow_id, &rejected) catch |err|
+        return .{ .handler_error = rpcError(a, std.fmt.allocPrint(a, "{s}: canceling workflow \"{s}\" failed", .{ what, t.workflow_id }) catch what ++ ": canceling its workflow failed", err, rejected) };
     return .requested;
 }
 
@@ -1366,6 +1403,46 @@ test "a workflow-run operation starts its workflow with the request ID, callback
     try testing.expectEqualStrings("temporal://system", with_callback.raw.callbacks.items[0].callback.?.variant.?.nexus.url);
 }
 
+test "a rejected workflow start or cancel maps to a handler error by its gRPC status" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Case = struct { code: ?client_mod.RpcCode, type: HandlerErrorType, retryable: bool };
+    const cases = [_]Case{
+        .{ .code = .invalid_argument, .type = .bad_request, .retryable = false },
+        .{ .code = .already_exists, .type = .internal, .retryable = false },
+        .{ .code = .failed_precondition, .type = .internal, .retryable = false },
+        .{ .code = .out_of_range, .type = .internal, .retryable = false },
+        .{ .code = .aborted, .type = .unavailable, .retryable = true },
+        .{ .code = .unavailable, .type = .unavailable, .retryable = true },
+        .{ .code = .resource_exhausted, .type = .resource_exhausted, .retryable = true },
+        .{ .code = .unimplemented, .type = .not_implemented, .retryable = false },
+        .{ .code = .deadline_exceeded, .type = .upstream_timeout, .retryable = true },
+        .{ .code = .not_found, .type = .not_found, .retryable = false },
+        .{ .code = .internal, .type = .internal, .retryable = true },
+        .{ .code = .permission_denied, .type = .internal, .retryable = true },
+        .{ .code = null, .type = .internal, .retryable = true },
+    };
+    for (cases) |case| {
+        const rejected: ?client_mod.RpcRejection = if (case.code) |code| .{ .code = code, .message = "workflow ID exceeds the length limit" } else null;
+        const e = rpcError(a, "starting workflow \"W\" failed", error.RpcFailed, rejected);
+        try testing.expectEqual(case.type, e.type);
+        try testing.expectEqual(case.retryable, e.retryable());
+        if (case.code) |code| {
+            try testing.expect(std.mem.indexOf(u8, e.message, @tagName(code)) != null);
+            try testing.expect(std.mem.indexOf(u8, e.message, "workflow ID exceeds the length limit") != null);
+        }
+    }
+    // Errors from before the call aren't retried; the status only matters for RpcFailed.
+    for ([_]anyerror{ error.InvalidOptions, error.InvalidSearchAttribute, error.WorkflowExecutionAlreadyStarted }) |err| {
+        const e = rpcError(a, "w", err, .{ .code = .invalid_argument, .message = "" });
+        try testing.expectEqual(HandlerErrorType.internal, e.type);
+        try testing.expect(!e.retryable());
+    }
+    try testing.expectEqual(HandlerErrorType.not_found, rpcError(a, "w", error.NotFound, null).type);
+    try testing.expect(rpcError(a, "w", error.Canceled, null).retryable());
+}
+
 test "compile errors name the operation, the service, and what to fix" {
     const expectMessage = struct {
         fn f(comptime message: ?[]const u8, comptime parts: []const []const u8) !void {
@@ -1434,4 +1511,8 @@ test "compile errors name the operation, the service, and what to fix" {
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.A.echo), OperationHandler(Ping, H.B.ping) }), &.{ "nexus service \"svc\"", "one service handler binds one receiver" });
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.echo), u8 }), &.{ "nexus service \"svc\"", "element 1", "not a nexus.OperationHandler" });
     try expectMessage(comptime serviceHandlerError(Svc, OperationHandler(Echo, H.echo)), &.{ "nexus service \"svc\"", "tuple" });
+}
+
+test {
+    _ = @import("nexus/wire.zig");
 }

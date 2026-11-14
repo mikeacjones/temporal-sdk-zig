@@ -1,5 +1,5 @@
-//! Workers: poll a task queue and run the workflows and
-//! activities registered on it.
+//! Workers: poll a task queue and run the workflows, activities, and Nexus services
+//! registered on it.
 //!
 //!     var w = try temporal.worker.Worker.init(gpa, io, &client, "hello-world", .{});
 //!     defer w.deinit();
@@ -19,8 +19,8 @@
 //! Workflow activations of different runs are processed in parallel, each on a task of its
 //! own and on its run's deterministic Io; `max_concurrent_workflow_task_executions` bounds how
 //! many at once. A run is processed by one thread at a time, but may move to another thread
-//! between activations. Activities run concurrently on the worker's Io, each on its own task
-//! so a cancel from the core reaches it as `std.Io` cancellation.
+//! between activations. Activities and Nexus requests run concurrently on the worker's Io, each
+//! on its own task so a cancel from the core reaches it as `std.Io` cancellation.
 
 const std = @import("std");
 const bridge = @import("bridge.zig");
@@ -31,6 +31,7 @@ const log_mod = @import("log.zig");
 const workflow = @import("workflow.zig");
 const activity = @import("activity.zig");
 const nexus = @import("nexus.zig");
+const wire = @import("nexus/wire.zig");
 const client_mod = @import("client.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
@@ -54,8 +55,14 @@ pub const Options = struct {
     /// for different runs.
     max_concurrent_workflow_task_executions: usize = 100,
     max_concurrent_activity_executions: usize = 100,
+    /// How many Nexus requests (starts and cancels of operations) the worker handles at
+    /// once, each on its own task. Only used with a registered Nexus service.
+    max_concurrent_nexus_task_executions: usize = 100,
     max_concurrent_workflow_task_pollers: usize = 2,
     max_concurrent_activity_task_pollers: usize = 2,
+    /// How many Nexus task polls the worker keeps open at once. Only used with a registered
+    /// Nexus service; must be positive.
+    max_concurrent_nexus_task_pollers: usize = 2,
     /// Empty uses the client's identity.
     identity: []const u8 = "",
     /// Stack size for each workflow coroutine.
@@ -82,8 +89,8 @@ pub const Options = struct {
     /// queries, and one that finishes the workflow, are not checked. The workflow logger
     /// also records the failure, except while replaying unless `log_during_replay` is set.
     workflow_memory_limit: ?usize = null,
-    /// How long running activities may keep running after `stop` before they are canceled
-    /// with reason `worker_shutdown`.
+    /// How long running activities and Nexus handlers may keep running after `stop` before
+    /// they are canceled with reason `worker_shutdown`.
     graceful_shutdown_period: Io.Duration = .zero,
     /// Where workflow and activity loggers write. Null uses the client's
     /// (`client.Options.logger`). Borrowed: it must outlive the worker. Called concurrently
@@ -159,7 +166,7 @@ pub const Worker = struct {
     dynamic_workflow: ?workflow.Registered = null,
     /// Runs activity types with no entry in `activities`, if set.
     dynamic_activity: ?activity.Registered = null,
-    /// Nexus services by name. Registered only: no poll loop runs them yet.
+    /// Nexus services by name; `run` polls Nexus tasks when there is one.
     nexus_services: std.StringHashMapUnmanaged(nexus.Registered) = .empty,
     /// The core workers while `run` is active, for `stop` on other threads: the task queue's,
     /// then with sessions, the session queue's and the host queue's.
@@ -309,8 +316,10 @@ pub const Worker = struct {
 
     /// Registers a Nexus service handler defined with `temporal.nexus.ServiceHandler`, under
     /// its service's name. Use `registerNexusServiceWith` when its handlers take a receiver.
-    /// A service name already registered returns `error.AlreadyRegistered`. Registration
-    /// only stores the handler; call it before `run`, from the thread that owns the worker.
+    /// A service name already registered returns `error.AlreadyRegistered`. Call it before
+    /// `run`, from the thread that owns the worker; `run` then polls the task queue's Nexus
+    /// tasks and calls the handlers on the worker's Io, each request on a task of its own (see
+    /// `temporal.nexus.Context` for what a handler's errors and cancellation come to).
     pub fn registerNexusService(w: *Worker, comptime Handler: type) RegisterNexusServiceError!void {
         checkNexusHandler(Handler);
         return w.registerNexusServiceImpl(Handler.registered);
@@ -358,11 +367,17 @@ pub const Worker = struct {
         return w.activities.count() > 0 or w.dynamic_activity != null;
     }
 
+    fn hasNexusServices(w: *const Worker) bool {
+        return w.nexus_services.count() > 0;
+    }
+
     const PollError = bridge.Worker.PollError;
 
     /// Errors from `run`:
-    /// - `NothingRegistered`, `InvalidOptions`: the worker's registrations or options, before
-    ///   anything starts (the reason is logged).
+    /// - `NothingRegistered`: the worker has no workflow, activity, or Nexus service; nothing
+    ///   starts.
+    /// - `InvalidOptions`: the worker's options, before anything starts (the reason is
+    ///   logged).
     /// - `WorkerInitFailed`, `ValidationFailed`: the core rejected the worker or the server
     ///   rejected its namespace or task queue (the core's message is logged).
     /// - `ConcurrencyUnavailable`: the worker's Io couldn't start a poll loop.
@@ -371,8 +386,10 @@ pub const Worker = struct {
     /// - `OutOfMemory`.
     pub const RunError = error{ OutOfMemory, NothingRegistered, WorkerInitFailed, InvalidOptions, ValidationFailed, ShutdownFailed, ConcurrencyUnavailable, PollFailed };
 
-    /// Polls and runs tasks until `stop` is called, or until polling fails for good. Returns
-    /// after in-flight work finishes and every core worker is shut down:
+    /// Polls and runs tasks until `stop` is called, or until polling fails for good: workflow
+    /// tasks when a workflow is registered, activity tasks when an activity or a workflow is
+    /// (workflows' side effects run as local activities), and Nexus tasks when a Nexus
+    /// service is. Returns after in-flight work finishes and every core worker is shut down:
     /// - success after `stop` (or a signal, with `runUntilSignal`);
     /// - `error.PollFailed` (or `error.OutOfMemory`) when the core gave up polling, after
     ///   shutting down as `stop` does; `fatalMessage` has the task queue and the core's text;
@@ -391,7 +408,7 @@ pub const Worker = struct {
             w.start_failed = true;
             w.started.set(w.io);
         };
-        if (!w.hasWorkflows() and !w.hasActivities()) return error.NothingRegistered;
+        if (!w.hasWorkflows() and !w.hasActivities() and !w.hasNexusServices()) return error.NothingRegistered;
         if (w.options.sessions) |o| if (o.max_concurrent_sessions == 0) {
             log.warn("worker for task queue {s}: sessions.max_concurrent_sessions must be positive", .{w.task_queue});
             return error.InvalidOptions;
@@ -414,6 +431,7 @@ pub const Worker = struct {
             .tuner = .{
                 .workflow = .{ .fixed = w.options.max_concurrent_workflow_task_executions },
                 .activity = .{ .fixed = w.options.max_concurrent_activity_executions },
+                .nexus = .{ .fixed = w.options.max_concurrent_nexus_task_executions },
             },
             .task_types = .{
                 .workflows = w.hasWorkflows(),
@@ -421,10 +439,12 @@ pub const Worker = struct {
                 // The core runs local activities only on a worker that also polls workflows.
                 // Every workflow worker runs them: side effects are recorded by one.
                 .local_activities = w.hasWorkflows(),
-                .nexus = false,
+                .nexus = w.hasNexusServices(),
             },
             .workflow_task_pollers = .{ .simple_maximum = w.options.max_concurrent_workflow_task_pollers },
             .activity_task_pollers = .{ .simple_maximum = w.options.max_concurrent_activity_task_pollers },
+            // The core checks this even on a worker that polls no Nexus tasks.
+            .nexus_task_pollers = .{ .simple_maximum = if (w.hasNexusServices()) w.options.max_concurrent_nexus_task_pollers else 1 },
             .graceful_shutdown_period_ms = std.math.cast(u64, w.options.graceful_shutdown_period.toMilliseconds()) orelse 0,
         }, &message);
         defer core.deinit();
@@ -488,24 +508,39 @@ pub const Worker = struct {
         // down like a normal stop, drain every poller (finalizing waits for each to return
         // null), finalize, then return the error.
         var start_failed: ?RunError = null;
+        var polling = workflows_done != null;
+        var nexus_done: ?Io.Future(void) = null;
+        if (w.hasNexusServices()) {
+            if (w.io.concurrent(nexusLoop, .{ w, core })) |f| {
+                nexus_done = f;
+                polling = true;
+            } else |err| {
+                if (!polling) return err;
+                w.startFailed(cores, "the Nexus loop", w.task_queue, err);
+                start_failed = err;
+                nexusLoop(w, core);
+            }
+        }
+        // The task queue's own core polls activities only when it runs them, local ones
+        // included; the session queues' always do.
+        const first_activity_core: usize = if (w.hasWorkflows() or w.hasActivities()) 0 else 1;
         var activity_loops: [3]?Io.Future(void) = @splat(null);
-        for (cores, activity_loops[0..core_count], 0..) |c, *loop, i| {
+        for (cores[first_activity_core..], activity_loops[first_activity_core..core_count]) |c, *loop| {
             if (start_failed == null) {
                 if (w.io.concurrent(activityLoop, .{ w, c.core, c.task_queue })) |f| {
                     loop.* = f;
+                    polling = true;
                     continue;
                 } else |err| {
-                    if (workflows_done == null and i == 0) return err;
-                    log.warn("starting the activity loop for task queue {s} failed, stopping the worker: {t}", .{ c.task_queue, err });
+                    if (!polling) return err;
+                    w.startFailed(cores, "the activity loop", c.task_queue, err);
                     start_failed = err;
-                    w.stop_mutex.lockUncancelable(w.io);
-                    defer w.stop_mutex.unlock(w.io);
-                    for (cores) |other| other.core.initiateShutdown();
                 }
             }
             activityLoop(w, c.core, c.task_queue);
         }
         if (workflows_done) |*f| f.await(w.io);
+        if (nexus_done) |*f| f.await(w.io);
         for (activity_loops[0..core_count]) |*loop| if (loop.*) |*f| f.await(w.io);
 
         // Finalizing moves a core worker out of its handle, without waiting for an
@@ -539,7 +574,15 @@ pub const Worker = struct {
         if (shutdown_failed) |err| return err;
     }
 
-    /// Creates and validates a core worker; logs and returns the error on failure.
+    /// Reports a poll loop that couldn't start while others already poll, and shuts every
+    /// core down so they drain.
+    fn startFailed(w: *Worker, cores: []const ActivityCore, comptime what: []const u8, task_queue: []const u8, err: RunError) void {
+        log.warn("starting " ++ what ++ " for task queue {s} failed, stopping the worker: {t}", .{ task_queue, err });
+        w.stop_mutex.lockUncancelable(w.io);
+        defer w.stop_mutex.unlock(w.io);
+        for (cores) |other| other.core.initiateShutdown();
+    }
+
     /// The activity slots of the session queue and of the host queue, which runs session
     /// activities beside the main queue's own pool. Saturates, so "unlimited" counts can't
     /// overflow; the bridge lowers them to what the core takes.
@@ -547,6 +590,7 @@ pub const Worker = struct {
         return .{ max_sessions, max_activities +| max_sessions };
     }
 
+    /// Creates and validates a core worker; logs and returns the error on failure.
     fn createCore(w: *Worker, connection: bridge.Connection, options: bridge.Worker.Options, message: *?[]u8) RunError!bridge.Worker {
         const core = bridge.Worker.init(w.gpa, connection, options, message) catch |err| {
             log.err("creating the worker for task queue {s} failed: {s}", .{ options.task_queue, message.* orelse @errorName(err) });
@@ -608,7 +652,7 @@ pub const Worker = struct {
         for (w.core_ptrs) |p| if (p) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
     }
 
-    /// The first poll failure of the last `run`, as `polling for <workflow|activity> tasks on
+    /// The first poll failure of the last `run`, as `polling for <workflow|activity|nexus> tasks on
     /// task queue <queue> failed: <the core's message>`, or null if that run had none (or its
     /// text couldn't be allocated). Owned by the worker: valid until the next `run` starts or
     /// `deinit`. Safe to call from any thread.
@@ -618,7 +662,7 @@ pub const Worker = struct {
         return w.fatal_message;
     }
 
-    const PollKind = enum { workflow, activity };
+    const PollKind = enum { workflow, activity, nexus };
 
     /// Reports a failed poll from a poll loop: the core has already retried what it considers
     /// transient, so the worker logs it, records it for `run` to return, and stops.
@@ -1465,6 +1509,362 @@ const side_effect_activity: activity.Registered = .{
     }.echo,
 };
 
+// ---------------------------------------------------------------- Nexus
+
+const nexus_pb = proto.coresdk.nexus;
+
+/// Polls the core's Nexus tasks: each request runs on a task of its own, and a cancel from
+/// the core reaches its request's handler as `std.Io` cancellation. The core's Nexus slots
+/// bound how many run at once.
+fn nexusLoop(w: *Worker, core: bridge.Worker) void {
+    var group: Io.Group = .init;
+    var running: RunningNexusRequests = .{};
+    defer running.map.deinit(w.gpa);
+    var message: ?[]u8 = null;
+    defer if (message) |m| w.gpa.free(m);
+    while (true) {
+        const polled = core.pollNexusTask(w.gpa, w.io, &message) catch |err| {
+            w.pollFailed(.nexus, w.task_queue, err, message);
+            continue;
+        } orelse break;
+        const req = receiveNexusTask(w, core, &running, polled) orelse continue;
+        // Never handled on this thread: the core's cancel for a request arrives in a later
+        // poll, so a handler waiting for it here would wait forever.
+        group.concurrent(w.io, superviseNexusRequest, .{ w, core, &running, req }) catch {
+            req.outcome = .{ .failed = no_thread_for_nexus_request };
+            finishNexusRequest(w, core, &running, req);
+        };
+    }
+    group.await(w.io) catch {};
+}
+
+const no_thread_for_nexus_request: nexus.HandlerError = .{
+    .type = .resource_exhausted,
+    .message = "the worker's Io has no thread free to handle the Nexus request",
+    .retry = .retryable,
+};
+
+/// The Nexus requests a worker is handling, by task token, so the poll loop can deliver the
+/// core's cancels to them. The poll loop adds requests; each request's supervisor removes and
+/// frees its own. A request is only touched by the poll loop while holding `mutex` and finding
+/// it in `map`.
+const RunningNexusRequests = struct {
+    mutex: Io.Mutex = .init,
+    /// Keys are the requests' task tokens, owned by the requests.
+    map: std.StringHashMapUnmanaged(*NexusRequest) = .empty,
+};
+
+/// One Nexus request, from its task until its completion has been sent. Everything it holds
+/// lives in `arena` or `polled`, which the handler's context borrows.
+const NexusRequest = struct {
+    arena: std.heap.ArenaAllocator,
+    polled: bridge.Worker.Polled,
+    task_token: []const u8 = &.{},
+    request: proto.temporal.api.nexus.v1.Request = .{},
+    endpoint: []const u8 = "",
+    deadline: ?Io.Timestamp = null,
+    ctx: nexus.Context,
+    outcome: NexusOutcome = .{ .failed = .{ .type = .internal, .message = "the Nexus request was never handled" } },
+    /// Set when the handler returns or a cancel arrives; wakes the supervisor.
+    wake: Io.Event = .unset,
+
+    fn destroy(req: *NexusRequest, gpa: Allocator) void {
+        req.arena.deinit();
+        req.polled.deinit();
+        gpa.destroy(req);
+    }
+};
+
+/// What handling a request came to: a handler's result, or a handler error from before any
+/// handler ran (no such service or operation, a request of neither kind).
+const NexusOutcome = union(enum) {
+    start: nexus.StartResult,
+    cancel: nexus.CancelResult,
+    failed: nexus.HandlerError,
+};
+
+/// Decodes a polled Nexus task. Returns a new request for a server request; delivers a cancel
+/// from the core to its request and returns null.
+fn receiveNexusTask(w: *Worker, core: bridge.Worker, running: *RunningNexusRequests, polled: bridge.Worker.Polled) ?*NexusRequest {
+    const sink_logger: log_mod.Logger = .{ .sink = w.logSink() };
+    const req = w.gpa.create(NexusRequest) catch {
+        defer polled.deinit();
+        log.err("out of memory receiving a Nexus task on task queue {s}", .{w.task_queue});
+        const response = runId(polled.bytes()) orelse return null;
+        dropNexusTask(w, core, runId(response) orelse return null, sink_logger);
+        return null;
+    };
+    req.* = .{
+        .arena = .init(w.gpa),
+        .polled = polled,
+        .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = .{ .service = "", .operation = "" }, .logger_ = sink_logger, .client_ = w.client, .codecs = w.client.codecs },
+    };
+    var keep = false;
+    defer if (!keep) req.destroy(w.gpa);
+
+    var reader: Io.Reader = .fixed(polled.bytes());
+    const task = nexus_pb.NexusTask.decode(&reader, req.arena.allocator()) catch |err| {
+        failUndecodableNexusTask(w, core, polled.bytes(), err);
+        return null;
+    };
+    switch (task.variant orelse {
+        log.warn("a Nexus task on task queue {s} carries neither a request nor a cancel; ignoring it", .{w.task_queue});
+        return null;
+    }) {
+        .task => |t| {
+            req.task_token = t.task_token;
+            req.request = t.request orelse .{};
+            req.endpoint = if (task.endpoint.len > 0) task.endpoint else req.request.endpoint;
+            req.deadline = zigTimestamp(task.request_deadline);
+            // Named here, before anything can fail the request, so every failure's log names
+            // them; without memory for the fields it logs to the worker's sink without them.
+            const info = &req.ctx.info_;
+            if (req.request.variant) |v| switch (v) {
+                .start_operation => |s| info.* = .{ .service = s.service, .operation = s.operation },
+                .cancel_operation => |c| info.* = .{ .service = c.service, .operation = c.operation },
+            };
+            req.ctx.logger_ = sink_logger.with(req.arena.allocator(), .{
+                .NexusService = info.service,
+                .NexusOperation = info.operation,
+                .NexusEndpoint = req.endpoint,
+                .TaskQueue = w.task_queue,
+            }) catch sink_logger;
+            running.mutex.lockUncancelable(w.io);
+            defer running.mutex.unlock(w.io);
+            running.map.put(w.gpa, req.task_token, req) catch
+                log.warn("out of memory tracking a Nexus request on task queue {s}; it runs, but cancels won't reach it", .{w.task_queue});
+            keep = true;
+            return req;
+        },
+        .cancel_task => |c| {
+            running.mutex.lockUncancelable(w.io);
+            defer running.mutex.unlock(w.io);
+            // A request that already finished has nothing to cancel.
+            const target = running.map.get(c.task_token) orelse return null;
+            const reason: nexus.CancelReason = switch (c.reason) {
+                .WORKER_SHUTDOWN => .worker_shutdown,
+                else => .timed_out,
+            };
+            if (target.ctx.setCancelReason(reason)) target.wake.set(w.io);
+            return null;
+        },
+    }
+}
+
+/// Fails a request whose task doesn't decode (for example a header that isn't UTF-8), so the
+/// core doesn't wait for it forever: its task token is read from the raw bytes (the token is
+/// field 1 of the poll response, itself field 1 of the task).
+fn failUndecodableNexusTask(w: *Worker, core: bridge.Worker, bytes: []const u8, err: anyerror) void {
+    const token = if (runId(bytes)) |response| runId(response) else null;
+    const t = token orelse return log.err("decoding a Nexus task on task queue {s} failed: {t}; it has no task token to complete it with", .{ w.task_queue, err });
+    log.warn("decoding a Nexus task on task queue {s} failed: {t}; failing the request as a bad request", .{ w.task_queue, err });
+    var arena: std.heap.ArenaAllocator = .init(w.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const message = std.fmt.allocPrint(a, "the worker on task queue {s} couldn't decode the Nexus request: {t}", .{ w.task_queue, err }) catch "the worker couldn't decode the Nexus request";
+    const completion = wire.failedCompletion(a, t, .{ .type = .bad_request, .message = message, .retry = .non_retryable }) catch
+        return log.err("out of memory failing an undecodable Nexus task on task queue {s}", .{w.task_queue});
+    sendNexusCompletion(w, core, a, completion, .{ .sink = w.logSink() });
+}
+
+/// Runs a request's handler on a task of its own, waits for it to return or for a cancel,
+/// cancels the task through its `std.Io` on a cancel, and sends the completion. Sending
+/// happens here, not on the handler's task, so a late cancel can't interrupt it. Without a
+/// thread for the handler the request fails as `resource_exhausted`, which the server
+/// retries: run here, the handler couldn't be canceled.
+fn superviseNexusRequest(w: *Worker, core: bridge.Worker, running: *RunningNexusRequests, req: *NexusRequest) void {
+    if (w.io.concurrent(runNexusRequest, .{ w, req })) |started| {
+        var task = started;
+        req.wake.waitUncancelable(w.io);
+        if (req.ctx.cancelReason() != null) task.cancel(w.io) else task.await(w.io);
+    } else |_| req.outcome = .{ .failed = no_thread_for_nexus_request };
+    finishNexusRequest(w, core, running, req);
+}
+
+/// Sends the completion of `req.outcome`, then forgets and frees the request.
+fn finishNexusRequest(w: *Worker, core: bridge.Worker, running: *RunningNexusRequests, req: *NexusRequest) void {
+    completeNexusRequest(w, core, req, req.outcome);
+    running.mutex.lockUncancelable(w.io);
+    _ = running.map.remove(req.task_token);
+    running.mutex.unlock(w.io);
+    req.destroy(w.gpa);
+}
+
+/// Runs the request into `req.outcome`. The outcome is stored rather than returned: its
+/// alignment (16, from `Io.Duration`) is more than `std.Io.Threaded` futures place results at,
+/// which overruns their allocation.
+fn runNexusRequest(w: *Worker, req: *NexusRequest) void {
+    defer req.wake.set(w.io);
+    req.outcome = handleNexusRequest(w, req);
+}
+
+/// Builds the request's context and calls its operation's handler.
+fn handleNexusRequest(w: *Worker, req: *NexusRequest) NexusOutcome {
+    const a = req.arena.allocator();
+    const ctx = &req.ctx;
+    // The context already exists: a cancel may have set its reason.
+    ctx.arena = a;
+    const r = &req.request;
+    const variant = r.variant orelse return .{ .failed = .{
+        .type = .bad_request,
+        .message = "the Nexus request is neither a start nor a cancel of an operation",
+        .retry = .non_retryable,
+    } };
+    const service, const operation = switch (variant) {
+        .start_operation => |s| .{ s.service, s.operation },
+        .cancel_operation => |c| .{ c.service, c.operation },
+    };
+    const oom: NexusOutcome = .{ .failed = .{ .type = .internal, .message = "the worker ran out of memory handling the Nexus request" } };
+    ctx.info_ = .{
+        .service = service,
+        .operation = operation,
+        .headers = nexusHeaders(a, r.header.items) catch return oom,
+        .endpoint = req.endpoint,
+        .namespace = w.client.namespace,
+        .task_queue = w.task_queue,
+        .request_deadline = req.deadline,
+    };
+    ctx.metrics_ = w.client.metrics().with(.{
+        .namespace = w.client.namespace,
+        .task_queue = w.task_queue,
+        .nexus_endpoint = req.endpoint,
+        .nexus_service = service,
+        .nexus_operation = operation,
+    }) catch return oom;
+    defer {
+        ctx.metrics_.deinit();
+        ctx.metrics_ = .noop;
+    }
+    const bound = w.nexusOperation(service, operation) catch |err| return .{ .failed = .{
+        .type = .not_found,
+        .message = switch (err) {
+            error.ServiceNotFound => std.fmt.allocPrint(a, "Nexus service \"{s}\" is not registered on the worker for task queue {s} (looking for its operation \"{s}\")", .{ service, w.task_queue, operation }),
+            error.OperationNotFound => std.fmt.allocPrint(a, "Nexus service \"{s}\" has no operation \"{s}\" on the worker for task queue {s}", .{ service, operation, w.task_queue }),
+        } catch "the Nexus service or operation is not registered on this worker",
+        .retry = .non_retryable,
+    } };
+    switch (variant) {
+        .start_operation => |s| {
+            ctx.info_.request_id = s.request_id;
+            ctx.info_.callback_url = s.callback;
+            ctx.info_.callback_headers = nexusHeaders(a, s.callback_header.items) catch return oom;
+            var links: std.ArrayList(nexus.Link) = .empty;
+            for (s.links.items) |link| {
+                var why: []const u8 = "";
+                const converted = wire.fromNexusLink(a, link, &why) catch |err| switch (err) {
+                    error.OutOfMemory => return oom,
+                    error.InvalidLink => {
+                        ctx.logger_.warn("Dropping a link of the Nexus request that doesn't parse", .{ .Url = link.url, .Type = link.type, .Reason = why });
+                        continue;
+                    },
+                };
+                links.append(a, converted) catch return oom;
+            }
+            ctx.info_.links = links.items;
+            return .{ .start = bound.start(ctx, s.payload) };
+        },
+        .cancel_operation => |c| {
+            const token = if (c.operation_token.len > 0) c.operation_token else c.operation_id;
+            return .{ .cancel = bound.cancel(ctx, token) };
+        },
+    }
+}
+
+fn nexusHeaders(a: Allocator, entries: anytype) error{OutOfMemory}![]const nexus.Header {
+    const out = try a.alloc(nexus.Header, entries.len);
+    for (entries, out) |e, *h| h.* = .{ .name = e.key, .value = e.value };
+    return out;
+}
+
+/// Turns a request's outcome into its completion and sends it. A handler the worker
+/// canceled that gave up with `error.Canceled` acknowledges the cancel instead (see
+/// `nexus.Context`).
+fn completeNexusRequest(w: *Worker, core: bridge.Worker, req: *NexusRequest, outcome: NexusOutcome) void {
+    const a = req.arena.allocator();
+    const ctx = &req.ctx;
+    const logger = ctx.logger_;
+    const handler_error: ?nexus.HandlerError = switch (outcome) {
+        .start => |r| if (r == .handler_error) r.handler_error else null,
+        .cancel => |r| if (r == .handler_error) r.handler_error else null,
+        .failed => |e| e,
+    };
+    if (handler_error) |e| {
+        if (wire.canceledByWorker(ctx, e)) {
+            logger.debug("Nexus handler canceled; acknowledging the cancel", .{ .Reason = @tagName(ctx.cancelReason().?) });
+            return sendNexusCompletion(w, core, a, wire.ackCancel(req.task_token), logger);
+        }
+        logger.warn("Nexus request failed", .{ .Error = e.message, .Type = e.type.wireName(), .Retryable = e.retryable() });
+    }
+    if (outcome == .start and outcome.start == .operation_error)
+        logger.debug("Nexus operation ended unsuccessfully", .{ .Error = outcome.start.operation_error.failure.message, .State = @tagName(outcome.start.operation_error.state) });
+    var completion = switch (outcome) {
+        .start => |r| wire.startCompletion(a, req.task_token, r, logger),
+        .cancel => |r| wire.cancelCompletion(a, req.task_token, r),
+        .failed => |e| wire.failedCompletion(a, req.task_token, e),
+    } catch return dropNexusTask(w, core, req.task_token, logger);
+    encodeNexusFailure(w, a, &completion, ctx.info_.namespace) catch |err| {
+        logger.warn("Encoding the Nexus request's failure with the client's codecs failed; sending it without its details", .{ .Error = @errorName(err) });
+        completion = wire.failedCompletion(a, req.task_token, .{
+            .type = .internal,
+            .message = std.fmt.allocPrint(a, "encoding the failure of Nexus operation \"{s}\" of service \"{s}\" with the client's codecs failed: {t}", .{ ctx.info_.operation, ctx.info_.service, err }) catch "encoding the Nexus request's failure with the client's codecs failed",
+        }) catch return dropNexusTask(w, core, req.task_token, logger);
+    };
+    sendNexusCompletion(w, core, a, completion, logger);
+}
+
+/// Encodes the payloads of the completion's failure, if it has one, with the client's codecs.
+/// A synchronous result is already encoded (by `nexus.Operation.start`).
+fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, namespace: []const u8) converter.CodecError!void {
+    const context: converter.CodecContext = .{ .namespace = namespace };
+    const status = if (completion.status) |*st| st else return;
+    const f: *failure_mod.Failure = switch (status.*) {
+        .failure => |*f| f,
+        .completed => |*response| f: {
+            const variant = if (response.variant) |*v| v else return;
+            const start = switch (variant.*) {
+                .start_operation => |*so| so,
+                else => return,
+            };
+            const outcome = if (start.variant) |*v| v else return;
+            break :f switch (outcome.*) {
+                .failure => |*f| f,
+                else => return,
+            };
+        },
+        else => return,
+    };
+    try converter.encodeMessage(failure_mod.Failure, f, w.client.codecs, a, w.io, &context);
+}
+
+fn sendNexusCompletion(w: *Worker, core: bridge.Worker, a: Allocator, completion: wire.Completion, logger: log_mod.Logger) void {
+    var encoded: Io.Writer.Allocating = .init(a);
+    completion.encode(&encoded.writer, a) catch return dropNexusTask(w, core, completion.task_token, logger);
+    completeNexusTask(w, core, encoded.written(), logger);
+}
+
+/// Completes a task whose response couldn't be built for lack of memory, with a completion
+/// that needs none: an acknowledged cancel, which the core takes for any task it is waiting
+/// on and doesn't send to the server, so the caller's attempt times out and is retried.
+fn dropNexusTask(w: *Worker, core: bridge.Worker, token: []const u8, logger: log_mod.Logger) void {
+    var buffer: [wire.max_ack_cancel_len]u8 = undefined;
+    const completion = wire.encodeAckCancel(&buffer, token) orelse
+        return logger.err("Out of memory completing a Nexus request, and its task token is too long to acknowledge without memory; the core keeps the task, so the worker can't finish stopping", .{ .TaskTokenLength = token.len });
+    logger.err("Out of memory completing a Nexus request; sending no response, so the caller's attempt times out and is retried", .{});
+    completeNexusTask(w, core, completion, logger);
+}
+
+/// Hands an encoded completion to the core. The core forgets a task whose completion it
+/// receives, even one it then fails to deliver; only running out of memory before the call
+/// leaves the task with the core, which then can't finish shutting down.
+fn completeNexusTask(w: *Worker, core: bridge.Worker, completion: []const u8, logger: log_mod.Logger) void {
+    var message: ?[]u8 = null;
+    defer if (message) |m| w.gpa.free(m);
+    core.completeNexusTask(w.gpa, w.io, completion, &message) catch |err| switch (err) {
+        error.OutOfMemory => logger.err("Out of memory completing a Nexus task; the core keeps the task, so the worker can't finish stopping", .{}),
+        else => logger.err("Completing a Nexus task failed", .{ .Error = message orelse @errorName(err) }),
+    };
+}
+
 // ---------------------------------------------------------------- sessions
 
 /// The sessions a worker holds open (`Options.sessions`), for one `run`. Its two activities
@@ -1808,8 +2208,7 @@ test "registered Nexus services are found by service and operation name, once ea
     try testing.expectEqualStrings("\"nexus-test: hi\"", echoed.succeeded.result.data);
     const counted = (try w.nexusOperation("nexus-test", "count")).start(&ctx, null);
     try testing.expectEqualStrings("7", counted.succeeded.result.data);
-    // Registering services doesn't make a worker runnable: nothing polls them yet.
-    try testing.expect(!w.hasWorkflows() and !w.hasActivities());
+    try testing.expect(!w.hasWorkflows() and !w.hasActivities() and w.hasNexusServices());
 }
 
 const Counter = struct {
