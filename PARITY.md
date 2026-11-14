@@ -69,6 +69,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | [encryption](samples/encryption) | encryption |
 | [worker-versioning](samples/worker-versioning) | worker-versioning |
 | [nexus](samples/nexus) | nexus |
+| [nexus-cancelation](samples/nexus-cancelation) | nexus-cancelation |
 
 ## Samples with no Zig equivalent
 
