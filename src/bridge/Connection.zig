@@ -46,8 +46,10 @@ pub const Options = struct {
     compression: enum { gzip, none } = .gzip,
     /// Serves every gRPC call of the connection, including the GetSystemInfo that `connect`
     /// makes, in Zig instead of over the network. `target_url` must still be a valid URL;
-    /// TLS, keep-alive, proxy, DNS load balancing and compression are ignored. The pointee
-    /// must outlive the connection.
+    /// TLS, keep-alive, proxy, DNS load balancing and compression are ignored. Per-call
+    /// timeouts are not enforced either: `CallOptions.timeout_ms` reaches the handler only as
+    /// the request's `grpc-timeout` header, and the call waits until the handler responds,
+    /// however long that takes. The pointee must outlive the connection.
     grpc_override: ?*const GrpcOverride = null,
 
     pub const Tls = struct {
