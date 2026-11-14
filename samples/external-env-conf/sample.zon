@@ -1,0 +1,11 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The programs read
+// config.toml, and samples-test's TEMPORAL_ADDRESS overrides its address.
+.{
+    .expect = .{
+        "Connecting using custom config: config.toml",
+        "Workflow result: Hello Temporal!",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"externalenvconf_test.zig"},
+}

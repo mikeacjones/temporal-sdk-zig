@@ -40,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "encryption:starter")) return @import("encryption/starter.zig").main(init);
     if (std.mem.eql(u8, name, "expense:worker")) return @import("expense/worker.zig").main(init);
     if (std.mem.eql(u8, name, "expense:starter")) return @import("expense/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "external-env-conf:worker")) return @import("external-env-conf/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "external-env-conf:starter")) return @import("external-env-conf/starter.zig").main(init);
     if (std.mem.eql(u8, name, "greetings:worker")) return @import("greetings/worker.zig").main(init);
     if (std.mem.eql(u8, name, "greetings:starter")) return @import("greetings/starter.zig").main(init);
     if (std.mem.eql(u8, name, "greetingslocal:worker")) return @import("greetingslocal/worker.zig").main(init);
