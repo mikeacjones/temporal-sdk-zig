@@ -45,6 +45,18 @@ pub const VersioningOverride = union(enum) {
     /// Moves the workflow to its deployment's current (or ramping) version at its next
     /// workflow task, like an auto-upgrade workflow.
     auto_upgrade,
+
+    /// The override a server message reports, or null for none and for a kind this SDK has no
+    /// case for. Reads only the `override` oneof, never the deprecated fields beside it;
+    /// borrows `o`'s slices.
+    pub fn fromProto(o: ?proto.temporal.api.workflow.v1.VersioningOverride) ?VersioningOverride {
+        const override = (o orelse return null).override orelse return null;
+        return switch (override) {
+            .pinned => |p| .{ .pinned = Version.fromProto(p.version) orelse return null },
+            .auto_upgrade => |on| if (on) .auto_upgrade else null,
+            .one_time => null,
+        };
+    }
 };
 
 /// Where a version stands in its deployment's rollout.
@@ -297,4 +309,29 @@ test "statuses map from the server's values" {
     try std.testing.expectEqual(DrainageStatus.draining, DrainageStatus.fromProto(.VERSION_DRAINAGE_STATUS_DRAINING));
     // An empty routing version means unversioned workers.
     try std.testing.expectEqual(@as(?Version, null), Version.fromProto(.{ .deployment_name = "shop" }));
+}
+
+test "versioning overrides map from the server's message; kinds with no case map to null" {
+    const wf = proto.temporal.api.workflow.v1;
+    const v1: pb.WorkerDeploymentVersion = .{ .deployment_name = "rollout", .build_id = "v1" };
+    const pinned_v1: VersioningOverride = .{ .pinned = .{ .deployment_name = "rollout", .build_id = "v1" } };
+    const Case = struct { from: ?wf.VersioningOverride, want: ?VersioningOverride };
+    const cases = [_]Case{
+        .{ .from = null, .want = null },
+        .{ .from = .{}, .want = null },
+        .{ .from = .{ .override = .{ .auto_upgrade = true } }, .want = .auto_upgrade },
+        .{ .from = .{ .override = .{ .auto_upgrade = false } }, .want = null },
+        // The deprecated fields are never read: alone, or disagreeing with the oneof.
+        .{ .from = .{ .behavior = .VERSIONING_BEHAVIOR_PINNED, .pinned_version = "rollout.v1" }, .want = null },
+        .{ .from = .{ .behavior = .VERSIONING_BEHAVIOR_AUTO_UPGRADE, .override = .{ .auto_upgrade = false } }, .want = null },
+        .{ .from = .{ .behavior = .VERSIONING_BEHAVIOR_AUTO_UPGRADE, .override = .{ .pinned = .{ .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED, .version = v1 } } }, .want = pinned_v1 },
+        .{ .from = .{ .pinned_version = "deprecated.v9", .override = .{ .pinned = .{ .version = .{ .deployment_name = "", .build_id = "v1" } } } }, .want = .{ .pinned = .{ .deployment_name = "", .build_id = "v1" } } },
+        // A pin without a version or a build ID.
+        .{ .from = .{ .override = .{ .pinned = .{ .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED } } }, .want = null },
+        .{ .from = .{ .override = .{ .pinned = .{ .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED, .version = .{ .deployment_name = "rollout" } } } }, .want = null },
+        // A pin behavior this SDK doesn't know still pins.
+        .{ .from = .{ .override = .{ .pinned = .{ .behavior = @fromBackingInt(7), .version = v1 } } }, .want = pinned_v1 },
+        .{ .from = .{ .override = .{ .one_time = .{ .target_deployment_version = v1 } } }, .want = null },
+    };
+    for (cases) |case| try std.testing.expectEqualDeep(case.want, VersioningOverride.fromProto(case.from));
 }

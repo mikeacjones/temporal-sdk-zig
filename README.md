@@ -328,8 +328,9 @@ Notes:
 - Results are allocated from the arena passed in. A description's `raw` is the full server response, and a listed workflow's `raw` is the server's record of that execution.
 - Visibility is eventually consistent. An invalid query is `error.RpcFailed`, logged with the server's reason.
 - A cancelled workflow sees `error.Canceled` from its next cancelable wait and may clean up first. `Client.historyIterator` reads history a page at a time, optionally waiting for new events.
-<!-- stub: temporal-sdk-zig-d51.5.3 -->
-- Not implemented yet: terminate with details or a first-execution run ID.
+- `Client.terminateWorkflowWithOptions` records details (any value the converter encodes, or `{}` for none) in the terminated event. With `TerminateOptions.first_execution_run_id`, it terminates only the chain of runs that started with that run; another chain is `error.NotFound`, and the workflow keeps running.
+<!-- stub: temporal-sdk-zig-d51.5.30 -->
+- Not implemented yet: a first-execution run ID on `cancelWorkflow`, and links on a termination.
 
 #### Schedules
 
@@ -410,9 +411,46 @@ Notes:
 - `Client.listWorkerDeployments` lists them, and `StartWorkflowOptions.versioning_override` pins one workflow to a version. The server's refusals are `error.RpcFailed`, logged.
 
 #### Workflow reset and execution options
-<!-- stub: temporal-sdk-zig-d51.5.3 -->
-Not implemented yet.
-The client will reset a workflow to an earlier point in its history and change a running workflow's execution options, such as its versioning override.
+
+`Client.resetWorkflow` starts a new run of a workflow from an earlier point in a run's history, the end of a workflow task, and returns the new run's ID. `Client.updateWorkflowExecutionOptions` changes a running workflow's execution options, such as its versioning override.
+
+<!-- example: client-reset -->
+```zig
+// Reset the latest run to the end of its first workflow task: the new run keeps the
+// history up to there. Reading the run ID once makes both calls name the same run.
+const run_id = (try client.describeWorkflow(arena, workflow_id, "")).run_id;
+const history = try client.fetchHistory(arena, workflow_id, run_id);
+const first_task = for (history.events.items) |event| {
+    if (event.attributes) |attrs| if (attrs == .workflow_task_completed_event_attributes) break event.event_id;
+} else return error.NoCompletedWorkflowTask;
+const new_run_id = try client.resetWorkflow(arena, workflow_id, run_id, .{
+    .workflow_task_finish_event_id = first_task,
+    .reason = "greet again",
+    .reapply_exclude = .{ .signals = true }, // the new run doesn't get the earlier `finish`
+});
+var new_run = try client.getWorkflow([]const u8, workflow_id, new_run_id);
+defer new_run.deinit();
+```
+
+<!-- example: client-execution-options -->
+```zig
+// Auto-upgrade from the next workflow task on, whatever the workflow's definition says.
+const options = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{
+    .versioning_override = .{ .set = .auto_upgrade },
+});
+std.log.info("versioning override: {s}", .{if (options.versioning_override) |o| @tagName(o) else "none"});
+// Back to the definition's behavior.
+_ = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{ .versioning_override = .remove });
+```
+Notes:
+- The reset point is the event ID of a workflow task's completed, failed, or timed-out event, or its started event, found with `Client.fetchHistory`; a non-positive one is `error.InvalidOptions`, and one the server refuses is `error.RpcFailed`. An unknown workflow or run is `error.NotFound`.
+- A running base run ends terminated, as does the workflow's current run; a closed base run stays as it was. A handle that names the base run's ID, such as one `executeWorkflow` returned, doesn't follow the reset: its `get` returns `error.WorkflowTerminated` (or the run's own result if it had closed). A handle made with an empty run ID reads the latest run when `get` runs, so it gets the new run's result.
+- Signals, updates, and Nexus events recorded after the reset point are reapplied to the new run unless `ResetOptions.reapply_exclude` excludes them. Don't rely on `request_id` to deduplicate: a repeated request may reset again.
+- A reset is sent once, without the automatic retries other calls get. A transport failure is `error.RpcFailed` too, and after it the reset may or may not have happened: before resetting again, describe the base run, whose `raw.workflow_extended_info.reset_run_id` names the new run once it has been reset.
+- In `WorkflowExecutionOptionsChanges`, `null` leaves an option as it is, `.remove` clears the override, and `.set` replaces it; changing nothing is `error.InvalidOptions`. A pin (`.set = .{ .pinned = version }`) needs a worker of that version to have polled the workflow's task queue, or it is `error.RpcFailed`; auto-upgrade needs none. A closed workflow is `error.NotFound`.
+- The server's refusals are logged as warnings with its reason.
+<!-- stub: temporal-sdk-zig-d51.5.30 -->
+- Not implemented yet: operations applied after a reset, helpers that pick a reset point, and changing a workflow's priority or time-skipping configuration.
 
 #### Namespaces and raw service access
 <!-- stub: temporal-sdk-zig-d51.5.11 -->

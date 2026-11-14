@@ -124,6 +124,38 @@ pub fn manageWorkflows(client: *temporal.client.Client, arena: Allocator) !void 
     try std.testing.expectError(error.WorkflowTerminated, stuck.get(arena));
 }
 
+pub fn resetGreeter(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8) ![]const u8 {
+    // example: client-reset
+    // Reset the latest run to the end of its first workflow task: the new run keeps the
+    // history up to there. Reading the run ID once makes both calls name the same run.
+    const run_id = (try client.describeWorkflow(arena, workflow_id, "")).run_id;
+    const history = try client.fetchHistory(arena, workflow_id, run_id);
+    const first_task = for (history.events.items) |event| {
+        if (event.attributes) |attrs| if (attrs == .workflow_task_completed_event_attributes) break event.event_id;
+    } else return error.NoCompletedWorkflowTask;
+    const new_run_id = try client.resetWorkflow(arena, workflow_id, run_id, .{
+        .workflow_task_finish_event_id = first_task,
+        .reason = "greet again",
+        .reapply_exclude = .{ .signals = true }, // the new run doesn't get the earlier `finish`
+    });
+    var new_run = try client.getWorkflow([]const u8, workflow_id, new_run_id);
+    defer new_run.deinit();
+    // end-example
+    return new_run_id;
+}
+
+pub fn overrideVersioning(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8) !void {
+    // example: client-execution-options
+    // Auto-upgrade from the next workflow task on, whatever the workflow's definition says.
+    const options = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{
+        .versioning_override = .{ .set = .auto_upgrade },
+    });
+    std.log.info("versioning override: {s}", .{if (options.versioning_override) |o| @tagName(o) else "none"});
+    // Back to the definition's behavior.
+    _ = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{ .versioning_override = .remove });
+    // end-example
+}
+
 pub fn scheduleGreetings(client: *temporal.client.Client, arena: Allocator) !void {
     // example: client-schedule
     var handle = try client.createSchedule("daily-greeting", .{ .schedule = .{
@@ -230,6 +262,33 @@ test "client: examples against a dev server" {
     try std.testing.expectEqualStrings("Howdy, Ziggy!", try updated.get(arena));
 
     try manageWorkflows(&client, arena);
+
+    var greeter = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-reset", .task_queue = "greetings" }, .{"Ada"});
+    defer greeter.deinit();
+    try std.testing.expectEqualStrings("Hello", try client.queryWorkflow(CurrentGreeting, arena, greeter.id, "", .{}));
+    try client.signalWorkflow(Finish, greeter.id, "", .{});
+    try std.testing.expectEqualStrings("Hello, Ada!", try greeter.get(arena));
+    var reset = try client.getWorkflow([]const u8, greeter.id, try resetGreeter(&client, arena, "greeter-reset"));
+    defer reset.deinit();
+    try std.testing.expectEqual(temporal.client.WorkflowExecutionStatus.completed, (try client.describeWorkflow(arena, greeter.id, greeter.run_id)).status);
+    // Without the `finish` signal, the new run waits for one.
+    try std.testing.expectEqual(temporal.client.WorkflowExecutionStatus.running, (try client.describeWorkflow(arena, reset.id, reset.run_id)).status);
+    // The greetings worker is unversioned: an auto-upgrade override needs no versioned worker.
+    try overrideVersioning(&client, arena, "greeter-reset");
+    var changes: std.ArrayList(temporal.proto.temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes) = .empty;
+    for ((try client.fetchHistory(arena, reset.id, reset.run_id)).events.items) |event| {
+        const attrs = event.attributes orelse continue;
+        if (attrs == .workflow_execution_options_updated_event_attributes) try changes.append(arena, attrs.workflow_execution_options_updated_event_attributes);
+    }
+    try std.testing.expectEqual(2, changes.items.len);
+    const set = changes.items[0].versioning_override orelse return error.TestUnexpectedResult;
+    try std.testing.expect((set.override orelse return error.TestUnexpectedResult) == .auto_upgrade);
+    try std.testing.expect(changes.items[1].unset_versioning_override);
+    var update = try client.updateWorkflow(SetGreeting, reset.id, reset.run_id, .{"Hi"}, .{});
+    defer update.deinit();
+    try std.testing.expectEqualStrings("Hello", try update.get(arena));
+    try client.signalWorkflow(Finish, reset.id, reset.run_id, .{});
+    try std.testing.expectEqualStrings("Hi, Ada!", try reset.get(arena));
     try scheduleGreetings(&client, arena);
     try std.testing.expectEqualStrings("Hello, Ada!", try runStandaloneActivity(&client, arena));
 
