@@ -1,0 +1,13 @@
+# cargo-deny settings for .review/reports.sh, which runs `check advisories sources` on the
+# cargo workspace in deps/ (sdk-core's C bridge and everything it pulls in).
+
+[advisories]
+# The defaults: a crate with a security advisory fails, as does a yanked one.
+
+[sources]
+# Every crate comes from crates.io. A git or other-registry dependency appearing in
+# deps/Cargo.lock fails until it is allowed here on purpose.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

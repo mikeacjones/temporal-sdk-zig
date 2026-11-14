@@ -1,0 +1,8 @@
+# gitleaks settings for .review/reports.sh: the default rules, minus this repository's
+# test fixtures.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "TLS keys generated for the samples' Docker server; they protect nothing"
+paths = ['''^tools/fixtures/tls/.*\.key$''']

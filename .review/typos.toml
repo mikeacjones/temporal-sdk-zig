@@ -1,0 +1,20 @@
+# typos settings for .review/reports.sh. Generated and vendored code is not ours to spell.
+[files]
+extend-exclude = [
+    "deps/sdk-core",
+    "deps/Cargo.lock",
+    "src/proto",
+    "src/proto.zig",
+    "src/bridge_abi.txt",
+    "tools/fixtures",
+]
+
+# Words the dictionary takes for misspellings.
+[default.extend-words]
+flate = "flate" # std.compress.flate
+ba = "ba"       # a hex digit pair in a test vector
+caf = "caf"     # a workflow ID in a test
+secur = "secur" # a linker flag prefix in build.zig
+
+[default.extend-identifiers]
+WRONLY = "WRONLY" # O_WRONLY
