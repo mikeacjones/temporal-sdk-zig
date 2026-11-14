@@ -17,6 +17,10 @@
 //! Docker container instead (see `DockerServer`), and is reported as skipped when Docker isn't
 //! available.
 //!
+//! The runner reads the manifests before it starts the dev server, so that the server starts
+//! with every namespace the selected samples declare, and then creates the Nexus endpoints
+//! they declare (see `Manifest.namespaces` and `Manifest.nexus_endpoints`).
+//!
 //! Usage: samples_runner <build-root> <work-dir> [--only <sample>] [--jobs <n>] (<sample>:<program> <exe>)...
 
 const std = @import("std");
@@ -40,6 +44,26 @@ const Manifest = struct {
     programs: []const []const u8 = &.{},
     /// Run against a server in Docker with TLS rather than the shared dev server.
     docker_server: ?DockerServer = null,
+    /// Namespaces the sample's programs use besides "default". The shared dev server starts
+    /// with them (`--namespace`), so every part of the server knows them before any program
+    /// starts; a namespace registered on a running server may reach its services one by one.
+    /// Several samples may declare the same namespace. A sample with `docker_server` can't
+    /// declare any: its server is its own, and the runner registers only "default" there.
+    namespaces: []const []const u8 = &.{},
+    /// Nexus endpoints the runner creates on the shared dev server before the sample's
+    /// programs start. Each routes to "default" or one of the sample's own `namespaces`.
+    /// Several samples may declare an endpoint of the same name only with the same target. A
+    /// sample with `docker_server` can't declare any.
+    nexus_endpoints: []const NexusEndpoint = &.{},
+};
+
+/// A Nexus endpoint that routes operations to the worker polling `task_queue` in `namespace`,
+/// as `temporal operator nexus endpoint create --name <name> --target-namespace <namespace>
+/// --target-task-queue <task_queue>` creates it.
+const NexusEndpoint = struct {
+    name: []const u8,
+    namespace: []const u8,
+    task_queue: []const u8,
 };
 
 /// A temporalio/server container for one sample: in-memory SQLite and frontend TLS with the
@@ -62,6 +86,9 @@ const Sample = struct {
     worker: ?[]const u8 = null,
     starter: ?[]const u8 = null,
     manifest: ?Manifest = null,
+    /// Why the runner couldn't prepare the sample (its namespaces or endpoints), which fails
+    /// it without running its programs.
+    setup_failure: ?[]const u8 = null,
 };
 
 const Status = enum { pass, fail, skip };
@@ -123,25 +150,6 @@ pub fn main(init: std.process.Init) !void {
     const root_abs = try Io.Dir.cwd().realPathFileAlloc(io, root_path, arena);
     const work_abs = try Io.Dir.cwd().realPathFileAlloc(io, work_path, arena);
 
-    // The custom search attributes tests get, and standalone activities, so samples can use
-    // them too.
-    var server = try temporal.testing.DevServer.start(gpa, io, .{
-        .search_attributes = &temporal.testing.custom_search_attributes,
-        .extra_args = &temporal.testing.DevServer.standalone_activity_args,
-    });
-    errdefer server.stop(io);
-
-    // An empty config file: the children read only TEMPORAL_ADDRESS and TEMPORAL_NAMESPACE.
-    try work.writeFile(io, .{ .sub_path = "empty-temporal-config.toml", .data = "" });
-    const config_path = try std.fs.path.join(arena, &.{ work_path, "empty-temporal-config.toml" });
-    var env = try init.environ_map.clone(arena);
-    var to_remove: std.ArrayList([]const u8) = .empty;
-    for (env.keys()) |key| if (std.mem.startsWith(u8, key, "TEMPORAL_")) try to_remove.append(arena, key);
-    for (to_remove.items) |key| _ = env.swapRemove(key);
-    try env.put("TEMPORAL_ADDRESS", server.address());
-    try env.put("TEMPORAL_NAMESPACE", "default");
-    try env.put("TEMPORAL_CONFIG_FILE", config_path);
-
     var selected: std.ArrayList(Sample) = .empty;
     for (samples.items) |sample| {
         if (only) |o| if (!std.mem.eql(u8, o, sample.name)) continue;
@@ -154,10 +162,29 @@ pub fn main(init: std.process.Init) !void {
     var needs_docker = false;
     for (selected.items, arenas) |*sample, *a| {
         sample.manifest = readManifest(gpa, io, a.allocator(), root, sample.name);
-        if (sample.manifest) |m| if (m.docker_server != null) {
-            needs_docker = true;
-        };
+        const m = sample.manifest orelse continue;
+        if (m.docker_server != null) needs_docker = true;
+        sample.setup_failure = checkManifest(a.allocator(), m);
     }
+    for (selected.items, arenas, 0..) |*sample, *a, i| {
+        if (sample.setup_failure == null) sample.setup_failure = endpointConflict(a.allocator(), selected.items, i);
+    }
+
+    var server = try startDevServer(gpa, io, arena, selected.items);
+    errdefer server.stop(io);
+    createNexusEndpoints(gpa, io, &server, selected.items, arenas);
+
+    // An empty config file: the children read only TEMPORAL_ADDRESS and TEMPORAL_NAMESPACE.
+    try work.writeFile(io, .{ .sub_path = "empty-temporal-config.toml", .data = "" });
+    const config_path = try std.fs.path.join(arena, &.{ work_path, "empty-temporal-config.toml" });
+    var env = try init.environ_map.clone(arena);
+    var to_remove: std.ArrayList([]const u8) = .empty;
+    for (env.keys()) |key| if (std.mem.startsWith(u8, key, "TEMPORAL_")) try to_remove.append(arena, key);
+    for (to_remove.items) |key| _ = env.swapRemove(key);
+    try env.put("TEMPORAL_ADDRESS", server.address());
+    try env.put("TEMPORAL_NAMESPACE", "default");
+    try env.put("TEMPORAL_CONFIG_FILE", config_path);
+
     const docker: Docker = if (needs_docker) prepareDocker(gpa, io, arena) else .unused;
     var queue: Queue = .{ .samples = selected.items, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env, .docker = docker, .root_abs = root_abs, .work_abs = work_abs };
     var lanes: Io.Group = .init;
@@ -238,16 +265,109 @@ fn readManifest(gpa: Allocator, io: Io, arena: Allocator, root: Io.Dir, name: []
         std.log.err("{s}: cannot read {s}: {t}", .{ name, manifest_path, err });
         return null;
     };
+    return parseManifest(gpa, arena, manifest_src, manifest_path);
+}
+
+/// Parses a sample.zon read from `path`; null (with the problem logged) if it is invalid.
+fn parseManifest(gpa: Allocator, arena: Allocator, source: [:0]const u8, path: []const u8) ?Manifest {
     var diag: std.zon.parse.Diagnostics = undefined;
-    return std.zon.parse.fromSlice(Manifest, .{ .gpa = gpa, .arena = arena, .source = manifest_src, .diagnostics = &diag }) catch {
-        diag.log(manifest_path);
+    return std.zon.parse.fromSlice(Manifest, .{ .gpa = gpa, .arena = arena, .source = source, .diagnostics = &diag }) catch {
+        diag.log(path);
         return null;
     };
+}
+
+/// Why `manifest`'s namespaces or endpoints can't be satisfied, or null if they can.
+fn checkManifest(arena: Allocator, manifest: Manifest) ?[]const u8 {
+    if (manifest.docker_server != null and (manifest.namespaces.len > 0 or manifest.nexus_endpoints.len > 0))
+        return "sample.zon sets docker_server with namespaces or nexus_endpoints, which only the shared dev server supports";
+    for (manifest.namespaces) |ns| if (ns.len == 0) return "sample.zon declares an empty namespace";
+    for (manifest.nexus_endpoints, 0..) |e, i| {
+        if (e.name.len == 0 or e.namespace.len == 0 or e.task_queue.len == 0)
+            return std.fmt.allocPrint(arena, "sample.zon declares Nexus endpoint \"{s}\" with an empty name, namespace, or task queue", .{e.name}) catch "out of memory";
+        for (manifest.nexus_endpoints[0..i]) |earlier| if (std.mem.eql(u8, earlier.name, e.name))
+            return std.fmt.allocPrint(arena, "sample.zon declares Nexus endpoint {s} twice", .{e.name}) catch "out of memory";
+        if (!std.mem.eql(u8, e.namespace, "default") and !contains(manifest.namespaces, e.namespace))
+            return std.fmt.allocPrint(arena, "sample.zon's Nexus endpoint {s} routes to namespace {s}, which is neither \"default\" nor in its namespaces", .{ e.name, e.namespace }) catch "out of memory";
+    }
+    return null;
+}
+
+/// Why an endpoint of `samples[i]` conflicts with another sample's endpoint of the same name
+/// and another target, or null if none does.
+fn endpointConflict(arena: Allocator, samples: []const Sample, i: usize) ?[]const u8 {
+    const mine = samples[i].manifest orelse return null;
+    for (mine.nexus_endpoints) |e| for (samples, 0..) |other, j| {
+        if (j == i) continue;
+        const theirs = other.manifest orelse continue;
+        for (theirs.nexus_endpoints) |o| {
+            if (!std.mem.eql(u8, e.name, o.name)) continue;
+            if (std.mem.eql(u8, e.namespace, o.namespace) and std.mem.eql(u8, e.task_queue, o.task_queue)) continue;
+            return std.fmt.allocPrint(arena, "Nexus endpoint {s} routes to namespace {s}, task queue {s} here, but to namespace {s}, task queue {s} in sample {s}", .{ e.name, e.namespace, e.task_queue, o.namespace, o.task_queue, other.name }) catch "out of memory";
+        }
+    };
+    return null;
+}
+
+/// The namespaces besides "default" that the samples not already failed declare, each once,
+/// in the order declared.
+fn serverNamespaces(arena: Allocator, samples: []const Sample) error{OutOfMemory}![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    for (samples) |sample| {
+        if (sample.setup_failure != null) continue;
+        const m = sample.manifest orelse continue;
+        for (m.namespaces) |ns| {
+            if (std.mem.eql(u8, ns, "default") or contains(list.items, ns)) continue;
+            try list.append(arena, ns);
+        }
+    }
+    return list.items;
+}
+
+fn contains(list: []const []const u8, item: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, item)) return true;
+    return false;
+}
+
+/// Starts the shared dev server with the custom search attributes tests get, standalone
+/// activities, and the namespaces the samples declare.
+fn startDevServer(gpa: Allocator, io: Io, arena: Allocator, samples: []const Sample) !temporal.testing.DevServer {
+    var args: std.ArrayList([]const u8) = .empty;
+    try args.appendSlice(arena, &temporal.testing.DevServer.standalone_activity_args);
+    for (try serverNamespaces(arena, samples)) |ns| try args.appendSlice(arena, &.{ "--namespace", ns });
+    return temporal.testing.DevServer.start(gpa, io, .{ .search_attributes = &temporal.testing.custom_search_attributes, .extra_args = args.items });
+}
+
+/// Creates the Nexus endpoints the samples not already failed declare, and fails a sample
+/// whose endpoint can't be created. An endpoint that exists already was created for another
+/// sample with the same target (`endpointConflict` failed the others).
+fn createNexusEndpoints(gpa: Allocator, io: Io, server: *const temporal.testing.DevServer, samples: []Sample, arenas: []std.heap.ArenaAllocator) void {
+    var client: ?temporal.client.Client = null;
+    defer if (client) |*c| c.close();
+    for (samples, arenas) |*sample, *a| {
+        if (sample.setup_failure != null) continue;
+        const m = sample.manifest orelse continue;
+        for (m.nexus_endpoints) |e| {
+            if (client == null) client = temporal.client.Client.connect(gpa, io, server.clientOptions()) catch |err| {
+                std.log.err("connecting to the dev server to create Nexus endpoints failed: {t}", .{err});
+                sample.setup_failure = std.fmt.allocPrint(a.allocator(), "cannot connect to the dev server to create Nexus endpoint {s}: {t}", .{ e.name, err }) catch "out of memory";
+                break;
+            };
+            temporal.testing.createNexusEndpoint(&client.?, e.name, .{ .namespace = e.namespace, .task_queue = e.task_queue }) catch |err| switch (err) {
+                error.AlreadyExists => {},
+                else => {
+                    sample.setup_failure = std.fmt.allocPrint(a.allocator(), "cannot create Nexus endpoint {s} (namespace {s}, task queue {s}): {t}; the server's reason is logged", .{ e.name, e.namespace, e.task_queue, err }) catch "out of memory";
+                    break;
+                },
+            };
+        }
+    }
 }
 
 /// Runs one sample, against its own Docker server if its manifest asks for one.
 fn validate(gpa: Allocator, io: Io, arena: Allocator, queue: *const Queue, sample: Sample) Outcome {
     const manifest = sample.manifest orelse return .{ .fail = "missing or invalid sample.zon" };
+    if (sample.setup_failure) |reason| return .{ .fail = reason };
     const options = manifest.docker_server orelse
         return failure(runPrograms(gpa, io, arena, queue.work, queue.work_path, queue.env, sample, manifest));
     switch (queue.docker) {
@@ -637,4 +757,101 @@ fn succeeded(term: std.process.Child.Term) bool {
 fn firstLine(text: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     return trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len];
+}
+
+const testing = std.testing;
+
+fn testManifest(arena: Allocator, source: [:0]const u8) !Manifest {
+    return parseManifest(testing.allocator, arena, source, "sample.zon") orelse error.TestInvalidManifest;
+}
+
+test "a manifest without namespaces or endpoints declares none" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const m = try testManifest(arena.allocator(), ".{ .expect = .{\"done\"} }");
+    try testing.expectEqual(0, m.namespaces.len);
+    try testing.expectEqual(0, m.nexus_endpoints.len);
+    try testing.expectEqual(null, checkManifest(arena.allocator(), m));
+}
+
+test "a manifest declares namespaces and Nexus endpoints" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const m = try testManifest(arena.allocator(),
+        \\.{
+        \\    .expect = .{"done"},
+        \\    .namespaces = .{ "target", "caller" },
+        \\    .nexus_endpoints = .{
+        \\        .{ .name = "endpoint", .namespace = "target", .task_queue = "handlers" },
+        \\        .{ .name = "local", .namespace = "default", .task_queue = "handlers" },
+        \\    },
+        \\}
+    );
+    try testing.expectEqualStrings("caller", m.namespaces[1]);
+    try testing.expectEqualStrings("handlers", m.nexus_endpoints[0].task_queue);
+    try testing.expectEqual(null, checkManifest(arena.allocator(), m));
+}
+
+test "a manifest whose namespaces or endpoints can't be satisfied is rejected with the reason" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const endpoint: NexusEndpoint = .{ .name = "endpoint", .namespace = "target", .task_queue = "handlers" };
+    try testing.expectStringStartsWith(checkManifest(a, .{ .expect = &.{}, .docker_server = .{}, .namespaces = &.{"target"} }).?, "sample.zon sets docker_server with namespaces");
+    try testing.expectStringStartsWith(checkManifest(a, .{ .expect = &.{}, .docker_server = .{}, .namespaces = &.{"target"}, .nexus_endpoints = &.{endpoint} }).?, "sample.zon sets docker_server with namespaces");
+    try testing.expectEqualStrings("sample.zon declares an empty namespace", checkManifest(a, .{ .expect = &.{}, .namespaces = &.{""} }).?);
+    try testing.expectEqualStrings(
+        "sample.zon's Nexus endpoint endpoint routes to namespace target, which is neither \"default\" nor in its namespaces",
+        checkManifest(a, .{ .expect = &.{}, .namespaces = &.{"caller"}, .nexus_endpoints = &.{endpoint} }).?,
+    );
+    try testing.expectEqualStrings(
+        "sample.zon declares Nexus endpoint endpoint twice",
+        checkManifest(a, .{ .expect = &.{}, .namespaces = &.{"target"}, .nexus_endpoints = &.{ endpoint, .{ .name = "endpoint", .namespace = "default", .task_queue = "handlers" } } }).?,
+    );
+    try testing.expectEqualStrings(
+        "sample.zon declares Nexus endpoint \"endpoint\" with an empty name, namespace, or task queue",
+        checkManifest(a, .{ .expect = &.{}, .nexus_endpoints = &.{.{ .name = "endpoint", .namespace = "default", .task_queue = "" }} }).?,
+    );
+}
+
+test "samples may share an endpoint with one target, and conflict over one with two" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const endpoint: NexusEndpoint = .{ .name = "endpoint", .namespace = "target", .task_queue = "handlers" };
+    const other_queue: NexusEndpoint = .{ .name = "endpoint", .namespace = "target", .task_queue = "elsewhere" };
+    const samples = [_]Sample{
+        .{ .name = "one", .manifest = .{ .expect = &.{}, .namespaces = &.{"target"}, .nexus_endpoints = &.{endpoint} } },
+        .{ .name = "two", .manifest = .{ .expect = &.{}, .namespaces = &.{"target"}, .nexus_endpoints = &.{endpoint} } },
+        .{ .name = "three", .manifest = .{ .expect = &.{}, .namespaces = &.{"target"}, .nexus_endpoints = &.{other_queue} } },
+        .{ .name = "no-manifest" },
+    };
+    try testing.expectEqualStrings(
+        "Nexus endpoint endpoint routes to namespace target, task queue handlers here, but to namespace target, task queue elsewhere in sample three",
+        endpointConflict(a, &samples, 0).?,
+    );
+    try testing.expectEqualStrings(
+        "Nexus endpoint endpoint routes to namespace target, task queue elsewhere here, but to namespace target, task queue handlers in sample one",
+        endpointConflict(a, &samples, 2).?,
+    );
+    try testing.expectEqual(null, endpointConflict(a, samples[0..2], 0));
+    try testing.expectEqual(null, endpointConflict(a, &samples, 3));
+}
+
+test "the dev server gets each declared namespace once, without default or those of failed samples" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const samples = [_]Sample{
+        .{ .name = "plain", .manifest = .{ .expect = &.{} } },
+        .{ .name = "one", .manifest = .{ .expect = &.{}, .namespaces = &.{ "target", "caller" } } },
+        .{ .name = "two", .manifest = .{ .expect = &.{}, .namespaces = &.{ "default", "caller", "other" } } },
+        .{ .name = "failed", .manifest = .{ .expect = &.{}, .namespaces = &.{"rejected"} }, .setup_failure = "rejected" },
+        .{ .name = "no-manifest" },
+    };
+    const namespaces = try serverNamespaces(arena.allocator(), &samples);
+    try testing.expectEqual(3, namespaces.len);
+    try testing.expectEqualStrings("target", namespaces[0]);
+    try testing.expectEqualStrings("caller", namespaces[1]);
+    try testing.expectEqualStrings("other", namespaces[2]);
+    try testing.expectEqual(0, (try serverNamespaces(arena.allocator(), samples[0..1])).len);
 }

@@ -68,6 +68,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | [logger-interceptor](samples/logger-interceptor) | logger-interceptor |
 | [encryption](samples/encryption) | encryption |
 | [worker-versioning](samples/worker-versioning) | worker-versioning |
+| [nexus](samples/nexus) | nexus |
 
 ## Samples with no Zig equivalent
 

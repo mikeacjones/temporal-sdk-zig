@@ -173,6 +173,83 @@ pub const custom_search_attributes = [_]bridge.EphemeralServer.SearchAttribute{
     .{ .name = "CustomKeywordListField", .type = .KeywordList },
 };
 
+const testing_ns = @This();
+
+/// Where `createNexusEndpoint` routes an endpoint's operations: the namespace and task queue
+/// of the worker that handles them.
+pub const NexusWorkerTarget = struct {
+    namespace: []const u8,
+    task_queue: []const u8,
+};
+
+pub const CreateNexusEndpointError = error{
+    OutOfMemory,
+    Canceled,
+    /// An endpoint called `name` already exists on the server.
+    AlreadyExists,
+    /// The server refused the endpoint, for example for a name it doesn't accept, or a
+    /// namespace that doesn't exist; the reason is logged.
+    RpcFailed,
+    InvalidResponse,
+};
+
+/// Creates a Nexus endpoint called `name` on `client`'s server (the operator service's
+/// CreateNexusEndpoint), routing to `target`, for a server that has no `WorkflowEnvironment`,
+/// such as a `DevServer`. `WorkflowEnvironment.createNexusEndpoint` describes the endpoint
+/// and the names the server accepts. The target namespace must exist on the server (a
+/// `DevServer` registers more with `extra_args` `--namespace <name>`); `client`'s own
+/// namespace doesn't matter. `name` and `target` are only read during the call, which may
+/// run on any thread that may use `client`. Errors:
+/// - `AlreadyExists`: an endpoint called `name` exists, whatever its target.
+/// - `RpcFailed`: the server refused the endpoint, for example for a name it doesn't accept,
+///   an empty task queue, or a namespace it doesn't have; the server's reason is logged.
+/// - `InvalidResponse`: the server's response didn't decode.
+/// - `OutOfMemory`, `Canceled`.
+pub fn createNexusEndpoint(client: *client_mod.Client, name: []const u8, target: NexusWorkerTarget) CreateNexusEndpointError!void {
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const ops = proto.temporal.api.operatorservice.v1;
+    const request: ops.CreateNexusEndpointRequest = .{ .spec = .{
+        .name = name,
+        .target = .{ .variant = .{ .worker = .{ .namespace = target.namespace, .task_queue = target.task_queue } } },
+    } };
+    var status: u32 = 0;
+    _ = serviceCall(client, .operator, ops.CreateNexusEndpointResponse, "CreateNexusEndpoint", request, scratch.allocator(), &status) catch |err| return switch (err) {
+        error.RpcFailed => if (status == 6) error.AlreadyExists else error.RpcFailed,
+        else => |e| e,
+    };
+}
+
+/// Calls `method` on `service` without retries; the response's memory comes from `arena`.
+/// A failed call is logged, and its gRPC status code stored in `status` if given.
+fn serviceCall(client: *client_mod.Client, service: bridge.Connection.Service, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*u32) error{ OutOfMemory, Canceled, RpcFailed, InvalidResponse }!Response {
+    var encoded: Io.Writer.Allocating = .init(arena);
+    request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
+    var rpc_failure: ?bridge.Connection.RpcFailure = null;
+    defer if (rpc_failure) |f| f.deinit(client.gpa);
+    const bytes = client.currentConnection().call(client.gpa, client.io, service, method, encoded.written(), .{}, &rpc_failure) catch |err| switch (err) {
+        error.RpcFailed => {
+            const f = rpc_failure.?;
+            if (status) |out| {
+                out.* = f.status_code;
+                // ALREADY_EXISTS is the caller's to report.
+                if (f.status_code == 6) return error.RpcFailed;
+            }
+            log.err("{s} {s} failed: {s} (gRPC status {d})", .{ @tagName(service), method, f.message, f.status_code });
+            return error.RpcFailed;
+        },
+        error.InvalidOptions => return error.RpcFailed,
+        else => |e| return e,
+    };
+    defer client.gpa.free(bytes);
+    const owned = try arena.dupe(u8, bytes);
+    var reader: Io.Reader = .fixed(owned);
+    return Response.decode(&reader, arena) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidResponse,
+    };
+}
+
 /// A server, client and worker for running workflows in tests.
 ///
 /// `start` runs a dev server with `custom_search_attributes` registered; `startTimeSkipping` runs the time-skipping test server. On the
@@ -645,17 +722,6 @@ pub const WorkflowEnvironment = struct {
         task_queue: []const u8 = "",
     };
 
-    pub const CreateNexusEndpointError = error{
-        OutOfMemory,
-        Canceled,
-        /// An endpoint called `name` already exists on the server.
-        AlreadyExists,
-        /// The server refused the endpoint, for example for a name it doesn't accept, or a
-        /// namespace that doesn't exist; the reason is logged.
-        RpcFailed,
-        InvalidResponse,
-    };
-
     /// Creates a Nexus endpoint called `name` on the environment's server (the operator
     /// service's CreateNexusEndpoint), routing to `target`, so workflows can call operations
     /// through it (`workflow.Context.executeNexusOperation` with `.endpoint = name`). The
@@ -664,21 +730,10 @@ pub const WorkflowEnvironment = struct {
     /// to exist. `name` and `target` are only read during the call. Tested against the dev
     /// server (`start`); a server without Nexus endpoints returns `error.RpcFailed`.
     pub fn createNexusEndpoint(env: *WorkflowEnvironment, name: []const u8, target: NexusEndpointTarget) CreateNexusEndpointError!void {
-        var scratch: std.heap.ArenaAllocator = .init(env.gpa);
-        defer scratch.deinit();
-        const ops = proto.temporal.api.operatorservice.v1;
-        const request: ops.CreateNexusEndpointRequest = .{ .spec = .{
-            .name = name,
-            .target = .{ .variant = .{ .worker = .{
-                .namespace = if (target.namespace.len > 0) target.namespace else env.client.namespace,
-                .task_queue = if (target.task_queue.len > 0) target.task_queue else env.task_queue,
-            } } },
-        } };
-        var status: u32 = 0;
-        _ = env.serviceCall(.operator, ops.CreateNexusEndpointResponse, "CreateNexusEndpoint", request, scratch.allocator(), &status) catch |err| return switch (err) {
-            error.RpcFailed => if (status == 6) error.AlreadyExists else error.RpcFailed,
-            else => |e| e,
-        };
+        return testing_ns.createNexusEndpoint(&env.client, name, .{
+            .namespace = if (target.namespace.len > 0) target.namespace else env.client.namespace,
+            .task_queue = if (target.task_queue.len > 0) target.task_queue else env.task_queue,
+        });
     }
 
     const ts = proto.temporal.api.testservice.v1;
@@ -689,34 +744,8 @@ pub const WorkflowEnvironment = struct {
         return env.serviceCall(.test_service, Response, method, request, arena, null);
     }
 
-    /// Calls `method` on `service` without retries; the response's memory comes from `arena`.
-    /// A failed call is logged, and its gRPC status code stored in `status` if given.
     fn serviceCall(env: *WorkflowEnvironment, service: bridge.Connection.Service, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*u32) error{ OutOfMemory, Canceled, RpcFailed, InvalidResponse }!Response {
-        var encoded: Io.Writer.Allocating = .init(arena);
-        request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
-        var rpc_failure: ?bridge.Connection.RpcFailure = null;
-        defer if (rpc_failure) |f| f.deinit(env.gpa);
-        const bytes = env.client.currentConnection().call(env.gpa, env.io, service, method, encoded.written(), .{}, &rpc_failure) catch |err| switch (err) {
-            error.RpcFailed => {
-                const f = rpc_failure.?;
-                if (status) |out| {
-                    out.* = f.status_code;
-                    // ALREADY_EXISTS is the caller's to report.
-                    if (f.status_code == 6) return error.RpcFailed;
-                }
-                log.err("{s} {s} failed: {s} (gRPC status {d})", .{ @tagName(service), method, f.message, f.status_code });
-                return error.RpcFailed;
-            },
-            error.InvalidOptions => return error.RpcFailed,
-            else => |e| return e,
-        };
-        defer env.gpa.free(bytes);
-        const owned = try arena.dupe(u8, bytes);
-        var reader: Io.Reader = .fixed(owned);
-        return Response.decode(&reader, arena) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.InvalidResponse,
-        };
+        return testing_ns.serviceCall(&env.client, service, Response, method, request, arena, status);
     }
 
     /// Replays a run's history (fetched from the server) against the registered workflows.
@@ -2277,6 +2306,27 @@ test "DevServer honors namespace, port and search attribute options" {
     var client = try client_mod.Client.connect(testing.allocator, testing.io, server.clientOptions());
     defer client.close();
     try testing.expectEqualStrings("zig-tests", client.namespace);
+}
+
+test "createNexusEndpoint creates an endpoint on a DevServer that routes to another namespace, and reports a duplicate" {
+    var server = try DevServer.start(testing.allocator, testing.io, .{ .extra_args = &.{ "--namespace", "zig-endpoint-target" } });
+    defer server.stop(testing.io);
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer client.close();
+
+    try createNexusEndpoint(&client, "zig-endpoint", .{ .namespace = "zig-endpoint-target", .task_queue = "zig-handlers" });
+    try testing.expectError(error.AlreadyExists, createNexusEndpoint(&client, "zig-endpoint", .{ .namespace = "default", .task_queue = "other" }));
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const ops = proto.temporal.api.operatorservice.v1;
+    const listed = try serviceCall(&client, .operator, ops.ListNexusEndpointsResponse, "ListNexusEndpoints", ops.ListNexusEndpointsRequest{ .page_size = 10 }, arena.allocator(), null);
+    try testing.expectEqual(1, listed.endpoints.items.len);
+    const spec = listed.endpoints.items[0].spec.?;
+    try testing.expectEqualStrings("zig-endpoint", spec.name);
+    const worker_target = spec.target.?.variant.?.worker;
+    try testing.expectEqualStrings("zig-endpoint-target", worker_target.namespace);
+    try testing.expectEqualStrings("zig-handlers", worker_target.task_queue);
 }
 
 test "TestServer starts a time-skipping server a client can connect to" {
