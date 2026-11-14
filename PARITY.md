@@ -70,6 +70,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | [worker-versioning](samples/worker-versioning) | worker-versioning |
 | [nexus](samples/nexus) | nexus |
 | [nexus-cancelation](samples/nexus-cancelation) | nexus-cancelation |
+| [external-env-conf](samples/external-env-conf) | external-env-conf |
 
 ## Samples with no Zig equivalent
 
