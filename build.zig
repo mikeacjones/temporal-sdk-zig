@@ -86,6 +86,7 @@ const readme_example_files = [_][]const u8{
     "examples/readme/converter.zig",
     "examples/readme/testing.zig",
     "examples/readme/observability.zig",
+    "examples/readme/nexus.zig",
 };
 
 /// README.md's code blocks are copies of regions in examples/readme, which `test` compiles and
