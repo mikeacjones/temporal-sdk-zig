@@ -62,6 +62,9 @@
 //! - Coroutines: `io.async(fn, args)`, or `std.Io.Group.async` for a set of them.
 //! - Waiting for whichever result comes first: `std.Io.Select`.
 //! - Channels between coroutines: `std.Io.Queue`; locks: `std.Io.Mutex`, `std.Io.Semaphore`.
+//! - A value one coroutine sets and another waits for: a field plus a `std.Io.Event`;
+//!   `std.Io.Condition` for waits on shared state guarded by a `std.Io.Mutex`.
+//! - Naming a coroutine for stack-trace queries: `ctx.setCoroutineName`.
 //! - Timers: `io.sleep`, or `io.async(std.Io.sleep, ...)` for a timer to race or cancel.
 //! - Waiting for workflow state to change: `ctx.await`, `ctx.awaitTimeout`.
 //! - Time: `ctx.now()`.
@@ -619,6 +622,21 @@ pub const Context = struct {
     /// Memory that lives as long as the workflow run is cached.
     pub fn allocator(ctx: *Context) Allocator {
         return ctx.instance.arena();
+    }
+
+    /// Names the calling coroutine (the workflow function, a handler, or one started with
+    /// `io.async`, `io.concurrent`, a `std.Io.Group`, or a `std.Io.Select`) so stack-trace
+    /// queries can tell coroutines apart. The name is copied into `allocator()`, so a
+    /// coroutine that renames itself often grows the run's memory. Unnamed coroutines are
+    /// "workflow", "signal", "update", "async", or "group".
+    pub fn setCoroutineName(ctx: *Context, name: []const u8) error{OutOfMemory}!void {
+        const copy = try ctx.allocator().dupe(u8, name);
+        ctx.instance.wio.setCurrentName(copy);
+    }
+
+    /// The calling coroutine's name; see `setCoroutineName`. Valid while the run is cached.
+    pub fn coroutineName(ctx: *const Context) []const u8 {
+        return ctx.instance.wio.currentName();
     }
 
     pub fn info(ctx: *const Context) *const Info {

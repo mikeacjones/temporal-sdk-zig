@@ -557,7 +557,7 @@ Notes:
 - To race or cancel a timer, run `std.Io.sleep` as a coroutine, as the next example does.
 
 #### Concurrency
-`ctx.io()` gives workflows `std.Io` concurrency: `io.async` futures, `std.Io.Select`, `std.Io.Group`, `std.Io.Mutex`, and `std.Io.Queue`.
+`ctx.io()` gives workflows `std.Io` concurrency: `io.async` futures, `std.Io.Select`, `std.Io.Group`, `std.Io.Mutex`, `std.Io.Semaphore`, `std.Io.Event`, `std.Io.Condition`, and `std.Io.Queue`. Blocked coroutines wake in the order they started waiting, and a coroutine canceled while blocked on any of them gets `error.Canceled`.
 
 <!-- example: workflow-select -->
 ```zig
@@ -597,9 +597,34 @@ fn greetAll(ctx: *workflow.Context, names: []const []const u8) ![]const []const 
 pub const GreetAll = workflow.Def("greet_all", greetAll);
 ```
 
+A value one coroutine sets and another waits for is a field plus a `std.Io.Event`: the setter writes the field, then calls `set`; the waiter calls `wait`, then reads the field. This is the idiom; the SDK has no separate settable-future type.
+
+<!-- example: workflow-settable -->
+```zig
+const Reply = struct { value: []const u8 = "", ready: std.Io.Event = .unset };
+fn fetchReply(ctx: *workflow.Context, name: []const u8, out: *Reply) void {
+    ctx.setCoroutineName("fetch-reply") catch {}; // shown by stack-trace queries
+    out.value = ctx.executeActivity(Greet, greet_options, .{name}).get() catch "(no greeting)";
+    out.ready.set(ctx.io()); // after the value is written
+}
+fn greetWhenReady(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const io = ctx.io();
+    var reply: Reply = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    group.async(io, fetchReply, .{ ctx, name, &reply });
+    try reply.ready.wait(io);
+    return reply.value;
+}
+pub const GreetWhenReady = workflow.Def("greet_when_ready", greetWhenReady);
+```
+
 Notes:
 - Canceling a coroutine cancels what it waits on: its timer, activity, child workflow, or unrecorded external signal.
 - Call `cancelDiscard`, `cancel`, or `await` before a `Select` or `Group` leaves scope.
+- A `Select` case can receive from a channel: `select.async(.received, std.Io.Queue(T).getOne, .{ &queue, io })`. Canceling a receive that is still waiting takes nothing from the queue, but `cancelDiscard` drops the value of a receive that has already completed and not been awaited; use `cancel` in a loop to get those values back.
+- To poll without blocking (a select's "default" case), use `queue.get(io, buffer, 0)`, which returns 0 when the queue is empty, or a future's `isReady()` (`ActivityFuture` and the other SDK futures), `Event.isSet()`, or `ctx.await` on workflow state.
+- `ctx.setCoroutineName(name)` names the calling coroutine for stack-trace queries and copies `name` into `ctx.allocator()`; `ctx.coroutineName()` reads it. Unnamed coroutines are `workflow`, `signal`, `update`, `async`, or `group`.
 - The workflow ends when its function returns, whatever coroutines are still running.
 
 #### Signals, queries, and updates

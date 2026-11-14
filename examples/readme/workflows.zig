@@ -170,6 +170,37 @@ test "workflows: a Group of coroutines feeds a Queue" {
     }
 }
 
+// example: workflow-settable
+const Reply = struct { value: []const u8 = "", ready: std.Io.Event = .unset };
+fn fetchReply(ctx: *workflow.Context, name: []const u8, out: *Reply) void {
+    ctx.setCoroutineName("fetch-reply") catch {}; // shown by stack-trace queries
+    out.value = ctx.executeActivity(Greet, greet_options, .{name}).get() catch "(no greeting)";
+    out.ready.set(ctx.io()); // after the value is written
+}
+fn greetWhenReady(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const io = ctx.io();
+    var reply: Reply = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    group.async(io, fetchReply, .{ ctx, name, &reply });
+    try reply.ready.wait(io);
+    return reply.value;
+}
+pub const GreetWhenReady = workflow.Def("greet_when_ready", greetWhenReady);
+// end-example
+
+test "workflows: one coroutine sets a value another waits for" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(GreetWhenReady);
+    try env.registerActivity(Greet);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(GreetWhenReady, .{"Ann"}, arena.allocator(), null);
+    try testing.expectEqualStrings("Hello, Ann!", result);
+}
+
 // example: workflow-handlers
 pub const AddGuest = workflow.SignalDef("add_guest", fn (name: []const u8) void);
 pub const GuestCount = workflow.QueryDef("guest_count", fn () usize);

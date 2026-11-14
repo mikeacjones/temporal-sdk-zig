@@ -3494,6 +3494,43 @@ test "eviction while awaiting a condition frees everything" {
     inst.destroy();
 }
 
+// The workflow function and a coroutine it starts with io.async name themselves; the child
+// reads its name back after a durable timer.
+const CoroutineNames = struct {
+    fn child(ctx: *workflow.Context, seen: *[2][]const u8) !void {
+        seen[0] = ctx.coroutineName();
+        var name = "fetcher".*;
+        try ctx.setCoroutineName(&name);
+        name[0] = 'X'; // setCoroutineName copied it
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        seen[1] = ctx.coroutineName();
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const before = ctx.coroutineName();
+        try ctx.setCoroutineName("main");
+        var seen: [2][]const u8 = undefined;
+        var f = ctx.io().async(child, .{ ctx, &seen });
+        try f.await(ctx.io());
+        return std.mem.join(ctx.allocator(), ",", &.{ before, ctx.coroutineName(), seen[0], seen[1] });
+    }
+};
+const CoroutineNamesWf = workflow.Def("CoroutineNames", CoroutineNames.run);
+
+test "setCoroutineName names the calling coroutine, including one started with io.async" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, CoroutineNamesWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "CoroutineNames", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a));
+    try testing.expectEqualStrings("\"workflow,main,async,fetcher\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
 // Waits on an activity with the cancellation type named by `mode`. If the activity completes
 // despite a cancel, sleeps before returning, which a re-armed cancel interrupts.
 const WaitCancel = struct {
