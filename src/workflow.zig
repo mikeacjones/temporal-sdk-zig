@@ -68,8 +68,19 @@
 //!
 //! Canceling a future cancels what it is waiting on: a pending `io.sleep` cancels its timer and
 //! a pending `ActivityFuture.get` requests the activity's cancellation, a pending
-//! `ChildWorkflowFuture.get` or `started` the child workflow's, and a pending
+//! `ChildWorkflowFuture.get` or `started` the child workflow's, a pending
+//! `NexusOperationFuture.get` or `started` the Nexus operation's, and a pending
 //! `SignalExternalFuture.get` withdraws its signal if the server hasn't recorded it yet.
+//!
+//! A workflow calls a Nexus operation through an endpoint by the operation's contract
+//! (`nexus.OperationDef` and `nexus.ServiceDef`), so its input and output are checked at
+//! compile time:
+//!
+//!     const echo = ctx.executeNexusOperation(HelloService, Echo, .{
+//!         .endpoint = "hello-endpoint",
+//!         .schedule_to_close_timeout = .fromSeconds(10),
+//!     }, .{ .message = "hi" });
+//!     const output = try echo.get();
 //!
 //! Queries read a workflow's state from outside. Name one with `QueryDef` and answer it with
 //! `ctx.setQueryHandler`; the handler runs synchronously and must not change state or block:
@@ -232,6 +243,7 @@ const propagation = @import("propagation.zig");
 const search_attributes = @import("search_attributes.zig");
 const metrics_mod = @import("metrics.zig");
 const deployment = @import("deployment.zig");
+const nexus = @import("nexus.zig");
 const Instance = @import("workflow/Instance.zig");
 const WorkflowIo = @import("workflow/WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -507,6 +519,68 @@ pub const ChildWorkflowOptions = struct {
     /// The child's search attributes, built with `search_attributes.Key.set`; unsets are
     /// ignored. A value the server can't index fails the start with `error.InvalidOptions`.
     search_attributes: []const search_attributes.Update = &.{},
+};
+
+/// What canceling a Nexus operation does: `NexusOperationFuture.cancel`, or canceling the
+/// coroutine waiting in its `get` or `started`. The core carries each type out; the future
+/// resolves when the core says so, and a canceled operation's `failure()` describes the
+/// cancellation (a Nexus operation failure whose cause is a canceled failure).
+///
+/// Once the operation has started (the server recorded its start, or it is waiting for one):
+///
+/// - `wait_cancellation_completed`, the default: requests the cancellation from the handler
+///   and resolves once the operation has ended, as canceled, or as completed, failed, or
+///   timed out if it ended that way first.
+/// - `wait_cancellation_requested`: requests the cancellation and resolves as canceled once
+///   the handler has accepted the request. If the handler refuses it, the future resolves as
+///   failed with the refusal as its failure's cause.
+/// - `try_cancel`: requests the cancellation and resolves as canceled at once (in the next
+///   activation), without waiting for the handler. The request may not reach the handler if
+///   this workflow closes first.
+/// - `abandon`: sends no request; resolves as canceled at once and leaves the operation
+///   running. Caution: sdk-core v1.2.0, which this SDK is built on, rejects the event that
+///   records an abandoned operation ending (completing, failing, or timing out) as
+///   nondeterministic, so a workflow that is still running when that happens fails its
+///   workflow tasks from then on. Use `abandon` only when the workflow closes before the
+///   operation can end, or use `try_cancel`.
+///
+/// An operation canceled in the same workflow task that scheduled it is never sent: with any
+/// type, it resolves at once, its start failed with a canceled failure ("Nexus Operation
+/// cancelled before scheduled"). One the server scheduled but the handler hasn't started yet
+/// resolves as above for `try_cancel` and `abandon`; with the other two it resolves when the
+/// server ends it (its start fails, canceled), or as for a started operation if it starts
+/// first.
+pub const NexusOperationCancellationType = enum { wait_cancellation_completed, wait_cancellation_requested, try_cancel, abandon };
+
+/// How a Nexus operation is scheduled (`Context.executeNexusOperation`). Only read while
+/// scheduling; strings are copied.
+pub const NexusOperationOptions = struct {
+    /// The name of the Nexus endpoint to call through. It must exist on the server: an
+    /// operator creates it, routing to a namespace and task queue (in tests,
+    /// `testing.WorkflowEnvironment.createNexusEndpoint`). An endpoint the server doesn't
+    /// know fails the workflow task, which is retried, rather than the operation. Empty
+    /// makes the future return `error.InvalidOptions` (logged).
+    endpoint: []const u8,
+    /// How long the workflow waits for the operation to complete, its start included; the
+    /// server retries the start until then. Past it, the operation times out. Null leaves
+    /// the server's limit.
+    schedule_to_close_timeout: ?Duration = null,
+    /// How long the handler may take to start the operation (or complete it, if it is
+    /// synchronous). Past it, the operation times out. Null: no limit.
+    schedule_to_start_timeout: ?Duration = null,
+    /// How long an asynchronous operation may run once it started. Past it, it times out.
+    /// Synchronous operations ignore it. Null: no limit.
+    start_to_close_timeout: ?Duration = null,
+    cancellation_type: NexusOperationCancellationType = .wait_cancellation_completed,
+    /// Nexus headers sent with the request to start the operation (names are
+    /// case-insensitive). They are recorded in history and reach the handler as they are,
+    /// without the payload codecs, so don't put secrets in them. Propagators don't write
+    /// here.
+    headers: []const nexus.Header = &.{},
+    /// A short, single-line description of this operation, shown by the UI and CLI on its
+    /// scheduled event. Sent as a JSON string payload, through the worker's payload codecs.
+    /// Empty sends none.
+    summary: []const u8 = "",
 };
 
 /// How `Context.continueAsNew` starts the next run.
@@ -921,6 +995,32 @@ pub const Context = struct {
     /// tuple of argument values.
     pub fn executeChildWorkflowByName(ctx: *Context, comptime Result: type, workflow_type: []const u8, options: ChildWorkflowOptions, args: anytype) ChildWorkflowFuture(Result) {
         return .{ .ctx = ctx, .state = ctx.instance.executeChildWorkflow(workflow_type, options, args).state };
+    }
+
+    /// Schedules the Nexus operation `Operation` (a `nexus.OperationDef`) of `Service` (a
+    /// `nexus.ServiceDef`) through the endpoint `options.endpoint`, and returns a future for
+    /// its start and its result. `input` is encoded here, by the payload converter and then
+    /// the worker's payload codecs; a `void` input sends the converter's null payload. The
+    /// operation runs wherever the endpoint routes, often a worker in another namespace.
+    ///
+    ///     const echo = ctx.executeNexusOperation(HelloService, Echo, .{ .endpoint = "hello-endpoint" }, .{ .message = "hi" });
+    ///     const output = try echo.get();
+    ///
+    /// `Service` must have `Operation`, with the same input and output types: otherwise this
+    /// is a compile error naming the service and the operation. An input of the wrong type is
+    /// a compile error at the call. Workflow interceptors don't see Nexus calls.
+    pub fn executeNexusOperation(ctx: *Context, comptime Service: type, comptime Operation: type, options: NexusOperationOptions, input: Operation.Input) NexusOperationFuture(Operation.Output) {
+        if (comptime nexusCallError(Service, Operation)) |message| @compileError(message);
+        return .{ .ctx = ctx, .state = ctx.instance.scheduleNexusOperation(Service.service_name, Operation.operation_name, options, input) };
+    }
+
+    /// Schedules a Nexus operation by its service and operation names, for a service this
+    /// program has no contract for, like `executeNexusOperation`. `input` is any value the
+    /// payload converter encodes; `Output` is the type to decode the result as. The names are
+    /// copied. An empty service or operation name makes the future return
+    /// `error.InvalidOptions` (logged).
+    pub fn executeNexusOperationByName(ctx: *Context, comptime Output: type, service: []const u8, operation: []const u8, options: NexusOperationOptions, input: anytype) NexusOperationFuture(Output) {
+        return .{ .ctx = ctx, .state = ctx.instance.scheduleNexusOperation(service, operation, options, input) };
     }
 
     /// Sends `Signal` (a `SignalDef`) with `args` to the workflow `workflow_id` and returns a
@@ -1398,6 +1498,112 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
             return f.ctx.instance.signalExternal(.{ .child = exec.workflow_id }, Signal.signal_name, args);
         }
     };
+}
+
+/// `NexusOperationFailed`: the operation failed, timed out, or was canceled, or it failed to
+/// start; read why with the future's `failure`, a Nexus operation failure (`failure_info` is
+/// `nexus_operation_execution_failure_info`, naming the endpoint, service and operation) whose
+/// cause is the handler's failure, a timeout failure, or a canceled failure.
+/// `Canceled`: the calling coroutine was canceled while waiting, and the operation then
+/// resolved as canceled (see `NexusOperationCancellationType`).
+/// `InvalidOptions`: the options were rejected before scheduling (the worker logs why);
+/// nothing was sent.
+/// `InvalidPayload`, `UnknownEncoding`, `WrongArgumentCount`: the result doesn't decode as
+/// the output type.
+pub const NexusOperationError = error{ NexusOperationFailed, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
+
+/// The pending start and result of a Nexus operation, from `Context.executeNexusOperation`.
+/// `NexusOperationFuture(converter.Payload)` returns the result still encoded.
+pub fn NexusOperationFuture(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        ctx: *Context,
+        /// The validation error, if scheduling was rejected; `started` and `get` return it.
+        state: Instance.ScheduleError!*Instance.NexusOperationState,
+
+        /// Waits until the handler has started the operation and returns its operation token,
+        /// or null when the operation's result arrived with its start (its result is then
+        /// ready): it completed synchronously, or its completion was recorded before its
+        /// start. The token is arena memory of the run. Returns `error.NexusOperationFailed` if the
+        /// operation failed, timed out, or was canceled before it started. Canceling the
+        /// calling coroutine cancels the operation as `get` does.
+        pub fn started(f: Self) NexusOperationError!?[]const u8 {
+            const state = try f.state;
+            try f.ctx.instance.awaitNexusOperation(state, .started);
+            if (state.started) return state.token;
+            return f.fail();
+        }
+
+        /// Waits for the operation to end and returns its output, decoded into
+        /// `ctx.allocator()`. On `error.NexusOperationFailed` read the failure with `failure`.
+        /// If the calling coroutine is canceled while waiting (the workflow is canceled, or an
+        /// enclosing future, `Select`, or `Group` is), the operation's cancellation is
+        /// requested and this waits for the core to resolve it, which it does as the
+        /// cancellation type says: it returns `error.Canceled` once the operation resolved as
+        /// canceled. If it completed or failed instead, this returns its result or error, and
+        /// the coroutine's next cancelable wait returns `error.Canceled`. Eviction ends the
+        /// wait with `error.Canceled`.
+        pub fn get(f: Self) NexusOperationError!T {
+            const state = try f.state;
+            try f.ctx.instance.awaitNexusOperation(state, .result);
+            switch (state.outcome.?) {
+                .completed => |p| {
+                    if (T == void) return;
+                    return converter.fromPayload(T, f.ctx.allocator(), p);
+                },
+                .failed, .canceled, .timed_out => return f.fail(),
+            }
+        }
+
+        fn fail(f: Self) NexusOperationError {
+            f.ctx.instance.setLastFailure(f.failure());
+            return error.NexusOperationFailed;
+        }
+
+        /// Why the operation failed, timed out, or was canceled, after `get` or `started`
+        /// returned `error.NexusOperationFailed` or `error.Canceled`; null before it ended or
+        /// when it completed. Arena memory of the run.
+        pub fn failure(f: Self) ?*const failure_mod.Failure {
+            const state = f.state catch return null;
+            const outcome = state.outcome orelse return null;
+            return switch (outcome) {
+                .completed => null,
+                .failed, .canceled, .timed_out => |fl| fl,
+            };
+        }
+
+        /// Whether the operation has ended (or failed to start), so `get` won't block.
+        pub fn isReady(f: Self) bool {
+            const state = f.state catch return true;
+            return state.outcome != null;
+        }
+
+        /// Requests cancellation of the operation, as its `cancellation_type` says; `get`
+        /// then returns `error.NexusOperationFailed` with the cancellation as the failure once
+        /// the core resolves it (or the operation's own result, if it ended first). Does
+        /// nothing once the operation has ended or a cancellation was requested.
+        pub fn cancel(f: Self) void {
+            if (f.state) |s| f.ctx.instance.cancelNexusOperation(s) else |_| {}
+        }
+    };
+}
+
+/// Why `Operation` can't be called on `Service` with `Context.executeNexusOperation`, as the
+/// compile error reports, or null if it can.
+fn nexusCallError(comptime Service: type, comptime Operation: type) ?[]const u8 {
+    const is_service = @typeInfo(Service) == .@"struct" and @hasDecl(Service, "service_name") and @hasDecl(Service, "operation_defs");
+    if (!is_service) return "executeNexusOperation: Service must be a nexus.ServiceDef, not " ++ @typeName(Service);
+    const what = "executeNexusOperation on nexus service \"" ++ Service.service_name ++ "\"";
+    const is_operation = @typeInfo(Operation) == .@"struct" and @hasDecl(Operation, "operation_name") and @hasDecl(Operation, "Input") and @hasDecl(Operation, "Output");
+    if (!is_operation) return what ++ ": Operation must be a nexus.OperationDef, not " ++ @typeName(Operation);
+    if (Service.hasOperation(Operation)) return null;
+    const name = Operation.operation_name;
+    if (Service.operationNamed(name)) |D| return what ++ ": its operation \"" ++ name ++ "\" takes " ++ @typeName(D.Input) ++ " and returns " ++ @typeName(D.Output) ++
+        ", not " ++ @typeName(Operation.Input) ++ " and " ++ @typeName(Operation.Output) ++ "; call it with the service's own OperationDef";
+    var names: []const u8 = "";
+    for (Service.operation_defs, 0..) |D, i| names = names ++ (if (i > 0) ", " else "") ++ "\"" ++ D.operation_name ++ "\"";
+    return what ++ ": the service has no operation \"" ++ name ++ "\"; its operations are " ++ names;
 }
 
 /// `ExternalWorkflowNotFound`: the target workflow (or its namespace) doesn't exist, or it has
@@ -2093,4 +2299,31 @@ test "a struct Def's handler declaration errors name the workflow, the entry, an
         pub const queries = .{ .currentTotal = T.Total };
         pub const updates = .{ .reset = T.Reset };
     })) == null);
+}
+
+test "executeNexusOperation's compile errors name the service and the operation" {
+    const In = struct { message: []const u8 };
+    const Echo = nexus.OperationDef("echo", In, []const u8);
+    const Ping = nexus.OperationDef("ping", void, void);
+    const Service = nexus.ServiceDef("hello-service", .{ Echo, Ping });
+    const T = StructDefTests;
+
+    try std.testing.expect(comptime nexusCallError(Service, Echo) == null);
+    try std.testing.expect(comptime nexusCallError(Service, Ping) == null);
+    // An equal definition elsewhere is the same operation.
+    try std.testing.expect(comptime nexusCallError(Service, nexus.OperationDef("echo", In, []const u8)) == null);
+
+    try T.expectMessage(comptime nexusCallError(Service, nexus.OperationDef("shout", In, []const u8)), &.{
+        "executeNexusOperation on nexus service \"hello-service\"",
+        "has no operation \"shout\"",
+        "its operations are \"echo\", \"ping\"",
+    });
+    try T.expectMessage(comptime nexusCallError(Service, nexus.OperationDef("echo", u32, []const u8)), &.{
+        "nexus service \"hello-service\"",
+        "its operation \"echo\" takes",
+        "and returns []const u8, not u32 and []const u8",
+        "call it with the service's own OperationDef",
+    });
+    try T.expectMessage(comptime nexusCallError(u8, Echo), &.{"Service must be a nexus.ServiceDef, not u8"});
+    try T.expectMessage(comptime nexusCallError(Service, In), &.{ "nexus service \"hello-service\"", "Operation must be a nexus.OperationDef" });
 }

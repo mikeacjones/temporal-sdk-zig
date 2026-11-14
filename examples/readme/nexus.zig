@@ -43,6 +43,24 @@ fn registerGreetingService(w: *temporal.worker.Worker) !void {
 }
 // end-example
 
+// example: nexus-caller
+fn greetThroughNexus(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const future = ctx.executeNexusOperation(GreetingService, Greet, .{
+        .endpoint = "greeting-endpoint",
+        .schedule_to_close_timeout = .fromSeconds(60),
+    }, name);
+    // The token of the started workflow-run operation; null if the result came with the start.
+    if (try future.started()) |token| ctx.logger().info("greeting started", .{ .token = token });
+    return future.get();
+}
+pub const GreetThroughNexus = workflow.Def("greet_through_nexus", greetThroughNexus);
+// end-example
+
+test "nexus: a caller workflow is checked against the service contract" {
+    try testing.expectEqualStrings("greet_through_nexus", GreetThroughNexus.workflow_name);
+    try testing.expect(GreetThroughNexus.Result == Greet.Output);
+}
+
 test "nexus: a synchronous operation runs from the handler's dispatch table, and fails as the handler says" {
     _ = &registerGreetingService;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
