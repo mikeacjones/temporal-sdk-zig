@@ -1,0 +1,21 @@
+// How samples-test validates this sample: create the namespaces and the Nexus endpoint below
+// on the dev server, start the worker (the handler and caller workers in one process), run
+// the starter, and check that the starter's output contains each `expect` line before
+// `timeout_seconds`. The last line comes from the caller's history: the caller workflow ran in
+// my-caller-namespace and the operation's workflow in my-target-namespace. handler_worker and
+// caller_worker run the two workers on their own; worker.zig says how to set up a server by
+// hand.
+.{
+    .expect = .{
+        "Workflow result: Nexus Echo 👋",
+        "Workflow result: ¡Hola! Nexus 👋",
+        "in namespace my-caller-namespace called workflow hello-es-nexus in namespace my-target-namespace",
+    },
+    .timeout_seconds = 60,
+    .tests = .{ "caller_test.zig", "handler_test.zig" },
+    .programs = .{ "handler_worker", "caller_worker" },
+    .namespaces = .{ "my-target-namespace", "my-caller-namespace" },
+    .nexus_endpoints = .{
+        .{ .name = "nexus-endpoint", .namespace = "my-target-namespace", .task_queue = "nexus-handler" },
+    },
+}

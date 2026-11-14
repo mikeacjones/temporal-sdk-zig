@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
-    if (have_samples) addSampleSteps(b, target, optimize, temporal);
+    if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters);
     if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters);
 }
 
@@ -134,7 +134,7 @@ fn addReadmeSteps(
     }
 }
 
-fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module) void {
+fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8) void {
     // zig build fmt
     const fmt_paths: []const std.Build.LazyPath = &.{
         b.path("build.zig"),
@@ -163,6 +163,8 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             .imports = &.{.{ .name = "temporal", .module = temporal }},
         }),
     });
+    // The runner's own logic (reading sample.zon, planning namespaces and endpoints).
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "samples-runner", .root_module = runner.root_module, .filters = test_filters })).step);
     const run_samples = b.addRunArtifact(runner);
     run_samples.addDirectoryArg(b.path("."));
     run_samples.addDirectoryArg(b.addWriteFiles().getDirectory());
