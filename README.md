@@ -1197,7 +1197,7 @@ Notes:
 - Every workflow `executeWorkflow` or `getResult` waits for that completes, fails, is canceled, or times out is then replayed from its history, so a test also fails with `error.Nondeterminism`. A terminated run, or any other error, returns before the replay.
 - `registerActivityAs` runs a double under the activity's name; registering the activity as well returns `error.AlreadyRegistered`.
 - `startWorkflow` returns the run without waiting, for tests that signal, query, or update it before `getResult`.
-- `createNexusEndpoint` creates a Nexus endpoint on the dev server that routes to a namespace and task queue (the environment's by default), for workflows that call [Nexus operations](#calling-operations-from-workflows); a name that exists returns `error.AlreadyExists`.
+- `createNexusEndpoint` creates a Nexus endpoint on the dev server that routes to a namespace and task queue (the environment's by default), for workflows that call [Nexus operations](#calling-operations-from-workflows); a name that exists returns `error.AlreadyExists`. `testing.createNexusEndpoint(client, name, target)` does the same through any client, for a server without an environment such as a `testing.DevServer`; its target names both the namespace, which must exist on the server, and the task queue.
 - `startWithOptions` takes extra dev server arguments, codecs, a logger, propagators, worker and client interceptors, and metrics, borrowed for the environment's life. `startTimeSkipping` takes no options.
 
 #### Time skipping
