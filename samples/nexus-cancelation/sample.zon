@@ -1,0 +1,28 @@
+// How samples-test validates this sample: create the namespaces and the Nexus endpoint below
+// on the dev server, start the worker (the handler and caller workers in one process), run
+// the starter, and check that the starter's output contains each `expect` line before
+// `timeout_seconds`. The starter's arguments fix the handler workflows' times, which are
+// random by default: the one for es finishes at once and the others work for ten minutes, so
+// es completes and the others are canceled; a canceled one cleans up for one second. The
+// starter prints the result, then how each operation ended from the caller's history, and
+// for each canceled one how its handler workflow ended from that workflow's history.
+// handler_worker and caller_worker run the two workers on their own; worker.zig says how to
+// set up a server by hand.
+.{
+    .expect = .{
+        "Workflow result: ¡Hola! Nexus 👋",
+        "Operation for es completed: ¡Hola! Nexus 👋",
+        "Operation for en canceled: handler workflow hello-en-nexus in namespace my-cancelation-target-namespace received the cancellation, cleaned up for 1000 ms, and ended canceled",
+        "Operation for fr canceled: handler workflow hello-fr-nexus in namespace my-cancelation-target-namespace received the cancellation, cleaned up for 1000 ms, and ended canceled",
+        "Operation for de canceled: handler workflow hello-de-nexus in namespace my-cancelation-target-namespace received the cancellation, cleaned up for 1000 ms, and ended canceled",
+        "Operation for tr canceled: handler workflow hello-tr-nexus in namespace my-cancelation-target-namespace received the cancellation, cleaned up for 1000 ms, and ended canceled",
+    },
+    .starter_args = .{ "--work-ms", "es=0,en=600000,fr=600000,de=600000,tr=600000", "--cleanup-ms", "1000" },
+    .timeout_seconds = 60,
+    .tests = .{ "caller_test.zig", "handler_test.zig" },
+    .programs = .{ "handler_worker", "caller_worker" },
+    .namespaces = .{ "my-cancelation-target-namespace", "my-cancelation-caller-namespace" },
+    .nexus_endpoints = .{
+        .{ .name = "nexus-cancelation-endpoint", .namespace = "my-cancelation-target-namespace", .task_queue = "nexus-cancelation-handler" },
+    },
+}
