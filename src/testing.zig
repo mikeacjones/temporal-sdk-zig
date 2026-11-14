@@ -351,6 +351,23 @@ pub const WorkflowEnvironment = struct {
         return env.worker.registerDynamicActivityWith(Dynamic, receiver);
     }
 
+    /// Registers a Nexus service handler (`temporal.nexus.ServiceHandler`) on the
+    /// environment's worker, which then serves its operations to callers of an endpoint
+    /// routed to the environment's task queue (`createNexusEndpoint`). See
+    /// `Worker.registerNexusService`. Call it before the worker starts (the first workflow
+    /// the environment starts); returns `error.AlreadyRegistered` for a service name
+    /// registered already.
+    pub fn registerNexusService(env: *WorkflowEnvironment, comptime Handler: type) !void {
+        return env.worker.registerNexusService(Handler);
+    }
+
+    /// Registers a Nexus service handler whose handlers take a receiver, bound to `receiver`,
+    /// which must outlive the environment and be safe to use from several requests at once.
+    /// See `Worker.registerNexusServiceWith` and `registerNexusService`.
+    pub fn registerNexusServiceWith(env: *WorkflowEnvironment, comptime Handler: type, receiver: *Handler.Receiver) !void {
+        return env.worker.registerNexusServiceWith(Handler, receiver);
+    }
+
     /// Runs a workflow to completion on the environment's worker and returns its result,
     /// allocated from `arena`. On `error.WorkflowFailed`, `failure` (if given) receives the
     /// workflow's failure.

@@ -781,8 +781,14 @@ pub const Client = struct {
         if (attach.callback_url.len > 0 or attach.links.len > 0)
             request.on_conflict_options = .{ .attach_request_id = true, .attach_completion_callbacks = true, .attach_links = true };
         var header = try c.outgoingHeader(arena, options.context);
-        const response = c.rpcCall(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, arena, null, &header, options.context) catch |err| switch (err) {
+        var status: ?RpcStatus = null;
+        const status_out: ?*?RpcStatus = if (attach.rejection != null) &status else null;
+        const response = c.rpcCall(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, arena, status_out, &header, options.context) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
+            error.RpcFailed => {
+                if (attach.rejection) |out| out.* = if (status) |s| rpcRejection(s) else null;
+                return error.RpcFailed;
+            },
             else => |e| return e,
         };
         return .{
@@ -967,6 +973,33 @@ pub const Client = struct {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
         };
+    }
+
+    /// Requests cancellation of the latest run of `workflow_id` for a Nexus workflow-run
+    /// operation's cancel (`temporal.nexus`), as `cancelWorkflow` does. Applications don't
+    /// call this. A rejection the server reports with `error.RpcFailed` isn't logged: its gRPC
+    /// status is stored in `rejected` (null without one, such as a transport error) for the
+    /// caller to report, its message allocated from `arena`, as is everything the call
+    /// allocates. Other errors are `cancelWorkflow`'s.
+    pub fn cancelNexusWorkflow(c: *Client, arena: Allocator, workflow_id: []const u8, rejected: *?RpcRejection) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void {
+        var status: ?RpcStatus = null;
+        rejected.* = null;
+        _ = c.rpcWithStatus(wfs.RequestCancelWorkflowExecutionResponse, "RequestCancelWorkflowExecution", wfs.RequestCancelWorkflowExecutionRequest{
+            .namespace = c.namespace,
+            .workflow_execution = .{ .workflow_id = workflow_id },
+            .identity = c.identity,
+            .request_id = try uuid(arena, c.io),
+        }, arena, &status) catch |err| switch (err) {
+            error.AlreadyExists, error.RpcFailed => {
+                if (status) |s| rejected.* = rpcRejection(s);
+                return error.RpcFailed;
+            },
+            else => |e| return e,
+        };
+    }
+
+    fn rpcRejection(s: RpcStatus) ?RpcRejection {
+        return if (s.code == 0) null else .{ .code = @fromBackingInt(s.code), .message = s.message };
     }
 
     /// Completes an activity that returned `ctx.completeAsync()`, identified by the task token
@@ -1847,6 +1880,40 @@ pub const NexusWorkflowAttachments = struct {
     callback_headers: []const NexusHeader = &.{},
     /// Links back to what scheduled the operation, recorded with the workflow's start.
     links: []const proto.temporal.api.common.v1.Link = &.{},
+    /// When set, a start the server rejects with `error.RpcFailed` stores the call's gRPC
+    /// status here (null for a failure without one, such as a transport error) and is not
+    /// logged, so the caller can map and report it. Its message comes from the call's arena.
+    rejection: ?*?RpcRejection = null,
+};
+
+/// The gRPC status of a call the server rejected: its code, and the server's message, which
+/// says what it rejected.
+pub const RpcRejection = struct {
+    code: RpcCode,
+    message: []const u8,
+};
+
+/// A gRPC status code (https://grpc.io/docs/guides/status-codes/), as a failed call reports
+/// it.
+pub const RpcCode = enum(u32) {
+    ok = 0,
+    cancelled = 1,
+    unknown = 2,
+    invalid_argument = 3,
+    deadline_exceeded = 4,
+    not_found = 5,
+    already_exists = 6,
+    permission_denied = 7,
+    resource_exhausted = 8,
+    failed_precondition = 9,
+    aborted = 10,
+    out_of_range = 11,
+    unimplemented = 12,
+    internal = 13,
+    unavailable = 14,
+    data_loss = 15,
+    unauthenticated = 16,
+    _,
 };
 
 /// A Nexus header: names are case-insensitive.

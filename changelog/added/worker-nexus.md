@@ -1,0 +1,3 @@
+Workers serve their registered Nexus services: a worker with a service polls its task queue for Nexus tasks, so a workflow can call a Zig handler through a Nexus endpoint, and a worker with only Nexus services runs. `worker.Options.max_concurrent_nexus_task_executions` and `max_concurrent_nexus_task_pollers` bound the requests handled and the polls open at once.
+`testing.WorkflowEnvironment.registerNexusService` and `registerNexusServiceWith` register a Nexus service on a test environment's worker.
+A Nexus workflow-run operation whose workflow start or cancel the server rejects fails by the rejection's gRPC status and carries the server's message: an invalid argument, for example, is a `bad_request` handler error that isn't retried.
