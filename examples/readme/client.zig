@@ -275,12 +275,16 @@ test "client: examples against a dev server" {
     try std.testing.expectEqual(temporal.client.WorkflowExecutionStatus.running, (try client.describeWorkflow(arena, reset.id, reset.run_id)).status);
     // The greetings worker is unversioned: an auto-upgrade override needs no versioned worker.
     try overrideVersioning(&client, arena, "greeter-reset");
+    // The server records a change once any workflow task in progress has ended, so follow
+    // the history until both are there.
     var changes: std.ArrayList(temporal.proto.temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes) = .empty;
-    for ((try client.fetchHistory(arena, reset.id, reset.run_id)).events.items) |event| {
+    var events = try client.historyIterator(reset.id, reset.run_id, .{ .wait_new_event = true });
+    defer events.deinit();
+    while (changes.items.len < 2) {
+        const event = (try events.next(arena)) orelse return error.TestUnexpectedResult;
         const attrs = event.attributes orelse continue;
         if (attrs == .workflow_execution_options_updated_event_attributes) try changes.append(arena, attrs.workflow_execution_options_updated_event_attributes);
     }
-    try std.testing.expectEqual(2, changes.items.len);
     const set = changes.items[0].versioning_override orelse return error.TestUnexpectedResult;
     try std.testing.expect((set.override orelse return error.TestUnexpectedResult) == .auto_upgrade);
     try std.testing.expect(changes.items[1].unset_versioning_override);

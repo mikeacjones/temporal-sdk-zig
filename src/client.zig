@@ -1010,10 +1010,11 @@ pub const Client = struct {
 
     /// Changes the execution options of run `run_id` of `workflow_id` (the latest run when
     /// empty): each non-null field of `changes` is applied, and the others are left as they
-    /// are. The server records a change in the workflow's history; one that leaves the
-    /// options as they were (removing an override the workflow doesn't have, setting the one
-    /// it has) succeeds and records nothing. Returns the run's options after the change,
-    /// allocated from `arena` (as is everything the call allocates).
+    /// are. The server records a change in the workflow's history, once any workflow task in
+    /// progress has ended; one that leaves the options as they were (removing an override the
+    /// workflow doesn't have, setting the one it has) succeeds and records nothing. Returns
+    /// the run's options after the change, allocated from `arena` (as is everything the call
+    /// allocates).
     ///
     /// A `changes` that changes nothing is `error.InvalidOptions` before any call. An unknown
     /// or closed workflow is `error.NotFound`. A change the server refuses, such as a pin to

@@ -4078,6 +4078,9 @@ test "client: a reset's request ID is sent as given, and repeating it resets aga
     try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(chain.id, hopped, "reset run", {}, .{}));
     const changed = try c.updateWorkflowExecutionOptions(a, chain.id, third, .{ .versioning_override = .{ .set = .auto_upgrade } });
     try testing.expect(changed.versioning_override.? == .auto_upgrade);
+    // The server holds the event back while a workflow task is in progress, as the reset
+    // run's first one may be: wait for it rather than read the history once.
+    _ = try ResetFixtures.awaitEvent(c, chain.id, third, .workflow_execution_options_updated_event_attributes, 1);
     try testing.expectEqual(1, try ResetFixtures.countEvents(c, a, chain.id, third, .workflow_execution_options_updated_event_attributes));
     // The chain's first run survives continue-as-new and the reset.
     try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(chain.id, "", "reset run's id", {}, .{ .first_execution_run_id = third }));
@@ -4193,6 +4196,7 @@ test "client: execution options: set a pinned, then an auto-upgrade override, th
         try testing.expect(info.versioning_override == null);
     }
 
+    _ = try ResetFixtures.awaitEvent(c, run.id, run.run_id, .workflow_execution_options_updated_event_attributes, 3);
     const history = try c.fetchHistory(a, run.id, run.run_id);
     var updates: std.ArrayList(proto.temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes) = .empty;
     for (history.events.items) |event| switch (event.attributes orelse continue) {
