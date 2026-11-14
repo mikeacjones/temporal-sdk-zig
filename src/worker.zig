@@ -2750,6 +2750,60 @@ test "the workflow runner hands codecs the run's propagated values and identity"
     try testing.expectEqualStrings("acme", runner.runs.get("run-1").?.inst.propagated.get(ContextRecordingCodec.tenant).?);
 }
 
+const NexusCodecTest = struct {
+    const Echo = nexus.OperationDef("echo", []const u8, []const u8);
+    const Service = nexus.ServiceDef("hello-service", .{Echo});
+
+    fn call(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeNexusOperation(Service, Echo, .{ .endpoint = "ep", .summary = "echo it" }, "hi").get();
+    }
+    const Call = workflow.Def("CallNexus", call);
+};
+
+test "the workflow runner encodes a Nexus operation's input and decodes its result with the codecs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const zlib: converter.ZlibCodec = .{ .always_encode = true };
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, NexusCodecTest.Call.workflow_name, NexusCodecTest.Call.registered);
+    var runner: WorkflowRunner = .{
+        .gpa = testing.allocator,
+        .workflows = &workflows,
+        .task_queue = "tq",
+        .namespace = "ns",
+        .stack_size = 256 * 1024,
+        .codecs = &codecs,
+    };
+    defer runner.deinit();
+
+    const init: act_pb.InitializeWorkflow = .{ .workflow_type = "CallNexus", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+    try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+    var bytes: Io.Writer.Allocating = .init(a);
+    try act.encode(&bytes.writer, a);
+    const first = (try runner.handle(bytes.written(), a, testing.io)).completion;
+    const command = first.status.?.successful.commands.items[0];
+    const input = command.variant.?.schedule_nexus_operation.input.?;
+    try testing.expectEqualStrings(converter.ZlibCodec.encoding, converter.encodingOf(input).?);
+    try testing.expectEqualStrings(converter.ZlibCodec.encoding, converter.encodingOf(command.user_metadata.?.summary.?).?);
+    const decoded_input = try converter.decodePayloads(&codecs, a, testing.io, &.{input});
+    try testing.expectEqualStrings("\"hi\"", decoded_input[0].data);
+
+    const output = try converter.encodePayloads(&codecs, a, testing.io, &.{try converter.toPayload(a, @as([]const u8, "hi back"))});
+    var resolve: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_001 } };
+    try resolve.jobs.append(a, .{ .variant = .{ .resolve_nexus_operation_start = .{ .seq = 1, .status = .{ .started_sync = true } } } });
+    try resolve.jobs.append(a, .{ .variant = .{ .resolve_nexus_operation = .{ .seq = 1, .result = .{ .status = .{ .completed = output[0] } } } } });
+    bytes.clearRetainingCapacity();
+    try resolve.encode(&bytes.writer, a);
+    const second = (try runner.handle(bytes.written(), a, testing.io)).completion;
+    const result = second.status.?.successful.commands.items[0].variant.?.complete_workflow_execution.result.?;
+    // The workflow saw the decoded result; its own result is encoded again.
+    try testing.expectEqualStrings("\"hi back\"", (try converter.decodePayloads(&codecs, a, testing.io, &.{result}))[0].data);
+}
+
 /// Workflows that call `hook` from their code, so a test can hold an activation in workflow
 /// code or see two runs' code at the same time. The hook is test code that blocks on the
 /// test's Io, outside the workflow's: real workflow code must never do this.

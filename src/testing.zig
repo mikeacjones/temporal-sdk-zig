@@ -27,6 +27,7 @@ const log_mod = @import("log.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
+const nexus = @import("nexus.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -618,19 +619,75 @@ pub const WorkflowEnvironment = struct {
         }
     }
 
+    /// Where `createNexusEndpoint` routes an endpoint's operations: a namespace and a task
+    /// queue on the environment's server, whose worker handles them.
+    pub const NexusEndpointTarget = struct {
+        /// Empty routes to the environment's namespace.
+        namespace: []const u8 = "",
+        /// Empty routes to the environment's task queue.
+        task_queue: []const u8 = "",
+    };
+
+    pub const CreateNexusEndpointError = error{
+        OutOfMemory,
+        Canceled,
+        /// An endpoint called `name` already exists on the server.
+        AlreadyExists,
+        /// The server refused the endpoint, for example for a name it doesn't accept, or a
+        /// namespace that doesn't exist; the reason is logged.
+        RpcFailed,
+        InvalidResponse,
+    };
+
+    /// Creates a Nexus endpoint called `name` on the environment's server (the operator
+    /// service's CreateNexusEndpoint), routing to `target`, so workflows can call operations
+    /// through it (`workflow.Context.executeNexusOperation` with `.endpoint = name`). The
+    /// server accepts names of ASCII letters, digits, `-` and `_`, starting with a letter.
+    /// The endpoint lasts as long as the server; nothing has to poll its task queue for it
+    /// to exist. `name` and `target` are only read during the call. Tested against the dev
+    /// server (`start`); a server without Nexus endpoints returns `error.RpcFailed`.
+    pub fn createNexusEndpoint(env: *WorkflowEnvironment, name: []const u8, target: NexusEndpointTarget) CreateNexusEndpointError!void {
+        var scratch: std.heap.ArenaAllocator = .init(env.gpa);
+        defer scratch.deinit();
+        const ops = proto.temporal.api.operatorservice.v1;
+        const request: ops.CreateNexusEndpointRequest = .{ .spec = .{
+            .name = name,
+            .target = .{ .variant = .{ .worker = .{
+                .namespace = if (target.namespace.len > 0) target.namespace else env.client.namespace,
+                .task_queue = if (target.task_queue.len > 0) target.task_queue else env.task_queue,
+            } } },
+        } };
+        var status: u32 = 0;
+        _ = env.serviceCall(.operator, ops.CreateNexusEndpointResponse, "CreateNexusEndpoint", request, scratch.allocator(), &status) catch |err| return switch (err) {
+            error.RpcFailed => if (status == 6) error.AlreadyExists else error.RpcFailed,
+            else => |e| e,
+        };
+    }
+
     const ts = proto.temporal.api.testservice.v1;
 
     /// Calls a TestService method; the response's memory comes from `arena`. Not retried:
     /// the server counts lock and unlock calls, so a retried call could unbalance them.
     fn testService(env: *WorkflowEnvironment, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator) error{ OutOfMemory, Canceled, RpcFailed, InvalidResponse }!Response {
+        return env.serviceCall(.test_service, Response, method, request, arena, null);
+    }
+
+    /// Calls `method` on `service` without retries; the response's memory comes from `arena`.
+    /// A failed call is logged, and its gRPC status code stored in `status` if given.
+    fn serviceCall(env: *WorkflowEnvironment, service: bridge.Connection.Service, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*u32) error{ OutOfMemory, Canceled, RpcFailed, InvalidResponse }!Response {
         var encoded: Io.Writer.Allocating = .init(arena);
         request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var rpc_failure: ?bridge.Connection.RpcFailure = null;
         defer if (rpc_failure) |f| f.deinit(env.gpa);
-        const bytes = env.client.currentConnection().call(env.gpa, env.io, .test_service, method, encoded.written(), .{}, &rpc_failure) catch |err| switch (err) {
+        const bytes = env.client.currentConnection().call(env.gpa, env.io, service, method, encoded.written(), .{}, &rpc_failure) catch |err| switch (err) {
             error.RpcFailed => {
                 const f = rpc_failure.?;
-                log.err("test server {s} failed: {s} (gRPC status {d})", .{ method, f.message, f.status_code });
+                if (status) |out| {
+                    out.* = f.status_code;
+                    // ALREADY_EXISTS is the caller's to report.
+                    if (f.status_code == 6) return error.RpcFailed;
+                }
+                log.err("{s} {s} failed: {s} (gRPC status {d})", .{ @tagName(service), method, f.message, f.status_code });
                 return error.RpcFailed;
             },
             error.InvalidOptions => return error.RpcFailed,
@@ -1911,6 +1968,47 @@ const ExternalFixtures = struct {
         return "requested";
     }
     const CancelOtherChanged = workflow.Def("CancelOther", cancelOtherChanged);
+};
+
+const NexusFixtures = struct {
+    const EchoInput = struct { message: []const u8 };
+    const Echo = nexus.OperationDef("echo", EchoInput, []const u8);
+    const Shout = nexus.OperationDef("shout", EchoInput, []const u8);
+    const Service = nexus.ServiceDef("hello-service", .{ Echo, Shout });
+
+    /// Calls `Operation` through `endpoint` with a 2s schedule-to-close timeout, and returns
+    /// its output, or the error, the failure's message and its root cause's.
+    fn call(comptime Operation: type, ctx: *workflow.Context, endpoint: []const u8) ![]const u8 {
+        const f = ctx.executeNexusOperation(Service, Operation, .{
+            .endpoint = endpoint,
+            .schedule_to_close_timeout = .fromSeconds(2),
+            .headers = &.{.{ .name = "trace-id", .value = "abc" }},
+            .summary = "echo it",
+        }, .{ .message = "hi" });
+        return f.get() catch |err| switch (err) {
+            error.NexusOperationFailed => {
+                const fl = f.failure().?;
+                const root = failure_mod.rootCause(fl);
+                const timeout = switch (root.failure_info orelse return error.NoFailureInfo) {
+                    .timeout_failure_info => |t| t.timeout_type,
+                    else => return error.NotATimeout,
+                };
+                return std.fmt.allocPrint(ctx.allocator(), "{t}: {s} <- {s} ({t})", .{ err, fl.message, root.message, timeout });
+            },
+            else => return err,
+        };
+    }
+
+    fn callEcho(ctx: *workflow.Context, endpoint: []const u8) ![]const u8 {
+        return call(Echo, ctx, endpoint);
+    }
+    const CallEcho = workflow.Def("CallEcho", callEcho);
+
+    /// `callEcho` calling another operation, which can't replay `CallEcho`'s history.
+    fn callShout(ctx: *workflow.Context, endpoint: []const u8) ![]const u8 {
+        return call(Shout, ctx, endpoint);
+    }
+    const CallEchoChanged = workflow.Def("CallEcho", callShout);
 };
 
 const ContinueFixtures = struct {
@@ -4707,6 +4805,65 @@ test "cancelExternalWorkflow: one workflow cancels another, which ends canceled"
 /// A dev-server run of `ExternalFixtures.CancelOther` canceling a running
 /// `ExternalFixtures.WaitForApproval`, exported with `temporal workflow show`.
 const cancel_external_history = @embedFile("testdata/cancel_external_history.json");
+
+test "nexus: a workflow schedules an operation through an endpoint, and it times out on a task queue nobody polls" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(NexusFixtures.CallEcho);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var suffix: [4]u8 = undefined;
+    testing.io.random(&suffix);
+    const endpoint = try std.fmt.allocPrint(a, "test-endpoint-{x}", .{suffix});
+    const unpolled = try std.fmt.allocPrint(a, "{s}-unpolled", .{env.task_queue});
+    try env.createNexusEndpoint(endpoint, .{ .task_queue = unpolled });
+    try testing.expectError(error.AlreadyExists, env.createNexusEndpoint(endpoint, .{}));
+
+    var run = try env.startWorkflow(NexusFixtures.CallEcho, .{}, .{endpoint});
+    defer run.deinit();
+    // Replays the run too.
+    const result = try env.getResult(NexusFixtures.CallEcho, &run, a, null);
+    try testing.expectEqualStrings("NexusOperationFailed: nexus operation completed unsuccessfully <- operation timed out (TIMEOUT_TYPE_SCHEDULE_TO_CLOSE)", result);
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var scheduled_seen = false;
+    var timed_out_seen = false;
+    for (history.events.items) |event| switch (event.attributes.?) {
+        .nexus_operation_scheduled_event_attributes => |attrs| {
+            scheduled_seen = true;
+            try testing.expectEqualStrings(endpoint, attrs.endpoint);
+            try testing.expectEqualStrings("hello-service", attrs.service);
+            try testing.expectEqualStrings("echo", attrs.operation);
+            try testing.expectEqualStrings("{\"message\":\"hi\"}", attrs.input.?.data);
+            try testing.expectEqual(@as(i64, 2), attrs.schedule_to_close_timeout.?.seconds);
+            try testing.expectEqual(@as(usize, 1), attrs.nexus_header.items.len);
+            try testing.expectEqualStrings("trace-id", attrs.nexus_header.items[0].key);
+            try testing.expectEqualStrings("abc", attrs.nexus_header.items[0].value);
+            try StartOptionFixtures.expectMetadata(a, event, "echo it", "");
+        },
+        .nexus_operation_timed_out_event_attributes => timed_out_seen = true,
+        else => {},
+    };
+    try testing.expect(scheduled_seen and timed_out_seen);
+}
+
+/// A dev-server run of `NexusFixtures.CallEcho` whose operation timed out on a task queue
+/// nobody polled, from the test above, exported as JSON.
+const nexus_history = @embedFile("testdata/nexus_history.json");
+
+test "WorkflowReplayer replays a Nexus operation and catches a workflow that schedules another" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(NexusFixtures.CallEcho);
+    try ok.replayHistoryJson(nexus_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(NexusFixtures.CallEchoChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(nexus_history));
+}
 
 test "WorkflowReplayer replays a cancellation request to another workflow and catches a dropped one" {
     var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
