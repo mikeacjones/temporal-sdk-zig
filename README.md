@@ -82,7 +82,8 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Tracing](#tracing)
   - [Nexus](#nexus)
     - [Services and handlers](#services-and-handlers)
-    - [Serving and calling operations](#serving-and-calling-operations)
+    - [Calling operations from workflows](#calling-operations-from-workflows)
+    - [Serving operations and standalone calls](#serving-operations-and-standalone-calls)
   - [Contrib](#contrib)
 - [Parity](#parity)
 - [Versioning](#versioning-1)
@@ -1194,6 +1195,7 @@ Notes:
 - Every workflow `executeWorkflow` or `getResult` waits for that completes, fails, is canceled, or times out is then replayed from its history, so a test also fails with `error.Nondeterminism`. A terminated run, or any other error, returns before the replay.
 - `registerActivityAs` runs a double under the activity's name; registering the activity as well returns `error.AlreadyRegistered`.
 - `startWorkflow` returns the run without waiting, for tests that signal, query, or update it before `getResult`.
+- `createNexusEndpoint` creates a Nexus endpoint on the dev server that routes to a namespace and task queue (the environment's by default), for workflows that call [Nexus operations](#calling-operations-from-workflows); a name that exists returns `error.AlreadyExists`.
 - `startWithOptions` takes extra dev server arguments, codecs, a logger, propagators, worker and client interceptors, and metrics, borrowed for the environment's life. `startTimeSkipping` takes no options.
 
 #### Time skipping
@@ -1458,12 +1460,40 @@ Notes:
 - What a handler passes to `ctx.fail`, `ctx.failCanceled`, and `ctx.handlerError`, and the strings in a `WorkflowStart`, are stored as given: they must live until the response has been sent, as memory from `ctx.allocator()` does.
 - `ctx.info()` gives the service, operation, request ID, headers (`Info.header` looks one up by name, ignoring case), and the caller's links; `ctx.client()` gives the worker's client.
 - Registering a service name twice returns `error.AlreadyRegistered`.
-- Workers don't poll for Nexus tasks yet (see the next section), so a registered service isn't served: `Worker.run` on a worker with only Nexus services returns `error.NothingRegistered`.
+- Workers don't poll for Nexus tasks yet (see [Serving operations and standalone calls](#serving-operations-and-standalone-calls)), so a registered service isn't served: `Worker.run` on a worker with only Nexus services returns `error.NothingRegistered`.
 
-#### Serving and calling operations
-<!-- stub: temporal-sdk-zig-d51.10.2, temporal-sdk-zig-d51.10.3, temporal-sdk-zig-d51.5.12 -->
+#### Calling operations from workflows
+
+`workflow.Context.executeNexusOperation` schedules an operation of a service contract through a Nexus endpoint and returns a `workflow.NexusOperationFuture` for its start and its result. The operation runs wherever the endpoint routes, often a worker in another namespace.
+
+<!-- example: nexus-caller -->
+```zig
+fn greetThroughNexus(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const future = ctx.executeNexusOperation(GreetingService, Greet, .{
+        .endpoint = "greeting-endpoint",
+        .schedule_to_close_timeout = .fromSeconds(60),
+    }, name);
+    // The token of the started workflow-run operation; null if the result came with the start.
+    if (try future.started()) |token| ctx.logger().info("greeting started", .{ .token = token });
+    return future.get();
+}
+pub const GreetThroughNexus = workflow.Def("greet_through_nexus", greetThroughNexus);
+```
+
+Notes:
+
+- `options.endpoint` names an endpoint that an operator created on the server, routing to a namespace and task queue. An endpoint the server doesn't know fails the workflow task, which is retried, rather than the operation; an empty one makes the future return `error.InvalidOptions`. In tests, `testing.WorkflowEnvironment.createNexusEndpoint` creates one on the environment's dev server.
+- `get` returns `error.NexusOperationFailed` when the operation failed, timed out, was canceled, or didn't start; `future.failure()` is then a Nexus operation failure whose cause is the handler's failure, a timeout, or a cancellation. `started` waits for the start and returns the operation token, or null when the result arrived with the start.
+- `schedule_to_close_timeout` bounds the whole operation, `schedule_to_start_timeout` the time until the handler starts it, and `start_to_close_timeout` an asynchronous operation's run; each is optional. `headers` are sent to the handler as Nexus headers and recorded in history without the payload codecs, and `summary` describes the operation in the UI.
+- `future.cancel()`, or canceling the coroutine that waits in `get` or `started`, requests cancellation as `options.cancellation_type` says, and the future resolves when the core reports it. `wait_cancellation_completed` (the default) resolves once the operation has ended, `wait_cancellation_requested` once the handler has accepted the request, and `try_cancel` and `abandon` in the next activation, `abandon` without telling the handler. After `future.cancel()`, `get` returns `error.NexusOperationFailed` with the cancellation as the failure; a canceled coroutine gets `error.Canceled`.
+- With sdk-core v1.2.0, a workflow that is still running when an operation it abandoned ends fails its workflow tasks from then on: use `abandon` only when the workflow closes first, or use `try_cancel`.
+- A service that lacks the operation, or an operation whose types differ from the service's, is a compile error naming the service and the operation. `executeNexusOperationByName` calls a service this program has no contract for, by service and operation name.
+- Workflow interceptors don't see Nexus calls.
+
+#### Serving operations and standalone calls
+<!-- stub: temporal-sdk-zig-d51.10.2, temporal-sdk-zig-d51.5.12 -->
 Not implemented yet.
-Planned: workers serving their registered services, calling operations from workflows, and standalone operations from a client.
+Planned: workers serving their registered services, and standalone operations from a client.
 
 ### Contrib
 <!-- stub: temporal-sdk-zig-d51.13.2, temporal-sdk-zig-d51.13.4, temporal-sdk-zig-d51.13.5, temporal-sdk-zig-d51.13.6 -->

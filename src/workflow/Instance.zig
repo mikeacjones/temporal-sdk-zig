@@ -96,12 +96,15 @@ next_child_seq: u32 = 1,
 /// Signals and cancellation requests to other workflows share one sequence space; the core
 /// keys each kind separately, so their seqs never meet.
 next_external_seq: u32 = 1,
+next_nexus_seq: u32 = 1,
 activities: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 timers: std.AutoHashMapUnmanaged(u32, *WorkflowIo.Timer) = .empty,
 /// Child workflows that have not closed, by seq.
 children: std.AutoHashMapUnmanaged(u32, *ChildState) = .empty,
 /// Signals and cancellation requests to other workflows that the core has not resolved, by seq.
 externals: std.AutoHashMapUnmanaged(u32, *ExternalState) = .empty,
+/// Nexus operations the core has not resolved, by seq.
+nexus_operations: std.AutoHashMapUnmanaged(u32, *NexusOperationState) = .empty,
 /// Local activities waiting on a workflow timer before their next attempt, by timer seq.
 backoffs: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 /// Coroutines blocked in `awaitCondition`, in the order they started waiting.
@@ -329,6 +332,46 @@ pub const ChildState = struct {
     }
 };
 
+/// A Nexus operation, from its ScheduleNexusOperation command until the core resolves it.
+/// Arena memory; the future keeps pointing at it after it ends.
+pub const NexusOperationState = struct {
+    seq: u32,
+    endpoint: []const u8,
+    service: []const u8,
+    operation: []const u8,
+    cancellation_type: workflow.NexusOperationCancellationType,
+    /// The coroutines blocked in `started` and in `get`.
+    start_waiter: ?*WorkflowIo.Wait = null,
+    result_waiter: ?*WorkflowIo.Wait = null,
+    /// Set once the handler started the operation, or completed it synchronously.
+    started: bool = false,
+    /// The operation token of an asynchronous start; null for a synchronous one.
+    token: ?[]const u8 = null,
+    /// Set once the operation ended, or its start failed.
+    outcome: ?Outcome = null,
+    cancel_requested: bool = false,
+
+    /// `completed` holds the result as the core sent it. A failed start is `canceled` or
+    /// `timed_out` when its failure says so, else `failed`.
+    pub const Outcome = union(enum) {
+        completed: converter.Payload,
+        failed: *const Failure,
+        canceled: *const Failure,
+        timed_out: *const Failure,
+    };
+
+    pub const Phase = enum { started, result };
+
+    fn reached(state: *const NexusOperationState, phase: Phase) bool {
+        return state.outcome != null or (phase == .started and state.started);
+    }
+
+    fn wake(state: *NexusOperationState, wio: *WorkflowIo) void {
+        if (state.start_waiter) |w| wio.wake(w);
+        if (state.result_waiter) |w| wio.wake(w);
+    }
+};
+
 /// A signal or cancellation request sent to another workflow, from its command until the
 /// core resolves it. Arena memory; the future keeps pointing at it after it resolves.
 pub const ExternalState = struct {
@@ -448,6 +491,8 @@ pub fn teardown(inst: *Instance) usize {
     while (backing_off.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
     var children = inst.children.valueIterator();
     while (children.next()) |state| state.*.wake(&inst.wio);
+    var operations = inst.nexus_operations.valueIterator();
+    while (operations.next()) |state| state.*.wake(&inst.wio);
     inst.wio.run();
     std.debug.assert(inst.commands.items.len == 0);
     return inst.sched.live;
@@ -540,7 +585,11 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     var answers: std.ArrayList(cmd_pb.WorkflowCommand) = .empty;
 
     for (act.jobs.items) |job| {
-        const variant = job.variant orelse continue;
+        const variant = job.variant orelse {
+            // A job of a kind this SDK's protos don't know, from a newer core.
+            if (job._unknown_fields.len > 0) inst.task_failure = "workflow activation has a job of a kind this SDK version doesn't know; upgrade the SDK";
+            continue;
+        };
         switch (variant) {
             .query_workflow => |q| try answers.append(out, .{ .variant = .{ .respond_to_query = try inst.answerQuery(&q, out) } }),
             .initialize_workflow => |init| try inst.initialize(&init, act.run_id),
@@ -556,6 +605,8 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
             .notify_has_patch => |p| try inst.notified_patches.put(inst.arena(), try inst.arena().dupe(u8, p.patch_id), {}),
             .resolve_child_workflow_execution_start => |r| try inst.resolveChildStart(&r),
             .resolve_child_workflow_execution => |r| try inst.resolveChild(&r),
+            .resolve_nexus_operation_start => |r| try inst.resolveNexusOperationStart(&r),
+            .resolve_nexus_operation => |r| try inst.resolveNexusOperation(&r),
             .resolve_signal_external_workflow => |r| try inst.resolveExternal(r.seq, r.failure, switch (r.cause) {
                 .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND,
                 .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND,
@@ -570,9 +621,6 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
             }),
             .cancel_workflow => if (!inst.finished) if (inst.root) |root| inst.wio.cancelTask(root),
             .remove_from_cache => {},
-            else => |other| {
-                inst.task_failure = try std.fmt.allocPrint(out, "workflow activation job '{t}' is not supported by this SDK version yet", .{other});
-            },
         }
     }
 
@@ -902,7 +950,7 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
 fn updateFailure(a: Allocator, run: *const HandlerRun, err: anyerror) error{OutOfMemory}!Failure {
     switch (err) {
         error.ApplicationFailure => if (run.pending_failure) |p| return failure_mod.application(a, p),
-        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed => if (run.last_failure) |f| return f.*,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (run.last_failure) |f| return f.*,
         else => {},
     }
     return failure_mod.fromError(a, err);
@@ -1148,7 +1196,7 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
         .{ inst.ctx.pending_failure, inst.ctx.last_failure };
     if (pending) |p| return failure_mod.application(a, p);
     switch (err) {
-        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed => if (last) |f| return f.*,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (last) |f| return f.*,
         // Only the workflow function's return of ctx.continueAsNew's error continues as new.
         error.ContinueAsNew => return failure_mod.application(a, .{
             .message = if (inst.continue_as_new == null)
@@ -1846,6 +1894,158 @@ fn resolveChild(inst: *Instance, r: *const act_pb.ResolveChildWorkflowExecution)
     state.wake(&inst.wio);
 }
 
+// ---------------------------------------------------------------- Nexus operations
+
+/// Validates the options, encodes `input`, and emits ScheduleNexusOperation. Nexus calls
+/// don't go through the outbound interceptors. The names, endpoint and headers are copied
+/// into the arena.
+pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, input: anytype) ScheduleError!*NexusOperationState {
+    const fields = .{ .NexusEndpoint = options.endpoint, .NexusService = service, .NexusOperation = operation };
+    if (options.endpoint.len == 0) {
+        inst.logger.warn("executeNexusOperation: NexusOperationOptions.endpoint is empty; name the Nexus endpoint to call through", fields);
+        return error.InvalidOptions;
+    }
+    if (service.len == 0 or operation.len == 0) {
+        inst.logger.warn("executeNexusOperationByName: the service or operation name is empty; name both", fields);
+        return error.InvalidOptions;
+    }
+    inline for (.{ "schedule_to_close_timeout", "schedule_to_start_timeout", "start_to_close_timeout" }) |name| {
+        if (@field(options, name)) |d| if (d.nanoseconds < 0) {
+            inst.logger.warn("executeNexusOperation: NexusOperationOptions." ++ name ++ " is negative; leave it null for no limit", fields);
+            return error.InvalidOptions;
+        };
+    }
+    const a = inst.arena();
+    const state = try a.create(NexusOperationState);
+    state.* = .{
+        .seq = inst.next_nexus_seq,
+        .endpoint = try a.dupe(u8, options.endpoint),
+        .service = try a.dupe(u8, service),
+        .operation = try a.dupe(u8, operation),
+        .cancellation_type = options.cancellation_type,
+    };
+    var cmd: cmd_pb.ScheduleNexusOperation = .{
+        .seq = state.seq,
+        .endpoint = state.endpoint,
+        .service = state.service,
+        .operation = state.operation,
+        .input = try converter.toPayload(a, input),
+        .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
+        .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
+        .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
+        .cancellation_type = switch (options.cancellation_type) {
+            .wait_cancellation_completed => .WAIT_CANCELLATION_COMPLETED,
+            .wait_cancellation_requested => .WAIT_CANCELLATION_REQUESTED,
+            .try_cancel => .TRY_CANCEL,
+            .abandon => .ABANDON,
+        },
+    };
+    try cmd.nexus_header.ensureTotalCapacity(a, options.headers.len);
+    for (options.headers) |h| cmd.nexus_header.appendAssumeCapacity(.{ .key = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) });
+    try inst.nexus_operations.put(a, state.seq, state);
+    inst.next_nexus_seq += 1;
+    try inst.emit(.{
+        .user_metadata = try summaryMetadata(a, options.summary),
+        .variant = .{ .schedule_nexus_operation = cmd },
+    });
+    return state;
+}
+
+/// Blocks the calling coroutine until the operation reaches `phase` (started, or ended), or
+/// can't: an operation whose start failed, or that ended before it started, reaches both.
+/// When the coroutine is canceled while waiting, requests the operation's cancellation and
+/// keeps waiting, uncanceled, for the core to resolve it: the core decides when, by the
+/// cancellation type. Returns error.Canceled if it resolved as canceled; otherwise its
+/// outcome is kept for the caller and the cancel request is re-armed, so the coroutine's next
+/// cancelable wait returns error.Canceled. Eviction ends the wait with error.Canceled.
+pub fn awaitNexusOperation(inst: *Instance, state: *NexusOperationState, phase: NexusOperationState.Phase) error{Canceled}!void {
+    if (state.reached(phase)) return;
+    var wait = inst.wio.newWaitPoint();
+    const waiter = switch (phase) {
+        .started => &state.start_waiter,
+        .result => &state.result_waiter,
+    };
+    waiter.* = &wait;
+    defer waiter.* = null;
+    var canceled = false;
+    while (!state.reached(phase)) {
+        if (inst.evicting) return error.Canceled;
+        wait = inst.wio.newWaitPoint();
+        inst.wio.waitFor(&wait, !canceled) catch {
+            inst.cancelNexusOperation(state);
+            canceled = true;
+        };
+    }
+    if (!canceled) return;
+    if (state.outcome) |o| if (o == .canceled) return error.Canceled;
+    inst.wio.io().recancel();
+}
+
+/// Sends RequestCancelNexusOperation; the core resolves the operation as its cancellation
+/// type says (see `workflow.NexusOperationCancellationType`).
+pub fn cancelNexusOperation(inst: *Instance, state: *NexusOperationState) void {
+    if (state.outcome != null or state.cancel_requested) return;
+    state.cancel_requested = true;
+    inst.emit(.{ .variant = .{ .request_cancel_nexus_operation = .{ .seq = state.seq } } }) catch {
+        inst.task_failure = "out of memory requesting Nexus operation cancellation";
+    };
+}
+
+/// Applies ResolveNexusOperationStart. A failed start ends the operation: the core sends no
+/// ResolveNexusOperation after it. A job for an operation already resolved (the core may
+/// resolve a canceled operation before its start) is ignored.
+fn resolveNexusOperationStart(inst: *Instance, r: *const act_pb.ResolveNexusOperationStart) !void {
+    const state = inst.nexus_operations.get(r.seq) orelse return;
+    const a = inst.arena();
+    switch (r.status orelse return) {
+        .operation_token => |token| {
+            state.token = try a.dupe(u8, token);
+            state.started = true;
+        },
+        .started_sync => state.started = true,
+        .failed => |f| {
+            _ = inst.nexus_operations.remove(r.seq);
+            const copy = try dupeFailure(a, f);
+            state.outcome = if (hasFailureInfo(copy, .canceled_failure_info))
+                .{ .canceled = copy }
+            else if (hasFailureInfo(copy, .timeout_failure_info))
+                .{ .timed_out = copy }
+            else
+                .{ .failed = copy };
+        },
+    }
+    state.wake(&inst.wio);
+}
+
+/// Whether `f` or its direct cause carries `info`: the core wraps a cancellation or timeout in
+/// a Nexus operation failure.
+fn hasFailureInfo(f: *const Failure, info: std.meta.Tag(Failure.failure_info_union)) bool {
+    if (f.failure_info) |i| if (i == info) return true;
+    const cause = f.cause orelse return false;
+    const i = cause.failure_info orelse return false;
+    return i == info;
+}
+
+fn resolveNexusOperation(inst: *Instance, r: *const act_pb.ResolveNexusOperation) !void {
+    const kv = inst.nexus_operations.fetchRemove(r.seq) orelse return;
+    const state = kv.value;
+    const a = inst.arena();
+    const status = (r.result orelse NexusResult{}).status orelse {
+        state.outcome = .{ .failed = try dupeFailure(a, .{ .message = "the core resolved the Nexus operation without a result" }) };
+        state.wake(&inst.wio);
+        return;
+    };
+    state.outcome = switch (status) {
+        .completed => |p| .{ .completed = try p.dupe(a) },
+        .failed => |f| .{ .failed = try dupeFailure(a, f) },
+        .cancelled => |f| .{ .canceled = try dupeFailure(a, f) },
+        .timed_out => |f| .{ .timed_out = try dupeFailure(a, f) },
+    };
+    state.wake(&inst.wio);
+}
+
+const NexusResult = proto.coresdk.nexus.NexusOperationResult;
+
 // ---------------------------------------------------------------- external workflows
 
 /// Whom a signal goes to: a workflow by ID (and run ID, empty for its latest run), or a
@@ -2289,15 +2489,24 @@ test "eviction mid-run frees everything" {
     inst.destroy(); // testing.allocator reports leaks
 }
 
-test "unsupported jobs fail the workflow task" {
+test "a job of a kind this SDK doesn't know fails the workflow task" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
     const a = scratch.allocator();
     const inst = try create(testing.allocator, Hello.registered, .{});
     defer inst.destroy();
     _ = try inst.activate(&try initActivation(a, "Workflow", .{@as([]const u8, "Temporal")}), a);
-    const c = try inst.activate(&try oneJob(a, .{ .resolve_nexus_operation_start = .{ .seq = 1 } }), a);
-    try testing.expect(c.status.? == .failed);
+    // Every job kind the protos define is handled; a newer core's job decodes as unknown
+    // fields: here field 99, an empty message.
+    var reader: std.Io.Reader = .fixed("\x9a\x06\x00");
+    const job = try act_pb.WorkflowActivationJob.decode(&reader, a);
+    try testing.expect(job.variant == null);
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1" };
+    try act.jobs.append(a, job);
+    const c = try inst.activate(&act, a);
+    const f = c.status.?.failed.failure.?;
+    try testing.expectEqualStrings("UnsupportedJob", failure_mod.applicationType(f).?);
+    try testing.expect(std.mem.indexOf(u8, f.message, "doesn't know") != null);
 }
 
 // Patches: the workflow reports what `patched`, `deprecatePatch` and `getVersion` decided.
@@ -4594,6 +4803,441 @@ test "child workflow: an empty workflow type returns error.InvalidOptions from g
     const done = commandsOf(try inst.activate(&try initActivation(a, "ByName", .{}), a));
     try testing.expectEqual(@as(usize, 1), done.len);
     try testing.expectEqualStrings("InvalidOptions", done[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+// Nexus operations. No handler runs here: the tests resolve the operations as the core does.
+const NexusWf = struct {
+    const nexus_mod = @import("../nexus.zig");
+    const EchoInput = struct { message: []const u8 };
+    const Echo = nexus_mod.OperationDef("echo", EchoInput, []const u8);
+    const Ping = nexus_mod.OperationDef("ping", void, void);
+    const Service = nexus_mod.ServiceDef("hello-service", .{ Echo, Ping });
+    const Future = workflow.NexusOperationFuture([]const u8);
+
+    /// Calls `Echo` with every option set and reports how it went (`describe`).
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const f = ctx.executeNexusOperation(Service, Echo, .{
+            .endpoint = "hello-endpoint",
+            .schedule_to_close_timeout = .fromSeconds(60),
+            .schedule_to_start_timeout = .fromSeconds(10),
+            .start_to_close_timeout = .fromMilliseconds(30_500),
+            .cancellation_type = .wait_cancellation_requested,
+            .headers = &.{ .{ .name = "trace-id", .value = "abc" }, .{ .name = "tenant", .value = "acme" } },
+            .summary = "say hi",
+        }, .{ .message = "hi" });
+        return describe(ctx, f);
+    }
+    const Run = workflow.Def("RunNexus", run);
+
+    /// "<token or sync>: <result>", or "<error>: <failure's message> <- <root cause's
+    /// message> (<outcome>)" for an error from `started` or `get`.
+    fn describe(ctx: *workflow.Context, f: Future) ![]const u8 {
+        const a = ctx.allocator();
+        const token = f.started() catch |err| return failed(ctx, f, err);
+        if (token == null and !f.isReady()) return error.SyncStartWithoutResult;
+        const result = f.get() catch |err| return failed(ctx, f, err);
+        return std.fmt.allocPrint(a, "{s}: {s}", .{ token orelse "sync", result });
+    }
+
+    fn failed(ctx: *workflow.Context, f: Future, err: workflow.NexusOperationError) ![]const u8 {
+        if (err != error.NexusOperationFailed) return err;
+        const fl = f.failure().?;
+        const state = try f.state;
+        return std.fmt.allocPrint(ctx.allocator(), "{t}: {s} <- {s} ({s})", .{ err, fl.message, failure_mod.rootCause(fl).message, @tagName(state.outcome.?) });
+    }
+
+    /// Calls `Echo` with the cancellation type named by `mode`, and returns its result after
+    /// a sleep, which a re-armed cancel interrupts. A mode ending in "+future" cancels through
+    /// the future once the operation started, and one ending in "+now" right after
+    /// scheduling it.
+    fn cancel(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        const end = std.mem.indexOfScalar(u8, mode, '+') orelse mode.len;
+        const cancellation_type = std.meta.stringToEnum(workflow.NexusOperationCancellationType, mode[0..end]) orelse return error.InvalidPayload;
+        const f = ctx.executeNexusOperation(Service, Echo, .{ .endpoint = "hello-endpoint", .cancellation_type = cancellation_type }, .{ .message = "hi" });
+        if (std.mem.endsWith(u8, mode, "+now")) f.cancel();
+        if (std.mem.endsWith(u8, mode, "+future")) {
+            _ = f.started() catch |err| return failed(ctx, f, err);
+            f.cancel();
+        }
+        const r = f.get() catch |err| return failed(ctx, f, err);
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        return r;
+    }
+    const Cancel = workflow.Def("CancelNexus", cancel);
+
+    /// Calls `Ping`, whose input and output are void.
+    fn ping(ctx: *workflow.Context) ![]const u8 {
+        try ctx.executeNexusOperation(Service, Ping, .{ .endpoint = "hello-endpoint" }, {}).get();
+        return "pong";
+    }
+    const PingWf = workflow.Def("PingNexus", ping);
+
+    /// Calls `Echo` twice at once and waits for the first, then the second.
+    fn two(ctx: *workflow.Context) ![]const u8 {
+        const first = ctx.executeNexusOperation(Service, Echo, .{ .endpoint = "hello-endpoint" }, .{ .message = "one" });
+        const second = ctx.executeNexusOperation(Service, Echo, .{ .endpoint = "hello-endpoint" }, .{ .message = "two" });
+        const one = try first.get();
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ one, try second.get() });
+    }
+    const Two = workflow.Def("TwoNexus", two);
+
+    /// Returns `Echo`'s error unhandled, so it fails the workflow.
+    fn unhandled(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeNexusOperation(Service, Echo, .{ .endpoint = "hello-endpoint" }, .{ .message = "hi" }).get();
+    }
+    const Unhandled = workflow.Def("UnhandledNexus", unhandled);
+
+    /// Calls an operation by name with the endpoint, service and operation from `names`
+    /// ("endpoint/service/operation"); returns the error's name if scheduling fails.
+    fn byName(ctx: *workflow.Context, names: []const u8) ![]const u8 {
+        var it = std.mem.splitScalar(u8, names, '/');
+        const endpoint = it.next().?;
+        const service = it.next().?;
+        const operation = it.next().?;
+        const f = ctx.executeNexusOperationByName([]const u8, service, operation, .{ .endpoint = endpoint }, @as(u32, 7));
+        return f.get() catch |err| @errorName(err);
+    }
+    const ByName = workflow.Def("ByNameNexus", byName);
+};
+
+fn nexusFailure(a: Allocator, message: []const u8, cause: Failure) !Failure {
+    const c = try a.create(Failure);
+    c.* = cause;
+    return .{ .message = message, .cause = c, .failure_info = .{ .nexus_operation_execution_failure_info = .{
+        .endpoint = "hello-endpoint",
+        .service = "hello-service",
+        .operation = "echo",
+    } } };
+}
+
+fn nexusCanceledFailure(a: Allocator, message: []const u8) !Failure {
+    return nexusFailure(a, message, .{ .message = "", .failure_info = .{ .canceled_failure_info = .{} } });
+}
+
+fn nexusStart(a: Allocator, seq: u32, status: act_pb.ResolveNexusOperationStart.status_union) !act_pb.WorkflowActivation {
+    return oneJob(a, .{ .resolve_nexus_operation_start = .{ .seq = seq, .status = status } });
+}
+
+fn nexusResolved(a: Allocator, seq: u32, status: NexusResult.status_union) !act_pb.WorkflowActivation {
+    return oneJob(a, .{ .resolve_nexus_operation = .{ .seq = seq, .result = .{ .status = status } } });
+}
+
+fn nexusOutput(a: Allocator, text: []const u8) !NexusResult.status_union {
+    return .{ .completed = try converter.toPayload(a, text) };
+}
+
+/// The workflow's result, from a completion that completed it.
+fn nexusResultOf(c: done_pb.WorkflowActivationCompletion) []const u8 {
+    const cmds = commandsOf(c);
+    return cmds[cmds.len - 1].variant.?.complete_workflow_execution.result.?.data;
+}
+
+test "nexus: ScheduleNexusOperation carries the options; a synchronous start and its result arrive together" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusWf.Run.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "RunNexus", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const cmd = first[0].variant.?.schedule_nexus_operation;
+    try testing.expectEqual(@as(u32, 1), cmd.seq);
+    try testing.expectEqualStrings("hello-endpoint", cmd.endpoint);
+    try testing.expectEqualStrings("hello-service", cmd.service);
+    try testing.expectEqualStrings("echo", cmd.operation);
+    try testing.expectEqualStrings("{\"message\":\"hi\"}", cmd.input.?.data);
+    try testing.expectEqualStrings("json/plain", converter.encodingOf(cmd.input.?).?);
+    try testing.expectEqual(@as(i64, 60), cmd.schedule_to_close_timeout.?.seconds);
+    try testing.expectEqual(@as(i64, 10), cmd.schedule_to_start_timeout.?.seconds);
+    try testing.expectEqual(@as(i64, 30), cmd.start_to_close_timeout.?.seconds);
+    try testing.expectEqual(@as(i32, 500_000_000), cmd.start_to_close_timeout.?.nanos);
+    try testing.expect(cmd.cancellation_type == .WAIT_CANCELLATION_REQUESTED);
+    try testing.expectEqual(@as(usize, 2), cmd.nexus_header.items.len);
+    try testing.expectEqualStrings("trace-id", cmd.nexus_header.items[0].key);
+    try testing.expectEqualStrings("abc", cmd.nexus_header.items[0].value);
+    try testing.expectEqualStrings("tenant", cmd.nexus_header.items[1].key);
+    try testing.expectEqualStrings("acme", cmd.nexus_header.items[1].value);
+    try testing.expectEqualStrings("\"say hi\"", first[0].user_metadata.?.summary.?.data);
+
+    var act = try nexusStart(a, 1, .{ .started_sync = true });
+    try act.jobs.append(a, .{ .variant = .{ .resolve_nexus_operation = .{ .seq = 1, .result = .{ .status = try nexusOutput(a, "hi back") } } } });
+    try testing.expectEqualStrings("\"sync: hi back\"", nexusResultOf(try inst.activate(&act, a)));
+}
+
+test "nexus: the default options send no timeouts, headers or summary, and wait_cancellation_completed" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusWf.Unhandled.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "UnhandledNexus", .{}), a));
+    const cmd = first[0].variant.?.schedule_nexus_operation;
+    try testing.expect(cmd.schedule_to_close_timeout == null and cmd.schedule_to_start_timeout == null and cmd.start_to_close_timeout == null);
+    try testing.expectEqual(@as(usize, 0), cmd.nexus_header.items.len);
+    try testing.expect(cmd.cancellation_type == .WAIT_CANCELLATION_COMPLETED);
+    try testing.expect(first[0].user_metadata == null);
+}
+
+test "nexus: an asynchronous start returns its token, and the result follows in a later activation" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusWf.Run.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "RunNexus", .{}), a);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok-1" }), a)).len);
+    try testing.expect(!inst.finished);
+    try testing.expectEqualStrings("\"tok-1: hi later\"", nexusResultOf(try inst.activate(&try nexusResolved(a, 1, try nexusOutput(a, "hi later")), a)));
+}
+
+test "nexus: a failed start returns error.NexusOperationFailed from started, with the core's failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const cases = [_]struct { Failure, []const u8 }{
+        .{ try nexusFailure(a, "nexus operation completed unsuccessfully", try failure_mod.application(a, .{ .message = "no such user", .type = "NotFound" })), "nexus operation completed unsuccessfully <- no such user (failed)" },
+        .{ try nexusFailure(a, "nexus operation completed unsuccessfully", .{ .message = "operation timed out", .failure_info = .{ .timeout_failure_info = .{ .timeout_type = .TIMEOUT_TYPE_SCHEDULE_TO_CLOSE } } }), "nexus operation completed unsuccessfully <- operation timed out (timed_out)" },
+        .{ try nexusFailure(a, "nexus operation completed unsuccessfully", .{ .message = "operation canceled", .failure_info = .{ .canceled_failure_info = .{} } }), "nexus operation completed unsuccessfully <- operation canceled (canceled)" },
+    };
+    for (cases) |c| {
+        const inst = try create(testing.allocator, NexusWf.Run.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "RunNexus", .{}), a);
+        const want = try std.fmt.allocPrint(a, "\"NexusOperationFailed: {s}\"", .{c[1]});
+        try testing.expectEqualStrings(want, nexusResultOf(try inst.activate(&try nexusStart(a, 1, .{ .failed = c[0] }), a)));
+        // No result follows a failed start; one that did anyway would be ignored.
+        try testing.expectEqual(@as(usize, 0), inst.nexus_operations.count());
+    }
+}
+
+test "nexus: a started operation completes, fails, is canceled, or times out" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const cases = [_]struct { NexusResult.status_union, []const u8 }{
+        .{ try nexusOutput(a, "done"), "\"tok: done\"" },
+        .{ .{ .failed = try nexusFailure(a, "nexus operation completed unsuccessfully", try failure_mod.application(a, .{ .message = "broken" })) }, "\"NexusOperationFailed: nexus operation completed unsuccessfully <- broken (failed)\"" },
+        .{ .{ .cancelled = try nexusFailure(a, "nexus operation completed unsuccessfully", .{ .message = "operation canceled", .failure_info = .{ .canceled_failure_info = .{} } }) }, "\"NexusOperationFailed: nexus operation completed unsuccessfully <- operation canceled (canceled)\"" },
+        .{ .{ .timed_out = try nexusFailure(a, "nexus operation completed unsuccessfully", .{ .message = "operation timed out", .failure_info = .{ .timeout_failure_info = .{} } }) }, "\"NexusOperationFailed: nexus operation completed unsuccessfully <- operation timed out (timed_out)\"" },
+    };
+    for (cases) |c| {
+        const inst = try create(testing.allocator, NexusWf.Run.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "RunNexus", .{}), a);
+        _ = try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+        try testing.expectEqualStrings(c[1], nexusResultOf(try inst.activate(&try nexusResolved(a, 1, c[0]), a)));
+    }
+}
+
+test "nexus: an unhandled operation failure becomes the workflow's failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusWf.Unhandled.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "UnhandledNexus", .{}), a);
+    const f = try nexusFailure(a, "nexus operation completed unsuccessfully", try failure_mod.application(a, .{ .message = "broken", .type = "Broken" }));
+    const done = commandsOf(try inst.activate(&try nexusStart(a, 1, .{ .failed = f }), a));
+    const fail = done[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expectEqualStrings("nexus operation completed unsuccessfully", fail.message);
+    try testing.expect(fail.failure_info.? == .nexus_operation_execution_failure_info);
+    try testing.expectEqualStrings("Broken", failure_mod.applicationType(fail.cause.?.*).?);
+}
+
+test "nexus: void input sends the null payload, and void output ignores the result" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusWf.PingWf.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "PingNexus", .{}), a));
+    const cmd = first[0].variant.?.schedule_nexus_operation;
+    try testing.expectEqualStrings("ping", cmd.operation);
+    try testing.expectEqualStrings("binary/null", converter.encodingOf(cmd.input.?).?);
+    try testing.expectEqual(@as(usize, 0), cmd.input.?.data.len);
+    // A synchronous void operation's result is an empty payload.
+    var act = try nexusStart(a, 1, .{ .started_sync = true });
+    try act.jobs.append(a, .{ .variant = .{ .resolve_nexus_operation = .{ .seq = 1, .result = .{ .status = .{ .completed = .{} } } } } });
+    try testing.expectEqualStrings("\"pong\"", nexusResultOf(try inst.activate(&act, a)));
+}
+
+test "nexus: two operations get their own seqs and resolve in the opposite order" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusWf.Two.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "TwoNexus", .{}), a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.schedule_nexus_operation.seq);
+    try testing.expectEqualStrings("{\"message\":\"one\"}", first[0].variant.?.schedule_nexus_operation.input.?.data);
+    try testing.expectEqual(@as(u32, 2), first[1].variant.?.schedule_nexus_operation.seq);
+    try testing.expectEqualStrings("{\"message\":\"two\"}", first[1].variant.?.schedule_nexus_operation.input.?.data);
+
+    _ = try inst.activate(&try nexusStart(a, 2, .{ .operation_token = "t2" }), a);
+    _ = try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "t1" }), a);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try nexusResolved(a, 2, try nexusOutput(a, "second")), a)).len);
+    try testing.expect(!inst.finished);
+    try testing.expectEqualStrings("\"first second\"", nexusResultOf(try inst.activate(&try nexusResolved(a, 1, try nexusOutput(a, "first")), a)));
+}
+
+test "nexus: an empty endpoint, service or operation returns error.InvalidOptions and sends nothing" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "/hello-service/echo", "hello-endpoint//echo", "hello-endpoint/hello-service/" }) |names| {
+        const inst = try create(testing.allocator, NexusWf.ByName.registered, .{});
+        defer inst.destroy();
+        const done = commandsOf(try inst.activate(&try initActivation(a, "ByNameNexus", .{names}), a));
+        try testing.expectEqual(@as(usize, 1), done.len);
+        try testing.expectEqualStrings("\"InvalidOptions\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+        try testing.expectEqual(@as(u32, 1), inst.next_nexus_seq);
+    }
+    // By name, the input is any value and the names are the ones given.
+    const inst = try create(testing.allocator, NexusWf.ByName.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "ByNameNexus", .{@as([]const u8, "ep/other-service/other-op")}), a));
+    const cmd = first[0].variant.?.schedule_nexus_operation;
+    try testing.expectEqualStrings("ep", cmd.endpoint);
+    try testing.expectEqualStrings("other-service", cmd.service);
+    try testing.expectEqualStrings("other-op", cmd.operation);
+    try testing.expectEqualStrings("7", cmd.input.?.data);
+}
+
+test "nexus: workflow cancellation before the start resolves sends RequestCancelNexusOperation; each type resolves as the core does" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "try_cancel", "abandon", "wait_cancellation_requested", "wait_cancellation_completed" }) |mode| {
+        const inst = try create(testing.allocator, NexusWf.Cancel.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "CancelNexus", .{mode}), a);
+        const cmds = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+        // The request goes to the core whatever the type; the core decides what reaches the
+        // server, and nothing resolves until it says so.
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqual(@as(u32, 1), cmds[0].variant.?.request_cancel_nexus_operation.seq);
+        try testing.expect(!inst.finished);
+        // try_cancel and abandon: the core resolves the operation as canceled at once, with no
+        // start. The other two: the server canceled it before it started, so its start fails.
+        const resolution = if (std.mem.eql(u8, mode, "try_cancel") or std.mem.eql(u8, mode, "abandon"))
+            try nexusResolved(a, 1, .{ .cancelled = try nexusCanceledFailure(a, "Nexus operation cancelled after starting") })
+        else
+            try nexusStart(a, 1, .{ .failed = try nexusCanceledFailure(a, "nexus operation completed unsuccessfully") });
+        const done = commandsOf(try inst.activate(&resolution, a));
+        try testing.expectEqual(@as(usize, 1), done.len);
+        try testing.expect(done[0].variant.? == .cancel_workflow_execution);
+        // A start the core sends after resolving a try_cancel operation is ignored.
+        try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "late" }), a)).len);
+    }
+}
+
+test "nexus: workflow cancellation after the start: each type ends the wait when the core resolves the operation" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "try_cancel", "Nexus operation cancelled after starting" },
+        .{ "abandon", "Nexus operation cancelled after starting" },
+        .{ "wait_cancellation_requested", "Nexus operation cancellation request completed" },
+        .{ "wait_cancellation_completed", "nexus operation completed unsuccessfully" },
+    };
+    for (cases) |c| {
+        const inst = try create(testing.allocator, NexusWf.Cancel.registered, .{});
+        defer inst.destroy();
+        const first = commandsOf(try inst.activate(&try initActivation(a, "CancelNexus", .{c[0]}), a));
+        const want_type: proto.coresdk.nexus.NexusOperationCancellationType = if (std.mem.eql(u8, c[0], "try_cancel")) .TRY_CANCEL else if (std.mem.eql(u8, c[0], "abandon")) .ABANDON else if (std.mem.eql(u8, c[0], "wait_cancellation_requested")) .WAIT_CANCELLATION_REQUESTED else .WAIT_CANCELLATION_COMPLETED;
+        try testing.expect(first[0].variant.?.schedule_nexus_operation.cancellation_type == want_type);
+        _ = try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+        const cmds = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqual(@as(u32, 1), cmds[0].variant.?.request_cancel_nexus_operation.seq);
+        try testing.expect(!inst.finished);
+        const done = commandsOf(try inst.activate(&try nexusResolved(a, 1, .{ .cancelled = try nexusCanceledFailure(a, c[1]) }), a));
+        try testing.expectEqual(@as(usize, 1), done.len);
+        try testing.expect(done[0].variant.? == .cancel_workflow_execution);
+    }
+}
+
+test "nexus: wait_cancellation_completed, an operation that completes despite the cancel returns its result" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelNexus", .{@as([]const u8, "wait_cancellation_completed")}), a);
+    _ = try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+    _ = try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a);
+    // get returns the result; the re-armed cancel then ends the sleep, and the workflow.
+    const done = commandsOf(try inst.activate(&try nexusResolved(a, 1, try nexusOutput(a, "finished anyway")), a));
+    try testing.expect(done[done.len - 1].variant.? == .cancel_workflow_execution);
+    for (done) |cmd| try testing.expect(cmd.variant.? != .complete_workflow_execution);
+}
+
+test "nexus: wait_cancellation_requested, a refused cancel request resolves the operation as failed" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelNexus", .{@as([]const u8, "wait_cancellation_requested+future")}), a);
+    try testing.expectEqual(@as(u32, 1), commandsOf(try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a))[0].variant.?.request_cancel_nexus_operation.seq);
+    const refused = try nexusFailure(a, "Nexus operation cancellation request failed", try failure_mod.application(a, .{ .message = "cannot cancel" }));
+    try testing.expectEqualStrings(
+        "\"NexusOperationFailed: Nexus operation cancellation request failed <- cannot cancel (failed)\"",
+        nexusResultOf(try inst.activate(&try nexusResolved(a, 1, .{ .failed = refused }), a)),
+    );
+}
+
+test "nexus: canceling the future sends RequestCancelNexusOperation, and get reports the cancellation" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "try_cancel+future", "abandon+future", "wait_cancellation_requested+future", "wait_cancellation_completed+future" }) |mode| {
+        const inst = try create(testing.allocator, NexusWf.Cancel.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "CancelNexus", .{mode}), a);
+        const cmds = commandsOf(try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a));
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqual(@as(u32, 1), cmds[0].variant.?.request_cancel_nexus_operation.seq);
+        try testing.expectEqualStrings(
+            "\"NexusOperationFailed: Nexus operation cancelled after starting <-  (canceled)\"",
+            nexusResultOf(try inst.activate(&try nexusResolved(a, 1, .{ .cancelled = try nexusCanceledFailure(a, "Nexus operation cancelled after starting") }), a)),
+        );
+    }
+}
+
+test "nexus: canceled in the workflow task that scheduled it, the operation's start fails canceled" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusWf.Cancel.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "CancelNexus", .{@as([]const u8, "wait_cancellation_completed+now")}), a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expect(first[0].variant.? == .schedule_nexus_operation);
+    try testing.expectEqual(@as(u32, 1), first[1].variant.?.request_cancel_nexus_operation.seq);
+    try testing.expectEqualStrings(
+        "\"NexusOperationFailed: Nexus Operation cancelled before scheduled <-  (canceled)\"",
+        nexusResultOf(try inst.activate(&try nexusStart(a, 1, .{ .failed = try nexusCanceledFailure(a, "Nexus Operation cancelled before scheduled") }), a)),
+    );
+}
+
+test "nexus: eviction ends waits for the start and for the cancellation to resolve" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const starting = try create(testing.allocator, NexusWf.Run.registered, .{});
+    _ = try starting.activate(&try initActivation(a, "RunNexus", .{}), a);
+    starting.destroy();
+
+    const canceling = try create(testing.allocator, NexusWf.Cancel.registered, .{});
+    _ = try canceling.activate(&try initActivation(a, "CancelNexus", .{@as([]const u8, "wait_cancellation_completed")}), a);
+    _ = try canceling.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+    _ = try canceling.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a);
+    canceling.destroy();
 }
 
 // Signals to other workflows. `ExternalWf.Kid` never runs here: the tests resolve it.
