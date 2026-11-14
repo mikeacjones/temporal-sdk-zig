@@ -13,6 +13,7 @@ This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust 
   - `zig build samples-test` builds the samples and validates them against a dev server.
   - `zig build readme-check` checks that README.md's code blocks equal their regions in `examples/readme/` (`zig build test` runs it too), and `zig build readme` rewrites them.
   - `scripts/check-core-version.sh` checks that the sdk-core pin, the cargo workspace in `deps/`, and the proto list agree.
+  - `.review/reports.sh [--base <ref>] [--quick] [--all]` writes the review reports for a change into `.review/out/`: the diff, the checks above, and the scanners' output. Reviewers read `INDEX.txt` there before the code. `.review/install.sh` installs the scanners.
   - `scripts/changelog-check.sh [<base>]` checks the changelog fragments, and the commits since `<base>` for a fragment or trailer; `scripts/changelog-test.sh` tests the changelog scripts.
 - For focused tests, use `-Dtest-filter` (repeatable): `zig build test -Dtest-filter="fibers interleave"`.
 - Use `std.testing.allocator` in tests so leaks fail them. Avoid fixed sleeps in tests: wait on the condition itself.
@@ -93,6 +94,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `samples/` holds the samples, and `tools/samples_runner.zig` validates them. PARITY.md lists them and explains how parity is measured.
 - `examples/readme/` holds the compiled examples that README.md's code blocks copy, and `tools/readme_examples.zig` checks or rewrites the copies.
 - `scripts/` holds maintenance scripts, each with usage in its header.
+- `.review/` holds the review tooling: `reports.sh` runs the checks and the scanners (gitleaks, osv-scanner, cargo-deny, shellcheck, actionlint, typos, zlint) on a change, `install.sh` installs them, and the `.toml` files are their settings. It isn't part of the SDK and isn't in the release tarball.
 - `docs/` holds maintainer documentation.
 - `CONTRIBUTING.md` is the guide for issues and pull requests; `.github/PULL_REQUEST_TEMPLATE.md` and `.github/ISSUE_TEMPLATE/` hold the pull request and issue templates.
 - `.github/workflows/` runs CI (`ci.yml`) and the samples suite (`samples.yml`), and, when dispatched by hand, builds and publishes the core bundles (`core-bundles.yml`) and releases the SDK (`release.yml`).
