@@ -1,0 +1,1 @@
+`testing.createNexusEndpoint` creates a Nexus endpoint through any client, for a server that has no `testing.WorkflowEnvironment`, such as a `testing.DevServer` started with `--namespace` arguments for a handler in another namespace.
