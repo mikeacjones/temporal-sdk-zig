@@ -748,6 +748,54 @@ pub const Client = struct {
         return .{ .run_id = try c.gpa.dupe(u8, response.run_id), .eager = response.eager_workflow_task != null };
     }
 
+    /// Starts the workflow behind a Nexus workflow-run operation (`temporal.nexus`), so the
+    /// server completes the operation when the workflow closes. Applications don't call
+    /// this: return a `nexus.WorkflowStart` from an operation handler instead.
+    ///
+    /// The request is a normal start of `workflow_type` with `options` and `args`, plus
+    /// `attach`: its request ID replaces the generated one, so a retried start with the same
+    /// request ID finds the workflow the first one started; the completion callback (when
+    /// `attach.callback_url` is set) and `attach.links` are recorded with the workflow; and
+    /// a start that finds the workflow already running under `id_conflict_policy`
+    /// `.use_existing` attaches the request ID, callback, and links to it.
+    /// `options.id` must be set. `enable_eager_start` and `error_when_already_started` are
+    /// ignored: a workflow ID held by another start returns
+    /// `error.WorkflowExecutionAlreadyStarted`.
+    ///
+    /// The result's memory, and everything the call allocates, comes from `arena`. Errors are
+    /// `executeWorkflow`'s.
+    pub fn startNexusWorkflow(c: *Client, arena: Allocator, workflow_type: []const u8, options: StartWorkflowOptions, args: anytype, attach: NexusWorkflowAttachments) StartError!NexusWorkflowStarted {
+        if (options.id.len == 0) {
+            log.warn("starting workflow of type \"{s}\" for a Nexus operation: StartWorkflowOptions.id is empty; the operation token names the workflow by ID, so set it", .{workflow_type});
+            return error.InvalidOptions;
+        }
+        var request = try c.startRequest(arena, workflow_type, options.id, options, args);
+        request.request_id = attach.request_id;
+        try request.links.appendSlice(arena, attach.links);
+        if (attach.callback_url.len > 0) {
+            var callback: proto.temporal.api.common.v1.Callback = .{ .variant = .{ .nexus = .{ .url = attach.callback_url } } };
+            for (attach.callback_headers) |h| try callback.variant.?.nexus.header.append(arena, .{ .key = h.name, .value = h.value });
+            try callback.links.appendSlice(arena, attach.links);
+            try request.completion_callbacks.append(arena, callback);
+        }
+        if (attach.callback_url.len > 0 or attach.links.len > 0)
+            request.on_conflict_options = .{ .attach_request_id = true, .attach_completion_callbacks = true, .attach_links = true };
+        var header = try c.outgoingHeader(arena, options.context);
+        const response = c.rpcCall(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", request, arena, null, &header, options.context) catch |err| switch (err) {
+            error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
+            else => |e| return e,
+        };
+        return .{
+            .run_id = response.run_id,
+            .link = response.link orelse .{ .variant = .{ .workflow_event = .{
+                .namespace = c.namespace,
+                .workflow_id = options.id,
+                .run_id = response.run_id,
+                .reference = .{ .request_id_ref = .{ .request_id = attach.request_id, .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED } },
+            } } },
+        };
+    }
+
     /// The start request for `options`, allocated from `a`. Signal-with-start copies it.
     fn startRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype) (search_attributes.EncodeError || error{InvalidOptions})!wfs.StartWorkflowExecutionRequest {
         if (options.task_queue.len == 0) {
@@ -1787,6 +1835,30 @@ pub const StartWorkflowOptions = struct {
     /// the workflow reads them with `ctx.propagated()`. Signal-with-start and update-with-start
     /// send them with the start. Only read during the call.
     context: ?*const propagation.Values = null,
+};
+
+/// What `Client.startNexusWorkflow` attaches to the workflow it starts. Borrowed for the call.
+pub const NexusWorkflowAttachments = struct {
+    /// The Nexus start request's ID, sent as the start's request ID.
+    request_id: []const u8,
+    /// Where the server delivers the operation's completion; empty attaches no callback.
+    callback_url: []const u8 = "",
+    /// Headers the server sends with the completion, the operation token among them.
+    callback_headers: []const NexusHeader = &.{},
+    /// Links back to what scheduled the operation, recorded with the workflow's start.
+    links: []const proto.temporal.api.common.v1.Link = &.{},
+};
+
+/// A Nexus header: names are case-insensitive.
+pub const NexusHeader = struct { name: []const u8, value: []const u8 };
+
+/// The workflow `Client.startNexusWorkflow` started, or found already started by the same
+/// request ID or under `.use_existing`.
+pub const NexusWorkflowStarted = struct {
+    run_id: []const u8,
+    /// Links to the workflow's start event: the server's, or one naming the event by the
+    /// request ID when the server sends none.
+    link: proto.temporal.api.common.v1.Link,
 };
 
 /// How `Client.signalWorkflowWithOptions` sends a signal.

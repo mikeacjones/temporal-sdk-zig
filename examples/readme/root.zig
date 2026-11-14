@@ -8,6 +8,7 @@ test {
     _ = @import("workflows.zig");
     _ = @import("activities.zig");
     _ = @import("workers.zig");
+    _ = @import("nexus.zig");
     _ = @import("converter.zig");
     _ = @import("testing.zig");
     _ = @import("observability.zig");

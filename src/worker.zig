@@ -30,6 +30,7 @@ const failure_mod = @import("failure.zig");
 const log_mod = @import("log.zig");
 const workflow = @import("workflow.zig");
 const activity = @import("activity.zig");
+const nexus = @import("nexus.zig");
 const client_mod = @import("client.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
@@ -158,6 +159,8 @@ pub const Worker = struct {
     dynamic_workflow: ?workflow.Registered = null,
     /// Runs activity types with no entry in `activities`, if set.
     dynamic_activity: ?activity.Registered = null,
+    /// Nexus services by name. Registered only: no poll loop runs them yet.
+    nexus_services: std.StringHashMapUnmanaged(nexus.Registered) = .empty,
     /// The core workers while `run` is active, for `stop` on other threads: the task queue's,
     /// then with sessions, the session queue's and the host queue's.
     /// Guards `core_ptrs`, `stop_requested`, `fatal` and `fatal_message`, which `stop` (any
@@ -185,6 +188,7 @@ pub const Worker = struct {
     pub fn deinit(w: *Worker) void {
         w.workflows.deinit(w.gpa);
         w.activities.deinit(w.gpa);
+        w.nexus_services.deinit(w.gpa);
         w.gpa.free(w.task_queue);
         if (w.fatal_message) |m| w.gpa.free(m);
         w.* = undefined;
@@ -301,6 +305,49 @@ pub const Worker = struct {
             return error.AlreadyRegistered;
         }
         w.dynamic_activity = registered;
+    }
+
+    /// Registers a Nexus service handler defined with `temporal.nexus.ServiceHandler`, under
+    /// its service's name. Use `registerNexusServiceWith` when its handlers take a receiver.
+    /// A service name already registered returns `error.AlreadyRegistered`. Registration
+    /// only stores the handler; call it before `run`, from the thread that owns the worker.
+    pub fn registerNexusService(w: *Worker, comptime Handler: type) RegisterNexusServiceError!void {
+        checkNexusHandler(Handler);
+        return w.registerNexusServiceImpl(Handler.registered);
+    }
+
+    /// Registers a Nexus service handler whose handlers take a receiver, bound to `receiver`.
+    /// The receiver must outlive the worker and be safe to use from several requests at once.
+    /// A service name already registered returns `error.AlreadyRegistered`.
+    pub fn registerNexusServiceWith(w: *Worker, comptime Handler: type, receiver: *Handler.Receiver) RegisterNexusServiceError!void {
+        checkNexusHandler(Handler);
+        return w.registerNexusServiceImpl(Handler.with(receiver));
+    }
+
+    /// `AlreadyRegistered`: the worker already has a handler for the service's name.
+    pub const RegisterNexusServiceError = error{ OutOfMemory, AlreadyRegistered };
+
+    fn checkNexusHandler(comptime Handler: type) void {
+        if (@typeInfo(Handler) != .@"struct" or !@hasDecl(Handler, "service_name") or !@hasDecl(Handler, "operations") or !@hasDecl(Handler, "Receiver"))
+            @compileError("registerNexusService takes a temporal.nexus.ServiceHandler, not " ++ @typeName(Handler));
+    }
+
+    fn registerNexusServiceImpl(w: *Worker, registered: nexus.Registered) RegisterNexusServiceError!void {
+        const gop = try w.nexus_services.getOrPut(w.gpa, registered.name);
+        if (gop.found_existing) {
+            log.warn("registering Nexus service \"{s}\" failed: the worker already has a handler for that service; register each service once", .{registered.name});
+            return error.AlreadyRegistered;
+        }
+        gop.value_ptr.* = registered;
+    }
+
+    /// The operation `operation` of the registered Nexus service `service`, ready to start or
+    /// cancel. Valid while the worker is. Safe to call from several threads once registration
+    /// is done. Returns `error.ServiceNotFound` when no service of that name is registered,
+    /// and `error.OperationNotFound` when the service has no operation of that name.
+    pub fn nexusOperation(w: *const Worker, service: []const u8, operation: []const u8) nexus.LookupError!nexus.BoundOperation {
+        const registered = w.nexus_services.getPtr(service) orelse return error.ServiceNotFound;
+        return registered.find(operation) orelse error.OperationNotFound;
     }
 
     fn hasWorkflows(w: *const Worker) bool {
@@ -1722,8 +1769,56 @@ test "registering an activity type with the SDK's reserved prefix is rejected" {
     try w.registerActivity(HelloTest.Greet);
 }
 
+const NexusTest = struct {
+    const Echo = nexus.OperationDef("echo", []const u8, []const u8);
+    const Count = nexus.OperationDef("count", void, u32);
+    const Service = nexus.ServiceDef("nexus-test", .{ Echo, Count });
+
+    fn echo(ctx: *nexus.Context, input: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "{s}: {s}", .{ ctx.info().service, input });
+    }
+    const Handler = nexus.ServiceHandler(Service, .{
+        nexus.OperationHandler(Echo, echo),
+        nexus.OperationHandler(Count, Counter.count),
+    });
+
+    const Other = nexus.ServiceDef("nexus-other", .{Echo});
+    const OtherHandler = nexus.ServiceHandler(Other, .{nexus.OperationHandler(Echo, echo)});
+    const SameName = nexus.ServiceHandler(nexus.ServiceDef("nexus-test", .{Echo}), .{nexus.OperationHandler(Echo, echo)});
+};
+
+test "registered Nexus services are found by service and operation name, once each" {
+    var client: client_mod.Client = undefined; // registration never touches the client
+    var w = try Worker.init(testing.allocator, testing.io, &client, "nexus", .{});
+    defer w.deinit();
+    var counter: Counter = .{ .step = 7 };
+    try w.registerNexusServiceWith(NexusTest.Handler, &counter);
+    try w.registerNexusService(NexusTest.OtherHandler);
+    try testing.expectError(error.AlreadyRegistered, w.registerNexusService(NexusTest.SameName));
+    try testing.expectError(error.AlreadyRegistered, w.registerNexusServiceWith(NexusTest.Handler, &counter));
+    try testing.expectError(error.ServiceNotFound, w.nexusOperation("no-such-service", "echo"));
+    try testing.expectError(error.OperationNotFound, w.nexusOperation("nexus-test", "no-such-operation"));
+    try testing.expectError(error.OperationNotFound, w.nexusOperation("nexus-other", "count"));
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ctx: nexus.Context = .{ .arena = a, .io_ = testing.io, .info_ = .{ .service = "nexus-test", .operation = "echo" } };
+    const echoed = (try w.nexusOperation("nexus-test", "echo")).start(&ctx, try converter.toPayload(a, @as([]const u8, "hi")));
+    try testing.expectEqualStrings("\"nexus-test: hi\"", echoed.succeeded.result.data);
+    const counted = (try w.nexusOperation("nexus-test", "count")).start(&ctx, null);
+    try testing.expectEqualStrings("7", counted.succeeded.result.data);
+    // Registering services doesn't make a worker runnable: nothing polls them yet.
+    try testing.expect(!w.hasWorkflows() and !w.hasActivities());
+}
+
 const Counter = struct {
     step: u32,
+
+    fn count(c: *Counter, ctx: *nexus.Context) !u32 {
+        _ = ctx;
+        return c.step;
+    }
 
     pub const unit = "count";
 
