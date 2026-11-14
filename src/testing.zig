@@ -2705,6 +2705,24 @@ const VersionFixtures = struct {
             try testing.io.sleep(.fromMilliseconds(100), .awake);
         }
     }
+
+    /// Waits until version `build_id` of `h`'s deployment has polled `task_queue` for
+    /// workflow tasks: the server pins a workflow only to a version that has.
+    fn awaitPolled(h: *const client_mod.WorkerDeploymentHandle, build_id: []const u8, task_queue: []const u8) !void {
+        while (true) {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            // The version can be missing for a moment after the deployment lists it.
+            const version = h.describeVersion(scratch.allocator(), build_id) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (version) |v| for (v.task_queues) |q| {
+                if (q.type == .workflow and std.mem.eql(u8, q.name, task_queue)) return;
+            };
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    }
 };
 
 test "a worker that only reports its deployment version runs workflows that see it" {
@@ -3400,6 +3418,879 @@ test "client: summary, details, priority and a versioning override set at start 
     try testing.expect(plain_started.versioning_override == null);
     try testing.expect(plain_started.retry_policy == null);
     try testing.expect(plain_started.priority == null);
+}
+
+/// A client interceptor that keeps a copy of every terminate, reset and execution-options
+/// request, recorded before the call goes on so a refused call is recorded too. It can play
+/// the server for those calls: `options_answer` (or `reset_answer`) answers
+/// UpdateWorkflowExecutionOptions (or ResetWorkflowExecution), `fail_with` fails them, and
+/// `block` holds them until the calling task is canceled, setting `blocked` first. Copies
+/// live in `arena`, which the test frees after the environment.
+const RequestCapture = struct {
+    const wfs = proto.temporal.api.workflowservice.v1;
+
+    io: Io,
+    mutex: Io.Mutex = .init,
+    arena: std.heap.ArenaAllocator,
+    terminates: std.ArrayList(wfs.TerminateWorkflowExecutionRequest) = .empty,
+    resets: std.ArrayList(wfs.ResetWorkflowExecutionRequest) = .empty,
+    option_updates: std.ArrayList(wfs.UpdateWorkflowExecutionOptionsRequest) = .empty,
+    options_answer: ?wfs.UpdateWorkflowExecutionOptionsResponse = null,
+    reset_answer: ?wfs.ResetWorkflowExecutionResponse = null,
+    fail_with: ?interceptor.ClientError = null,
+    block: bool = false,
+    blocked: Io.Event = .unset,
+
+    pub fn call(r: *RequestCapture, input: *interceptor.ClientCall, next: interceptor.Client.Next) interceptor.ClientError!void {
+        const fail_with, const block = played: {
+            r.mutex.lockUncancelable(r.io);
+            defer r.mutex.unlock(r.io);
+            const a = r.arena.allocator();
+            // The request's memory is the call's arena, freed when the call returns.
+            if (input.request(wfs.TerminateWorkflowExecutionRequest)) |req| {
+                try r.terminates.append(a, try req.dupe(a));
+            } else if (input.request(wfs.ResetWorkflowExecutionRequest)) |req| {
+                try r.resets.append(a, try req.dupe(a));
+            } else if (input.request(wfs.UpdateWorkflowExecutionOptionsRequest)) |req| {
+                try r.option_updates.append(a, try req.dupe(a));
+            } else break :played .{ null, false };
+            if (r.fail_with == null and !r.block) {
+                if (input.response(wfs.UpdateWorkflowExecutionOptionsResponse)) |response| if (r.options_answer) |answer| {
+                    response.* = try answer.dupe(input.arena);
+                    return;
+                };
+                if (input.response(wfs.ResetWorkflowExecutionResponse)) |response| if (r.reset_answer) |answer| {
+                    response.* = try answer.dupe(input.arena);
+                    return;
+                };
+            }
+            break :played .{ r.fail_with, r.block };
+        };
+        if (fail_with) |err| return err;
+        if (block) {
+            r.blocked.set(r.io);
+            var never: Io.Event = .unset;
+            try never.wait(r.io);
+            return error.InvalidResponse;
+        }
+        try next.call(input);
+    }
+
+    fn interceptors(r: *RequestCapture) [1]interceptor.Client {
+        return .{interceptor.Client.from(RequestCapture, r)};
+    }
+};
+
+const ResetFixtures = struct {
+    /// Continues as new `hops` times, then waits for one approval.
+    fn hop(ctx: *workflow.Context, hops: u32) ![]const u8 {
+        if (hops > 0) return ctx.continueAsNew(Hop, .{}, .{hops - 1});
+        return SignalFixtures.awaitApprovals(ctx, 1);
+    }
+    const Hop = workflow.Def("ResetHop", hop);
+
+    /// Schedules an activity on a task queue nobody polls, so it stays pending.
+    fn pendingActivity(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(Fixtures.Greet, .{ .task_queue = "reset-pending-activity-nobody-polls", .start_to_close_timeout = .fromSeconds(60) }, .{"never"}).get();
+    }
+    const PendingActivity = workflow.Def("ResetPendingActivity", pendingActivity);
+
+    const EventTag = std.meta.Tag(proto.temporal.api.history.v1.HistoryEvent.attributes_union);
+
+    /// Waits, long-polling the server, until the run records its `n`th event of kind `tag`,
+    /// and returns that event's ID. Fails if the run closes first.
+    fn awaitEvent(c: *client_mod.Client, id: []const u8, run_id: []const u8, comptime tag: EventTag, n: usize) !i64 {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        var it = try c.historyIterator(id, run_id, .{ .wait_new_event = true });
+        defer it.deinit();
+        var seen: usize = 0;
+        while (try it.next(scratch.allocator())) |event| {
+            const attrs = event.attributes orelse continue;
+            if (attrs != tag) continue;
+            seen += 1;
+            if (seen == n) return event.event_id;
+        }
+        return error.TestUnexpectedResult;
+    }
+
+    /// Waits until the run's first workflow task has completed, and returns the ID of its
+    /// completed event: a point the run can be reset to.
+    fn firstTaskCompleted(c: *client_mod.Client, id: []const u8, run_id: []const u8) !i64 {
+        return awaitEvent(c, id, run_id, .workflow_task_completed_event_attributes, 1);
+    }
+
+    /// The number of events of kind `tag` in the run's history so far.
+    fn countEvents(c: *client_mod.Client, a: Allocator, id: []const u8, run_id: []const u8, comptime tag: EventTag) !usize {
+        var n: usize = 0;
+        for ((try c.fetchHistory(a, id, run_id)).events.items) |event| {
+            const attrs = event.attributes orelse continue;
+            if (attrs == tag) n += 1;
+        }
+        return n;
+    }
+
+    /// The approvers of the run's signaled events, in history order.
+    fn signalers(c: *client_mod.Client, a: Allocator, id: []const u8, run_id: []const u8) ![]const []const u8 {
+        const history = try c.fetchHistory(a, id, run_id);
+        var names: std.ArrayList([]const u8) = .empty;
+        for (history.events.items) |event| switch (event.attributes orelse continue) {
+            .workflow_execution_signaled_event_attributes => |attrs| {
+                if (!std.mem.eql(u8, attrs.signal_name, "approve")) return error.TestUnexpectedResult;
+                const input = attrs.input orelse return error.TestUnexpectedResult;
+                if (input.payloads.items.len != 1) return error.TestUnexpectedResult;
+                try names.append(a, try converter.fromPayload([]const u8, a, input.payloads.items[0]));
+            },
+            else => {},
+        };
+        return names.items;
+    }
+
+    /// The reset's failed workflow task, which the new run's history records at the reset
+    /// point.
+    fn resetEvent(c: *client_mod.Client, a: Allocator, id: []const u8, new_run_id: []const u8, point: i64) !proto.temporal.api.history.v1.WorkflowTaskFailedEventAttributes {
+        const history = try c.fetchHistory(a, id, new_run_id);
+        for (history.events.items) |event| if (event.event_id == point) switch (event.attributes orelse return error.TestUnexpectedResult) {
+            .workflow_task_failed_event_attributes => |attrs| return attrs,
+            else => return error.TestUnexpectedResult,
+        };
+        return error.TestUnexpectedResult;
+    }
+
+    fn lastEvent(c: *client_mod.Client, a: Allocator, id: []const u8, run_id: []const u8) !proto.temporal.api.history.v1.HistoryEvent {
+        const history = try c.fetchHistory(a, id, run_id);
+        if (history.events.items.len == 0) return error.TestUnexpectedResult;
+        return history.events.items[history.events.items.len - 1];
+    }
+
+    /// The terminated event that closed the run.
+    fn terminated(c: *client_mod.Client, a: Allocator, id: []const u8, run_id: []const u8) !proto.temporal.api.history.v1.WorkflowExecutionTerminatedEventAttributes {
+        return switch ((try lastEvent(c, a, id, run_id)).attributes orelse return error.TestUnexpectedResult) {
+            .workflow_execution_terminated_event_attributes => |attrs| attrs,
+            else => error.TestUnexpectedResult,
+        };
+    }
+
+    /// The single payload of a terminated event's details.
+    fn detail(event: proto.temporal.api.history.v1.WorkflowExecutionTerminatedEventAttributes) !converter.Payload {
+        const details = event.details orelse return error.TestUnexpectedResult;
+        if (details.payloads.items.len != 1) return error.TestUnexpectedResult;
+        return details.payloads.items[0];
+    }
+};
+
+test "client: terminate, reset and execution-options API shapes" {
+    // terminateWorkflow keeps its signature and error set.
+    try testing.expect(@TypeOf(client_mod.Client.terminateWorkflow) == fn (*client_mod.Client, []const u8, []const u8, []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void);
+    const terminate_options: client_mod.TerminateOptions = .{};
+    try testing.expectEqualStrings("", terminate_options.first_execution_run_id);
+
+    // The reset point has no default.
+    const reset_info = @typeInfo(client_mod.ResetOptions).@"struct";
+    const point_index = comptime for (reset_info.field_names, 0..) |name, i| {
+        if (std.mem.eql(u8, name, "workflow_task_finish_event_id")) break i;
+    } else unreachable;
+    try testing.expect(reset_info.field_types[point_index] == i64);
+    try testing.expect(reset_info.field_attrs[point_index].default_value_ptr == null);
+    const reset_options: client_mod.ResetOptions = .{ .workflow_task_finish_event_id = 4 };
+    try testing.expectEqualStrings("", reset_options.reason);
+    try testing.expectEqualStrings("", reset_options.request_id);
+
+    // Every exclusion is off by default.
+    const exclude: client_mod.ResetReapplyExclude = .{};
+    try testing.expect(!exclude.signals and !exclude.updates and !exclude.nexus);
+    try testing.expect(@TypeOf(reset_options.reapply_exclude) == client_mod.ResetReapplyExclude);
+
+    // Changes default to changing nothing, so fields can be added without breaking callers.
+    const changes: client_mod.WorkflowExecutionOptionsChanges = .{};
+    try testing.expect(changes.versioning_override == null);
+    try testing.expect(@FieldType(client_mod.VersioningOverrideChange, "set") == deployment_mod.VersioningOverride);
+    try testing.expect(@FieldType(client_mod.WorkflowExecutionOptions, "versioning_override") == ?deployment_mod.VersioningOverride);
+    try testing.expect(@FieldType(client_mod.WorkflowExecutionOptions, "raw") == proto.temporal.api.workflowservice.v1.UpdateWorkflowExecutionOptionsResponse);
+}
+
+test "client: terminate with details and a first-execution run ID; unknown, closed and other-chain runs are NotFound" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+    const Detail = struct { ticket: []const u8, attempts: u32 };
+
+    // Nobody polls the task queue: the runs wait until they are terminated.
+    var guarded = try c.executeWorkflow(Fixtures.Hello, .{ .id = "terminate-guarded", .task_queue = "nobody-polls-this" }, .{"guarded"});
+    defer guarded.deinit();
+    defer c.terminateWorkflow(guarded.id, "", "test cleanup") catch {};
+
+    // Another chain's first run ID: refused, and the run keeps running.
+    try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(guarded.id, "", "wrong chain", Detail{ .ticket = "OPS-1", .attempts = 1 }, .{
+        .first_execution_run_id = try client_mod.uuid(a, testing.io),
+    }));
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, (try c.describeWorkflow(a, guarded.id, guarded.run_id)).status);
+    try testing.expectEqual(0, try ResetFixtures.countEvents(c, a, guarded.id, guarded.run_id, .workflow_execution_terminated_event_attributes));
+
+    // Its own first run ID terminates it, with the details in the terminated event.
+    try c.terminateWorkflowWithOptions(guarded.id, guarded.run_id, "operator request", Detail{ .ticket = "OPS-42", .attempts = 3 }, .{
+        .first_execution_run_id = guarded.run_id,
+    });
+    try testing.expectError(error.WorkflowTerminated, guarded.get(a));
+    const terminated = try ResetFixtures.terminated(c, a, guarded.id, guarded.run_id);
+    try testing.expectEqualStrings("operator request", terminated.reason);
+    try testing.expectEqualStrings(c.identity, terminated.identity);
+    const detail = try converter.fromPayload(Detail, a, try ResetFixtures.detail(terminated));
+    try testing.expectEqualStrings("OPS-42", detail.ticket);
+    try testing.expectEqual(3, detail.attempts);
+    const guarded_request = capture.terminates.items[capture.terminates.items.len - 1];
+    try testing.expectEqualStrings(guarded.run_id, guarded_request.workflow_execution.?.run_id);
+    try testing.expectEqualStrings(guarded.run_id, guarded_request.first_execution_run_id);
+    try testing.expect(guarded_request.details != null);
+
+    // No details sends none: a plain terminate and a `{}` one send the same request.
+    var plain = try c.executeWorkflow(Fixtures.Hello, .{ .id = "terminate-plain", .task_queue = "nobody-polls-this" }, .{"plain"});
+    defer plain.deinit();
+    defer c.terminateWorkflow(plain.id, "", "test cleanup") catch {};
+    var empty = try c.executeWorkflow(Fixtures.Hello, .{ .id = "terminate-empty", .task_queue = "nobody-polls-this" }, .{"empty"});
+    defer empty.deinit();
+    defer c.terminateWorkflow(empty.id, "", "test cleanup") catch {};
+    try c.terminateWorkflow(plain.id, "", "plain");
+    try c.terminateWorkflowWithOptions(empty.id, "", "empty", {}, .{});
+    for ([_][]const u8{ plain.id, empty.id }, [_][]const u8{ plain.run_id, empty.run_id }) |id, run_id| {
+        try testing.expect((try ResetFixtures.terminated(c, a, id, run_id)).details == null);
+    }
+    try testing.expectEqual(4, capture.terminates.items.len);
+    for (capture.terminates.items[2..], [_][]const u8{ "terminate-plain", "terminate-empty" }, [_][]const u8{ "plain", "empty" }) |request, id, reason| {
+        try testing.expect(request.details == null);
+        try testing.expectEqual(0, request.first_execution_run_id.len);
+        try testing.expectEqual(0, request.links.items.len);
+        try testing.expectEqualStrings(c.namespace, request.namespace);
+        try testing.expectEqualStrings(c.identity, request.identity);
+        try testing.expectEqualStrings(id, request.workflow_execution.?.workflow_id);
+        try testing.expectEqual(0, request.workflow_execution.?.run_id.len);
+        try testing.expectEqualStrings(reason, request.reason);
+    }
+
+    // A closed chain and an unknown workflow.
+    try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(guarded.id, "", "again", {}, .{}));
+    try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions("no-such-workflow", "", "x", {}, .{}));
+}
+
+test "client: terminate details pass through the client's codecs" {
+    var reversing: ReversingCodec = .{};
+    const codecs = [_]converter.PayloadCodec{reversing.codec()};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs });
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var run = try c.executeWorkflow(Fixtures.Hello, .{ .id = "terminate-coded", .task_queue = "nobody-polls-this" }, .{"coded"});
+    defer run.deinit();
+    defer c.terminateWorkflow(run.id, "", "test cleanup") catch {};
+    const before = reversing.encoded.load(.monotonic);
+    try c.terminateWorkflowWithOptions(run.id, "", "coded", "secret-detail", .{});
+    try testing.expectEqual(before + 1, reversing.encoded.load(.monotonic));
+
+    const decoded = try ResetFixtures.terminated(c, a, run.id, run.run_id);
+    try testing.expectEqualStrings("secret-detail", try converter.fromPayload([]const u8, a, try ResetFixtures.detail(decoded)));
+
+    // A client without codecs sees what the server stored.
+    var plain = try client_mod.Client.connect(testing.allocator, testing.io, env.server.clientOptions());
+    defer plain.close();
+    const stored = try ResetFixtures.detail(try ResetFixtures.terminated(&plain, a, run.id, run.run_id));
+    try testing.expectEqualStrings(ReversingCodec.encoding, converter.encodingOf(stored) orelse return error.TestUnexpectedResult);
+    const event = try ResetFixtures.lastEvent(&plain, a, run.id, run.run_id);
+    var bytes: Io.Writer.Allocating = .init(a);
+    try event.encode(&bytes.writer, a);
+    try testing.expect(std.mem.indexOf(u8, bytes.written(), "secret-detail") == null);
+}
+
+/// Fails every payload it is asked to encode, and decodes nothing.
+const FailingCodec = struct {
+    fn codec(f: *FailingCodec) converter.PayloadCodec {
+        return .{ .ptr = f, .vtable = &.{ .encode = encode, .decode = decode } };
+    }
+
+    fn encode(_: *anyopaque, _: Allocator, _: Io, _: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return error.CodecFailed;
+    }
+
+    fn decode(_: *anyopaque, arena: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return arena.dupe(converter.Payload, payloads);
+    }
+};
+
+test "client: terminate details a codec fails to encode are CodecFailed, and the workflow keeps running" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.client.executeWorkflow(Fixtures.Hello, .{ .id = "terminate-codec-fails", .task_queue = "nobody-polls-this" }, .{"coded"});
+    defer run.deinit();
+    defer env.client.terminateWorkflow(run.id, "", "test cleanup") catch {};
+
+    var failing_codec: FailingCodec = .{};
+    const codecs = [_]converter.PayloadCodec{failing_codec.codec()};
+    var options = env.server.clientOptions();
+    options.codecs = &codecs;
+    var failing = try client_mod.Client.connect(testing.allocator, testing.io, options);
+    defer failing.close();
+    try testing.expectError(error.CodecFailed, failing.terminateWorkflowWithOptions(run.id, "", "coded", "secret-detail", .{}));
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, (try env.client.describeWorkflow(a, run.id, run.run_id)).status);
+    // No details, nothing to encode: the same client terminates.
+    try failing.terminateWorkflowWithOptions(run.id, "", "plain", {}, .{});
+    try testing.expectError(error.WorkflowTerminated, run.get(a));
+}
+
+test "client: reset, terminate and execution options take the interceptor chain's answers, errors and cancellation as the server's" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+    const wf = proto.temporal.api.workflow.v1;
+
+    // A reset response that names no new run.
+    capture.reset_answer = .{};
+    try testing.expectError(error.InvalidResponse, c.resetWorkflow(a, "chain-reset", "", .{ .workflow_task_finish_event_id = 4 }));
+    try testing.expectEqual(1, capture.resets.items.len);
+
+    // A huge run ID and a non-UTF-8 one come back as given, copied into the caller's arena.
+    const huge = try testing.allocator.alloc(u8, 1024 * 1024);
+    defer testing.allocator.free(huge);
+    for (huge, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    for ([_][]const u8{ huge, "\xff\x00\xfe" }) |run_id| {
+        capture.reset_answer = .{ .run_id = run_id };
+        const got = try c.resetWorkflow(a, "chain-reset", "", .{ .workflow_task_finish_event_id = 4 });
+        try testing.expect(got.ptr != run_id.ptr);
+        for (0..64) |_| @memset(try a.alloc(u8, 64 * 1024), 0xaa);
+        try testing.expectEqualSlices(u8, run_id, got);
+    }
+
+    // Each exclusion maps to its own exclude type.
+    capture.reset_answer = .{ .run_id = "r" };
+    const ExcludeType = proto.temporal.api.enums.v1.ResetReapplyExcludeType;
+    for ([_]client_mod.ResetReapplyExclude{ .{ .signals = true }, .{ .updates = true }, .{ .nexus = true } }, [_]ExcludeType{
+        .RESET_REAPPLY_EXCLUDE_TYPE_SIGNAL,
+        .RESET_REAPPLY_EXCLUDE_TYPE_UPDATE,
+        .RESET_REAPPLY_EXCLUDE_TYPE_NEXUS,
+    }) |exclude, want| {
+        _ = try c.resetWorkflow(a, "chain-reset", "", .{ .workflow_task_finish_event_id = 4, .reapply_exclude = exclude });
+        try testing.expectEqualSlices(ExcludeType, &.{want}, capture.resets.items[capture.resets.items.len - 1].reset_reapply_exclude_types.items);
+    }
+    capture.reset_answer = null;
+
+    // The options the response reports are lifted into the result, and `raw` keeps the rest.
+    capture.options_answer = .{ .workflow_execution_options = .{ .versioning_override = .{ .override = .{ .pinned = .{
+        .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED,
+        .version = .{ .deployment_name = "rollout", .build_id = "v1" },
+    } } } } };
+    const pinned = try c.updateWorkflowExecutionOptions(a, "chain-options", "", .{ .versioning_override = .remove });
+    try testing.expectEqualDeep(@as(?deployment_mod.VersioningOverride, .{ .pinned = .{ .deployment_name = "rollout", .build_id = "v1" } }), pinned.versioning_override);
+    capture.options_answer = .{ .workflow_execution_options = .{ .versioning_override = wf.VersioningOverride{
+        .override = .{ .one_time = .{ .target_deployment_version = .{ .deployment_name = "rollout", .build_id = "v1" } } },
+    } } };
+    const one_time = try c.updateWorkflowExecutionOptions(a, "chain-options", "", .{ .versioning_override = .remove });
+    try testing.expect(one_time.versioning_override == null);
+    const raw_override = (one_time.raw.workflow_execution_options orelse return error.TestUnexpectedResult).versioning_override orelse return error.TestUnexpectedResult;
+    try testing.expect((raw_override.override orelse return error.TestUnexpectedResult) == .one_time);
+    capture.options_answer = .{};
+    const empty = try c.updateWorkflowExecutionOptions(a, "chain-options", "", .{ .versioning_override = .remove });
+    try testing.expect(empty.versioning_override == null);
+    try testing.expect(empty.raw.workflow_execution_options == null);
+    capture.options_answer = null;
+
+    // Each error the chain can return comes back as returned, except AlreadyExists, which
+    // none of these calls can return.
+    inline for (@typeInfo(interceptor.ClientError).error_set.error_names.?) |name| {
+        const err = @field(anyerror, name);
+        capture.fail_with = @errorCast(err);
+        const want: anyerror = if (err == error.AlreadyExists) error.InvalidResponse else err;
+        try testing.expectError(want, c.resetWorkflow(a, "chain-errors", "", .{ .workflow_task_finish_event_id = 4 }));
+        try testing.expectError(want, c.updateWorkflowExecutionOptions(a, "chain-errors", "", .{ .versioning_override = .remove }));
+        try testing.expectError(want, c.terminateWorkflowWithOptions("chain-errors", "", "x", "detail", .{}));
+    }
+    capture.fail_with = null;
+
+    // Canceling the calling task mid-call returns Canceled, and leaks nothing.
+    const Calls = struct {
+        fn reset(cl: *client_mod.Client) client_mod.ResetError!void {
+            var call_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer call_arena.deinit();
+            _ = try cl.resetWorkflow(call_arena.allocator(), "chain-cancel", "", .{ .workflow_task_finish_event_id = 4 });
+        }
+        fn options(cl: *client_mod.Client) client_mod.UpdateExecutionOptionsError!void {
+            var call_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer call_arena.deinit();
+            _ = try cl.updateWorkflowExecutionOptions(call_arena.allocator(), "chain-cancel", "", .{ .versioning_override = .{ .set = .auto_upgrade } });
+        }
+        fn terminate(cl: *client_mod.Client) client_mod.TerminateError!void {
+            return cl.terminateWorkflowWithOptions("chain-cancel", "", "x", .{ .big = "detail" }, .{ .first_execution_run_id = "abc" });
+        }
+    };
+    capture.block = true;
+    var reset = try testing.io.concurrent(Calls.reset, .{c});
+    try capture.blocked.wait(testing.io);
+    capture.blocked.reset();
+    try testing.expectError(error.Canceled, reset.cancel(testing.io));
+    var options = try testing.io.concurrent(Calls.options, .{c});
+    try capture.blocked.wait(testing.io);
+    capture.blocked.reset();
+    try testing.expectError(error.Canceled, options.cancel(testing.io));
+    var terminate = try testing.io.concurrent(Calls.terminate, .{c});
+    try capture.blocked.wait(testing.io);
+    capture.blocked.reset();
+    try testing.expectError(error.Canceled, terminate.cancel(testing.io));
+}
+
+test "client: reset a running workflow: later signals are reapplied, the old run ends terminated, and the new run replays and completes" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    try env.registerWorkflow(ResetFixtures.PendingActivity);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var run = try env.startWorkflow(SignalFixtures.AwaitApprovals, .{ .id = "reset-running", .task_queue = "" }, .{3});
+    defer run.deinit();
+    defer c.terminateWorkflow(run.id, "", "test cleanup") catch {};
+    // A handle with an empty run ID, made before the reset.
+    var latest_handle = try c.getWorkflow([]const u8, run.id, "");
+    defer latest_handle.deinit();
+    const point = try ResetFixtures.firstTaskCompleted(c, run.id, run.run_id);
+    try c.signalWorkflow(SignalFixtures.Approve, run.id, run.run_id, .{"ann"});
+    try c.signalWorkflow(SignalFixtures.Approve, run.id, run.run_id, .{"bob"});
+
+    // An empty run ID resets the latest run.
+    const new_run_id = try c.resetWorkflow(a, run.id, "", .{ .workflow_task_finish_event_id = point, .reason = "replay the approvals" });
+    try testing.expect(new_run_id.len > 0);
+    try testing.expect(!std.mem.eql(u8, new_run_id, run.run_id));
+
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.terminated, (try c.describeWorkflow(a, run.id, run.run_id)).status);
+    try testing.expectEqualStrings("replay the approvals", (try ResetFixtures.terminated(c, a, run.id, run.run_id)).reason);
+    // The base run names the run that replaced it: how a caller tells whether a reset happened.
+    const base_info = (try c.describeWorkflow(a, run.id, run.run_id)).raw.workflow_extended_info orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(new_run_id, base_info.reset_run_id);
+    const latest = try c.describeWorkflow(a, run.id, "");
+    try testing.expectEqualStrings(new_run_id, latest.run_id);
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, latest.status);
+
+    const reset = try ResetFixtures.resetEvent(c, a, run.id, new_run_id, point);
+    try testing.expectEqual(.WORKFLOW_TASK_FAILED_CAUSE_RESET_WORKFLOW, reset.cause);
+    try testing.expectEqualStrings("replay the approvals", (reset.failure orelse return error.TestUnexpectedResult).message);
+    try testing.expectEqualStrings(run.run_id, reset.base_run_id);
+    try testing.expectEqualStrings(new_run_id, reset.new_run_id);
+    // The signals after the reset point are reapplied by default.
+    const signalers = try ResetFixtures.signalers(c, a, run.id, new_run_id);
+    try testing.expectEqual(2, signalers.len);
+    try testing.expectEqualStrings("ann", signalers[0]);
+    try testing.expectEqualStrings("bob", signalers[1]);
+
+    // The handle that names the old run doesn't follow the reset.
+    try testing.expectError(error.WorkflowTerminated, run.get(a));
+
+    // Waiting for the result replays the new run's history, reset event included.
+    try c.signalWorkflow(SignalFixtures.Approve, run.id, new_run_id, .{"cy"});
+    var next = try c.getWorkflow([]const u8, run.id, new_run_id);
+    defer next.deinit();
+    try testing.expectEqualStrings("ann bob cy", try env.getResult(SignalFixtures.AwaitApprovals, &next, a, null));
+    // The handle with an empty run ID reads the latest run, so it follows.
+    try testing.expectEqualStrings("ann bob cy", try latest_handle.get(a));
+
+    try testing.expectEqual(1, capture.resets.items.len);
+    const request = capture.resets.items[0];
+    try testing.expectEqualStrings(c.namespace, request.namespace);
+    try testing.expectEqualStrings(c.identity, request.identity);
+    try testing.expectEqualStrings("reset-running", request.workflow_execution.?.workflow_id);
+    try testing.expectEqual(0, request.workflow_execution.?.run_id.len);
+    try testing.expectEqual(point, request.workflow_task_finish_event_id);
+    try testing.expectEqualStrings("replay the approvals", request.reason);
+    try testing.expectEqual(36, request.request_id.len);
+    try testing.expectEqual(0, @backingInt(request.reset_reapply_type));
+    try testing.expectEqual(0, request.reset_reapply_exclude_types.items.len);
+    try testing.expectEqual(0, request.post_reset_operations.items.len);
+
+    // A run with a pending activity: the new run replays up to the reset point on the
+    // worker and schedules the activity again. A nondeterminism failure would fail that
+    // workflow task instead.
+    var pending = try env.startWorkflow(ResetFixtures.PendingActivity, .{ .id = "reset-pending-activity", .task_queue = "" }, .{});
+    defer pending.deinit();
+    defer c.terminateWorkflow(pending.id, "", "test cleanup") catch {};
+    const pending_point = try ResetFixtures.firstTaskCompleted(c, pending.id, pending.run_id);
+    try testing.expectEqual(1, try ResetFixtures.countEvents(c, a, pending.id, pending.run_id, .activity_task_scheduled_event_attributes));
+    const pending_new = try c.resetWorkflow(a, pending.id, "", .{ .workflow_task_finish_event_id = pending_point });
+    _ = try ResetFixtures.awaitEvent(c, pending.id, pending_new, .activity_task_scheduled_event_attributes, 1);
+    try testing.expectEqual(1, try ResetFixtures.countEvents(c, a, pending.id, pending_new, .workflow_task_failed_event_attributes));
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, (try c.describeWorkflow(a, pending.id, pending_new)).status);
+}
+
+test "client: reset with reapply exclusions: a reset completed workflow gets no signals and runs again, and an update after the reset point is reapplied unless excluded" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    try env.registerWorkflow(UpdateFixtures.HandleUpdatesChanged);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var run = try env.startWorkflow(SignalFixtures.AwaitApprovals, .{ .id = "reset-closed", .task_queue = "" }, .{1});
+    defer run.deinit();
+    defer c.terminateWorkflow(run.id, "", "test cleanup") catch {};
+    const point = try ResetFixtures.firstTaskCompleted(c, run.id, run.run_id);
+    try c.signalWorkflow(SignalFixtures.Approve, run.id, run.run_id, .{"ann"});
+    try testing.expectEqualStrings("ann", try env.getResult(SignalFixtures.AwaitApprovals, &run, a, null));
+
+    const new_run_id = try c.resetWorkflow(a, run.id, run.run_id, .{
+        .workflow_task_finish_event_id = point,
+        .reason = "rerun",
+        .reapply_exclude = .{ .signals = true, .updates = true, .nexus = true },
+    });
+    // A closed base run stays as it was.
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.completed, (try c.describeWorkflow(a, run.id, run.run_id)).status);
+    // Without the signal, the new run waits for one.
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, (try c.describeWorkflow(a, run.id, new_run_id)).status);
+    try testing.expectEqual(0, (try ResetFixtures.signalers(c, a, run.id, new_run_id)).len);
+    _ = try ResetFixtures.resetEvent(c, a, run.id, new_run_id, point);
+
+    try c.signalWorkflow(SignalFixtures.Approve, run.id, new_run_id, .{"bob"});
+    var next = try c.getWorkflow([]const u8, run.id, new_run_id);
+    defer next.deinit();
+    try testing.expectEqualStrings("bob", try env.getResult(SignalFixtures.AwaitApprovals, &next, a, null));
+
+    try testing.expectEqual(1, capture.resets.items.len);
+    const request = capture.resets.items[0];
+    try testing.expectEqualStrings(run.run_id, request.workflow_execution.?.run_id);
+    try testing.expectEqual(36, request.request_id.len);
+    try testing.expectEqual(0, @backingInt(request.reset_reapply_type));
+    const excluded = request.reset_reapply_exclude_types.items;
+    try testing.expectEqual(3, excluded.len);
+    for ([_]proto.temporal.api.enums.v1.ResetReapplyExcludeType{
+        .RESET_REAPPLY_EXCLUDE_TYPE_SIGNAL,
+        .RESET_REAPPLY_EXCLUDE_TYPE_UPDATE,
+        .RESET_REAPPLY_EXCLUDE_TYPE_NEXUS,
+    }) |want| {
+        try testing.expect(std.mem.indexOfScalar(proto.temporal.api.enums.v1.ResetReapplyExcludeType, excluded, want) != null);
+    }
+
+    // Updates accepted after the reset point are reapplied to the new run and run again
+    // there, unless excluded.
+    for ([_]bool{ false, true }) |exclude| {
+        const id = if (exclude) "reset-updates-excluded" else "reset-updates-reapplied";
+        var updated = try env.startWorkflow(UpdateFixtures.HandleUpdatesChanged, .{ .id = id, .task_queue = "" }, .{});
+        defer updated.deinit();
+        defer c.terminateWorkflow(updated.id, "", "test cleanup") catch {};
+        const update_point = try ResetFixtures.firstTaskCompleted(c, updated.id, updated.run_id);
+        var set = try c.updateWorkflow(UpdateFixtures.Set, updated.id, updated.run_id, .{5}, .{});
+        defer set.deinit();
+        try testing.expectEqual(0, try set.get(a));
+        var greet = try c.updateWorkflow(UpdateFixtures.Greet, updated.id, updated.run_id, .{"ann"}, .{});
+        defer greet.deinit();
+        try testing.expectEqualStrings("ann", try greet.get(a));
+
+        const reset_id = try c.resetWorkflow(a, updated.id, "", .{ .workflow_task_finish_event_id = update_point, .reapply_exclude = .{ .updates = exclude } });
+        try c.signalWorkflow(UpdateFixtures.Done, updated.id, reset_id, .{});
+        var reset_run = try c.getWorkflow([]const u8, updated.id, reset_id);
+        defer reset_run.deinit();
+        try testing.expectEqualStrings(if (exclude) "0 " else "5 ann", try env.getResult(UpdateFixtures.HandleUpdatesChanged, &reset_run, a, null));
+        const reapplied: usize = if (exclude) 0 else 2;
+        try testing.expectEqual(reapplied, try ResetFixtures.countEvents(c, a, updated.id, reset_id, .workflow_execution_update_admitted_event_attributes));
+        try testing.expectEqual(reapplied, try ResetFixtures.countEvents(c, a, updated.id, reset_id, .workflow_execution_update_accepted_event_attributes));
+    }
+}
+
+test "client: a reset's request ID is sent as given, and repeating it resets again; first-execution and closed run IDs across continue-as-new and a reset" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    try env.registerWorkflow(ResetFixtures.Hop);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var run = try env.startWorkflow(SignalFixtures.AwaitApprovals, .{ .id = "reset-request-id", .task_queue = "" }, .{1});
+    defer run.deinit();
+    defer c.terminateWorkflow(run.id, "", "test cleanup") catch {};
+    const point = try ResetFixtures.firstTaskCompleted(c, run.id, run.run_id);
+
+    const options: client_mod.ResetOptions = .{ .workflow_task_finish_event_id = point, .request_id = "reset-once" };
+    const first = try c.resetWorkflow(a, run.id, run.run_id, options);
+    const second = try c.resetWorkflow(a, run.id, run.run_id, options);
+    // Observed on dev server 1.32.2: the server doesn't deduplicate resets by request ID. If
+    // this fails, the server started to: update the README's note on request_id.
+    try testing.expect(!std.mem.eql(u8, first, second));
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.terminated, (try c.describeWorkflow(a, run.id, first)).status);
+    const latest = try c.describeWorkflow(a, run.id, "");
+    try testing.expectEqualStrings(second, latest.run_id);
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, latest.status);
+
+    try testing.expectEqual(2, capture.resets.items.len);
+    for (capture.resets.items) |request| try testing.expectEqualStrings("reset-once", request.request_id);
+
+    // The chain's first run is still the original one: a reset run's ID doesn't match it.
+    try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(run.id, "", "x", {}, .{ .first_execution_run_id = first }));
+    try c.terminateWorkflowWithOptions(run.id, "", "done", {}, .{ .first_execution_run_id = run.run_id });
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.terminated, (try c.describeWorkflow(a, run.id, second)).status);
+
+    // A chain that continued as new once: its second run waits for an approval.
+    var chain = try env.startWorkflow(ResetFixtures.Hop, .{ .id = "reset-chain", .task_queue = "" }, .{1});
+    defer chain.deinit();
+    defer c.terminateWorkflow(chain.id, "", "test cleanup") catch {};
+    var close = try c.historyIterator(chain.id, chain.run_id, .{ .wait_new_event = true, .filter = .close_event });
+    defer close.deinit();
+    const hopped = switch (((try close.next(a)) orelse return error.TestUnexpectedResult).attributes orelse return error.TestUnexpectedResult) {
+        .workflow_execution_continued_as_new_event_attributes => |attrs| attrs.new_execution_run_id,
+        else => return error.TestUnexpectedResult,
+    };
+    const chain_point = try ResetFixtures.firstTaskCompleted(c, chain.id, hopped);
+
+    // A later run of the chain is not its first.
+    try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(chain.id, "", "later run", {}, .{ .first_execution_run_id = hopped }));
+    // The first run closed by continuing as new: naming it is NotFound.
+    try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(chain.id, chain.run_id, "closed run", {}, .{}));
+    try testing.expectError(error.NotFound, c.updateWorkflowExecutionOptions(a, chain.id, chain.run_id, .{ .versioning_override = .{ .set = .auto_upgrade } }));
+
+    // The reset closes the second run, and naming it is NotFound too.
+    const third = try c.resetWorkflow(a, chain.id, "", .{ .workflow_task_finish_event_id = chain_point });
+    try testing.expectError(error.NotFound, c.updateWorkflowExecutionOptions(a, chain.id, hopped, .{ .versioning_override = .{ .set = .auto_upgrade } }));
+    try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(chain.id, hopped, "reset run", {}, .{}));
+    const changed = try c.updateWorkflowExecutionOptions(a, chain.id, third, .{ .versioning_override = .{ .set = .auto_upgrade } });
+    try testing.expect(changed.versioning_override.? == .auto_upgrade);
+    // The server holds the event back while a workflow task is in progress, as the reset
+    // run's first one may be: wait for it rather than read the history once.
+    _ = try ResetFixtures.awaitEvent(c, chain.id, third, .workflow_execution_options_updated_event_attributes, 1);
+    try testing.expectEqual(1, try ResetFixtures.countEvents(c, a, chain.id, third, .workflow_execution_options_updated_event_attributes));
+    // The chain's first run survives continue-as-new and the reset.
+    try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(chain.id, "", "reset run's id", {}, .{ .first_execution_run_id = third }));
+    try c.terminateWorkflowWithOptions(chain.id, third, "original", {}, .{ .first_execution_run_id = chain.run_id });
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.terminated, (try c.describeWorkflow(a, chain.id, third)).status);
+}
+
+test "client: reset event IDs: unknown workflow or run is NotFound, a non-positive one is InvalidOptions before any call, one the server refuses is RpcFailed, and a workflow task's started or failed event is accepted" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var run = try env.startWorkflow(SignalFixtures.AwaitApprovals, .{ .id = "reset-errors", .task_queue = "" }, .{1});
+    defer run.deinit();
+    defer c.terminateWorkflow(run.id, "", "test cleanup") catch {};
+    const point = try ResetFixtures.firstTaskCompleted(c, run.id, run.run_id);
+
+    for ([_]i64{ 0, -5, std.math.minInt(i64) }) |event_id| {
+        try testing.expectError(error.InvalidOptions, c.resetWorkflow(a, run.id, "", .{ .workflow_task_finish_event_id = event_id }));
+    }
+    try testing.expectEqual(0, capture.resets.items.len);
+
+    // Event 1 (the workflow's start), beyond the history, and an event that isn't at a
+    // workflow task's boundary.
+    const last = (try ResetFixtures.lastEvent(c, a, run.id, run.run_id)).event_id;
+    for ([_]i64{ 1, last + 1, 999, std.math.maxInt(i64) }) |event_id| {
+        try testing.expectError(error.RpcFailed, c.resetWorkflow(a, run.id, "", .{ .workflow_task_finish_event_id = event_id }));
+    }
+    const history = try c.fetchHistory(a, run.id, run.run_id);
+    const scheduled = for (history.events.items) |event| {
+        if (event.event_id == point - 2) break event;
+    } else return error.TestUnexpectedResult;
+    try testing.expect((scheduled.attributes orelse return error.TestUnexpectedResult) == .workflow_task_scheduled_event_attributes);
+    try testing.expectError(error.RpcFailed, c.resetWorkflow(a, run.id, "", .{ .workflow_task_finish_event_id = point - 2 }));
+
+    try testing.expectError(error.NotFound, c.resetWorkflow(a, "no-such-workflow", "", .{ .workflow_task_finish_event_id = 4 }));
+    try testing.expectError(error.NotFound, c.resetWorkflow(a, run.id, try client_mod.uuid(a, testing.io), .{ .workflow_task_finish_event_id = point }));
+
+    // Nothing was reset.
+    const latest = try c.describeWorkflow(a, run.id, "");
+    try testing.expectEqualStrings(run.run_id, latest.run_id);
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, latest.status);
+    try testing.expectEqual(7, capture.resets.items.len);
+
+    // The server also accepts a workflow task's started event.
+    const started_point = for (history.events.items) |event| {
+        const attrs = event.attributes orelse continue;
+        if (attrs == .workflow_task_started_event_attributes and event.event_id < point) break event.event_id;
+    } else return error.TestUnexpectedResult;
+    const started = try c.resetWorkflow(a, run.id, "", .{ .workflow_task_finish_event_id = started_point, .reason = "started" });
+
+    // A reset run reset to the reset's own failed workflow task.
+    const failed_point = try ResetFixtures.awaitEvent(c, run.id, started, .workflow_task_failed_event_attributes, 1);
+    _ = try ResetFixtures.awaitEvent(c, run.id, started, .workflow_task_completed_event_attributes, 1);
+    const again = try c.resetWorkflow(a, run.id, started, .{ .workflow_task_finish_event_id = failed_point, .reason = "reset of a reset" });
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.terminated, (try c.describeWorkflow(a, run.id, started)).status);
+    try c.signalWorkflow(SignalFixtures.Approve, run.id, again, .{"ann"});
+    var next = try c.getWorkflow([]const u8, run.id, again);
+    defer next.deinit();
+    try testing.expectEqualStrings("ann", try env.getResult(SignalFixtures.AwaitApprovals, &next, a, null));
+}
+
+test "client: execution options: set a pinned, then an auto-upgrade override, then remove it; history and describe follow" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    // The server pins only to a version that has polled the workflow's task queue.
+    var rollout = try c.workerDeployment("rollout");
+    defer rollout.deinit();
+    var v1: VersionFixtures.VersionWorker = undefined;
+    try v1.start(c, "options-override", "v1");
+    defer v1.stop();
+    try VersionFixtures.awaitVersion(&rollout, "v1");
+    try VersionFixtures.awaitPolled(&rollout, "v1", "options-override");
+
+    // v1 isn't current and no unversioned worker polls, so the first workflow task waits
+    // until the pin sends it to v1.
+    var run = try c.executeWorkflow(VersionFixtures.AutoRollout, .{ .id = "options-pinned", .task_queue = "options-override" }, .{});
+    defer run.deinit();
+    defer c.terminateWorkflow(run.id, "", "test cleanup") catch {};
+
+    const pinned = try c.updateWorkflowExecutionOptions(a, run.id, "", .{ .versioning_override = .{ .set = .{ .pinned = .{ .deployment_name = "rollout", .build_id = "v1" } } } });
+    try testing.expectEqualStrings("rollout", pinned.versioning_override.?.pinned.deployment_name);
+    try testing.expectEqualStrings("v1", pinned.versioning_override.?.pinned.build_id);
+    try testing.expectEqualStrings("v1", pinned.raw.workflow_execution_options.?.versioning_override.?.override.?.pinned.version.?.build_id);
+    try testing.expectEqualStrings("v1", try c.queryWorkflow(VersionFixtures.StartedOn, a, run.id, "", .{}));
+    const pinned_info = (try c.describeWorkflow(a, run.id, "")).raw.workflow_execution_info.?.versioning_info.?;
+    try testing.expectEqualStrings("v1", pinned_info.versioning_override.?.override.?.pinned.version.?.build_id);
+
+    const auto = try c.updateWorkflowExecutionOptions(a, run.id, "", .{ .versioning_override = .{ .set = .auto_upgrade } });
+    try testing.expect(auto.versioning_override.? == .auto_upgrade);
+    const auto_info = (try c.describeWorkflow(a, run.id, "")).raw.workflow_execution_info.?.versioning_info.?;
+    try testing.expect(auto_info.versioning_override.?.override.?.auto_upgrade);
+
+    const removed = try c.updateWorkflowExecutionOptions(a, run.id, "", .{ .versioning_override = .remove });
+    try testing.expect(removed.versioning_override == null);
+    // The run's own versioning info stays (it ran on v1); only the override is gone.
+    if ((try c.describeWorkflow(a, run.id, "")).raw.workflow_execution_info.?.versioning_info) |info| {
+        try testing.expect(info.versioning_override == null);
+    }
+
+    _ = try ResetFixtures.awaitEvent(c, run.id, run.run_id, .workflow_execution_options_updated_event_attributes, 3);
+    const history = try c.fetchHistory(a, run.id, run.run_id);
+    var updates: std.ArrayList(proto.temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes) = .empty;
+    for (history.events.items) |event| switch (event.attributes orelse continue) {
+        .workflow_execution_options_updated_event_attributes => |attrs| try updates.append(a, attrs),
+        else => {},
+    };
+    try testing.expectEqual(3, updates.items.len);
+    const pin = updates.items[0].versioning_override.?.override.?.pinned;
+    try testing.expectEqual(.PINNED_OVERRIDE_BEHAVIOR_PINNED, pin.behavior);
+    try testing.expectEqualStrings("rollout", pin.version.?.deployment_name);
+    try testing.expectEqualStrings("v1", pin.version.?.build_id);
+    try testing.expect(!updates.items[0].unset_versioning_override);
+    try testing.expectEqualStrings(c.identity, updates.items[0].identity);
+    try testing.expect(updates.items[1].versioning_override.?.override.?.auto_upgrade);
+    try testing.expect(updates.items[2].unset_versioning_override);
+    try testing.expect(updates.items[2].versioning_override == null);
+
+    try testing.expectEqual(3, capture.option_updates.items.len);
+    for (capture.option_updates.items) |request| {
+        const paths = request.update_mask.?.paths.items;
+        try testing.expectEqual(1, paths.len);
+        try testing.expectEqualStrings("versioning_override", paths[0]);
+        try testing.expect(request.workflow_execution_options != null);
+        try testing.expectEqualStrings(c.namespace, request.namespace);
+        try testing.expectEqualStrings(c.identity, request.identity);
+        try testing.expectEqualStrings("options-pinned", request.workflow_execution.?.workflow_id);
+        try testing.expectEqual(0, request.workflow_execution.?.run_id.len);
+    }
+    try testing.expect(capture.option_updates.items[2].workflow_execution_options.?.versioning_override == null);
+}
+
+test "client: execution options errors and no-ops: no change is InvalidOptions, a pin the server refuses is RpcFailed, a change to the options as they are records nothing, unknown and closed workflows are NotFound" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    // v1 polls a task queue other than the workflow's.
+    var rollout = try c.workerDeployment("rollout");
+    defer rollout.deinit();
+    var v1: VersionFixtures.VersionWorker = undefined;
+    try v1.start(c, "options-errors-other-queue", "v1");
+    defer v1.stop();
+    try VersionFixtures.awaitPolled(&rollout, "v1", "options-errors-other-queue");
+
+    var run = try c.executeWorkflow(Fixtures.Hello, .{ .id = "options-errors", .task_queue = "nobody-polls-this" }, .{"options"});
+    defer run.deinit();
+    defer c.terminateWorkflow(run.id, "", "test cleanup") catch {};
+
+    try testing.expectError(error.InvalidOptions, c.updateWorkflowExecutionOptions(a, run.id, "", .{}));
+    try testing.expectEqual(0, capture.option_updates.items.len);
+
+    // Pins to versions that never polled, have empty or huge names, or polled another queue.
+    const long = try a.alloc(u8, 1024);
+    @memset(long, 'v');
+    for ([_]deployment_mod.Version{
+        .{ .deployment_name = "rollout", .build_id = "never-polled" },
+        .{ .deployment_name = "", .build_id = "" },
+        .{ .deployment_name = "rollout", .build_id = "" },
+        .{ .deployment_name = "", .build_id = "v1" },
+        .{ .deployment_name = long, .build_id = long },
+        .{ .deployment_name = "rollout", .build_id = "v1" },
+    }) |version| {
+        try testing.expectError(error.RpcFailed, c.updateWorkflowExecutionOptions(a, run.id, "", .{ .versioning_override = .{ .set = .{ .pinned = version } } }));
+    }
+    try testing.expectEqual(0, try ResetFixtures.countEvents(c, a, run.id, run.run_id, .workflow_execution_options_updated_event_attributes));
+
+    // Each step names the run; one that leaves the options as they were records nothing.
+    const Step = struct { change: client_mod.VersioningOverrideChange, events: usize };
+    for ([_]Step{
+        .{ .change = .remove, .events = 0 },
+        .{ .change = .{ .set = .auto_upgrade }, .events = 1 },
+        .{ .change = .{ .set = .auto_upgrade }, .events = 1 },
+        .{ .change = .remove, .events = 2 },
+        .{ .change = .remove, .events = 2 },
+    }) |step| {
+        const options = try c.updateWorkflowExecutionOptions(a, run.id, run.run_id, .{ .versioning_override = step.change });
+        switch (step.change) {
+            .remove => try testing.expect(options.versioning_override == null),
+            .set => try testing.expect((options.versioning_override orelse return error.TestUnexpectedResult) == .auto_upgrade),
+        }
+        try testing.expectEqualStrings(run.run_id, capture.option_updates.items[capture.option_updates.items.len - 1].workflow_execution.?.run_id);
+        try testing.expectEqual(step.events, try ResetFixtures.countEvents(c, a, run.id, run.run_id, .workflow_execution_options_updated_event_attributes));
+    }
+
+    try testing.expectError(error.NotFound, c.updateWorkflowExecutionOptions(a, "no-such-workflow", "", .{ .versioning_override = .{ .set = .auto_upgrade } }));
+    try c.terminateWorkflow(run.id, "", "close it");
+    try testing.expectError(error.NotFound, c.updateWorkflowExecutionOptions(a, run.id, "", .{ .versioning_override = .{ .set = .auto_upgrade } }));
+    try testing.expectEqual(13, capture.option_updates.items.len);
 }
 
 test "client: an empty task queue fails every client start before any call; the environment fills in its own" {

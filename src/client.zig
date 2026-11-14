@@ -846,13 +846,7 @@ pub const Client = struct {
             .summary = if (options.static_summary.len > 0) try converter.toPayload(a, options.static_summary) else null,
             .details = if (options.static_details.len > 0) try converter.toPayload(a, options.static_details) else null,
         };
-        if (options.versioning_override) |o| request.versioning_override = .{ .override = switch (o) {
-            .pinned => |v| .{ .pinned = .{
-                .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED,
-                .version = .{ .deployment_name = v.deployment_name, .build_id = v.build_id },
-            } },
-            .auto_upgrade => .{ .auto_upgrade = true },
-        } };
+        if (options.versioning_override) |o| request.versioning_override = versioningOverrideProto(o);
         if (options.priority) |p| request.priority = .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight };
         return request;
     }
@@ -939,8 +933,17 @@ pub const Client = struct {
     }
 
     /// Terminates a workflow execution: it stops at once, with no chance to clean up. An empty
-    /// `run_id` targets the latest run.
+    /// `run_id` targets the latest run. Returns `error.NotFound` if no such workflow exists
+    /// or the run has closed. `terminateWorkflowWithOptions` attaches details.
     pub fn terminateWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void {
+        return c.terminateWorkflowWithOptions(workflow_id, run_id, reason, {}, .{});
+    }
+
+    /// `terminateWorkflow` with `details` recorded in the terminated event (any value the
+    /// converter encodes, encoded with the client's codecs, or `{}` for none) and
+    /// `options`. A `first_execution_run_id` that isn't the chain's first run is
+    /// `error.NotFound`, and the workflow keeps running. Only read during the call.
+    pub fn terminateWorkflowWithOptions(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8, details: anytype, options: TerminateOptions) TerminateError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
@@ -948,10 +951,114 @@ pub const Client = struct {
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .reason = reason,
+            .details = try detailPayloads(a, details),
             .identity = c.identity,
+            .first_execution_run_id = options.first_execution_run_id,
         }, a) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
+        };
+    }
+
+    /// Resets a workflow: a new run of `workflow_id` starts with the history of run `run_id`
+    /// (the latest run when empty) up to `options.workflow_task_finish_event_id`, and goes on
+    /// from there. The base run, if still running, ends terminated, as does whichever run of
+    /// the workflow is current; a closed base run stays as it was. Events after the reset
+    /// point are reapplied to the new run as `options.reapply_exclude` allows. A repeated
+    /// call may reset again, even with the same `request_id`.
+    ///
+    /// Returns the new run's ID, allocated from `arena` (as is everything the call
+    /// allocates); `getWorkflow` makes a handle to it. A handle that names the base run's ID,
+    /// such as one `executeWorkflow` returned, doesn't follow the reset: its `get` reports
+    /// `error.WorkflowTerminated` (or the run's own result if it had closed). A handle made
+    /// with an empty run ID reads the latest run when `get` runs, so it gets the new run's
+    /// result.
+    ///
+    /// A non-positive event ID is `error.InvalidOptions` before any call. An event ID the
+    /// server refuses (not at a workflow task's boundary, or beyond the history) is
+    /// `error.RpcFailed`; refusals are logged as warnings with the server's reason. The
+    /// request is sent once, without the automatic retries other calls get. A transport
+    /// failure is `error.RpcFailed` too, and after it the reset may or may not have
+    /// happened: before resetting again, describe the base run, whose
+    /// `raw.workflow_extended_info.reset_run_id` names the new run once it has been reset.
+    pub fn resetWorkflow(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8, options: ResetOptions) ResetError![]const u8 {
+        if (options.workflow_task_finish_event_id <= 0) {
+            log.warn("resetting workflow {s}: ResetOptions.workflow_task_finish_event_id is {d}; set it to the event ID of a workflow task's completed, failed, timed-out, or started event in the run's history (see Client.fetchHistory)", .{ workflow_id, options.workflow_task_finish_event_id });
+            return error.InvalidOptions;
+        }
+        var request: wfs.ResetWorkflowExecutionRequest = .{
+            .namespace = c.namespace,
+            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .reason = options.reason,
+            .workflow_task_finish_event_id = options.workflow_task_finish_event_id,
+            .request_id = if (options.request_id.len > 0) options.request_id else try uuid(arena, c.io),
+            .identity = c.identity,
+        };
+        const exclude = options.reapply_exclude;
+        for ([_]struct { bool, enums.ResetReapplyExcludeType }{
+            .{ exclude.signals, .RESET_REAPPLY_EXCLUDE_TYPE_SIGNAL },
+            .{ exclude.updates, .RESET_REAPPLY_EXCLUDE_TYPE_UPDATE },
+            .{ exclude.nexus, .RESET_REAPPLY_EXCLUDE_TYPE_NEXUS },
+        }) |pair| if (pair[0]) try request.reset_reapply_exclude_types.append(arena, pair[1]);
+        const response = try c.workflowChange(wfs.ResetWorkflowExecutionResponse, "ResetWorkflowExecution", request, arena, workflow_id);
+        if (response.run_id.len == 0) {
+            log.warn("ResetWorkflowExecution for workflow {s} returned no new run ID", .{workflow_id});
+            return error.InvalidResponse;
+        }
+        return response.run_id;
+    }
+
+    /// Changes the execution options of run `run_id` of `workflow_id` (the latest run when
+    /// empty): each non-null field of `changes` is applied, and the others are left as they
+    /// are. The server records a change in the workflow's history, once any workflow task in
+    /// progress has ended; one that leaves the options as they were (removing an override the
+    /// workflow doesn't have, setting the one it has) succeeds and records nothing. Returns
+    /// the run's options after the change, allocated from `arena` (as is everything the call
+    /// allocates).
+    ///
+    /// A `changes` that changes nothing is `error.InvalidOptions` before any call. An unknown
+    /// or closed workflow is `error.NotFound`. A change the server refuses, such as a pin to
+    /// a version whose workers haven't polled the workflow's task queue, is
+    /// `error.RpcFailed`; refusals are logged as warnings with the server's reason.
+    pub fn updateWorkflowExecutionOptions(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8, changes: WorkflowExecutionOptionsChanges) UpdateExecutionOptionsError!WorkflowExecutionOptions {
+        var request: wfs.UpdateWorkflowExecutionOptionsRequest = .{
+            .namespace = c.namespace,
+            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            // The server requires the options even when the change only clears a field.
+            .workflow_execution_options = .{},
+            .update_mask = .{},
+            .identity = c.identity,
+        };
+        if (changes.versioning_override) |change| {
+            request.workflow_execution_options.?.versioning_override = switch (change) {
+                .set => |o| versioningOverrideProto(o),
+                .remove => null,
+            };
+            try request.update_mask.?.paths.append(arena, "versioning_override");
+        }
+        if (request.update_mask.?.paths.items.len == 0) {
+            log.warn("updating the execution options of workflow {s}: WorkflowExecutionOptionsChanges changes nothing; set a field such as versioning_override", .{workflow_id});
+            return error.InvalidOptions;
+        }
+        const response = try c.workflowChange(wfs.UpdateWorkflowExecutionOptionsResponse, "UpdateWorkflowExecutionOptions", request, arena, workflow_id);
+        return .{
+            .versioning_override = if (response.workflow_execution_options) |o| deployment.VersioningOverride.fromProto(o.versioning_override) else null,
+            .raw = response,
+        };
+    }
+
+    /// Sends a request that changes `workflow_id`, logging the server's reason for a refusal
+    /// as a warning: these are refused for ordinary mistakes the caller handles.
+    fn workflowChange(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, workflow_id: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!Response {
+        var status: ?RpcStatus = null;
+        return c.rpcWithStatus(Response, method, request, arena, &status) catch |err| switch (err) {
+            error.AlreadyExists => error.InvalidResponse,
+            error.RpcFailed => {
+                const s = status orelse return error.RpcFailed;
+                log.warn("{s} for workflow {s} failed: {s} (gRPC status {d})", .{ method, workflow_id, s.message, s.code });
+                return error.RpcFailed;
+            },
+            else => |e| e,
         };
     }
 
@@ -1759,6 +1866,13 @@ pub const Client = struct {
         return rpc_timeout_ms;
     }
 
+    /// Whether the core retries a failed call. Not a reset: an attempt the server applied
+    /// before the transport failed would be applied again, and the server doesn't
+    /// deduplicate resets.
+    fn callRetries(comptime method: []const u8) bool {
+        return !std.mem.eql(u8, method, "ResetWorkflowExecution");
+    }
+
     /// Sends the request to the server: the end of the interceptor chain. When `status` is
     /// given, a failure other than NOT_FOUND is stored there (allocated from `arena`) for the
     /// caller to report instead of being logged; ALREADY_EXISTS still returns
@@ -1777,7 +1891,7 @@ pub const Client = struct {
         coded.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var failure: ?bridge.Connection.RpcFailure = null;
         defer if (failure) |f| f.deinit(c.gpa);
-        const call_options: bridge.Connection.CallOptions = .{ .retry = true, .timeout_ms = callTimeoutMs(@TypeOf(coded), method, &coded, c.rpc_timeout_ms) };
+        const call_options: bridge.Connection.CallOptions = .{ .retry = callRetries(method), .timeout_ms = callTimeoutMs(@TypeOf(coded), method, &coded, c.rpc_timeout_ms) };
         const bytes = c.currentConnection().call(c.gpa, c.io, .workflow, method, encoded.written(), call_options, &failure) catch |err| switch (err) {
             error.RpcFailed => {
                 const f = failure.?;
@@ -1974,6 +2088,109 @@ pub const SignalError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, Inval
 
 pub const DescribeError = error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed };
 
+pub const TerminateOptions = struct {
+    /// Terminates only if the workflow's chain of runs started with the run of this ID; a
+    /// chain that didn't is `error.NotFound`. The chain's first run stays the original one
+    /// across resets and continue-as-new. Empty checks nothing.
+    first_execution_run_id: []const u8 = "",
+};
+
+pub const TerminateError = error{
+    /// A payload codec (`Options.codecs`) failed encoding the details; logged.
+    CodecFailed,
+    OutOfMemory,
+    Canceled,
+    /// The server refused; logged with its reason.
+    RpcFailed,
+    /// No such workflow, the run has closed, or it isn't the chain `first_execution_run_id`
+    /// names. Also when an automatic retry of the call finds that an earlier attempt
+    /// terminated the run.
+    NotFound,
+    InvalidResponse,
+};
+
+pub const ResetOptions = struct {
+    /// The event the new run's history ends at: the ID of a workflow task's completed,
+    /// failed, or timed-out event in the base run's history (see `Client.fetchHistory`);
+    /// the server also accepts the task's started event. The new run goes on from the end
+    /// of that workflow task. Required.
+    workflow_task_finish_event_id: i64,
+    /// Recorded in the new run's history and in the terminated event of the run the reset
+    /// terminates, if one was running.
+    reason: []const u8 = "",
+    /// The request's ID, recorded by the server; empty generates a UUID. Don't rely on it to
+    /// deduplicate: a repeated request may reset again.
+    request_id: []const u8 = "",
+    /// Which kinds of events recorded after the reset point are not reapplied to the new run.
+    reapply_exclude: ResetReapplyExclude = .{},
+};
+
+/// Kinds of events, recorded in the base run after the reset point, that a reset doesn't
+/// reapply to the new run. By default it reapplies all of them.
+pub const ResetReapplyExclude = struct {
+    signals: bool = false,
+    updates: bool = false,
+    /// Nexus operation events.
+    nexus: bool = false,
+};
+
+pub const ResetError = error{
+    /// `ResetOptions.workflow_task_finish_event_id` isn't positive; logged, and nothing was
+    /// sent.
+    InvalidOptions,
+    /// A payload codec failed encoding the request (logged), or an interceptor returned it.
+    CodecFailed,
+    OutOfMemory,
+    Canceled,
+    /// The server refused, such as an event ID that isn't at a workflow task's boundary or
+    /// is beyond the history; logged as a warning with its reason. Also a transport failure,
+    /// which isn't retried: the reset may have happened (see `Client.resetWorkflow`).
+    RpcFailed,
+    /// No such workflow or run.
+    NotFound,
+    InvalidResponse,
+};
+
+/// The changes `Client.updateWorkflowExecutionOptions` makes. A null field leaves that
+/// option as it is; at least one must be set.
+pub const WorkflowExecutionOptionsChanges = struct {
+    versioning_override: ?VersioningOverrideChange = null,
+};
+
+pub const VersioningOverrideChange = union(enum) {
+    /// Replaces the workflow's versioning override, if any, with this one. A pin needs a
+    /// worker of that version to have polled the workflow's task queue; auto-upgrade needs
+    /// none.
+    set: deployment.VersioningOverride,
+    /// Clears the override: the workflow's definition decides its behavior again.
+    remove,
+};
+
+/// A workflow run's execution options, as `Client.updateWorkflowExecutionOptions` returns
+/// them. Every slice borrows the arena passed to the call.
+pub const WorkflowExecutionOptions = struct {
+    /// Null when the run has no override, or one of a kind this SDK has no case for (read
+    /// it from `raw`).
+    versioning_override: ?deployment.VersioningOverride,
+    /// The full server response, for anything not lifted into the fields above.
+    raw: wfs.UpdateWorkflowExecutionOptionsResponse,
+};
+
+pub const UpdateExecutionOptionsError = error{
+    /// The changes change nothing; logged, and nothing was sent.
+    InvalidOptions,
+    /// A payload codec failed encoding the request (logged), or an interceptor returned it.
+    CodecFailed,
+    OutOfMemory,
+    Canceled,
+    /// The server refused, such as a pin to a version whose workers haven't polled the
+    /// workflow's task queue; logged as a warning with its reason.
+    RpcFailed,
+    /// No such workflow or run, or it has closed.
+    NotFound,
+    InvalidResponse,
+};
+
 pub const CheckHealthError = error{
     OutOfMemory,
     /// The calling task was canceled.
@@ -2032,6 +2249,17 @@ pub const WorkflowExecutionInfo = struct {
         return converter.fieldValue(T, arena, i.memo, name);
     }
 };
+
+/// The override as the server's requests carry it; borrows `o`'s slices.
+fn versioningOverrideProto(o: deployment.VersioningOverride) proto.temporal.api.workflow.v1.VersioningOverride {
+    return .{ .override = switch (o) {
+        .pinned => |v| .{ .pinned = .{
+            .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED,
+            .version = .{ .deployment_name = v.deployment_name, .build_id = v.build_id },
+        } },
+        .auto_upgrade => .{ .auto_upgrade = true },
+    } };
+}
 
 /// Lifts the fields of `info` into a `WorkflowExecutionInfo` that borrows it.
 fn executionInfo(arena: Allocator, info: proto.temporal.api.workflow.v1.WorkflowExecutionInfo) error{OutOfMemory}!WorkflowExecutionInfo {
@@ -3909,6 +4137,13 @@ test "calls that wait on the server get no rpc timeout" {
     try testing.expectEqual(t, Client.callTimeoutMs(wfs.GetWorkflowExecutionHistoryRequest, "GetWorkflowExecutionHistory", &.{}, t));
     try testing.expectEqual(t, Client.callTimeoutMs(wfs.QueryWorkflowRequest, "QueryWorkflow", &.{}, t));
     try testing.expectEqual(t, Client.callTimeoutMs(wfs.StartWorkflowExecutionRequest, "StartWorkflowExecution", &.{}, t));
+}
+
+test "a reset is sent once; other calls are retried" {
+    try testing.expect(!Client.callRetries("ResetWorkflowExecution"));
+    inline for ([_][]const u8{ "StartWorkflowExecution", "TerminateWorkflowExecution", "UpdateWorkflowExecutionOptions", "SignalWorkflowExecution" }) |method| {
+        try testing.expect(Client.callRetries(method));
+    }
 }
 
 test "health check responses other than SERVING fail" {
