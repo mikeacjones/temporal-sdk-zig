@@ -1,7 +1,7 @@
 //! A synchronous call between two workflows, built from signals. The calling workflow signals
 //! a request to the target workflow, naming itself, and then blocks until the target signals a
-//! response back to it. Each side receives through a `Channel`, a queue its signal handler
-//! fills, so requests and responses that arrive before anyone waits for them are kept in order.
+//! response back to it. Each side receives through a signal channel (`ctx.signalChannel`), so
+//! requests and responses that arrive before anyone waits for them are kept in order.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -24,41 +24,10 @@ pub const Response = struct {
 pub const RequestSignal = workflow.SignalDef("proxy-request-signal", fn (request: Request) void);
 pub const ResponseSignal = workflow.SignalDef("proxy-response-signal", fn (response: Response) void);
 
-/// The values `Signal` (a `SignalDef` with one argument of type `T`) delivers, in arrival
-/// order. Allocated with `ctx.allocator()` by `init`, which registers the signal's handler:
-/// create the channel before anything can need it, so no signal finds the handler missing.
-pub fn Channel(comptime Signal: type, comptime T: type) type {
-    return struct {
-        const Self = @This();
-
-        ctx: *workflow.Context,
-        pending: std.ArrayList(T) = .empty,
-
-        pub fn init(ctx: *workflow.Context) !*Self {
-            const ch = try ctx.allocator().create(Self);
-            ch.* = .{ .ctx = ctx };
-            try ctx.setSignalHandler(Signal, ch, deliver);
-            return ch;
-        }
-
-        fn deliver(ch: *Self, value: T) !void {
-            try ch.pending.append(ch.ctx.allocator(), value);
-        }
-
-        fn hasPending(ch: *Self) bool {
-            return ch.pending.items.len > 0;
-        }
-
-        /// Waits for the next value. Returns `error.Canceled` if the workflow is canceled.
-        pub fn receive(ch: *Self) !T {
-            try ch.ctx.await(ch, hasPending);
-            return ch.pending.orderedRemove(0);
-        }
-    };
-}
-
-pub const RequestChannel = Channel(RequestSignal, Request);
-pub const ResponseChannel = Channel(ResponseSignal, Response);
+/// The requests and responses each side receives, in arrival order, from
+/// `ctx.signalChannel`. A signal that arrives before its channel is opened waits for it.
+pub const RequestChannel = workflow.SignalChannel(RequestSignal.Args);
+pub const ResponseChannel = workflow.SignalChannel(ResponseSignal.Args);
 
 /// Signals a request to `target_workflow_id`, naming the calling workflow as the one to answer.
 pub fn sendRequest(ctx: *workflow.Context, target_workflow_id: []const u8, key: []const u8, value: []const u8) !void {

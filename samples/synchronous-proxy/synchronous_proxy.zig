@@ -58,7 +58,7 @@ fn receiveValid(ctx: *workflow.Context, requests: *proxy.RequestChannel, comptim
 
 /// Takes an order driven by requests from a UI, then ships it.
 fn orderWorkflow(ctx: *workflow.Context) !void {
-    const requests = try proxy.RequestChannel.init(ctx);
+    const requests = try ctx.signalChannel(proxy.RequestSignal);
     var order: TShirtOrder = .{};
     order.email = try receiveValid(ctx, requests, RegisterEmail, size_stage);
     order.size = try receiveValid(ctx, requests, ValidateSize, color_stage);
@@ -80,8 +80,7 @@ pub const ShippingWorkflow = workflow.Def("ShippingWorkflow", shippingWorkflow);
 /// Sends `value` for `stage` to the order workflow and returns the stage the order moved on to.
 /// Fails with the order workflow's message if it rejected the value.
 fn updateOrderWorkflow(ctx: *workflow.Context, order_workflow_id: []const u8, stage: []const u8, value: []const u8) !OrderStatus {
-    // Listening before the request goes out, so the response can't arrive unhandled.
-    const responses = try proxy.ResponseChannel.init(ctx);
+    const responses = try ctx.signalChannel(proxy.ResponseSignal);
     try proxy.sendRequest(ctx, order_workflow_id, stage, value);
     const response = try proxy.receiveResponse(ctx, responses);
     return .{ .order_id = order_workflow_id, .stage = response.key };

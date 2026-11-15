@@ -127,6 +127,13 @@ pub fn wake(w: *WorkflowIo, wait: *Wait) void {
     w.wakeWait(wait);
 }
 
+/// `wake`, but a coroutine that this wakes runs before the others that are ready.
+pub fn wakeFirst(w: *WorkflowIo, wait: *Wait) void {
+    if (wait.woken) return;
+    wait.woken = true;
+    if (wait.fiber.state == .blocked) w.scheduler.wakeFirst(wait.fiber);
+}
+
 /// The running coroutine's name: the one `spawn` gave it, "async" or "group" for coroutines
 /// started through the `std.Io` interface, or the last one `setCurrentName` set. Empty
 /// outside a coroutine.

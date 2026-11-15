@@ -140,6 +140,17 @@
 //!     try ctx.setSignalHandlerByName(name, struct { []const u8 }, state, State.approve);
 //!     try ctx.setDynamicSignalHandler(state, State.other); // fn (*State, []const u8, EncodedValues) void
 //!
+//! Workflow code that would rather receive a signal where it needs it than in a handler opens
+//! a `SignalChannel` with `ctx.signalChannel` (or `signalChannelByName`), which takes the place
+//! of the signal's handler. Its `receive` blocks and works as a `std.Io.Select` case:
+//!
+//!     const approvals = try ctx.signalChannel(Approve);
+//!     const approver = try approvals.receive(); // []const u8, in arrival order
+//!
+//! `ctx.removeSignalHandler` (and `removeSignalHandlerByName`, `removeDynamicSignalHandler`)
+//! unregisters a handler or channel; `ctx.unhandledSignalNames` lists the signals nothing has
+//! taken, including those unread in a channel.
+//!
 //! A workflow signals another with `ctx.signalExternalWorkflow`, by workflow ID (and run ID,
 //! empty for the latest run), and its child with `ChildWorkflowFuture.signal`. The future's
 //! `get` waits until the server delivered the signal; it returns
@@ -1249,6 +1260,62 @@ pub const Context = struct {
         return ctx.instance.setDynamicSignalHandler(.{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call }, contextAddress(context));
     }
 
+    /// The channel of the signals named by `Signal` (a `SignalDef`), for workflow code that
+    /// receives them where it needs them instead of in a handler (see `SignalChannel`).
+    /// Signals of that name buffered before this call reach the channel in arrival order,
+    /// once the calling coroutine blocks; later ones as they arrive.
+    ///
+    /// The channel takes the place of the signal's handler, the same way registering a
+    /// handler replaces the one before it; `setSignalHandler` or `removeSignalHandler` for
+    /// the name ends its deliveries, keeping the signals it took. Calling this again for the
+    /// same signal, while its channel is still the handler, returns the same channel.
+    ///
+    ///     const approvals = try ctx.signalChannel(Approve);
+    ///     const approver = try approvals.receive(); // []const u8
+    pub fn signalChannel(ctx: *Context, comptime Signal: type) error{OutOfMemory}!*SignalChannel(Signal.Args) {
+        return SignalChannel(Signal.Args).open(ctx, Signal.signal_name);
+    }
+
+    /// `signalChannel` for a signal named at run time, whose arguments are the tuple type
+    /// `Args`. `name` is copied into `ctx.allocator()`. A call for the same name and `Args`,
+    /// while that channel is still the handler, returns the same channel.
+    ///
+    ///     const unlocks = try ctx.signalChannelByName(name, struct { []const u8 });
+    pub fn signalChannelByName(ctx: *Context, name: []const u8, comptime Args: type) error{OutOfMemory}!*SignalChannel(Args) {
+        if (ctx.instance.signalChannelFor(name, SignalChannel(Args).decode)) |core| return @fieldParentPtr("core", core);
+        return SignalChannel(Args).open(ctx, try ctx.allocator().dupe(u8, name));
+    }
+
+    /// Unregisters the handler or channel for the signals named by `Signal` (a `SignalDef`),
+    /// if any. Later signals of that name go to the dynamic handler if one is set, and are
+    /// otherwise buffered until a handler or channel is registered for them again. Handler
+    /// coroutines already started run to completion, and a channel keeps the signals it
+    /// already took, still readable.
+    pub fn removeSignalHandler(ctx: *Context, comptime Signal: type) void {
+        ctx.instance.removeSignalHandler(Signal.signal_name);
+    }
+
+    /// `removeSignalHandler` for a signal named at run time.
+    pub fn removeSignalHandlerByName(ctx: *Context, name: []const u8) void {
+        ctx.instance.removeSignalHandler(name);
+    }
+
+    /// Unregisters the dynamic signal handler, if any: later signals with no handler of their
+    /// own are buffered until one is registered. Handler coroutines already started run to
+    /// completion.
+    pub fn removeDynamicSignalHandler(ctx: *Context) void {
+        ctx.instance.removeDynamicSignalHandler();
+    }
+
+    /// The distinct names of the signals that nothing has taken: those buffered because no
+    /// handler, channel, or dynamic handler was registered when they arrived (and none has
+    /// been since), and those unread in a signal channel or on their way to one. In the
+    /// order each name first arrived; allocated in `ctx.allocator()`. When the workflow
+    /// finishes with any, it logs a warning counting them, since they are dropped.
+    pub fn unhandledSignalNames(ctx: *Context) error{OutOfMemory}![]const []const u8 {
+        return ctx.instance.unhandledSignalNames(ctx.allocator());
+    }
+
     pub const SetUpdateHandlerError = error{
         OutOfMemory,
         /// `context` points into the calling coroutine's stack (logged with the update name).
@@ -1684,6 +1751,79 @@ const ExternalFuture = struct {
         return state.outcome != null;
     }
 };
+
+/// The signals of one name, from `Context.signalChannel` or `signalChannelByName`, read in
+/// arrival order. `Args` is the signal's argument tuple; each receive returns a `Value`: the
+/// argument itself for a signal with one argument, else the whole tuple. Allocated in
+/// `ctx.allocator()`; the decoded arguments live there too.
+///
+/// The channel is the signal's handler: each signal of its name runs the inbound interceptors
+/// and decodes its arguments in a handler coroutine of its own, as a handler would, and is
+/// appended to the channel. A signal whose arguments don't decode is dropped with a warning.
+/// Use it from workflow coroutines only.
+pub fn SignalChannel(comptime Args: type) type {
+    const field_types = @typeInfo(Args).@"struct".field_types;
+    return struct {
+        const Self = @This();
+
+        core: Instance.SignalChannel,
+
+        /// What a receive returns: the signal's argument for a signal with one, else `Args`.
+        pub const Value = if (field_types.len == 1) field_types[0] else Args;
+
+        /// Waits for the next signal and returns its arguments. If the calling coroutine is
+        /// canceled while it waits (the workflow is canceled, or an enclosing future, `Select`,
+        /// or `Group` is), returns `error.Canceled` and leaves the channel's signals unread,
+        /// so it can be a `std.Io.Select` case. A receive woken by a signal runs before the
+        /// coroutines the same workflow task's other events woke, so a signal that arrives with
+        /// a raced timer wins the race.
+        ///
+        /// A receive that returned has taken its signal from the channel. A Select returns
+        /// one finished case per `await`; when more than one has finished (receives on several
+        /// channels, or a Select awaited only after its cases had time to finish),
+        /// `cancelDiscard` drops the others, and a received signal with them. To keep every
+        /// signal, cancel with `cancel` until it returns null and handle each result it
+        /// returns; a receive it cancels returns `error.Canceled` and took nothing:
+        ///
+        ///     var select: std.Io.Select(union(enum) { approval: error{Canceled}!Ch.Value, timeout: std.Io.Cancelable!void }) = .init(io, &buffer);
+        ///     select.async(.approval, Ch.receive, .{approvals});
+        ///     select.async(.timeout, std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+        ///     var next: ?@TypeOf(buffer[0]) = try select.await();
+        ///     while (next) |result| : (next = select.cancel()) handle(result);
+        pub fn receive(ch: *Self) error{Canceled}!Value {
+            return value(try ch.core.receive());
+        }
+
+        /// The next signal's arguments without waiting, or null if no signal is unread.
+        pub fn tryReceive(ch: *Self) ?Value {
+            return value(ch.core.take() orelse return null);
+        }
+
+        /// How many signals are unread.
+        pub fn len(ch: *const Self) usize {
+            return ch.core.len();
+        }
+
+        fn value(p: *const anyopaque) Value {
+            const args: *const Args = @ptrCast(@alignCast(p));
+            return if (field_types.len == 1) args[0] else args.*;
+        }
+
+        fn decode(out: Allocator, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
+            const args = try out.create(Args);
+            args.* = try converter.fromPayloads(Args, out, payloads);
+            return @ptrCast(args);
+        }
+
+        fn open(ctx: *Context, name: []const u8) error{OutOfMemory}!*Self {
+            const inst = ctx.instance;
+            if (inst.signalChannelFor(name, decode)) |core| return @fieldParentPtr("core", core);
+            const ch = try ctx.allocator().create(Self);
+            try inst.createSignalChannel(name, &ch.core, decode);
+            return ch;
+        }
+    };
+}
 
 /// The version `Context.getVersion` returns for a run that passed the change's point before
 /// the change existed.

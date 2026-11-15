@@ -254,6 +254,47 @@ test "workflows: signal, query, and update handlers of a struct workflow" {
     try testing.expectEqual(1, try env.queryWorkflow(GuestCount, a, run.id, .{}));
 }
 
+// example: workflow-signal-channel
+const Arrival = union(enum) { guest: error{Canceled}![]const u8, quiet: std.Io.Cancelable!void };
+fn greetArrivals(ctx: *workflow.Context) ![]const u8 {
+    const io = ctx.io();
+    const guests = try ctx.signalChannel(AddGuest); // takes the place of a handler
+    var names: std.ArrayList([]const u8) = .empty;
+    while (true) { // until a minute passes with no guest
+        var buffer: [2]Arrival = undefined;
+        var select: std.Io.Select(Arrival) = .init(io, &buffer);
+        select.async(.guest, workflow.SignalChannel(AddGuest.Args).receive, .{guests});
+        select.async(.quiet, std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+        const first = try select.await();
+        select.cancelDiscard(); // one receive, awaited at once: no guest is dropped
+        switch (first) {
+            .guest => |name| try names.append(ctx.allocator(), try name),
+            .quiet => break,
+        }
+    }
+    ctx.removeSignalHandler(AddGuest); // later guests are buffered, unread
+    const unread = try ctx.unhandledSignalNames(); // logged, and dropped, when the run ends
+    if (unread.len > 0) ctx.logger().warn("signals left unread", .{ .first = unread[0] });
+    return std.mem.join(ctx.allocator(), ", ", names.items);
+}
+pub const GreetArrivals = workflow.Def("greet_arrivals", greetArrivals);
+// end-example
+
+test "workflows: a signal channel receives guests until a quiet minute" {
+    const env = try temporal.testing.WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(GreetArrivals);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(GreetArrivals, .{}, .{});
+    defer run.deinit();
+    try env.signalWorkflow(AddGuest, run.id, .{"Ann"});
+    try env.signalWorkflow(AddGuest, run.id, .{"Bob"});
+    try testing.expectEqualStrings("Ann, Bob", try env.getResult(GreetArrivals, &run, a, null));
+}
+
 // example: workflow-child
 fn greetFamily(ctx: *workflow.Context, names: []const []const u8) ![]const []const u8 {
     const a = ctx.allocator();

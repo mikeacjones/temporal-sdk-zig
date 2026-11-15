@@ -671,6 +671,41 @@ Notes:
 - Signal and update handlers run in their own coroutines and may block; query handlers and validators must only read state.
 - `ctx.setSignalHandlerByName` handles a signal named at run time, and `ctx.setDynamicSignalHandler` every signal without a handler.
 
+A signal channel lets workflow code receive a signal where it needs it instead of in a handler. `ctx.signalChannel(Signal)` (or `ctx.signalChannelByName(name, Args)`) returns a `workflow.SignalChannel` that takes the place of the signal's handler:
+
+<!-- example: workflow-signal-channel -->
+```zig
+const Arrival = union(enum) { guest: error{Canceled}![]const u8, quiet: std.Io.Cancelable!void };
+fn greetArrivals(ctx: *workflow.Context) ![]const u8 {
+    const io = ctx.io();
+    const guests = try ctx.signalChannel(AddGuest); // takes the place of a handler
+    var names: std.ArrayList([]const u8) = .empty;
+    while (true) { // until a minute passes with no guest
+        var buffer: [2]Arrival = undefined;
+        var select: std.Io.Select(Arrival) = .init(io, &buffer);
+        select.async(.guest, workflow.SignalChannel(AddGuest.Args).receive, .{guests});
+        select.async(.quiet, std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+        const first = try select.await();
+        select.cancelDiscard(); // one receive, awaited at once: no guest is dropped
+        switch (first) {
+            .guest => |name| try names.append(ctx.allocator(), try name),
+            .quiet => break,
+        }
+    }
+    ctx.removeSignalHandler(AddGuest); // later guests are buffered, unread
+    const unread = try ctx.unhandledSignalNames(); // logged, and dropped, when the run ends
+    if (unread.len > 0) ctx.logger().warn("signals left unread", .{ .first = unread[0] });
+    return std.mem.join(ctx.allocator(), ", ", names.items);
+}
+pub const GreetArrivals = workflow.Def("greet_arrivals", greetArrivals);
+```
+
+Notes:
+- `receive` blocks until a signal arrives and returns `error.Canceled` if its coroutine is canceled, so it works as a `std.Io.Select` case; a signal that arrives in the same workflow task as a raced timer wins the race. A receive that returned has taken its signal, and `cancelDiscard` drops every finished case but the one `await` returned: with receives on several channels, or a Select awaited only after its cases had time to finish, cancel with `select.cancel()` until it returns null and handle each result instead. `tryReceive` returns null instead of blocking, and `len` counts unread signals.
+- A signal with one argument is received as that value, one with several as its argument tuple. Signals buffered before the channel was opened reach it in arrival order once the caller blocks; until then `len` and `tryReceive` don't see them, but `ctx.unhandledSignalNames()` lists them.
+- `ctx.removeSignalHandler(Signal)`, `removeSignalHandlerByName`, and `removeDynamicSignalHandler` unregister a handler or channel: later signals go to the dynamic handler or are buffered, handler coroutines already running finish, and a channel keeps what it took.
+- `ctx.unhandledSignalNames()` lists the names of the signals nothing has taken, buffered or unread in a channel, in first-arrival order; a workflow that finishes with any logs a warning counting them.
+
 #### Child workflows
 `workflow.Context.executeChildWorkflow` starts a child and returns a `workflow.ChildWorkflowFuture` for its start and result.
 
