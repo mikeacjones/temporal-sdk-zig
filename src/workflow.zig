@@ -86,7 +86,9 @@
 //!     const output = try echo.get();
 //!
 //! Queries read a workflow's state from outside. Name one with `QueryDef` and answer it with
-//! `ctx.setQueryHandler`; the handler runs synchronously and must not change state or block:
+//! `ctx.setQueryHandler`; the handler runs synchronously and must only read state. A call
+//! that would start an activity, timer, child workflow or other command, or block, fails the
+//! query with a `ReadOnlyViolation` failure naming the call, and nothing is sent:
 //!
 //!     pub const Greeting = temporal.workflow.QueryDef("greeting", fn () []const u8);
 //!
@@ -103,6 +105,11 @@
 //! A struct workflow declares it instead: `pub const queries = .{ .current = Greeting };`
 //! with `pub fn current(self: *W) []const u8`. A query can arrive before `run` starts, so its
 //! handler may see `W{}`.
+//!
+//! `ctx.setDynamicQueryHandler` answers every query with no handler of its own, with the query
+//! type and its arguments still encoded (`converter.EncodedValues`):
+//!
+//!     try ctx.setDynamicQueryHandler(state, State.anyQuery); // fn (*State, []const u8, EncodedValues) !T
 //!
 //! Signals change a workflow's state from outside. Name one with `SignalDef` and handle it
 //! with `ctx.setSignalHandler`. Each signal runs its handler in a coroutine of its own, so a
@@ -644,9 +651,11 @@ pub const Context = struct {
         return ctx.instance.wio.io();
     }
 
-    /// Memory that lives as long as the workflow run is cached.
+    /// Memory that lives as long as the workflow run is cached. In a query handler it is
+    /// instead the query's memory, freed once the answer is sent, so answering queries
+    /// doesn't grow the run.
     pub fn allocator(ctx: *Context) Allocator {
-        return ctx.instance.arena();
+        return ctx.instance.allocator();
     }
 
     /// Names the calling coroutine (the workflow function, a handler, or one started with
@@ -656,7 +665,7 @@ pub const Context = struct {
     /// "workflow", "signal", "update", "async", or "group". Outside a coroutine, as in a
     /// query handler, there is nothing to name: it does nothing and allocates nothing.
     pub fn setCoroutineName(ctx: *Context, name: []const u8) error{OutOfMemory}!void {
-        if (ctx.instance.wio.scheduler.currentFiber() == null) return;
+        if (ctx.instance.wio.scheduler.currentFiber() == null or ctx.instance.wio.refuse("setCoroutineName")) return;
         const copy = try ctx.allocator().dupe(u8, name);
         ctx.instance.wio.setCurrentName(copy);
     }
@@ -835,7 +844,7 @@ pub const Context = struct {
     ///
     /// Set it before the workflow first blocks, so the run's first workflow task carries it.
     pub fn setVersioningBehavior(ctx: *Context, behavior: VersioningBehavior) void {
-        ctx.instance.versioning_behavior = behavior;
+        ctx.instance.setVersioningBehavior(behavior);
     }
 
     /// The Worker Deployment Version that ran the current workflow task (on replay, the one
@@ -1053,6 +1062,7 @@ pub const Context = struct {
     /// session is `closed`. A closed session is left as it is, and a failed one just closes.
     pub fn completeSession(ctx: *Context, session: *Session) error{OutOfMemory}!void {
         if (session.closed) return;
+        if (ctx.instance.wio.refuse("completeSession")) return;
         const was_open = session.state() == .open;
         session.closed = true;
         if (!was_open) return;
@@ -1198,9 +1208,21 @@ pub const Context = struct {
     /// error's name. Registering the same query type again replaces its handler.
     ///
     /// Handlers run synchronously on the worker thread, outside any coroutine, possibly after
-    /// the workflow function has returned. They must only read workflow state: not change it,
-    /// not block, and not call into the workflow context. Arguments and the result use
-    /// memory that lives until the answer is sent.
+    /// the workflow function has returned. They must only read workflow state. A handler that
+    /// calls something that would emit a command (`executeActivity`, `sleep`,
+    /// `executeChildWorkflow`, `upsertMemo`, `signalExternalWorkflow`, and so on), register or
+    /// remove a handler (`setSignalHandler`, `signalChannel`, `setUpdateHandler`, ...), take a
+    /// signal from a channel, change the run's settings (`setVersioningBehavior`), start a
+    /// coroutine, or block (`await`, a pending future's `get`) is refused: the call returns
+    /// `error.InvalidOptions` or `error.Canceled` (or, where it can't fail, does nothing), and
+    /// the query fails with a `ReadOnlyViolation` failure naming the call, whatever the
+    /// handler returns. Nothing is sent and the workflow task doesn't fail. Waking a coroutine
+    /// through `std.Io` (`Event.set`, `Condition.signal`, `Queue.put`) fails the query too,
+    /// but the wake happens: `std.Io` has already changed the primitive. The SDK can't undo
+    /// what a handler writes to workflow data or a `std.Io` primitive.
+    /// `ctx.fail` and `ctx.failWith` describe the query's failure instead of the workflow's.
+    /// Arguments and the result use memory that lives until the answer is sent, and so does
+    /// `ctx.allocator()` while the handler runs.
     ///
     /// `context` is usually a pointer to the state the handler reads. It must outlive the run,
     /// so allocate it with `ctx.allocator()` (or point to a global); a pointer into the calling
@@ -1223,6 +1245,44 @@ pub const Context = struct {
         const stored = try ctx.allocator().create(C);
         stored.* = context;
         return ctx.instance.setQueryHandler(Query.query_name, .{ .context = @ptrCast(stored), .call = Erased.call }, contextAddress(context));
+    }
+
+    /// Answers every query that has no handler registered for its type with
+    /// `handler(context, name, args)`, where `name` is the query type and `args` its
+    /// undecoded arguments (`converter.EncodedValues`), decoded with
+    /// `args.get(T, ctx.allocator(), index)`: in a query handler that is the answer's memory,
+    /// freed once it is sent. It returns the answer (any type the converter
+    /// encodes) or an error union of it; an error fails the query with the error's name.
+    /// Registering again replaces the dynamic handler. A handler registered for a query type
+    /// with `setQueryHandler` still answers that type. Without a dynamic handler, a query of
+    /// an unregistered type fails with `QueryNotRegistered`, and so do the query types
+    /// Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, `__temporal...`).
+    ///
+    /// The handler is read-only and its `context` must outlive the run, as in
+    /// `setQueryHandler`; a pointer into the calling coroutine's stack returns
+    /// `error.QueryContextOnStack`.
+    ///
+    ///     fn anyQuery(s: *State, name: []const u8, args: temporal.converter.EncodedValues) ![]const u8 {
+    ///         _ = args;
+    ///         return if (std.mem.eql(u8, name, "status")) s.status else error.UnknownQuery;
+    ///     }
+    ///     try ctx.setDynamicQueryHandler(state, State.anyQuery);
+    pub fn setDynamicQueryHandler(ctx: *Context, context: anytype, comptime handler: anytype) SetQueryHandlerError!void {
+        const C = @TypeOf(context);
+        const Args = struct { []const u8, converter.EncodedValues };
+        const Result = comptime dynamicQueryResult(C, @TypeOf(handler));
+        comptime checkHandler("dynamic query handler", Args, C, @TypeOf(handler), Result);
+        const Erased = struct {
+            fn call(p: *const anyopaque, out: Allocator, name: []const u8, payloads: []const converter.Payload) anyerror!converter.Payload {
+                const c: *const C = @ptrCast(@alignCast(p));
+                const result = handler(c.*, name, converter.EncodedValues{ .payloads = payloads });
+                const value = if (@typeInfo(@TypeOf(result)) == .error_union) try result else result;
+                return converter.toPayload(out, value);
+            }
+        };
+        const stored = try ctx.allocator().create(C);
+        stored.* = context;
+        return ctx.instance.setDynamicQueryHandler(.{ .context = @ptrCast(stored), .call = Erased.call }, contextAddress(context));
     }
 
     pub const SetSignalHandlerError = error{
@@ -1414,9 +1474,10 @@ pub const Context = struct {
     /// trace in history.
     ///
     /// The validator runs synchronously, outside the update's coroutine, like a query
-    /// handler: it must only read workflow state, not change it, block, or call into the
-    /// workflow context. It doesn't run on replay, where every update in history was
-    /// accepted.
+    /// handler: it must only read workflow state. A call that would emit a command, start a
+    /// coroutine, or block is refused as in a query handler (see `setQueryHandler`), and the
+    /// update is rejected with a `ReadOnlyViolation` failure naming the call. It doesn't run
+    /// on replay, where every update in history was accepted.
     ///
     ///     try ctx.setUpdateHandlerWithValidator(SetLimit, state, State.set, State.check);
     pub fn setUpdateHandlerWithValidator(ctx: *Context, comptime Update: type, context: anytype, comptime handler: anytype, comptime validator: anytype) SetUpdateHandlerError!void {
@@ -1862,6 +1923,7 @@ pub fn SignalChannel(comptime Args: type) type {
 
         /// The next signal's arguments without waiting, or null if no signal is unread.
         pub fn tryReceive(ch: *Self) ?Value {
+            if (ch.core.inst.wio.refuse("SignalChannel.tryReceive")) return null;
             return value(ch.core.take() orelse return null);
         }
 
@@ -2304,6 +2366,22 @@ fn contextAddress(context: anytype) ?usize {
 
 /// Compile error unless `H` is `fn (C, Args...) Result` or returns an error union of
 /// `Result`. `what` names the handler in the message, such as `query handler for "status"`.
+/// The answer type of a dynamic query handler `H`: its return type, without an error union.
+fn dynamicQueryResult(comptime C: type, comptime H: type) type {
+    const bad = "dynamic query handler must be fn (" ++ @typeName(C) ++ ", []const u8, temporal.converter.EncodedValues) Result (or an error union of it), not " ++ @typeName(H);
+    const info = switch (@typeInfo(H)) {
+        .@"fn" => |f| f,
+        else => @compileError(bad),
+    };
+    const Ret = info.return_type orelse @compileError(bad);
+    const Result = switch (@typeInfo(Ret)) {
+        .error_union => |eu| eu.payload,
+        else => Ret,
+    };
+    if (Result == void) @compileError(bad);
+    return Result;
+}
+
 fn checkHandler(comptime what: []const u8, comptime Args: type, comptime C: type, comptime H: type, comptime Result: type) void {
     if (handlerMismatch(what, Args, C, H, Result)) |message| @compileError(message);
 }

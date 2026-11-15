@@ -43,6 +43,28 @@ futex_head: ?*Wait = null,
 futex_tail: ?*Wait = null,
 /// Calls that would make replay depend on the outside world (secure randomness).
 determinism_violations: u32 = 0,
+/// The read-only sections that have begun and not ended, newest first (see `ReadOnly`).
+read_only_sections: ?*ReadOnly = null,
+/// Whether any read-only section is open, in any coroutine or outside them. The rules apply
+/// only to the code each section belongs to: see `currentReadOnly`.
+read_only: bool = false,
+
+/// Read-only code (a query handler, an update validator) run by the host between
+/// `beginReadOnly` and `endReadOnly`. The section belongs to the coroutine it began on, or to
+/// the code outside any coroutine, and governs only that: a validator run in a handler's
+/// coroutine that blocks leaves every other coroutine free. In it, waits that can be canceled
+/// return error.Canceled instead of blocking, `io.concurrent` and `Group.concurrent` return
+/// error.ConcurrencyUnavailable, `io.async` and `Group.async` run their function inline,
+/// futex wakes that resume a coroutine are recorded as refused (but still wake it: see
+/// `futexWake`), and `io.random` draws from the
+/// section's own copy of the generator. `refuse` records the first refused operation in
+/// `refused`. Lives on the stack of the code that runs the section.
+pub const ReadOnly = struct {
+    fiber: ?*Fiber = null,
+    refused: ?[]const u8 = null,
+    rng: std.Random.DefaultPrng = undefined,
+    next: ?*ReadOnly = null,
+};
 
 /// What the workflow runtime provides: workflow time and durable timers.
 pub const Host = struct {
@@ -147,6 +169,41 @@ pub fn currentName(w: *const WorkflowIo) []const u8 {
 pub fn setCurrentName(w: *WorkflowIo, name: []const u8) void {
     const f = w.scheduler.currentFiber() orelse return;
     f.name = name;
+}
+
+/// Opens `section` for the running coroutine (or for the code outside any coroutine).
+pub fn beginReadOnly(w: *WorkflowIo, section: *ReadOnly) void {
+    section.* = .{ .fiber = w.scheduler.currentFiber(), .rng = w.rng, .next = w.read_only_sections };
+    w.read_only_sections = section;
+    w.read_only = true;
+}
+
+/// Closes `section`, which other sections may have opened after and still hold open.
+pub fn endReadOnly(w: *WorkflowIo, section: *ReadOnly) void {
+    var link = &w.read_only_sections;
+    while (link.*) |r| : (link = &r.next) if (r == section) {
+        link.* = r.next;
+        break;
+    };
+    w.read_only = w.read_only_sections != null;
+}
+
+/// The innermost read-only section of the code running now, or null.
+pub fn currentReadOnly(w: *const WorkflowIo) ?*ReadOnly {
+    var it = w.read_only_sections orelse return null;
+    const fiber = w.scheduler.currentFiber();
+    while (true) {
+        if (it.fiber == fiber) return it;
+        it = it.next orelse return null;
+    }
+}
+
+/// Whether `operation` must be refused because the code running now is read-only. The first
+/// refused operation is kept in its section's `refused` (`operation` must outlive it).
+pub fn refuse(w: *WorkflowIo, operation: []const u8) bool {
+    const section = w.currentReadOnly() orelse return false;
+    if (section.refused == null) section.refused = operation;
+    return true;
 }
 
 /// Called by the host when a timer started with `Host.VTable.startTimer` fires.
@@ -361,7 +418,10 @@ fn wakeWait(w: *WorkflowIo, wait: *Wait) void {
 /// Blocks the current coroutine until `wait` is woken. A cancelable block also returns
 /// `error.Canceled` when the current task has a pending, unblocked cancel request.
 fn block(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void {
-    const task = w.currentTask();
+    const task = w.ownCancelTask();
+    // Read-only code reaches here only through a wait that can't fail, so can't be refused: it
+    // blocks its own coroutine (and only that one), and its query or update fails afterwards.
+    if (!wait.woken) _ = w.refuse("a wait that can't be refused (an uncancelable std.Io wait, Future.await, Group.cancel)");
     while (true) {
         if (cancelable) if (task) |t| {
             if (t.cancel_requested and t.cancel_protection == .unblocked) {
@@ -445,6 +505,11 @@ fn async(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) ?*Io.AnyFuture {
+    // Read-only code may not start a coroutine, which would run after it returned.
+    if (self(userdata).currentReadOnly() != null) {
+        start(context.ptr, result.ptr);
+        return null;
+    }
     // Always a coroutine, never run inline, so ordering doesn't depend on allocation success.
     return concurrent(userdata, result.len, result_alignment, context, context_alignment, start) catch
         @panic("out of memory starting a workflow coroutine");
@@ -459,6 +524,7 @@ fn concurrent(
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) Io.ConcurrentError!*Io.AnyFuture {
     const w = self(userdata);
+    if (w.refuse("io.concurrent")) return error.ConcurrencyUnavailable;
     const task = w.createTask("async", context, context_alignment, result_len, result_alignment, start, .future) catch
         return error.ConcurrencyUnavailable;
     return @ptrCast(task);
@@ -504,6 +570,7 @@ fn groupConcurrent(
     start: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
     const w = self(userdata);
+    if (w.refuse("Group.concurrent")) return error.ConcurrencyUnavailable;
     const g = w.groupState(group) catch return error.ConcurrencyUnavailable;
     const Erased = struct {
         fn run(ctx: *const anyopaque, result: *anyopaque) void {
@@ -531,6 +598,7 @@ fn groupAsync(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque) void,
 ) void {
+    if (self(userdata).currentReadOnly() != null) return start(context.ptr);
     groupConcurrent(userdata, group, context, context_alignment, start) catch
         @panic("out of memory starting a workflow coroutine");
 }
@@ -546,6 +614,7 @@ fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Can
     const w = self(userdata);
     const g: *GroupState = @ptrCast(@alignCast(token));
     if (g.pending > 0) {
+        if (w.refuse("Group.await")) return error.Canceled;
         var wait = w.newWait();
         g.awaiter = &wait;
         defer g.awaiter = null;
@@ -568,14 +637,23 @@ fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void 
     w.finishGroup(group, g);
 }
 
+/// The running coroutine's task, for its cancellation state; null outside a coroutine and in
+/// read-only code. A validator can run inside a coroutine (the workflow's or a handler's), and
+/// that coroutine's cancel request and protection belong to it: read-only code mustn't
+/// consume, set or change them, and sees an uncanceled task.
+fn ownCancelTask(w: *WorkflowIo) ?*Task {
+    if (w.currentReadOnly() != null) return null;
+    return w.currentTask();
+}
+
 fn recancel(userdata: ?*anyopaque) void {
     const w = self(userdata);
-    if (w.currentTask()) |t| t.cancel_requested = true;
+    if (w.ownCancelTask()) |t| t.cancel_requested = true;
 }
 
 fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
     const w = self(userdata);
-    const t = w.currentTask() orelse return .unblocked;
+    const t = w.ownCancelTask() orelse return .unblocked;
     const old = t.cancel_protection;
     t.cancel_protection = new;
     return old;
@@ -583,7 +661,7 @@ fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.Canc
 
 fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
     const w = self(userdata);
-    const t = w.currentTask() orelse return;
+    const t = w.ownCancelTask() orelse return;
     if (t.cancel_requested and t.cancel_protection == .unblocked) {
         t.cancel_requested = false;
         return error.Canceled;
@@ -592,15 +670,17 @@ fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
 
 fn futexWaitInner(w: *WorkflowIo, ptr: *const u32, expected: u32, timeout: Io.Timeout, cancelable: bool) Io.Cancelable!void {
     if (ptr.* != expected) return;
+    const duration = w.timeoutDuration(timeout);
+    if (duration) |d| if (d.nanoseconds <= 0) return;
+    // An uncancelable wait can't be refused: it blocks (or, outside a coroutine, panics).
+    if (cancelable and w.refuse("a futex wait (std.Io.Mutex, Condition, Event, Queue)")) return error.Canceled;
     var wait = w.newWait();
     wait.futex_ptr = ptr;
     w.futexEnqueue(&wait);
     defer w.futexRemove(&wait);
 
     var timer: Timer = .{ .wait = &wait };
-    const duration = w.timeoutDuration(timeout);
     if (duration) |d| {
-        if (d.nanoseconds <= 0) return;
         w.host.vtable.startTimer(w.host.ctx, &timer, d);
     }
     defer if (duration != null and !timer.fired) w.host.vtable.cancelTimer(w.host.ctx, &timer);
@@ -617,6 +697,17 @@ fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) 
 
 fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     const w = self(userdata);
+    if (w.currentReadOnly() != null) {
+        // Read-only code changed a std.Io primitive a coroutine waits on. std.Io already changed
+        // the primitive's memory (a Condition's count, a Queue's buffer) before this call, and
+        // that can't be undone, so the wake goes through to keep the primitive consistent; the
+        // read-only code's query fails, or its update is rejected, for it.
+        var it = w.futex_head;
+        while (it) |wait| : (it = wait.next) if (wait.futex_ptr == ptr) {
+            _ = w.refuse("a futex wake that resumes a workflow coroutine (std.Io.Event.set, Mutex.unlock, Queue.put, ...)");
+            break;
+        };
+    }
     var remaining = max_waiters;
     var it = w.futex_head;
     while (it) |wait| {
@@ -642,16 +733,22 @@ fn clockResolution(_: ?*anyopaque, _: Io.Clock) Io.Clock.ResolutionError!Io.Dura
 
 fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     const w = self(userdata);
-    const d = w.timeoutDuration(timeout) orelse {
+    const d = w.timeoutDuration(timeout);
+    // Read-only code returns at once from a sleep that needs no timer, and is refused one that
+    // does, before anything reads the coroutine's cancel request (see `ownCancelTask`).
+    if (d == null or d.?.nanoseconds > 0) {
+        if (w.refuse("sleep")) return error.Canceled;
+    } else if (w.currentReadOnly() != null) return;
+    const duration = d orelse {
         // Sleeping forever: wait for cancellation.
         var wait = w.newWait();
         return w.block(&wait, true);
     };
     try checkCancel(userdata);
-    if (d.nanoseconds <= 0) return;
+    if (duration.nanoseconds <= 0) return;
     var wait = w.newWait();
     var timer: Timer = .{ .wait = &wait };
-    w.host.vtable.startTimer(w.host.ctx, &timer, d);
+    w.host.vtable.startTimer(w.host.ctx, &timer, duration);
     w.block(&wait, true) catch |err| {
         if (!timer.fired) w.host.vtable.cancelTimer(w.host.ctx, &timer);
         return err;
@@ -660,7 +757,10 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
 }
 
 fn random(userdata: ?*anyopaque, buffer: []u8) void {
-    self(userdata).rng.fill(buffer);
+    const w = self(userdata);
+    // Read-only code draws from its section's copy, leaving the run's sequence as it was.
+    if (w.currentReadOnly()) |section| return section.rng.fill(buffer);
+    w.rng.fill(buffer);
 }
 
 fn randomSecure(userdata: ?*anyopaque, _: []u8) Io.RandomSecureError!void {

@@ -668,8 +668,51 @@ pub const PartyWorkflow = workflow.Def("party", Party);
 
 Notes:
 - Function workflows use `ctx.setSignalHandler`, `setQueryHandler`, and `setUpdateHandler(WithValidator)`, with a context from `ctx.allocator()`.
-- Signal and update handlers run in their own coroutines and may block; query handlers and validators must only read state.
+- Signal and update handlers run in their own coroutines and may block; query handlers and validators must only read state (see below).
 - `ctx.setSignalHandlerByName` handles a signal named at run time, and `ctx.setDynamicSignalHandler` every signal without a handler.
+
+`ctx.setDynamicQueryHandler(context, handler)` answers every query that has no handler of its own. The handler gets the query type and the arguments still encoded (`converter.EncodedValues`), like a dynamic signal handler, and returns the answer:
+
+<!-- example: workflow-dynamic-query -->
+```zig
+const Lobby = struct {
+    ctx: *workflow.Context,
+    guests: usize = 0,
+    fn addGuest(l: *Lobby, _: []const u8) void {
+        l.guests += 1;
+    }
+    fn full(l: *Lobby) bool {
+        return l.guests >= 2;
+    }
+    // Answers every query without a handler of its own; it may only read the lobby.
+    fn anyQuery(l: *Lobby, name: []const u8, args: temporal.converter.EncodedValues) ![]const u8 {
+        if (!std.mem.eql(u8, name, "welcome")) return error.UnknownQuery;
+        const a = l.ctx.allocator();
+        const guest = try args.get([]const u8, a, 0);
+        return std.fmt.allocPrint(a, "Welcome, {s}! {d} here so far.", .{ guest, l.guests });
+    }
+};
+fn lobby(ctx: *workflow.Context) !usize {
+    const l = try ctx.allocator().create(Lobby); // outlives the workflow function
+    l.* = .{ .ctx = ctx };
+    try ctx.setSignalHandler(AddGuest, l, Lobby.addGuest);
+    try ctx.setDynamicQueryHandler(l, Lobby.anyQuery);
+    try ctx.await(l, Lobby.full);
+    return l.guests;
+}
+pub const LobbyWorkflow = workflow.Def("lobby", lobby);
+```
+
+Notes:
+- A handler registered for a query type with `setQueryHandler` (or a struct workflow's `queries`) still answers that type. Without a dynamic handler, a query of an unregistered type fails with `QueryNotRegistered`, naming the registered types.
+- An error from the handler, or an argument that doesn't decode, fails the query with the error's name. Registering again replaces the dynamic handler; its context must outlive the run, and one on the calling coroutine's stack returns `error.QueryContextOnStack`.
+- Query handlers and update validators must not change workflow state: history doesn't record queries or rejected updates, so a change would make the run differ from its replay. A call from one that would start an activity, timer, child workflow or any other command (`executeActivity`, `sleep`, `executeChildWorkflow`, `signalExternalWorkflow`, `upsertMemo`, `completeSession`, ...), register or remove a handler (`setSignalHandler`, `signalChannel`, `setUpdateHandler`, ...), take a signal from a channel (`receive`, `tryReceive`), change the run's settings (`setVersioningBehavior`, `setCoroutineName`), start a coroutine (`io.concurrent`), or block (`ctx.await`, a pending future's `get`) is refused: it returns `error.InvalidOptions` or `error.Canceled` (or does nothing, where it can't fail), the query fails or the update is rejected with a `ReadOnlyViolation` failure whose message names the call, whatever the handler returns, no command is sent, and the workflow task doesn't fail. A zero `sleep` returns at once, `io.async` runs its function inline, and `io.random` draws without moving the workflow's random sequence. `ctx.fail` and `ctx.failWith` describe the query's failure or the update's rejection, not the workflow's.
+- Query types Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, and those starting with `__temporal`) don't go to the dynamic handler.
+- In a query handler, `ctx.allocator()` is the query's memory, freed once the answer is sent, so decoding arguments there doesn't grow the run.
+- Waits that can't fail can't be refused: an uncancelable wait that would block (such as `std.Io.Mutex.lockUncancelable` on a mutex the workflow holds), or awaiting or canceling a pending `std.Io.Future`, panics the worker in a query handler or a validator run on delivery. A validator run in a handler's coroutine (when the handler registers the update's handler) blocks only that coroutine, and its update is rejected with `ReadOnlyViolation` once the wait ends. Don't wait in them.
+- A handler or validator that wakes a workflow coroutine through `std.Io` (`Event.set`, `Condition.signal`, `Queue.put`, `Mutex.unlock` on something a coroutine waits for) also fails the query or has the update rejected with `ReadOnlyViolation`. The wake itself still happens, since `std.Io` has already changed the primitive: the woken coroutine runs in the next workflow task that runs workflow code.
+- The SDK can't undo a change a handler makes to workflow data or to a `std.Io` primitive, and doesn't detect one that wakes nothing; keeping to reads is the handler's job.
+- The rules apply only to the handler's or validator's own code: other coroutines, including ones that run while a validator is blocked, are unaffected. A validator run in a coroutine neither sees nor uses up that coroutine's cancellation: `io.checkCancel` and a zero `sleep` return normally, and the cancel stays for the coroutine's own code.
 
 A signal channel lets workflow code receive a signal where it needs it instead of in a handler. `ctx.signalChannel(Signal)` (or `ctx.signalChannelByName(name, Args)`) returns a `workflow.SignalChannel` that takes the place of the signal's handler:
 

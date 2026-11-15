@@ -254,6 +254,54 @@ test "workflows: signal, query, and update handlers of a struct workflow" {
     try testing.expectEqual(1, try env.queryWorkflow(GuestCount, a, run.id, .{}));
 }
 
+// example: workflow-dynamic-query
+const Lobby = struct {
+    ctx: *workflow.Context,
+    guests: usize = 0,
+    fn addGuest(l: *Lobby, _: []const u8) void {
+        l.guests += 1;
+    }
+    fn full(l: *Lobby) bool {
+        return l.guests >= 2;
+    }
+    // Answers every query without a handler of its own; it may only read the lobby.
+    fn anyQuery(l: *Lobby, name: []const u8, args: temporal.converter.EncodedValues) ![]const u8 {
+        if (!std.mem.eql(u8, name, "welcome")) return error.UnknownQuery;
+        const a = l.ctx.allocator();
+        const guest = try args.get([]const u8, a, 0);
+        return std.fmt.allocPrint(a, "Welcome, {s}! {d} here so far.", .{ guest, l.guests });
+    }
+};
+fn lobby(ctx: *workflow.Context) !usize {
+    const l = try ctx.allocator().create(Lobby); // outlives the workflow function
+    l.* = .{ .ctx = ctx };
+    try ctx.setSignalHandler(AddGuest, l, Lobby.addGuest);
+    try ctx.setDynamicQueryHandler(l, Lobby.anyQuery);
+    try ctx.await(l, Lobby.full);
+    return l.guests;
+}
+pub const LobbyWorkflow = workflow.Def("lobby", lobby);
+// end-example
+
+test "workflows: a dynamic query handler answers queries without a handler of their own" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(LobbyWorkflow);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(LobbyWorkflow, .{}, .{});
+    defer run.deinit();
+    try env.signalWorkflow(AddGuest, run.id, .{"Ann"});
+    const Welcome = workflow.QueryDef("welcome", fn (guest: []const u8) []const u8);
+    try testing.expectEqualStrings("Welcome, Bob! 1 here so far.", try env.queryWorkflow(Welcome, a, run.id, .{"Bob"}));
+    const Unknown = workflow.QueryDef("unknown", fn () []const u8);
+    try testing.expectError(error.QueryFailed, env.queryWorkflow(Unknown, a, run.id, .{}));
+    try env.signalWorkflow(AddGuest, run.id, .{"Bob"});
+    try testing.expectEqual(2, try env.getResult(LobbyWorkflow, &run, a, null));
+}
+
 // example: workflow-signal-channel
 const Arrival = union(enum) { guest: error{Canceled}![]const u8, quiet: std.Io.Cancelable!void };
 fn greetArrivals(ctx: *workflow.Context) ![]const u8 {

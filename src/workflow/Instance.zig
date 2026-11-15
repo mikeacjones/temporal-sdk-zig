@@ -125,10 +125,6 @@ interceptors: []const interceptor.Worker = &.{},
 /// The run's interceptors, from `interceptors` at initialization. Arena memory.
 inbound: []const interceptor.WorkflowInbound = &.{},
 outbound: []const interceptor.WorkflowOutbound = &.{},
-/// The handler of the update being validated, for the validation chain's end.
-validating: ?UpdateHandler = null,
-/// The update being validated, for `currentUpdate` in its validator.
-validating_update: ?*const Update = null,
 last_completion_result: ?converter.Payload = null,
 /// The failure the previous run of a retried or cron workflow ended with. Arena memory.
 previous_run_failure: ?*const Failure = null,
@@ -168,6 +164,8 @@ task_failure_type: []const u8 = "UnsupportedJob",
 /// Query handlers by query type, in registration order (the order an unknown query's failure
 /// lists them in). Arena memory; they outlive the workflow function.
 queries: std.array_hash_map.String(QueryHandler) = .empty,
+/// Answers queries with no handler registered for their type, if set. Arena memory.
+dynamic_query_handler: ?DynamicQueryHandler = null,
 /// Signal handlers by signal name, in registration order. Arena memory.
 signal_handlers: std.array_hash_map.String(SignalHandler) = .empty,
 /// Handles signals with no handler registered for their name, if set. Arena memory.
@@ -229,6 +227,13 @@ pub const QueryHandler = struct {
     call: *const fn (context: *const anyopaque, out: Allocator, args: []const converter.Payload) anyerror!converter.Payload,
 };
 
+/// A type-erased dynamic query handler: like `QueryHandler`, but `call` also gets the query
+/// type, and `args` stay encoded for the handler to decode.
+pub const DynamicQueryHandler = struct {
+    context: *const anyopaque,
+    call: *const fn (context: *const anyopaque, out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!converter.Payload,
+};
+
 /// A type-erased signal handler. `decode` turns a signal's name and payloads (both arena
 /// memory of the run) into the handler's arguments, allocated in `out`; `call` runs the
 /// handler with `context` and those arguments, inside the signal's coroutine.
@@ -288,6 +293,7 @@ pub const SignalChannel = struct {
     /// `Select`, or `Group`, or with the workflow), leaving the channel's signals unread.
     pub fn receive(ch: *SignalChannel) error{Canceled}!*const anyopaque {
         while (true) {
+            if (ch.inst.wio.refuse("SignalChannel.receive")) return error.Canceled;
             if (ch.take()) |args| return args;
             var waiter: Waiter = .{ .wait = ch.inst.wio.newWaitPoint(), .next = ch.waiters };
             ch.waiters = &waiter;
@@ -681,6 +687,9 @@ fn runFree(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr
 /// still cancel timers or activities, but the core has dropped the run, so nothing is sent.
 fn emit(inst: *Instance, command: cmd_pb.WorkflowCommand) error{OutOfMemory}!void {
     if (inst.evicting) return;
+    // Every caller refuses read-only code itself, naming the call; this keeps the invariant if
+    // one is missed.
+    if (inst.wio.refuse("a call that emits a command")) return;
     try inst.commands.append(inst.arena(), command);
 }
 
@@ -823,6 +832,7 @@ fn setDeploymentVersion(inst: *Instance, v: ?proto.coresdk.common.WorkerDeployme
 /// context points to, if it is a pointer: one into the calling coroutine's stack is rejected,
 /// since that stack is reused once the coroutine returns and queries can arrive after that.
 pub fn setQueryHandler(inst: *Instance, name: []const u8, handler: QueryHandler, context_addr: ?usize) error{ OutOfMemory, QueryContextOnStack }!void {
+    if (inst.wio.refuse("setQueryHandler")) return;
     if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
         inst.logger.warn("setQueryHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{ .QueryType = name });
         return error.QueryContextOnStack;
@@ -830,17 +840,36 @@ pub fn setQueryHandler(inst: *Instance, name: []const u8, handler: QueryHandler,
     try inst.queries.put(inst.arena(), name, handler);
 }
 
+/// Registers `handler` for queries with no handler registered for their type, replacing any
+/// earlier one. The handler's context must outlive the run; `context_addr` is checked as in
+/// `setQueryHandler`.
+pub fn setDynamicQueryHandler(inst: *Instance, handler: DynamicQueryHandler, context_addr: ?usize) error{QueryContextOnStack}!void {
+    if (inst.wio.refuse("setDynamicQueryHandler")) return;
+    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
+        inst.logger.warn("setDynamicQueryHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{});
+        return error.QueryContextOnStack;
+    };
+    inst.dynamic_query_handler = handler;
+}
+
 /// The answer to one query: the handler's encoded result, or a failure for an unknown query
-/// type or a handler error. Memory comes from `out`.
+/// type, a handler error, or a call the handler may not make (see `ReadOnlySection`). Memory
+/// comes from `out`.
 fn answerQuery(inst: *Instance, q: *const act_pb.QueryWorkflow, out: Allocator) !cmd_pb.QueryResult {
-    const response = inst.inboundNext().handleQuery(.{
+    const header: converter.Header = try .fromEntries(out, q.headers.items);
+    var section: ReadOnlySection = .{ .memory = out };
+    inst.wio.beginReadOnly(&section.io);
+    const result = inst.inboundNext().handleQuery(.{
         .query_type = q.query_type,
         .args = .{ .payloads = q.arguments.items },
-        .header = try .fromEntries(out, q.headers.items),
+        .header = header,
         .arena = out,
-    }) catch |err| {
+    });
+    inst.wio.endReadOnly(&section.io);
+    if (section.io.refused) |call| return .{ .query_id = q.query_id, .variant = .{ .failed = try readOnlyFailure(out, "query handler", q.query_type, call) } };
+    const response = result catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        if (err != error.QueryNotRegistered) return .{ .query_id = q.query_id, .variant = .{ .failed = try failure_mod.fromError(out, err) } };
+        if (err != error.QueryNotRegistered) return .{ .query_id = q.query_id, .variant = .{ .failed = try section.failureOf(out, err) } };
         const names = try std.mem.join(out, ", ", inst.queries.keys());
         return .{ .query_id = q.query_id, .variant = .{ .failed = try failure_mod.application(out, .{
             .message = try std.fmt.allocPrint(out, "query type \"{s}\" is not registered on workflow \"{s}\"; registered query types: [{s}]", .{ q.query_type, inst.info.workflow_type, names }),
@@ -850,6 +879,73 @@ fn answerQuery(inst: *Instance, q: *const act_pb.QueryWorkflow, out: Allocator) 
     return .{ .query_id = q.query_id, .variant = .{ .succeeded = .{ .response = response } } };
 }
 
+/// A query handler or an update validator running now, under the read-only invariant: the
+/// SDK changes none of the run state it owns on its behalf (commands, sequence numbers,
+/// handler tables, buffered signals and updates, signal channels, the random generator,
+/// pending failures, patches and versions, memo, search attributes, sessions, versioning
+/// behavior, task failure, and the cancel request and protection of the coroutine a
+/// validator runs in), and nothing the run keeps points into the query's memory, because
+/// none of it is in history and replay runs no query. Its only effect is the answer, or the
+/// update's acceptance or rejection. What the code itself writes to workflow data or to a
+/// std.Io primitive (an Event, Condition, Queue, Mutex) can't be intercepted or undone: a
+/// write that wakes a coroutine is reported (the wake still happens, as std.Io already
+/// changed the primitive), and other writes are the handler's error.
+///
+/// The section belongs to the code it began in: outside any coroutine (queries, and updates
+/// validated on delivery) or in one handler's coroutine (an update validated when a handler
+/// registers its update handler). Everything here applies to that code alone, so a validator
+/// blocked in a wait that can't be refused leaves the rest of the run as it was, and two
+/// sections in different coroutines don't share anything. Every SDK call that would change
+/// run state checks `WorkflowIo.refuse` first and does nothing; `emit` refuses as a backstop.
+/// What the section's own code may use for itself is kept here, not in the run: the random
+/// generator (in `io`), the query's memory (`Context.allocator`), the update being validated,
+/// and the failures `ctx.fail` and futures record. Lives on the stack of `answerQuery` or
+/// `startUpdate`.
+const ReadOnlySection = struct {
+    io: WorkflowIo.ReadOnly = .{},
+    /// The query's memory, freed once its answer is sent; null in a validator.
+    memory: ?Allocator = null,
+    /// The update being validated and its handler; null in a query handler.
+    update: ?*const Update = null,
+    update_handler: ?UpdateHandler = null,
+    pending_failure: ?PendingFailure = null,
+    last_failure: ?*const Failure = null,
+
+    /// The failure that describes the handler's or validator's error `err`: the one it chose
+    /// with `ctx.fail` or `ctx.failWith`, or that of the future whose error it returned, as
+    /// for an update handler's error. Memory from `a`.
+    fn failureOf(r: *const ReadOnlySection, a: Allocator, err: anyerror) error{OutOfMemory}!Failure {
+        switch (err) {
+            error.ApplicationFailure => if (r.pending_failure) |p| return p.resolve(a, ""),
+            error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (r.last_failure) |f| return f.*,
+            else => {},
+        }
+        return failure_mod.fromError(a, err);
+    }
+};
+
+/// The read-only section of the code running now, or null.
+pub fn readOnly(inst: *const Instance) ?*ReadOnlySection {
+    const io_section = inst.wio.currentReadOnly() orelse return null;
+    return @alignCast(@fieldParentPtr("io", io_section));
+}
+
+/// The memory `Context.allocator` returns: the query's while its handler runs, otherwise the
+/// run's.
+pub fn allocator(inst: *Instance) Allocator {
+    if (inst.readOnly()) |r| if (r.memory) |m| return m;
+    return inst.arena();
+}
+
+/// The failure of a query, or the rejection of an update, whose handler or validator made a
+/// call its `ReadOnlySection` refuses. `what` is "query handler" or "update validator".
+fn readOnlyFailure(a: Allocator, what: []const u8, name: []const u8, call: []const u8) error{OutOfMemory}!Failure {
+    return failure_mod.application(a, .{
+        .message = try std.fmt.allocPrint(a, "{s} for \"{s}\" called {s}, which query handlers and update validators may not call: they only read workflow state, so they must not start activities, timers, child workflows or other commands, or block", .{ what, name, call }),
+        .type = "ReadOnlyViolation",
+    });
+}
+
 // ---------------------------------------------------------------- signals
 
 /// Registers `handler` for signals called `name`, replacing any handler registered under it,
@@ -857,6 +953,8 @@ fn answerQuery(inst: *Instance, q: *const act_pb.QueryWorkflow, out: Allocator) 
 /// `name` and the handler's context must outlive the run. `context_addr` is checked as in
 /// `setQueryHandler`: a handler coroutine can run after the registering coroutine returned.
 pub fn setSignalHandler(inst: *Instance, name: []const u8, handler: SignalHandler, context_addr: ?usize) error{ OutOfMemory, SignalContextOnStack }!void {
+    // Registering can start buffered signals' handler coroutines.
+    if (inst.wio.refuse("setSignalHandler")) return;
     if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
         inst.logger.warn("setSignalHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{ .SignalName = name });
         return error.SignalContextOnStack;
@@ -879,6 +977,7 @@ pub fn setSignalHandler(inst: *Instance, name: []const u8, handler: SignalHandle
 /// The handler's context must outlive the run; `context_addr` is checked as in
 /// `setSignalHandler`.
 pub fn setDynamicSignalHandler(inst: *Instance, handler: SignalHandler, context_addr: ?usize) error{ OutOfMemory, SignalContextOnStack }!void {
+    if (inst.wio.refuse("setDynamicSignalHandler")) return;
     if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
         inst.logger.warn("setDynamicSignalHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{});
         return error.SignalContextOnStack;
@@ -897,6 +996,7 @@ pub fn setDynamicSignalHandler(inst: *Instance, handler: SignalHandler, context_
 /// `ch` is arena memory the caller allocated.
 pub fn createSignalChannel(inst: *Instance, name: []const u8, ch: *SignalChannel, decode: *const fn (out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque) error{OutOfMemory}!void {
     ch.* = .{ .inst = inst };
+    if (inst.wio.refuse("signalChannel")) return;
     try inst.signal_channels.append(inst.arena(), ch);
     inst.setSignalHandler(name, .{ .context = ch, .decode = decode, .call = SignalChannel.handlerCall }, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -912,16 +1012,24 @@ pub fn signalChannelFor(inst: *Instance, name: []const u8, decode: *const fn (ou
     return @ptrCast(@alignCast(@constCast(handler.context)));
 }
 
+/// Sets the versioning behavior sent with each completion from now on.
+pub fn setVersioningBehavior(inst: *Instance, behavior: workflow.VersioningBehavior) void {
+    if (inst.wio.refuse("setVersioningBehavior")) return;
+    inst.versioning_behavior = behavior;
+}
+
 /// Unregisters the handler (or channel) for signals called `name`, if any. Later signals of
 /// that name go to the dynamic handler, or are buffered. Handler coroutines already started
 /// run to completion, and a channel keeps the signals it already took.
 pub fn removeSignalHandler(inst: *Instance, name: []const u8) void {
+    if (inst.wio.refuse("removeSignalHandler")) return;
     _ = inst.signal_handlers.orderedRemove(name);
 }
 
 /// Unregisters the dynamic signal handler, if any: later signals with no handler of their own
 /// are buffered. Handler coroutines already started run to completion.
 pub fn removeDynamicSignalHandler(inst: *Instance) void {
+    if (inst.wio.refuse("removeDynamicSignalHandler")) return;
     inst.dynamic_signal_handler = null;
 }
 
@@ -1002,6 +1110,8 @@ fn startSignalHandler(inst: *Instance, handler: SignalHandler, signal: *const Si
 /// then delivers each buffered update of that name to it, in arrival order. `name` and the
 /// handler's context must outlive the run; `context_addr` is checked as in `setQueryHandler`.
 pub fn setUpdateHandler(inst: *Instance, name: []const u8, handler: UpdateHandler, context_addr: ?usize) error{ OutOfMemory, UpdateContextOnStack }!void {
+    // Registering can validate and accept buffered updates and start their coroutines.
+    if (inst.wio.refuse("setUpdateHandler")) return;
     if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
         inst.logger.warn("setUpdateHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{ .UpdateName = name });
         return error.UpdateContextOnStack;
@@ -1050,13 +1160,14 @@ fn deliverUpdate(inst: *Instance, job: *const act_pb.DoUpdate) !void {
 fn startUpdate(inst: *Instance, handler: UpdateHandler, update: *const Update) error{OutOfMemory}!void {
     const a = inst.arena();
     if (update.run_validator) {
-        inst.validating = handler;
-        inst.validating_update = update;
-        defer inst.validating = null;
-        defer inst.validating_update = null;
-        inst.inboundNext().validateUpdate(update.input()) catch |err| switch (err) {
+        var section: ReadOnlySection = .{ .update = update, .update_handler = handler };
+        inst.wio.beginReadOnly(&section.io);
+        const result = inst.inboundNext().validateUpdate(update.input());
+        inst.wio.endReadOnly(&section.io);
+        if (section.io.refused) |call| return inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try readOnlyFailure(a, "update validator", update.name, call) });
+        result catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try failure_mod.fromError(a, err) }),
+            else => return inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try section.failureOf(a, err) }),
         };
     }
     try inst.respondToUpdate(update.protocol_instance_id, .{ .accepted = .{} });
@@ -1207,9 +1318,10 @@ fn currentHandler(inst: *Instance) ?*HandlerRun {
 
 /// The update being validated, or else the update whose handler is running now. The
 /// validator comes first: a handler that registers an update handler validates buffered
-/// updates inline in its own coroutine, and `validating_update` is set only for that call.
+/// updates inline in its own coroutine, and its read-only section names the update only for
+/// that coroutine.
 pub fn currentUpdate(inst: *Instance) ?workflow.UpdateInfo {
-    if (inst.validating_update) |u| return .{ .id = u.id, .name = u.name };
+    if (inst.readOnly()) |r| if (r.update) |u| return .{ .id = u.id, .name = u.name };
     const run = inst.currentHandler() orelse return null;
     return switch (run.kind) {
         .update => |u| .{ .id = u.update.id, .name = u.update.name },
@@ -1220,13 +1332,17 @@ pub fn currentUpdate(inst: *Instance) ?workflow.UpdateInfo {
 /// Records `Context.fail`'s or `Context.failWith`'s failure for the running coroutine: its
 /// handler run's, or the workflow function's.
 pub fn setPendingFailure(inst: *Instance, a: PendingFailure) void {
-    if (inst.currentHandler()) |run| run.pending_failure = a else inst.ctx.pending_failure = a;
+    if (inst.readOnly()) |r| {
+        r.pending_failure = a;
+    } else if (inst.currentHandler()) |run| run.pending_failure = a else inst.ctx.pending_failure = a;
 }
 
 /// Records the failure a future's `get` returned for the running coroutine, as
 /// `setPendingFailure` does. `f` must live as long as the run (arena memory).
 pub fn setLastFailure(inst: *Instance, f: ?*const Failure) void {
-    if (inst.currentHandler()) |run| run.last_failure = f else inst.ctx.last_failure = f;
+    if (inst.readOnly()) |r| {
+        r.last_failure = f;
+    } else if (inst.currentHandler()) |run| run.last_failure = f else inst.ctx.last_failure = f;
 }
 
 fn removeHandler(inst: *Instance, run: *HandlerRun) void {
@@ -1263,14 +1379,15 @@ pub const Condition = struct {
 /// returns when a durable timer fires; returns whether the condition was met.
 pub fn awaitCondition(inst: *Instance, check: *const fn (context: *const anyopaque) bool, context: *const anyopaque, timeout: ?std.Io.Duration) error{ Canceled, OutOfMemory }!bool {
     if (check(context)) return true;
+    const timed = if (timeout) |d| d.nanoseconds > 0 else false;
+    if (timeout != null and !timed) return false;
+    if (inst.wio.refuse(if (timeout == null) "await" else "awaitTimeout")) return error.Canceled;
     var wait = inst.wio.newWaitPoint();
     var cond: Condition = .{ .check = check, .context = context, .wait = &wait };
     try inst.conditions.append(inst.arena(), &cond);
     defer if (!cond.met) inst.removeCondition(&cond);
 
     var timer: WorkflowIo.Timer = .{ .wait = &wait };
-    const timed = if (timeout) |d| d.nanoseconds > 0 else false;
-    if (timeout != null and !timed) return false;
     if (timed) hostStartTimer(inst, &timer, timeout.?);
     defer if (timed and !timer.fired) hostCancelTimer(inst, &timer);
 
@@ -1456,6 +1573,7 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
 /// Encodes `args` into the arena and passes the request through the outbound interceptors to
 /// `recordContinueAsNew`.
 pub fn requestContinueAsNew(inst: *Instance, workflow_type: []const u8, options: workflow.ContinueAsNewOptions, args: anytype) sa.EncodeError!void {
+    if (inst.wio.refuse("continueAsNew")) return;
     const out = try inst.outgoing(args);
     return inst.outboundNext().continueAsNew(.{ .workflow_type = workflow_type, .options = options, .args = out.args, .header = out.header });
 }
@@ -1494,7 +1612,7 @@ fn recordContinueAsNew(inst: *Instance, workflow_type: []const u8, options: work
 /// them to `inst.memo`. `fields` must stay valid for the run (arena memory). Upserting no
 /// fields does nothing.
 pub fn upsertMemo(inst: *Instance, fields: []const converter.Field) error{OutOfMemory}!void {
-    if (fields.len == 0) return;
+    if (fields.len == 0 or inst.wio.refuse("upsertMemo")) return;
     const a = inst.arena();
     var upserted: common.Memo = .{};
     try upserted.fields.ensureTotalCapacity(a, fields.len);
@@ -1540,7 +1658,7 @@ fn fieldOrder(name: []const u8, f: converter.Field) std.math.Order {
 /// Emits one UpsertWorkflowSearchAttributes command with `updates` (in their order) and
 /// applies them to `inst.search_attributes`. Upserting nothing does nothing.
 pub fn upsertSearchAttributes(inst: *Instance, updates: []const sa.Update) sa.EncodeError!void {
-    if (updates.len == 0) return;
+    if (updates.len == 0 or inst.wio.refuse("upsertSearchAttributes")) return;
     const a = inst.arena();
     const encoded = try sa.toProto(a, updates, .upsert);
     const view = try inst.search_attributes.withEntries(a, encoded.indexed_fields.items);
@@ -1558,6 +1676,8 @@ pub fn upsertSearchAttributes(inst: *Instance, updates: []const sa.Update) sa.En
 pub fn patch(inst: *Instance, patch_id: []const u8, deprecated: bool) bool {
     if (inst.patches.get(patch_id)) |used| return used;
     const used = !inst.replaying or inst.notified_patches.contains(patch_id);
+    // Read-only code gets the answer without deciding it for the run.
+    if (inst.wio.refuse("patched")) return used;
     inst.recordPatch(patch_id, used, deprecated) catch {
         inst.task_failure = "out of memory recording a patch";
     };
@@ -1594,17 +1714,20 @@ pub fn getVersion(inst: *Instance, change_id: []const u8, min_supported: i32, ma
     const a = inst.arena();
     const version = inst.versions.get(change_id) orelse blk: {
         const v = inst.recordedVersion(change_id) orelse if (inst.replaying) workflow.default_version else max_supported;
+        if (inst.wio.refuse("getVersion")) return v;
         inst.versions.put(a, a.dupe(u8, change_id) catch return inst.versionOutOfMemory(v), v) catch return inst.versionOutOfMemory(v);
         break :blk v;
     };
     if (version < min_supported or version > max_supported) {
+        if (inst.readOnly() != null) return error.UnsupportedVersion; // the workflow task is not the query's to fail
         // Failing the task, not the workflow, lets a worker whose code supports the
         // version run it. The message reaches the server's WorkflowTaskFailed event; the
         // workflow's logger is silent during the replay that usually finds this.
         inst.task_failure = std.fmt.allocPrint(a, "getVersion(\"{s}\", {d}, {d}): the run uses version {d} of this change, which this code doesn't support", .{ change_id, min_supported, max_supported, version }) catch "getVersion: the run uses a version of a change this code doesn't support";
         return error.UnsupportedVersion;
     }
-    if (version == workflow.default_version) return version;
+    // Read-only code only reads the version: there is no marker to record.
+    if (version == workflow.default_version or inst.readOnly() != null) return version;
     _ = inst.patch(versionPatchId(a, change_id, version) catch return inst.versionOutOfMemory(version), false);
     return version;
 }
@@ -1649,29 +1772,34 @@ pub fn currentLogger(inst: *Instance) log.Logger {
 
 /// Encodes `args` and schedules an activity through the outbound interceptors.
 pub fn executeActivity(inst: *Instance, activity_type: []const u8, options: workflow.ActivityOptions, args: anytype) workflow.ActivityFuture(converter.Payload) {
+    if (inst.wio.refuse("executeActivity")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
     const out = inst.outgoing(args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     return inst.outboundNext().executeActivity(.{ .activity_type = activity_type, .options = options, .args = out.args, .header = out.header });
 }
 
 /// Encodes `args` and schedules a local activity through the outbound interceptors.
 pub fn executeLocalActivity(inst: *Instance, activity_type: []const u8, options: workflow.LocalActivityOptions, args: anytype) workflow.ActivityFuture(converter.Payload) {
+    if (inst.wio.refuse("executeLocalActivity")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
     const out = inst.outgoing(args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     return inst.outboundNext().executeLocalActivity(.{ .activity_type = activity_type, .options = options, .args = out.args, .header = out.header });
 }
 
 /// Records a side effect's value (null on replay) through the outbound interceptors.
 pub fn sideEffect(inst: *Instance, value: ?converter.Payload) workflow.ActivityFuture(converter.Payload) {
+    if (inst.wio.refuse("sideEffect")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
     return inst.outboundNext().sideEffect(.{ .value = value });
 }
 
 /// Encodes `args` and starts a child workflow through the outbound interceptors.
 pub fn executeChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workflow.ChildWorkflowOptions, args: anytype) workflow.ChildWorkflowFuture(converter.Payload) {
+    if (inst.wio.refuse("executeChildWorkflow")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
     const out = inst.outgoing(args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     return inst.outboundNext().executeChildWorkflow(.{ .workflow_type = workflow_type, .options = options, .args = out.args, .header = out.header });
 }
 
 /// Encodes `args` and sends a signal through the outbound interceptors.
 pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []const u8, args: anytype) workflow.SignalExternalFuture {
+    if (inst.wio.refuse("signalExternalWorkflow")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
     const out = inst.outgoing(args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     const workflow_id, const run_id, const child = switch (target) {
         .execution => |e| .{ e.workflow_id, e.run_id, false },
@@ -1689,6 +1817,7 @@ pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
 
 /// Requests another workflow's cancellation through the outbound interceptors.
 pub fn cancelExternalWorkflow(inst: *Instance, workflow_id: []const u8, run_id: []const u8) workflow.CancelExternalFuture {
+    if (inst.wio.refuse("cancelExternalWorkflow")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
     return inst.outboundNext().cancelExternalWorkflow(.{ .workflow_id = workflow_id, .run_id = run_id });
 }
 
@@ -1900,6 +2029,7 @@ fn protoRetryPolicy(a: Allocator, rp: workflow.RetryPolicy) !common.RetryPolicy 
 /// Eviction ends any of these waits with error.Canceled.
 pub fn awaitActivity(inst: *Instance, state: *ActivityState) error{Canceled}!void {
     if (state.outcome != null) return;
+    if (inst.wio.refuse("ActivityFuture.get")) return error.Canceled;
     var wait = inst.wio.newWaitPoint();
     state.waiter = &wait;
     defer state.waiter = null;
@@ -1921,6 +2051,7 @@ pub fn awaitActivity(inst: *Instance, state: *ActivityState) error{Canceled}!voi
 
 pub fn cancelActivity(inst: *Instance, state: *ActivityState) void {
     if (state.outcome != null or state.cancel_requested) return;
+    if (inst.wio.refuse("ActivityFuture.cancel")) return;
     state.cancel_requested = true;
     inst.requestCancel(state) catch {
         inst.task_failure = "out of memory requesting activity cancellation";
@@ -2053,6 +2184,10 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
 /// wait with error.Canceled.
 pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) error{Canceled}!void {
     if (state.reached(phase)) return;
+    if (inst.wio.refuse(switch (phase) {
+        .started => "ChildWorkflowFuture.started",
+        .result => "ChildWorkflowFuture.get",
+    })) return error.Canceled;
     var wait = inst.wio.newWaitPoint();
     const waiter = switch (phase) {
         .started => &state.start_waiter,
@@ -2079,6 +2214,7 @@ pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) 
 /// says (and resolves a child whose start it hasn't sent yet as canceled before starting).
 pub fn cancelChild(inst: *Instance, state: *ChildState) void {
     if (state.outcome != null or state.cancel_requested) return;
+    if (inst.wio.refuse("ChildWorkflowFuture.cancel")) return;
     state.cancel_requested = true;
     inst.emit(.{ .variant = .{ .cancel_child_workflow_execution = .{
         .child_workflow_seq = state.seq,
@@ -2147,6 +2283,7 @@ fn resolveChild(inst: *Instance, r: *const act_pb.ResolveChildWorkflowExecution)
 /// don't go through the outbound interceptors. The names, endpoint and headers are copied
 /// into the arena.
 pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, input: anytype) ScheduleError!*NexusOperationState {
+    if (inst.wio.refuse("executeNexusOperation")) return error.InvalidOptions;
     const fields = .{ .NexusEndpoint = options.endpoint, .NexusService = service, .NexusOperation = operation };
     if (options.endpoint.len == 0) {
         inst.logger.warn("executeNexusOperation: NexusOperationOptions.endpoint is empty; name the Nexus endpoint to call through", fields);
@@ -2207,6 +2344,10 @@ pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: [
 /// cancelable wait returns error.Canceled. Eviction ends the wait with error.Canceled.
 pub fn awaitNexusOperation(inst: *Instance, state: *NexusOperationState, phase: NexusOperationState.Phase) error{Canceled}!void {
     if (state.reached(phase)) return;
+    if (inst.wio.refuse(switch (phase) {
+        .started => "NexusOperationFuture.started",
+        .result => "NexusOperationFuture.get",
+    })) return error.Canceled;
     var wait = inst.wio.newWaitPoint();
     const waiter = switch (phase) {
         .started => &state.start_waiter,
@@ -2232,6 +2373,7 @@ pub fn awaitNexusOperation(inst: *Instance, state: *NexusOperationState, phase: 
 /// type says (see `workflow.NexusOperationCancellationType`).
 pub fn cancelNexusOperation(inst: *Instance, state: *NexusOperationState) void {
     if (state.outcome != null or state.cancel_requested) return;
+    if (inst.wio.refuse("NexusOperationFuture.cancel")) return;
     state.cancel_requested = true;
     inst.emit(.{ .variant = .{ .request_cancel_nexus_operation = .{ .seq = state.seq } } }) catch {
         inst.task_failure = "out of memory requesting Nexus operation cancellation";
@@ -2368,6 +2510,10 @@ fn newExternal(inst: *Instance, kind: ExternalState.Kind, workflow_id: []const u
 /// withdrawn. Eviction ends the wait with error.Canceled.
 pub fn awaitExternal(inst: *Instance, state: *ExternalState) error{Canceled}!void {
     if (state.outcome != null) return;
+    if (inst.wio.refuse(switch (state.kind) {
+        .signal => "SignalExternalFuture.get",
+        .cancel => "CancelExternalFuture.get",
+    })) return error.Canceled;
     var wait = inst.wio.newWaitPoint();
     state.waiter = &wait;
     defer state.waiter = null;
@@ -2476,13 +2622,24 @@ fn rootHandleSignal(ptr: *anyopaque, input: interceptor.HandleSignalInput, _: in
 
 fn rootHandleQuery(ptr: *anyopaque, input: interceptor.HandleQueryInput, _: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    const handler = inst.queries.get(input.query_type) orelse return error.QueryNotRegistered;
-    return handler.call(handler.context, input.arena, input.args.payloads);
+    if (inst.queries.get(input.query_type)) |handler| return handler.call(handler.context, input.arena, input.args.payloads);
+    if (reservedQuery(input.query_type)) return error.QueryNotRegistered;
+    const dynamic = inst.dynamic_query_handler orelse return error.QueryNotRegistered;
+    return dynamic.call(dynamic.context, input.arena, input.query_type, input.args.payloads);
+}
+
+/// Whether `query_type` names one of the queries Temporal's tools send for themselves (stack
+/// traces, workflow metadata), which a dynamic query handler doesn't answer.
+fn reservedQuery(query_type: []const u8) bool {
+    return std.mem.eql(u8, query_type, "__stack_trace") or
+        std.mem.eql(u8, query_type, "__enhanced_stack_trace") or
+        std.mem.startsWith(u8, query_type, "__temporal");
 }
 
 fn rootValidateUpdate(ptr: *anyopaque, input: interceptor.UpdateInput, _: interceptor.WorkflowInbound.Next) anyerror!void {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    const handler = inst.validating orelse return error.HandlerNotFound;
+    const section = inst.readOnly() orelse return error.HandlerNotFound;
+    const handler = section.update_handler orelse return error.HandlerNotFound;
     const args = try handler.decode(inst.arena(), input.args.payloads);
     if (handler.validate) |validate| try validate(handler.context, args);
 }
@@ -5802,6 +5959,867 @@ test "query: a handler context on the workflow coroutine's stack is rejected" {
     try testing.expectEqual(@as(usize, 0), inst.queries.count());
 }
 
+// Read-only query handlers and update validators, and the dynamic query handler.
+const ReadOnlyWf = struct {
+    const StartActivity = workflow.QueryDef("start_activity", fn () []const u8);
+    const Sleep = workflow.QueryDef("sleep", fn () []const u8);
+    const StartChild = workflow.QueryDef("start_child", fn () []const u8);
+    const AwaitDone = workflow.QueryDef("await_done", fn () []const u8);
+    const GetPending = workflow.QueryDef("get_pending", fn () []const u8);
+    const Memo = workflow.QueryDef("memo", fn () []const u8);
+    const Inline = workflow.QueryDef("inline", fn () i64);
+    const Set = workflow.UpdateDef("set", fn (i64) i64);
+    const Done = workflow.SignalDef("done", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        value: i64 = 0,
+        done: bool = false,
+        pending: ?workflow.ActivityFuture([]const u8) = null,
+
+        // Each of these swallows the refused call's error: the query fails anyway.
+        fn startActivity(s: *State) []const u8 {
+            _ = s.ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"query"}).get() catch {};
+            return "ignored the error";
+        }
+        fn sleep(s: *State) []const u8 {
+            s.ctx.sleep(.fromSeconds(1), .{}) catch {};
+            return "slept";
+        }
+        fn startChild(s: *State) []const u8 {
+            _ = s.ctx.executeChildWorkflow(ChildWf.Kid, .{}, .{"query"}).get() catch {};
+            return "started";
+        }
+        fn awaitDone(s: *State) ![]const u8 {
+            try s.ctx.await(s, State.finished);
+            return "done";
+        }
+        fn getPending(s: *State) ![]const u8 {
+            return s.pending.?.get();
+        }
+        fn memo(s: *State) ![]const u8 {
+            try s.ctx.upsertMemo(.{ .owner = "query" });
+            return "upserted";
+        }
+        /// `io.async` runs its function inline in a query handler, so this is allowed.
+        fn inlineAsync(s: *State) i64 {
+            var f = s.ctx.io().async(double, .{s.value});
+            return f.await(s.ctx.io());
+        }
+        fn double(x: i64) i64 {
+            return 2 * x;
+        }
+        fn anyQuery(s: *State, name: []const u8, args: converter.EncodedValues) ![]const u8 {
+            const a = s.ctx.allocator();
+            if (std.mem.eql(u8, name, "dynamic_fails")) return error.NoAnswer;
+            if (std.mem.eql(u8, name, "dynamic_sleep")) try s.ctx.sleep(.fromSeconds(1), .{});
+            const arg = if (args.payloads.len > 0) try args.get([]const u8, a, 0) else "none";
+            return std.fmt.allocPrint(a, "{s}({s}) value={d}", .{ name, arg, s.value });
+        }
+
+        fn set(s: *State, value: i64) i64 {
+            defer s.value = value;
+            return s.value;
+        }
+        /// Rejects updates by sleeping, for a negative value, or by starting an activity, for
+        /// zero; accepts the rest.
+        fn validateSet(s: *State, value: i64) !void {
+            if (value < 0) try s.ctx.sleep(.fromSeconds(1), .{});
+            if (value == 0) _ = s.ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"validator"});
+        }
+        fn finish(s: *State) void {
+            s.done = true;
+        }
+        fn finished(s: *State) bool {
+            return s.done;
+        }
+    };
+
+    /// Starts an activity it never awaits (sequence 1), waits for `done`, then starts another
+    /// activity and a timer and returns the value. Refused calls must not use up a sequence
+    /// number, so those are activity 2 and timer 1.
+    fn run(ctx: *workflow.Context) !i64 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(StartActivity, s, State.startActivity);
+        try ctx.setQueryHandler(Sleep, s, State.sleep);
+        try ctx.setQueryHandler(StartChild, s, State.startChild);
+        try ctx.setQueryHandler(AwaitDone, s, State.awaitDone);
+        try ctx.setQueryHandler(GetPending, s, State.getPending);
+        try ctx.setQueryHandler(Memo, s, State.memo);
+        try ctx.setQueryHandler(Inline, s, State.inlineAsync);
+        try ctx.setDynamicQueryHandler(s, State.anyQuery);
+        try ctx.setUpdateHandlerWithValidator(Set, s, State.set, State.validateSet);
+        try ctx.setSignalHandler(Done, s, State.finish);
+        s.pending = ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"workflow"});
+        try ctx.await(s, State.finished);
+        _ = ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"after"});
+        try ctx.sleep(.fromSeconds(5), .{});
+        return s.value;
+    }
+
+    fn dynamicOnStack(ctx: *workflow.Context) ![]const u8 {
+        var s: State = .{ .ctx = ctx };
+        ctx.setDynamicQueryHandler(&s, State.anyQuery) catch |err| return @errorName(err);
+        return "accepted";
+    }
+};
+const ReadOnlyWfDef = workflow.Def("ReadOnly", ReadOnlyWf.run);
+const DynamicOnStackWf = workflow.Def("DynamicOnStack", ReadOnlyWf.dynamicOnStack);
+
+/// Checks that a query or update failed for calling `call` read-only.
+fn expectReadOnlyViolation(f: Failure, what: []const u8, name: []const u8, call: []const u8) !void {
+    try testing.expectEqualStrings("ReadOnlyViolation", failure_mod.applicationType(f).?);
+    const prefix = try std.fmt.allocPrint(testing.allocator, "{s} for \"{s}\" called {s}, ", .{ what, name, call });
+    defer testing.allocator.free(prefix);
+    if (!std.mem.startsWith(u8, f.message, prefix)) {
+        std.debug.print("message: {s}\nexpected prefix: {s}\n", .{ f.message, prefix });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "query: a dynamic handler answers queries with no handler of their own, with the name and encoded arguments" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ReadOnlyWfDef.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "ReadOnly", .{}), a);
+
+    const c = try inst.activate(&try queryActivation(a, &.{
+        .{ "q1", "anything", (try converter.toPayloads(a, .{"arg"})).items },
+        .{ "q2", "other", &.{} },
+        .{ "q3", "inline", &.{} },
+        .{ "q4", "dynamic_fails", &.{} },
+        .{ "q5", "anything", (try converter.toPayloads(a, .{@as(i64, 5)})).items },
+    }), a);
+    try testing.expectEqual(@as(usize, 5), commandsOf(c).len);
+    try testing.expectEqualStrings("\"anything(arg) value=0\"", answer(c, 0).variant.?.succeeded.response.?.data);
+    try testing.expectEqualStrings("\"other(none) value=0\"", answer(c, 1).variant.?.succeeded.response.?.data);
+    // A registered handler still answers its own query type.
+    try testing.expectEqualStrings("0", answer(c, 2).variant.?.succeeded.response.?.data);
+    // The dynamic handler's error, or an argument it can't decode, fails the query.
+    const failed = answer(c, 3).variant.?.failed;
+    try testing.expectEqualStrings("NoAnswer", failure_mod.applicationType(failed).?);
+    try testing.expect(answer(c, 4).variant.? == .failed);
+}
+
+test "query: a dynamic handler context on the workflow coroutine's stack is rejected" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, DynamicOnStackWf.registered, .{});
+    defer inst.destroy();
+    const done = commandsOf(try inst.activate(&try initActivation(a, "DynamicOnStack", .{}), a));
+    try testing.expectEqualStrings("\"QueryContextOnStack\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+    try testing.expect(inst.dynamic_query_handler == null);
+    // Without a dynamic handler an unknown query fails as before.
+    const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "nope", &.{} }}), a);
+    try testing.expectEqualStrings("QueryNotRegistered", failure_mod.applicationType(answer(c, 0).variant.?.failed).?);
+}
+
+test "query: a handler that starts a command or blocks fails the query naming the call, and nothing is sent" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ReadOnlyWfDef.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "ReadOnly", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.schedule_activity.seq);
+
+    const c = try inst.activate(&try queryActivation(a, &.{
+        .{ "q1", "start_activity", &.{} },
+        .{ "q2", "sleep", &.{} },
+        .{ "q3", "start_child", &.{} },
+        .{ "q4", "await_done", &.{} },
+        .{ "q5", "get_pending", &.{} },
+        .{ "q6", "memo", &.{} },
+        .{ "q7", "dynamic_sleep", &.{} },
+        .{ "q8", "inline", &.{} },
+    }), a);
+    try testing.expect(c.status.? == .successful); // the workflow task doesn't fail
+    const cmds = commandsOf(c);
+    try testing.expectEqual(@as(usize, 8), cmds.len); // the answers, and nothing else
+    for (cmds) |cmd| try testing.expect(cmd.variant.? == .respond_to_query);
+    try expectReadOnlyViolation(answer(c, 0).variant.?.failed, "query handler", "start_activity", "executeActivity");
+    try expectReadOnlyViolation(answer(c, 1).variant.?.failed, "query handler", "sleep", "sleep");
+    try expectReadOnlyViolation(answer(c, 2).variant.?.failed, "query handler", "start_child", "executeChildWorkflow");
+    try expectReadOnlyViolation(answer(c, 3).variant.?.failed, "query handler", "await_done", "await");
+    try expectReadOnlyViolation(answer(c, 4).variant.?.failed, "query handler", "get_pending", "ActivityFuture.get");
+    try expectReadOnlyViolation(answer(c, 5).variant.?.failed, "query handler", "memo", "upsertMemo");
+    try expectReadOnlyViolation(answer(c, 6).variant.?.failed, "query handler", "dynamic_sleep", "sleep");
+    try testing.expectEqualStrings("0", answer(c, 7).variant.?.succeeded.response.?.data);
+    try testing.expectEqual(@as(usize, 0), inst.memo.len);
+
+    // The refused calls used up no sequence numbers, and the run goes on as before.
+    const after = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "done", .{})), a));
+    try testing.expectEqual(@as(usize, 2), after.len);
+    try testing.expectEqual(@as(u32, 2), after[0].variant.?.schedule_activity.seq);
+    try testing.expectEqual(@as(u32, 1), after[1].variant.?.start_timer.seq);
+}
+
+test "update: a validator that starts a command or blocks rejects the update naming the call, and nothing is sent" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ReadOnlyWfDef.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "ReadOnly", .{}), a);
+
+    var act = try oneJob(a, try updateJob(a, "u1", "set", .{@as(i64, -1)}, true));
+    try act.jobs.append(a, .{ .variant = try updateJob(a, "u2", "set", .{@as(i64, 0)}, true) });
+    const c = try inst.activate(&act, a);
+    try testing.expect(c.status.? == .successful);
+    const cmds = commandsOf(c);
+    try testing.expectEqual(@as(usize, 2), cmds.len); // the rejections, and nothing else
+    try expectReadOnlyViolation((try updateResponse(cmds[0], "u1")).rejected, "update validator", "set", "sleep");
+    try expectReadOnlyViolation((try updateResponse(cmds[1], "u2")).rejected, "update validator", "set", "executeActivity");
+
+    // A validator that only reads accepts; the run's sequence numbers are untouched.
+    const ok = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u3", "set", .{@as(i64, 4)}, true)), a));
+    try testing.expectEqual(@as(usize, 2), ok.len);
+    try testing.expect(try updateResponse(ok[0], "u3") == .accepted);
+    try testing.expectEqualStrings("0", (try updateResponse(ok[1], "u3")).completed.data);
+    const after = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "done", .{})), a));
+    try testing.expectEqual(@as(u32, 2), after[0].variant.?.schedule_activity.seq);
+    try testing.expectEqual(@as(u32, 1), after[1].variant.?.start_timer.seq);
+}
+
+// A query handler or update validator that registers a signal handler while a signal of
+// that name is buffered would start the handler's coroutine: a coroutine (and the commands
+// it emits) that only exists because of a query, which history doesn't record.
+const LazySignalWf = struct {
+    const Register = workflow.QueryDef("register", fn () []const u8);
+    const Check = workflow.UpdateDef("check", fn (i64) i64);
+    const Ping = workflow.SignalDef("ping", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        fn register(s: *State) []const u8 {
+            s.ctx.setSignalHandler(Ping, s, State.onPing) catch {};
+            return "registered";
+        }
+        fn check(s: *State, v: i64) i64 {
+            _ = s;
+            return v;
+        }
+        fn validateCheck(s: *State, v: i64) !void {
+            _ = v;
+            try s.ctx.setSignalHandler(Ping, s, State.onPing);
+        }
+        fn onPing(s: *State) void {
+            _ = s.ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"ping"});
+        }
+    };
+
+    fn run(ctx: *workflow.Context) !i64 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(Register, s, State.register);
+        try ctx.setUpdateHandlerWithValidator(Check, s, State.check, State.validateCheck);
+        try ctx.sleep(.fromSeconds(60), .{});
+        return 1;
+    }
+};
+const LazySignalWfDef = workflow.Def("LazySignal", LazySignalWf.run);
+
+test "query: a handler that registers a signal handler for a buffered signal fails the query and starts no handler" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, LazySignalWfDef.registered, .{});
+    defer inst.destroy();
+    const timer = commandsOf(try inst.activate(&try initActivation(a, "LazySignal", .{}), a))[0].variant.?.start_timer;
+    // No handler for "ping" yet: it is buffered.
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "ping", .{})), a)).len);
+    try testing.expectEqual(@as(usize, 1), inst.buffered_signals.items.len);
+
+    const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "register", &.{} }}), a);
+    try testing.expect(c.status.? == .successful);
+    try testing.expect(answer(c, 0).variant.? == .failed);
+    try testing.expectEqualStrings("ReadOnlyViolation", failure_mod.applicationType(answer(c, 0).variant.?.failed).?);
+    try testing.expectEqual(@as(usize, 1), inst.buffered_signals.items.len);
+
+    // The query started no coroutine, so the run goes on as history says: it completes.
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expect(done[0].variant.? == .complete_workflow_execution);
+}
+
+test "update: a validator that registers a signal handler for a buffered signal rejects the update and starts no handler" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, LazySignalWfDef.registered, .{});
+    defer inst.destroy();
+    const timer = commandsOf(try inst.activate(&try initActivation(a, "LazySignal", .{}), a))[0].variant.?.start_timer;
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "ping", .{})), a)).len);
+
+    const c = try inst.activate(&try oneJob(a, try updateJob(a, "u1", "check", .{@as(i64, 1)}, true)), a);
+    try testing.expect(c.status.? == .successful);
+    const cmds = commandsOf(c);
+    try testing.expectEqual(@as(usize, 1), cmds.len); // the rejection, and nothing else
+    try testing.expectEqualStrings("ReadOnlyViolation", failure_mod.applicationType((try updateResponse(cmds[0], "u1")).rejected).?);
+    try testing.expectEqual(@as(usize, 1), inst.buffered_signals.items.len);
+
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expect(done[0].variant.? == .complete_workflow_execution);
+}
+
+// A handler that registers an update handler while an update of that name is buffered runs
+// the validator inline, in the handler's own coroutine. A validator there that waits where
+// no wait can be refused (an uncancelable `std.Io` wait) blocks that coroutine: the
+// read-only section must not outlive it and govern the rest of the run's coroutines.
+const BlockedValidatorWf = struct {
+    const Register = workflow.SignalDef("register", fn () void);
+    const Set = workflow.UpdateDef("set", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        loaded: std.Io.Event = .unset,
+        fn register(s: *State) !void {
+            try s.ctx.setUpdateHandlerWithValidator(Set, s, State.set, State.validate);
+        }
+        fn validate(s: *State) void {
+            s.loaded.waitUncancelable(s.ctx.io());
+        }
+        fn set(_: *State) void {}
+    };
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setSignalHandler(Register, s, State.register);
+        try ctx.sleep(.fromSeconds(1), .{});
+        s.loaded.set(ctx.io());
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"after"}).get();
+    }
+};
+const BlockedValidatorWfDef = workflow.Def("BlockedValidator", BlockedValidatorWf.run);
+
+test "update: a validator blocked in a handler's coroutine leaves the rest of the run free to emit commands" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, BlockedValidatorWfDef.registered, .{});
+    defer inst.destroy();
+    const timer = commandsOf(try inst.activate(&try initActivation(a, "BlockedValidator", .{}), a))[0].variant.?.start_timer;
+
+    // u1 is buffered, then the signal handler registers its handler and runs the validator.
+    var act = try oneJob(a, try updateJob(a, "u1", "set", .{}, true));
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "register", .{}) });
+    const blocked = try inst.activate(&act, a);
+    try testing.expect(blocked.status.? == .successful);
+    var responded = false;
+    for (commandsOf(blocked)) |c| if (c.variant.? == .update_response) {
+        responded = true;
+    };
+
+    // The workflow function wakes, sets the event and starts its activity: its own code, not
+    // the validator's, so the activity is scheduled.
+    const fired = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a);
+    try testing.expect(fired.status.? == .successful);
+    var scheduled = false;
+    for (commandsOf(fired)) |c| switch (c.variant.?) {
+        .schedule_activity => scheduled = true,
+        .update_response => responded = true,
+        else => {},
+    };
+    try testing.expect(scheduled);
+    try testing.expect(responded);
+    try testing.expect(!inst.wio.read_only);
+}
+
+// A dynamic query handler gets its arguments encoded and no allocator of its own, so it
+// decodes them with `ctx.allocator()`, as the README's example does. A query's memory must
+// not stay in the run: a workflow queried every second would grow without bound (and, with
+// `memory_limit`, fail its workflow tasks).
+const DynamicMemoryWf = struct {
+    const Echo = workflow.QueryDef("echo", fn ([]const u8) usize);
+    const State = struct {
+        ctx: *workflow.Context,
+        fn echo(_: *State, text: []const u8) usize {
+            return text.len;
+        }
+        fn anyQuery(s: *State, name: []const u8, args: converter.EncodedValues) !usize {
+            _ = name;
+            const text = try args.get([]const u8, s.ctx.allocator(), 0);
+            return text.len;
+        }
+    };
+    fn run(ctx: *workflow.Context) !void {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(Echo, s, State.echo);
+        try ctx.setDynamicQueryHandler(s, State.anyQuery);
+        try ctx.sleep(.fromSeconds(60), .{});
+    }
+};
+const DynamicMemoryWfDef = workflow.Def("DynamicMemory", DynamicMemoryWf.run);
+
+test "query: a dynamic handler decoding its arguments leaves no memory in the run, like a typed handler" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, DynamicMemoryWfDef.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "DynamicMemory", .{}), a);
+    const args = (try converter.toPayloads(a, .{"a query argument"})).items;
+
+    const before = inst.allocated;
+    for (0..100) |_| {
+        const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "echo", args }}), a);
+        try testing.expectEqualStrings("16", answer(c, 0).variant.?.succeeded.response.?.data);
+    }
+    try testing.expectEqual(before, inst.allocated); // a typed handler decodes into the answer's memory
+    for (0..100) |_| {
+        const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "anything", args }}), a);
+        try testing.expectEqualStrings("16", answer(c, 0).variant.?.succeeded.response.?.data);
+    }
+    try testing.expectEqual(before, inst.allocated);
+}
+
+// `ctx.fail` copies its failure's cause chain into `ctx.allocator()` and records it as the
+// workflow's pending failure. In a query handler `ctx.allocator()` is the answer's memory,
+// freed once the answer is sent, so the run must not keep a failure that lives there.
+const QueryFailWf = struct {
+    const Describe = workflow.QueryDef("describe", fn () []const u8);
+    const Go = workflow.SignalDef("go", fn () void);
+    const State = struct {
+        ctx: *workflow.Context,
+        go: bool = false,
+        fn describe(s: *State) ![]const u8 {
+            const cause: Failure = .{ .message = "query cause" };
+            return s.ctx.fail(.{ .message = "query failure", .cause = &cause });
+        }
+        fn onGo(s: *State) void {
+            s.go = true;
+        }
+        fn ready(s: *State) bool {
+            return s.go;
+        }
+    };
+    fn run(ctx: *workflow.Context) !void {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(Describe, s, State.describe);
+        try ctx.setSignalHandler(Go, s, State.onGo);
+        try ctx.await(s, State.ready);
+        return error.Boom;
+    }
+};
+const QueryFailWfDef = workflow.Def("QueryFail", QueryFailWf.run);
+
+test "query: ctx.fail in a query handler leaves the run no failure in the query's freed memory" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, QueryFailWfDef.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "QueryFail", .{}), a);
+
+    // The query's activation memory, reused (here: zeroed) once its completion is sent.
+    var query_buffer: [64 * 1024]u8 = undefined;
+    var query_memory: std.heap.FixedBufferAllocator = .init(&query_buffer);
+    const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "describe", &.{} }}), query_memory.allocator());
+    try testing.expect(answer(c, 0).variant.? == .failed);
+    @memset(&query_buffer, 0);
+
+    // The workflow then fails on its own. Whatever failure it reports must be intact.
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "go", .{})), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    const f = done[0].variant.?.fail_workflow_execution.failure.?;
+    if (f.cause) |cause| try testing.expectEqualStrings("query cause", cause.message);
+}
+
+// A signal channel's `receive` and `tryReceive` take a signal from the channel. A query
+// handler that calls one while signals are unread must not take them: the workflow would
+// never see the signal live, but would on replay, where there is no query.
+const ChannelQueryWf = struct {
+    const Receive = workflow.QueryDef("receive", fn () []const u8);
+    const TryReceive = workflow.QueryDef("try_receive", fn () []const u8);
+    const Msg = workflow.SignalDef("msg", fn ([]const u8) void);
+    const State = struct {
+        ch: *workflow.SignalChannel(Msg.Args),
+        fn receive(s: *State) ![]const u8 {
+            return s.ch.receive();
+        }
+        fn tryReceive(s: *State) []const u8 {
+            return s.ch.tryReceive() orelse "none";
+        }
+    };
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ch = try ctx.signalChannel(Msg) };
+        try ctx.setQueryHandler(Receive, s, State.receive);
+        try ctx.setQueryHandler(TryReceive, s, State.tryReceive);
+        try ctx.sleep(.fromSeconds(60), .{});
+        const first = s.ch.tryReceive() orelse "none";
+        const second = s.ch.tryReceive() orelse "none";
+        return std.fmt.allocPrint(ctx.allocator(), "{s},{s}", .{ first, second });
+    }
+};
+const ChannelQueryWfDef = workflow.Def("ChannelQuery", ChannelQueryWf.run);
+
+test "query: a handler that receives from a signal channel leaves its signals for the workflow" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChannelQueryWfDef.registered, .{});
+    defer inst.destroy();
+    const timer = commandsOf(try inst.activate(&try initActivation(a, "ChannelQuery", .{}), a))[0].variant.?.start_timer;
+    var signals = try oneJob(a, try signalJob(a, "msg", .{"a"}));
+    try signals.jobs.append(a, .{ .variant = try signalJob(a, "msg", .{"b"}) });
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&signals, a)).len);
+
+    const c = try inst.activate(&try queryActivation(a, &.{
+        .{ "q1", "receive", &.{} },
+        .{ "q2", "try_receive", &.{} },
+    }), a);
+    try testing.expect(c.status.? == .successful);
+
+    // As on replay, where no query ran, the workflow reads both signals.
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("\"a,b\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// The rest of the read-only invariant: what read-only code may use for itself (`ctx.fail`,
+// zero sleeps, random draws) works and leaves the run as it was; anything else that changes
+// SDK state (waking a coroutine, the versioning behavior, a task failure) is refused.
+const ReadOnlyStateWf = struct {
+    const Q = workflow.QueryDef("q", fn ([]const u8) []const u8);
+    const State = struct {
+        ctx: *workflow.Context,
+        ev: std.Io.Event = .unset,
+        fn q(s: *State, what: []const u8) ![]const u8 {
+            const ctx = s.ctx;
+            const a = ctx.allocator();
+            if (std.mem.eql(u8, what, "fail")) return ctx.fail(.{ .message = "chosen by the query", .type = "QueryChose" });
+            if (std.mem.eql(u8, what, "zero_sleep")) {
+                try ctx.sleep(.fromSeconds(0), .{});
+                _ = try ctx.awaitTimeout(.fromSeconds(0), s, State.never);
+                return "slept";
+            }
+            if (std.mem.eql(u8, what, "random")) {
+                var x: u64 = undefined;
+                var y: u64 = undefined;
+                ctx.io().random(std.mem.asBytes(&x));
+                ctx.io().random(std.mem.asBytes(&y));
+                return std.fmt.allocPrint(a, "{d},{d}", .{ x, y });
+            }
+            if (std.mem.eql(u8, what, "set_event")) {
+                s.ev.set(ctx.io());
+                return "set";
+            }
+            if (std.mem.eql(u8, what, "versioning")) {
+                ctx.setVersioningBehavior(.pinned);
+                return "set";
+            }
+            if (std.mem.eql(u8, what, "version")) {
+                _ = try ctx.getVersion("change", workflow.default_version, 1);
+                return "supported";
+            }
+            return error.UnknownWhat;
+        }
+        fn never(_: *State) bool {
+            return false;
+        }
+        fn anyQuery(_: *State, name: []const u8, _: converter.EncodedValues) []const u8 {
+            return name;
+        }
+        fn release(s: *State) void {
+            s.ev.set(s.ctx.io());
+        }
+    };
+    const Release = workflow.SignalDef("release", fn () void);
+    fn run(ctx: *workflow.Context) !u64 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(Q, s, State.q);
+        try ctx.setDynamicQueryHandler(s, State.anyQuery);
+        try ctx.setSignalHandler(Release, s, State.release);
+        _ = try ctx.getVersion("change", workflow.default_version, 2);
+        try s.ev.wait(ctx.io());
+        var x: u64 = undefined;
+        ctx.io().random(std.mem.asBytes(&x));
+        return x;
+    }
+};
+const ReadOnlyStateWfDef = workflow.Def("ReadOnlyState", ReadOnlyStateWf.run);
+
+fn readOnlyQuery(a: Allocator, inst: *Instance, what: []const u8) !done_pb.WorkflowActivationCompletion {
+    const c = try inst.activate(&try queryActivation(a, &.{.{ "q", "q", (try converter.toPayloads(a, .{what})).items }}), a);
+    try testing.expect(c.status.? == .successful);
+    try testing.expectEqual(@as(usize, 1), commandsOf(c).len);
+    return c;
+}
+
+test "query: read-only code keeps the run's state as replay sees it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ReadOnlyStateWfDef.registered, .{ .send_versioning_behavior = true });
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "ReadOnlyState", .{}), a);
+    const rng_before = inst.wio.rng;
+
+    // ctx.fail describes the query's failure, not the run's.
+    const failed = answer(try readOnlyQuery(a, inst, "fail"), 0).variant.?.failed;
+    try testing.expectEqualStrings("chosen by the query", failed.message);
+    try testing.expectEqualStrings("QueryChose", failure_mod.applicationType(failed).?);
+    try testing.expect(inst.ctx.pending_failure == null);
+
+    try testing.expectEqualStrings("\"slept\"", answer(try readOnlyQuery(a, inst, "zero_sleep"), 0).variant.?.succeeded.response.?.data);
+
+    // Two draws differ, and the same query draws the same again: the generator is restored.
+    const draws = answer(try readOnlyQuery(a, inst, "random"), 0).variant.?.succeeded.response.?.data;
+    var parts = std.mem.splitScalar(u8, std.mem.trim(u8, draws, "\""), ',');
+    try testing.expect(!std.mem.eql(u8, parts.next().?, parts.next().?));
+    try testing.expectEqualStrings(draws, answer(try readOnlyQuery(a, inst, "random"), 0).variant.?.succeeded.response.?.data);
+    try testing.expectEqual(rng_before.s, inst.wio.rng.s);
+
+    const woke = answer(try readOnlyQuery(a, inst, "set_event"), 0).variant.?.failed;
+    try expectReadOnlyViolation(woke, "query handler", "q", "a futex wake that resumes a workflow coroutine (std.Io.Event.set, Mutex.unlock, Queue.put, ...)");
+    try testing.expect(!inst.wio.read_only);
+
+    try expectReadOnlyViolation(answer(try readOnlyQuery(a, inst, "versioning"), 0).variant.?.failed, "query handler", "q", "setVersioningBehavior");
+    try testing.expectEqual(workflow.VersioningBehavior.unspecified, inst.versioning_behavior);
+
+    // An unsupported version fails the query, not the workflow task.
+    try testing.expectEqualStrings("UnsupportedVersion", answer(try readOnlyQuery(a, inst, "version"), 0).variant.?.failed.message);
+
+    // Reserved query types don't go to the dynamic handler.
+    const c = try inst.activate(&try queryActivation(a, &.{
+        .{ "q1", "__stack_trace", &.{} },
+        .{ "q2", "__temporal_workflow_metadata", &.{} },
+        .{ "q3", "custom", &.{} },
+    }), a);
+    try testing.expectEqualStrings("QueryNotRegistered", failure_mod.applicationType(answer(c, 0).variant.?.failed).?);
+    try testing.expectEqualStrings("QueryNotRegistered", failure_mod.applicationType(answer(c, 1).variant.?.failed).?);
+    try testing.expectEqualStrings("\"custom\"", answer(c, 2).variant.?.succeeded.response.?.data);
+
+    // The workflow (woken by the query's refused set, or by this signal's) draws the number
+    // replay draws: the queries' draws left the run's generator alone.
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "release", .{})), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    var expected_rng = rng_before;
+    var expected: u64 = undefined;
+    expected_rng.fill(std.mem.asBytes(&expected));
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{expected}), done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "update: a validator blocked in a handler's coroutine is rejected once it wakes, and others see no update" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, BlockedValidatorWfDef.registered, .{});
+    defer inst.destroy();
+    const timer = commandsOf(try inst.activate(&try initActivation(a, "BlockedValidator", .{}), a))[0].variant.?.start_timer;
+    var act = try oneJob(a, try updateJob(a, "u1", "set", .{}, true));
+    try act.jobs.append(a, .{ .variant = try signalJob(a, "register", .{}) });
+    _ = try inst.activate(&act, a);
+    // The validator's section is open, but only for its coroutine.
+    try testing.expect(inst.wio.read_only);
+    try testing.expect(inst.readOnly() == null);
+    try testing.expect(inst.currentUpdate() == null);
+
+    const fired = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a));
+    var rejected: ?Failure = null;
+    for (fired) |c| if (c.variant.? == .update_response) {
+        rejected = (try updateResponse(c, "u1")).rejected;
+    };
+    try expectReadOnlyViolation(rejected.?, "update validator", "set", "a wait that can't be refused (an uncancelable std.Io wait, Future.await, Group.cancel)");
+    try testing.expect(!inst.wio.read_only);
+}
+
+// The workflow waits on a std.Io.Condition; a query signals it (refused), then a signal
+// handler signals it for real.
+const ReadOnlyConditionWf = struct {
+    const Q = workflow.QueryDef("poke", fn () []const u8);
+    const State = struct {
+        ctx: *workflow.Context,
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
+        released: bool = false,
+        fn poke(s: *State) []const u8 {
+            s.cond.signal(s.ctx.io());
+            return "poked";
+        }
+        fn release(s: *State) !void {
+            try s.mutex.lock(s.ctx.io());
+            defer s.mutex.unlock(s.ctx.io());
+            s.released = true;
+            s.cond.signal(s.ctx.io());
+        }
+    };
+    const Release = workflow.SignalDef("release", fn () void);
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(Q, s, State.poke);
+        try ctx.setSignalHandler(Release, s, State.release);
+        try s.mutex.lock(ctx.io());
+        defer s.mutex.unlock(ctx.io());
+        while (!s.released) try s.cond.wait(ctx.io(), &s.mutex);
+        return "released";
+    }
+};
+const ReadOnlyConditionWfDef = workflow.Def("ReadOnlyCondition", ReadOnlyConditionWf.run);
+
+test "query: a refused Condition.signal leaves the condition so the workflow's own signal still wakes its waiter" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ReadOnlyConditionWfDef.registered, .{});
+    defer inst.destroy();
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try initActivation(a, "ReadOnlyCondition", .{}), a)).len);
+
+    const c = try inst.activate(&try queryActivation(a, &.{.{ "q", "poke", &.{} }}), a);
+    try testing.expect(c.status.? == .successful);
+    try expectReadOnlyViolation(answer(c, 0).variant.?.failed, "query handler", "poke", "a futex wake that resumes a workflow coroutine (std.Io.Event.set, Mutex.unlock, Queue.put, ...)");
+
+    // Replay runs no query: there, this signal wakes the workflow and it completes.
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "release", .{})), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("\"released\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// The workflow waits on a std.Io.Queue; a query puts into it (refused), then a signal
+// handler puts the value the workflow should get.
+const ReadOnlyQueueWf = struct {
+    const Q = workflow.QueryDef("put", fn () []const u8);
+    const State = struct {
+        ctx: *workflow.Context,
+        buf: [4]u32 = undefined,
+        queue: std.Io.Queue(u32) = undefined,
+        fn put(s: *State) ![]const u8 {
+            try s.queue.putOne(s.ctx.io(), 666);
+            return "put";
+        }
+        fn send(s: *State) !void {
+            try s.queue.putOne(s.ctx.io(), 7);
+        }
+    };
+    const Send = workflow.SignalDef("send", fn () void);
+    /// The latest run's state, for the test to inspect the queue.
+    var last: ?*State = null;
+    fn run(ctx: *workflow.Context) !u32 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        s.queue = .init(&s.buf);
+        last = s;
+        try ctx.setQueryHandler(Q, s, State.put);
+        try ctx.setSignalHandler(Send, s, State.send);
+        return s.queue.getOne(ctx.io());
+    }
+};
+const ReadOnlyQueueWfDef = workflow.Def("ReadOnlyQueue", ReadOnlyQueueWf.run);
+
+// Ruled by the foreman in round 4: this test first asked that the workflow still get only
+// the 7 its own code puts, as on replay. That can't be done: std.Io's Queue.put hands the
+// query's 666 to the waiting getter (pops it off the getters list and copies the value into
+// its buffer) under an uncontended mutex before any Io call the SDK sees, so the SDK can't
+// undo it, and any rollback leaves the queue inconsistent. A handler that changes workflow
+// data or a std.Io primitive is the user's error, which the SDK reports but can't take back.
+// So the test now checks what the SDK does promise: the query fails with ReadOnlyViolation,
+// the wake goes through so the workflow isn't left blocked, and the queue stays consistent
+// (the 7 the workflow's own code puts is in the queue). It keeps its original name, which the
+// bead's regression tracking looks for.
+test "query: a refused Queue.put leaves the queue so the workflow gets what its own code puts" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ReadOnlyQueueWfDef.registered, .{});
+    defer inst.destroy();
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try initActivation(a, "ReadOnlyQueue", .{}), a)).len);
+
+    const c = try inst.activate(&try queryActivation(a, &.{.{ "q", "put", &.{} }}), a);
+    try testing.expect(c.status.? == .successful);
+    try expectReadOnlyViolation(answer(c, 0).variant.?.failed, "query handler", "put", "a futex wake that resumes a workflow coroutine (std.Io.Event.set, Mutex.unlock, Queue.put, ...)");
+    try testing.expectEqual(@as(usize, 1), commandsOf(c).len); // the answer, and no command
+
+    // A query-only activation runs no coroutine; the next one does. The workflow ends with the
+    // value the query handed over, and the signal's 7 waits in the queue's buffer.
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "send", .{})), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("666", done[0].variant.?.complete_workflow_execution.result.?.data);
+    const q = &ReadOnlyQueueWf.last.?.queue.type_erased;
+    try testing.expect(q.getters.first == null);
+    try testing.expect(q.putters.first == null);
+    try testing.expectEqual(@as(usize, @sizeOf(u32)), q.len); // bytes: one u32
+    try testing.expectEqual(@as(u32, 7), std.mem.bytesToValue(u32, q.buffer[q.start..][0..@sizeOf(u32)]));
+}
+
+test "query: Event.set on an event a coroutine waits for wakes it and fails the query" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ReadOnlyStateWfDef.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "ReadOnlyState", .{}), a);
+
+    const woke = answer(try readOnlyQuery(a, inst, "set_event"), 0).variant.?.failed;
+    try expectReadOnlyViolation(woke, "query handler", "q", "a futex wake that resumes a workflow coroutine (std.Io.Event.set, Mutex.unlock, Queue.put, ...)");
+
+    // The waiter was woken: the next activation that runs coroutines (here, one whose signal
+    // has no handler) lets the workflow finish, so it doesn't hang.
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "unrelated", .{})), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expect(done[0].variant.? == .complete_workflow_execution);
+}
+
+// Read-only code that only looks at cancellation (a zero sleep, checkCancel, recancel,
+// swapCancelProtection) in a canceled workflow's coroutine must leave the cancel request to
+// the workflow: the validator accepts, and the workflow is canceled as on replay.
+const CancelProbeValidatorWf = struct {
+    const Set = workflow.UpdateDef("set", fn () void);
+    const State = struct {
+        ctx: *workflow.Context,
+        fn set(_: *State) void {}
+        fn validate(s: *State) !void {
+            const io = s.ctx.io();
+            try s.ctx.sleep(.fromSeconds(0), .{});
+            try io.checkCancel();
+            const old = io.swapCancelProtection(.blocked);
+            _ = io.swapCancelProtection(old);
+            io.recancel();
+        }
+    };
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandlerWithValidator(Set, s, State.set, State.validate);
+        try ctx.sleep(.fromSeconds(10), .{});
+        return "slept";
+    }
+};
+const CancelProbeValidatorWfDef = workflow.Def("CancelProbeValidator", CancelProbeValidatorWf.run);
+
+test "update: a validator that only looks at cancellation in a canceled workflow's coroutine leaves the cancel to the workflow" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, CancelProbeValidatorWfDef.registered, .{});
+    defer inst.destroy();
+    var act = try initActivation(a, "CancelProbeValidator", .{});
+    try act.jobs.append(a, .{ .variant = try updateJob(a, "u1", "set", .{}, true) });
+    try act.jobs.append(a, .{ .variant = .{ .cancel_workflow = .{} } });
+    const cmds = commandsOf(try inst.activate(&act, a));
+    var accepted = false;
+    var canceled = false;
+    for (cmds) |cmd| switch (cmd.variant.?) {
+        .update_response => accepted = accepted or (try updateResponse(cmd, "u1")) == .accepted,
+        .cancel_workflow_execution => canceled = true,
+        .start_timer => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try testing.expect(accepted);
+    try testing.expect(canceled);
+}
+
 // Child workflows. `Kid` itself never runs here: the tests resolve it.
 const ChildWf = struct {
     fn kid(ctx: *workflow.Context, name: []const u8) ![]const u8 {
@@ -7456,4 +8474,53 @@ test "eviction sends nothing: commands from unwinding coroutines are dropped" {
     try testing.expectEqual(@as(usize, 0), evicted.teardown());
     try testing.expectEqual(@as(usize, 0), evicted.commands.items.len);
     evicted.destroy();
+}
+
+// A workflow canceled in the task that starts it, with an update already waiting: the
+// workflow function registers the update's handler with a pending cancel, so the validator
+// runs inline in the workflow's own coroutine. A validator that sleeps there starts a timer,
+// which read-only code may not do: the sleep must be refused (naming it) before it looks at
+// the coroutine's cancel request, which belongs to the workflow, not the validator. On
+// replay the rejected update isn't in history and the validator doesn't run, so the workflow
+// function sees that cancel at its own sleep and the run is canceled.
+const SleepingValidatorWf = struct {
+    const Set = workflow.UpdateDef("set", fn () void);
+    const State = struct {
+        ctx: *workflow.Context,
+        fn set(_: *State) void {}
+        fn validate(s: *State) !void {
+            try s.ctx.sleep(.fromSeconds(1), .{});
+        }
+    };
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandlerWithValidator(Set, s, State.set, State.validate);
+        try ctx.sleep(.fromSeconds(10), .{});
+        return "slept";
+    }
+};
+const SleepingValidatorWfDef = workflow.Def("SleepingValidator", SleepingValidatorWf.run);
+
+test "update: a validator that sleeps in a canceled workflow's coroutine is refused and leaves the cancel to the workflow" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SleepingValidatorWfDef.registered, .{});
+    defer inst.destroy();
+    var act = try initActivation(a, "SleepingValidator", .{});
+    try act.jobs.append(a, .{ .variant = try updateJob(a, "u1", "set", .{}, true) });
+    try act.jobs.append(a, .{ .variant = .{ .cancel_workflow = .{} } });
+    const c = try inst.activate(&act, a);
+    try testing.expect(c.status.? == .successful);
+    var rejected: ?Failure = null;
+    var canceled = false;
+    for (commandsOf(c)) |cmd| switch (cmd.variant.?) {
+        .update_response => rejected = (try updateResponse(cmd, "u1")).rejected,
+        .cancel_workflow_execution => canceled = true,
+        .start_timer => return error.TestUnexpectedResult, // the workflow lost its cancel
+        else => {},
+    };
+    try expectReadOnlyViolation(rejected.?, "update validator", "set", "sleep");
+    try testing.expect(canceled);
 }
