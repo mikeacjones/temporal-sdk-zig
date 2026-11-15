@@ -166,3 +166,82 @@ test "converter: failWith keeps a failure that a failed cleanup would replace" {
     try testing.expectEqualStrings("card declined", temporal.failure.rootCause(&failure.?).message);
     try testing.expectEqualStrings("charge", failure.?.failure_info.?.activity_failure_info.activity_type.?.name);
 }
+
+// example: converter-failure-kinds
+fn reserve(ctx: *activity.Context, sku: []const u8) !void {
+    const why = try temporal.failure.application(ctx.allocator(), .{ .message = "warehouse offline", .type = "WarehouseOffline" });
+    return ctx.fail(.{
+        .message = "reservation failed",
+        .type = "ReserveFailed",
+        .non_retryable = true,
+        .details = &.{try converter.toPayload(ctx.allocator(), sku)},
+        // Copied by ctx.fail, so it may live on the stack.
+        .cause = &why,
+    });
+}
+
+fn fulfill(ctx: *workflow.Context, sku: []const u8) ![]const u8 {
+    const future = ctx.executeActivity(Reserve, .{ .start_to_close_timeout = .fromSeconds(5) }, .{sku});
+    future.get() catch |err| {
+        const f = future.failure() orelse return err;
+        // f is the activity failure; its cause is the one the activity raised.
+        const reason = switch (temporal.failure.kind(f.cause orelse f)) {
+            .timeout => |t| try std.fmt.allocPrint(ctx.allocator(), "timed out ({t})", .{t.timeout_type}),
+            .application => |app| try std.fmt.allocPrint(ctx.allocator(), "{s} for {s}: {s}", .{
+                app.type,
+                try app.details.get([]const u8, ctx.allocator(), 0),
+                temporal.failure.rootCause(f).message,
+            }),
+            else => return err,
+        };
+        // The workflow's failure, with the activity's chain under it.
+        return ctx.fail(.{ .message = reason, .type = "FulfillFailed", .cause = f });
+    };
+    return "reserved";
+}
+// end-example
+
+const Reserve = activity.Def("reserve", reserve);
+const Fulfill = workflow.Def("fulfill", fulfill);
+
+test "converter: causes, kinds and stack traces of failures" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fulfill);
+    try env.registerActivity(Reserve);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var failure: ?temporal.failure.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(Fulfill, .{"sku-1"}, arena.allocator(), &failure));
+    try testing.expectEqualStrings("ReserveFailed for sku-1: warehouse offline", failure.?.message);
+    try testing.expectEqualStrings("warehouse offline", temporal.failure.rootCause(&failure.?).message);
+    // Built from ctx.fail and the error the workflow returned, so it has a stack trace.
+    try testing.expect(failure.?.stack_trace.len > 0);
+}
+
+test "converter: encoded failure attributes" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    // example: converter-encoded-attributes
+    const zlib: converter.ZlibCodec = .{};
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, io, .{
+        .codecs = &codecs,
+        // client.Options.encode_failure_attributes, for the client and its workers.
+        .encode_failure_attributes = true,
+    });
+    defer env.deinit();
+
+    // What the client and its workers do to each failure they send, before the codecs run,
+    // and to each failure they receive, after them.
+    var f = try temporal.failure.application(arena, .{ .message = "card 4242 declined" });
+    try temporal.failure.encodeAttributes(temporal.Failure, &f, arena);
+    try testing.expectEqualStrings("Encoded failure", f.message);
+    try temporal.failure.decodeAttributes(temporal.Failure, &f, arena);
+    try testing.expectEqualStrings("card 4242 declined", f.message);
+    // end-example
+}

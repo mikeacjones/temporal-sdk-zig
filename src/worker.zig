@@ -130,6 +130,15 @@ pub const Options = struct {
     /// queries, and one that finishes the workflow, are not checked. The workflow logger
     /// also records the failure, except while replaying unless `log_during_replay` is set.
     workflow_memory_limit: ?usize = null,
+    /// Put the error's return trace, as text with source locations, in `Failure.stack_trace`
+    /// when the worker builds a failure from an error a workflow function, signal or update
+    /// handler, or activity function returned (from the error's name or from `ctx.fail`). Only
+    /// builds with error return tracing have a trace (Debug by default; in ReleaseSafe, set
+    /// `.error_tracing = true` on the executable's root module and the module with the
+    /// workflows and activities), and only one whose debug info the worker can read;
+    /// otherwise the stack trace is empty. A failure passed on unchanged (a future's failure,
+    /// `ctx.failWith`) keeps its own.
+    failure_stack_traces: bool = true,
     /// How long running activities and Nexus handlers may keep running after `stop` before
     /// they are canceled with reason `worker_shutdown`.
     graceful_shutdown_period: Io.Duration = .zero,
@@ -863,7 +872,9 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .namespace = w.client.namespace,
         .stack_size = w.options.workflow_stack_size,
         .memory_limit = w.options.workflow_memory_limit,
+        .failure_stack_traces = w.options.failure_stack_traces,
         .codecs = w.client.codecs,
+        .encode_failure_attributes = w.client.encode_failure_attributes,
         .propagators = w.client.propagators,
         .interceptors = w.interceptors,
         .logger = w.logSink(),
@@ -915,8 +926,12 @@ pub const WorkflowRunner = struct {
     stack_size: usize,
     /// See `Options.workflow_memory_limit`.
     memory_limit: ?usize = null,
+    /// See `Options.failure_stack_traces`.
+    failure_stack_traces: bool = true,
     /// Borrowed; see `client.Options.codecs`.
     codecs: []const converter.PayloadCodec = &.{},
+    /// See `client.Options.encode_failure_attributes`.
+    encode_failure_attributes: bool = false,
     /// Borrowed; see `client.Options.propagators`.
     propagators: []const propagation.ContextPropagator = &.{},
     /// Borrowed; see `Options.interceptors`.
@@ -1047,13 +1062,19 @@ pub const WorkflowRunner = struct {
     /// Decides what to send the core for `bytes`, without sending it. Falls back to a failed
     /// completion built in `fallback_buf` when the activation can't be handled.
     fn respond(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io, fallback_buf: []u8) Response {
-        const handled = r.handle(bytes, a, io) catch |err| {
+        var handled = r.handle(bytes, a, io) catch |err| {
             r.logger.log(.err, "processing a workflow activation failed", &.{
                 .{ .key = "run_id", .value = runId(bytes) orelse "" },
                 .{ .key = "error", .value = @errorName(err) },
             });
             return fallbackCompletion(bytes, @errorName(err), fallback_buf);
         };
+        // A task failure `handle` returned early (before the codecs, which it skips: it holds
+        // no payloads) is recorded in history too. One already encoded is left as it is. The
+        // heap-free fallback below isn't encoded: its message is only an error name.
+        if (r.encode_failure_attributes) if (handled.completion.status) |*st| if (st.* == .failed)
+            failure_mod.encodeAttributes(done_pb.WorkflowActivationCompletion, &handled.completion, a) catch
+                return fallbackCompletion(bytes, "OutOfMemory", fallback_buf);
         var encoded: Io.Writer.Allocating = .init(a);
         handled.completion.encode(&encoded.writer, a) catch |err| {
             r.logger.log(.err, "encoding a workflow activation completion failed", &.{
@@ -1085,6 +1106,11 @@ pub const WorkflowRunner = struct {
     /// header is decoded first, without propagated values, so the rest is decoded with the
     /// values the propagators extract from it, the same ones the workflow will see.
     fn decodeActivation(r: *WorkflowRunner, act: *act_pb.WorkflowActivation, cached: ?*const Instance, a: Allocator, io: Io) converter.CodecError!void {
+        try r.decodeActivationPayloads(act, cached, a, io);
+        try failure_mod.decodeAttributes(act_pb.WorkflowActivation, act, a);
+    }
+
+    fn decodeActivationPayloads(r: *WorkflowRunner, act: *act_pb.WorkflowActivation, cached: ?*const Instance, a: Allocator, io: Io) converter.CodecError!void {
         if (r.codecs.len == 0) return;
         if (cached) |inst| return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &runCodecContext(r.namespace, inst));
         const index = for (act.jobs.items, 0..) |job, i| {
@@ -1153,11 +1179,30 @@ pub const WorkflowRunner = struct {
             error.Canceled, error.CodecFailed => return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "decoding the workflow activation's payloads with the client's codecs failed: {t}", .{err})) },
         };
         var completion = inst.activate(&act, a) catch |err| return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err})) };
+        if (r.encode_failure_attributes) try encodeCompletionAttributes(&completion, a);
         converter.encodeMessage(done_pb.WorkflowActivationCompletion, &completion, r.codecs, a, io, &runCodecContext(r.namespace, inst)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled, error.CodecFailed => return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "encoding the workflow activation completion's payloads with the client's codecs failed: {t}", .{err})) },
         };
         return .{ .completion = completion };
+    }
+
+    /// `failure.encodeAttributes` for the completion, except query answers: they never reach
+    /// history, and the server reports a failed query's message to the caller as its gRPC
+    /// status message (`QueryOptions.failure_message`), which no codec decodes.
+    fn encodeCompletionAttributes(completion: *done_pb.WorkflowActivationCompletion, a: Allocator) error{OutOfMemory}!void {
+        const status = if (completion.status) |*s| s else return;
+        switch (status.*) {
+            .successful => |*success| {
+                const commands = try a.dupe(proto.coresdk.workflow_commands.WorkflowCommand, success.commands.items);
+                for (commands) |*cmd| {
+                    if (cmd.variant) |v| if (v == .respond_to_query) continue;
+                    try failure_mod.encodeAttributes(@TypeOf(cmd.*), cmd, a);
+                }
+                success.commands = .fromOwnedSlice(commands);
+            },
+            else => try failure_mod.encodeAttributes(done_pb.WorkflowActivationCompletion, completion, a),
+        }
     }
 
     /// Marks a cached run busy and returns its instance; null if it isn't cached.
@@ -1184,6 +1229,7 @@ pub const WorkflowRunner = struct {
             .namespace = r.namespace,
             .stack_size = r.stack_size,
             .memory_limit = r.memory_limit,
+            .failure_stack_traces = r.failure_stack_traces,
             .logger = r.logger,
             .log_during_replay = r.log_during_replay,
             .propagators = r.propagators,
@@ -1451,6 +1497,8 @@ fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivitie
     };
     const a = run.arena.allocator();
     var result = outcome catch return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
+    if (w.client.encode_failure_attributes) failure_mod.encodeAttributes(result_pb.ActivityExecutionResult, &result, a) catch
+        return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
     converter.encodeMessage(result_pb.ActivityExecutionResult, &result, w.client.codecs, a, w.io, &run.codec_context) catch |err| {
         if (err == error.OutOfMemory) return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
         // Report a failure without the payloads that couldn't be encoded.
@@ -1573,6 +1621,10 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     ctx.outbound = outbound.items;
     var call: ActivityCall = .{ .entry = entry, .ctx = ctx };
     const next: interceptor.ActivityInbound.Next = .{ .chain = inbound.items, .root = .{ .ptr = &call, .vtable = &ActivityCall.vtable } };
+    // The activity's failure gets the frames its own error recorded, not earlier ones of the
+    // pooled thread it runs on.
+    const trace_scope: failure_mod.TraceScope = .begin(@errorReturnTrace());
+    defer trace_scope.end();
     const payload = next.execute(.{ .activity_type = start.activity_type, .args = .{ .payloads = start.input.items }, .header = ctx.header_ }) catch |err| {
         if (err == error.CompleteAsync) {
             if (!start.is_local) return .{ .status = .{ .will_complete_async = .{} } };
@@ -1587,7 +1639,9 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
             .source = failure_mod.source,
             .failure_info = .{ .canceled_failure_info = .{} },
         } } } };
-        const f = if (ctx.pending_failure) |p| try failure_mod.application(a, p) else try failure_mod.fromError(a, err);
+        const trace = if (w.options.failure_stack_traces) @errorReturnTrace() else null;
+        var f = if (ctx.pending_failure) |p| try failure_mod.application(a, p) else try failure_mod.fromError(a, err);
+        f.stack_trace = try failure_mod.traceText(a, trace);
         if (failure_mod.applicationCategory(f) == .benign)
             ctx.logger_.debug("Activity failed", .{ .Error = f.message })
         else
@@ -2014,6 +2068,7 @@ fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, na
         },
         else => return,
     };
+    if (w.client.encode_failure_attributes) try failure_mod.encodeAttributes(failure_mod.Failure, f, a);
     try converter.encodeMessage(failure_mod.Failure, f, w.client.codecs, a, w.io, &context);
 }
 

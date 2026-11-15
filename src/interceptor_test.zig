@@ -421,3 +421,52 @@ test "a client interceptor sees every operation's request in order, and can chan
     }
     for (want, got) |w, g| try testing.expectEqualStrings(w, g);
 }
+
+/// Refuses every activity and child workflow with a failure whose cause it builds on its own
+/// stack, then reuses that memory before returning, as a stack frame's memory is reused once
+/// it returns.
+const RefusingWithCause = struct {
+    pub fn interceptWorkflow(_: *RefusingWithCause, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+        const run = try ctx.allocator().create(Run);
+        run.* = .{ .ctx = ctx };
+        return .{ .outbound = interceptor.WorkflowOutbound.from(Run, run) };
+    }
+
+    const Run = struct {
+        ctx: *workflow.Context,
+
+        pub fn executeActivity(r: *Run, input: interceptor.ActivityInput, _: interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(Payload) {
+            var why: failure_mod.Failure = .{ .message = "over budget" };
+            const future = interceptor.rejectActivity(r.ctx, input.activity_type, .{ .message = "refused", .type = "Refused", .cause = &why });
+            why = .{ .message = "reused stack" };
+            return future;
+        }
+
+        pub fn executeChildWorkflow(r: *Run, input: interceptor.ChildWorkflowInput, _: interceptor.WorkflowOutbound.Next) workflow.ChildWorkflowFuture(Payload) {
+            var why: failure_mod.Failure = .{ .message = "over budget" };
+            const future = interceptor.rejectChildWorkflow(r.ctx, input.workflow_type, .{ .message = "refused", .type = "Refused", .cause = &why });
+            why = .{ .message = "reused stack" };
+            return future;
+        }
+    };
+
+    fn refused(ctx: *workflow.Context) ![]const u8 {
+        const act = ctx.executeActivity(Fixtures.Echo, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"});
+        _ = act.get() catch {};
+        const kid = ctx.executeChildWorkflow(Fixtures.Kid, .{}, .{});
+        _ = kid.get() catch {};
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|{s}", .{ failure_mod.rootCause(act.failure().?).message, failure_mod.rootCause(kid.failure().?).message });
+    }
+    const Refused = workflow.Def("RefusedWithCause", refused);
+};
+
+test "rejectActivity and rejectChildWorkflow copy the refusal's cause, which the interceptor may build on its stack" {
+    var refusing: RefusingWithCause = .{};
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RefusingWithCause, &refusing)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(RefusingWithCause.Refused);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("over budget|over budget", try env.executeWorkflow(RefusingWithCause.Refused, .{}, arena.allocator(), null));
+}

@@ -1,0 +1,1 @@
+Failures the worker builds from an error a workflow, signal or update handler, or activity returned carry the error's return trace in `stack_trace`, in builds with error return tracing (Debug, and ReleaseSafe when the program's root module sets `.error_tracing = true`); `worker.Options.failure_stack_traces = false` turns it off.

@@ -65,7 +65,6 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Payloads](#payloads)
     - [Payload codecs](#payload-codecs)
     - [Failures](#failures-1)
-    - [Failure converter](#failure-converter)
     - [External payload storage](#external-payload-storage)
     - [Remote codec client](#remote-codec-client)
   - [Testing](#testing)
@@ -1356,17 +1355,80 @@ fn checkout(ctx: *workflow.Context, order: []const u8) !void {
 Notes:
 
 - A plain error becomes an application failure whose message and type are the error's name. An earlier `ctx.fail` replaces that failure, whatever the error, only for the code it was called in: one in the workflow function, or in a coroutine that it or a handler starts, applies to the error the workflow function returns; one in a signal handler applies to that handler's error when the error fails the workflow; one in an activity attempt applies to the error that attempt returns. An update handler uses its `ctx.fail` failure only when it returns `error.ApplicationFailure`; any other error rejects the update with the error's name. In a workflow, `error.Canceled` cancels it and `error.OutOfMemory` fails the workflow task for a retry; in an activity, `error.Canceled` after a cancel reports it canceled.
-- `ctx.fail` takes a `failure.Application` (`type`, `non_retryable`, `details`, `category`, `next_retry_delay`) and returns `error.ApplicationFailure`.
+- `ctx.fail` takes a `failure.Application` (`type`, `non_retryable`, `details`, `category`, `next_retry_delay`, `cause`) and returns `error.ApplicationFailure`.
 - On the client, `run.failure()` reads the failure after `error.WorkflowFailed`; it borrows the arena passed to `get`.
 - A workflow that returns `error.ActivityFailed` (or a child, external, or session error) fails with the last failure a `get` returned; `failure.rootCause` then reaches the original one. The last failure is kept per signal or update handler run, and once for the workflow function and every coroutine it or a handler starts, so a failed `get` in a sibling coroutine, or a cleanup activity that fails after it, can replace it. Return the error as soon as `get` gives it, or choose the failure with `ctx.failWith`.
 - `failWith` reports `f` as given: its kind (here an activity failure), message, details, and cause chain. `f` is copied, but what it points to is read after the function returns, so it must live as long as the run; a failure read from a future does, as does one built in `ctx.allocator()`.
 - Call `failWith` only for the future's failure error. A `get` can return `error.Canceled` while `failure()` already holds the activity's failure (it failed as the workflow was canceled); returning `failWith`'s error there would fail a workflow that should be canceled.
 - `ctx.fail` and `ctx.failWith` share one slot and follow the same rules: the later call wins, and once recorded it is reported for the error the code returns, so call it on the path that returns. In an update handler, returning its `error.ApplicationFailure` rejects the update with `f`; in a signal handler it fails the workflow with `f`.
 
-#### Failure converter
-<!-- stub: temporal-sdk-zig-d51.4.5 -->
-Not implemented yet.
-A pluggable failure converter on the client and worker that builds cause chains, records stack traces, and can encode failure messages.
+A failure can carry the failure that caused it: set `cause` on the `failure.Application` given to `ctx.fail` (in a workflow, an activity, or a Nexus operation) or to `Client.failActivity`. `failure.kind(f)` reads a failure as a `failure.Kind`, a tagged union with one case per kind the server defines (`application`, `timeout`, `canceled`, `terminated`, `server`, `reset_workflow`, `activity`, `child_workflow`, `nexus_operation`, `nexus_handler`) and `unknown`:
+
+<!-- example: converter-failure-kinds -->
+```zig
+fn reserve(ctx: *activity.Context, sku: []const u8) !void {
+    const why = try temporal.failure.application(ctx.allocator(), .{ .message = "warehouse offline", .type = "WarehouseOffline" });
+    return ctx.fail(.{
+        .message = "reservation failed",
+        .type = "ReserveFailed",
+        .non_retryable = true,
+        .details = &.{try converter.toPayload(ctx.allocator(), sku)},
+        // Copied by ctx.fail, so it may live on the stack.
+        .cause = &why,
+    });
+}
+
+fn fulfill(ctx: *workflow.Context, sku: []const u8) ![]const u8 {
+    const future = ctx.executeActivity(Reserve, .{ .start_to_close_timeout = .fromSeconds(5) }, .{sku});
+    future.get() catch |err| {
+        const f = future.failure() orelse return err;
+        // f is the activity failure; its cause is the one the activity raised.
+        const reason = switch (temporal.failure.kind(f.cause orelse f)) {
+            .timeout => |t| try std.fmt.allocPrint(ctx.allocator(), "timed out ({t})", .{t.timeout_type}),
+            .application => |app| try std.fmt.allocPrint(ctx.allocator(), "{s} for {s}: {s}", .{
+                app.type,
+                try app.details.get([]const u8, ctx.allocator(), 0),
+                temporal.failure.rootCause(f).message,
+            }),
+            else => return err,
+        };
+        // The workflow's failure, with the activity's chain under it.
+        return ctx.fail(.{ .message = reason, .type = "FulfillFailed", .cause = f });
+    };
+    return "reserved";
+}
+```
+
+When the SDK builds a failure from an error a workflow function, a signal or update handler, or an activity function returned (from the error's name or from `ctx.fail`), the failure's `stack_trace` holds the error's return trace, one line per frame: `src/shop.zig:42:13: in reserve`. With `client.Options.encode_failure_attributes`, the client and its workers move the message and stack trace of every failure they send into its `encoded_attributes`, so the codecs encode them too:
+
+<!-- example: converter-encoded-attributes -->
+```zig
+const zlib: converter.ZlibCodec = .{};
+const codecs = [_]converter.PayloadCodec{zlib.codec()};
+const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, io, .{
+    .codecs = &codecs,
+    // client.Options.encode_failure_attributes, for the client and its workers.
+    .encode_failure_attributes = true,
+});
+defer env.deinit();
+
+// What the client and its workers do to each failure they send, before the codecs run,
+// and to each failure they receive, after them.
+var f = try temporal.failure.application(arena, .{ .message = "card 4242 declined" });
+try temporal.failure.encodeAttributes(temporal.Failure, &f, arena);
+try testing.expectEqualStrings("Encoded failure", f.message);
+try temporal.failure.decodeAttributes(temporal.Failure, &f, arena);
+try testing.expectEqualStrings("card 4242 declined", f.message);
+```
+
+Notes:
+
+- `cause` is borrowed only until the call it is given to returns: `ctx.fail`, `Client.failActivity` and `failActivityById`, `interceptor.rejectActivity` and `rejectChildWorkflow`, and the cause of a Nexus `ctx.handlerError` copy the chain (and the `details` list), so it may point at the stack. A future's failure (`future.failure()`) works as is.
+- `failure.kind` borrows the failure it reads. Details and last heartbeat details are `converter.EncodedValues` (decode one with `get(T, arena, index)`), `next_retry_delay` is a `std.Io.Duration`, and timeout types, retry states and Nexus retry behaviors are Zig enums with an `unknown` case for values this SDK doesn't know. A failure with no info, or of a kind newer than the SDK, is `unknown`.
+- Stack traces exist only in builds with error return tracing whose debug info the worker can read; otherwise, and with `worker.Options.failure_stack_traces = false`, `stack_trace` is empty. Zig traces errors in Debug by default. For traces in ReleaseSafe, set `.error_tracing = true` on your executable's root module (the one with `main`) and on the module with your workflows and activities; the SDK's module leaves the setting to you, because a dependency that turns tracing on while the root module doesn't breaks the program. It never holds bare addresses. A failure passed on unchanged (a future's failure returned through `error.ActivityFailed`, or `ctx.failWith`) keeps its own stack trace. Each workflow coroutine and each activity attempt starts with an empty trace, so frames of other failures never mix in. Traces name source paths of the build machine. The trace holds a bounded number of frames, keeping those nearest where the error started, and an error that comes from another coroutine or thread (awaited from `io.async` or a `Group`) has only the frames after it reached this one.
+- Encoded attributes are a `json/plain` payload of `{"message": ..., "stack_trace": ...}` (`failure.EncodedAttributes`), the format other Temporal SDKs read and write; the failure travels with the message "Encoded failure" and an empty stack trace. Each cause in the chain is encoded the same way. Type, details and the rest stay where they are. A failure that already has encoded attributes (one passed on that this side couldn't decode) is sent as received, and a failed query's answer isn't encoded: it never reaches history, and the server returns its message in the clear.
+- Received failures are decoded back after the codecs whatever the option says, so a client or worker reads failures from senders that encode them. One whose `encoded_attributes` doesn't decode (a codec this side lacks, another format) is left as received: a client without the codec reads "Encoded failure".
+- `failure.encodeAttributes` and `failure.decodeAttributes` do the same to any protobuf message, for code that handles raw requests.
 
 #### External payload storage
 <!-- stub: temporal-sdk-zig-d51.4.9 -->

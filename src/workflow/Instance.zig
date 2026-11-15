@@ -147,6 +147,15 @@ root_outcome: ?RootOutcome = null,
 /// The signal handler whose error failed the workflow, if one did; its failure details
 /// describe the workflow's failure. Arena memory.
 failed_handler: ?*HandlerRun = null,
+/// The return addresses of the error the workflow function returned, for the stack trace of
+/// the failure built from it. Arena memory; empty without error return tracing.
+root_trace: []const usize = &.{},
+/// See `Options.failure_stack_traces`.
+failure_stack_traces: bool = true,
+/// Update rejections built in a handler coroutine from a returned error, whose stack trace
+/// is filled in once the coroutines have run: reading debug info to symbolize a trace can
+/// take more stack than a coroutine has. Arena memory.
+update_traces: std.ArrayList(UpdateTrace) = .empty,
 finished: bool = false,
 /// Set by `destroy`: waits that ignore workflow cancellation (an activity's cancellation
 /// completing) end with error.Canceled instead, so every coroutine can exit.
@@ -341,6 +350,8 @@ const Update = struct {
     }
 };
 
+const UpdateTrace = struct { protocol_instance_id: []const u8, addresses: []const usize };
+
 /// A running signal or update handler coroutine. Arena memory.
 const HandlerRun = struct {
     name: []const u8,
@@ -354,6 +365,8 @@ const HandlerRun = struct {
     /// or child future it awaited; the workflow function's are in `Context`.
     pending_failure: ?PendingFailure = null,
     last_failure: ?*const Failure = null,
+    /// The return addresses of the error the handler returned; see `Instance.root_trace`.
+    trace: []const usize = &.{},
     /// Set when a signal channel's handler appended the signal to its channel.
     taken: bool = false,
 };
@@ -365,9 +378,15 @@ pub const PendingFailure = union(enum) {
     application: failure_mod.Application,
     failure: Failure,
 
-    fn resolve(p: PendingFailure, a: Allocator) error{OutOfMemory}!Failure {
+    /// The failure to send. A failure described with `fail` gets the stack trace `trace`
+    /// (text); one given to `failWith` keeps its own.
+    fn resolve(p: PendingFailure, a: Allocator, trace: []const u8) error{OutOfMemory}!Failure {
         return switch (p) {
-            .application => |app| failure_mod.application(a, app),
+            .application => |app| blk: {
+                var f = try failure_mod.application(a, app);
+                f.stack_trace = trace;
+                break :blk f;
+            },
             .failure => |f| f,
         };
     }
@@ -513,6 +532,9 @@ pub const Options = struct {
     /// activation that runs workflow code; over it, the activation fails the workflow task.
     /// Null: no limit. See `worker.Options.workflow_memory_limit`.
     memory_limit: ?usize = null,
+    /// Put the error's return trace in the stack trace of a failure built from an error the
+    /// workflow function or a handler returned. See `worker.Options.failure_stack_traces`.
+    failure_stack_traces: bool = true,
     /// Where the workflow's logger writes.
     logger: log.Sink = .std_log,
     /// Keep the workflow's logger on while it replays history.
@@ -544,6 +566,7 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
         .versioning_behavior = entry.versioning_behavior,
         .send_versioning_behavior = options.send_versioning_behavior,
         .memory_limit = options.memory_limit,
+        .failure_stack_traces = options.failure_stack_traces,
     };
     inst.wio = .init(inst.arena(), &inst.sched, .{ .ctx = inst, .vtable = &host_vtable }, 0);
     inst.ctx = .{ .instance = inst };
@@ -742,6 +765,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     if (inst.task_failure == null and !query_only and !inst.finished) {
         const ran = !update_only or inst.accepted_update;
         if (ran) inst.runUntilQuiet();
+        try inst.fillUpdateTraces(out);
         try inst.rejectUnhandledUpdates();
         try inst.finishIfDone();
         if (ran and !inst.finished and inst.task_failure == null) try inst.checkMemoryLimit(out);
@@ -1092,6 +1116,7 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
             inst.removeHandler(run);
             result catch |err| {
                 if (inst.evicting) return;
+                if (inst.failure_stack_traces) run.trace = failure_mod.captureTrace(inst.arena(), @errorReturnTrace()) catch &.{};
                 if (inst.root_outcome == null) {
                     inst.root_outcome = .{ .failed = err };
                     inst.failed_handler = run;
@@ -1107,11 +1132,18 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
             if (inst.evicting) return;
             const response: cmd_pb.UpdateResponse.response_union = if (result) |payload|
                 .{ .completed = payload }
-            else |err|
-                .{ .rejected = updateFailure(a, run, err) catch {
+            else |err| rejected: {
+                if (inst.failure_stack_traces) run.trace = failure_mod.captureTrace(a, @errorReturnTrace()) catch &.{};
+                const rejected = updateFailure(a, run, err) catch {
                     inst.task_failure = "out of memory rejecting an update whose handler failed";
                     return;
-                } };
+                };
+                if (run.trace.len > 0 and builtFromError(run, err)) inst.update_traces.append(a, .{ .protocol_instance_id = u.update.protocol_instance_id, .addresses = run.trace }) catch {
+                    inst.task_failure = "out of memory rejecting an update whose handler failed";
+                    return;
+                };
+                break :rejected .{ .rejected = rejected };
+            };
             inst.respondToUpdate(u.update.protocol_instance_id, response) catch {
                 inst.task_failure = "out of memory completing an update";
             };
@@ -1123,11 +1155,45 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
 /// `ctx.failWith`, or the failure of the activity or child workflow whose error it returned.
 fn updateFailure(a: Allocator, run: *const HandlerRun, err: anyerror) error{OutOfMemory}!Failure {
     switch (err) {
-        error.ApplicationFailure => if (run.pending_failure) |p| return p.resolve(a),
+        error.ApplicationFailure => if (run.pending_failure) |p| return p.resolve(a, ""),
         error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (run.last_failure) |f| return f.*,
         else => {},
     }
     return failure_mod.fromError(a, err);
+}
+
+/// Whether `updateFailure` builds the rejection from `err` (its name, or `ctx.fail`), as
+/// opposed to passing on a failure unchanged.
+fn builtFromError(run: *const HandlerRun, err: anyerror) bool {
+    switch (err) {
+        error.ApplicationFailure => if (run.pending_failure) |p| return p == .application,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (run.last_failure != null) return false,
+        else => {},
+    }
+    return true;
+}
+
+/// Fills in the stack traces of the update rejections `update_traces` lists, among the
+/// commands so far. Runs outside the coroutines. The text goes to `out`, the activation's
+/// memory, like query answers: it would otherwise count toward the memory limit in a cached
+/// run but not a replayed one, where the rejection isn't rebuilt.
+fn fillUpdateTraces(inst: *Instance, out: Allocator) error{OutOfMemory}!void {
+    if (inst.update_traces.items.len == 0) return;
+    defer inst.update_traces.clearRetainingCapacity();
+    for (inst.commands.items) |*cmd| {
+        const variant = if (cmd.variant) |*v| v else continue;
+        const response = switch (variant.*) {
+            .update_response => |*r| r,
+            else => continue,
+        };
+        const rejected = if (response.response) |*r| switch (r.*) {
+            .rejected => |*f| f,
+            else => continue,
+        } else continue;
+        for (inst.update_traces.items) |t| if (std.mem.eql(u8, t.protocol_instance_id, response.protocol_instance_id)) {
+            rejected.stack_trace = try failure_mod.addressesText(out, t.addresses);
+        };
+    }
 }
 
 /// The handler run executing now, or null in the workflow function, the coroutines it
@@ -1316,8 +1382,10 @@ fn rootMain(inst: *Instance) void {
         .{ .completed = result }
     else |err| if (err == error.ContinueAsNew and inst.continue_as_new != null)
         .continued_as_new
-    else
-        .{ .failed = err };
+    else blk: {
+        if (inst.failure_stack_traces) inst.root_trace = failure_mod.captureTrace(inst.arena(), @errorReturnTrace()) catch &.{};
+        break :blk .{ .failed = err };
+    };
     // A signal handler's error may have finished the workflow first.
     if (inst.root_outcome == null) inst.root_outcome = outcome;
     inst.root = null; // the task frees itself when this returns
@@ -1361,11 +1429,11 @@ fn finishIfDone(inst: *Instance) !void {
 
 fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
     const a = inst.arena();
-    const pending, const last = if (inst.failed_handler) |run|
-        .{ run.pending_failure, run.last_failure }
+    const pending, const last, const addresses = if (inst.failed_handler) |run|
+        .{ run.pending_failure, run.last_failure, run.trace }
     else
-        .{ inst.ctx.pending_failure, inst.ctx.last_failure };
-    if (pending) |p| return p.resolve(a);
+        .{ inst.ctx.pending_failure, inst.ctx.last_failure, inst.root_trace };
+    if (pending) |p| return p.resolve(a, try failure_mod.addressesText(a, addresses));
     switch (err) {
         error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (last) |f| return f.*,
         // Only the workflow function's return of ctx.continueAsNew's error continues as new.
@@ -1378,7 +1446,9 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
         }),
         else => {},
     }
-    return failure_mod.fromError(a, err);
+    var f = try failure_mod.fromError(a, err);
+    f.stack_trace = try failure_mod.addressesText(a, addresses);
+    return f;
 }
 
 // ---------------------------------------------------------------- continue-as-new
@@ -3731,8 +3801,6 @@ const Updates = struct {
     const SetSlowly = workflow.UpdateDef("set_slowly", fn (value: i64) i64);
     const Break = workflow.UpdateDef("break", fn () void);
     const Done = workflow.SignalDef("done", fn () void);
-    const KeepUpdate = workflow.UpdateDef("keep", fn () void);
-    const KeepSignal = workflow.SignalDef("keep", fn () void);
 
     const State = struct {
         ctx: *workflow.Context,
@@ -4219,6 +4287,47 @@ test "failWith: a caught cleanup failure doesn't replace the failure the workflo
     const f = try failureAfterCleanup(a, plain, "plain");
     try testing.expectEqualStrings("activity error", f.message);
     try testing.expectEqualStrings("cleanup failed", f.cause.?.message);
+}
+
+/// Fails with the failure of its activity under its own, as `ctx.fail` with a future's
+/// failure as `cause` does in the README.
+const WrapFailure = struct {
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+        const charged = ctx.executeActivity(Greet, opts, .{"charge"});
+        _ = charged.get() catch |err| return switch (err) {
+            error.ActivityFailed => ctx.fail(.{ .message = "order failed", .type = "OrderFailed", .cause = charged.failure().? }),
+            else => err,
+        };
+        return "charged";
+    }
+};
+const WrapFailureWf = workflow.Def("WrapFailure", WrapFailure.run);
+
+test "ctx.fail copies a deep cause chain without overflowing the workflow coroutine's stack" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, WrapFailureWf.registered, .{});
+    defer inst.destroy();
+
+    const scheduled = commandsOf(try inst.activate(&try initActivation(a, "WrapFailure", .{}), a));
+    try testing.expectEqual(@as(usize, 1), scheduled.len);
+    // The activity's failure carries a long chain, as one from a tree of child workflows
+    // that each fail with their child's failure as the cause does. The copy `ctx.fail`
+    // makes runs on the workflow's coroutine stack (`Options.stack_size`, 256 KiB here).
+    var chain = try activityFailure(a, "card declined", "Declined");
+    for (0..200) |_| {
+        const next = try a.create(Failure);
+        next.* = .{ .message = "child workflow failed", .failure_info = .{ .child_workflow_execution_failure_info = .{} }, .cause = chain };
+        chain = next;
+    }
+    const done = commandsOf(try inst.activate(&try resolveFailed(a, 1, chain), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    const fail = done[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expectEqualStrings("order failed", fail.message);
+    try testing.expectEqualStrings("child workflow failed", fail.cause.?.message);
+    try testing.expectEqualStrings("card declined", failure_mod.rootCause(&fail).message);
 }
 
 test "failWith: a workflow canceled as its activity fails is canceled, not failed" {
@@ -5233,8 +5342,6 @@ const CurrentUpdateWf = struct {
     const Who = workflow.UpdateDef("who", fn (expected_id: []const u8) []const u8);
     const Probe = workflow.SignalDef("probe", fn () void);
     const Done = workflow.SignalDef("done", fn () void);
-    const KeepUpdate = workflow.UpdateDef("keep", fn () void);
-    const KeepSignal = workflow.SignalDef("keep", fn () void);
 
     const State = struct {
         ctx: *workflow.Context,
@@ -5322,8 +5429,6 @@ const NestedValidatorWf = struct {
     const A = workflow.UpdateDef("a", fn () []const u8);
     const B = workflow.UpdateDef("b", fn () void);
     const Done = workflow.SignalDef("done", fn () void);
-    const KeepUpdate = workflow.UpdateDef("keep", fn () void);
-    const KeepSignal = workflow.SignalDef("keep", fn () void);
 
     const State = struct {
         ctx: *workflow.Context,

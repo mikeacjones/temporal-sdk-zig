@@ -518,6 +518,33 @@ test "every start result maps to the completion the core expects" {
     try testing.expect(ackCancel("tt").status.?.ack_cancel);
 }
 
+test "a Nexus operation's ctx.fail copies the cause, and the operation failure sends it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ctx: nexus.Context = .{ .arena = a, .io_ = testing.io, .info_ = .{ .service = "s", .operation = "o" } };
+    var why = try failure_mod.application(a, .{ .message = "warehouse offline", .type = "WarehouseOffline" });
+    try testing.expectEqual(error.OperationFailed, ctx.fail(.{ .message = "out of stock", .type = "OutOfStock", .cause = &why }));
+    why.message = "changed";
+    const f = try operationFailure(a, ctx.pending.?.operation);
+    try testing.expectEqualStrings("out of stock", f.message);
+    try testing.expectEqualStrings("warehouse offline", f.cause.?.message);
+    try testing.expectEqualStrings("WarehouseOffline", failure_mod.applicationType(f.cause.?.*).?);
+}
+
+test "a Nexus handler error's cause keeps a copy of its own cause chain" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ctx: nexus.Context = .{ .arena = a, .io_ = testing.io, .info_ = .{ .service = "s", .operation = "o" } };
+    var why: Failure = .{ .message = "quota spent" };
+    try testing.expectEqual(error.HandlerError, ctx.handlerError(.{ .type = .bad_request, .message = "no", .cause = .{ .message = "refused", .cause = &why } }));
+    why = .{ .message = "reused stack" };
+    const f = try handlerFailure(a, ctx.pending.?.handler);
+    try testing.expectEqualStrings("refused", f.cause.?.message);
+    try testing.expectEqualStrings("quota spent", f.cause.?.cause.?.message);
+}
+
 test "every cancel result maps to the completion the core expects" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

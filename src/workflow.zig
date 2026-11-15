@@ -747,8 +747,21 @@ pub const Context = struct {
 
     /// Fails the workflow with a failure you describe. Return the error this gives back. In
     /// an update handler, returning it rejects the update with that failure instead.
+    ///
+    /// The `a.details` list and the `a.cause` chain (a future's failure, for example) are
+    /// copied into the run's memory here, so they may live on the stack; strings and payload
+    /// data must live as long as the run, as `allocator()` memory does. The failure's stack
+    /// trace is the return trace of the error the workflow function or handler returns (see
+    /// `worker.Options.failure_stack_traces`).
     pub fn fail(ctx: *Context, a: failure_mod.Application) error{ApplicationFailure} {
-        ctx.instance.setPendingFailure(.{ .application = a });
+        const app = failure_mod.keep(ctx.allocator(), a) catch blk: {
+            ctx.instance.logger.warn("out of memory copying the details and cause of a workflow failure; the failure is sent without them", .{ .message = a.message });
+            var bare = a;
+            bare.details = &.{};
+            bare.cause = null;
+            break :blk bare;
+        };
+        ctx.instance.setPendingFailure(.{ .application = app });
         return error.ApplicationFailure;
     }
 

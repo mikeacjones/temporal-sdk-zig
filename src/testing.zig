@@ -302,6 +302,9 @@ pub const WorkflowEnvironment = struct {
         /// replay of each finished workflow use too. Borrowed: they must outlive the
         /// environment.
         codecs: []const converter.PayloadCodec = &.{},
+        /// Encode the message and stack trace of failures the client and its worker send
+        /// (`client.Options.encode_failure_attributes`).
+        encode_failure_attributes: bool = false,
         /// Where the client's sdk-core logs and the worker's workflow and activity logs go
         /// (`client.Options.logger`). Borrowed: it must outlive the environment.
         logger: ?log_mod.Sink = null,
@@ -349,6 +352,7 @@ pub const WorkflowEnvironment = struct {
         errdefer env.server.stop(io);
         var client_options = env.server.clientOptions();
         client_options.codecs = options.codecs;
+        client_options.encode_failure_attributes = options.encode_failure_attributes;
         client_options.logger = options.logger;
         client_options.propagators = options.propagators;
         client_options.worker_interceptors = options.worker_interceptors;
