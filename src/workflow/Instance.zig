@@ -4278,6 +4278,44 @@ test "setCoroutineName names the calling coroutine, including one started with i
     try testing.expectEqualStrings("\"workflow,main,async,fetcher\"", done[0].variant.?.complete_workflow_execution.result.?.data);
 }
 
+// Names itself, sleeps, and returns its name. Its query handler tries to rename the caller,
+// which outside a coroutine names nothing.
+const QueryRename = struct {
+    const Name = workflow.QueryDef("name", fn () []const u8);
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        try ctx.setCoroutineName("main");
+        try ctx.setQueryHandler(Name, ctx, name);
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        return ctx.coroutineName();
+    }
+
+    fn name(ctx: *workflow.Context) []const u8 {
+        ctx.setCoroutineName("from-query") catch return "OutOfMemory";
+        return ctx.coroutineName();
+    }
+};
+const QueryRenameWf = workflow.Def("QueryRename", QueryRename.run);
+
+test "setCoroutineName in a query handler names nothing and allocates nothing" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, QueryRenameWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "QueryRename", .{}), a));
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+    for (0..3) |_| {
+        const allocated = inst.allocated;
+        const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "name", &.{} }}), a);
+        try testing.expectEqualStrings("\"\"", answer(c, 0).variant.?.succeeded.response.?.data);
+        try testing.expectEqual(allocated, inst.allocated);
+    }
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a));
+    try testing.expectEqualStrings("\"main\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
 // Waits on an activity with the cancellation type named by `mode`. If the activity completes
 // despite a cancel, sleeps before returning, which a re-armed cancel interrupts.
 const WaitCancel = struct {

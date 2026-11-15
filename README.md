@@ -557,7 +557,7 @@ Notes:
 - To race or cancel a timer, run `std.Io.sleep` as a coroutine, as the next example does.
 
 #### Concurrency
-`ctx.io()` gives workflows `std.Io` concurrency: `io.async` futures, `std.Io.Select`, `std.Io.Group`, `std.Io.Mutex`, `std.Io.Semaphore`, `std.Io.Event`, `std.Io.Condition`, and `std.Io.Queue`. Blocked coroutines wake in the order they started waiting, and a coroutine canceled while blocked on any of them gets `error.Canceled`.
+`ctx.io()` gives workflows `std.Io` concurrency: `io.async` futures, `std.Io.Select`, `std.Io.Group`, `std.Io.Mutex`, `std.Io.Semaphore`, `std.Io.Event`, `std.Io.Condition`, and `std.Io.Queue`. Blocked coroutines are woken in the order they started waiting, but a woken coroutine is not guaranteed to get what it waited for: a coroutine that releases a `std.Io.Mutex` or a `std.Io.Semaphore` permit and takes it again before it blocks gets it first, so code must not depend on the order in which coroutines acquire them. A coroutine canceled while blocked on any of them gets `error.Canceled`.
 
 <!-- example: workflow-select -->
 ```zig
@@ -597,9 +597,9 @@ fn greetAll(ctx: *workflow.Context, names: []const []const u8) ![]const []const 
 pub const GreetAll = workflow.Def("greet_all", greetAll);
 ```
 
-A value one coroutine sets and another waits for is a field plus a `std.Io.Event`: the setter writes the field, then calls `set`; the waiter calls `wait`, then reads the field. This is the idiom; the SDK has no separate settable-future type.
+A value one coroutine sets and another waits for is a field plus a `std.Io.Event`: the setter writes the field, then calls `set`; the waiter calls `wait`, then reads the field. This is the idiom; the SDK has no separate type for this.
 
-<!-- example: workflow-settable -->
+<!-- example: workflow-event-value -->
 ```zig
 const Reply = struct { value: []const u8 = "", ready: std.Io.Event = .unset };
 fn fetchReply(ctx: *workflow.Context, name: []const u8, out: *Reply) void {

@@ -639,8 +639,10 @@ pub const Context = struct {
     /// `io.async`, `io.concurrent`, a `std.Io.Group`, or a `std.Io.Select`) so stack-trace
     /// queries can tell coroutines apart. The name is copied into `allocator()`, so a
     /// coroutine that renames itself often grows the run's memory. Unnamed coroutines are
-    /// "workflow", "signal", "update", "async", or "group".
+    /// "workflow", "signal", "update", "async", or "group". Outside a coroutine, as in a
+    /// query handler, there is nothing to name: it does nothing and allocates nothing.
     pub fn setCoroutineName(ctx: *Context, name: []const u8) error{OutOfMemory}!void {
+        if (ctx.instance.wio.scheduler.currentFiber() == null) return;
         const copy = try ctx.allocator().dupe(u8, name);
         ctx.instance.wio.setCurrentName(copy);
     }

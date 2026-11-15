@@ -170,7 +170,7 @@ test "workflows: a Group of coroutines feeds a Queue" {
     }
 }
 
-// example: workflow-settable
+// example: workflow-event-value
 const Reply = struct { value: []const u8 = "", ready: std.Io.Event = .unset };
 fn fetchReply(ctx: *workflow.Context, name: []const u8, out: *Reply) void {
     ctx.setCoroutineName("fetch-reply") catch {}; // shown by stack-trace queries
