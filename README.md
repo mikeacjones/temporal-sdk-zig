@@ -730,6 +730,7 @@ Notes:
 - `started` returns the child's execution; `error.ChildWorkflowAlreadyStarted` means its ID is taken.
 - `get` returns `error.ChildWorkflowFailed` for a failed, timed-out, canceled, or terminated child, `future.failure()` saying which, and `error.ChildWorkflowAlreadyStarted` when the child's ID is taken.
 - `parent_close_policy` defaults to `.terminate`; `future.signal` signals the child and `future.cancel()` cancels it.
+- `static_summary` (a short single line) and `static_details` (longer text) describe the child; the UI and CLI show them on its started event. Each is sent as a JSON string payload through the worker's payload codecs, and empty sends none. They don't take part in replay.
 
 #### External workflows
 - `ctx.signalExternalWorkflow` and `ctx.cancelExternalWorkflow` signal or cancel a workflow by ID; an empty run ID targets the latest run.

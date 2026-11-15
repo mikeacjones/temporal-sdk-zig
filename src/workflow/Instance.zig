@@ -1951,7 +1951,13 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
     };
     try inst.children.put(a, state.seq, state);
     inst.next_child_seq += 1;
-    try inst.emit(.{ .variant = .{ .start_child_workflow_execution = cmd } });
+    try inst.emit(.{
+        .user_metadata = if (options.static_summary.len > 0 or options.static_details.len > 0) .{
+            .summary = if (options.static_summary.len > 0) try converter.toPayload(a, options.static_summary) else null,
+            .details = if (options.static_details.len > 0) try converter.toPayload(a, options.static_details) else null,
+        } else null,
+        .variant = .{ .start_child_workflow_execution = cmd },
+    });
     return state;
 }
 
@@ -5550,7 +5556,46 @@ const ChildWf = struct {
         return ctx.executeChildWorkflowByName([]const u8, "", .{}, .{}).get();
     }
     const ByName = workflow.Def("ByName", byName);
+
+    /// Starts `Kid` with the given static summary and details and returns its result.
+    fn described(ctx: *workflow.Context, summary: []const u8, details: []const u8) ![]const u8 {
+        return ctx.executeChildWorkflow(Kid, .{ .id = "kid-1", .static_summary = summary, .static_details = details }, .{"kid"}).get();
+    }
+    const Described = workflow.Def("DescribedChild", described);
 };
+
+/// Runs `DescribedChild` with `summary` and `details` and checks its StartChildWorkflowExecution
+/// command's user_metadata: null fields expect none, and both null expects no user_metadata.
+fn expectDescribedChildStart(summary: []const u8, details: []const u8, want_summary: ?[]const u8, want_details: ?[]const u8) !void {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Described.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "DescribedChild", .{ summary, details }), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqualStrings("kid-1", first[0].variant.?.start_child_workflow_execution.workflow_id);
+    if (want_summary == null and want_details == null) return testing.expect(first[0].user_metadata == null);
+    const md = first[0].user_metadata.?;
+    inline for (.{ .{ want_summary, md.summary }, .{ want_details, md.details } }) |pair| {
+        if (pair[0]) |want| {
+            try testing.expectEqualStrings(want, pair[1].?.data);
+            try testing.expectEqualStrings("json/plain", pair[1].?.metadata.items[0].value);
+        } else try testing.expect(pair[1] == null);
+    }
+}
+
+test "child workflow: static summary and details are sent as the start command's user_metadata" {
+    try expectDescribedChildStart("Charge the card", "Charges **once** per order.", "\"Charge the card\"", "\"Charges **once** per order.\"");
+}
+
+test "child workflow: a static summary alone sends no details" {
+    try expectDescribedChildStart("Charge the card", "", "\"Charge the card\"", null);
+}
+
+test "child workflow: no static summary or details sends no user_metadata" {
+    try expectDescribedChildStart("", "", null, null);
+}
 
 fn childStarted(a: Allocator, seq: u32, run_id: []const u8) !act_pb.WorkflowActivation {
     return oneJob(a, .{ .resolve_child_workflow_execution_start = .{ .seq = seq, .status = .{ .succeeded = .{ .run_id = run_id } } } });

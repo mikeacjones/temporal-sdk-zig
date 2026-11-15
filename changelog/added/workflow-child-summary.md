@@ -1,0 +1,1 @@
+`workflow.ChildWorkflowOptions.static_summary` and `static_details` describe a child workflow; the UI and CLI show them on its started event. See [Child workflows](https://github.com/mikeacjones/temporal-sdk-zig#child-workflows).

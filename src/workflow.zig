@@ -533,6 +533,12 @@ pub const ChildWorkflowOptions = struct {
     /// The child's search attributes, built with `search_attributes.Key.set`; unsets are
     /// ignored. A value the server can't index fails the start with `error.InvalidOptions`.
     search_attributes: []const search_attributes.Update = &.{},
+    /// A short single-line description of the child, shown in the UI and CLI on its started
+    /// event. Sent as a JSON string payload (through the codecs); empty sends none.
+    static_summary: []const u8 = "",
+    /// A longer description of the child, shown in the UI and CLI. Sent as a JSON string
+    /// payload (through the codecs); empty sends none.
+    static_details: []const u8 = "",
 };
 
 /// What canceling a Nexus operation does: `NexusOperationFuture.cancel`, or canceling the

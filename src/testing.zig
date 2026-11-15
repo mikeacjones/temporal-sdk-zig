@@ -1921,6 +1921,24 @@ const ChildFixtures = struct {
     }
     const ParentOfNamed = workflow.Def("ParentOfNamed", parentOfNamed);
 
+    /// Runs `GreetChild` as "described-child" with a static summary and details. The ID is
+    /// fixed so the replayer, which runs the parent under its own ID, starts the same child.
+    fn describedParent(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return ctx.executeChildWorkflow(GreetChild, .{
+            .id = "described-child",
+            .static_summary = "Greet the guest",
+            .static_details = "Greets **one** guest by name.",
+        }, .{name}).get();
+    }
+    const DescribedParent = workflow.Def("DescribedParent", describedParent);
+
+    /// `describedParent` without the summary and details: they aren't replayed, so it replays
+    /// `DescribedParent`'s history.
+    fn describedParentPlain(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return ctx.executeChildWorkflow(GreetChild, .{ .id = "described-child" }, .{name}).get();
+    }
+    const DescribedParentPlain = workflow.Def("DescribedParent", describedParentPlain);
+
     /// `parent` starting a different child type, which can't replay `Parent`'s history.
     fn parentOfOther(ctx: *workflow.Context, name: []const u8) ![]const u8 {
         return ctx.executeChildWorkflowByName([]const u8, "OtherChild", .{}, .{name}).get();
@@ -5968,6 +5986,41 @@ test "WorkflowReplayer replays a parent's child workflow and catches a changed c
     defer changed.deinit();
     try changed.registerWorkflow(ChildFixtures.ParentChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(child_workflow_history));
+}
+
+test "a child workflow's static summary and details are recorded on its started event" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChildFixtures.DescribedParent);
+    try env.registerWorkflow(ChildFixtures.GreetChild);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(ChildFixtures.DescribedParent, .{}, .{"Ada"});
+    defer run.deinit();
+    // Replays the run too.
+    try testing.expectEqualStrings("Hello Ada from a child!", try env.getResult(ChildFixtures.DescribedParent, &run, a, null));
+
+    const event = try StartOptionFixtures.startedEvent(&env.client, a, "described-child", "");
+    try StartOptionFixtures.expectMetadata(a, event, "Greet the guest", "Greets **one** guest by name.");
+    try testing.expectEqualStrings(run.id, event.attributes.?.workflow_execution_started_event_attributes.parent_workflow_execution.?.workflow_id);
+}
+
+/// A dev-server run of `ChildFixtures.DescribedParent`, whose child was started with a static
+/// summary and details, exported as JSON.
+const described_child_history = @embedFile("testdata/described_child_history.json");
+
+test "WorkflowReplayer replays a child started with a static summary and details, with or without them" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(ChildFixtures.DescribedParent);
+    try ok.replayHistoryJson(described_child_history);
+
+    var plain: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer plain.deinit();
+    try plain.registerWorkflow(ChildFixtures.DescribedParentPlain);
+    try plain.replayHistoryJson(described_child_history);
 }
 
 const RetryDelayFixtures = struct {
