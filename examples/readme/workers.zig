@@ -50,21 +50,53 @@ test "workers: a worker runs a workflow until it is stopped" {
     const result = try run.get(arena); // "Hello, Ana!"
     // end-example
     try testing.expectEqualStrings("Hello, Ana!", result);
+}
 
-    var configured = try initGreetingWorker(gpa, io, &client);
+test "workers: a worker with its options set runs a workflow" {
+    var server = try temporal.testing.DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var client = try temporal.client.Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var configured = try initGreetingWorker(testing.allocator, testing.io, &client);
     defer configured.deinit();
     try testing.expectEqual(@as(usize, 20), configured.options.max_concurrent_activity_executions);
+    // The core accepts every option: the worker starts polling and runs a workflow.
+    var running = try testing.io.concurrent(Worker.run, .{&configured});
+    defer {
+        configured.stop();
+        running.await(testing.io) catch {};
+    }
+    try configured.waitUntilRunning();
+    var run = try client.executeWorkflow(Greeting, .{ .id = "greeting-bo", .task_queue = "greetings" }, .{"Bo"});
+    defer run.deinit();
+    try testing.expectEqualStrings("Hello, Bo!", try run.get(arena.allocator()));
 }
 
 fn initGreetingWorker(gpa: std.mem.Allocator, io: std.Io, client: *temporal.client.Client) !Worker {
-    return Worker.init(gpa, io, client, "greetings", .{
+    // example: worker-options
+    var w = try Worker.init(gpa, io, client, "greetings", .{
         .identity = "greetings-worker-1", // default: the client's identity
         .max_concurrent_activity_executions = 20,
+        .max_concurrent_local_activity_executions = 50,
         .max_concurrent_activity_task_pollers = 4,
         .max_cached_workflows = 500,
+        .sticky_schedule_to_start_timeout = .fromSeconds(5),
+        .max_activities_per_second = 50, // this worker
+        .max_task_queue_activities_per_second = 200, // all workers on "greetings"
+        .default_heartbeat_throttle_interval = .fromSeconds(10),
+        .max_heartbeat_throttle_interval = .fromSeconds(30),
+        .max_eager_activity_reservations_per_workflow_task = 0, // no eager activities
         .graceful_shutdown_period = .fromSeconds(10),
         .workflow_memory_limit = 16 * 1024 * 1024,
     });
+    // end-example
+    errdefer w.deinit();
+    try w.registerWorkflow(Greeting);
+    try w.registerActivity(Greet);
+    return w;
 }
 
 // example: worker-versioning

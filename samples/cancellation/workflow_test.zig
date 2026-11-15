@@ -63,7 +63,7 @@ const Heartbeats = struct {
     }
 };
 
-fn runToBeCanceled(env: *const temporal.testing.ActivityEnvironment, arena: std.mem.Allocator) !void {
+fn runToBeCanceled(env: *temporal.testing.ActivityEnvironment, arena: std.mem.Allocator) !void {
     return env.executeActivity(cancellation.ActivityToBeCanceled, .{}, arena);
 }
 

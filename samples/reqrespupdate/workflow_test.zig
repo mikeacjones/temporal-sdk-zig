@@ -88,6 +88,6 @@ test "without the validator, requests past the limit are handled before continui
 test "UppercaseActivity uppercases its input" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectEqualStrings("FOO 1", try env.executeActivityWith(reqrespupdate.UppercaseActivity, null, .{"foo 1"}, arena.allocator()));
 }

@@ -73,7 +73,7 @@ test "a failed validation refuses the child workflow" {
 test "the validation activity approves only ChildWorkflow" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expect(try env.executeActivity(security_interceptor.ValidateChildWorkflowTypeActivity, .{"ChildWorkflow"}, arena.allocator()));
     try testing.expect(!try env.executeActivity(security_interceptor.ValidateChildWorkflowTypeActivity, .{"ProhibitedChildWorkflow"}, arena.allocator()));
 }

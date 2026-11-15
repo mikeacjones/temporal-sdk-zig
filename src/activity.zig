@@ -18,9 +18,16 @@
 //! `error.Canceled` reports the activity canceled; returning anything else reports that
 //! outcome as usual. A cancel from the workflow reaches the worker in the server's answer to
 //! a heartbeat, so an activity that should notice it must call `ctx.heartbeat`. Heartbeats
-//! are throttled to 80% of the heartbeat timeout (at most 60 seconds; 30 without one), which
-//! bounds how late the cancel arrives. A local activity (`info().is_local`) gets its cancels
+//! are throttled to 80% of the heartbeat timeout, at most the worker's
+//! `max_heartbeat_throttle_interval` (60 seconds by default), and to its
+//! `default_heartbeat_throttle_interval` (30 seconds by default) without one; that bounds how
+//! late the cancel arrives. A local activity (`info().is_local`) gets its cancels
 //! straight from the worker, without heartbeating, and its heartbeats are dropped.
+//!
+//! When the worker begins stopping, `ctx.isWorkerStopping()` turns true and
+//! `ctx.waitForWorkerStop()` returns, before the worker's graceful shutdown period starts
+//! running out; an activity still running when it has passed is canceled with reason
+//! `worker_shutdown`. `ctx.info().deadline()` says when the current attempt times out.
 //!
 //! An activity that finishes elsewhere (a person approves it, another system calls back)
 //! returns `ctx.completeAsync()` after handing `ctx.info().task_token` to whatever completes
@@ -60,6 +67,7 @@ const log = @import("log.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
+const workflow = @import("workflow.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Info = struct {
@@ -88,6 +96,31 @@ pub const Info = struct {
     /// The session the workflow ran the activity in (`workflow.ActivityOptions.session`), or
     /// empty.
     session_id: []const u8 = "",
+    /// How long the activity may take from being scheduled until it closes, across every
+    /// attempt. Null when the task carried none.
+    schedule_to_close_timeout: ?std.Io.Duration = null,
+    /// How long each attempt may run. Null when the task carried none.
+    start_to_close_timeout: ?std.Io.Duration = null,
+    /// How long the activity may go without heartbeating before the attempt times out. Null
+    /// when the task carried none.
+    heartbeat_timeout: ?std.Io.Duration = null,
+    /// The retry policy the activity was scheduled with, as the server filled it in, or null
+    /// when the task carried none. Intervals the server didn't set are null.
+    retry_policy: ?workflow.RetryPolicy = null,
+    /// The priority the activity was scheduled with. All fields are zero when it carried
+    /// none, which means the server's default.
+    priority: workflow.Priority = .{},
+
+    /// When this attempt must finish: the earlier of `scheduled_time` plus
+    /// `schedule_to_close_timeout` and `started_time` plus `start_to_close_timeout`, or null
+    /// when neither pair is known.
+    pub fn deadline(info: *const Info) ?std.Io.Timestamp {
+        const by_schedule = if (info.scheduled_time) |t| if (info.schedule_to_close_timeout) |d| t.addDuration(d) else null else null;
+        const by_start = if (info.started_time) |t| if (info.start_to_close_timeout) |d| t.addDuration(d) else null else null;
+        const a = by_schedule orelse return by_start;
+        const b = by_start orelse return a;
+        return if (a.nanoseconds <= b.nanoseconds) a else b;
+    }
 };
 
 /// Why an activity was canceled.
@@ -105,8 +138,8 @@ pub const CancelReason = enum(u8) {
     reset,
 };
 
-/// An activity's context. The activity uses it from its own task; `cancelReason` is also
-/// safe to call from other threads.
+/// An activity's context. The activity uses it from its own task; `cancelReason`,
+/// `isWorkerStopping` and `waitForWorkerStop` are also safe to call from other threads.
 pub const Context = struct {
     arena: Allocator,
     io_: std.Io,
@@ -130,6 +163,10 @@ pub const Context = struct {
     metrics_: metrics_mod.Handler = .noop,
     /// Written once by the worker when a cancel arrives, possibly from another thread.
     cancel_reason_: std.atomic.Value(u8) = .init(not_canceled),
+    /// Set once by the worker (any thread) when it begins stopping.
+    worker_stopping_: std.atomic.Value(bool) = .init(false),
+    /// Set when the worker begins stopping or a cancel arrives; wakes `waitForWorkerStop`.
+    stop_wake_: std.Io.Event = .unset,
 
     const not_canceled = std.math.maxInt(u8);
 
@@ -162,7 +199,40 @@ pub const Context = struct {
     /// Records why the activity is being canceled, before its task is canceled. The first
     /// reason wins; returns whether this call set it. Called by the worker (any thread).
     pub fn setCancelReason(ctx: *Context, reason: CancelReason) bool {
-        return ctx.cancel_reason_.cmpxchgStrong(not_canceled, @backingInt(reason), .acq_rel, .acquire) == null;
+        const set = ctx.cancel_reason_.cmpxchgStrong(not_canceled, @backingInt(reason), .acq_rel, .acquire) == null;
+        if (set) ctx.stop_wake_.set(ctx.io_);
+        return set;
+    }
+
+    /// Whether the worker running the activity has begun stopping (`worker.Worker.stop`, or
+    /// `run` ending on a poll failure). It stays true. While the worker's
+    /// `graceful_shutdown_period` lasts the activity may still finish and report its result;
+    /// after it, the activity is canceled with reason `worker_shutdown`.
+    pub fn isWorkerStopping(ctx: *const Context) bool {
+        return ctx.worker_stopping_.load(.acquire);
+    }
+
+    /// Blocks until the worker running the activity begins stopping (see `isWorkerStopping`),
+    /// or returns `error.Canceled` if the activity is canceled first. Run it as a coroutine
+    /// beside the activity's work, with `io.concurrent` or as a `std.Io.Select` case started
+    /// with `select.concurrent`, to wind the work down, save progress, or heartbeat before the
+    /// graceful shutdown period ends. Not with `async`: when the Io has no thread to spare
+    /// (always on a one-CPU host), `async` runs the function at once on the caller, which
+    /// then blocks here until the worker stops. Its own task being canceled also returns
+    /// `error.Canceled`.
+    pub fn waitForWorkerStop(ctx: *Context) error{Canceled}!void {
+        while (true) {
+            if (ctx.cancelReason() != null) return error.Canceled;
+            if (ctx.isWorkerStopping()) return;
+            try ctx.stop_wake_.wait(ctx.io_);
+        }
+    }
+
+    /// Records that the worker has begun stopping and wakes `waitForWorkerStop`. Called by
+    /// the worker and by `testing.ActivityEnvironment` (any thread).
+    pub fn notifyWorkerStop(ctx: *Context) void {
+        ctx.worker_stopping_.store(true, .release);
+        ctx.stop_wake_.set(ctx.io_);
     }
 
     /// The client of the worker running the activity, for starting, signaling, querying or
@@ -841,4 +911,42 @@ test "DynamicDef hands the arguments over undecoded, to a function or a method" 
     try std.testing.expectError(error.InvalidPayload, reg.invoke(reg.receiver, &ctx, wrong.items));
     const right = try converter.toPayloads(a, .{@as(i64, 7)});
     try std.testing.expectEqualStrings("\"n=7\"", (try reg.invoke(reg.receiver, &ctx, right.items)).data);
+}
+
+test "deadline is the earlier of the schedule-to-close and start-to-close ends" {
+    var info: Info = .{ .activity_id = "1", .activity_type = "A", .task_queue = "q", .workflow_id = "w", .workflow_run_id = "r", .workflow_type = "W", .workflow_namespace = "default", .attempt = 1 };
+    try std.testing.expectEqual(null, info.deadline());
+    info.scheduled_time = .fromNanoseconds(100 * std.time.ns_per_s);
+    info.started_time = .fromNanoseconds(110 * std.time.ns_per_s);
+    try std.testing.expectEqual(null, info.deadline());
+
+    info.schedule_to_close_timeout = .fromSeconds(60);
+    try std.testing.expectEqual(@as(i96, 160 * std.time.ns_per_s), info.deadline().?.nanoseconds);
+
+    info.start_to_close_timeout = .fromSeconds(30);
+    try std.testing.expectEqual(@as(i96, 140 * std.time.ns_per_s), info.deadline().?.nanoseconds);
+    info.start_to_close_timeout = .fromSeconds(90);
+    try std.testing.expectEqual(@as(i96, 160 * std.time.ns_per_s), info.deadline().?.nanoseconds);
+
+    info.schedule_to_close_timeout = null;
+    try std.testing.expectEqual(@as(i96, 200 * std.time.ns_per_s), info.deadline().?.nanoseconds);
+    // A timeout without the time it counts from can't be computed.
+    info.started_time = null;
+    try std.testing.expectEqual(null, info.deadline());
+}
+
+test "waitForWorkerStop returns once the worker stops, or error.Canceled after a cancel" {
+    var stopped: Context = .{ .arena = std.testing.allocator, .io_ = std.testing.io, .info_ = undefined, .logger_ = .{} };
+    try std.testing.expect(!stopped.isWorkerStopping());
+    var waiting = try std.testing.io.concurrent(Context.waitForWorkerStop, .{&stopped});
+    stopped.notifyWorkerStop();
+    try waiting.await(std.testing.io);
+    try std.testing.expect(stopped.isWorkerStopping());
+    try stopped.waitForWorkerStop();
+
+    var canceled: Context = .{ .arena = std.testing.allocator, .io_ = std.testing.io, .info_ = undefined, .logger_ = .{} };
+    var waiting_canceled = try std.testing.io.concurrent(Context.waitForWorkerStop, .{&canceled});
+    try std.testing.expect(canceled.setCancelReason(.canceled));
+    try std.testing.expectError(error.Canceled, waiting_canceled.await(std.testing.io));
+    try std.testing.expect(!canceled.isWorkerStopping());
 }

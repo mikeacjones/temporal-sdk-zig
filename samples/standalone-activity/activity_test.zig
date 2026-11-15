@@ -10,7 +10,7 @@ const testing = std.testing;
 test "activity" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     const result = try env.executeActivity(helloworld.Activity, .{"World"}, arena.allocator());
     try testing.expectEqualStrings("Hello World!", result);
 }

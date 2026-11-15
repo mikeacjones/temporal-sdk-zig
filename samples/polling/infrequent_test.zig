@@ -32,7 +32,7 @@ test "the polling activity fails with a benign service error while the service i
     defer arena.deinit();
     var service: test_service.TestService = .init(2);
     var activities: infrequent.PollingActivities = .{ .test_service = &service };
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectError(error.ApplicationFailure, env.executeActivityWith(infrequent.DoPoll, &activities, .{}, arena.allocator()));
     try testing.expectEqualStrings("OK", try env.executeActivityWith(infrequent.DoPoll, &activities, .{}, arena.allocator()));
 }

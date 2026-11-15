@@ -55,6 +55,10 @@ pub const Options = struct {
     /// for different runs.
     max_concurrent_workflow_task_executions: usize = 100,
     max_concurrent_activity_executions: usize = 100,
+    /// How many local activities the worker runs at once, each on its own task: a fixed slot
+    /// count, separate from `max_concurrent_activity_executions`. A local activity waits for a
+    /// free slot up to its `schedule_to_start_timeout`.
+    max_concurrent_local_activity_executions: usize = 100,
     /// How many Nexus requests (starts and cancels of operations) the worker handles at
     /// once, each on its own task. Only used with a registered Nexus service.
     max_concurrent_nexus_task_executions: usize = 100,
@@ -65,6 +69,43 @@ pub const Options = struct {
     max_concurrent_nexus_task_pollers: usize = 2,
     /// Empty uses the client's identity.
     identity: []const u8 = "",
+    /// How long a workflow task may wait on this worker's sticky queue before the server
+    /// times it out and hands it to any worker on the task queue, which replays the run from
+    /// its history. Must not be negative; counted in whole milliseconds.
+    sticky_schedule_to_start_timeout: Io.Duration = .fromSeconds(10),
+    /// The most activities per second this worker starts from its task queue; it polls no
+    /// more while starting another would go over. Null: no limit. Must be positive and finite.
+    /// A limit also turns off eager activity execution, whose starts would bypass it. Applies
+    /// to the task queue's own activities, not to session activities (`sessions`).
+    max_activities_per_second: ?f64 = null,
+    /// The most activities per second the server hands out from this task queue, across all
+    /// of its workers; set on each activity poll, so workers with different values override
+    /// each other. Null: no limit. Must be positive and finite. A limit also turns off eager
+    /// activity execution. Applies to the task queue's own activities, not to session
+    /// activities (`sessions`).
+    max_task_queue_activities_per_second: ?f64 = null,
+    /// How often an activity's heartbeats reach the server when the activity has no heartbeat
+    /// timeout; with one, they are sent at 80% of it, at most every
+    /// `max_heartbeat_throttle_interval`. Heartbeats in between are batched, keeping only the
+    /// latest details. Applies to session activities too. Must not be negative or above
+    /// `max_heartbeat_throttle_interval`.
+    default_heartbeat_throttle_interval: Io.Duration = .fromSeconds(30),
+    /// The longest interval between an activity's heartbeats reaching the server. Applies to
+    /// session activities too. Must not be negative.
+    max_heartbeat_throttle_interval: Io.Duration = .fromSeconds(60),
+    /// How many activities a workflow task may ask the server to start on this worker
+    /// eagerly, in the answer to the task's completion, instead of through the task queue.
+    /// Only activities on the worker's own task queue, and only while activity slots are
+    /// free, are asked for. 0 turns eager activity execution off for the worker; so does
+    /// either per-second limit.
+    max_eager_activity_reservations_per_workflow_task: u32 = 3,
+    /// Whether the worker polls its task queue for activity tasks. False runs the
+    /// registered activities only as local activities of this worker's workflows
+    /// (`workflow.Context.executeLocalActivity`): activities scheduled through the task queue
+    /// wait for another worker, or time out. Needs a registered workflow when activities are
+    /// registered, and can't be combined with `sessions`; `run` returns
+    /// `error.InvalidOptions` otherwise.
+    poll_activity_tasks: bool = true,
     /// Stack size for each workflow coroutine.
     workflow_stack_size: usize = 256 * 1024,
     /// The most memory, in bytes, one cached workflow run may hold. Null (the default): no
@@ -175,6 +216,11 @@ pub const Worker = struct {
     stop_mutex: Io.Mutex = .init,
     core_ptrs: [3]?*bridge.c.TemporalCoreWorker = @splat(null),
     stop_requested: bool = false,
+    /// The activities of each running activity loop, so `stop` can tell them the worker is
+    /// stopping (`activity.Context.isWorkerStopping`). Guarded by `stop_mutex`.
+    activity_runs: [3]?*RunningActivities = @splat(null),
+    /// Set by `stop` before it notifies `activity_runs`; an activity starting later reads it.
+    stopping: std.atomic.Value(bool) = .init(false),
     /// The first poll failure of the current or last run, and its text (owned; null if it
     /// couldn't be allocated). See `fatalMessage`.
     fatal: ?PollError = null,
@@ -388,8 +434,9 @@ pub const Worker = struct {
 
     /// Polls and runs tasks until `stop` is called, or until polling fails for good: workflow
     /// tasks when a workflow is registered, activity tasks when an activity or a workflow is
-    /// (workflows' side effects run as local activities), and Nexus tasks when a Nexus
-    /// service is. Returns after in-flight work finishes and every core worker is shut down:
+    /// (workflows' side effects run as local activities; with `poll_activity_tasks` false,
+    /// only local ones), and Nexus tasks when a Nexus service is. Returns after in-flight
+    /// work finishes and every core worker is shut down:
     /// - success after `stop` (or a signal, with `runUntilSignal`);
     /// - `error.PollFailed` (or `error.OutOfMemory`) when the core gave up polling, after
     ///   shutting down as `stop` does; `fatalMessage` has the task queue and the core's text;
@@ -409,10 +456,10 @@ pub const Worker = struct {
             w.started.set(w.io);
         };
         if (!w.hasWorkflows() and !w.hasActivities() and !w.hasNexusServices()) return error.NothingRegistered;
-        if (w.options.sessions) |o| if (o.max_concurrent_sessions == 0) {
-            log.warn("worker for task queue {s}: sessions.max_concurrent_sessions must be positive", .{w.task_queue});
-            return error.InvalidOptions;
-        };
+        const registered: Registered = .{ .workflows = w.hasWorkflows(), .activities = w.hasActivities(), .nexus = w.hasNexusServices() };
+        try checkOptions(w.options, w.task_queue, registered);
+        const strategy = try w.versioningStrategy();
+        const core_options = coreOptions(w.options, w.client.namespace, w.task_queue, strategy, registered);
         const interceptors = try std.mem.concat(w.gpa, interceptor.Worker, &.{ w.client.worker_interceptors, w.options.interceptors });
         defer w.gpa.free(interceptors);
         w.interceptors = interceptors;
@@ -420,33 +467,8 @@ pub const Worker = struct {
         var message: ?[]u8 = null;
         defer if (message) |m| w.gpa.free(m);
 
-        const strategy = try w.versioningStrategy();
         const created_on = w.client.currentConnection();
-        const core = try w.createCore(created_on, .{
-            .namespace = w.client.namespace,
-            .task_queue = w.task_queue,
-            .versioning = strategy,
-            .identity_override = w.options.identity,
-            .max_cached_workflows = w.options.max_cached_workflows,
-            .tuner = .{
-                .workflow = .{ .fixed = w.options.max_concurrent_workflow_task_executions },
-                .activity = .{ .fixed = w.options.max_concurrent_activity_executions },
-                .nexus = .{ .fixed = w.options.max_concurrent_nexus_task_executions },
-            },
-            .task_types = .{
-                .workflows = w.hasWorkflows(),
-                .remote_activities = w.hasActivities(),
-                // The core runs local activities only on a worker that also polls workflows.
-                // Every workflow worker runs them: side effects are recorded by one.
-                .local_activities = w.hasWorkflows(),
-                .nexus = w.hasNexusServices(),
-            },
-            .workflow_task_pollers = .{ .simple_maximum = w.options.max_concurrent_workflow_task_pollers },
-            .activity_task_pollers = .{ .simple_maximum = w.options.max_concurrent_activity_task_pollers },
-            // The core checks this even on a worker that polls no Nexus tasks.
-            .nexus_task_pollers = .{ .simple_maximum = if (w.hasNexusServices()) w.options.max_concurrent_nexus_task_pollers else 1 },
-            .graceful_shutdown_period_ms = std.math.cast(u64, w.options.graceful_shutdown_period.toMilliseconds()) orelse 0,
-        }, &message);
+        const core = try w.createCore(created_on, core_options, &message);
         defer core.deinit();
 
         // Polled even without registered activities: a workflow's side effects run as local
@@ -459,18 +481,8 @@ pub const Worker = struct {
         defer if (host) |*h| h.deinit();
         if (w.options.sessions) |o| {
             host = try SessionHost.init(w, o.max_concurrent_sessions);
-            // Session queues are unversioned, so a rollout can't strand a host's sessions.
             for ([_][]const u8{ host.?.creation_queue, host.?.host_queue }, sessionSlots(w.options.max_concurrent_activity_executions, o.max_concurrent_sessions)) |queue, slots| {
-                activity_cores[core_count] = .{ .task_queue = queue, .core = try w.createCore(created_on, .{
-                    .namespace = w.client.namespace,
-                    .task_queue = queue,
-                    .identity_override = w.options.identity,
-                    .max_cached_workflows = w.options.max_cached_workflows,
-                    .tuner = .{ .activity = .{ .fixed = slots } },
-                    .task_types = .{ .workflows = false, .remote_activities = true, .local_activities = false, .nexus = false },
-                    .activity_task_pollers = .{ .simple_maximum = w.options.max_concurrent_activity_task_pollers },
-                    .graceful_shutdown_period_ms = std.math.cast(u64, w.options.graceful_shutdown_period.toMilliseconds()) orelse 0,
-                }, &message) };
+                activity_cores[core_count] = .{ .task_queue = queue, .core = try w.createCore(created_on, sessionCoreOptions(core_options, queue, slots), &message) };
                 core_count += 1;
             }
         }
@@ -523,7 +535,7 @@ pub const Worker = struct {
         }
         // The task queue's own core polls activities only when it runs them, local ones
         // included; the session queues' always do.
-        const first_activity_core: usize = if (w.hasWorkflows() or w.hasActivities()) 0 else 1;
+        const first_activity_core: usize = if (core_options.task_types.local_activities or core_options.task_types.remote_activities) 0 else 1;
         var activity_loops: [3]?Io.Future(void) = @splat(null);
         for (cores[first_activity_core..], activity_loops[first_activity_core..core_count]) |c, *loop| {
             if (start_failed == null) {
@@ -580,6 +592,7 @@ pub const Worker = struct {
         log.warn("starting " ++ what ++ " for task queue {s} failed, stopping the worker: {t}", .{ task_queue, err });
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
+        w.notifyActivitiesOfStop();
         for (cores) |other| other.core.initiateShutdown();
     }
 
@@ -588,6 +601,119 @@ pub const Worker = struct {
     /// overflow; the bridge lowers them to what the core takes.
     fn sessionSlots(max_activities: usize, max_sessions: usize) [2]usize {
         return .{ max_sessions, max_activities +| max_sessions };
+    }
+
+    /// What a worker has registered, which decides the task types its core worker polls.
+    const Registered = struct { workflows: bool, activities: bool, nexus: bool };
+
+    /// Returns `error.InvalidOptions`, logging the option and why, for options the core
+    /// would reject or misread, or that contradict each other. `coreOptions` relies on it.
+    fn checkOptions(o: Options, task_queue: []const u8, registered: Registered) error{InvalidOptions}!void {
+        if (o.sessions) |s| {
+            if (s.max_concurrent_sessions == 0) {
+                log.warn("worker for task queue {s}: sessions.max_concurrent_sessions must be positive", .{task_queue});
+                return error.InvalidOptions;
+            }
+            if (!o.poll_activity_tasks) {
+                log.warn("worker for task queue {s}: poll_activity_tasks = false can't be combined with sessions, whose activities arrive through task queues", .{task_queue});
+                return error.InvalidOptions;
+            }
+        }
+        if (!o.poll_activity_tasks and registered.activities and !registered.workflows) {
+            log.warn("worker for task queue {s}: poll_activity_tasks = false runs activities only as local activities of this worker's workflows, and no workflow is registered", .{task_queue});
+            return error.InvalidOptions;
+        }
+        inline for (.{ "max_activities_per_second", "max_task_queue_activities_per_second" }) |name| {
+            if (@field(o, name)) |rate| if (!(rate > 0) or !std.math.isNormal(rate)) {
+                log.warn("worker for task queue {s}: " ++ name ++ " is {d}; it must be a positive, finite number, or null for no limit", .{ task_queue, rate });
+                return error.InvalidOptions;
+            };
+        }
+        // The core spaces this worker's polls 1/rate seconds apart, computing up to two
+        // spacings past now on a monotonic instant of signed 64-bit seconds since boot; an
+        // overflow panics its activity poller, and no activity ever starts. A spacing below
+        // 2^61 seconds keeps now + 2/rate under 2^62 seconds plus the uptime.
+        if (o.max_activities_per_second) |rate| if (1 / rate >= max_poll_spacing_seconds) {
+            log.warn("worker for task queue {s}: max_activities_per_second is {e}; it must be at least one activity per 2^61 seconds (about 4.4e-19 per second), or null for no limit", .{ task_queue, rate });
+            return error.InvalidOptions;
+        };
+        inline for (.{ "sticky_schedule_to_start_timeout", "default_heartbeat_throttle_interval", "max_heartbeat_throttle_interval" }) |name| {
+            const d: Io.Duration = @field(o, name);
+            if (d.nanoseconds < 0) {
+                log.warn("worker for task queue {s}: " ++ name ++ " is {f}; it must not be negative", .{ task_queue, d });
+                return error.InvalidOptions;
+            }
+        }
+        if (o.default_heartbeat_throttle_interval.nanoseconds > o.max_heartbeat_throttle_interval.nanoseconds) {
+            log.warn("worker for task queue {s}: default_heartbeat_throttle_interval ({f}) must not be above max_heartbeat_throttle_interval ({f})", .{ task_queue, o.default_heartbeat_throttle_interval, o.max_heartbeat_throttle_interval });
+            return error.InvalidOptions;
+        }
+    }
+
+    /// The longest poll spacing, 1 / `max_activities_per_second`, that `checkOptions` accepts.
+    const max_poll_spacing_seconds: f64 = 0x1p61;
+
+    /// The core options of the worker's own task queue, from options `checkOptions` accepted.
+    fn coreOptions(o: Options, namespace: []const u8, task_queue: []const u8, versioning: bridge.Worker.Options.Versioning, registered: Registered) bridge.Worker.Options {
+        return .{
+            .namespace = namespace,
+            .task_queue = task_queue,
+            .versioning = versioning,
+            .identity_override = o.identity,
+            .max_cached_workflows = o.max_cached_workflows,
+            .tuner = .{
+                .workflow = .{ .fixed = o.max_concurrent_workflow_task_executions },
+                .activity = .{ .fixed = o.max_concurrent_activity_executions },
+                .local_activity = .{ .fixed = o.max_concurrent_local_activity_executions },
+                .nexus = .{ .fixed = o.max_concurrent_nexus_task_executions },
+            },
+            .task_types = .{
+                .workflows = registered.workflows,
+                .remote_activities = registered.activities and o.poll_activity_tasks,
+                // The core runs local activities only on a worker that also polls workflows.
+                // Every workflow worker runs them: side effects are recorded by one.
+                .local_activities = registered.workflows,
+                .nexus = registered.nexus,
+            },
+            .sticky_queue_schedule_to_start_timeout_ms = millis(o.sticky_schedule_to_start_timeout),
+            .default_heartbeat_throttle_interval_ms = millis(o.default_heartbeat_throttle_interval),
+            .max_heartbeat_throttle_interval_ms = millis(o.max_heartbeat_throttle_interval),
+            // The core reads 0 as no limit.
+            .max_activities_per_second = o.max_activities_per_second orelse 0,
+            .max_task_queue_activities_per_second = o.max_task_queue_activities_per_second orelse 0,
+            // Eagerly started activities skip the core's poll rate limiter, so a per-worker
+            // limit turns eager execution off. The core does that itself for the task queue's.
+            .max_eager_activity_reservations_per_workflow_task = if (o.max_activities_per_second == null) o.max_eager_activity_reservations_per_workflow_task else 0,
+            .workflow_task_pollers = .{ .simple_maximum = o.max_concurrent_workflow_task_pollers },
+            .activity_task_pollers = .{ .simple_maximum = o.max_concurrent_activity_task_pollers },
+            // The core checks this even on a worker that polls no Nexus tasks.
+            .nexus_task_pollers = .{ .simple_maximum = if (registered.nexus) o.max_concurrent_nexus_task_pollers else 1 },
+            .graceful_shutdown_period_ms = millis(o.graceful_shutdown_period),
+        };
+    }
+
+    /// The core options of a session queue: activities only, unversioned so a rollout can't
+    /// strand a host's sessions, with `slots` activity slots. The heartbeat throttling of the
+    /// worker's own queue applies; its per-second limits don't.
+    fn sessionCoreOptions(main: bridge.Worker.Options, task_queue: []const u8, slots: usize) bridge.Worker.Options {
+        return .{
+            .namespace = main.namespace,
+            .task_queue = task_queue,
+            .identity_override = main.identity_override,
+            .max_cached_workflows = main.max_cached_workflows,
+            .tuner = .{ .activity = .{ .fixed = slots } },
+            .task_types = .{ .workflows = false, .remote_activities = true, .local_activities = false, .nexus = false },
+            .default_heartbeat_throttle_interval_ms = main.default_heartbeat_throttle_interval_ms,
+            .max_heartbeat_throttle_interval_ms = main.max_heartbeat_throttle_interval_ms,
+            .activity_task_pollers = main.activity_task_pollers,
+            .graceful_shutdown_period_ms = main.graceful_shutdown_period_ms,
+        };
+    }
+
+    /// Whole milliseconds of `d`; negative is 0 and too long saturates.
+    fn millis(d: Io.Duration) u64 {
+        if (d.nanoseconds <= 0) return 0;
+        return std.math.cast(u64, @divTrunc(d.nanoseconds, std.time.ns_per_ms)) orelse std.math.maxInt(u64);
     }
 
     /// Creates and validates a core worker; logs and returns the error on failure.
@@ -649,7 +775,22 @@ pub const Worker = struct {
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
         w.stop_requested = true;
+        w.notifyActivitiesOfStop();
         for (w.core_ptrs) |p| if (p) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
+    }
+
+    /// Tells every running activity, and those that start later, that the worker is
+    /// stopping. Called with `stop_mutex` held.
+    fn notifyActivitiesOfStop(w: *Worker) void {
+        // Before the runs are visited: `receiveActivityTask` reads it after adding a run, under
+        // the same mutex, so each run is notified by one side or the other.
+        w.stopping.store(true, .release);
+        for (w.activity_runs) |r| if (r) |running| {
+            running.mutex.lockUncancelable(w.io);
+            defer running.mutex.unlock(w.io);
+            var it = running.map.valueIterator();
+            while (it.next()) |activity_run| activity_run.*.ctx.notifyWorkerStop();
+        };
     }
 
     /// The first poll failure of the last `run`, as `polling for <workflow|activity|nexus> tasks on
@@ -1164,6 +1305,23 @@ fn activityLoop(w: *Worker, core: bridge.Worker, task_queue: []const u8) void {
     var group: Io.Group = .init;
     var running: RunningActivities = .{};
     defer running.map.deinit(w.gpa);
+    const slot = slot: {
+        w.stop_mutex.lockUncancelable(w.io);
+        defer w.stop_mutex.unlock(w.io);
+        // One loop per core, and a `run` has at most as many cores as slots; only `run`
+        // called again while running fills them.
+        const i = std.mem.indexOfScalar(?*RunningActivities, &w.activity_runs, null) orelse {
+            log.warn("worker for task queue {s}: more activity loops than expected (is run called twice at once?); activities on {s} won't see the worker stop", .{ w.task_queue, task_queue });
+            break :slot null;
+        };
+        w.activity_runs[i] = &running;
+        break :slot i;
+    };
+    defer if (slot) |i| {
+        w.stop_mutex.lockUncancelable(w.io);
+        w.activity_runs[i] = null;
+        w.stop_mutex.unlock(w.io);
+    };
     var message: ?[]u8 = null;
     defer if (message) |m| w.gpa.free(m);
     while (true) {
@@ -1246,6 +1404,7 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
             defer running.mutex.unlock(w.io);
             running.map.put(w.gpa, run.task_token, run) catch
                 log.warn("out of memory tracking activity {s}; it runs, but cancels won't reach it", .{s.activity_id});
+            if (w.stopping.load(.acquire)) run.ctx.notifyWorkerStop();
             keep = true;
             return run;
         },
@@ -1455,7 +1614,29 @@ fn activityInfo(start: *const task_pb.Start, task_queue: []const u8, task_token:
         .scheduled_time = zigTimestamp(start.scheduled_time),
         .current_attempt_scheduled_time = zigTimestamp(start.current_attempt_scheduled_time),
         .started_time = zigTimestamp(start.started_time),
+        .schedule_to_close_timeout = positiveDuration(start.schedule_to_close_timeout),
+        .start_to_close_timeout = positiveDuration(start.start_to_close_timeout),
+        .heartbeat_timeout = positiveDuration(start.heartbeat_timeout),
+        .retry_policy = if (start.retry_policy) |p| .{
+            .initial_interval = positiveDuration(p.initial_interval),
+            .backoff_coefficient = p.backoff_coefficient,
+            .maximum_interval = positiveDuration(p.maximum_interval),
+            .maximum_attempts = p.maximum_attempts,
+            .non_retryable_error_types = p.non_retryable_error_types.items,
+        } else null,
+        .priority = if (start.priority) |p| .{
+            .priority_key = p.priority_key,
+            .fairness_key = p.fairness_key,
+            .fairness_weight = p.fairness_weight,
+        } else .{},
     };
+}
+
+/// A duration from the core, or null when absent or not positive (unset).
+fn positiveDuration(d: ?proto.google.protobuf.Duration) ?Io.Duration {
+    const v = d orelse return null;
+    const ns = @as(i96, v.seconds) * std.time.ns_per_s + v.nanos;
+    return if (ns > 0) .{ .nanoseconds = ns } else null;
 }
 
 fn zigTimestamp(t: ?proto.google.protobuf.Timestamp) ?Io.Timestamp {
@@ -1950,8 +2131,12 @@ const SessionHost = struct {
     /// good; any other cancel (the workflow completing it, a timeout) is reported as one.
     fn canceled(h: *SessionHost, ctx: *activity.Context) anyerror {
         if (ctx.cancelReason() != .worker_shutdown) return error.Canceled;
+        // The return type is an error set, not an error union, so `try` doesn't apply.
+        const message = std.fmt.allocPrint(ctx.allocator(), "the session's worker stopped (host task queue {s})", .{h.host_queue}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
         return ctx.fail(.{
-            .message = try std.fmt.allocPrint(ctx.allocator(), "the session's worker stopped (host task queue {s})", .{h.host_queue}),
+            .message = message,
             .type = "SessionWorkerStopped",
             .non_retryable = true,
         });
@@ -2359,6 +2544,387 @@ test "session slot counts saturate instead of overflowing" {
     try testing.expectEqual([2]usize{ 1, max }, Worker.sessionSlots(max, 1));
 }
 
+test "worker options map to the core options of the task queue" {
+    const options: Options = .{
+        .identity = "id-1",
+        .max_cached_workflows = 7,
+        .max_concurrent_workflow_task_executions = 11,
+        .max_concurrent_activity_executions = 12,
+        .max_concurrent_local_activity_executions = 13,
+        .max_concurrent_nexus_task_executions = 14,
+        .max_concurrent_workflow_task_pollers = 3,
+        .max_concurrent_activity_task_pollers = 4,
+        .max_concurrent_nexus_task_pollers = 5,
+        .sticky_schedule_to_start_timeout = .fromMilliseconds(2500),
+        .max_activities_per_second = 1.5,
+        .max_task_queue_activities_per_second = 2.5,
+        .default_heartbeat_throttle_interval = .fromSeconds(4),
+        .max_heartbeat_throttle_interval = .fromSeconds(9),
+        .max_eager_activity_reservations_per_workflow_task = 0,
+        .poll_activity_tasks = false,
+        .graceful_shutdown_period = .fromSeconds(6),
+    };
+    const all: Worker.Registered = .{ .workflows = true, .activities = true, .nexus = true };
+    try Worker.checkOptions(options, "mapped", all);
+    const core = Worker.coreOptions(options, "ns", "mapped", .{ .none = .{ .build_id = "b" } }, all);
+    try testing.expectEqualStrings("ns", core.namespace);
+    try testing.expectEqualStrings("mapped", core.task_queue);
+    try testing.expectEqualStrings("b", core.versioning.none.build_id);
+    try testing.expectEqualStrings("id-1", core.identity_override);
+    try testing.expectEqual(7, core.max_cached_workflows);
+    try testing.expectEqual(11, core.tuner.workflow.fixed);
+    try testing.expectEqual(12, core.tuner.activity.fixed);
+    try testing.expectEqual(13, core.tuner.local_activity.fixed);
+    try testing.expectEqual(14, core.tuner.nexus.fixed);
+    try testing.expectEqual(3, core.workflow_task_pollers.simple_maximum);
+    try testing.expectEqual(4, core.activity_task_pollers.simple_maximum);
+    try testing.expectEqual(5, core.nexus_task_pollers.simple_maximum);
+    try testing.expectEqual(2500, core.sticky_queue_schedule_to_start_timeout_ms);
+    try testing.expectEqual(1.5, core.max_activities_per_second);
+    try testing.expectEqual(2.5, core.max_task_queue_activities_per_second);
+    try testing.expectEqual(4000, core.default_heartbeat_throttle_interval_ms);
+    try testing.expectEqual(9000, core.max_heartbeat_throttle_interval_ms);
+    try testing.expectEqual(0, core.max_eager_activity_reservations_per_workflow_task);
+    try testing.expectEqual(6000, core.graceful_shutdown_period_ms);
+    // Activities still run, as local activities of the worker's workflows.
+    try testing.expectEqual(bridge.Worker.Options.TaskTypes{ .workflows = true, .local_activities = true, .remote_activities = false, .nexus = true }, core.task_types);
+}
+
+test "default worker options give the core its own defaults" {
+    const defaults: bridge.Worker.Options = .{ .namespace = "ns", .task_queue = "q" };
+    const all: Worker.Registered = .{ .workflows = true, .activities = true, .nexus = false };
+    try Worker.checkOptions(.{}, "q", all);
+    const core = Worker.coreOptions(.{}, "ns", "q", .{ .none = .{} }, all);
+    try testing.expectEqual(defaults.sticky_queue_schedule_to_start_timeout_ms, core.sticky_queue_schedule_to_start_timeout_ms);
+    try testing.expectEqual(defaults.default_heartbeat_throttle_interval_ms, core.default_heartbeat_throttle_interval_ms);
+    try testing.expectEqual(defaults.max_heartbeat_throttle_interval_ms, core.max_heartbeat_throttle_interval_ms);
+    try testing.expectEqual(defaults.max_activities_per_second, core.max_activities_per_second);
+    try testing.expectEqual(defaults.max_task_queue_activities_per_second, core.max_task_queue_activities_per_second);
+    try testing.expectEqual(defaults.max_eager_activity_reservations_per_workflow_task, core.max_eager_activity_reservations_per_workflow_task);
+    try testing.expectEqual(defaults.tuner.local_activity.fixed, core.tuner.local_activity.fixed);
+    try testing.expectEqual(defaults.graceful_shutdown_period_ms, core.graceful_shutdown_period_ms);
+    try testing.expectEqual(1000, core.max_cached_workflows);
+    try testing.expectEqual(100, core.tuner.workflow.fixed);
+    try testing.expectEqual(100, core.tuner.activity.fixed);
+    try testing.expectEqual(100, core.tuner.nexus.fixed);
+    try testing.expectEqual(2, core.workflow_task_pollers.simple_maximum);
+    try testing.expectEqual(2, core.activity_task_pollers.simple_maximum);
+    try testing.expectEqual(1, core.nexus_task_pollers.simple_maximum);
+    try testing.expectEqual(bridge.Worker.Options.TaskTypes{ .workflows = true, .local_activities = true, .remote_activities = true, .nexus = false }, core.task_types);
+}
+
+test "session queues get the heartbeat throttling but not the per-second limits" {
+    const options: Options = .{
+        .identity = "id-1",
+        .max_concurrent_activity_task_pollers = 4,
+        .max_activities_per_second = 1.5,
+        .max_task_queue_activities_per_second = 2.5,
+        .default_heartbeat_throttle_interval = .fromSeconds(4),
+        .max_heartbeat_throttle_interval = .fromSeconds(9),
+        .graceful_shutdown_period = .fromSeconds(6),
+        .sessions = .{},
+    };
+    const registered: Worker.Registered = .{ .workflows = false, .activities = true, .nexus = false };
+    try Worker.checkOptions(options, "q", registered);
+    const session = Worker.sessionCoreOptions(Worker.coreOptions(options, "ns", "q", .{ .none = .{} }, registered), "q@host", 42);
+    try testing.expectEqualStrings("ns", session.namespace);
+    try testing.expectEqualStrings("q@host", session.task_queue);
+    try testing.expectEqualStrings("id-1", session.identity_override);
+    try testing.expectEqual(42, session.tuner.activity.fixed);
+    try testing.expectEqual(4, session.activity_task_pollers.simple_maximum);
+    try testing.expectEqual(4000, session.default_heartbeat_throttle_interval_ms);
+    try testing.expectEqual(9000, session.max_heartbeat_throttle_interval_ms);
+    try testing.expectEqual(6000, session.graceful_shutdown_period_ms);
+    try testing.expectEqual(0, session.max_activities_per_second);
+    try testing.expectEqual(0, session.max_task_queue_activities_per_second);
+    try testing.expectEqual(bridge.Worker.Options.TaskTypes{ .workflows = false, .local_activities = false, .remote_activities = true, .nexus = false }, session.task_types);
+}
+
+test "a per-worker activity rate turns eager activities off; without one the reservations pass through" {
+    const all: Worker.Registered = .{ .workflows = true, .activities = true, .nexus = false };
+    const limited = Worker.coreOptions(.{ .max_activities_per_second = 1, .max_eager_activity_reservations_per_workflow_task = 5 }, "ns", "q", .{ .none = .{} }, all);
+    try testing.expectEqual(0, limited.max_eager_activity_reservations_per_workflow_task);
+    const unlimited = Worker.coreOptions(.{ .max_eager_activity_reservations_per_workflow_task = 5, .max_task_queue_activities_per_second = 1 }, "ns", "q", .{ .none = .{} }, all);
+    try testing.expectEqual(5, unlimited.max_eager_activity_reservations_per_workflow_task);
+}
+
+test "durations the core takes in milliseconds are truncated, and saturate when too long" {
+    try testing.expectEqual(1, Worker.millis(.fromMicroseconds(1999)));
+    try testing.expectEqual(0, Worker.millis(.zero));
+    try testing.expectEqual(std.math.maxInt(u64), Worker.millis(.max));
+}
+
+test "invalid worker options are rejected before the worker starts" {
+    const all: Worker.Registered = .{ .workflows = true, .activities = true, .nexus = false };
+    const invalid = [_]Options{
+        .{ .max_activities_per_second = 0 },
+        .{ .max_activities_per_second = -1 },
+        .{ .max_activities_per_second = std.math.nan(f64) },
+        .{ .max_activities_per_second = std.math.inf(f64) },
+        // The core's poll spacing, 1/rate seconds, would overflow.
+        .{ .max_activities_per_second = 1e-25 },
+        .{ .max_activities_per_second = 0x1p-64 },
+        // Two spacings past now would overflow the core's monotonic instant.
+        .{ .max_activities_per_second = 1e-19 },
+        .{ .max_activities_per_second = 1 / Worker.max_poll_spacing_seconds },
+        .{ .max_task_queue_activities_per_second = 0 },
+        .{ .max_task_queue_activities_per_second = -0.5 },
+        .{ .max_task_queue_activities_per_second = std.math.nan(f64) },
+        .{ .sticky_schedule_to_start_timeout = .fromMilliseconds(-1) },
+        .{ .default_heartbeat_throttle_interval = .fromMilliseconds(-1) },
+        .{ .max_heartbeat_throttle_interval = .fromSeconds(-1) },
+        .{ .default_heartbeat_throttle_interval = .fromSeconds(61) },
+        .{ .default_heartbeat_throttle_interval = .fromSeconds(5), .max_heartbeat_throttle_interval = .fromSeconds(4) },
+        .{ .poll_activity_tasks = false, .sessions = .{} },
+    };
+    for (invalid) |options| try testing.expectError(error.InvalidOptions, Worker.checkOptions(options, "q", all));
+    // Activities that could run only as local activities need a workflow to call them.
+    try testing.expectError(error.InvalidOptions, Worker.checkOptions(.{ .poll_activity_tasks = false }, "q", .{ .workflows = false, .activities = true, .nexus = false }));
+
+    const valid = [_]Options{
+        .{ .max_activities_per_second = 0.001, .max_task_queue_activities_per_second = 1e6 },
+        .{ .max_activities_per_second = 1e-18, .max_task_queue_activities_per_second = 1e-25 },
+        .{ .max_activities_per_second = 0x1.0000000000001p-61 },
+        .{ .sticky_schedule_to_start_timeout = .zero, .default_heartbeat_throttle_interval = .zero, .max_heartbeat_throttle_interval = .zero },
+        .{ .default_heartbeat_throttle_interval = .fromSeconds(60) },
+        .{ .poll_activity_tasks = false },
+    };
+    for (valid) |options| try Worker.checkOptions(options, "q", all);
+    try Worker.checkOptions(.{ .poll_activity_tasks = false }, "q", .{ .workflows = false, .activities = false, .nexus = true });
+}
+
+test "run returns InvalidOptions for an invalid option, before it uses the client" {
+    var client: client_mod.Client = undefined; // rejected before the client is used
+    const invalid = [_]Options{
+        .{ .max_activities_per_second = std.math.nan(f64) },
+        .{ .max_heartbeat_throttle_interval = .fromSeconds(-1) },
+        .{ .poll_activity_tasks = false, .sessions = .{} },
+    };
+    for (invalid) |options| {
+        var w = try Worker.init(testing.allocator, testing.io, &client, "invalid", options);
+        defer w.deinit();
+        try w.registerWorkflow(HelloTest.Hello);
+        try w.registerActivity(HelloTest.Greet);
+        try testing.expectError(error.InvalidOptions, w.run());
+        try testing.expectError(error.WorkerFailedToStart, w.waitUntilRunning());
+    }
+}
+
+const LocalOnlyTest = struct {
+    var active: std.atomic.Value(u32) = .init(0);
+    var most_active: std.atomic.Value(u32) = .init(0);
+
+    fn track(ctx: *activity.Context, name: []const u8) ![]const u8 {
+        const now = active.fetchAdd(1, .acq_rel) + 1;
+        _ = most_active.fetchMax(now, .acq_rel);
+        defer _ = active.fetchSub(1, .acq_rel);
+        try ctx.io().sleep(.fromMilliseconds(300), .awake);
+        return std.fmt.allocPrint(ctx.allocator(), "Hello {s}!", .{name});
+    }
+    const Track = activity.Def("Track", track);
+
+    fn twoLocal(ctx: *workflow.Context) ![]const u8 {
+        const options: workflow.LocalActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+        const a = ctx.executeLocalActivity(Track, options, .{"a"});
+        const b = ctx.executeLocalActivity(Track, options, .{"b"});
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ try a.get(), try b.get() });
+    }
+    const TwoLocal = workflow.Def("TwoLocal", twoLocal);
+
+    /// Runs `Track` as a local activity, then as a regular one, and reports how each ended.
+    fn localThenRemote(ctx: *workflow.Context) ![]const u8 {
+        const local = try ctx.executeLocalActivity(Track, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"local"}).get();
+        const remote = ctx.executeActivity(Track, .{
+            .schedule_to_start_timeout = .fromSeconds(1),
+            .start_to_close_timeout = .fromSeconds(10),
+        }, .{"remote"});
+        const outcome: []const u8 = if (remote.get()) |_| "completed" else |err| switch (err) {
+            error.ActivityFailed => outcome: {
+                const cause = failure_mod.rootCause(remote.failure().?);
+                const info = cause.failure_info orelse break :outcome "failed";
+                break :outcome switch (info) {
+                    .timeout_failure_info => |t| @tagName(t.timeout_type),
+                    else => "failed",
+                };
+            },
+            else => |e| return e,
+        };
+        return std.fmt.allocPrint(ctx.allocator(), "{s}; remote: {s}", .{ local, outcome });
+    }
+    const LocalThenRemote = workflow.Def("LocalThenRemote", localThenRemote);
+
+    fn start(task_queue: []const u8, options: Options, comptime Workflow: type) ![]const u8 {
+        active.store(0, .release);
+        most_active.store(0, .release);
+        const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+        defer rt.deinit();
+        var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+        defer server.shutdown(testing.io, null) catch {};
+        var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+        defer client.close();
+
+        var w = try Worker.init(testing.allocator, testing.io, &client, task_queue, options);
+        defer w.deinit();
+        try w.registerWorkflow(Workflow);
+        try w.registerActivity(Track);
+        var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+        defer {
+            w.stop();
+            running.await(testing.io) catch {};
+        }
+        try w.waitUntilRunning();
+
+        var run = try client.executeWorkflow(Workflow, .{ .task_queue = task_queue }, .{});
+        defer run.deinit();
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        return testing.allocator.dupe(u8, try run.get(arena.allocator()));
+    }
+};
+
+test "one local activity slot runs local activities one at a time" {
+    const result = try LocalOnlyTest.start("one-local-slot", .{ .max_concurrent_local_activity_executions = 1 }, LocalOnlyTest.TwoLocal);
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("Hello a! Hello b!", result);
+    try testing.expectEqual(1, LocalOnlyTest.most_active.load(.acquire));
+}
+
+test "a worker that doesn't poll activity tasks runs its activities only as local activities" {
+    const result = try LocalOnlyTest.start("local-activities-only", .{ .poll_activity_tasks = false }, LocalOnlyTest.LocalThenRemote);
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("Hello local!; remote: TIMEOUT_TYPE_SCHEDULE_TO_START", result);
+}
+
+const RateLimitTest = struct {
+    /// When each `Stamp` started, on the awake clock, in start order.
+    var started_at: [5]i96 = @splat(0);
+    var started: std.atomic.Value(usize) = .init(0);
+
+    fn stamp(ctx: *activity.Context, n: u32) !u32 {
+        const i = started.fetchAdd(1, .acq_rel);
+        if (i < started_at.len) started_at[i] = Io.Timestamp.now(ctx.io(), .awake).nanoseconds;
+        return n;
+    }
+    const Stamp = activity.Def("Stamp", stamp);
+
+    /// Schedules five activities on the worker's own task queue at once (eager execution
+    /// requested, the default) and waits for all of them.
+    fn fiveAtOnce(ctx: *workflow.Context) !u32 {
+        const options: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+        var pending: [5]@TypeOf(ctx.executeActivity(Stamp, options, .{@as(u32, 0)})) = undefined;
+        for (&pending, 0..) |*p, i| p.* = ctx.executeActivity(Stamp, options, .{@as(u32, @intCast(i))});
+        var sum: u32 = 0;
+        for (&pending) |*p| sum += try p.get();
+        return sum;
+    }
+    const FiveAtOnce = workflow.Def("FiveAtOnce", fiveAtOnce);
+};
+
+test "max_activities_per_second also limits activities a workflow task asks to start eagerly" {
+    RateLimitTest.started.store(0, .release);
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    // One activity per second, through one poller, with the default eager reservations.
+    var w = try Worker.init(testing.allocator, testing.io, &client, "one-activity-per-second", .{
+        .max_activities_per_second = 1,
+        .max_concurrent_activity_task_pollers = 1,
+    });
+    defer w.deinit();
+    try w.registerWorkflow(RateLimitTest.FiveAtOnce);
+    try w.registerActivity(RateLimitTest.Stamp);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    try w.waitUntilRunning();
+
+    var run = try client.executeWorkflow(RateLimitTest.FiveAtOnce, .{ .task_queue = "one-activity-per-second", .execution_timeout = .fromSeconds(30) }, .{});
+    defer run.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(0 + 1 + 2 + 3 + 4, try run.get(arena.allocator()));
+    try testing.expectEqual(5, RateLimitTest.started.load(.acquire));
+
+    // At one per second, five activities can't all start within two seconds, even counting
+    // the poll already in flight when they are scheduled. Eagerly started ones bypass the
+    // poll limiter, so without this they all start within milliseconds.
+    const spread: Io.Duration = .{ .nanoseconds = RateLimitTest.started_at[4] - RateLimitTest.started_at[0] };
+    try testing.expect(spread.nanoseconds >= Io.Duration.fromSeconds(2).nanoseconds);
+}
+
+test "a max_activities_per_second too small for the core's poll spacing is rejected or still runs the first activity" {
+    // One activity per 1e19 seconds passes the 2^64-second check, but the core adds the
+    // poll spacing to a monotonic instant with signed 64-bit seconds, which overflows from
+    // about 2^63 seconds: the core's activity poller panics, and no activity ever starts.
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, testing.io, &client, "one-activity-per-1e19-seconds", .{ .max_activities_per_second = 1e-19 });
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    var awaited = false;
+    defer if (!awaited) {
+        w.stop();
+        running.await(testing.io) catch {};
+    };
+    w.waitUntilRunning() catch |err| {
+        // Rejecting the rate up front fixes it too.
+        try testing.expectEqual(error.WorkerFailedToStart, err);
+        awaited = true;
+        try testing.expectError(error.InvalidOptions, running.await(testing.io));
+        return;
+    };
+
+    // Accepted, the limit spaces the polls after the first, which goes at once.
+    var run = try client.executeWorkflow(HelloTest.Hello, .{ .task_queue = "one-activity-per-1e19-seconds", .execution_timeout = .fromSeconds(10) }, .{"rate"});
+    defer run.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("Hello rate!", try run.get(arena.allocator()));
+}
+
+test "the smallest max_activities_per_second accepted still runs the first activity" {
+    // Just inside the bound: the core computes two poll spacings, almost 2^62 seconds, past
+    // now without overflowing, and the first poll goes at once.
+    const rate: f64 = 0x1.0000000000001p-61;
+    try testing.expect(1 / rate < Worker.max_poll_spacing_seconds);
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, testing.io, &client, "slowest-accepted-rate", .{ .max_activities_per_second = rate });
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    try w.waitUntilRunning();
+
+    var run = try client.executeWorkflow(HelloTest.Hello, .{ .task_queue = "slowest-accepted-rate", .execution_timeout = .fromSeconds(10) }, .{"rate"});
+    defer run.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("Hello rate!", try run.get(arena.allocator()));
+}
+
 test "versioning options map to the core's strategy, and contradictions are rejected" {
     var client: client_mod.Client = undefined; // the strategy never touches the client
     const Pinned = workflow.DefWithOptions("Pinned", HelloTest.hello, .{ .versioning_behavior = .pinned });
@@ -2711,6 +3277,166 @@ test "a graceful shutdown period lets a running activity finish" {
     try testing.expect(elapsed.nanoseconds < period.nanoseconds);
 }
 
+/// An activity that reports the timeouts, retry policy, priority and deadline in its info.
+const InfoTest = struct {
+    const Env = @import("testing.zig").WorkflowEnvironment;
+
+    fn report(ctx: *activity.Context) ![]const u8 {
+        const i = ctx.info();
+        var out: Io.Writer.Allocating = .init(ctx.allocator());
+        const w = &out.writer;
+        try w.print("s2c={?f} st2c={?f} hb={?f}", .{ i.schedule_to_close_timeout, i.start_to_close_timeout, i.heartbeat_timeout });
+        if (i.retry_policy) |p| {
+            try w.print(" retry={?f},{d},{?f},{d},", .{ p.initial_interval, p.backoff_coefficient, p.maximum_interval, p.maximum_attempts });
+            for (p.non_retryable_error_types, 0..) |t, n| try w.print("{s}{s}", .{ if (n > 0) "+" else "", t });
+        } else try w.writeAll(" retry=null");
+        try w.print(" priority={d},{s},{d}", .{ i.priority.priority_key, i.priority.fairness_key, i.priority.fairness_weight });
+        const deadline = i.deadline() orelse return error.NoDeadline;
+        const expected = i.started_time.?.addDuration(i.start_to_close_timeout.?);
+        try w.print(" deadline_is_start_plus_start_to_close={}", .{deadline.nanoseconds == expected.nanoseconds});
+        return out.written();
+    }
+    const Report = activity.Def("ReportInfo", report);
+
+    const retry: workflow.RetryPolicy = .{
+        .initial_interval = .fromSeconds(1),
+        .backoff_coefficient = 3,
+        .maximum_interval = .fromSeconds(20),
+        .maximum_attempts = 4,
+        .non_retryable_error_types = &.{ "Fatal", "Bad" },
+    };
+
+    fn regular(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(Report, .{
+            .schedule_to_close_timeout = .fromSeconds(300),
+            .start_to_close_timeout = .fromSeconds(30),
+            .heartbeat_timeout = .fromSeconds(10),
+            .retry_policy = retry,
+            .priority = .{ .priority_key = 2, .fairness_key = "tenant-a", .fairness_weight = 1.5 },
+        }, .{}).get();
+    }
+    const Regular = workflow.Def("ReportInfoRegular", regular);
+
+    fn local(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeLocalActivity(Report, .{
+            .schedule_to_close_timeout = .fromSeconds(300),
+            .start_to_close_timeout = .fromSeconds(30),
+            .retry_policy = retry,
+        }, .{}).get();
+    }
+    const Local = workflow.Def("ReportInfoLocal", local);
+};
+
+test "an activity's info reports the timeouts, retry policy and priority it was scheduled with" {
+    const env = try InfoTest.Env.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(InfoTest.Regular);
+    try env.registerWorkflow(InfoTest.Local);
+    try env.registerActivity(InfoTest.Report);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings(
+        "s2c=5m st2c=30s hb=10s retry=1s,3,20s,4,Fatal+Bad priority=2,tenant-a,1.5 deadline_is_start_plus_start_to_close=true",
+        try env.executeWorkflow(InfoTest.Regular, .{}, a, null),
+    );
+    try testing.expectEqualStrings(
+        "s2c=5m st2c=30s hb=null retry=1s,3,20s,4,Fatal+Bad priority=0,,0 deadline_is_start_plus_start_to_close=true",
+        try env.executeWorkflow(InfoTest.Local, .{}, a, null),
+    );
+}
+
+/// Activities that wait for the worker to stop, run as a regular activity, a local activity
+/// and an activity in a session.
+const WorkerStopTest = struct {
+    const Env = @import("testing.zig").WorkflowEnvironment;
+
+    var started: Io.Event = .unset;
+    var returned: Io.Event = .unset;
+    var returned_at: Io.Timestamp = .zero;
+    var stopping_before: bool = true;
+
+    /// Waits for the worker to stop on a coroutine of its own and returns.
+    fn waitStop(ctx: *activity.Context) ![]const u8 {
+        stopping_before = ctx.isWorkerStopping();
+        var waiting = try ctx.io().concurrent(activity.Context.waitForWorkerStop, .{ctx});
+        started.set(ctx.io());
+        try waiting.await(ctx.io());
+        if (!ctx.isWorkerStopping()) return error.NotStopping;
+        returned_at = .now(ctx.io(), .awake);
+        returned.set(ctx.io());
+        return "drained";
+    }
+    const WaitStop = activity.Def("WaitForWorkerStop", waitStop);
+
+    fn regular(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(WaitStop, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const Regular = workflow.Def("WaitStopRegular", regular);
+
+    fn local(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeLocalActivity(WaitStop, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const Local = workflow.Def("WaitStopLocal", local);
+
+    fn inSession(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.createSession(.{ .creation_timeout = .fromSeconds(30), .execution_timeout = .fromSeconds(120) });
+        return ctx.executeActivity(WaitStop, .{ .start_to_close_timeout = .fromSeconds(60), .session = s }, .{}).get();
+    }
+    const InSession = workflow.Def("WaitStopInSession", inSession);
+
+    /// Starts `Workflow` on a worker with `period` to shut down gracefully, stops the worker
+    /// once the activity waits, and expects the activity to have returned before the period
+    /// passed, without a cancel. Returns the environment and the run for more checks.
+    fn stopWhileWaiting(comptime Workflow: type, period: Io.Duration, sessions: bool) !struct { *Env, client_mod.WorkflowRun([]const u8) } {
+        started = .unset;
+        returned = .unset;
+        stopping_before = true;
+        const env = try Env.start(testing.allocator, testing.io);
+        errdefer env.deinit();
+        env.worker.options.graceful_shutdown_period = period;
+        if (sessions) env.worker.options.sessions = .{};
+        try env.registerWorkflow(Workflow);
+        try env.registerActivity(WaitStop);
+
+        var run = try env.startWorkflow(Workflow, .{ .task_queue = "" }, .{});
+        errdefer run.deinit();
+        try started.wait(testing.io);
+        const stopped_at = Io.Timestamp.now(testing.io, .awake);
+        env.worker.stop();
+        try env.running.?.await(testing.io);
+        env.running = null;
+
+        try testing.expect(!stopping_before);
+        try testing.expect(returned.isSet());
+        try testing.expect(stopped_at.durationTo(returned_at).nanoseconds < period.nanoseconds);
+        return .{ env, run };
+    }
+};
+
+test "an activity waiting in waitForWorkerStop returns when the worker stops and completes" {
+    const period: Io.Duration = .fromSeconds(30);
+    const env, var run = try WorkerStopTest.stopWhileWaiting(WorkerStopTest.Regular, period, false);
+    defer env.deinit();
+    defer run.deinit();
+    try testing.expectEqual(1, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_COMPLETED));
+    try testing.expectEqual(0, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_CANCELED));
+}
+
+test "a local activity waiting in waitForWorkerStop returns when the worker stops" {
+    const env, var run = try WorkerStopTest.stopWhileWaiting(WorkerStopTest.Local, .fromSeconds(30), false);
+    defer env.deinit();
+    defer run.deinit();
+}
+
+test "an activity in a session waiting in waitForWorkerStop returns when the worker stops" {
+    // The session itself is held until the graceful period ends, so keep it short.
+    const env, var run = try WorkerStopTest.stopWhileWaiting(WorkerStopTest.InSession, .fromSeconds(5), true);
+    defer env.deinit();
+    defer run.deinit();
+}
+
 test "waitUntilRunning returns once run polls, or fails if run returned first" {
     const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
     defer rt.deinit();
@@ -3038,9 +3764,40 @@ const ContextRecordingCodec = struct {
     }
 };
 
-test "an activity's info carries its Start task's schedule and start times" {
+test "an activity's info carries its Start task's times, timeouts, retry policy and priority" {
     var start: task_pb.Start = .{ .activity_id = "1", .activity_type = "Charge", .attempt = 2 };
-    try testing.expect(activityInfo(&start, "tq", "token").started_time == null);
+    {
+        const bare = activityInfo(&start, "tq", "token");
+        try testing.expect(bare.started_time == null);
+        try testing.expectEqual(null, bare.schedule_to_close_timeout);
+        try testing.expectEqual(null, bare.start_to_close_timeout);
+        try testing.expectEqual(null, bare.heartbeat_timeout);
+        try testing.expect(bare.retry_policy == null);
+        try testing.expectEqual(@as(i32, 0), bare.priority.priority_key);
+        try testing.expectEqualStrings("", bare.priority.fairness_key);
+        try testing.expectEqual(@as(f32, 0), bare.priority.fairness_weight);
+        try testing.expectEqual(null, bare.deadline());
+    }
+    // Zero durations mean unset.
+    start.schedule_to_close_timeout = .{};
+    start.heartbeat_timeout = .{ .seconds = 0 };
+    {
+        const zero = activityInfo(&start, "tq", "token");
+        try testing.expectEqual(null, zero.schedule_to_close_timeout);
+        try testing.expectEqual(null, zero.heartbeat_timeout);
+    }
+
+    var non_retryable = [_][]const u8{"Fatal"};
+    start.schedule_to_close_timeout = .{ .seconds = 300 };
+    start.start_to_close_timeout = .{ .seconds = 30, .nanos = 5 };
+    start.heartbeat_timeout = .{ .seconds = 10 };
+    start.retry_policy = .{
+        .initial_interval = .{ .seconds = 1 },
+        .backoff_coefficient = 2,
+        .maximum_attempts = 5,
+        .non_retryable_error_types = .fromOwnedSlice(&non_retryable),
+    };
+    start.priority = .{ .priority_key = 2, .fairness_key = "tenant-a", .fairness_weight = 1.5 };
     start.scheduled_time = .{ .seconds = 100 };
     start.current_attempt_scheduled_time = .{ .seconds = 105, .nanos = 7 };
     start.started_time = .{ .seconds = 106 };
@@ -3050,6 +3807,21 @@ test "an activity's info carries its Start task's schedule and start times" {
     try testing.expectEqual(@as(i96, 106 * std.time.ns_per_s), info.started_time.?.nanoseconds);
     try testing.expectEqualStrings("Charge", info.activity_type);
     try testing.expectEqual(@as(u32, 2), info.attempt);
+    try testing.expectEqual(@as(i96, 300 * std.time.ns_per_s), info.schedule_to_close_timeout.?.nanoseconds);
+    try testing.expectEqual(@as(i96, 30 * std.time.ns_per_s + 5), info.start_to_close_timeout.?.nanoseconds);
+    try testing.expectEqual(@as(i96, 10 * std.time.ns_per_s), info.heartbeat_timeout.?.nanoseconds);
+    const rp = info.retry_policy.?;
+    try testing.expectEqual(@as(i96, std.time.ns_per_s), rp.initial_interval.?.nanoseconds);
+    try testing.expectEqual(@as(f64, 2), rp.backoff_coefficient);
+    try testing.expectEqual(null, rp.maximum_interval);
+    try testing.expectEqual(@as(i32, 5), rp.maximum_attempts);
+    try testing.expectEqual(1, rp.non_retryable_error_types.len);
+    try testing.expectEqualStrings("Fatal", rp.non_retryable_error_types[0]);
+    try testing.expectEqual(@as(i32, 2), info.priority.priority_key);
+    try testing.expectEqualStrings("tenant-a", info.priority.fairness_key);
+    try testing.expectEqual(@as(f32, 1.5), info.priority.fairness_weight);
+    // Started at 106 s with 30 s to run, before the schedule-to-close end at 400 s.
+    try testing.expectEqual(@as(i96, 136 * std.time.ns_per_s + 5), info.deadline().?.nanoseconds);
 }
 
 const CodecContextTest = struct {

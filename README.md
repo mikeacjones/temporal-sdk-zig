@@ -925,11 +925,26 @@ Notes:
 
 #### Context
 
-`activity.Context` is the activity's view of its attempt. The activity uses it from its own task; only `cancelReason` is also safe from other threads.
+`activity.Context` is the activity's view of its attempt. The activity uses it from its own task; `cancelReason`, `isWorkerStopping` and `waitForWorkerStop` are also safe from other threads.
+
+<!-- example: activity-info -->
+```zig
+/// How much of the attempt's time is left, from the timeouts the workflow set.
+fn timeLeft(ctx: *activity.Context) !std.Io.Duration {
+    const info = ctx.info();
+    ctx.logger().info("attempt", .{ .attempt = info.attempt, .max = if (info.retry_policy) |p| p.maximum_attempts else 0 });
+    const deadline = info.deadline() orelse return error.NoTimeout; // none in this attempt's info
+    return std.Io.Timestamp.now(ctx.io(), .real).durationTo(deadline);
+}
+pub const TimeLeft = activity.Def("time_left", timeLeft);
+```
 
 Notes:
 - `allocator()`: memory that lives until the result has been reported. `io()`: the worker's `std.Io`.
 - `info()`: IDs, types, task queue, `attempt`, `is_local`, `task_token`, `session_id`, and scheduled and started times; freed with the result.
+- `info()` also has the timeouts the activity was scheduled with (`schedule_to_close_timeout`, `start_to_close_timeout`, `heartbeat_timeout`, each null when unset), its `retry_policy` (null when the task carries none) and `priority` (all zero when it carries none), as `workflow.RetryPolicy` and `workflow.Priority`. A local activity has no heartbeat timeout or priority.
+- `info().deadline()`: when this attempt times out, the earlier of `scheduled_time` plus `schedule_to_close_timeout` and `started_time` plus `start_to_close_timeout`; null when neither is known.
+- `isWorkerStopping()` and `waitForWorkerStop()`: see [Worker shutdown](#worker-shutdown).
 - `logger()`: a logger carrying the activity's and its workflow's IDs and types, writing to `worker.Options.logger`.
 - `cancelReason()`: `not_found`, `canceled`, `timed_out`, `worker_shutdown`, `paused`, or `reset`, or null before a cancel.
 - `client()`: the worker's client (don't `close` it); `error.NoClient` in an `ActivityEnvironment` without one.
@@ -954,10 +969,55 @@ pub const SendGreetings = activity.Def("send_greetings", sendGreetings);
 ```
 
 Notes:
-- A cancel from the workflow arrives only in the server's answer to a heartbeat, so an activity that should notice it must heartbeat. Heartbeats are throttled to 80% of the heartbeat timeout (at most 60 seconds; 30 seconds without a heartbeat timeout), so calling `heartbeat` often is cheap.
+- A cancel from the workflow arrives only in the server's answer to a heartbeat, so an activity that should notice it must heartbeat. Heartbeats are throttled to 80% of the heartbeat timeout, at most the worker's `max_heartbeat_throttle_interval` (60 seconds), and to its `default_heartbeat_throttle_interval` (30 seconds) without a heartbeat timeout, so calling `heartbeat` often is cheap.
 - `heartbeat({})` sends no details; pass a struct for several values. `heartbeatDetails(T)` decodes the first detail, and returns `error.NoHeartbeatDetails` when the previous attempt left none (a first attempt, or one that never heartbeated or heartbeated with `{}`); `encodedHeartbeatDetails()` returns every payload undecoded.
 - Returning `error.Canceled` after a cancel reports the activity canceled; any other outcome is reported as usual. Without a cancel, `error.Canceled` is reported as a failure.
 - A local activity (`info().is_local`) gets cancels straight from the worker, and its heartbeats are dropped.
+
+#### Worker shutdown
+
+When its worker begins stopping (`Worker.stop`, or `run` ending on a poll failure), an activity sees `ctx.isWorkerStopping()` turn true and `ctx.waitForWorkerStop()` return. The worker's `graceful_shutdown_period` is the time it then has to finish or save its progress; an activity still running when it has passed is canceled with reason `worker_shutdown`.
+
+<!-- example: activity-worker-stop -->
+```zig
+/// Waits for new mail, standing in for real I/O with a sleep, or for the worker to stop.
+fn waitForMail(ctx: *activity.Context) ![]const u8 {
+    const Woken = union(enum) { stopping: error{Canceled}!void, mail: error{Canceled}!void };
+    var buffer: [2]Woken = undefined;
+    var select: std.Io.Select(Woken) = .init(ctx.io(), &buffer);
+    defer select.cancelDiscard();
+    // `concurrent`, not `async`: an `async` the Io can't give a thread runs at once, here.
+    try select.concurrent(.stopping, activity.Context.waitForWorkerStop, .{ctx});
+    try select.concurrent(.mail, std.Io.sleep, .{ ctx.io(), .fromSeconds(30), .awake });
+    switch (try select.await()) {
+        // Within the worker's graceful_shutdown_period: return, and let a retry carry on.
+        .stopping => |stopped| {
+            try stopped; // error.Canceled when the activity was canceled first
+            return "worker stopping";
+        },
+        .mail => |slept| {
+            try slept;
+            return "mail";
+        },
+    }
+}
+pub const WaitForMail = activity.Def("wait_for_mail", waitForMail);
+
+/// A loop can check the same signal between steps instead.
+fn copyFiles(ctx: *activity.Context, count: u32) !u32 {
+    var copied: u32 = if (ctx.hasHeartbeatDetails()) try ctx.heartbeatDetails(u32) else 0;
+    while (copied < count and !ctx.isWorkerStopping()) : (copied += 1) {
+        ctx.heartbeat(copied + 1);
+    }
+    return copied;
+}
+pub const CopyFiles = activity.Def("copy_files", copyFiles);
+```
+
+Notes:
+- Run `waitForWorkerStop` as a coroutine beside the work, with `io.concurrent` or as a `std.Io.Select` case started with `select.concurrent`. Not with `async`: when the Io has no thread to spare (always on a one-CPU host, and on any host once enough activities run), `async` runs the wait at once on the activity's own task, which then blocks until the worker stops. It returns `error.Canceled` when the activity is canceled first, or when its own task is canceled.
+- With the default `graceful_shutdown_period` of zero, the cancel follows the stop at once, so set a period to give activities time to react.
+- Regular activities, local activities and activities in sessions all see the signal. There is no "am I in an activity" check: code that holds an `*activity.Context` is in one.
 
 #### Asynchronous completion
 
@@ -1068,17 +1128,44 @@ Notes:
 
 `worker.Options` is the struct literal passed to `Worker.init`; every field has a default, so `.{}` works.
 
+<!-- example: worker-options -->
+```zig
+var w = try Worker.init(gpa, io, client, "greetings", .{
+    .identity = "greetings-worker-1", // default: the client's identity
+    .max_concurrent_activity_executions = 20,
+    .max_concurrent_local_activity_executions = 50,
+    .max_concurrent_activity_task_pollers = 4,
+    .max_cached_workflows = 500,
+    .sticky_schedule_to_start_timeout = .fromSeconds(5),
+    .max_activities_per_second = 50, // this worker
+    .max_task_queue_activities_per_second = 200, // all workers on "greetings"
+    .default_heartbeat_throttle_interval = .fromSeconds(10),
+    .max_heartbeat_throttle_interval = .fromSeconds(30),
+    .max_eager_activity_reservations_per_workflow_task = 0, // no eager activities
+    .graceful_shutdown_period = .fromSeconds(10),
+    .workflow_memory_limit = 16 * 1024 * 1024,
+});
+```
+
 Notes:
 - `max_concurrent_workflow_task_executions` (100): workflow activations processed at once. Activations of different runs run in parallel, each on its own thread; one run's activations run one at a time, possibly on different threads. Payload codecs, interceptors, and log sinks are therefore called concurrently.
-- `max_concurrent_activity_executions` (100): activities run at once, each on its own task.
+- `max_concurrent_activity_executions` (100): activities run at once, each on its own task. `max_concurrent_local_activity_executions` (100): local activities run at once, a separate pool; a local activity waits for a slot up to its `schedule_to_start_timeout`.
 - `max_concurrent_nexus_task_executions` (100): Nexus requests (starts and cancels of operations) handled at once, each on its own task. Used only with a registered Nexus service.
 - `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers`, `max_concurrent_nexus_task_pollers` (2 each): polls in flight at once. Each must be at least 1, and the workflow pollers at least 2 while `max_cached_workflows` isn't 0; sdk-core rejects other values and `run` returns `error.WorkerInitFailed`, logged. The Nexus pollers are checked only with a registered Nexus service.
 - `max_cached_workflows` (1000): runs kept in memory between tasks. Over the limit the least recently used run is evicted and replayed from its history at its next task; 0 replays every task from the start. `workflow_stack_size` (256 KiB): each coroutine's stack.
 - `identity`: the worker's name to the server; empty uses the client's.
+- `sticky_schedule_to_start_timeout` (10 s): how long a workflow task waits on this worker's sticky queue, where the next task of a cached run goes, before the server hands it to any worker on the task queue, which replays the run.
+- `max_activities_per_second` (null, no limit): the most activities per second this worker starts; it stops polling while one more would go over, and eager activities, which would bypass it, are turned off. `max_task_queue_activities_per_second` (null): the most the server hands out from the task queue across all its workers, sent with each poll, so workers with different values override each other; a limit also turns off eager activities. Both must be positive and finite, and apply to the task queue's own activities only, not to session activities.
+- `default_heartbeat_throttle_interval` (30 s) and `max_heartbeat_throttle_interval` (60 s): an activity's heartbeats reach the server at 80% of its heartbeat timeout, at most every `max_heartbeat_throttle_interval`, or every `default_heartbeat_throttle_interval` without a heartbeat timeout; heartbeats in between keep only the latest details. Session activities are throttled the same way. Neither may be negative, and the default may not be above the maximum.
+- `max_eager_activity_reservations_per_workflow_task` (3): how many activities on the worker's own task queue one workflow task may ask the server to start on this worker eagerly, with free activity slots, in the answer to the task's completion; 0 turns eager activities off for the worker, as either per-second limit does. `ActivityOptions.disable_eager_execution` turns it off for one activity.
+- `poll_activity_tasks` (true): false stops the worker polling its task queue for activity tasks, so its registered activities run only as local activities of its own workflows (`workflow.Context.executeLocalActivity`); activities scheduled through the task queue wait for another worker or time out. It needs a registered workflow when activities are registered, and can't be combined with `sessions`.
+- `run` returns `error.InvalidOptions`, and logs the option and why, for a per-second limit that is zero, negative, infinite or NaN (or a `max_activities_per_second` below one per 2^61 seconds, about 4.4e-19 per second), a negative duration among the ones above, a default heartbeat throttle interval above the maximum, or `poll_activity_tasks = false` with `sessions` or with activities but no workflow.
 - `graceful_shutdown_period` (zero) and `workflow_memory_limit` (null): see below.
 - `logger` (null uses the client's sink) and `log_during_replay` (false): where workflow and activity logs go, and whether replay logs.
 - `interceptors`: run after the client's `worker_interceptors`; borrowed, called from several threads.
 - `deployment`, `build_id`, `use_build_id_versioning`, and `sessions`: see below.
+- There is no option to stop polling workflow tasks: a worker polls them only when a workflow is registered, activity tasks when an activity or a workflow is, and Nexus tasks when a Nexus service is.
+- There is no option for state shared by activities: register them as methods bound to a receiver with `registerActivityWith`, `registerActivitiesWith`, or `registerActivities`.
 
 #### Shutdown
 
@@ -1339,7 +1426,7 @@ Notes:
 test "testing: an activity on its own" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: ActivityEnvironment = .init(testing.io);
+    var env: ActivityEnvironment = .init(testing.io);
 
     const result = try env.executeActivity(Greet, .{"Ziggy"}, arena.allocator());
     try testing.expectEqualStrings("Hello, Ziggy!", result);
@@ -1351,8 +1438,54 @@ test "testing: an activity on its own" {
 Notes:
 
 - The result comes from the arena passed in; the failure a `ctx.fail` call describes isn't exposed.
-- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, and `metrics` to control what the activity sees; `info.activity_type` is always the activity's name.
-- The environment can't cancel a running activity.
+- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, and `metrics` to control what the activity sees; `info.activity_type` is always the activity's name. Its timeouts and `retry_policy` start out null and its `priority` zero.
+- `executeActivity` takes the environment by pointer (`var env`) and runs the activity on a task of its own while it waits; canceling the calling task cancels the activity, without a `cancelReason`.
+
+`cancel(reason)` cancels the running activity as a worker does, and `stopWorker()` fires the worker-stop signal:
+
+<!-- example: testing-activity-cancel -->
+```zig
+var waiting: std.Io.Event = .unset;
+
+fn waitForever(ctx: *activity.Context) ![]const u8 {
+    waiting.set(ctx.io());
+    ctx.io().sleep(.fromSeconds(3600), .awake) catch |err| {
+        const reason = ctx.cancelReason() orelse return err;
+        return @tagName(reason); // a cancel the activity reports as a result, for the test
+    };
+    return "slept";
+}
+const WaitForever = activity.Def("wait_forever", waitForever);
+
+fn runWaitForever(env: *ActivityEnvironment, arena: std.mem.Allocator) ![]const u8 {
+    return env.executeActivity(WaitForever, .{}, arena);
+}
+
+test "testing: an activity sees a cancel and the worker stopping" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    env.info.heartbeat_timeout = .fromSeconds(5); // the new Info fields start out null or zero
+
+    var running = try testing.io.concurrent(runWaitForever, .{ &env, arena.allocator() });
+    try waiting.wait(testing.io);
+    env.cancel(.timed_out); // as the worker cancels it: the next wait returns error.Canceled
+    try testing.expectEqualStrings("timed_out", try running.await(testing.io));
+
+    env.stopWorker(); // this and later activities see ctx.isWorkerStopping()
+    try testing.expect(try env.executeActivity(activity.Def("stopping", isStopping), .{}, arena.allocator()));
+}
+
+fn isStopping(ctx: *activity.Context) !bool {
+    try ctx.waitForWorkerStop(); // returns at once: the worker is already stopping
+    return ctx.isWorkerStopping();
+}
+```
+
+Notes:
+
+- `cancel` reaches the activities running at the time, from any thread; with none running it does nothing. An activity already canceled keeps its first reason.
+- After `stopWorker`, every activity the environment runs, now or later, sees `isWorkerStopping()` true.
 
 #### Replaying histories
 

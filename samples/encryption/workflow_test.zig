@@ -38,7 +38,7 @@ test "activity greets the name it is given, or someone" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
 
     var info: encryption.Info = .{};
     try info.map.put(a, "name", "World");

@@ -66,12 +66,50 @@ const Reminder = workflow.Def("reminder", reminder);
 test "testing: an activity on its own" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: ActivityEnvironment = .init(testing.io);
+    var env: ActivityEnvironment = .init(testing.io);
 
     const result = try env.executeActivity(Greet, .{"Ziggy"}, arena.allocator());
     try testing.expectEqualStrings("Hello, Ziggy!", result);
     // A failure the activity describes with `ctx.fail` returns its error.
     try testing.expectError(error.ApplicationFailure, env.executeActivity(Greet, .{""}, arena.allocator()));
+}
+// end-example
+
+// example: testing-activity-cancel
+var waiting: std.Io.Event = .unset;
+
+fn waitForever(ctx: *activity.Context) ![]const u8 {
+    waiting.set(ctx.io());
+    ctx.io().sleep(.fromSeconds(3600), .awake) catch |err| {
+        const reason = ctx.cancelReason() orelse return err;
+        return @tagName(reason); // a cancel the activity reports as a result, for the test
+    };
+    return "slept";
+}
+const WaitForever = activity.Def("wait_forever", waitForever);
+
+fn runWaitForever(env: *ActivityEnvironment, arena: std.mem.Allocator) ![]const u8 {
+    return env.executeActivity(WaitForever, .{}, arena);
+}
+
+test "testing: an activity sees a cancel and the worker stopping" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    env.info.heartbeat_timeout = .fromSeconds(5); // the new Info fields start out null or zero
+
+    var running = try testing.io.concurrent(runWaitForever, .{ &env, arena.allocator() });
+    try waiting.wait(testing.io);
+    env.cancel(.timed_out); // as the worker cancels it: the next wait returns error.Canceled
+    try testing.expectEqualStrings("timed_out", try running.await(testing.io));
+
+    env.stopWorker(); // this and later activities see ctx.isWorkerStopping()
+    try testing.expect(try env.executeActivity(activity.Def("stopping", isStopping), .{}, arena.allocator()));
+}
+
+fn isStopping(ctx: *activity.Context) !bool {
+    try ctx.waitForWorkerStop(); // returns at once: the worker is already stopping
+    return ctx.isWorkerStopping();
 }
 // end-example
 

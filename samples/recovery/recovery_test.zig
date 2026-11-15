@@ -191,6 +191,6 @@ test "recovering a batch fails without retrying when its executions aren't cache
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectError(error.ApplicationFailure, env.executeActivityWith(recovery_workflow.RecoverExecutions, &activities, .{ "missing", 0, 2 }, arena.allocator()));
 }

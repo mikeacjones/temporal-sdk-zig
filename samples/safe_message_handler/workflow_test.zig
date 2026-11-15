@@ -126,7 +126,7 @@ test "health checks mark bad nodes, and the state survives continue-as-new" {
 test "the health check activity reports nodes whose number is a multiple of 5" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     const bad = try env.executeActivity(activities.FindBadNodesActivity, .{.{ .nodes_to_check = &.{ "0", "3", "10", "12" } }}, arena.allocator());
     try testing.expectEqual(2, bad.len);
     try testing.expectEqualStrings("0", bad[0]);

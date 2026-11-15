@@ -32,7 +32,7 @@ test "activities: a function activity and a method activity run in the activity 
     _ = &registerGreetings;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectEqualStrings("Hello, Ana!", try env.executeActivity(Greet, .{"Ana"}, arena.allocator()));
 
     var shared: Greeter = .{ .punctuation = "!!" };
@@ -78,6 +78,108 @@ test "activities: a heartbeating activity resumes from the previous attempt's de
     try testing.expectEqual(@as(u32, 3), recorder.last);
 }
 
+// example: activity-info
+/// How much of the attempt's time is left, from the timeouts the workflow set.
+fn timeLeft(ctx: *activity.Context) !std.Io.Duration {
+    const info = ctx.info();
+    ctx.logger().info("attempt", .{ .attempt = info.attempt, .max = if (info.retry_policy) |p| p.maximum_attempts else 0 });
+    const deadline = info.deadline() orelse return error.NoTimeout; // none in this attempt's info
+    return std.Io.Timestamp.now(ctx.io(), .real).durationTo(deadline);
+}
+pub const TimeLeft = activity.Def("time_left", timeLeft);
+// end-example
+
+test "activities: the deadline comes from the timeouts in the info" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    try testing.expectError(error.NoTimeout, env.executeActivity(TimeLeft, .{}, arena.allocator()));
+    env.info.start_to_close_timeout = .fromSeconds(60);
+    const left = try env.executeActivity(TimeLeft, .{}, arena.allocator());
+    try testing.expect(left.nanoseconds > 0 and left.nanoseconds <= 60 * std.time.ns_per_s);
+}
+
+// example: activity-worker-stop
+/// Waits for new mail, standing in for real I/O with a sleep, or for the worker to stop.
+fn waitForMail(ctx: *activity.Context) ![]const u8 {
+    const Woken = union(enum) { stopping: error{Canceled}!void, mail: error{Canceled}!void };
+    var buffer: [2]Woken = undefined;
+    var select: std.Io.Select(Woken) = .init(ctx.io(), &buffer);
+    defer select.cancelDiscard();
+    // `concurrent`, not `async`: an `async` the Io can't give a thread runs at once, here.
+    try select.concurrent(.stopping, activity.Context.waitForWorkerStop, .{ctx});
+    try select.concurrent(.mail, std.Io.sleep, .{ ctx.io(), .fromSeconds(30), .awake });
+    switch (try select.await()) {
+        // Within the worker's graceful_shutdown_period: return, and let a retry carry on.
+        .stopping => |stopped| {
+            try stopped; // error.Canceled when the activity was canceled first
+            return "worker stopping";
+        },
+        .mail => |slept| {
+            try slept;
+            return "mail";
+        },
+    }
+}
+pub const WaitForMail = activity.Def("wait_for_mail", waitForMail);
+
+/// A loop can check the same signal between steps instead.
+fn copyFiles(ctx: *activity.Context, count: u32) !u32 {
+    var copied: u32 = if (ctx.hasHeartbeatDetails()) try ctx.heartbeatDetails(u32) else 0;
+    while (copied < count and !ctx.isWorkerStopping()) : (copied += 1) {
+        ctx.heartbeat(copied + 1);
+    }
+    return copied;
+}
+pub const CopyFiles = activity.Def("copy_files", copyFiles);
+// end-example
+
+fn runWaitForMail(env: *temporal.testing.ActivityEnvironment, arena: std.mem.Allocator) ![]const u8 {
+    return env.executeActivity(WaitForMail, .{}, arena);
+}
+
+test "activities: an activity returns when its worker begins stopping" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    try testing.expectEqual(@as(u32, 3), try env.executeActivity(CopyFiles, .{3}, arena.allocator()));
+
+    var waiting = try testing.io.concurrent(runWaitForMail, .{ &env, arena.allocator() });
+    env.stopWorker(); // before or after the activity starts waiting: both see it
+    try testing.expectEqualStrings("worker stopping", try waiting.await(testing.io));
+    try testing.expectEqual(@as(u32, 0), try env.executeActivity(CopyFiles, .{3}, arena.allocator()));
+}
+
+fn runWaitForMailThenSignal(env: *temporal.testing.ActivityEnvironment, arena: std.mem.Allocator, done: *std.Io.Event) ![]const u8 {
+    defer done.set(env.io);
+    return env.executeActivity(WaitForMail, .{}, arena);
+}
+
+test "activities: waitForMail returns promptly after its worker stops on an Io sized for one CPU" {
+    // `std.Io.Threaded` lets `async` run as many tasks on threads of their own as there are
+    // CPUs less one; past that, and so always on a one-CPU host, `async` runs the function at
+    // once on the caller. A worker with a few activities and its poll loops reaches the limit
+    // on any host.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: temporal.testing.ActivityEnvironment = .init(io);
+    var done: std.Io.Event = .unset;
+
+    var waiting = try io.concurrent(runWaitForMailThenSignal, .{ &env, arena.allocator(), &done });
+    env.stopWorker();
+    // The activity returns at once once its worker is stopping; it must not first sit out the
+    // 30 s it gives the mail. The bound only keeps a failure from taking that long.
+    done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch {
+        env.cancel(.canceled);
+        _ = waiting.await(io) catch {};
+        return error.ActivityKeptRunningAfterWorkerStop;
+    };
+    try testing.expectEqualStrings("worker stopping", try waiting.await(io));
+}
+
 // example: activity-async
 pub const Approvals = struct {
     gpa: std.mem.Allocator, // thread-safe: activities run concurrently
@@ -111,7 +213,7 @@ test "activities: an asynchronous activity hands off its task token" {
         for (approvals.tokens.items) |t| testing.allocator.free(t);
         approvals.tokens.deinit(testing.allocator);
     }
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectError(error.CompleteAsync, env.executeActivityWith(RequestGreeting, &approvals, .{"Ana"}, arena.allocator()));
     try testing.expectEqual(@as(usize, 1), approvals.tokens.items.len);
     try testing.expectEqualStrings("test-task-token", approvals.tokens.items[0]);
@@ -142,7 +244,7 @@ pub const GreetMember = activity.Def("greet_member", greetMember);
 test "activities: an activity fails with an application failure" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectError(error.ApplicationFailure, env.executeActivity(GreetMember, .{""}, arena.allocator()));
     try testing.expectEqualStrings("Hello, Ana!", try env.executeActivity(GreetMember, .{"Ana"}, arena.allocator()));
 }

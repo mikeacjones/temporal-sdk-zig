@@ -128,6 +128,6 @@ test "a failed withdrawal has nothing to compensate" {
 test "the real StepWithError always fails" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectError(error.ApplicationFailure, env.executeActivity(saga.StepWithError, .{test_details}, arena.allocator()));
 }
