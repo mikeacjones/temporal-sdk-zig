@@ -18,8 +18,10 @@
 //! `error.Canceled` reports the activity canceled; returning anything else reports that
 //! outcome as usual. A cancel from the workflow reaches the worker in the server's answer to
 //! a heartbeat, so an activity that should notice it must call `ctx.heartbeat`. Heartbeats
-//! are throttled to 80% of the heartbeat timeout (at most 60 seconds; 30 without one), which
-//! bounds how late the cancel arrives. A local activity (`info().is_local`) gets its cancels
+//! are throttled to 80% of the heartbeat timeout, at most the worker's
+//! `max_heartbeat_throttle_interval` (60 seconds by default), and to its
+//! `default_heartbeat_throttle_interval` (30 seconds by default) without one; that bounds how
+//! late the cancel arrives. A local activity (`info().is_local`) gets its cancels
 //! straight from the worker, without heartbeating, and its heartbeats are dropped.
 //!
 //! An activity that finishes elsewhere (a person approves it, another system calls back)

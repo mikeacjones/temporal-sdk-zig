@@ -446,6 +446,36 @@ test "a fixed slot count above the core's limit is lowered to it" {
     try std.testing.expectEqual(5, slotSupplier(.{ .fixed = 5 }).unnamed_0.unnamed_0.fixed_size.num_slots);
 }
 
+test "non-default options land in the core's worker options" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const core = try coreOptions(arena_state.allocator(), .{
+        .namespace = "ns",
+        .task_queue = "q",
+        .tuner = .{ .local_activity = .{ .fixed = 7 } },
+        .task_types = .{ .remote_activities = false },
+        .sticky_queue_schedule_to_start_timeout_ms = 2500,
+        .max_heartbeat_throttle_interval_ms = 9000,
+        .default_heartbeat_throttle_interval_ms = 4000,
+        .max_activities_per_second = 1.5,
+        .max_task_queue_activities_per_second = 2.5,
+        .graceful_shutdown_period_ms = 6000,
+        .max_eager_activity_reservations_per_workflow_task = 0,
+    });
+    try testing.expectEqual(2500, core.sticky_queue_schedule_to_start_timeout_millis);
+    try testing.expectEqual(9000, core.max_heartbeat_throttle_interval_millis);
+    try testing.expectEqual(4000, core.default_heartbeat_throttle_interval_millis);
+    try testing.expectEqual(1.5, core.max_activities_per_second);
+    try testing.expectEqual(2.5, core.max_task_queue_activities_per_second);
+    try testing.expectEqual(6000, core.graceful_shutdown_period_millis);
+    try testing.expectEqual(0, core.max_eager_activity_reservations_per_workflow_task);
+    try testing.expect(core.tuner.local_activity_slot_supplier.tag == c.TemporalCoreSlotSupplier_FixedSize);
+    try testing.expectEqual(7, core.tuner.local_activity_slot_supplier.unnamed_0.unnamed_0.fixed_size.num_slots);
+    try testing.expectEqual(100, core.tuner.activity_slot_supplier.unnamed_0.unnamed_0.fixed_size.num_slots);
+    try testing.expect(!core.task_types.enable_remote_activities);
+    try testing.expect(core.task_types.enable_local_activities and core.task_types.enable_workflows and core.task_types.enable_nexus);
+}
+
 test "a workflow started by RPC is polled, completed, and shut down through the core" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();

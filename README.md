@@ -954,7 +954,7 @@ pub const SendGreetings = activity.Def("send_greetings", sendGreetings);
 ```
 
 Notes:
-- A cancel from the workflow arrives only in the server's answer to a heartbeat, so an activity that should notice it must heartbeat. Heartbeats are throttled to 80% of the heartbeat timeout (at most 60 seconds; 30 seconds without a heartbeat timeout), so calling `heartbeat` often is cheap.
+- A cancel from the workflow arrives only in the server's answer to a heartbeat, so an activity that should notice it must heartbeat. Heartbeats are throttled to 80% of the heartbeat timeout, at most the worker's `max_heartbeat_throttle_interval` (60 seconds), and to its `default_heartbeat_throttle_interval` (30 seconds) without a heartbeat timeout, so calling `heartbeat` often is cheap.
 - `heartbeat({})` sends no details; pass a struct for several values. `heartbeatDetails(T)` decodes the first detail, and returns `error.NoHeartbeatDetails` when the previous attempt left none (a first attempt, or one that never heartbeated or heartbeated with `{}`); `encodedHeartbeatDetails()` returns every payload undecoded.
 - Returning `error.Canceled` after a cancel reports the activity canceled; any other outcome is reported as usual. Without a cancel, `error.Canceled` is reported as a failure.
 - A local activity (`info().is_local`) gets cancels straight from the worker, and its heartbeats are dropped.
@@ -1068,17 +1068,44 @@ Notes:
 
 `worker.Options` is the struct literal passed to `Worker.init`; every field has a default, so `.{}` works.
 
+<!-- example: worker-options -->
+```zig
+var w = try Worker.init(gpa, io, client, "greetings", .{
+    .identity = "greetings-worker-1", // default: the client's identity
+    .max_concurrent_activity_executions = 20,
+    .max_concurrent_local_activity_executions = 50,
+    .max_concurrent_activity_task_pollers = 4,
+    .max_cached_workflows = 500,
+    .sticky_schedule_to_start_timeout = .fromSeconds(5),
+    .max_activities_per_second = 50, // this worker
+    .max_task_queue_activities_per_second = 200, // all workers on "greetings"
+    .default_heartbeat_throttle_interval = .fromSeconds(10),
+    .max_heartbeat_throttle_interval = .fromSeconds(30),
+    .max_eager_activity_reservations_per_workflow_task = 0, // no eager activities
+    .graceful_shutdown_period = .fromSeconds(10),
+    .workflow_memory_limit = 16 * 1024 * 1024,
+});
+```
+
 Notes:
 - `max_concurrent_workflow_task_executions` (100): workflow activations processed at once. Activations of different runs run in parallel, each on its own thread; one run's activations run one at a time, possibly on different threads. Payload codecs, interceptors, and log sinks are therefore called concurrently.
-- `max_concurrent_activity_executions` (100): activities run at once, each on its own task.
+- `max_concurrent_activity_executions` (100): activities run at once, each on its own task. `max_concurrent_local_activity_executions` (100): local activities run at once, a separate pool; a local activity waits for a slot up to its `schedule_to_start_timeout`.
 - `max_concurrent_nexus_task_executions` (100): Nexus requests (starts and cancels of operations) handled at once, each on its own task. Used only with a registered Nexus service.
 - `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers`, `max_concurrent_nexus_task_pollers` (2 each): polls in flight at once. Each must be at least 1, and the workflow pollers at least 2 while `max_cached_workflows` isn't 0; sdk-core rejects other values and `run` returns `error.WorkerInitFailed`, logged. The Nexus pollers are checked only with a registered Nexus service.
 - `max_cached_workflows` (1000): runs kept in memory between tasks. Over the limit the least recently used run is evicted and replayed from its history at its next task; 0 replays every task from the start. `workflow_stack_size` (256 KiB): each coroutine's stack.
 - `identity`: the worker's name to the server; empty uses the client's.
+- `sticky_schedule_to_start_timeout` (10 s): how long a workflow task waits on this worker's sticky queue, where the next task of a cached run goes, before the server hands it to any worker on the task queue, which replays the run.
+- `max_activities_per_second` (null, no limit): the most activities per second this worker starts; it stops polling while one more would go over, and eager activities, which would bypass it, are turned off. `max_task_queue_activities_per_second` (null): the most the server hands out from the task queue across all its workers, sent with each poll, so workers with different values override each other; a limit also turns off eager activities. Both must be positive and finite, and apply to the task queue's own activities only, not to session activities.
+- `default_heartbeat_throttle_interval` (30 s) and `max_heartbeat_throttle_interval` (60 s): an activity's heartbeats reach the server at 80% of its heartbeat timeout, at most every `max_heartbeat_throttle_interval`, or every `default_heartbeat_throttle_interval` without a heartbeat timeout; heartbeats in between keep only the latest details. Session activities are throttled the same way. Neither may be negative, and the default may not be above the maximum.
+- `max_eager_activity_reservations_per_workflow_task` (3): how many activities on the worker's own task queue one workflow task may ask the server to start on this worker eagerly, with free activity slots, in the answer to the task's completion; 0 turns eager activities off for the worker, as either per-second limit does. `ActivityOptions.disable_eager_execution` turns it off for one activity.
+- `poll_activity_tasks` (true): false stops the worker polling its task queue for activity tasks, so its registered activities run only as local activities of its own workflows (`workflow.Context.executeLocalActivity`); activities scheduled through the task queue wait for another worker or time out. It needs a registered workflow when activities are registered, and can't be combined with `sessions`.
+- `run` returns `error.InvalidOptions`, and logs the option and why, for a per-second limit that is zero, negative, infinite or NaN (or a `max_activities_per_second` below one per 2^61 seconds, about 4.4e-19 per second), a negative duration among the ones above, a default heartbeat throttle interval above the maximum, or `poll_activity_tasks = false` with `sessions` or with activities but no workflow.
 - `graceful_shutdown_period` (zero) and `workflow_memory_limit` (null): see below.
 - `logger` (null uses the client's sink) and `log_during_replay` (false): where workflow and activity logs go, and whether replay logs.
 - `interceptors`: run after the client's `worker_interceptors`; borrowed, called from several threads.
 - `deployment`, `build_id`, `use_build_id_versioning`, and `sessions`: see below.
+- There is no option to stop polling workflow tasks: a worker polls them only when a workflow is registered, activity tasks when an activity or a workflow is, and Nexus tasks when a Nexus service is.
+- There is no option for state shared by activities: register them as methods bound to a receiver with `registerActivityWith`, `registerActivitiesWith`, or `registerActivities`.
 
 #### Shutdown
 
