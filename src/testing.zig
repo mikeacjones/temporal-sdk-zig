@@ -1807,6 +1807,38 @@ const UpdateFixtures = struct {
     }
     const HandleUpdatesChecked = workflow.Def("HandleUpdates", handleUpdatesChecked);
 
+    /// Handles `set` with its own handler and `greet` with the dynamic update handler, whose
+    /// validator rejects every other update; otherwise like `handleUpdates`.
+    fn handleDynamic(ctx: *workflow.Context, comptime greet: anytype) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        const Dynamic = struct {
+            fn handle(st: *State, name: []const u8, args: converter.EncodedValues) ![]const u8 {
+                try expectUpdate(st, name);
+                return greet(st, try args.get([]const u8, st.ctx.allocator(), 0));
+            }
+            fn check(st: *State, name: []const u8, args: converter.EncodedValues) !void {
+                try expectUpdate(st, name);
+                if (!std.mem.eql(u8, name, "greet")) return error.UnknownUpdate;
+                _ = try args.get([]const u8, st.ctx.allocator(), 0);
+            }
+        };
+        try ctx.setUpdateHandlerWithValidator(Set, s, State.set, State.positive);
+        try ctx.setDynamicUpdateHandlerWithValidator(s, Dynamic.handle, Dynamic.check);
+        try ctx.setSignalHandler(Done, s, State.finish);
+        try ctx.await(s, State.finished);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return std.fmt.allocPrint(ctx.allocator(), "{d} {s}", .{ s.value, try std.mem.join(ctx.allocator(), " ", s.greetings.items) });
+    }
+    fn handleDynamicUpdates(ctx: *workflow.Context) ![]const u8 {
+        return handleDynamic(ctx, State.greet);
+    }
+    const HandleDynamicUpdates = workflow.Def("HandleDynamicUpdates", handleDynamicUpdates);
+    fn handleDynamicUpdatesWithoutActivity(ctx: *workflow.Context) ![]const u8 {
+        return handleDynamic(ctx, State.greetWithoutActivity);
+    }
+    const HandleDynamicUpdatesChanged = workflow.Def("HandleDynamicUpdates", handleDynamicUpdatesWithoutActivity);
+
     const Nap = workflow.UpdateDef("nap", fn (seconds: i64) i64);
     /// Sleeps in the handler; returns how many seconds of workflow time passed.
     fn nap(s: *State, seconds: i64) !i64 {
@@ -2829,6 +2861,25 @@ test "WorkflowReplayer replays update_history.json with the handlers declared on
     defer r.deinit();
     try r.registerWorkflow(StructFixtures.HandleUpdatesWf);
     try r.replayHistoryJson(update_history);
+}
+
+/// A dev-server run of `UpdateFixtures.HandleDynamicUpdates` sent `set 5` (accepted by its
+/// own handler), an update called `other` (rejected by the dynamic handler's validator, so it
+/// left no events), and `greet "ann"` (taken by the dynamic handler, which waits for an
+/// activity), then signaled `done`. Recorded from a `WorkflowEnvironment` dev server with
+/// `Client.fetchHistory` and encoded as ProtoJSON.
+const dynamic_update_history = @embedFile("testdata/dynamic_update_history.json");
+
+test "WorkflowReplayer replays an update handled by the dynamic update handler and catches a handler that changed" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(UpdateFixtures.HandleDynamicUpdates);
+    try ok.replayHistoryJson(dynamic_update_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(UpdateFixtures.HandleDynamicUpdatesChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(dynamic_update_history));
 }
 
 /// A dev-server run of the struct workflow `StructFixtures.Ledger` signal-with-started with

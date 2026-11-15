@@ -254,6 +254,115 @@ test "workflows: signal, query, and update handlers of a struct workflow" {
     try testing.expectEqual(1, try env.queryWorkflow(GuestCount, a, run.id, .{}));
 }
 
+// example: workflow-dynamic-query
+const Lobby = struct {
+    ctx: *workflow.Context,
+    guests: usize = 0,
+    fn addGuest(l: *Lobby, _: []const u8) void {
+        l.guests += 1;
+    }
+    fn full(l: *Lobby) bool {
+        return l.guests >= 2;
+    }
+    // Answers every query without a handler of its own; it may only read the lobby.
+    fn anyQuery(l: *Lobby, name: []const u8, args: temporal.converter.EncodedValues) ![]const u8 {
+        if (!std.mem.eql(u8, name, "welcome")) return error.UnknownQuery;
+        const a = l.ctx.allocator();
+        const guest = try args.get([]const u8, a, 0);
+        return std.fmt.allocPrint(a, "Welcome, {s}! {d} here so far.", .{ guest, l.guests });
+    }
+};
+fn lobby(ctx: *workflow.Context) !usize {
+    const l = try ctx.allocator().create(Lobby); // outlives the workflow function
+    l.* = .{ .ctx = ctx };
+    try ctx.setSignalHandler(AddGuest, l, Lobby.addGuest);
+    try ctx.setDynamicQueryHandler(l, Lobby.anyQuery);
+    try ctx.await(l, Lobby.full);
+    return l.guests;
+}
+pub const LobbyWorkflow = workflow.Def("lobby", lobby);
+// end-example
+
+test "workflows: a dynamic query handler answers queries without a handler of their own" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(LobbyWorkflow);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(LobbyWorkflow, .{}, .{});
+    defer run.deinit();
+    try env.signalWorkflow(AddGuest, run.id, .{"Ann"});
+    const Welcome = workflow.QueryDef("welcome", fn (guest: []const u8) []const u8);
+    try testing.expectEqualStrings("Welcome, Bob! 1 here so far.", try env.queryWorkflow(Welcome, a, run.id, .{"Bob"}));
+    const Unknown = workflow.QueryDef("unknown", fn () []const u8);
+    try testing.expectError(error.QueryFailed, env.queryWorkflow(Unknown, a, run.id, .{}));
+    try env.signalWorkflow(AddGuest, run.id, .{"Bob"});
+    try testing.expectEqual(2, try env.getResult(LobbyWorkflow, &run, a, null));
+}
+
+// example: workflow-dynamic-update
+pub const CloseTally = workflow.SignalDef("close_tally", fn () void);
+pub const Ping = workflow.SignalDef("ping", fn () void);
+const Tally = struct {
+    ctx: *workflow.Context,
+    total: i64 = 0,
+    closed: bool = false,
+    // Takes every update without a handler of its own, in a coroutine of its own.
+    fn anyUpdate(t: *Tally, name: []const u8, args: temporal.converter.EncodedValues) !i64 {
+        const amount = try args.get(i64, t.ctx.allocator(), 0);
+        t.total += if (std.mem.eql(u8, name, "subtract")) -amount else amount;
+        return t.total;
+    }
+    // Runs before the update is accepted; its error rejects the update.
+    fn checkUpdate(_: *Tally, name: []const u8, _: temporal.converter.EncodedValues) !void {
+        if (!std.mem.eql(u8, name, "add") and !std.mem.eql(u8, name, "subtract")) return error.UnknownUpdate;
+    }
+    fn ping(t: *Tally) !void {
+        try t.ctx.io().sleep(.fromSeconds(60), .awake);
+    }
+    fn close(t: *Tally) void {
+        t.closed = true;
+    }
+    fn isClosed(t: *Tally) bool {
+        return t.closed;
+    }
+};
+fn tally(ctx: *workflow.Context) !i64 {
+    const t = try ctx.allocator().create(Tally);
+    t.* = .{ .ctx = ctx };
+    try ctx.setDynamicUpdateHandlerWithValidator(t, Tally.anyUpdate, Tally.checkUpdate);
+    try ctx.setSignalHandler(CloseTally, t, Tally.close);
+    // A ping may still be sleeping when the tally closes; that is fine, so no warning.
+    try ctx.setSignalHandlerWithOptions(Ping, t, Tally.ping, .{ .unfinished_policy = .abandon });
+    try ctx.await(t, Tally.isClosed);
+    return t.total;
+}
+pub const TallyWorkflow = workflow.Def("tally", tally);
+// end-example
+
+test "workflows: a dynamic update handler takes updates without a handler of their own" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(TallyWorkflow);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(TallyWorkflow, .{}, .{});
+    defer run.deinit();
+    try env.signalWorkflow(Ping, run.id, .{});
+    const Add = workflow.UpdateDef("add", fn (amount: i64) i64);
+    const Subtract = workflow.UpdateDef("subtract", fn (amount: i64) i64);
+    const Multiply = workflow.UpdateDef("multiply", fn (factor: i64) i64);
+    try testing.expectEqual(5, try env.updateWorkflow(Add, a, run.id, .{5}, null));
+    try testing.expectEqual(3, try env.updateWorkflow(Subtract, a, run.id, .{2}, null));
+    try testing.expectError(error.UpdateFailed, env.updateWorkflow(Multiply, a, run.id, .{4}, null));
+    try env.signalWorkflow(CloseTally, run.id, .{});
+    try testing.expectEqual(3, try env.getResult(TallyWorkflow, &run, a, null));
+}
+
 // example: workflow-signal-channel
 const Arrival = union(enum) { guest: error{Canceled}![]const u8, quiet: std.Io.Cancelable!void };
 fn greetArrivals(ctx: *workflow.Context) ![]const u8 {

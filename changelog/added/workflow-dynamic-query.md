@@ -1,0 +1,1 @@
+`workflow.Context.setDynamicQueryHandler` answers every query that has no handler of its own, with the query type and its arguments still encoded (`converter.EncodedValues`); see [Signals, queries, and updates](https://github.com/mikeacjones/temporal-sdk-zig#signals-queries-and-updates-1).

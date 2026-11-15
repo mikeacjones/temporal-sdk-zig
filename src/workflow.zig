@@ -86,7 +86,9 @@
 //!     const output = try echo.get();
 //!
 //! Queries read a workflow's state from outside. Name one with `QueryDef` and answer it with
-//! `ctx.setQueryHandler`; the handler runs synchronously and must not change state or block:
+//! `ctx.setQueryHandler`; the handler runs synchronously and must only read state. A call
+//! that would start an activity, timer, child workflow or other command, or block, fails the
+//! query with a `ReadOnlyViolation` failure naming the call, and nothing is sent:
 //!
 //!     pub const Greeting = temporal.workflow.QueryDef("greeting", fn () []const u8);
 //!
@@ -103,6 +105,11 @@
 //! A struct workflow declares it instead: `pub const queries = .{ .current = Greeting };`
 //! with `pub fn current(self: *W) []const u8`. A query can arrive before `run` starts, so its
 //! handler may see `W{}`.
+//!
+//! `ctx.setDynamicQueryHandler` answers every query with no handler of its own, with the query
+//! type and its arguments still encoded (`converter.EncodedValues`):
+//!
+//!     try ctx.setDynamicQueryHandler(state, State.anyQuery); // fn (*State, []const u8, EncodedValues) !T
 //!
 //! Signals change a workflow's state from outside. Name one with `SignalDef` and handle it
 //! with `ctx.setSignalHandler`. Each signal runs its handler in a coroutine of its own, so a
@@ -209,9 +216,17 @@
 //!
 //!     const id = ctx.currentUpdate().?.id;
 //!
+//! `ctx.setDynamicUpdateHandler` (or `setDynamicUpdateHandlerWithValidator`) takes every
+//! update with no handler of its own, with its name and arguments still encoded, in a
+//! coroutine of its own like a typed handler:
+//!
+//!     try ctx.setDynamicUpdateHandler(state, State.anyUpdate); // fn (*State, []const u8, EncodedValues) !T
+//!
 //! The workflow ends when its function returns, even while signal or update handlers are still
 //! running; to let them finish first,
-//! `try ctx.await(ctx, temporal.workflow.Context.allHandlersFinished)`.
+//! `try ctx.await(ctx, temporal.workflow.Context.allHandlersFinished)`. Handlers still running
+//! when the workflow completes, is canceled, or continues as new are named in one warning,
+//! unless registered (or declared) with `.unfinished_policy = .abandon` (`HandlerOptions`).
 //!
 //! A long-running workflow keeps its history small by continuing as new: the workflow
 //! function returns `ctx.continueAsNew`, which ends the run and starts a fresh one with the
@@ -315,6 +330,23 @@ pub const UpdateInfo = struct {
     id: []const u8,
     /// The update's name, which selected the handler.
     name: []const u8,
+};
+
+/// What the SDK does about a signal or update handler that is still running when the
+/// workflow completes, is canceled, or continues as new. Either way the handler is cut
+/// short: its coroutine never resumes, and an unfinished update gets no result.
+pub const HandlerUnfinishedPolicy = enum {
+    /// Logs one warning at the end of the run naming every such handler (update names and
+    /// IDs, signal names).
+    warn_and_abandon,
+    /// Leaves the handler out of that warning, for one whose work may be cut short.
+    abandon,
+};
+
+/// Options for registering a signal or update handler (`Context.setSignalHandlerWithOptions`,
+/// `setUpdateHandlerWithOptions`, and their dynamic and by-name variants).
+pub const HandlerOptions = struct {
+    unfinished_policy: HandlerUnfinishedPolicy = .warn_and_abandon,
 };
 
 pub const RetryPolicy = struct {
@@ -644,9 +676,11 @@ pub const Context = struct {
         return ctx.instance.wio.io();
     }
 
-    /// Memory that lives as long as the workflow run is cached.
+    /// Memory that lives as long as the workflow run is cached. In a query handler it is
+    /// instead the query's memory, freed once the answer is sent, so answering queries
+    /// doesn't grow the run.
     pub fn allocator(ctx: *Context) Allocator {
-        return ctx.instance.arena();
+        return ctx.instance.allocator();
     }
 
     /// Names the calling coroutine (the workflow function, a handler, or one started with
@@ -656,7 +690,7 @@ pub const Context = struct {
     /// "workflow", "signal", "update", "async", or "group". Outside a coroutine, as in a
     /// query handler, there is nothing to name: it does nothing and allocates nothing.
     pub fn setCoroutineName(ctx: *Context, name: []const u8) error{OutOfMemory}!void {
-        if (ctx.instance.wio.scheduler.currentFiber() == null) return;
+        if (ctx.instance.wio.scheduler.currentFiber() == null or ctx.instance.wio.refuse("setCoroutineName")) return;
         const copy = try ctx.allocator().dupe(u8, name);
         ctx.instance.wio.setCurrentName(copy);
     }
@@ -835,7 +869,7 @@ pub const Context = struct {
     ///
     /// Set it before the workflow first blocks, so the run's first workflow task carries it.
     pub fn setVersioningBehavior(ctx: *Context, behavior: VersioningBehavior) void {
-        ctx.instance.versioning_behavior = behavior;
+        ctx.instance.setVersioningBehavior(behavior);
     }
 
     /// The Worker Deployment Version that ran the current workflow task (on replay, the one
@@ -1053,6 +1087,7 @@ pub const Context = struct {
     /// session is `closed`. A closed session is left as it is, and a failed one just closes.
     pub fn completeSession(ctx: *Context, session: *Session) error{OutOfMemory}!void {
         if (session.closed) return;
+        if (ctx.instance.wio.refuse("completeSession")) return;
         const was_open = session.state() == .open;
         session.closed = true;
         if (!was_open) return;
@@ -1198,9 +1233,21 @@ pub const Context = struct {
     /// error's name. Registering the same query type again replaces its handler.
     ///
     /// Handlers run synchronously on the worker thread, outside any coroutine, possibly after
-    /// the workflow function has returned. They must only read workflow state: not change it,
-    /// not block, and not call into the workflow context. Arguments and the result use
-    /// memory that lives until the answer is sent.
+    /// the workflow function has returned. They must only read workflow state. A handler that
+    /// calls something that would emit a command (`executeActivity`, `sleep`,
+    /// `executeChildWorkflow`, `upsertMemo`, `signalExternalWorkflow`, and so on), register or
+    /// remove a handler (`setSignalHandler`, `signalChannel`, `setUpdateHandler`, ...), take a
+    /// signal from a channel, change the run's settings (`setVersioningBehavior`), start a
+    /// coroutine, or block (`await`, a pending future's `get`) is refused: the call returns
+    /// `error.InvalidOptions` or `error.Canceled` (or, where it can't fail, does nothing), and
+    /// the query fails with a `ReadOnlyViolation` failure naming the call, whatever the
+    /// handler returns. Nothing is sent and the workflow task doesn't fail. Waking a coroutine
+    /// through `std.Io` (`Event.set`, `Condition.signal`, `Queue.put`) fails the query too,
+    /// but the wake happens: `std.Io` has already changed the primitive. The SDK can't undo
+    /// what a handler writes to workflow data or a `std.Io` primitive.
+    /// `ctx.fail` and `ctx.failWith` describe the query's failure instead of the workflow's.
+    /// Arguments and the result use memory that lives until the answer is sent, and so does
+    /// `ctx.allocator()` while the handler runs.
     ///
     /// `context` is usually a pointer to the state the handler reads. It must outlive the run,
     /// so allocate it with `ctx.allocator()` (or point to a global); a pointer into the calling
@@ -1223,6 +1270,44 @@ pub const Context = struct {
         const stored = try ctx.allocator().create(C);
         stored.* = context;
         return ctx.instance.setQueryHandler(Query.query_name, .{ .context = @ptrCast(stored), .call = Erased.call }, contextAddress(context));
+    }
+
+    /// Answers every query that has no handler registered for its type with
+    /// `handler(context, name, args)`, where `name` is the query type and `args` its
+    /// undecoded arguments (`converter.EncodedValues`), decoded with
+    /// `args.get(T, ctx.allocator(), index)`: in a query handler that is the answer's memory,
+    /// freed once it is sent. It returns the answer (any type the converter
+    /// encodes) or an error union of it; an error fails the query with the error's name.
+    /// Registering again replaces the dynamic handler. A handler registered for a query type
+    /// with `setQueryHandler` still answers that type. Without a dynamic handler, a query of
+    /// an unregistered type fails with `QueryNotRegistered`, and so do the query types
+    /// Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, `__temporal...`).
+    ///
+    /// The handler is read-only and its `context` must outlive the run, as in
+    /// `setQueryHandler`; a pointer into the calling coroutine's stack returns
+    /// `error.QueryContextOnStack`.
+    ///
+    ///     fn anyQuery(s: *State, name: []const u8, args: temporal.converter.EncodedValues) ![]const u8 {
+    ///         _ = args;
+    ///         return if (std.mem.eql(u8, name, "status")) s.status else error.UnknownQuery;
+    ///     }
+    ///     try ctx.setDynamicQueryHandler(state, State.anyQuery);
+    pub fn setDynamicQueryHandler(ctx: *Context, context: anytype, comptime handler: anytype) SetQueryHandlerError!void {
+        const C = @TypeOf(context);
+        const Args = struct { []const u8, converter.EncodedValues };
+        const Result = comptime dynamicResult("dynamic query handler", C, @TypeOf(handler));
+        comptime checkHandler("dynamic query handler", Args, C, @TypeOf(handler), Result);
+        const Erased = struct {
+            fn call(p: *const anyopaque, out: Allocator, name: []const u8, payloads: []const converter.Payload) anyerror!converter.Payload {
+                const c: *const C = @ptrCast(@alignCast(p));
+                const result = handler(c.*, name, converter.EncodedValues{ .payloads = payloads });
+                const value = if (@typeInfo(@TypeOf(result)) == .error_union) try result else result;
+                return converter.toPayload(out, value);
+            }
+        };
+        const stored = try ctx.allocator().create(C);
+        stored.* = context;
+        return ctx.instance.setDynamicQueryHandler(.{ .context = @ptrCast(stored), .call = Erased.call }, contextAddress(context));
     }
 
     pub const SetSignalHandlerError = error{
@@ -1252,8 +1337,16 @@ pub const Context = struct {
     ///     const state = try ctx.allocator().create(State);
     ///     try ctx.setSignalHandler(Approve, state, State.approve);
     pub fn setSignalHandler(ctx: *Context, comptime Signal: type, context: anytype, comptime handler: anytype) SetSignalHandlerError!void {
+        return ctx.setSignalHandlerWithOptions(Signal, context, handler, .{});
+    }
+
+    /// `setSignalHandler` with options, such as `.unfinished_policy = .abandon` for a handler
+    /// whose work may be cut short when the workflow ends (see `HandlerUnfinishedPolicy`).
+    ///
+    ///     try ctx.setSignalHandlerWithOptions(Ping, state, State.ping, .{ .unfinished_policy = .abandon });
+    pub fn setSignalHandlerWithOptions(ctx: *Context, comptime Signal: type, context: anytype, comptime handler: anytype, options: HandlerOptions) SetSignalHandlerError!void {
         comptime checkHandler("signal handler for \"" ++ Signal.signal_name ++ "\"", Signal.Args, @TypeOf(context), @TypeOf(handler), void);
-        return ctx.setSignalHandlerInner(Signal.signal_name, Signal.Args, context, handler);
+        return ctx.setSignalHandlerInner(Signal.signal_name, Signal.Args, context, handler, options);
     }
 
     /// `setSignalHandler` for a signal named at run time, such as one whose name includes a
@@ -1264,11 +1357,16 @@ pub const Context = struct {
     ///     const name = try std.fmt.allocPrint(ctx.allocator(), "unlock-{s}", .{holder_id});
     ///     try ctx.setSignalHandlerByName(name, struct { []const u8 }, state, State.unlock);
     pub fn setSignalHandlerByName(ctx: *Context, name: []const u8, comptime Args: type, context: anytype, comptime handler: anytype) SetSignalHandlerError!void {
-        comptime checkHandler("signal handler for a signal named at run time", Args, @TypeOf(context), @TypeOf(handler), void);
-        return ctx.setSignalHandlerInner(try ctx.allocator().dupe(u8, name), Args, context, handler);
+        return ctx.setSignalHandlerByNameWithOptions(name, Args, context, handler, .{});
     }
 
-    fn setSignalHandlerInner(ctx: *Context, name: []const u8, comptime Args: type, context: anytype, comptime handler: anytype) SetSignalHandlerError!void {
+    /// `setSignalHandlerByName` with options (see `setSignalHandlerWithOptions`).
+    pub fn setSignalHandlerByNameWithOptions(ctx: *Context, name: []const u8, comptime Args: type, context: anytype, comptime handler: anytype, options: HandlerOptions) SetSignalHandlerError!void {
+        comptime checkHandler("signal handler for a signal named at run time", Args, @TypeOf(context), @TypeOf(handler), void);
+        return ctx.setSignalHandlerInner(try ctx.allocator().dupe(u8, name), Args, context, handler, options);
+    }
+
+    fn setSignalHandlerInner(ctx: *Context, name: []const u8, comptime Args: type, context: anytype, comptime handler: anytype, options: HandlerOptions) SetSignalHandlerError!void {
         const C = @TypeOf(context);
         const Erased = struct {
             fn decode(out: Allocator, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
@@ -1285,7 +1383,7 @@ pub const Context = struct {
         };
         const stored = try ctx.allocator().create(C);
         stored.* = context;
-        return ctx.instance.setSignalHandler(name, .{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call }, contextAddress(context));
+        return ctx.instance.setSignalHandler(name, .{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call, .unfinished_policy = options.unfinished_policy }, contextAddress(context));
     }
 
     /// Handles every signal that has no handler registered for its name with
@@ -1305,6 +1403,11 @@ pub const Context = struct {
     ///     }
     ///     try ctx.setDynamicSignalHandler(state, State.onSignal);
     pub fn setDynamicSignalHandler(ctx: *Context, context: anytype, comptime handler: anytype) SetSignalHandlerError!void {
+        return ctx.setDynamicSignalHandlerWithOptions(context, handler, .{});
+    }
+
+    /// `setDynamicSignalHandler` with options (see `setSignalHandlerWithOptions`).
+    pub fn setDynamicSignalHandlerWithOptions(ctx: *Context, context: anytype, comptime handler: anytype, options: HandlerOptions) SetSignalHandlerError!void {
         const C = @TypeOf(context);
         const Args = struct { []const u8, converter.EncodedValues };
         comptime checkHandler("dynamic signal handler", Args, C, @TypeOf(handler), void);
@@ -1323,7 +1426,7 @@ pub const Context = struct {
         };
         const stored = try ctx.allocator().create(C);
         stored.* = context;
-        return ctx.instance.setDynamicSignalHandler(.{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call }, contextAddress(context));
+        return ctx.instance.setDynamicSignalHandler(.{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call, .unfinished_policy = options.unfinished_policy }, contextAddress(context));
     }
 
     /// The channel of the signals named by `Signal` (a `SignalDef`), for workflow code that
@@ -1397,15 +1500,15 @@ pub const Context = struct {
     /// rejects the update with the error's name, without failing the workflow. Updates of
     /// this name that arrived in the current workflow task, before this call, are validated
     /// and accepted here in arrival order; their handlers run once the caller blocks. Updates
-    /// with no handler once every coroutine has blocked are rejected, so register handlers
-    /// before the workflow function first blocks. An update whose arguments don't decode as
+    /// with no handler (nor a dynamic one, `setDynamicUpdateHandler`) once every coroutine has
+    /// blocked are rejected, so register handlers before the workflow function first blocks. An update whose arguments don't decode as
     /// the handler's parameters is rejected.
     ///
     /// `context` must outlive the run, as for `setSignalHandler`; a pointer into the calling
     /// coroutine's stack returns `error.UpdateContextOnStack`. Decoded arguments live in
     /// `ctx.allocator()`.
     pub fn setUpdateHandler(ctx: *Context, comptime Update: type, context: anytype, comptime handler: anytype) SetUpdateHandlerError!void {
-        return ctx.setUpdateHandlerInner(Update, context, handler, null);
+        return ctx.setUpdateHandlerWithOptions(Update, context, handler, null, .{});
     }
 
     /// `setUpdateHandler` with a validator: `validator(context, args...)`, returning `void`
@@ -1414,23 +1517,29 @@ pub const Context = struct {
     /// trace in history.
     ///
     /// The validator runs synchronously, outside the update's coroutine, like a query
-    /// handler: it must only read workflow state, not change it, block, or call into the
-    /// workflow context. It doesn't run on replay, where every update in history was
-    /// accepted.
+    /// handler: it must only read workflow state. A call that would emit a command, start a
+    /// coroutine, or block is refused as in a query handler (see `setQueryHandler`), and the
+    /// update is rejected with a `ReadOnlyViolation` failure naming the call. It doesn't run
+    /// on replay, where every update in history was accepted.
     ///
     ///     try ctx.setUpdateHandlerWithValidator(SetLimit, state, State.set, State.check);
     pub fn setUpdateHandlerWithValidator(ctx: *Context, comptime Update: type, context: anytype, comptime handler: anytype, comptime validator: anytype) SetUpdateHandlerError!void {
-        return ctx.setUpdateHandlerInner(Update, context, handler, validator);
+        return ctx.setUpdateHandlerWithOptions(Update, context, handler, validator, .{});
     }
 
-    fn setUpdateHandlerInner(ctx: *Context, comptime Update: type, context: anytype, comptime handler: anytype, comptime validator: anytype) SetUpdateHandlerError!void {
+    /// `setUpdateHandlerWithValidator` with options, such as `.unfinished_policy = .abandon`
+    /// for a handler whose work may be cut short when the workflow ends (see
+    /// `HandlerUnfinishedPolicy`). `validator` is `null` for an update without one.
+    ///
+    ///     try ctx.setUpdateHandlerWithOptions(SetLimit, state, State.set, null, .{ .unfinished_policy = .abandon });
+    pub fn setUpdateHandlerWithOptions(ctx: *Context, comptime Update: type, context: anytype, comptime handler: anytype, comptime validator: anytype, options: HandlerOptions) SetUpdateHandlerError!void {
         const C = @TypeOf(context);
         const what = "update handler for \"" ++ Update.update_name ++ "\"";
         comptime checkHandler(what, Update.Args, C, @TypeOf(handler), Update.Result);
         const has_validator = @TypeOf(validator) != @TypeOf(null);
         if (has_validator) comptime checkHandler("update validator for \"" ++ Update.update_name ++ "\"", Update.Args, C, @TypeOf(validator), void);
         const Erased = struct {
-            fn decode(out: Allocator, payloads: []const converter.Payload) anyerror!*const anyopaque {
+            fn decode(out: Allocator, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
                 const args = try out.create(Update.Args);
                 args.* = try converter.fromPayloads(Update.Args, out, payloads);
                 return @ptrCast(args);
@@ -1456,12 +1565,85 @@ pub const Context = struct {
             .decode = Erased.decode,
             .validate = if (has_validator) Erased.validate else null,
             .call = Erased.call,
+            .unfinished_policy = options.unfinished_policy,
+        }, contextAddress(context));
+    }
+
+    /// Handles every update that has no handler registered for its name with
+    /// `handler(context, name, args)`, where `name` is the update's name and `args` its
+    /// undecoded arguments (`converter.EncodedValues`), decoded with
+    /// `args.get(T, ctx.allocator(), index)`. It returns the update's result (any type the
+    /// converter encodes, or `void`) or an error union of it. Registering again replaces the
+    /// dynamic handler for the updates delivered afterwards.
+    ///
+    /// Updates buffered before this call, of any name, are accepted here in arrival order. A
+    /// handler registered for an update's name later still takes that name's later updates.
+    /// Each accepted update runs the handler in a coroutine of its own, and
+    /// `ctx.currentUpdate()` names it there; results, errors, and `context` work as in
+    /// `setUpdateHandler`. An argument that doesn't decode is the handler's error to return,
+    /// which rejects the update after it was accepted; reject it before acceptance with
+    /// `setDynamicUpdateHandlerWithValidator`.
+    ///
+    ///     fn anyUpdate(s: *State, name: []const u8, args: temporal.converter.EncodedValues) !i64 {
+    ///         const amount = try args.get(i64, s.ctx.allocator(), 0);
+    ///         return s.record(name, amount);
+    ///     }
+    ///     try ctx.setDynamicUpdateHandler(state, State.anyUpdate);
+    pub fn setDynamicUpdateHandler(ctx: *Context, context: anytype, comptime handler: anytype) SetUpdateHandlerError!void {
+        return ctx.setDynamicUpdateHandlerWithOptions(context, handler, null, .{});
+    }
+
+    /// `setDynamicUpdateHandler` with a validator: `validator(context, name, args)`,
+    /// returning `void` or `!void`, runs when the update is delivered, before it is accepted,
+    /// read-only as in `setUpdateHandlerWithValidator`. Its error rejects the update.
+    pub fn setDynamicUpdateHandlerWithValidator(ctx: *Context, context: anytype, comptime handler: anytype, comptime validator: anytype) SetUpdateHandlerError!void {
+        return ctx.setDynamicUpdateHandlerWithOptions(context, handler, validator, .{});
+    }
+
+    /// `setDynamicUpdateHandlerWithValidator` with options (see
+    /// `setUpdateHandlerWithOptions`); `validator` is `null` for none.
+    pub fn setDynamicUpdateHandlerWithOptions(ctx: *Context, context: anytype, comptime handler: anytype, comptime validator: anytype, options: HandlerOptions) SetUpdateHandlerError!void {
+        const C = @TypeOf(context);
+        const Args = struct { []const u8, converter.EncodedValues };
+        const Result = comptime dynamicResult("dynamic update handler", C, @TypeOf(handler));
+        comptime checkHandler("dynamic update handler", Args, C, @TypeOf(handler), Result);
+        const has_validator = @TypeOf(validator) != @TypeOf(null);
+        if (has_validator) comptime checkHandler("dynamic update validator", Args, C, @TypeOf(validator), void);
+        const Erased = struct {
+            fn decode(out: Allocator, name: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
+                const args = try out.create(Args);
+                args.* = .{ name, .{ .payloads = payloads } };
+                return @ptrCast(args);
+            }
+            fn validate(p: *const anyopaque, a: *const anyopaque) anyerror!void {
+                const c: *const C = @ptrCast(@alignCast(p));
+                const args: *const Args = @ptrCast(@alignCast(a));
+                const result = @call(.auto, validator, .{c.*} ++ args.*);
+                if (@typeInfo(@TypeOf(result)) == .error_union) try result;
+            }
+            fn call(p: *const anyopaque, out: Allocator, a: *const anyopaque) anyerror!converter.Payload {
+                const c: *const C = @ptrCast(@alignCast(p));
+                const args: *const Args = @ptrCast(@alignCast(a));
+                const result = @call(.auto, handler, .{c.*} ++ args.*);
+                const value = if (@typeInfo(@TypeOf(result)) == .error_union) try result else result;
+                return converter.toPayload(out, value);
+            }
+        };
+        const stored = try ctx.allocator().create(C);
+        stored.* = context;
+        return ctx.instance.setDynamicUpdateHandler(.{
+            .context = @ptrCast(stored),
+            .decode = Erased.decode,
+            .validate = if (has_validator) Erased.validate else null,
+            .call = Erased.call,
+            .unfinished_policy = options.unfinished_policy,
         }, contextAddress(context));
     }
 
     /// Whether no signal or update handler coroutine is running: every delivered signal's
     /// and accepted update's handler has returned. Wait for it before returning so handlers
-    /// aren't cut short:
+    /// aren't cut short (and the run doesn't log a warning naming them, see
+    /// `HandlerUnfinishedPolicy`):
     ///
     ///     try ctx.await(ctx, temporal.workflow.Context.allHandlersFinished);
     pub fn allHandlersFinished(ctx: *Context) bool {
@@ -1862,6 +2044,7 @@ pub fn SignalChannel(comptime Args: type) type {
 
         /// The next signal's arguments without waiting, or null if no signal is unread.
         pub fn tryReceive(ch: *Self) ?Value {
+            if (ch.core.inst.wio.refuse("SignalChannel.tryReceive")) return null;
             return value(ch.core.take() orelse return null);
         }
 
@@ -1942,7 +2125,9 @@ pub const DefOptions = struct {
 ///   default value. It lives as long as the run stays cached.
 /// - `pub const queries`, `signals`, and `updates`, each optional, are struct literals that map
 ///   a pub method of `W` to a `QueryDef`, `SignalDef`, or `UpdateDef`. An update entry may also
-///   name a validator method: `.{ UpdateDef, .validatorMethod }`.
+///   name a validator method: `.{ UpdateDef, .validatorMethod }`. A signal or update entry
+///   may end with `HandlerOptions`, such as `.{ Add, .{ .unfinished_policy = .abandon } }` or
+///   `.{ Reset, .checkReset, .{ .unfinished_policy = .abandon } }`.
 /// - A handler method takes `self: *W` followed by the Def's arguments and returns what
 ///   `Context.setQueryHandler`, `setSignalHandler`, or `setUpdateHandler` accepts. A
 ///   validator returns `void` or `!void`. Each Def appears once per declaration.
@@ -2039,15 +2224,15 @@ fn StructDef(comptime name: []const u8, comptime W: type, comptime options: DefO
                 try ctx.setQueryHandler(D, w, @field(W, entry));
             }
             inline for (comptime entryNames(W, "signals")) |entry| {
-                const D = comptime handlerEntry("signals", @field(W.signals, entry)).?.def;
-                try ctx.setSignalHandler(D, w, @field(W, entry));
+                const e = comptime handlerEntry("signals", @field(W.signals, entry)).?;
+                try ctx.setSignalHandlerWithOptions(e.def, w, @field(W, entry), e.options);
             }
             inline for (comptime entryNames(W, "updates")) |entry| {
                 const e = comptime handlerEntry("updates", @field(W.updates, entry)).?;
                 if (e.validator) |v|
-                    try ctx.setUpdateHandlerWithValidator(e.def, w, @field(W, entry), @field(W, v))
+                    try ctx.setUpdateHandlerWithOptions(e.def, w, @field(W, entry), @field(W, v), e.options)
                 else
-                    try ctx.setUpdateHandler(e.def, w, @field(W, entry));
+                    try ctx.setUpdateHandlerWithOptions(e.def, w, @field(W, entry), null, e.options);
             }
             return w;
         }
@@ -2151,30 +2336,60 @@ fn defKind(comptime decl: []const u8) struct { def: []const u8, name_decl: []con
         .name_decl = "signal_name",
         .noun = "signal",
         .example = "`.{ .approve = Approve }`",
-        .want = "a SignalDef (temporal.workflow.SignalDef(name, fn (args...) void))",
+        .want = "a SignalDef (temporal.workflow.SignalDef(name, fn (args...) void)), or .{ SignalDef, HandlerOptions }",
     };
     return .{
         .def = "UpdateDef",
         .name_decl = "update_name",
         .noun = "update",
         .example = "`.{ .setLimit = SetLimit }` or `.{ .setLimit = .{ SetLimit, .checkLimit } }`",
-        .want = "an UpdateDef (temporal.workflow.UpdateDef(name, fn (args...) Result)), or .{ UpdateDef, .validatorMethod }",
+        .want = "an UpdateDef (temporal.workflow.UpdateDef(name, fn (args...) Result)), or .{ UpdateDef, .validatorMethod }, with HandlerOptions such as .{ .unfinished_policy = .abandon } last if any",
     };
 }
 
-/// The Def of an entry of `W.queries`, `signals`, or `updates`, and the name of its validator
-/// method, or null if the entry isn't one of `decl`'s kind.
-fn handlerEntry(comptime decl: []const u8, comptime value: anytype) ?struct { def: type, validator: ?[]const u8 } {
+/// The Def of an entry of `W.queries`, `signals`, or `updates`, the name of its validator
+/// method, and its handler options, or null if the entry isn't one of `decl`'s kind. A signal
+/// entry is `Def` or `.{ Def, options }`; an update entry is also `.{ Def, .validator }` or
+/// `.{ Def, .validator, options }`.
+fn handlerEntry(comptime decl: []const u8, comptime value: anytype) ?struct { def: type, validator: ?[]const u8 = null, options: HandlerOptions = .{} } {
     const name_decl = defKind(decl).name_decl;
-    if (@TypeOf(value) == type) return if (isDef(value, name_decl)) .{ .def = value, .validator = null } else null;
-    if (!std.mem.eql(u8, decl, "updates")) return null;
+    if (@TypeOf(value) == type) return if (isDef(value, name_decl)) .{ .def = value } else null;
+    if (std.mem.eql(u8, decl, "queries")) return null;
     const s = switch (@typeInfo(@TypeOf(value))) {
         .@"struct" => |s| s,
         else => return null,
     };
-    if (!s.is_tuple or s.field_types.len != 2 or s.field_types[0] != type or @typeInfo(s.field_types[1]) != .enum_literal) return null;
+    if (!s.is_tuple or s.field_types.len < 2 or s.field_types.len > 3 or s.field_types[0] != type) return null;
     if (!isDef(value[0], name_decl)) return null;
-    return .{ .def = value[0], .validator = @tagName(value[1]) };
+    const updates = std.mem.eql(u8, decl, "updates");
+    const has_validator = updates and @typeInfo(s.field_types[1]) == .enum_literal;
+    if (s.field_types.len == 3 and !has_validator) return null;
+    if (s.field_types.len == 2 and has_validator) return .{ .def = value[0], .validator = @tagName(value[1]) };
+    const options = handlerOptions(value[s.field_types.len - 1]) orelse return null;
+    return .{ .def = value[0], .validator = if (has_validator) @tagName(value[1]) else null, .options = options };
+}
+
+/// `value` as `HandlerOptions`: a `HandlerOptions`, or a struct literal of its fields such as
+/// `.{ .unfinished_policy = .abandon }`. Null if it is neither.
+fn handlerOptions(comptime value: anytype) ?HandlerOptions {
+    const T = @TypeOf(value);
+    if (T == HandlerOptions) return value;
+    const s = switch (@typeInfo(T)) {
+        .@"struct" => |s| s,
+        else => return null,
+    };
+    if (s.is_tuple) return null;
+    var options: HandlerOptions = .{};
+    for (s.field_names, s.field_types) |name, F| {
+        if (!@hasField(HandlerOptions, name)) return null;
+        const Want = @FieldType(HandlerOptions, name);
+        if (F == Want) {
+            @field(options, name) = @field(value, name);
+        } else if (@typeInfo(F) == .enum_literal and @typeInfo(Want) == .@"enum") {
+            @field(options, name) = std.meta.stringToEnum(Want, @tagName(@field(value, name))) orelse return null;
+        } else return null;
+    }
+    return options;
 }
 
 fn isDef(comptime T: type, comptime name_decl: []const u8) bool {
@@ -2300,6 +2515,24 @@ fn contextAddress(context: anytype) ?usize {
         },
         else => null,
     };
+}
+
+/// The result type of a dynamic query or update handler `H` (`what` names which): its
+/// return type, without an error union. A query must answer something; an update may return
+/// `void`.
+fn dynamicResult(comptime what: []const u8, comptime C: type, comptime H: type) type {
+    const bad = what ++ " must be fn (" ++ @typeName(C) ++ ", []const u8, temporal.converter.EncodedValues) Result (or an error union of it), not " ++ @typeName(H);
+    const info = switch (@typeInfo(H)) {
+        .@"fn" => |f| f,
+        else => @compileError(bad),
+    };
+    const Ret = info.return_type orelse @compileError(bad);
+    const Result = switch (@typeInfo(Ret)) {
+        .error_union => |eu| eu.payload,
+        else => Ret,
+    };
+    if (Result == void and std.mem.eql(u8, what, "dynamic query handler")) @compileError(bad);
+    return Result;
 }
 
 /// Compile error unless `H` is `fn (C, Args...) Result` or returns an error union of
@@ -2517,11 +2750,38 @@ test "a struct Def's handler declaration errors name the workflow, the entry, an
         pub const updates = .{ .reset = .{ T.Reset, .badCheck } };
     })), &.{ "workflow \"W\": updates.reset validator .badCheck must be fn (*", ", i64) void (or !void), not fn (*" });
 
+    // Handler options: only on signals and updates, last, and with HandlerOptions' fields.
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const queries = .{ .currentTotal = .{ T.Total, .{ .unfinished_policy = .abandon } } };
+    })), &.{"queries.currentTotal must be a QueryDef"});
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const signals = .{ .add = .{ T.Add, .{ .unfinished_policy = .later } } };
+    })), &.{ "signals.add must be a SignalDef", ".{ SignalDef, HandlerOptions }" });
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const updates = .{ .reset = .{ T.Reset, .{ .policy = .abandon } } };
+    })), &.{ "updates.reset must be an UpdateDef", "HandlerOptions such as .{ .unfinished_policy = .abandon } last" });
+    try T.expectMessage(comptime defError("W", Base.With(struct {
+        pub const updates = .{ .reset = .{ T.Reset, HandlerOptions{}, .checkReset } };
+    })), &.{"updates.reset must be an UpdateDef"});
+
     // Valid entries pass; other pub declarations are ignored.
     try std.testing.expect(comptime defError("W", Base.With(struct {
         pub const signals = .{ .add = T.Add };
         pub const queries = .{ .currentTotal = T.Total };
         pub const updates = .{ .reset = T.Reset };
+    })) == null);
+    try std.testing.expect(comptime defError("W", Base.With(struct {
+        pub const signals = .{ .add = .{ T.Add, .{ .unfinished_policy = .abandon } } };
+        pub const updates = .{ .reset = .{ T.Reset, .add2, HandlerOptions{ .unfinished_policy = .abandon } } };
+    })) != null); // .add2 names no method
+    const declared = comptime handlerEntry("updates", .{ T.Reset, .checkReset, .{ .unfinished_policy = .abandon } }).?;
+    try std.testing.expectEqualStrings("checkReset", declared.validator.?);
+    try std.testing.expectEqual(HandlerUnfinishedPolicy.abandon, declared.options.unfinished_policy);
+    const plain = comptime handlerEntry("signals", .{ T.Add, HandlerOptions{} }).?;
+    try std.testing.expectEqual(HandlerUnfinishedPolicy.warn_and_abandon, plain.options.unfinished_policy);
+    try std.testing.expect(comptime defError("W", Base.With(struct {
+        pub const signals = .{ .add = .{ T.Add, .{ .unfinished_policy = .abandon } } };
+        pub const updates = .{ .reset = .{ T.Reset, HandlerOptions{ .unfinished_policy = .abandon } } };
     })) == null);
 }
 
