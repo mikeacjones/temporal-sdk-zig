@@ -557,7 +557,7 @@ Notes:
 - To race or cancel a timer, run `std.Io.sleep` as a coroutine, as the next example does.
 
 #### Concurrency
-`ctx.io()` gives workflows `std.Io` concurrency: `io.async` futures, `std.Io.Select`, `std.Io.Group`, `std.Io.Mutex`, and `std.Io.Queue`.
+`ctx.io()` gives workflows `std.Io` concurrency: `io.async` futures, `std.Io.Select`, `std.Io.Group`, `std.Io.Mutex`, `std.Io.Semaphore`, `std.Io.Event`, `std.Io.Condition`, and `std.Io.Queue`. Blocked coroutines are woken in the order they started waiting, but a woken coroutine is not guaranteed to get what it waited for: a coroutine that releases a `std.Io.Mutex` or a `std.Io.Semaphore` permit and takes it again before it blocks gets it first, so code must not depend on the order in which coroutines acquire them. A coroutine canceled while blocked on any of them gets `error.Canceled`.
 
 <!-- example: workflow-select -->
 ```zig
@@ -597,9 +597,34 @@ fn greetAll(ctx: *workflow.Context, names: []const []const u8) ![]const []const 
 pub const GreetAll = workflow.Def("greet_all", greetAll);
 ```
 
+A value one coroutine sets and another waits for is a field plus a `std.Io.Event`: the setter writes the field, then calls `set`; the waiter calls `wait`, then reads the field. This is the idiom; the SDK has no separate type for this.
+
+<!-- example: workflow-event-value -->
+```zig
+const Reply = struct { value: []const u8 = "", ready: std.Io.Event = .unset };
+fn fetchReply(ctx: *workflow.Context, name: []const u8, out: *Reply) void {
+    ctx.setCoroutineName("fetch-reply") catch {}; // shown by stack-trace queries
+    out.value = ctx.executeActivity(Greet, greet_options, .{name}).get() catch "(no greeting)";
+    out.ready.set(ctx.io()); // after the value is written
+}
+fn greetWhenReady(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const io = ctx.io();
+    var reply: Reply = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    group.async(io, fetchReply, .{ ctx, name, &reply });
+    try reply.ready.wait(io);
+    return reply.value;
+}
+pub const GreetWhenReady = workflow.Def("greet_when_ready", greetWhenReady);
+```
+
 Notes:
 - Canceling a coroutine cancels what it waits on: its timer, activity, child workflow, or unrecorded external signal.
 - Call `cancelDiscard`, `cancel`, or `await` before a `Select` or `Group` leaves scope.
+- A `Select` case can receive from a channel: `select.async(.received, std.Io.Queue(T).getOne, .{ &queue, io })`. Canceling a receive that is still waiting takes nothing from the queue, but `cancelDiscard` drops the value of a receive that has already completed and not been awaited; use `cancel` in a loop to get those values back.
+- To poll without blocking (a select's "default" case), use `queue.get(io, buffer, 0)`, which returns 0 when the queue is empty, or a future's `isReady()` (`ActivityFuture` and the other SDK futures), `Event.isSet()`, or `ctx.await` on workflow state.
+- `ctx.setCoroutineName(name)` names the calling coroutine for stack-trace queries and copies `name` into `ctx.allocator()`; `ctx.coroutineName()` reads it. Unnamed coroutines are `workflow`, `signal`, `update`, `async`, or `group`.
 - The workflow ends when its function returns, whatever coroutines are still running.
 
 #### Signals, queries, and updates
@@ -645,6 +670,41 @@ Notes:
 - Function workflows use `ctx.setSignalHandler`, `setQueryHandler`, and `setUpdateHandler(WithValidator)`, with a context from `ctx.allocator()`.
 - Signal and update handlers run in their own coroutines and may block; query handlers and validators must only read state.
 - `ctx.setSignalHandlerByName` handles a signal named at run time, and `ctx.setDynamicSignalHandler` every signal without a handler.
+
+A signal channel lets workflow code receive a signal where it needs it instead of in a handler. `ctx.signalChannel(Signal)` (or `ctx.signalChannelByName(name, Args)`) returns a `workflow.SignalChannel` that takes the place of the signal's handler:
+
+<!-- example: workflow-signal-channel -->
+```zig
+const Arrival = union(enum) { guest: error{Canceled}![]const u8, quiet: std.Io.Cancelable!void };
+fn greetArrivals(ctx: *workflow.Context) ![]const u8 {
+    const io = ctx.io();
+    const guests = try ctx.signalChannel(AddGuest); // takes the place of a handler
+    var names: std.ArrayList([]const u8) = .empty;
+    while (true) { // until a minute passes with no guest
+        var buffer: [2]Arrival = undefined;
+        var select: std.Io.Select(Arrival) = .init(io, &buffer);
+        select.async(.guest, workflow.SignalChannel(AddGuest.Args).receive, .{guests});
+        select.async(.quiet, std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+        const first = try select.await();
+        select.cancelDiscard(); // one receive, awaited at once: no guest is dropped
+        switch (first) {
+            .guest => |name| try names.append(ctx.allocator(), try name),
+            .quiet => break,
+        }
+    }
+    ctx.removeSignalHandler(AddGuest); // later guests are buffered, unread
+    const unread = try ctx.unhandledSignalNames(); // logged, and dropped, when the run ends
+    if (unread.len > 0) ctx.logger().warn("signals left unread", .{ .first = unread[0] });
+    return std.mem.join(ctx.allocator(), ", ", names.items);
+}
+pub const GreetArrivals = workflow.Def("greet_arrivals", greetArrivals);
+```
+
+Notes:
+- `receive` blocks until a signal arrives and returns `error.Canceled` if its coroutine is canceled, so it works as a `std.Io.Select` case; a signal that arrives in the same workflow task as a raced timer wins the race. A receive that returned has taken its signal, and `cancelDiscard` drops every finished case but the one `await` returned: with receives on several channels, or a Select awaited only after its cases had time to finish, cancel with `select.cancel()` until it returns null and handle each result instead. `tryReceive` returns null instead of blocking, and `len` counts unread signals.
+- A signal with one argument is received as that value, one with several as its argument tuple. Signals buffered before the channel was opened reach it in arrival order once the caller blocks; until then `len` and `tryReceive` don't see them, but `ctx.unhandledSignalNames()` lists them.
+- `ctx.removeSignalHandler(Signal)`, `removeSignalHandlerByName`, and `removeDynamicSignalHandler` unregister a handler or channel: later signals go to the dynamic handler or are buffered, handler coroutines already running finish, and a channel keeps what it took.
+- `ctx.unhandledSignalNames()` lists the names of the signals nothing has taken, buffered or unread in a channel, in first-arrival order; a workflow that finishes with any logs a warning counting them.
 
 #### Child workflows
 `workflow.Context.executeChildWorkflow` starts a child and returns a `workflow.ChildWorkflowFuture` for its start and result.

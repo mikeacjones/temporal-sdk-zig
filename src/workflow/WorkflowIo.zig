@@ -127,6 +127,28 @@ pub fn wake(w: *WorkflowIo, wait: *Wait) void {
     w.wakeWait(wait);
 }
 
+/// `wake`, but a coroutine that this wakes runs before the others that are ready.
+pub fn wakeFirst(w: *WorkflowIo, wait: *Wait) void {
+    if (wait.woken) return;
+    wait.woken = true;
+    if (wait.fiber.state == .blocked) w.scheduler.wakeFirst(wait.fiber);
+}
+
+/// The running coroutine's name: the one `spawn` gave it, "async" or "group" for coroutines
+/// started through the `std.Io` interface, or the last one `setCurrentName` set. Empty
+/// outside a coroutine.
+pub fn currentName(w: *const WorkflowIo) []const u8 {
+    const f = w.scheduler.currentFiber() orelse return "";
+    return f.name;
+}
+
+/// Renames the running coroutine. `name` is not copied and must outlive the coroutine. Does
+/// nothing outside a coroutine.
+pub fn setCurrentName(w: *WorkflowIo, name: []const u8) void {
+    const f = w.scheduler.currentFiber() orelse return;
+    f.name = name;
+}
+
 /// Called by the host when a timer started with `Host.VTable.startTimer` fires.
 pub fn fireTimer(w: *WorkflowIo, timer: *Timer) void {
     assert(!timer.fired);
@@ -1001,4 +1023,245 @@ test "cancelTask delivers cancellation to a top-level coroutine" {
     e.fake.runAll(&e.wio);
     try testing.expectEqual(@as(?anyerror, error.Canceled), result);
     try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+const SemaphoreState = struct {
+    sem: Io.Semaphore = .{ .permits = 2 },
+    active: u32 = 0,
+    max_active: u32 = 0,
+    acquired: Trace = .{},
+};
+
+fn semaphoreWorker(i: Io, s: *SemaphoreState, id: u32, hold_secs: i64) void {
+    s.sem.wait(i) catch unreachable;
+    defer s.sem.post(i);
+    s.acquired.add(id);
+    s.active += 1;
+    s.max_active = @max(s.max_active, s.active);
+    i.sleep(.fromSeconds(hold_secs), .awake) catch unreachable;
+    s.active -= 1;
+}
+
+fn semaphoreWorkflow(i: Io, s: *SemaphoreState) void {
+    var g: Io.Group = .init;
+    // Holders release in the opposite order they acquired, so the waiters' order comes from
+    // the semaphore, not from the timers.
+    for (1..6) |id| g.async(i, semaphoreWorker, .{ i, s, @as(u32, @intCast(id)), @as(i64, @intCast(10 - id)) });
+    g.await(i) catch unreachable;
+}
+
+test "std.Io.Semaphore limits holders across durable waits and wakes waiters in arrival order" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var s: SemaphoreState = .{};
+    _ = try e.wio.spawn("wf", semaphoreWorkflow, .{ e.wio.io(), &s });
+    e.wio.run();
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, s.acquired.items());
+    e.fake.runAll(&e.wio);
+    try testing.expectEqual(@as(u32, 2), s.max_active);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5 }, s.acquired.items());
+    try testing.expectEqual(@as(usize, 2), s.sem.permits);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+fn eventWaiter(i: Io, ev: *Io.Event, trace: *Trace, id: u32) void {
+    ev.wait(i) catch unreachable;
+    trace.add(id);
+}
+
+fn eventSetter(i: Io, ev: *Io.Event, trace: *Trace) void {
+    i.sleep(.fromSeconds(10), .awake) catch unreachable;
+    trace.add(99);
+    ev.set(i);
+}
+
+fn eventWorkflow(i: Io, trace: *Trace) void {
+    var ev: Io.Event = .unset;
+    var g: Io.Group = .init;
+    for (1..4) |id| g.async(i, eventWaiter, .{ i, &ev, trace, @as(u32, @intCast(id)) });
+    g.async(i, eventSetter, .{ i, &ev, trace });
+    g.await(i) catch unreachable;
+    // Once set, waiting returns at once.
+    ev.wait(i) catch unreachable;
+    trace.add(100);
+}
+
+test "std.Io.Event.set wakes every waiter after a durable timer" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var trace: Trace = .{};
+    _ = try e.wio.spawn("wf", eventWorkflow, .{ e.wio.io(), &trace });
+    e.wio.run();
+    try testing.expectEqual(@as(usize, 0), trace.len);
+    e.fake.runAll(&e.wio);
+    try testing.expectEqualSlices(u32, &.{ 99, 1, 2, 3, 100 }, trace.items());
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+const ConditionState = struct {
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
+    tokens: u32 = 0,
+    open: bool = false,
+    trace: Trace = .{},
+};
+
+fn conditionWaiter(i: Io, s: *ConditionState, id: u32) void {
+    s.mutex.lockUncancelable(i);
+    defer s.mutex.unlock(i);
+    while (s.tokens == 0 and !s.open) s.cond.wait(i, &s.mutex) catch unreachable;
+    if (s.tokens > 0) s.tokens -= 1;
+    s.trace.add(id);
+}
+
+fn conditionController(i: Io, s: *ConditionState) void {
+    i.sleep(.fromSeconds(1), .awake) catch unreachable;
+    s.mutex.lockUncancelable(i);
+    s.tokens = 1;
+    s.cond.signal(i);
+    s.mutex.unlock(i);
+    i.sleep(.fromSeconds(1), .awake) catch unreachable;
+    s.mutex.lockUncancelable(i);
+    s.open = true;
+    s.cond.broadcast(i);
+    s.mutex.unlock(i);
+}
+
+fn conditionWorkflow(i: Io, s: *ConditionState) void {
+    var g: Io.Group = .init;
+    for (1..4) |id| g.async(i, conditionWaiter, .{ i, s, @as(u32, @intCast(id)) });
+    g.async(i, conditionController, .{ i, s });
+    g.await(i) catch unreachable;
+}
+
+test "std.Io.Condition signal wakes one waiter and broadcast wakes the rest" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var s: ConditionState = .{};
+    _ = try e.wio.spawn("wf", conditionWorkflow, .{ e.wio.io(), &s });
+    e.wio.run();
+    try testing.expectEqual(@as(usize, 0), s.trace.len);
+    try testing.expect(e.fake.fireNext(&e.wio));
+    e.wio.run();
+    try testing.expectEqualSlices(u32, &.{1}, s.trace.items());
+    try testing.expect(e.fake.fireNext(&e.wio));
+    e.wio.run();
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, s.trace.items());
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+const Blockers = struct {
+    sem: Io.Semaphore = .{},
+    event: Io.Event = .unset,
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
+    results: [3]?anyerror = @splat(null),
+
+    fn onSemaphore(i: Io, b: *Blockers) void {
+        b.sem.wait(i) catch |err| {
+            b.results[0] = err;
+        };
+    }
+
+    fn onEvent(i: Io, b: *Blockers) void {
+        b.event.wait(i) catch |err| {
+            b.results[1] = err;
+        };
+    }
+
+    fn onCondition(i: Io, b: *Blockers) void {
+        b.mutex.lockUncancelable(i);
+        defer b.mutex.unlock(i);
+        b.cond.wait(i, &b.mutex) catch |err| {
+            b.results[2] = err;
+        };
+    }
+
+    fn run(i: Io, b: *Blockers) void {
+        var sem = i.async(onSemaphore, .{ i, b });
+        var event = i.async(onEvent, .{ i, b });
+        var cond = i.async(onCondition, .{ i, b });
+        i.sleep(.fromSeconds(1), .awake) catch unreachable;
+        sem.cancel(i);
+        event.cancel(i);
+        cond.cancel(i);
+    }
+};
+
+test "a coroutine canceled while blocked on a Semaphore, Event, or Condition gets error.Canceled" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var b: Blockers = .{};
+    _ = try e.wio.spawn("wf", Blockers.run, .{ e.wio.io(), &b });
+    e.wio.run();
+    try testing.expectEqualSlices(?anyerror, &.{ null, null, null }, &b.results);
+    e.fake.runAll(&e.wio);
+    try testing.expectEqualSlices(?anyerror, &.{ error.Canceled, error.Canceled, error.Canceled }, &b.results);
+    try testing.expectEqual(@as(?*Wait, null), e.wio.futex_head);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+const Received = union(enum) {
+    received: (Io.QueueClosedError || Io.Cancelable)!u32,
+    timeout: Io.Cancelable!void,
+};
+
+fn sendAfter(i: Io, q: *Io.Queue(u32), secs: i64, value: u32) void {
+    i.sleep(.fromSeconds(secs), .awake) catch return;
+    q.putOne(i, value) catch return;
+}
+
+fn receiveOrTimeout(i: Io, send_secs: i64, out: *[2]?u32) void {
+    var buf: [1]u32 = undefined;
+    var q: Io.Queue(u32) = .init(&buf);
+    var drained: [1]u32 = undefined;
+    // The non-blocking path: min = 0 returns at once with what is there.
+    assert((q.get(i, &drained, 0) catch unreachable) == 0);
+
+    var sender: Io.Group = .init;
+    sender.async(i, sendAfter, .{ i, &q, send_secs, 7 });
+
+    var results: [2]Received = undefined;
+    var sel: Io.Select(Received) = .init(i, &results);
+    sel.async(.received, Io.Queue(u32).getOne, .{ &q, i });
+    sel.async(.timeout, Io.sleep, .{ i, .fromSeconds(10), .awake });
+    switch (sel.await() catch unreachable) {
+        .received => |r| out[0] = r catch unreachable,
+        .timeout => |r| r catch unreachable,
+    }
+    sel.cancelDiscard();
+    sender.await(i) catch unreachable;
+    // A canceled receive takes nothing: a value sent afterwards stays in the queue.
+    if ((q.get(i, &drained, 0) catch unreachable) == 1) out[1] = drained[0];
+}
+
+test "std.Io.Select races a std.Io.Queue receive against a timer" {
+    // The value arrives first: the receive wins and the timer is canceled.
+    {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var out: [2]?u32 = .{ null, null };
+        _ = try e.wio.spawn("wf", receiveOrTimeout, .{ e.wio.io(), 5, &out });
+        e.fake.runAll(&e.wio);
+        try testing.expectEqualSlices(?u32, &.{ 7, null }, &out);
+        try testing.expectEqual(@as(u32, 1), e.fake.canceled);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+    }
+    // The timer fires first: the receive is canceled, and the late value stays queued.
+    {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var out: [2]?u32 = .{ null, null };
+        _ = try e.wio.spawn("wf", receiveOrTimeout, .{ e.wio.io(), 20, &out });
+        e.fake.runAll(&e.wio);
+        try testing.expectEqualSlices(?u32, &.{ null, 7 }, &out);
+        try testing.expectEqual(@as(u32, 0), e.fake.canceled);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+    }
 }

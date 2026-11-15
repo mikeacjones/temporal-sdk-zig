@@ -1582,6 +1582,45 @@ const SignalFixtures = struct {
         return std.mem.join(ctx.allocator(), " ", s.names.items);
     }
     const AwaitApprovals = workflow.Def("AwaitApprovals", awaitApprovals);
+
+    const Race = union(enum) { approval: error{Canceled}![]const u8, timeout: Io.Cancelable!void };
+    /// Sleeps 2 s before opening a channel for approvals, so a signal sent at once is
+    /// buffered; then receives two, each raced against a one-minute timer, and greets each
+    /// approver with an activity (or, `greet` unset, keeps the name).
+    fn receive(ctx: *workflow.Context, comptime greet: bool) ![]const u8 {
+        const io = ctx.io();
+        try io.sleep(.fromSeconds(2), .awake);
+        const approvals = try ctx.signalChannel(Approve);
+        var greetings: std.ArrayList([]const u8) = .empty;
+        while (greetings.items.len < 2) {
+            var buf: [2]Race = undefined;
+            var select: Io.Select(Race) = .init(io, &buf);
+            select.async(.approval, workflow.SignalChannel(Approve.Args).receive, .{approvals});
+            select.async(.timeout, Io.sleep, .{ io, .fromSeconds(60), .awake });
+            const first = try select.await();
+            select.cancelDiscard();
+            const greeting = switch (first) {
+                .approval => |r| if (greet)
+                    try ctx.executeActivity(Fixtures.Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{try r}).get()
+                else
+                    try r,
+                .timeout => |r| blk: {
+                    try r;
+                    break :blk "nobody";
+                },
+            };
+            try greetings.append(ctx.allocator(), greeting);
+        }
+        return std.mem.join(ctx.allocator(), " ", greetings.items);
+    }
+    fn receiveApprovals(ctx: *workflow.Context) ![]const u8 {
+        return receive(ctx, true);
+    }
+    const ReceiveApprovals = workflow.Def("ReceiveApprovals", receiveApprovals);
+    fn receiveApprovalsWithoutActivity(ctx: *workflow.Context) ![]const u8 {
+        return receive(ctx, false);
+    }
+    const ReceiveApprovalsChanged = workflow.Def("ReceiveApprovals", receiveApprovalsWithoutActivity);
 };
 
 const UpdateFixtures = struct {
@@ -2491,6 +2530,24 @@ test "WorkflowReplayer replays signal handlers and catches a handler that change
     defer changed.deinit();
     try changed.registerWorkflow(SignalFixtures.CollectApprovalsChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(signal_history));
+}
+
+/// A dev-server run of `SignalFixtures.ReceiveApprovals` signaled "ann" while it slept, before
+/// it opened its channel, and "bob" while its receive raced the timer (which bob's signal
+/// canceled), recorded from a `WorkflowEnvironment` dev server with `Client.fetchHistory` and
+/// encoded as ProtoJSON.
+const signal_channel_history = @embedFile("testdata/signal_channel_history.json");
+
+test "WorkflowReplayer replays a signal channel's receives and catches a receiver that changed" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(SignalFixtures.ReceiveApprovals);
+    try ok.replayHistoryJson(signal_channel_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(SignalFixtures.ReceiveApprovalsChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(signal_channel_history));
 }
 
 /// A dev-server run of `UpdateFixtures.HandleUpdates` sent, with `temporal workflow update

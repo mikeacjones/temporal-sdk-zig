@@ -164,6 +164,11 @@ dynamic_signal_handler: ?SignalHandler = null,
 /// Signals that arrived before a handler for their name (or a dynamic handler), in arrival
 /// order. Arena memory.
 buffered_signals: std.ArrayList(*const Signal) = .empty,
+/// Every signal channel the run created, in creation order, for `unhandledSignalNames`.
+/// Arena memory.
+signal_channels: std.ArrayList(*SignalChannel) = .empty,
+/// How many signals have been delivered: the next one's `Signal.arrival`.
+signals_delivered: u64 = 0,
 /// Update handlers by update name, in registration order (the order an unregistered update's
 /// rejection lists them in). Arena memory.
 update_handlers: std.array_hash_map.String(UpdateHandler) = .empty,
@@ -233,8 +238,92 @@ pub const UpdateHandler = struct {
     call: *const fn (context: *const anyopaque, out: Allocator, args: *const anyopaque) anyerror!converter.Payload,
 };
 
-/// A delivered signal, copied into the arena so it outlives its activation.
-const Signal = struct { name: []const u8, args: []const converter.Payload, header: converter.Header };
+/// A delivered signal, copied into the arena so it outlives its activation. `arrival` orders
+/// signals by delivery.
+const Signal = struct { name: []const u8, args: []const converter.Payload, header: converter.Header, arrival: u64 };
+
+/// The untyped part of `workflow.SignalChannel`: the signals its handler took, with their
+/// decoded arguments, until a receive reads them. Arena memory, created by
+/// `createSignalChannel`.
+pub const SignalChannel = struct {
+    inst: *Instance,
+    /// Unread signals are `items[head..]`, oldest first.
+    items: std.ArrayList(Item) = .empty,
+    head: usize = 0,
+    /// Coroutines blocked in `receive`, each on its own stack.
+    waiters: ?*Waiter = null,
+
+    const Item = struct { signal: *const Signal, args: *const anyopaque };
+    const Waiter = struct { wait: WorkflowIo.Wait, next: ?*Waiter = null };
+
+    pub fn len(ch: *const SignalChannel) usize {
+        return ch.items.items.len - ch.head;
+    }
+
+    /// The oldest unread signal's decoded arguments, removed from the channel, or null.
+    pub fn take(ch: *SignalChannel) ?*const anyopaque {
+        if (ch.head == ch.items.items.len) return null;
+        const item = ch.items.items[ch.head];
+        ch.head += 1;
+        if (ch.head == ch.items.items.len) {
+            ch.items.clearRetainingCapacity();
+            ch.head = 0;
+        }
+        return item.args;
+    }
+
+    /// Like `take`, but blocks the calling coroutine until a signal arrives. Returns
+    /// error.Canceled when the coroutine is canceled while it waits (by an enclosing future,
+    /// `Select`, or `Group`, or with the workflow), leaving the channel's signals unread.
+    pub fn receive(ch: *SignalChannel) error{Canceled}!*const anyopaque {
+        while (true) {
+            if (ch.take()) |args| return args;
+            var waiter: Waiter = .{ .wait = ch.inst.wio.newWaitPoint(), .next = ch.waiters };
+            ch.waiters = &waiter;
+            defer ch.removeWaiter(&waiter);
+            try ch.inst.wio.waitFor(&waiter.wait, true);
+        }
+    }
+
+    fn removeWaiter(ch: *SignalChannel, waiter: *Waiter) void {
+        var link = &ch.waiters;
+        while (link.*) |w| : (link = &w.next) if (w == waiter) {
+            link.* = w.next;
+            return;
+        };
+    }
+
+    /// Appends a signal its handler coroutine decoded and wakes every waiting receive; each
+    /// takes one signal or waits again.
+    ///
+    /// The receives run before the coroutines that are already ready, such as a timer's
+    /// sleep that the same activation fired (core delivers signals before timers). A receive
+    /// raced against that timer in a `std.Io.Select` then completes first, so the Select
+    /// returns the signal; otherwise the receive would take the signal after the timer won,
+    /// and canceling the Select would discard it.
+    fn push(ch: *SignalChannel, signal: *const Signal, args: *const anyopaque) error{OutOfMemory}!void {
+        try ch.items.append(ch.inst.arena(), .{ .signal = signal, .args = args });
+        // Each is woken to the front, so the last woken runs first. `waiters` is newest
+        // first, which leaves the oldest receive running first.
+        var next = ch.waiters;
+        ch.waiters = null;
+        while (next) |w| {
+            next = w.next;
+            ch.inst.wio.wakeFirst(&w.wait);
+        }
+    }
+
+    fn handlerCall(context: *const anyopaque, args: *const anyopaque) anyerror!void {
+        const ch: *SignalChannel = @ptrCast(@alignCast(@constCast(context)));
+        const run = ch.inst.currentHandler() orelse return error.HandlerNotFound;
+        run.taken = true;
+        return ch.push(run.kind.signal.signal, args);
+    }
+
+    fn isHandler(handler: SignalHandler) bool {
+        return handler.call == handlerCall;
+    }
+};
 
 /// A delivered update, copied into the arena so it outlives its activation.
 const Update = struct {
@@ -263,6 +352,8 @@ const HandlerRun = struct {
     /// awaited; the workflow function's are in `Context`.
     pending_failure: ?failure_mod.Application = null,
     last_failure: ?*const Failure = null,
+    /// Set when a signal channel's handler appended the signal to its channel.
+    taken: bool = false,
 };
 
 /// `continued_as_new`: the workflow function returned error.ContinueAsNew after
@@ -758,6 +849,71 @@ pub fn setDynamicSignalHandler(inst: *Instance, handler: SignalHandler, context_
     for (buffered) |signal| try inst.startSignalHandler(handler, signal);
 }
 
+/// Creates a signal channel and registers it as the handler for signals called `name` (which
+/// must outlive the run), as `setSignalHandler` would. Each signal of that name runs the
+/// inbound interceptors and `decode` in a handler coroutine of its own, which appends the
+/// decoded arguments to the channel; buffered signals of that name start theirs here.
+/// `ch` is arena memory the caller allocated.
+pub fn createSignalChannel(inst: *Instance, name: []const u8, ch: *SignalChannel, decode: *const fn (out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque) error{OutOfMemory}!void {
+    ch.* = .{ .inst = inst };
+    try inst.signal_channels.append(inst.arena(), ch);
+    inst.setSignalHandler(name, .{ .context = ch, .decode = decode, .call = SignalChannel.handlerCall }, null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SignalContextOnStack => unreachable, // no context address is checked
+    };
+}
+
+/// The channel registered for signals called `name` whose arguments `decode` decodes, or null
+/// if another handler (or a channel of other argument types) handles them, or none does.
+pub fn signalChannelFor(inst: *Instance, name: []const u8, decode: *const fn (out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque) ?*SignalChannel {
+    const handler = inst.signal_handlers.get(name) orelse return null;
+    if (handler.call != SignalChannel.handlerCall or handler.decode != decode) return null;
+    return @ptrCast(@alignCast(@constCast(handler.context)));
+}
+
+/// Unregisters the handler (or channel) for signals called `name`, if any. Later signals of
+/// that name go to the dynamic handler, or are buffered. Handler coroutines already started
+/// run to completion, and a channel keeps the signals it already took.
+pub fn removeSignalHandler(inst: *Instance, name: []const u8) void {
+    _ = inst.signal_handlers.orderedRemove(name);
+}
+
+/// Unregisters the dynamic signal handler, if any: later signals with no handler of their own
+/// are buffered. Handler coroutines already started run to completion.
+pub fn removeDynamicSignalHandler(inst: *Instance) void {
+    inst.dynamic_signal_handler = null;
+}
+
+/// The signals nothing has taken: buffered ones and those still unread in a channel, oldest
+/// first. Allocated in `a`.
+fn unhandledSignals(inst: *Instance, a: Allocator) error{OutOfMemory}![]*const Signal {
+    var all: std.ArrayList(*const Signal) = .empty;
+    try all.appendSlice(a, inst.buffered_signals.items);
+    for (inst.signal_channels.items) |ch| for (ch.items.items[ch.head..]) |item| try all.append(a, item.signal);
+    // A signal on its way to a channel, whose handler coroutine hasn't appended it yet.
+    for ([_][]const *HandlerRun{ inst.handlers.items, inst.held_handlers.items }) |runs| for (runs) |run| switch (run.kind) {
+        .signal => |s| if (!run.taken and SignalChannel.isHandler(s.handler)) try all.append(a, s.signal),
+        .update => {},
+    };
+    std.mem.sort(*const Signal, all.items, {}, struct {
+        fn lessThan(_: void, l: *const Signal, r: *const Signal) bool {
+            return l.arrival < r.arrival;
+        }
+    }.lessThan);
+    return all.items;
+}
+
+/// The distinct names of the signals nothing has taken (buffered, or unread in a channel), in
+/// the order each name first arrived. Allocated in `a`; the names are arena memory of the run.
+pub fn unhandledSignalNames(inst: *Instance, a: Allocator) error{OutOfMemory}![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    outer: for (try inst.unhandledSignals(a)) |signal| {
+        for (names.items) |n| if (std.mem.eql(u8, n, signal.name)) continue :outer;
+        try names.append(a, signal.name);
+    }
+    return names.items;
+}
+
 /// Copies a SignalWorkflow job into the arena and starts its handler, or buffers it until a
 /// handler for its name is registered.
 fn deliverSignal(inst: *Instance, job: *const act_pb.SignalWorkflow) !void {
@@ -767,7 +923,8 @@ fn deliverSignal(inst: *Instance, job: *const act_pb.SignalWorkflow) !void {
     const args = try a.alloc(converter.Payload, job.input.items.len);
     for (job.input.items, args) |p, *d| d.* = try p.dupe(a);
     const signal = try a.create(Signal);
-    signal.* = .{ .name = try a.dupe(u8, job.signal_name), .args = args, .header = try .fromEntries(a, job.headers.items) };
+    signal.* = .{ .name = try a.dupe(u8, job.signal_name), .args = args, .header = try .fromEntries(a, job.headers.items), .arrival = inst.signals_delivered };
+    inst.signals_delivered += 1;
     if (inst.signal_handlers.get(signal.name)) |handler| return inst.startSignalHandler(handler, signal);
     if (inst.dynamic_signal_handler) |handler| return inst.startSignalHandler(handler, signal);
     try inst.buffered_signals.append(a, signal);
@@ -1154,13 +1311,10 @@ fn finishIfDone(inst: *Instance) !void {
     const outcome = inst.root_outcome orelse return;
     inst.finished = true;
     const a = inst.arena();
-    if (inst.buffered_signals.items.len > 0) {
-        var names: std.ArrayList(u8) = .empty;
-        for (inst.buffered_signals.items, 0..) |signal, i| {
-            if (i > 0) try names.appendSlice(a, ", ");
-            try names.appendSlice(a, signal.name);
-        }
-        inst.logger.warn("the workflow finished with signals no handler was registered for; they are dropped", .{ .count = inst.buffered_signals.items.len, .SignalNames = names.items });
+    const unhandled = try inst.unhandledSignals(a);
+    if (unhandled.len > 0) {
+        const names = try std.mem.join(a, ", ", try inst.unhandledSignalNames(a));
+        inst.logger.warn("the workflow finished with signals that no handler took or that are unread in a signal channel; they are dropped", .{ .count = unhandled.len, .SignalNames = names });
     }
     if (inst.held_handlers.items.len > 0) {
         var names: std.ArrayList(u8) = .empty;
@@ -2939,6 +3093,599 @@ test "signal external by name: the command carries a copy of the name built at r
     try testing.expect(done[done.len - 1].variant.? == .complete_workflow_execution);
 }
 
+// Signal channels, unhandled signal names, and removing handlers.
+const ChannelSignals = struct {
+    const Approve = Signals.Approve;
+    const Pair = workflow.SignalDef("pair", fn (a: i64, b: i64) void);
+    const ApproveCh = workflow.SignalChannel(Approve.Args);
+    const PairCh = workflow.SignalChannel(Pair.Args);
+
+    fn join(ctx: *workflow.Context, items: []const []const u8) ![]const u8 {
+        return std.mem.join(ctx.allocator(), ",", items);
+    }
+    fn hasOne(ch: *ApproveCh) bool {
+        return ch.len() >= 1;
+    }
+    fn hasTwo(ch: *PairCh) bool {
+        return ch.len() >= 2;
+    }
+
+    /// Sleeps 10 s with no handler, then receives `want` approvals through a channel.
+    fn receiveLate(ctx: *workflow.Context, want: usize) ![]const u8 {
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        const ch = try ctx.signalChannel(Approve);
+        if (ch != try ctx.signalChannel(Approve)) return "a second channel";
+        var got: std.ArrayList([]const u8) = .empty;
+        for (0..want) |_| try got.append(ctx.allocator(), try ch.receive());
+        if (ch.tryReceive() != null) return "an extra approval";
+        return join(ctx, got.items);
+    }
+
+    /// Waits until two `pair` signals are unread, then reads them without blocking.
+    fn peek(ctx: *workflow.Context) ![]const u8 {
+        const ch = try ctx.signalChannel(Pair);
+        const before = ch.len();
+        try ctx.await(ch, hasTwo);
+        const first = ch.tryReceive().?;
+        const second = ch.tryReceive().?;
+        return std.fmt.allocPrint(ctx.allocator(), "{} {}+{} {}+{} {} {}", .{ before, first[0], first[1], second[0], second[1], ch.tryReceive() == null, ch.len() });
+    }
+
+    /// Waits for an approval; returns how the wait ended.
+    fn cancelable(ctx: *workflow.Context) ![]const u8 {
+        const ch = try ctx.signalChannelByName("approve", Approve.Args);
+        const approver = ch.receive() catch |err| return @errorName(err);
+        return approver;
+    }
+
+    const Race = union(enum) { approval: error{Canceled}!ApproveCh.Value, timeout: std.Io.Cancelable!void };
+
+    /// Collects approvals until a minute passes without one, then sleeps 10 s more and
+    /// reports what is left unread.
+    fn untilQuiet(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const ch = try ctx.signalChannel(Approve);
+        var got: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            var buf: [2]Race = undefined;
+            var select: std.Io.Select(Race) = .init(io, &buf);
+            select.async(.approval, ApproveCh.receive, .{ch});
+            select.async(.timeout, std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+            const first = try select.await();
+            select.cancelDiscard();
+            switch (first) {
+                .approval => |r| try got.append(ctx.allocator(), try r),
+                .timeout => |r| {
+                    try r;
+                    break;
+                },
+            }
+        }
+        try io.sleep(.fromSeconds(10), .awake);
+        const left = try join(ctx, try ctx.unhandledSignalNames());
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|{}|{s}", .{ try join(ctx, got.items), ch.len(), left });
+    }
+
+    /// Takes approvals through a channel that it never reads, sleeps 10 s, and returns the
+    /// unhandled signal names.
+    fn leaveUnread(ctx: *workflow.Context) ![]const u8 {
+        _ = try ctx.signalChannel(Approve);
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        return join(ctx, try ctx.unhandledSignalNames());
+    }
+
+    /// Handles approvals with a handler that records the approver, sleeps 5 s, and records
+    /// it again; removes it once the first arrives and sleeps 10 s; then handles what came
+    /// meanwhile dynamically; removes that too, and sleeps 10 s more.
+    fn removal(ctx: *workflow.Context) ![]const u8 {
+        const s = try Signals.State.create(ctx, 1);
+        try ctx.setSignalHandler(Approve, s, approveThenSleep);
+        try ctx.setSignalHandlerByName("unlock", struct { []const u8 }, s, Signals.State.approve);
+        try ctx.await(s, Signals.State.enough);
+        ctx.removeSignalHandler(Approve);
+        ctx.removeSignalHandlerByName("unlock");
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        try s.add(try std.fmt.allocPrint(ctx.allocator(), "[{s}]", .{try join(ctx, try ctx.unhandledSignalNames())}));
+        try ctx.setDynamicSignalHandler(s, RuntimeSignals.dynamic);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        ctx.removeDynamicSignalHandler();
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        try s.add(try std.fmt.allocPrint(ctx.allocator(), "[{s}]", .{try join(ctx, try ctx.unhandledSignalNames())}));
+        return s.joined();
+    }
+    fn approveThenSleep(s: *Signals.State, approver: []const u8) !void {
+        try s.add(approver);
+        try s.ctx.io().sleep(.fromSeconds(5), .awake);
+        try s.add(try std.fmt.allocPrint(s.ctx.allocator(), "{s}!", .{approver}));
+    }
+
+    /// Sleeps 10 s, opens a channel over the buffered approvals, and reports at once, without
+    /// blocking, the unhandled names, `len`, and whether `tryReceive` got one.
+    fn openNoYield(ctx: *workflow.Context) ![]const u8 {
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        const ch = try ctx.signalChannel(Approve);
+        const names = try join(ctx, try ctx.unhandledSignalNames());
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|{}|{}", .{ names, ch.len(), ch.tryReceive() != null });
+    }
+
+    const Reject = workflow.SignalDef("reject", fn (who: []const u8) void);
+    const RejectCh = workflow.SignalChannel(Reject.Args);
+    const Either = union(enum) { approve: error{Canceled}![]const u8, reject: error{Canceled}![]const u8 };
+
+    /// Records a received signal; a receive that the Select canceled got none.
+    fn either(ctx: *workflow.Context, got: *std.ArrayList([]const u8), result: Either) !void {
+        const entry = switch (result) {
+            .approve => |r| try std.fmt.allocPrint(ctx.allocator(), "a:{s}", .{r catch return}),
+            .reject => |r| try std.fmt.allocPrint(ctx.allocator(), "r:{s}", .{r catch return}),
+        };
+        try got.append(ctx.allocator(), entry);
+    }
+
+    /// Opens channels for approvals and rejections, sleeps `sleep_s` seconds if positive,
+    /// then races a receive on each in a new Select until two signals arrived. Each round
+    /// cancels its Select with `cancel` until it returns null, keeping a receive that finished
+    /// after the first result, as `cancelDiscard` wouldn't.
+    fn twoChannels(ctx: *workflow.Context, sleep_s: i64) ![]const u8 {
+        const io = ctx.io();
+        const approvals = try ctx.signalChannel(Approve);
+        const rejections = try ctx.signalChannel(Reject);
+        if (sleep_s > 0) try io.sleep(.fromSeconds(sleep_s), .awake);
+        var got: std.ArrayList([]const u8) = .empty;
+        while (got.items.len < 2) {
+            var buf: [2]Either = undefined;
+            var select: std.Io.Select(Either) = .init(io, &buf);
+            select.async(.approve, ApproveCh.receive, .{approvals});
+            select.async(.reject, RejectCh.receive, .{rejections});
+            try either(ctx, &got, try select.await());
+            while (select.cancel()) |late| try either(ctx, &got, late);
+        }
+        return join(ctx, got.items);
+    }
+
+    /// Races a receive on each channel in one Select and awaits it twice.
+    fn selectTwice(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var buf: [2]Either = undefined;
+        var select: std.Io.Select(Either) = .init(io, &buf);
+        defer select.cancelDiscard();
+        select.async(.approve, ApproveCh.receive, .{try ctx.signalChannel(Approve)});
+        select.async(.reject, RejectCh.receive, .{try ctx.signalChannel(Reject)});
+        var got: std.ArrayList([]const u8) = .empty;
+        try either(ctx, &got, try select.await());
+        try either(ctx, &got, try select.await());
+        return join(ctx, got.items);
+    }
+
+    /// Removes its channel once an approval is unread; later approvals wait for a new one.
+    fn channelRemoved(ctx: *workflow.Context) ![]const u8 {
+        const ch = try ctx.signalChannel(Approve);
+        try ctx.await(ch, hasOne);
+        ctx.removeSignalHandler(Approve);
+        try ctx.io().sleep(.fromSeconds(10), .awake);
+        const left = try join(ctx, try ctx.unhandledSignalNames());
+        const kept = ch.tryReceive().?;
+        const again = try ctx.signalChannel(Approve);
+        if (again == ch) return "the removed channel";
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|{s}|{s}|{}", .{ kept, left, try again.receive(), ch.len() });
+    }
+};
+const ChannelLateWf = workflow.Def("ChannelLate", ChannelSignals.receiveLate);
+const OpenNoYieldWf = workflow.Def("OpenNoYield", ChannelSignals.openNoYield);
+const TwoChannelsWf = workflow.Def("TwoChannels", ChannelSignals.twoChannels);
+const SelectTwiceWf = workflow.Def("SelectTwice", ChannelSignals.selectTwice);
+const ChannelPeekWf = workflow.Def("ChannelPeek", ChannelSignals.peek);
+const ChannelCancelWf = workflow.Def("ChannelCancel", ChannelSignals.cancelable);
+const ChannelQuietWf = workflow.Def("ChannelQuiet", ChannelSignals.untilQuiet);
+const LeaveUnreadWf = workflow.Def("LeaveUnread", ChannelSignals.leaveUnread);
+const RemovalWf = workflow.Def("Removal", ChannelSignals.removal);
+const ChannelRemovedWf = workflow.Def("ChannelRemoved", ChannelSignals.channelRemoved);
+
+test "a signal channel receives buffered signals, then later ones, in arrival order" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChannelLateWf.registered, .{});
+    defer inst.destroy();
+
+    var start = try initActivation(a, "ChannelLate", .{@as(usize, 3)});
+    try start.jobs.append(a, .{ .variant = try signalJob(a, "approve", .{@as([]const u8, "ann")}) });
+    try testing.expect(commandsOf(try inst.activate(&start, a))[0].variant.? == .start_timer);
+    // One whose argument doesn't decode is dropped; one of another name stays buffered.
+    var early = try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "bob")}));
+    try early.jobs.append(a, .{ .variant = try signalJob(a, "approve", .{@as(i64, 5)}) });
+    try early.jobs.append(a, .{ .variant = try signalJob(a, "unknown", .{}) });
+    _ = try inst.activate(&early, a);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)).len);
+    const names = try inst.ctx.unhandledSignalNames();
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("unknown", names[0]);
+    try testing.expectEqualStrings("\"ann,bob,cy\"", completedWith(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "cy")})), a)));
+}
+
+test "a signal channel's tryReceive and len read without blocking; a multi-argument signal arrives as its tuple" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChannelPeekWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "ChannelPeek", .{}), a);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "pair", .{ @as(i64, 1), @as(i64, 2) })), a)).len);
+    try testing.expectEqualStrings("\"0 1+2 3+4 true 0\"", completedWith(try inst.activate(&try oneJob(a, try signalJob(a, "pair", .{ @as(i64, 3), @as(i64, 4) })), a)));
+}
+
+test "a signal channel receive returns error.Canceled when the workflow is canceled" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChannelCancelWf.registered, .{});
+    defer inst.destroy();
+
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try initActivation(a, "ChannelCancel", .{}), a)).len);
+    try testing.expectEqualStrings("\"Canceled\"", completedWith(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a)));
+}
+
+test "a signal channel receive races a timer in a Select: a signal cancels the timer, the timer cancels the receive" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChannelQuietWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "ChannelQuiet", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+    // The approval wins: its timer is canceled and the next round starts another.
+    const won = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a));
+    try testing.expectEqual(@as(usize, 2), won.len);
+    try testing.expectEqual(@as(u32, 1), won[0].variant.?.cancel_timer.seq);
+    try testing.expectEqual(@as(u32, 2), won[1].variant.?.start_timer.seq);
+    // The timer wins: the receive is canceled, and an approval after it stays unread.
+    const quiet = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 2 } }), a));
+    try testing.expectEqual(@as(usize, 1), quiet.len);
+    try testing.expectEqual(@as(u32, 3), quiet[0].variant.?.start_timer.seq);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "bob")})), a)).len);
+    try testing.expectEqualStrings("\"ann|1|approve\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 3 } }), a)));
+}
+
+test "a signal channel receive wins a Select over a timer that fires in the same activation, so the signal isn't discarded" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChannelQuietWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "ChannelQuiet", .{}), a);
+    // Core puts signal jobs before timer jobs in one activation.
+    var both = try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")}));
+    try both.jobs.append(a, .{ .variant = .{ .fire_timer = .{ .seq = 1 } } });
+    const next = commandsOf(try inst.activate(&both, a));
+    try testing.expectEqual(@as(usize, 1), next.len);
+    try testing.expectEqual(@as(u32, 2), next[0].variant.?.start_timer.seq);
+    try testing.expectEqual(@as(u32, 3), commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 2 } }), a))[0].variant.?.start_timer.seq);
+    try testing.expectEqualStrings("\"ann|0|\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 3 } }), a)));
+}
+
+test "a Select over two signal channels returns one signal and leaves the other unread when both arrive together" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, TwoChannelsWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "TwoChannels", .{@as(i64, 0)}), a);
+    var both = try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")}));
+    try both.jobs.append(a, .{ .variant = try signalJob(a, "reject", .{@as([]const u8, "bob")}) });
+    try testing.expectEqualStrings("\"a:ann,r:bob\"", completedWith(try inst.activate(&both, a)));
+}
+
+test "a Select over two signal channels that both hold an unread signal takes only one per round" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, TwoChannelsWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "TwoChannels", .{@as(i64, 10)}), a);
+    _ = try inst.activate(&try oneJob(a, try signalJob(a, "reject", .{@as([]const u8, "bob")})), a);
+    _ = try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a);
+    try testing.expectEqualStrings("\"a:ann,r:bob\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)));
+}
+
+test "a Select awaited again lets its other signal channel receive take its signal" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SelectTwiceWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "SelectTwice", .{}), a);
+    var both = try oneJob(a, try signalJob(a, "reject", .{@as([]const u8, "bob")}));
+    try both.jobs.append(a, .{ .variant = try signalJob(a, "approve", .{@as([]const u8, "ann")}) });
+    try testing.expectEqualStrings("\"r:bob,a:ann\"", completedWith(try inst.activate(&both, a)));
+}
+
+// Signal channel receives in a std.Io.Group, and in a Select awaited for every result: a
+// member that finished doesn't hold back a receive whose owner still waits for more.
+const GroupReceivers = struct {
+    const Approve = Signals.Approve;
+    const Ch = workflow.SignalChannel(Approve.Args);
+
+    fn sleeper(io: std.Io) void {
+        io.sleep(.fromSeconds(1), .awake) catch {};
+    }
+    fn receiver(ch: *Ch, out: *[]const u8) void {
+        out.* = ch.receive() catch "canceled";
+    }
+
+    /// A Group with a 1 s sleeper and a receiver; awaits the whole group.
+    fn groupRun(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const ch = try ctx.signalChannel(Approve);
+        var out: []const u8 = "none";
+        var group: std.Io.Group = .init;
+        group.async(io, sleeper, .{io});
+        group.async(io, receiver, .{ ch, &out });
+        try group.await(io);
+        return out;
+    }
+
+    /// A Group of two receivers on one channel.
+    fn twoReceivers(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const ch = try ctx.signalChannel(Approve);
+        var a: []const u8 = "none";
+        var b: []const u8 = "none";
+        var group: std.Io.Group = .init;
+        group.async(io, receiver, .{ ch, &a });
+        group.async(io, receiver, .{ ch, &b });
+        try group.await(io);
+        return std.fmt.allocPrint(ctx.allocator(), "{s},{s}", .{ a, b });
+    }
+
+    const St = struct { got: ?[]const u8 = null };
+    fn gotIt(s: *St) bool {
+        return s.got != null;
+    }
+    fn receiveInto(ch: *Ch, st: *St) void {
+        st.got = ch.receive() catch "canceled";
+    }
+    fn receiveThenSleep(ch: *Ch, st: *St, io: std.Io) void {
+        st.got = ch.receive() catch "canceled";
+        io.sleep(.fromSeconds(7), .awake) catch {};
+    }
+
+    /// A Group with a 1 s sleeper and a receiver; the owner waits with `ctx.await` for what
+    /// the receiver got.
+    fn ownerAwaits(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const ch = try ctx.signalChannel(Approve);
+        var st: St = .{};
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        group.async(io, sleeper, .{io});
+        group.async(io, receiveInto, .{ ch, &st });
+        try ctx.await(&st, gotIt);
+        return st.got.?;
+    }
+
+    /// A Group with a 1 s sleeper and a receiver that sleeps 7 s once it got its signal; the
+    /// owner sleeps 100 s before awaiting the Group.
+    fn ownerSleeps(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const ch = try ctx.signalChannel(Approve);
+        var st: St = .{};
+        var group: std.Io.Group = .init;
+        group.async(io, sleeper, .{io});
+        group.async(io, receiveThenSleep, .{ ch, &st, io });
+        try io.sleep(.fromSeconds(100), .awake);
+        try group.await(io);
+        return st.got orelse "none";
+    }
+
+    fn setAfter(io: std.Io, ev: *std.Io.Event) void {
+        io.sleep(.fromSeconds(5), .awake) catch {};
+        ev.set(io);
+    }
+    /// Races a receive against a 1 s timer, but waits on an Event set after 5 s before it
+    /// awaits the Select; then cancels the Select with `cancel` until it returns null.
+    fn selectLate(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const ch = try ctx.signalChannel(Approve);
+        var ev: std.Io.Event = .unset;
+        var setter = io.async(setAfter, .{ io, &ev });
+        var buf: [2]Race = undefined;
+        var select: std.Io.Select(Race) = .init(io, &buf);
+        select.async(.approval, Ch.receive, .{ch});
+        select.async(.timeout, std.Io.sleep, .{ io, .fromSeconds(1), .awake });
+        try ev.wait(io);
+        setter.await(io);
+        var got: std.ArrayList([]const u8) = .empty;
+        var next: ?Race = try select.await();
+        while (next) |r| : (next = select.cancel()) switch (r) {
+            .approval => |v| try got.append(ctx.allocator(), v catch "canceled"),
+            .timeout => |v| if (v) try got.append(ctx.allocator(), "timeout") else |_| {},
+        };
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|left={d}", .{ try std.mem.join(ctx.allocator(), ",", got.items), ch.len() });
+    }
+
+    const Race = union(enum) { approval: error{Canceled}![]const u8, timeout: std.Io.Cancelable!void };
+    /// A Select whose owner waits for both results with awaitMany.
+    fn selectBoth(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const ch = try ctx.signalChannel(Approve);
+        var buf: [2]Race = undefined;
+        var select: std.Io.Select(Race) = .init(io, &buf);
+        defer select.cancelDiscard();
+        select.async(.approval, Ch.receive, .{ch});
+        select.async(.timeout, std.Io.sleep, .{ io, .fromSeconds(1), .awake });
+        var got: [2]Race = undefined;
+        const n = try select.awaitMany(&got, 2);
+        for (got[0..n]) |r| switch (r) {
+            .approval => |v| return v,
+            .timeout => {},
+        };
+        return "no approval";
+    }
+};
+const GroupReceiveWf = workflow.Def("GroupReceive", GroupReceivers.groupRun);
+const GroupTwoReceiversWf = workflow.Def("GroupTwoReceivers", GroupReceivers.twoReceivers);
+const SelectBothWf = workflow.Def("SelectBoth", GroupReceivers.selectBoth);
+const GroupOwnerAwaitsWf = workflow.Def("GroupOwnerAwaits", GroupReceivers.ownerAwaits);
+const GroupOwnerSleepsWf = workflow.Def("GroupOwnerSleeps", GroupReceivers.ownerSleeps);
+const SelectLateWf = workflow.Def("SelectLate", GroupReceivers.selectLate);
+
+test "a receive in a Group gets its signal at once while the owner waits in ctx.await after a sibling finished" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, GroupOwnerAwaitsWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "GroupOwnerAwaits", .{}), a);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)).len);
+    try testing.expectEqualStrings("\"ann\"", completedWith(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a)));
+}
+
+test "a receive in a Group gets its signal at once while the owner sleeps after a sibling finished" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, GroupOwnerSleepsWf.registered, .{});
+    defer inst.destroy();
+
+    try testing.expectEqual(@as(usize, 2), commandsOf(try inst.activate(&try initActivation(a, "GroupOwnerSleeps", .{}), a)).len);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 2 } }), a)).len);
+    // The receiver's 7 s timer starts in the signal's activation, not after the owner's 100 s.
+    const got = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a));
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(@as(i64, 7), got[0].variant.?.start_timer.start_to_fire_timeout.?.seconds);
+    _ = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 3 } }), a);
+    try testing.expectEqualStrings("\"ann\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)));
+}
+
+test "a Select canceled with cancel until null returns a receive that finished after the first result" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SelectLateWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "SelectLate", .{}), a);
+    _ = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 2 } }), a); // the Select's 1 s timer
+    _ = try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a);
+    try testing.expectEqualStrings("\"timeout,ann|left=0\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)));
+}
+
+test "a receive in a Group gets its signal after a sibling member finished, while the owner awaits the Group" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, GroupReceiveWf.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "GroupReceive", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    _ = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a);
+    const c = try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a);
+    try testing.expectEqualStrings("\"ann\"", completedWith(c));
+}
+
+test "two receives on one channel in a Group each get one of two signals that arrive together" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, GroupTwoReceiversWf.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "GroupTwoReceivers", .{}), a);
+    var both = try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")}));
+    try both.jobs.append(a, .{ .variant = try signalJob(a, "approve", .{@as([]const u8, "bob")}) });
+    const c = try inst.activate(&both, a);
+    try testing.expectEqualStrings("\"ann,bob\"", completedWith(c));
+}
+
+test "a receive in a Select awaited for both results gets its signal after the timer finished" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SelectBothWf.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "SelectBoth", .{}), a);
+    _ = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a);
+    const c = try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a);
+    try testing.expectEqualStrings("\"ann\"", completedWith(c));
+}
+
+test "signals on their way to a just-opened channel are listed as unhandled" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, OpenNoYieldWf.registered, .{});
+    defer inst.destroy();
+
+    var start = try initActivation(a, "OpenNoYield", .{});
+    try start.jobs.append(a, .{ .variant = try signalJob(a, "approve", .{@as([]const u8, "ann")}) });
+    _ = try inst.activate(&start, a);
+    // len and tryReceive see the signal once the caller blocks, as documented.
+    try testing.expectEqualStrings("\"approve|0|false\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)));
+}
+
+test "unhandled signal names list buffered and unread channel signals once each, in first-arrival order, and the finish warning counts both" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, LeaveUnreadWf.registered, .{ .logger = recorder.sink() });
+    defer inst.destroy();
+
+    var start = try initActivation(a, "LeaveUnread", .{});
+    try start.jobs.append(a, .{ .variant = try signalJob(a, "x", .{}) });
+    _ = try inst.activate(&start, a);
+    var more = try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")}));
+    try more.jobs.append(a, .{ .variant = try signalJob(a, "y", .{}) });
+    try more.jobs.append(a, .{ .variant = try signalJob(a, "approve", .{@as([]const u8, "bob")}) });
+    try more.jobs.append(a, .{ .variant = try signalJob(a, "x", .{}) });
+    _ = try inst.activate(&more, a);
+    try testing.expectEqual(@as(usize, 0), recorder.count);
+    try testing.expectEqualStrings("\"x,approve,y\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)));
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+    try testing.expectEqualStrings("5", recorder.get("count").?);
+    try testing.expectEqualStrings("x, approve, y", recorder.get("SignalNames").?);
+}
+
+test "a removed signal handler finishes its running coroutines, and later signals are buffered or go to the dynamic handler" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, RemovalWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Removal", .{}), a);
+    const handling = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a));
+    try testing.expectEqual(@as(usize, 2), handling.len); // the handler's 5 s timer, the workflow's 10 s
+    var later = try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "bob")}));
+    try later.jobs.append(a, .{ .variant = try signalJob(a, "unlock", .{@as([]const u8, "key")}) });
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&later, a)).len);
+    try testing.expectEqual(@as(usize, 2), inst.buffered_signals.items.len);
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)).len);
+    try testing.expectEqual(@as(u32, 3), commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 2 } }), a))[0].variant.?.start_timer.seq);
+    _ = try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "cy")})), a);
+    try testing.expectEqualStrings("\"ann,ann!,[approve,unlock],approve=bob,unlock=key,[approve]\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 3 } }), a)));
+}
+
+test "a removed signal channel keeps the signals it took, and later ones wait for a new channel" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChannelRemovedWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "ChannelRemoved", .{}), a);
+    try testing.expectEqual(@as(u32, 1), commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "ann")})), a))[0].variant.?.start_timer.seq);
+    _ = try inst.activate(&try oneJob(a, try signalJob(a, "approve", .{@as([]const u8, "bob")})), a);
+    try testing.expectEqualStrings("\"ann|approve|bob|0\"", completedWith(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)));
+}
+
 // Update handlers. `State.value` is what `set` updates change; a `done` signal ends the run.
 const Updates = struct {
     const Set = workflow.UpdateDef("set", fn (value: i64) i64);
@@ -3492,6 +4239,81 @@ test "eviction while awaiting a condition frees everything" {
     const inst = try create(testing.allocator, GoroutinesWf.registered, .{});
     _ = try inst.activate(&try initActivation(a, "Goroutines", .{@as(usize, 2)}), a);
     inst.destroy();
+}
+
+// The workflow function and a coroutine it starts with io.async name themselves; the child
+// reads its name back after a durable timer.
+const CoroutineNames = struct {
+    fn child(ctx: *workflow.Context, seen: *[2][]const u8) !void {
+        seen[0] = ctx.coroutineName();
+        var name = "fetcher".*;
+        try ctx.setCoroutineName(&name);
+        name[0] = 'X'; // setCoroutineName copied it
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        seen[1] = ctx.coroutineName();
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const before = ctx.coroutineName();
+        try ctx.setCoroutineName("main");
+        var seen: [2][]const u8 = undefined;
+        var f = ctx.io().async(child, .{ ctx, &seen });
+        try f.await(ctx.io());
+        return std.mem.join(ctx.allocator(), ",", &.{ before, ctx.coroutineName(), seen[0], seen[1] });
+    }
+};
+const CoroutineNamesWf = workflow.Def("CoroutineNames", CoroutineNames.run);
+
+test "setCoroutineName names the calling coroutine, including one started with io.async" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, CoroutineNamesWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "CoroutineNames", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a));
+    try testing.expectEqualStrings("\"workflow,main,async,fetcher\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// Names itself, sleeps, and returns its name. Its query handler tries to rename the caller,
+// which outside a coroutine names nothing.
+const QueryRename = struct {
+    const Name = workflow.QueryDef("name", fn () []const u8);
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        try ctx.setCoroutineName("main");
+        try ctx.setQueryHandler(Name, ctx, name);
+        try ctx.io().sleep(.fromSeconds(1), .awake);
+        return ctx.coroutineName();
+    }
+
+    fn name(ctx: *workflow.Context) []const u8 {
+        ctx.setCoroutineName("from-query") catch return "OutOfMemory";
+        return ctx.coroutineName();
+    }
+};
+const QueryRenameWf = workflow.Def("QueryRename", QueryRename.run);
+
+test "setCoroutineName in a query handler names nothing and allocates nothing" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, QueryRenameWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "QueryRename", .{}), a));
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+    for (0..3) |_| {
+        const allocated = inst.allocated;
+        const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "name", &.{} }}), a);
+        try testing.expectEqualStrings("\"\"", answer(c, 0).variant.?.succeeded.response.?.data);
+        try testing.expectEqual(allocated, inst.allocated);
+    }
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a));
+    try testing.expectEqualStrings("\"main\"", done[0].variant.?.complete_workflow_execution.result.?.data);
 }
 
 // Waits on an activity with the cancellation type named by `mode`. If the activity completes

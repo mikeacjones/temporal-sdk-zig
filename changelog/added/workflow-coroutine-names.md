@@ -1,0 +1,2 @@
+`workflow.Context.setCoroutineName` names the calling workflow coroutine for stack-trace queries, and `workflow.Context.coroutineName` reads it back.
+`std.Io.Semaphore`, `std.Io.Event` and `std.Io.Condition` are tested and documented on the workflow `std.Io`, with the field-plus-`Event` idiom for a value one coroutine sets and another waits for, and `std.Io.Select` cases that receive from a `std.Io.Queue`; see [Concurrency](https://github.com/mikeacjones/temporal-sdk-zig#concurrency).

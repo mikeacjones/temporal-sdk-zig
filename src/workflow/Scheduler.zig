@@ -193,6 +193,16 @@ pub fn wake(s: *Scheduler, f: *Fiber) void {
     s.push(f);
 }
 
+/// `wake`, but the fiber goes to the front of the ready queue: it runs next.
+pub fn wakeFirst(s: *Scheduler, f: *Fiber) void {
+    assert(f.state == .blocked);
+    assert(f.queue_next == null);
+    f.state = .ready;
+    f.queue_next = s.ready_head;
+    s.ready_head = f;
+    if (s.ready_tail == null) s.ready_tail = f;
+}
+
 fn switchToMain(s: *Scheduler, f: *Fiber) void {
     switchStack(&f.sp, s.main_sp);
     // Resumed by `run`.
