@@ -85,6 +85,45 @@ expect pass "a GA missing row is printed" "missing  Absent (unfiled)" \
   '| Absent | Alpha, Beta | GA | missing | unfiled |'
 expect pass "pre-release gaps are not printed" "Every GA feature is supported" \
   '| Later | Alpha, Beta | pre-release | missing | unfiled |'
+# A GA row the owner deferred past the first release is listed under its own heading, not
+# among the gaps the first release still needs; only a partial or missing row naming its bead
+# can carry the mark.
+# expect_output <name> <exact output> <rows...>: the check passes and prints exactly this.
+expect_output() {
+  name="$1" want="$2"
+  shift 2
+  cases=$((cases + 1))
+  new_repo
+  parity "$@"
+  if ! out="$(sh "$src/scripts/parity-check.sh" "$repo" 2>&1)" || [ "$out" != "$want" ]; then
+    echo "FAIL $name: expected output \"$want\", got: $out"
+    failures=$((failures + 1))
+  fi
+}
+# shellcheck disable=SC2016
+expect_output "a deferred row is listed apart" "$(printf '%s\n' \
+  'parity-check: 2 rows checked. GA features the first release still needs:' \
+  '  partial  Partly (temporal-sdk-zig-d51.1)' \
+  'GA features deferred past the first release:' \
+  '  missing  Later (temporal-sdk-zig-d51.2)')" \
+  '| Partly | Alpha, Beta | GA | partial | `temporal-sdk-zig-d51.1`. Missing: the rest. |' \
+  '| Later | Alpha, Beta | GA, deferred | missing | `temporal-sdk-zig-d51.2`. None of it yet. |'
+# shellcheck disable=SC2016
+expect_output "a deferred row is not a gap the first release needs" "$(printf '%s\n' \
+  'parity-check: 2 rows checked. Every GA feature the first release needs is supported or not applicable.' \
+  'GA features deferred past the first release:' \
+  '  partial  Later (temporal-sdk-zig-d51.2)')" \
+  '| Linked | all | GA | supported | [W](README.md#workflows) |' \
+  '| Later | Alpha, Beta | GA, deferred | partial | `temporal-sdk-zig-d51.2`. Missing: all. |'
+expect fail "a deferred supported row" "only a partial or missing GA row can be deferred" \
+  '| Done | Alpha, Beta | GA, deferred | supported | [W](README.md#workflows) |'
+expect fail "a deferred not-applicable row" "only a partial or missing GA row can be deferred" \
+  '| Elsewhere | Alpha, Beta | GA, deferred | not applicable | Zig has no such thing. |'
+expect fail "a deferred row without a bead" "a deferred row names the bead" \
+  '| Later | Alpha, Beta | GA, deferred | partial | unfiled. Missing: all. |'
+# shellcheck disable=SC2016
+expect fail "a deferred pre-release row" 'unknown stage "pre-release, deferred"' \
+  '| Later | Alpha, Beta | pre-release, deferred | partial | `temporal-sdk-zig-d51.2`. Missing: all. |'
 expect fail "unknown status" 'unknown Zig status "done"' \
   '| Feature | Alpha, Beta | GA | done | [S](README.md#workflows) |'
 expect fail "unknown stage" 'unknown stage "beta"' \

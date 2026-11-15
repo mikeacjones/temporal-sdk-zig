@@ -213,7 +213,7 @@ Notes:
 ### Next steps
 
 - [samples](samples) has a complete program for each feature, each with tests that run against a dev server.
-- [PARITY.md](PARITY.md) lists the samples and the features they demonstrate.
+- [PARITY.md](PARITY.md) has the feature table, which says for each feature of Temporal's SDKs whether this SDK supports it, and the list of samples with the features they demonstrate.
 - [Temporal's documentation](https://docs.temporal.io) explains the concepts: workflows, activities, task queues, and workers.
 - The rest of this README documents the API area by area.
 
@@ -1969,7 +1969,7 @@ Planned: workflow streams, cloud storage drivers, serverless worker helpers, and
 
 ## Parity
 
-The SDK measures its feature coverage with a set of samples, each demonstrating one feature in idiomatic Zig. `zig build samples-test` validates every sample, with its tests, against a dev server. Fifty-four samples pass today. [PARITY.md](PARITY.md) describes how parity is measured and lists the samples; the code is in [samples](samples).
+The SDK measures its feature coverage with a set of samples, each demonstrating one feature in idiomatic Zig. `zig build samples-test` validates every sample, with its tests, against a dev server. Fifty-four samples pass today. [PARITY.md](PARITY.md) describes how parity is measured, holds the feature table that gives each feature's status in this SDK and the README.md section or sample that shows it, and lists the samples; the code is in [samples](samples).
 
 ## Versioning
 
@@ -2015,7 +2015,7 @@ zig build test -Doptimize=ReleaseSafe
 
 - `src/` contains the SDK. `temporal.zig` is the root module, and `client`, `worker`, `workflow`, `activity`, `nexus`, `converter`, and `testing` are its public namespaces. `bridge.zig` wraps the sdk-core C API, and `proto/` holds the generated protobuf types.
 - `deps/` holds the sdk-core submodule and the cargo workspace that builds its C bridge.
-- `samples/` contains the samples, one per feature; [PARITY.md](PARITY.md) lists them.
+- `samples/` contains the samples, one per feature; [PARITY.md](PARITY.md) lists them and holds the feature table.
 - `examples/readme/` contains the compiled examples that this README's code blocks copy.
 - `tools/` contains build tools: the samples runner and the README example checker.
 - `scripts/` contains maintenance scripts.
