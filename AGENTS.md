@@ -1,6 +1,6 @@
 # Contributor guidance for `temporal-sdk-zig`
 
-This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust Core SDK. It is a standalone, Zig-first SDK: it aims for feature parity with Temporal's other SDKs, with every feature expressed the Zig way rather than copied from another language. PARITY.md explains how parity is measured; nothing else in the repository refers to other SDKs' APIs or samples. Use this document as the quick reference for coding-agent work and pull requests. Task tracking with beads is described in `CLAUDE.md`.
+This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust Core SDK. It is a standalone, Zig-first SDK: it aims for feature parity with Temporal's other SDKs, with every feature expressed the Zig way rather than copied from another language. PARITY.md explains how parity is measured, maps every feature that more than one of Temporal's official SDKs offers to this SDK's status (supported, partial, missing, or not applicable) with its release stage, and lists the samples; it is the only file that names other SDKs. Use this document as the quick reference for coding-agent work and pull requests. Task tracking with beads is described in `CLAUDE.md`.
 
 ## Requirements for coding agents
 
@@ -11,9 +11,10 @@ This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust 
   - `zig build test -Doptimize=ReleaseSafe` is required for changes to the workflow runtime, fibers, or the bridge. Fiber code has failed only under optimization before.
   - `zig build fmt` checks formatting.
   - `zig build samples-test` builds the samples and validates them against a dev server.
-  - `zig build readme-check` checks that README.md's code blocks equal their regions in `examples/readme/` (`zig build test` runs it too), and `zig build readme` rewrites them.
+  - `zig build readme-check` checks that README.md's code blocks equal their regions in `examples/readme/` (`zig build test` runs that comparison too) and runs `scripts/parity-check-test.sh` and `scripts/parity-check.sh`, and `zig build readme` rewrites them.
   - `scripts/check-core-version.sh` checks that the sdk-core pin, the cargo workspace in `deps/`, and the proto list agree.
   - `.review/reports.sh [--base <ref>] [--quick] [--all]` writes the review reports for a change into `.review/out/`: the diff, the checks above, and the scanners' output. Reviewers read `INDEX.txt` there before the code. `.review/install.sh` installs the scanners.
+  - `scripts/parity-check.sh` checks PARITY.md's feature table: known statuses and stages, README.md anchors and sample directories that exist for supported rows, and a bead ID or `unfiled` for partial and missing rows. README.md anchors come from `scripts/github-anchors.awk`, which reads only plain top-level `#` headings and fails the check on any README.md construct that could create or hide a heading in a way it doesn't model (keep README.md's headings, fences, and comments plain and at column 0). It prints the GA features still partial or missing. `zig build readme-check` runs it and its tests (`scripts/parity-check-test.sh`), and CI's check job runs `zig build readme-check`; run it locally after changing PARITY.md or README.md's headings (or run `sh scripts/parity-check-test.sh` and `sh scripts/parity-check.sh` directly).
   - `scripts/changelog-check.sh [<base>]` checks the changelog fragments, and the commits since `<base>` for a fragment or trailer; `scripts/changelog-test.sh` tests the changelog scripts.
 - For focused tests, use `-Dtest-filter` (repeatable): `zig build test -Dtest-filter="fibers interleave"`.
 - Use `std.testing.allocator` in tests so leaks fail them. Avoid fixed sleeps in tests: wait on the condition itself.
@@ -50,7 +51,8 @@ Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md),
 - A planned capability has a stub in README.md, marked `<!-- stub: <bead id> -->`. The commit that lands the capability replaces the stub with a full section: explanation, example, and notes. A newly planned capability gets a stub when its bead is created.
 - Never edit README.md's code in place. Examples live in `examples/readme/` between `// example: <id>` and `// end-example`: change the region, then run `zig build readme`. `zig build test` compiles and runs the examples, and `zig build readme-check` fails when README.md and the regions differ.
 - Sample status goes in PARITY.md, not README.md: a new sample adds a row there, and a sample with no Zig equivalent is listed there with the reason.
-- README.md names no other SDK. PARITY.md is the only file that names the parity target.
+- A commit that lands a feature, or part of one, updates its row in PARITY.md's feature table in the same commit: a supported row links the README.md section or the sample that shows it.
+- README.md names no other SDK. PARITY.md is the only file that names other SDKs.
 
 ## Samples are the parity bar
 
@@ -67,7 +69,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 
 - Workflow code must stay deterministic. Anything reachable from workflow execution must not use threads, wall-clock time, randomness, unordered hash map iteration, or I/O outside the workflow `std.Io`.
 - For workflow runtime, command, patch, update, local activity, or Nexus workflow changes, add replay coverage with the workflow replayer to protect existing histories.
-- Behavior that crosses the core boundary follows sdk-core's rules (activation job ordering, patch semantics, local activity backoff). When in doubt, compare against the .NET SDK, which drives the same C bridge, and the Python and TypeScript SDKs.
+- Behavior that crosses the core boundary follows sdk-core's rules (activation job ordering, patch semantics, local activity backoff). When in doubt, compare against the official SDKs that drive the same core, which PARITY.md names.
 - Prefer idiomatic Zig over literal ports: explicit allocators and `std.Io`, struct-literal options, comptime-typed definitions, error sets with failure details read from the future or handle.
 - Document ownership, lifetime, and thread-safety at every interface boundary. Every `TemporalCoreByteArray` the core returns must be freed with `temporal_core_byte_array_free`. Core callbacks run on the core's threads, not the caller's.
 - When the C header changes, the ABI snapshot test fails. Update every wrapper that builds or reads a changed struct before refreshing the snapshot.
@@ -91,7 +93,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `src/bridge.zig` wraps the sdk-core C API; `src/bridge_abi.txt` is its struct layout snapshot.
 - `src/proto/` and `src/proto.zig` are the generated protobuf types (`temporal.proto`).
 - `deps/sdk-core/` is the pinned sdk-core submodule. `deps/Cargo.toml` and `deps/Cargo.lock` build its C bridge.
-- `samples/` holds the samples, and `tools/samples_runner.zig` validates them. PARITY.md lists them and explains how parity is measured.
+- `samples/` holds the samples, and `tools/samples_runner.zig` validates them. PARITY.md lists them, explains how parity is measured, and has the feature table; `scripts/parity-check.sh` checks the table.
 - `examples/readme/` holds the compiled examples that README.md's code blocks copy, and `tools/readme_examples.zig` checks or rewrites the copies.
 - `scripts/` holds maintenance scripts, each with usage in its header.
 - `.review/` holds the review tooling: `reports.sh` runs the checks and the scanners (gitleaks, osv-scanner, cargo-deny, shellcheck, actionlint, typos, zlint) on a change, `install.sh` installs them, and the `.toml` files are their settings. It isn't part of the SDK and isn't in the release tarball.
