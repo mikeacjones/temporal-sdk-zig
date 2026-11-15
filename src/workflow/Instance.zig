@@ -99,6 +99,8 @@ next_external_seq: u32 = 1,
 next_nexus_seq: u32 = 1,
 activities: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 timers: std.AutoHashMapUnmanaged(u32, *WorkflowIo.Timer) = .empty,
+/// The summary of the timer `sleep` is about to start; `hostStartTimer` sends it.
+timer_summary: []const u8 = "",
 /// Child workflows that have not closed, by seq.
 children: std.AutoHashMapUnmanaged(u32, *ChildState) = .empty,
 /// Signals and cancellation requests to other workflows that the core has not resolved, by seq.
@@ -1696,7 +1698,7 @@ fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflo
     return state;
 }
 
-/// A command's `user_metadata` for an activity summary, or null for none.
+/// A command's `user_metadata` for a summary, or null for none.
 fn summaryMetadata(a: Allocator, summary: []const u8) error{OutOfMemory}!?sdk_pb.UserMetadata {
     if (summary.len == 0) return null;
     return .{ .summary = try converter.toPayload(a, summary) };
@@ -2493,6 +2495,16 @@ fn hostNow(ctx: *anyopaque) std.Io.Timestamp {
     return .{ .nanoseconds = inst.now_ns };
 }
 
+/// `io.sleep` with a summary on its StartTimer command. Like `io.sleep`, it checks for
+/// cancellation first and emits CancelTimer when canceled while the timer runs.
+pub fn sleep(inst: *Instance, duration: std.Io.Duration, summary: []const u8) std.Io.Cancelable!void {
+    // `io.sleep` starts its timer before it first yields, so no other coroutine can start a
+    // timer while the summary is set.
+    inst.timer_summary = summary;
+    defer inst.timer_summary = "";
+    return inst.wio.io().sleep(duration, .awake);
+}
+
 fn hostStartTimer(ctx: *anyopaque, timer: *WorkflowIo.Timer, duration: std.Io.Duration) void {
     const inst: *Instance = @ptrCast(@alignCast(ctx));
     const seq = inst.next_timer_seq;
@@ -2502,7 +2514,13 @@ fn hostStartTimer(ctx: *anyopaque, timer: *WorkflowIo.Timer, duration: std.Io.Du
         inst.task_failure = "out of memory starting a timer";
         return;
     };
-    inst.emit(.{ .variant = .{ .start_timer = .{
+    const summary = inst.timer_summary;
+    inst.timer_summary = "";
+    const metadata = summaryMetadata(inst.arena(), summary) catch {
+        inst.task_failure = "out of memory starting a timer";
+        return;
+    };
+    inst.emit(.{ .user_metadata = metadata, .variant = .{ .start_timer = .{
         .seq = seq,
         .start_to_fire_timeout = protoDuration(duration),
     } } }) catch {
@@ -4153,6 +4171,130 @@ test "a timer that wins the race runs the fallback activity" {
     try testing.expectEqual(@as(usize, 2), done.len);
     try testing.expectEqual(@as(u32, 1), done[0].variant.?.request_cancel_activity.seq);
     try testing.expectEqualStrings("\"slow\"", done[1].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// ctx.sleep with a summary: alone, as an io.async coroutine that is canceled, and racing an
+// activity in a Select.
+const SummaryTimers = struct {
+    fn nap(ctx: *workflow.Context, summary: []const u8) ![]const u8 {
+        try ctx.sleep(.fromSeconds(30), .{ .summary = summary });
+        return "rested";
+    }
+
+    fn canceledNap(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var nap_future = io.async(workflow.Context.sleep, .{ ctx, .fromSeconds(30), .{ .summary = "short nap" } });
+        _ = try ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"order"}).get();
+        nap_future.cancel(io) catch |err| return @errorName(err);
+        return "fired";
+    }
+
+    const Done = union(enum) { processed: workflow.ActivityError![]const u8, timer: std.Io.Cancelable!void };
+
+    fn race(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const processing = ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"order"});
+        var buf: [2]Done = undefined;
+        var select: std.Io.Select(Done) = .init(io, &buf);
+        defer select.cancelDiscard();
+        select.async(.processed, workflow.ActivityFuture([]const u8).get, .{processing});
+        select.async(.timer, workflow.Context.sleep, .{ ctx, .fromSeconds(3), .{ .summary = "processing deadline" } });
+        return switch (try select.await()) {
+            .processed => |r| try r,
+            .timer => "late",
+        };
+    }
+};
+const SummaryNapWf = workflow.Def("SummaryNap", SummaryTimers.nap);
+const CanceledNapWf = workflow.Def("CanceledNap", SummaryTimers.canceledNap);
+const SummaryRaceWf = workflow.Def("SummaryRace", SummaryTimers.race);
+
+test "ctx.sleep sends its summary as the StartTimer command's user_metadata" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SummaryNapWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "SummaryNap", .{@as([]const u8, "wait for the cooldown")}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    const timer = first[0].variant.?.start_timer;
+    try testing.expectEqual(@as(i64, 30), timer.start_to_fire_timeout.?.seconds);
+    try testing.expectEqualStrings("\"wait for the cooldown\"", first[0].user_metadata.?.summary.?.data);
+    try testing.expectEqualStrings("json/plain", first[0].user_metadata.?.summary.?.metadata.items[0].value);
+    try testing.expect(first[0].user_metadata.?.details == null);
+
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a));
+    try testing.expectEqualStrings("\"rested\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "ctx.sleep with an empty summary sends the StartTimer command io.sleep sends" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SummaryNapWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "SummaryNap", .{@as([]const u8, "")}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expect(first[0].user_metadata == null);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+    try testing.expectEqual(@as(i64, 30), first[0].variant.?.start_timer.start_to_fire_timeout.?.seconds);
+}
+
+test "canceling a ctx.sleep coroutine emits CancelTimer and delivers error.Canceled" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, CanceledNapWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "CanceledNap", .{}), a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    var timer_seq: ?u32 = null;
+    for (first) |c| if (c.variant.? == .start_timer) {
+        timer_seq = c.variant.?.start_timer.seq;
+        try testing.expectEqualStrings("\"short nap\"", c.user_metadata.?.summary.?.data);
+    };
+    const done = commandsOf(try inst.activate(&try resolveOk(a, 1, "done"), a));
+    try testing.expectEqual(@as(usize, 2), done.len);
+    try testing.expectEqual(timer_seq.?, done[0].variant.?.cancel_timer.seq);
+    try testing.expectEqualStrings("\"Canceled\"", done[1].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "an activity that wins the race against a ctx.sleep with a summary cancels the timer" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SummaryRaceWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "SummaryRace", .{}), a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expect(first[0].variant.? == .schedule_activity);
+    try testing.expect(first[0].user_metadata == null);
+    try testing.expectEqual(@as(i64, 3), first[1].variant.?.start_timer.start_to_fire_timeout.?.seconds);
+    try testing.expectEqualStrings("\"processing deadline\"", first[1].user_metadata.?.summary.?.data);
+
+    const done = commandsOf(try inst.activate(&try resolveOk(a, 1, "done"), a));
+    try testing.expectEqual(@as(usize, 2), done.len);
+    try testing.expectEqual(@as(u32, 1), done[0].variant.?.cancel_timer.seq);
+    try testing.expectEqualStrings("\"done\"", done[1].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "a ctx.sleep with a summary that wins the race cancels the activity" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SummaryRaceWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "SummaryRace", .{}), a));
+    try testing.expectEqual(@as(u32, 1), first[1].variant.?.start_timer.seq);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a));
+    try testing.expectEqual(@as(usize, 2), done.len);
+    try testing.expectEqual(@as(u32, 1), done[0].variant.?.request_cancel_activity.seq);
+    try testing.expectEqualStrings("\"late\"", done[1].variant.?.complete_workflow_execution.result.?.data);
 }
 
 // Coroutines appending results, and the
