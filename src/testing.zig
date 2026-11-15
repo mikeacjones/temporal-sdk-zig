@@ -6,7 +6,8 @@
 //! - `WorkflowEnvironment`: a dev server, client and worker on a fresh task queue. Register
 //!   workflows and activities, replace activities with test doubles, and
 //!   execute workflows to their result.
-//! - `ActivityEnvironment`: calls an activity function directly with a test context.
+//! - `ActivityEnvironment`: runs an activity function with a test context, and cancels it or
+//!   stops its "worker" on request.
 //! - `WorkflowReplayer`: replays recorded histories against current workflow code to catch
 //!   nondeterministic changes.
 
@@ -775,7 +776,8 @@ pub const WorkflowEnvironment = struct {
     }
 };
 
-/// Runs activities directly, without a server.
+/// Runs activities without a server, each on a task of its own so `cancel` reaches it as a
+/// worker's cancel would.
 pub const ActivityEnvironment = struct {
     io: Io,
     info: activity.Info = .{
@@ -798,6 +800,20 @@ pub const ActivityEnvironment = struct {
     /// What `ctx.metrics()` returns, such as a custom handler that keeps what the activity
     /// records. Borrowed.
     metrics: metrics_mod.Handler = .noop,
+    /// Guards `running` and `worker_stopped`, which `cancel` and `stopWorker` share with the
+    /// activities running from other threads.
+    mutex: Io.Mutex = .init,
+    /// The activities running now, newest first.
+    running: ?*Running = null,
+    /// Set by `stopWorker`.
+    worker_stopped: bool = false,
+
+    const Running = struct {
+        ctx: *activity.Context,
+        /// Set when the activity returns or is canceled; wakes `executeActivityWith`.
+        wake: Io.Event = .unset,
+        next: ?*Running = null,
+    };
 
     /// An environment whose `info` says the activity was scheduled and started now.
     pub fn init(io: Io) ActivityEnvironment {
@@ -810,12 +826,16 @@ pub const ActivityEnvironment = struct {
     }
 
     /// Calls the activity's function with `args`. The result is allocated from `arena`.
-    pub fn executeActivity(env: *const ActivityEnvironment, comptime Activity: type, args: Activity.Args, arena: Allocator) !Activity.Result {
+    pub fn executeActivity(env: *ActivityEnvironment, comptime Activity: type, args: Activity.Args, arena: Allocator) !Activity.Result {
         return env.executeActivityWith(Activity, null, args, arena);
     }
 
-    /// Calls a method activity on `receiver` (null for plain functions).
-    pub fn executeActivityWith(env: *const ActivityEnvironment, comptime Activity: type, receiver: ?*Activity.Receiver, args: Activity.Args, arena: Allocator) !Activity.Result {
+    /// Calls a method activity on `receiver` (null for plain functions). The activity runs
+    /// on a task of its own while this call waits for it; canceling the calling task cancels
+    /// the activity, which sees `error.Canceled` with no `cancelReason`. Without a thread for
+    /// that task it runs on the calling one, where `cancel` only sets the reason and wakes
+    /// `waitForWorkerStop`.
+    pub fn executeActivityWith(env: *ActivityEnvironment, comptime Activity: type, receiver: ?*Activity.Receiver, args: Activity.Args, arena: Allocator) !Activity.Result {
         var info = env.info;
         info.activity_type = Activity.activity_name;
         var ctx: activity.Context = .{
@@ -828,7 +848,55 @@ pub const ActivityEnvironment = struct {
             .client_ = env.client,
             .metrics_ = env.metrics,
         };
-        return Activity.call(receiver, &ctx, args);
+        var run: Running = .{ .ctx = &ctx };
+        {
+            env.mutex.lockUncancelable(env.io);
+            defer env.mutex.unlock(env.io);
+            if (env.worker_stopped) ctx.notifyWorkerStop();
+            run.next = env.running;
+            env.running = &run;
+        }
+        defer {
+            env.mutex.lockUncancelable(env.io);
+            defer env.mutex.unlock(env.io);
+            var link = &env.running;
+            while (link.*.? != &run) link = &link.*.?.next;
+            link.* = run.next;
+        }
+        const S = struct {
+            fn call(r: ?*Activity.Receiver, c: *activity.Context, a: Activity.Args, wake: *Io.Event) @typeInfo(@TypeOf(Activity.call)).@"fn".return_type.? {
+                defer wake.set(c.io_);
+                return Activity.call(r, c, a);
+            }
+        };
+        var task = env.io.concurrent(S.call, .{ receiver, &ctx, args, &run.wake }) catch
+            return Activity.call(receiver, &ctx, args);
+        run.wake.wait(env.io) catch return task.cancel(env.io);
+        return if (ctx.cancelReason() != null) task.cancel(env.io) else task.await(env.io);
+    }
+
+    /// Cancels the activities this environment is running, as a worker does: each sees
+    /// `ctx.cancelReason()` return `reason`, and its next wait on `ctx.io()` returns
+    /// `error.Canceled`. An activity that was already canceled keeps its first reason. Does
+    /// nothing while no activity runs. Safe to call from any thread.
+    pub fn cancel(env: *ActivityEnvironment, reason: activity.CancelReason) void {
+        env.mutex.lockUncancelable(env.io);
+        defer env.mutex.unlock(env.io);
+        var it = env.running;
+        while (it) |r| : (it = r.next) {
+            if (r.ctx.setCancelReason(reason)) r.wake.set(env.io);
+        }
+    }
+
+    /// Makes the worker-stop signal fire, as `worker.Worker.stop` does: the running
+    /// activities, and those executed later, see `ctx.isWorkerStopping()` return true, and
+    /// `ctx.waitForWorkerStop()` returns. Safe to call from any thread.
+    pub fn stopWorker(env: *ActivityEnvironment) void {
+        env.mutex.lockUncancelable(env.io);
+        defer env.mutex.unlock(env.io);
+        env.worker_stopped = true;
+        var it = env.running;
+        while (it) |r| : (it = r.next) r.ctx.notifyWorkerStop();
     }
 };
 
@@ -2417,12 +2485,113 @@ test "ActivityEnvironment calls the activity directly" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const before: Io.Timestamp = .now(testing.io, .real);
-    const env: ActivityEnvironment = .init(testing.io);
+    var env: ActivityEnvironment = .init(testing.io);
     try testing.expectEqualStrings("Hello World!", try env.executeActivity(Fixtures.Greet, .{"World"}, arena.allocator()));
     // The default info was scheduled and started when the environment was made.
     try testing.expect(env.info.started_time.?.nanoseconds >= before.nanoseconds);
     try testing.expectEqual(env.info.started_time.?, env.info.scheduled_time.?);
     try testing.expectEqual(env.info.started_time.?, env.info.current_attempt_scheduled_time.?);
+}
+
+const EnvironmentStopFixtures = struct {
+    var started: Io.Event = .unset;
+    var seen_reason: ?activity.CancelReason = null;
+
+    /// Waits until canceled, recording the reason.
+    fn hold(ctx: *activity.Context) !void {
+        started.set(ctx.io());
+        while (true) ctx.io().sleep(.fromSeconds(60), .awake) catch |err| {
+            seen_reason = ctx.cancelReason();
+            return err;
+        };
+    }
+    const Hold = activity.Def("Hold", hold);
+
+    /// Waits for the worker to stop on a coroutine of its own, beside a long sleep, and
+    /// reports whether it saw the worker stopping before and after.
+    fn drain(ctx: *activity.Context) ![2]bool {
+        const before = ctx.isWorkerStopping();
+        const Result = union(enum) { stop: error{Canceled}!void, slept: error{Canceled}!void };
+        var buffer: [2]Result = undefined;
+        var select: Io.Select(Result) = .init(ctx.io(), &buffer);
+        defer select.cancelDiscard();
+        try select.concurrent(.stop, activity.Context.waitForWorkerStop, .{ctx});
+        try select.concurrent(.slept, Io.sleep, .{ ctx.io(), .fromSeconds(60), .awake });
+        started.set(ctx.io());
+        switch (try select.await()) {
+            .stop => |r| try r,
+            .slept => return error.WorkerNeverStopped,
+        }
+        return .{ before, ctx.isWorkerStopping() };
+    }
+    const Drain = activity.Def("Drain", drain);
+
+    fn info(ctx: *activity.Context) ![]const u8 {
+        const i = ctx.info();
+        return std.fmt.allocPrint(ctx.allocator(), "{?f}|{?f}|{?f}|{d}|{d}|{s}|{d}|{}", .{
+            i.schedule_to_close_timeout,
+            i.start_to_close_timeout,
+            i.heartbeat_timeout,
+            if (i.retry_policy) |p| p.maximum_attempts else -1,
+            i.priority.priority_key,
+            i.priority.fairness_key,
+            i.priority.fairness_weight,
+            i.deadline() != null,
+        });
+    }
+    const Info = activity.Def("Info", info);
+
+    fn runHold(env: *ActivityEnvironment, arena: Allocator) !void {
+        return env.executeActivity(Hold, .{}, arena);
+    }
+
+    fn runDrain(env: *ActivityEnvironment, arena: Allocator) ![2]bool {
+        return env.executeActivity(Drain, .{}, arena);
+    }
+};
+
+test "ActivityEnvironment.cancel cancels the running activity with the reason" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    // Without a running activity it does nothing.
+    env.cancel(.canceled);
+    for ([_]activity.CancelReason{ .timed_out, .paused }) |reason| {
+        EnvironmentStopFixtures.started = .unset;
+        EnvironmentStopFixtures.seen_reason = null;
+        var running = try testing.io.concurrent(EnvironmentStopFixtures.runHold, .{ &env, arena.allocator() });
+        try EnvironmentStopFixtures.started.wait(testing.io);
+        env.cancel(reason);
+        try testing.expectError(error.Canceled, running.await(testing.io));
+        try testing.expectEqual(@as(?activity.CancelReason, reason), EnvironmentStopFixtures.seen_reason);
+    }
+    try testing.expectEqual(null, env.running);
+}
+
+test "ActivityEnvironment.stopWorker wakes waitForWorkerStop and flips isWorkerStopping" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    EnvironmentStopFixtures.started = .unset;
+    var running = try testing.io.concurrent(EnvironmentStopFixtures.runDrain, .{ &env, arena.allocator() });
+    try EnvironmentStopFixtures.started.wait(testing.io);
+    env.stopWorker();
+    try testing.expectEqual([2]bool{ false, true }, try running.await(testing.io));
+    // An activity executed after the stop sees it at once.
+    try testing.expectEqual([2]bool{ true, true }, try env.executeActivity(EnvironmentStopFixtures.Drain, .{}, arena.allocator()));
+}
+
+test "ActivityEnvironment's info has no timeouts, retry policy or priority unless set" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    try testing.expectEqualStrings("null|null|null|-1|0||0|false", try env.executeActivity(EnvironmentStopFixtures.Info, .{}, arena.allocator()));
+    env.info.schedule_to_close_timeout = .fromSeconds(60);
+    env.info.start_to_close_timeout = .fromSeconds(10);
+    env.info.heartbeat_timeout = .fromSeconds(2);
+    env.info.retry_policy = .{ .maximum_attempts = 3 };
+    env.info.priority = .{ .priority_key = 1, .fairness_key = "tenant", .fairness_weight = 2 };
+    try testing.expectEqualStrings("1m|10s|2s|3|1|tenant|2|true", try env.executeActivity(EnvironmentStopFixtures.Info, .{}, arena.allocator()));
 }
 
 /// A history of samples/helloworld, whose workflow `Fixtures.Hello` matches.

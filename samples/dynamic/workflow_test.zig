@@ -50,7 +50,7 @@ test "workflow calls each activity by name once" {
 test "activities return the greeting parts" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectEqualStrings("Hello", try env.executeActivity(dynamic.GetGreeting, .{}, arena.allocator()));
     try testing.expectEqualStrings("Temporal", try env.executeActivity(dynamic.GetName, .{}, arena.allocator()));
     try testing.expectEqualStrings("Greeting: Hello Temporal!\n", try env.executeActivity(dynamic.SayGreeting, .{ "Hello", "Temporal" }, arena.allocator()));

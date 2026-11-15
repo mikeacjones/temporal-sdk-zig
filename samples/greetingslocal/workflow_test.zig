@@ -54,7 +54,7 @@ test "activities read their shared state" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var activities: greetingslocal.Activities = .{ .name = "Temporal", .greeting = "Hello" };
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectEqualStrings("Hello", try env.executeActivityWith(greetingslocal.activities.getGreeting, &activities, .{}, arena.allocator()));
     try testing.expectEqualStrings("Temporal", try env.executeActivityWith(greetingslocal.activities.getName, &activities, .{}, arena.allocator()));
     try testing.expectEqualStrings("Greeting: Hello Temporal!\n", try env.executeActivityWith(greetingslocal.activities.sayGreeting, &activities, .{ "Hello", "Temporal" }, arena.allocator()));

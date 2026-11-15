@@ -101,7 +101,7 @@ test "shipping emails the delivery date it scheduled for the order" {
 test "sizes and colors are validated against the catalog" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try env.executeActivity(sp.ValidateSize, .{"large"}, arena.allocator());
     try testing.expectError(error.ApplicationFailure, env.executeActivity(sp.ValidateSize, .{"huge"}, arena.allocator()));
     try env.executeActivity(sp.ValidateColor, .{"black"}, arena.allocator());

@@ -182,13 +182,13 @@ test "GetWorkerSpecificTaskQueue returns its worker's task queue" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var queue: activities.WorkerSpecificTaskQueue = .{ .task_queue = "worker-1" };
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectEqualStrings("worker-1", try env.executeActivityWith(activities.GetWorkerSpecificTaskQueue, &queue, .{}, arena.allocator()));
 }
 
 test "ProcessFile fails when the file is not on this host" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectError(error.FileNotFound, env.executeActivity(activities.ProcessFile, .{"/tmp/worker-specific-task-queues-missing-file"}, arena.allocator()));
 }

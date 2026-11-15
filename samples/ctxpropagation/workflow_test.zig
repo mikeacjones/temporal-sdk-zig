@@ -119,7 +119,7 @@ test "the activity returns the propagated value, or null without one" {
         try testing.expectEqual(@as(?Values, null), without);
     }
 
-    const activity_env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var activity_env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectEqual(@as(?Values, null), try activity_env.executeActivity(ctxpropagation.SampleActivity, .{}, a));
 }
 

@@ -91,6 +91,6 @@ test "continues as new once every request has been answered" {
 test "the activity uppercases its input" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectEqualStrings("SOME VALUE", try env.executeActivity(uppercase.UppercaseActivity, .{"SoMe VaLuE"}, arena.allocator()));
 }

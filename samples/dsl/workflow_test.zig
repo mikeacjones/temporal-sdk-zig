@@ -175,7 +175,7 @@ test "the activities return their name as their result" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var activities: dsl.Activities = .{};
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     const input: []const []const u8 = &.{ "value2", "Result_SampleActivity2" };
     try testing.expectEqualStrings("Result_SampleActivity3", try env.executeActivityWith(dsl.SampleActivity3, &activities, .{input}, arena.allocator()));
     try testing.expectEqualStrings("Result_SampleActivity5", try env.executeActivityWith(dsl.SampleActivity5, &activities, .{input}, arena.allocator()));

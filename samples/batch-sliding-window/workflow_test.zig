@@ -166,7 +166,7 @@ test "record loader pages through its records up to the maximum offset" {
     defer arena.deinit();
     const a = arena.allocator();
     var loader: sample.RecordLoader = .{ .record_count = 10 };
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
 
     try testing.expectEqual(10, try env.executeActivityWith(sample.GetRecordCount, &loader, .{}, a));
 

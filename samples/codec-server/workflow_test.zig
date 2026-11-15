@@ -55,6 +55,6 @@ test "the workflow runs with compressed payloads, which the server stores compre
 test "the activity greets its input" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
     try testing.expectEqualStrings("Received Plain text input", try env.executeActivity(codec_server.Activity, .{"Plain text input"}, arena.allocator()));
 }

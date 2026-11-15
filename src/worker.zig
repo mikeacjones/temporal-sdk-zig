@@ -216,6 +216,11 @@ pub const Worker = struct {
     stop_mutex: Io.Mutex = .init,
     core_ptrs: [3]?*bridge.c.TemporalCoreWorker = @splat(null),
     stop_requested: bool = false,
+    /// The activities of each running activity loop, so `stop` can tell them the worker is
+    /// stopping (`activity.Context.isWorkerStopping`). Guarded by `stop_mutex`.
+    activity_runs: [3]?*RunningActivities = @splat(null),
+    /// Set by `stop` before it notifies `activity_runs`; an activity starting later reads it.
+    stopping: std.atomic.Value(bool) = .init(false),
     /// The first poll failure of the current or last run, and its text (owned; null if it
     /// couldn't be allocated). See `fatalMessage`.
     fatal: ?PollError = null,
@@ -587,6 +592,7 @@ pub const Worker = struct {
         log.warn("starting " ++ what ++ " for task queue {s} failed, stopping the worker: {t}", .{ task_queue, err });
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
+        w.notifyActivitiesOfStop();
         for (cores) |other| other.core.initiateShutdown();
     }
 
@@ -769,7 +775,22 @@ pub const Worker = struct {
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
         w.stop_requested = true;
+        w.notifyActivitiesOfStop();
         for (w.core_ptrs) |p| if (p) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
+    }
+
+    /// Tells every running activity, and those that start later, that the worker is
+    /// stopping. Called with `stop_mutex` held.
+    fn notifyActivitiesOfStop(w: *Worker) void {
+        // Before the runs are visited: `receiveActivityTask` reads it after adding a run, under
+        // the same mutex, so each run is notified by one side or the other.
+        w.stopping.store(true, .release);
+        for (w.activity_runs) |r| if (r) |running| {
+            running.mutex.lockUncancelable(w.io);
+            defer running.mutex.unlock(w.io);
+            var it = running.map.valueIterator();
+            while (it.next()) |activity_run| activity_run.*.ctx.notifyWorkerStop();
+        };
     }
 
     /// The first poll failure of the last `run`, as `polling for <workflow|activity|nexus> tasks on
@@ -1284,6 +1305,23 @@ fn activityLoop(w: *Worker, core: bridge.Worker, task_queue: []const u8) void {
     var group: Io.Group = .init;
     var running: RunningActivities = .{};
     defer running.map.deinit(w.gpa);
+    const slot = slot: {
+        w.stop_mutex.lockUncancelable(w.io);
+        defer w.stop_mutex.unlock(w.io);
+        // One loop per core, and a `run` has at most as many cores as slots; only `run`
+        // called again while running fills them.
+        const i = std.mem.indexOfScalar(?*RunningActivities, &w.activity_runs, null) orelse {
+            log.warn("worker for task queue {s}: more activity loops than expected (is run called twice at once?); activities on {s} won't see the worker stop", .{ w.task_queue, task_queue });
+            break :slot null;
+        };
+        w.activity_runs[i] = &running;
+        break :slot i;
+    };
+    defer if (slot) |i| {
+        w.stop_mutex.lockUncancelable(w.io);
+        w.activity_runs[i] = null;
+        w.stop_mutex.unlock(w.io);
+    };
     var message: ?[]u8 = null;
     defer if (message) |m| w.gpa.free(m);
     while (true) {
@@ -1366,6 +1404,7 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
             defer running.mutex.unlock(w.io);
             running.map.put(w.gpa, run.task_token, run) catch
                 log.warn("out of memory tracking activity {s}; it runs, but cancels won't reach it", .{s.activity_id});
+            if (w.stopping.load(.acquire)) run.ctx.notifyWorkerStop();
             keep = true;
             return run;
         },
@@ -1575,7 +1614,29 @@ fn activityInfo(start: *const task_pb.Start, task_queue: []const u8, task_token:
         .scheduled_time = zigTimestamp(start.scheduled_time),
         .current_attempt_scheduled_time = zigTimestamp(start.current_attempt_scheduled_time),
         .started_time = zigTimestamp(start.started_time),
+        .schedule_to_close_timeout = positiveDuration(start.schedule_to_close_timeout),
+        .start_to_close_timeout = positiveDuration(start.start_to_close_timeout),
+        .heartbeat_timeout = positiveDuration(start.heartbeat_timeout),
+        .retry_policy = if (start.retry_policy) |p| .{
+            .initial_interval = positiveDuration(p.initial_interval),
+            .backoff_coefficient = p.backoff_coefficient,
+            .maximum_interval = positiveDuration(p.maximum_interval),
+            .maximum_attempts = p.maximum_attempts,
+            .non_retryable_error_types = p.non_retryable_error_types.items,
+        } else null,
+        .priority = if (start.priority) |p| .{
+            .priority_key = p.priority_key,
+            .fairness_key = p.fairness_key,
+            .fairness_weight = p.fairness_weight,
+        } else .{},
     };
+}
+
+/// A duration from the core, or null when absent or not positive (unset).
+fn positiveDuration(d: ?proto.google.protobuf.Duration) ?Io.Duration {
+    const v = d orelse return null;
+    const ns = @as(i96, v.seconds) * std.time.ns_per_s + v.nanos;
+    return if (ns > 0) .{ .nanoseconds = ns } else null;
 }
 
 fn zigTimestamp(t: ?proto.google.protobuf.Timestamp) ?Io.Timestamp {
@@ -3216,6 +3277,166 @@ test "a graceful shutdown period lets a running activity finish" {
     try testing.expect(elapsed.nanoseconds < period.nanoseconds);
 }
 
+/// An activity that reports the timeouts, retry policy, priority and deadline in its info.
+const InfoTest = struct {
+    const Env = @import("testing.zig").WorkflowEnvironment;
+
+    fn report(ctx: *activity.Context) ![]const u8 {
+        const i = ctx.info();
+        var out: Io.Writer.Allocating = .init(ctx.allocator());
+        const w = &out.writer;
+        try w.print("s2c={?f} st2c={?f} hb={?f}", .{ i.schedule_to_close_timeout, i.start_to_close_timeout, i.heartbeat_timeout });
+        if (i.retry_policy) |p| {
+            try w.print(" retry={?f},{d},{?f},{d},", .{ p.initial_interval, p.backoff_coefficient, p.maximum_interval, p.maximum_attempts });
+            for (p.non_retryable_error_types, 0..) |t, n| try w.print("{s}{s}", .{ if (n > 0) "+" else "", t });
+        } else try w.writeAll(" retry=null");
+        try w.print(" priority={d},{s},{d}", .{ i.priority.priority_key, i.priority.fairness_key, i.priority.fairness_weight });
+        const deadline = i.deadline() orelse return error.NoDeadline;
+        const expected = i.started_time.?.addDuration(i.start_to_close_timeout.?);
+        try w.print(" deadline_is_start_plus_start_to_close={}", .{deadline.nanoseconds == expected.nanoseconds});
+        return out.written();
+    }
+    const Report = activity.Def("ReportInfo", report);
+
+    const retry: workflow.RetryPolicy = .{
+        .initial_interval = .fromSeconds(1),
+        .backoff_coefficient = 3,
+        .maximum_interval = .fromSeconds(20),
+        .maximum_attempts = 4,
+        .non_retryable_error_types = &.{ "Fatal", "Bad" },
+    };
+
+    fn regular(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(Report, .{
+            .schedule_to_close_timeout = .fromSeconds(300),
+            .start_to_close_timeout = .fromSeconds(30),
+            .heartbeat_timeout = .fromSeconds(10),
+            .retry_policy = retry,
+            .priority = .{ .priority_key = 2, .fairness_key = "tenant-a", .fairness_weight = 1.5 },
+        }, .{}).get();
+    }
+    const Regular = workflow.Def("ReportInfoRegular", regular);
+
+    fn local(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeLocalActivity(Report, .{
+            .schedule_to_close_timeout = .fromSeconds(300),
+            .start_to_close_timeout = .fromSeconds(30),
+            .retry_policy = retry,
+        }, .{}).get();
+    }
+    const Local = workflow.Def("ReportInfoLocal", local);
+};
+
+test "an activity's info reports the timeouts, retry policy and priority it was scheduled with" {
+    const env = try InfoTest.Env.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(InfoTest.Regular);
+    try env.registerWorkflow(InfoTest.Local);
+    try env.registerActivity(InfoTest.Report);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings(
+        "s2c=5m st2c=30s hb=10s retry=1s,3,20s,4,Fatal+Bad priority=2,tenant-a,1.5 deadline_is_start_plus_start_to_close=true",
+        try env.executeWorkflow(InfoTest.Regular, .{}, a, null),
+    );
+    try testing.expectEqualStrings(
+        "s2c=5m st2c=30s hb=null retry=1s,3,20s,4,Fatal+Bad priority=0,,0 deadline_is_start_plus_start_to_close=true",
+        try env.executeWorkflow(InfoTest.Local, .{}, a, null),
+    );
+}
+
+/// Activities that wait for the worker to stop, run as a regular activity, a local activity
+/// and an activity in a session.
+const WorkerStopTest = struct {
+    const Env = @import("testing.zig").WorkflowEnvironment;
+
+    var started: Io.Event = .unset;
+    var returned: Io.Event = .unset;
+    var returned_at: Io.Timestamp = .zero;
+    var stopping_before: bool = true;
+
+    /// Waits for the worker to stop on a coroutine of its own and returns.
+    fn waitStop(ctx: *activity.Context) ![]const u8 {
+        stopping_before = ctx.isWorkerStopping();
+        var waiting = try ctx.io().concurrent(activity.Context.waitForWorkerStop, .{ctx});
+        started.set(ctx.io());
+        try waiting.await(ctx.io());
+        if (!ctx.isWorkerStopping()) return error.NotStopping;
+        returned_at = .now(ctx.io(), .awake);
+        returned.set(ctx.io());
+        return "drained";
+    }
+    const WaitStop = activity.Def("WaitForWorkerStop", waitStop);
+
+    fn regular(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(WaitStop, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const Regular = workflow.Def("WaitStopRegular", regular);
+
+    fn local(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeLocalActivity(WaitStop, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const Local = workflow.Def("WaitStopLocal", local);
+
+    fn inSession(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.createSession(.{ .creation_timeout = .fromSeconds(30), .execution_timeout = .fromSeconds(120) });
+        return ctx.executeActivity(WaitStop, .{ .start_to_close_timeout = .fromSeconds(60), .session = s }, .{}).get();
+    }
+    const InSession = workflow.Def("WaitStopInSession", inSession);
+
+    /// Starts `Workflow` on a worker with `period` to shut down gracefully, stops the worker
+    /// once the activity waits, and expects the activity to have returned before the period
+    /// passed, without a cancel. Returns the environment and the run for more checks.
+    fn stopWhileWaiting(comptime Workflow: type, period: Io.Duration, sessions: bool) !struct { *Env, client_mod.WorkflowRun([]const u8) } {
+        started = .unset;
+        returned = .unset;
+        stopping_before = true;
+        const env = try Env.start(testing.allocator, testing.io);
+        errdefer env.deinit();
+        env.worker.options.graceful_shutdown_period = period;
+        if (sessions) env.worker.options.sessions = .{};
+        try env.registerWorkflow(Workflow);
+        try env.registerActivity(WaitStop);
+
+        var run = try env.startWorkflow(Workflow, .{ .task_queue = "" }, .{});
+        errdefer run.deinit();
+        try started.wait(testing.io);
+        const stopped_at = Io.Timestamp.now(testing.io, .awake);
+        env.worker.stop();
+        try env.running.?.await(testing.io);
+        env.running = null;
+
+        try testing.expect(!stopping_before);
+        try testing.expect(returned.isSet());
+        try testing.expect(stopped_at.durationTo(returned_at).nanoseconds < period.nanoseconds);
+        return .{ env, run };
+    }
+};
+
+test "an activity waiting in waitForWorkerStop returns when the worker stops and completes" {
+    const period: Io.Duration = .fromSeconds(30);
+    const env, var run = try WorkerStopTest.stopWhileWaiting(WorkerStopTest.Regular, period, false);
+    defer env.deinit();
+    defer run.deinit();
+    try testing.expectEqual(1, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_COMPLETED));
+    try testing.expectEqual(0, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_CANCELED));
+}
+
+test "a local activity waiting in waitForWorkerStop returns when the worker stops" {
+    const env, var run = try WorkerStopTest.stopWhileWaiting(WorkerStopTest.Local, .fromSeconds(30), false);
+    defer env.deinit();
+    defer run.deinit();
+}
+
+test "an activity in a session waiting in waitForWorkerStop returns when the worker stops" {
+    // The session itself is held until the graceful period ends, so keep it short.
+    const env, var run = try WorkerStopTest.stopWhileWaiting(WorkerStopTest.InSession, .fromSeconds(5), true);
+    defer env.deinit();
+    defer run.deinit();
+}
+
 test "waitUntilRunning returns once run polls, or fails if run returned first" {
     const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
     defer rt.deinit();
@@ -3543,9 +3764,40 @@ const ContextRecordingCodec = struct {
     }
 };
 
-test "an activity's info carries its Start task's schedule and start times" {
+test "an activity's info carries its Start task's times, timeouts, retry policy and priority" {
     var start: task_pb.Start = .{ .activity_id = "1", .activity_type = "Charge", .attempt = 2 };
-    try testing.expect(activityInfo(&start, "tq", "token").started_time == null);
+    {
+        const bare = activityInfo(&start, "tq", "token");
+        try testing.expect(bare.started_time == null);
+        try testing.expectEqual(null, bare.schedule_to_close_timeout);
+        try testing.expectEqual(null, bare.start_to_close_timeout);
+        try testing.expectEqual(null, bare.heartbeat_timeout);
+        try testing.expect(bare.retry_policy == null);
+        try testing.expectEqual(@as(i32, 0), bare.priority.priority_key);
+        try testing.expectEqualStrings("", bare.priority.fairness_key);
+        try testing.expectEqual(@as(f32, 0), bare.priority.fairness_weight);
+        try testing.expectEqual(null, bare.deadline());
+    }
+    // Zero durations mean unset.
+    start.schedule_to_close_timeout = .{};
+    start.heartbeat_timeout = .{ .seconds = 0 };
+    {
+        const zero = activityInfo(&start, "tq", "token");
+        try testing.expectEqual(null, zero.schedule_to_close_timeout);
+        try testing.expectEqual(null, zero.heartbeat_timeout);
+    }
+
+    var non_retryable = [_][]const u8{"Fatal"};
+    start.schedule_to_close_timeout = .{ .seconds = 300 };
+    start.start_to_close_timeout = .{ .seconds = 30, .nanos = 5 };
+    start.heartbeat_timeout = .{ .seconds = 10 };
+    start.retry_policy = .{
+        .initial_interval = .{ .seconds = 1 },
+        .backoff_coefficient = 2,
+        .maximum_attempts = 5,
+        .non_retryable_error_types = .fromOwnedSlice(&non_retryable),
+    };
+    start.priority = .{ .priority_key = 2, .fairness_key = "tenant-a", .fairness_weight = 1.5 };
     start.scheduled_time = .{ .seconds = 100 };
     start.current_attempt_scheduled_time = .{ .seconds = 105, .nanos = 7 };
     start.started_time = .{ .seconds = 106 };
@@ -3555,6 +3807,21 @@ test "an activity's info carries its Start task's schedule and start times" {
     try testing.expectEqual(@as(i96, 106 * std.time.ns_per_s), info.started_time.?.nanoseconds);
     try testing.expectEqualStrings("Charge", info.activity_type);
     try testing.expectEqual(@as(u32, 2), info.attempt);
+    try testing.expectEqual(@as(i96, 300 * std.time.ns_per_s), info.schedule_to_close_timeout.?.nanoseconds);
+    try testing.expectEqual(@as(i96, 30 * std.time.ns_per_s + 5), info.start_to_close_timeout.?.nanoseconds);
+    try testing.expectEqual(@as(i96, 10 * std.time.ns_per_s), info.heartbeat_timeout.?.nanoseconds);
+    const rp = info.retry_policy.?;
+    try testing.expectEqual(@as(i96, std.time.ns_per_s), rp.initial_interval.?.nanoseconds);
+    try testing.expectEqual(@as(f64, 2), rp.backoff_coefficient);
+    try testing.expectEqual(null, rp.maximum_interval);
+    try testing.expectEqual(@as(i32, 5), rp.maximum_attempts);
+    try testing.expectEqual(1, rp.non_retryable_error_types.len);
+    try testing.expectEqualStrings("Fatal", rp.non_retryable_error_types[0]);
+    try testing.expectEqual(@as(i32, 2), info.priority.priority_key);
+    try testing.expectEqualStrings("tenant-a", info.priority.fairness_key);
+    try testing.expectEqual(@as(f32, 1.5), info.priority.fairness_weight);
+    // Started at 106 s with 30 s to run, before the schedule-to-close end at 400 s.
+    try testing.expectEqual(@as(i96, 136 * std.time.ns_per_s + 5), info.deadline().?.nanoseconds);
 }
 
 const CodecContextTest = struct {
