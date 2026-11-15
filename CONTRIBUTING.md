@@ -35,7 +35,7 @@ The [bug report template](.github/ISSUE_TEMPLATE/bug_report.md) asks for these.
 
 Open or join an issue before starting substantial feature work, behavior changes, or API design changes. This gives maintainers and other users a chance to discuss the approach before you invest in a larger implementation.
 
-Check what is already planned first. [PARITY.md](PARITY.md) lists the Zig samples that exist and the sample each one matches (whether they pass is the Samples badge on README.md, from `zig build samples-test`), and README.md has a section marked "Not implemented yet" for each planned capability that hasn't landed. A request for one of those is best made on its existing issue, or as a new issue that refers to the README section.
+Check what is already planned first. [PARITY.md](PARITY.md)'s feature table says, for each feature Temporal's SDKs offer, whether this SDK supports it, supports part of it, or lacks it, and names the issue that tracks the rest; PARITY.md also lists the Zig samples that exist and the sample each one matches (whether they pass is the Samples badge on README.md, from `zig build samples-test`). README.md has a section marked "Not implemented yet" for each planned capability that hasn't landed. A request for one of those is best made on its existing issue, or as a new issue that refers to the README section.
 
 Small bug fixes, documentation fixes, and narrowly scoped maintenance changes can go straight to a pull request.
 
@@ -51,7 +51,7 @@ zig build samples-test
 scripts/check-core-version.sh
 ```
 
-`zig build test` also checks that README.md's code blocks equal their compiled examples in `examples/readme/`. `zig build samples-test` needs a Temporal dev server and is required when a change touches the client, worker, workflow runtime, activities, Nexus, payload conversion, or interceptors. `scripts/check-core-version.sh` matters when a change touches `deps/` or the sdk-core pin.
+`zig build test` also checks that README.md's code blocks equal their compiled examples in `examples/readme/`. A change to PARITY.md or to README.md's headings needs `zig build readme-check` too: it runs `scripts/parity-check.sh` and its tests (`scripts/parity-check-test.sh`), which check PARITY.md's feature table and the README.md sections it links, and CI runs it. `zig build samples-test` needs a Temporal dev server and is required when a change touches the client, worker, workflow runtime, activities, Nexus, payload conversion, or interceptors. `scripts/check-core-version.sh` matters when a change touches `deps/` or the sdk-core pin.
 
 Generated files aren't edited by hand: AGENTS.md lists the command that regenerates each one.
 
