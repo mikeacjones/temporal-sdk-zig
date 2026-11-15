@@ -667,7 +667,7 @@ pub const PartyWorkflow = workflow.Def("party", Party);
 ```
 
 Notes:
-- Function workflows use `ctx.setSignalHandler`, `setQueryHandler`, and `setUpdateHandler(WithValidator)`, with a context from `ctx.allocator()`.
+- Function workflows use `ctx.setSignalHandler`, `setQueryHandler`, and `setUpdateHandler(WithValidator)`, with a context from `ctx.allocator()`. `ctx.currentUpdate()` gives an update handler or validator its update's ID and name.
 - Signal and update handlers run in their own coroutines and may block; query handlers and validators must only read state (see below).
 - `ctx.setSignalHandlerByName` handles a signal named at run time, and `ctx.setDynamicSignalHandler` every signal without a handler.
 
@@ -706,13 +706,67 @@ pub const LobbyWorkflow = workflow.Def("lobby", lobby);
 Notes:
 - A handler registered for a query type with `setQueryHandler` (or a struct workflow's `queries`) still answers that type. Without a dynamic handler, a query of an unregistered type fails with `QueryNotRegistered`, naming the registered types.
 - An error from the handler, or an argument that doesn't decode, fails the query with the error's name. Registering again replaces the dynamic handler; its context must outlive the run, and one on the calling coroutine's stack returns `error.QueryContextOnStack`.
-- Query handlers and update validators must not change workflow state: history doesn't record queries or rejected updates, so a change would make the run differ from its replay. A call from one that would start an activity, timer, child workflow or any other command (`executeActivity`, `sleep`, `executeChildWorkflow`, `signalExternalWorkflow`, `upsertMemo`, `completeSession`, ...), register or remove a handler (`setSignalHandler`, `signalChannel`, `setUpdateHandler`, ...), take a signal from a channel (`receive`, `tryReceive`), change the run's settings (`setVersioningBehavior`, `setCoroutineName`), start a coroutine (`io.concurrent`), or block (`ctx.await`, a pending future's `get`) is refused: it returns `error.InvalidOptions` or `error.Canceled` (or does nothing, where it can't fail), the query fails or the update is rejected with a `ReadOnlyViolation` failure whose message names the call, whatever the handler returns, no command is sent, and the workflow task doesn't fail. A zero `sleep` returns at once, `io.async` runs its function inline, and `io.random` draws without moving the workflow's random sequence. `ctx.fail` and `ctx.failWith` describe the query's failure or the update's rejection, not the workflow's.
+- Query handlers and update validators must not change workflow state: history doesn't record queries or rejected updates, so a change would make the run differ from its replay. A call from one that would start an activity, timer, child workflow or any other command (`executeActivity`, `sleep`, `executeChildWorkflow`, `signalExternalWorkflow`, `upsertMemo`, `completeSession`, ...), register or remove a handler (`setSignalHandler`, `signalChannel`, `setUpdateHandler`, ...), take a signal from a channel (`receive`, `tryReceive`), change the run's settings (`setVersioningBehavior`), start a coroutine (`io.concurrent`), or block (`ctx.await`, a pending future's `get`) is refused: it returns `error.InvalidOptions` or `error.Canceled` (or does nothing, where it can't fail), the query fails or the update is rejected with a `ReadOnlyViolation` failure whose message names the call, whatever the handler returns, no command is sent, and the workflow task doesn't fail. A zero `sleep` returns at once, `io.async` runs its function inline, and `io.random` draws without moving the workflow's random sequence. `ctx.fail` and `ctx.failWith` describe the query's failure or the update's rejection, not the workflow's.
+- `setCoroutineName` does nothing in a query handler or a validator run on delivery, which run outside any coroutine, so the query or update goes on. It is refused like the calls above in a validator that runs in a coroutine, which happens when the workflow function or a handler registers the handler of an update that is waiting for one: it would otherwise rename that coroutine.
 - Query types Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, and those starting with `__temporal`) don't go to the dynamic handler.
 - In a query handler, `ctx.allocator()` is the query's memory, freed once the answer is sent, so decoding arguments there doesn't grow the run.
 - Waits that can't fail can't be refused: an uncancelable wait that would block (such as `std.Io.Mutex.lockUncancelable` on a mutex the workflow holds), or awaiting or canceling a pending `std.Io.Future`, panics the worker in a query handler or a validator run on delivery. A validator run in a handler's coroutine (when the handler registers the update's handler) blocks only that coroutine, and its update is rejected with `ReadOnlyViolation` once the wait ends. Don't wait in them.
 - A handler or validator that wakes a workflow coroutine through `std.Io` (`Event.set`, `Condition.signal`, `Queue.put`, `Mutex.unlock` on something a coroutine waits for) also fails the query or has the update rejected with `ReadOnlyViolation`. The wake itself still happens, since `std.Io` has already changed the primitive: the woken coroutine runs in the next workflow task that runs workflow code.
 - The SDK can't undo a change a handler makes to workflow data or to a `std.Io` primitive, and doesn't detect one that wakes nothing; keeping to reads is the handler's job.
 - The rules apply only to the handler's or validator's own code: other coroutines, including ones that run while a validator is blocked, are unaffected. A validator run in a coroutine neither sees nor uses up that coroutine's cancellation: `io.checkCancel` and a zero `sleep` return normally, and the cancel stays for the coroutine's own code.
+
+`ctx.setDynamicUpdateHandler(context, handler)` takes every update that has no handler of its own, and `ctx.setDynamicUpdateHandlerWithValidator(context, handler, validator)` checks it first. Both get the update name and the arguments still encoded (`converter.EncodedValues`), and the handler returns the update's result:
+
+<!-- example: workflow-dynamic-update -->
+```zig
+pub const CloseTally = workflow.SignalDef("close_tally", fn () void);
+pub const Ping = workflow.SignalDef("ping", fn () void);
+const Tally = struct {
+    ctx: *workflow.Context,
+    total: i64 = 0,
+    closed: bool = false,
+    // Takes every update without a handler of its own, in a coroutine of its own.
+    fn anyUpdate(t: *Tally, name: []const u8, args: temporal.converter.EncodedValues) !i64 {
+        const amount = try args.get(i64, t.ctx.allocator(), 0);
+        t.total += if (std.mem.eql(u8, name, "subtract")) -amount else amount;
+        return t.total;
+    }
+    // Runs before the update is accepted; its error rejects the update.
+    fn checkUpdate(_: *Tally, name: []const u8, _: temporal.converter.EncodedValues) !void {
+        if (!std.mem.eql(u8, name, "add") and !std.mem.eql(u8, name, "subtract")) return error.UnknownUpdate;
+    }
+    fn ping(t: *Tally) !void {
+        try t.ctx.io().sleep(.fromSeconds(60), .awake);
+    }
+    fn close(t: *Tally) void {
+        t.closed = true;
+    }
+    fn isClosed(t: *Tally) bool {
+        return t.closed;
+    }
+};
+fn tally(ctx: *workflow.Context) !i64 {
+    const t = try ctx.allocator().create(Tally);
+    t.* = .{ .ctx = ctx };
+    try ctx.setDynamicUpdateHandlerWithValidator(t, Tally.anyUpdate, Tally.checkUpdate);
+    try ctx.setSignalHandler(CloseTally, t, Tally.close);
+    // A ping may still be sleeping when the tally closes; that is fine, so no warning.
+    try ctx.setSignalHandlerWithOptions(Ping, t, Tally.ping, .{ .unfinished_policy = .abandon });
+    try ctx.await(t, Tally.isClosed);
+    return t.total;
+}
+pub const TallyWorkflow = workflow.Def("tally", tally);
+```
+
+Notes:
+- The handler runs in a coroutine of its own, like a typed update handler: it may block, and `ctx.currentUpdate()` names the update there and in the validator. Its error rejects the update after acceptance, with the failure described as for a typed handler; the validator's error rejects it before acceptance, leaving no trace in history.
+- A handler registered for an update name with `setUpdateHandler` (or a struct workflow's `updates`) still takes that name. Updates delivered before the dynamic handler is registered, in the same workflow task, reach it in arrival order. Without one, an update of an unregistered name is rejected with `UpdateNotRegistered`.
+- An argument that doesn't decode is the handler's error (or the validator's) to return. Registering again replaces the dynamic handler; its context must outlive the run, and one on the calling coroutine's stack returns `error.UpdateContextOnStack`.
+
+A workflow that completes, is canceled, or continues as new while signal or update handlers are still running cuts them short: their coroutines never resume, and an unfinished update gets no result. The SDK then logs one warning naming them, with the update names and IDs and the signal names. Wait for them with `try ctx.await(ctx, workflow.Context.allHandlersFinished)` before returning, or register a handler whose work may be cut short with `.unfinished_policy = .abandon` to leave it out of the warning:
+- `ctx.setSignalHandlerWithOptions`, `setSignalHandlerByNameWithOptions`, `setDynamicSignalHandlerWithOptions`, `setUpdateHandlerWithOptions`, and `setDynamicUpdateHandlerWithOptions` take a `workflow.HandlerOptions` last; the update ones take the validator, or `null`, before it.
+- A struct workflow declares it at the end of an entry: `.{ Ping, .{ .unfinished_policy = .abandon } }` for a signal, `.{ Close, .checkClose, .{ .unfinished_policy = .abandon } }` for an update.
+- A workflow that fails logs no such warning, and handlers that have already returned aren't named.
 
 A signal channel lets workflow code receive a signal where it needs it instead of in a handler. `ctx.signalChannel(Signal)` (or `ctx.signalChannelByName(name, Args)`) returns a `workflow.SignalChannel` that takes the place of the signal's handler:
 
