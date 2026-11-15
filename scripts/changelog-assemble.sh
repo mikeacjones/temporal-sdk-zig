@@ -46,10 +46,19 @@ fi
 "$root/scripts/changelog-check.sh" >/dev/null
 
 order=(breaking-changes added stabilized changed deprecated fixed security)
-declare -A heading=(
-  [breaking-changes]=':boom: Breaking Changes' [added]=Added [stabilized]=Stabilized
-  [changed]=Changed [deprecated]=Deprecated [fixed]=Fixed [security]=Security
-)
+# A function rather than an associative array: macOS's /bin/bash is 3.2, which has none.
+heading() {
+  case "$1" in
+    breaking-changes) echo ':boom: Breaking Changes' ;;
+    added) echo Added ;;
+    stabilized) echo Stabilized ;;
+    changed) echo Changed ;;
+    deprecated) echo Deprecated ;;
+    fixed) echo Fixed ;;
+    security) echo Security ;;
+    *) echo "no heading for changelog category '$1'" >&2; return 1 ;;
+  esac
+}
 
 zig="$(sed -nE 's/^    \.minimum_zig_version = "([^"]*)",$/\1/p' build.zig.zon)"
 core="$(tr -d '[:space:]' < CORE_VERSION)"
@@ -71,7 +80,7 @@ used=()
     while IFS= read -r -d '' f; do files+=("$f"); done < <(find "changelog/$c" -maxdepth 1 -type f -name '*.md' -print0 | sort -z)
     [ ${#files[@]} -gt 0 ] || continue
     echo
-    echo "### ${heading[$c]}"
+    echo "### $(heading "$c")"
     echo
     for f in "${files[@]}"; do
       sed 's/^/- /' "$f"
