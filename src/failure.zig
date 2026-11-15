@@ -920,6 +920,8 @@ test "encoded attributes write invalid UTF-8 as a JSON string and read what othe
     }
 }
 
+const Scheduler = @import("workflow/Scheduler.zig");
+
 const DeepChain = struct {
     const depth = 10_000;
 
@@ -950,12 +952,16 @@ const DeepChain = struct {
 };
 
 test "copying, encoding and decoding a deep cause chain use the same stack whatever its length" {
-    // The size of a workflow coroutine's default stack (worker.Options.workflow_stack_size):
-    // recursion down a 10,000-link chain would overflow it. Not smaller: glibc refuses thread
-    // stacks under PTHREAD_STACK_MIN, which is 128 KiB on aarch64 Linux.
-    var result: anyerror!void = {};
-    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, DeepChain.run, .{&result});
-    thread.join();
+    // On a workflow coroutine with the default stack size (worker.Options.workflow_stack_size),
+    // where workflow code calls these functions: recursion down a 10,000-link chain would
+    // overflow it. Not on a thread: glibc counts static TLS against a thread's stack size and
+    // refuses a stack too small to hold it, and std's per-thread signal stack
+    // (std.options.signal_stack_size) alone is 256 KiB of TLS.
+    var scheduler: Scheduler = .init(testing.allocator, .{ .stack_size = 256 * 1024 });
+    defer scheduler.deinit();
+    var result: anyerror!void = error.NotRun;
+    _ = try scheduler.spawn("deep cause chain", DeepChain.run, .{&result});
+    scheduler.run();
     try result;
 }
 
