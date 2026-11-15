@@ -1580,6 +1580,52 @@ const Fixtures = struct {
         return "Canceled";
     }
     const SummaryNapsChanged = workflow.Def("SummaryNaps", summaryNapsChanged);
+
+    /// Holds a `std.Io.Mutex` across a timer while two coroutines wait to lock it, then
+    /// cancels the first waiter and unlocks, so the second locks it and naps. The canceled
+    /// branch naps too, so a waiter whose cancel was lost changes the commands.
+    fn cancelMutexWaiter(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var mutex: std.Io.Mutex = .init;
+        mutex.lockUncancelable(io);
+        var canceled = io.async(lockMutex, .{ io, &mutex });
+        var next = io.async(lockMutexAndNap, .{ io, &mutex });
+        try io.sleep(.fromMilliseconds(100), .awake);
+        const outcome = canceled.cancel(io);
+        mutex.unlock(io);
+        try next.await(io);
+        if (outcome) |_| return "locked" else |err| {
+            try io.sleep(.fromMilliseconds(100), .awake);
+            return @errorName(err);
+        }
+    }
+    const CancelMutexWaiter = workflow.Def("CancelMutexWaiter", cancelMutexWaiter);
+
+    fn lockMutex(io: std.Io, mutex: *std.Io.Mutex) std.Io.Cancelable!void {
+        try mutex.lock(io);
+        mutex.unlock(io);
+    }
+
+    fn lockMutexAndNap(io: std.Io, mutex: *std.Io.Mutex) std.Io.Cancelable!void {
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
+        try io.sleep(.fromMilliseconds(100), .awake);
+    }
+
+    /// `cancelMutexWaiter` without the canceled branch's nap.
+    fn cancelMutexWaiterChanged(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var mutex: std.Io.Mutex = .init;
+        mutex.lockUncancelable(io);
+        var canceled = io.async(lockMutex, .{ io, &mutex });
+        var next = io.async(lockMutexAndNap, .{ io, &mutex });
+        try io.sleep(.fromMilliseconds(100), .awake);
+        const outcome = canceled.cancel(io);
+        mutex.unlock(io);
+        try next.await(io);
+        if (outcome) |_| return "locked" else |err| return @errorName(err);
+    }
+    const CancelMutexWaiterChanged = workflow.Def("CancelMutexWaiter", cancelMutexWaiterChanged);
 };
 
 const SideEffectFixtures = struct {
@@ -5751,6 +5797,22 @@ test "WorkflowReplayer replays timers started by ctx.sleep with a summary and ca
     defer changed.deinit();
     try changed.registerWorkflow(Fixtures.SummaryNapsChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(summary_timer_history));
+}
+
+/// A dev-server run of `Fixtures.CancelMutexWaiter`, which cancels a coroutine blocked on a
+/// `std.Io.Mutex`, exported as ProtoJSON from `Client.fetchHistory`.
+const mutex_cancel_history = @embedFile("testdata/mutex_cancel_history.json");
+
+test "WorkflowReplayer replays a workflow that cancels a coroutine blocked on a mutex and catches a changed one" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(Fixtures.CancelMutexWaiter);
+    try ok.replayHistoryJson(mutex_cancel_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(Fixtures.CancelMutexWaiterChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(mutex_cancel_history));
 }
 
 test "ctx.sleep summaries are recorded on the timer started events" {
