@@ -1488,6 +1488,26 @@ const Fixtures = struct {
         return "timer";
     }
     const QueueDependent = workflow.Def("QueueDependent", queueDependent);
+
+    /// Sleeps on a timer with a summary, then races a long timer with a summary, run as a
+    /// coroutine, against a short one without, and cancels the long one.
+    fn summaryNaps(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        try ctx.sleep(.fromMilliseconds(100), .{ .summary = "cool down" });
+        var long = io.async(workflow.Context.sleep, .{ ctx, .fromSeconds(60 * 60), .{ .summary = "give up" } });
+        try ctx.sleep(.fromMilliseconds(100), .{});
+        long.cancel(io) catch |err| return @errorName(err);
+        return "rested";
+    }
+    const SummaryNaps = workflow.Def("SummaryNaps", summaryNaps);
+
+    /// `summaryNaps` without the long timer.
+    fn summaryNapsChanged(ctx: *workflow.Context) ![]const u8 {
+        try ctx.sleep(.fromMilliseconds(100), .{ .summary = "cool down" });
+        try ctx.sleep(.fromMilliseconds(100), .{});
+        return "Canceled";
+    }
+    const SummaryNapsChanged = workflow.Def("SummaryNaps", summaryNapsChanged);
 };
 
 const SideEffectFixtures = struct {
@@ -1900,6 +1920,24 @@ const ChildFixtures = struct {
         return ctx.executeChildWorkflow(GreetChild, .{ .id = child_id }, .{name}).get();
     }
     const ParentOfNamed = workflow.Def("ParentOfNamed", parentOfNamed);
+
+    /// Runs `GreetChild` as "described-child" with a static summary and details. The ID is
+    /// fixed so the replayer, which runs the parent under its own ID, starts the same child.
+    fn describedParent(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return ctx.executeChildWorkflow(GreetChild, .{
+            .id = "described-child",
+            .static_summary = "Greet the guest",
+            .static_details = "Greets **one** guest by name.",
+        }, .{name}).get();
+    }
+    const DescribedParent = workflow.Def("DescribedParent", describedParent);
+
+    /// `describedParent` without the summary and details: they aren't replayed, so it replays
+    /// `DescribedParent`'s history.
+    fn describedParentPlain(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        return ctx.executeChildWorkflow(GreetChild, .{ .id = "described-child" }, .{name}).get();
+    }
+    const DescribedParentPlain = workflow.Def("DescribedParent", describedParentPlain);
 
     /// `parent` starting a different child type, which can't replay `Parent`'s history.
     fn parentOfOther(ctx: *workflow.Context, name: []const u8) ![]const u8 {
@@ -5437,6 +5475,48 @@ test "time-skipping WorkflowEnvironment sleep advances server time" {
     try testing.expect(before.durationTo(try env.now()).nanoseconds >= std.time.ns_per_hour);
 }
 
+/// A dev-server run of `Fixtures.SummaryNaps`, whose timers carry summaries, exported with
+/// `temporal workflow show`.
+const summary_timer_history = @embedFile("testdata/summary_timer_history.json");
+
+test "WorkflowReplayer replays timers started by ctx.sleep with a summary and catches a dropped timer" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(Fixtures.SummaryNaps);
+    try ok.replayHistoryJson(summary_timer_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(Fixtures.SummaryNapsChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(summary_timer_history));
+}
+
+test "ctx.sleep summaries are recorded on the timer started events" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.SummaryNaps);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(Fixtures.SummaryNaps, .{}, .{});
+    defer run.deinit();
+    // Replays the run too.
+    try testing.expectEqualStrings("Canceled", try env.getResult(Fixtures.SummaryNaps, &run, a, null));
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var summaries: std.ArrayList([]const u8) = .empty;
+    for (history.events.items) |event| if (event.attributes.? == .timer_started_event_attributes) {
+        const summary = if (event.user_metadata) |m| try converter.fromPayload([]const u8, a, m.summary.?) else "";
+        try summaries.append(a, summary);
+    };
+    try testing.expectEqual(@as(usize, 3), summaries.items.len);
+    try testing.expectEqualStrings("cool down", summaries.items[0]);
+    // The short timer starts before the coroutine that starts the long one runs.
+    try testing.expectEqualStrings("", summaries.items[1]);
+    try testing.expectEqualStrings("give up", summaries.items[2]);
+}
+
 /// A dev-server run of `Fixtures.LocalGreetings`, whose second local activity waited on two
 /// backoff timers, exported with `temporal workflow show`.
 const local_activity_history = @embedFile("testdata/local_activity_history.json");
@@ -5906,6 +5986,41 @@ test "WorkflowReplayer replays a parent's child workflow and catches a changed c
     defer changed.deinit();
     try changed.registerWorkflow(ChildFixtures.ParentChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(child_workflow_history));
+}
+
+test "a child workflow's static summary and details are recorded on its started event" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChildFixtures.DescribedParent);
+    try env.registerWorkflow(ChildFixtures.GreetChild);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(ChildFixtures.DescribedParent, .{}, .{"Ada"});
+    defer run.deinit();
+    // Replays the run too.
+    try testing.expectEqualStrings("Hello Ada from a child!", try env.getResult(ChildFixtures.DescribedParent, &run, a, null));
+
+    const event = try StartOptionFixtures.startedEvent(&env.client, a, "described-child", "");
+    try StartOptionFixtures.expectMetadata(a, event, "Greet the guest", "Greets **one** guest by name.");
+    try testing.expectEqualStrings(run.id, event.attributes.?.workflow_execution_started_event_attributes.parent_workflow_execution.?.workflow_id);
+}
+
+/// A dev-server run of `ChildFixtures.DescribedParent`, whose child was started with a static
+/// summary and details, exported as JSON.
+const described_child_history = @embedFile("testdata/described_child_history.json");
+
+test "WorkflowReplayer replays a child started with a static summary and details, with or without them" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(ChildFixtures.DescribedParent);
+    try ok.replayHistoryJson(described_child_history);
+
+    var plain: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer plain.deinit();
+    try plain.registerWorkflow(ChildFixtures.DescribedParentPlain);
+    try plain.replayHistoryJson(described_child_history);
 }
 
 const RetryDelayFixtures = struct {

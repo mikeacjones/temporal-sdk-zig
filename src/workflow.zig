@@ -533,6 +533,12 @@ pub const ChildWorkflowOptions = struct {
     /// The child's search attributes, built with `search_attributes.Key.set`; unsets are
     /// ignored. A value the server can't index fails the start with `error.InvalidOptions`.
     search_attributes: []const search_attributes.Update = &.{},
+    /// A short single-line description of the child, shown in the UI and CLI on its started
+    /// event. Sent as a JSON string payload (through the codecs); empty sends none.
+    static_summary: []const u8 = "",
+    /// A longer description of the child, shown in the UI and CLI. Sent as a JSON string
+    /// payload (through the codecs); empty sends none.
+    static_details: []const u8 = "",
 };
 
 /// What canceling a Nexus operation does: `NexusOperationFuture.cancel`, or canceling the
@@ -615,6 +621,14 @@ pub const ContinueAsNewOptions = struct {
     retry_policy: ?RetryPolicy = null,
 };
 
+/// How `Context.sleep` starts its timer. Only read while starting it; strings are copied.
+pub const SleepOptions = struct {
+    /// A short, single-line description of this timer, shown by the UI and CLI on its
+    /// started event. Sent as a JSON string payload, through the worker's payload codecs.
+    /// Empty sends none.
+    summary: []const u8 = "",
+};
+
 pub const Context = struct {
     instance: *Instance,
     /// Set by `fail` in the workflow function (or a coroutine it started) and reported
@@ -695,6 +709,14 @@ pub const Context = struct {
     /// `ctx.io().now(...)`.
     pub fn now(ctx: *const Context) std.Io.Timestamp {
         return .{ .nanoseconds = ctx.instance.now_ns };
+    }
+
+    /// Blocks the calling coroutine on a durable timer, as `ctx.io().sleep` does, with
+    /// `options` on the timer. To race or cancel it, run it as a coroutine (`io.async`, or a
+    /// `std.Io.Select` case): canceling the coroutine cancels the timer and returns
+    /// `error.Canceled`. A zero or negative duration returns at once and starts no timer.
+    pub fn sleep(ctx: *Context, duration: Duration, options: SleepOptions) std.Io.Cancelable!void {
+        return ctx.instance.sleep(duration, options.summary);
     }
 
     /// Blocks until `condition(state)` returns true.

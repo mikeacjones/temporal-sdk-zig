@@ -82,7 +82,7 @@ fn isTrue(b: *bool) bool {
     return b.*;
 }
 fn patientGreeting(ctx: *workflow.Context, name: []const u8) ![]const u8 {
-    try ctx.io().sleep(.fromSeconds(60 * 60), .awake); // a durable timer
+    try ctx.sleep(.fromSeconds(60 * 60), .{ .summary = "give them an hour" }); // a durable timer
     const answered = try ctx.allocator().create(bool); // handler state outlives this call
     answered.* = false;
     try ctx.setSignalHandler(Answer, answered, setTrue);

@@ -529,7 +529,7 @@ Notes:
 - Adding any of the three to existing workflow code doesn't break replay of histories recorded without them.
 
 #### Timers and conditions
-`ctx.io().sleep` starts a durable timer; `workflow.Context.await` blocks until a condition holds, and `awaitTimeout` gives up after a timeout.
+`ctx.sleep` blocks on a durable timer, as `ctx.io().sleep` does, and takes `workflow.SleepOptions`: a `summary` the UI and CLI show on the timer's started event. `workflow.Context.await` blocks until a condition holds, and `awaitTimeout` gives up after a timeout.
 
 <!-- example: workflow-timers -->
 ```zig
@@ -541,7 +541,7 @@ fn isTrue(b: *bool) bool {
     return b.*;
 }
 fn patientGreeting(ctx: *workflow.Context, name: []const u8) ![]const u8 {
-    try ctx.io().sleep(.fromSeconds(60 * 60), .awake); // a durable timer
+    try ctx.sleep(.fromSeconds(60 * 60), .{ .summary = "give them an hour" }); // a durable timer
     const answered = try ctx.allocator().create(bool); // handler state outlives this call
     answered.* = false;
     try ctx.setSignalHandler(Answer, answered, setTrue);
@@ -554,7 +554,8 @@ pub const PatientGreeting = workflow.Def("patient_greeting", patientGreeting);
 Notes:
 - The condition reruns whenever all coroutines have blocked, so it must be cheap and change nothing.
 - `awaitTimeout` returns false if the timeout passed first; both return `error.Canceled` if the coroutine is canceled.
-- To race or cancel a timer, run `std.Io.sleep` as a coroutine, as the next example does.
+- To race or cancel a timer, run `std.Io.sleep` or `workflow.Context.sleep` as a coroutine (`io.async`, or a `std.Io.Select` case, as the next example does): canceling the coroutine cancels the timer, and the sleep returns `error.Canceled`.
+- The summary is sent as a JSON string payload through the worker's payload codecs; an empty one sends none, so the timer is the one `ctx.io().sleep` starts. A summary doesn't affect replay. `awaitTimeout`'s timer has no summary.
 
 #### Concurrency
 `ctx.io()` gives workflows `std.Io` concurrency: `io.async` futures, `std.Io.Select`, `std.Io.Group`, `std.Io.Mutex`, `std.Io.Semaphore`, `std.Io.Event`, `std.Io.Condition`, and `std.Io.Queue`. Blocked coroutines are woken in the order they started waiting, but a woken coroutine is not guaranteed to get what it waited for: a coroutine that releases a `std.Io.Mutex` or a `std.Io.Semaphore` permit and takes it again before it blocks gets it first, so code must not depend on the order in which coroutines acquire them. A coroutine canceled while blocked on any of them gets `error.Canceled`.
@@ -729,6 +730,7 @@ Notes:
 - `started` returns the child's execution; `error.ChildWorkflowAlreadyStarted` means its ID is taken.
 - `get` returns `error.ChildWorkflowFailed` for a failed, timed-out, canceled, or terminated child, `future.failure()` saying which, and `error.ChildWorkflowAlreadyStarted` when the child's ID is taken.
 - `parent_close_policy` defaults to `.terminate`; `future.signal` signals the child and `future.cancel()` cancels it.
+- `static_summary` (a short single line) and `static_details` (longer text) describe the child; the UI and CLI show them on its started event. Each is sent as a JSON string payload through the worker's payload codecs, and empty sends none. They don't take part in replay.
 
 #### External workflows
 - `ctx.signalExternalWorkflow` and `ctx.cancelExternalWorkflow` signal or cancel a workflow by ID; an empty run ID targets the latest run.
