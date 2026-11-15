@@ -368,7 +368,7 @@ expect_readme fail "a heading inside a multi-line HTML comment is no anchor" "no
 cases=$((cases + 1))
 if ! grep -qiE 'failure_converter|FailureConverter' "$src/src/client.zig" "$src/src/converter.zig" "$src/src/failure.zig" &&
   ! awk '/^## /{s=($0 ~ /^## Feature table/)} s' "$src/PARITY.md" | grep -qiE '^\|.*failure convert'; then
-  echo "FAIL the real PARITY.md's feature table has a row for custom failure converters, a GA feature of every official SDK but PHP"
+  echo "FAIL the real PARITY.md's feature table has a row for custom failure converters, a GA feature of more than one official SDK (PARITY.md's row names them)"
   failures=$((failures + 1))
 fi
 
@@ -448,7 +448,7 @@ fi
 cases=$((cases + 1))
 if ! grep -q '__enhanced_stack_trace' "$src/src/workflow.zig" "$src/src/workflow/Instance.zig" "$src/src/worker.zig" &&
   ! awk '/^## /{s=($0 ~ /^## Feature table/)} s' "$src/PARITY.md" | grep -qiE '^\|.*enhanced stack trace'; then
-  echo "FAIL the real PARITY.md's feature table has a row for the enhanced stack trace query, which TypeScript and Python both offer"
+  echo "FAIL the real PARITY.md's feature table has a row for the enhanced stack trace query, which more than one official SDK offers (PARITY.md's row names them)"
   failures=$((failures + 1))
 fi
 
@@ -459,7 +459,7 @@ fi
 cases=$((cases + 1))
 if grep -q 'stub: temporal-sdk-zig-d51.4.4' "$src/README.md" &&
   ! awk '/^## /{s=($0 ~ /^## Feature table/)} s' "$src/PARITY.md" | grep -qiE '^\|.*remote codec'; then
-  echo "FAIL the real PARITY.md's feature table has a row for a remote codec client, which Go and Java both offer"
+  echo "FAIL the real PARITY.md's feature table has a row for a remote codec client, which more than one official SDK offers (PARITY.md's row names them)"
   failures=$((failures + 1))
 fi
 
