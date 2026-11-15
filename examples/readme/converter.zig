@@ -120,3 +120,49 @@ test "converter: a failure's cause chain reaches the caller" {
     try testing.expectEqualStrings("name is empty", root.message);
     try testing.expectEqualStrings("InvalidName", temporal.failure.applicationType(root.*).?);
 }
+
+// example: converter-fail-with
+fn checkout(ctx: *workflow.Context, order: []const u8) !void {
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+    try ctx.executeActivity(Hold, opts, .{order}).get();
+    // Releases the hold if anything below fails; the release can fail too.
+    errdefer ctx.executeActivity(Release, opts, .{order}).get() catch {};
+
+    const charge = ctx.executeActivity(Charge, opts, .{order});
+    // Keeps the charge's failure: without failWith, a failed release would replace it.
+    // Other errors, such as error.Canceled, are returned as they are.
+    charge.get() catch |err| return switch (err) {
+        error.ActivityFailed => ctx.failWith(charge.failure().?),
+        else => err,
+    };
+}
+// end-example
+
+fn holdFunds(_: *activity.Context, _: []const u8) !void {}
+fn chargeCard(ctx: *activity.Context, _: []const u8) !void {
+    return ctx.fail(.{ .message = "card declined", .type = "Declined", .non_retryable = true });
+}
+fn releaseFunds(ctx: *activity.Context, _: []const u8) !void {
+    return ctx.fail(.{ .message = "release failed", .non_retryable = true });
+}
+
+const Hold = activity.Def("hold", holdFunds);
+const Charge = activity.Def("charge", chargeCard);
+const Release = activity.Def("release", releaseFunds);
+const Checkout = workflow.Def("checkout", checkout);
+
+test "converter: failWith keeps a failure that a failed cleanup would replace" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Checkout);
+    try env.registerActivity(Hold);
+    try env.registerActivity(Charge);
+    try env.registerActivity(Release);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var failure: ?temporal.failure.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(Checkout, .{"order-1"}, arena.allocator(), &failure));
+    try testing.expectEqualStrings("card declined", temporal.failure.rootCause(&failure.?).message);
+    try testing.expectEqualStrings("charge", failure.?.failure_info.?.activity_failure_info.activity_type.?.name);
+}

@@ -631,9 +631,9 @@ pub const SleepOptions = struct {
 
 pub const Context = struct {
     instance: *Instance,
-    /// Set by `fail` in the workflow function (or a coroutine it started) and reported
-    /// instead of the returned error's name. Signal and update handlers keep their own.
-    pending_failure: ?failure_mod.Application = null,
+    /// Set by `fail` or `failWith` in the workflow function (or a coroutine it started) and
+    /// reported instead of the returned error's name. Signal and update handlers keep their own.
+    pending_failure: ?Instance.PendingFailure = null,
     /// The last activity or child workflow failure a future returned to the workflow function
     /// (or a coroutine it started); reported as the workflow's failure when the workflow
     /// returns the future's error. Signal and update handlers keep their own.
@@ -748,7 +748,36 @@ pub const Context = struct {
     /// Fails the workflow with a failure you describe. Return the error this gives back. In
     /// an update handler, returning it rejects the update with that failure instead.
     pub fn fail(ctx: *Context, a: failure_mod.Application) error{ApplicationFailure} {
-        ctx.instance.setPendingFailure(a);
+        ctx.instance.setPendingFailure(.{ .application = a });
+        return error.ApplicationFailure;
+    }
+
+    /// Fails the workflow with `f` as given (its kind, message, details and cause chain), and
+    /// returns the error to return, as `fail` does. Use it to keep a failure that cleanup on
+    /// the error path (an `errdefer`, a `defer`, a `catch`) would otherwise replace: by
+    /// default a returned activity or child error reports the failure the latest `get`
+    /// returned, so a failed cleanup activity would win.
+    ///
+    ///     const charge = ctx.executeActivity(Charge, opts, .{order});
+    ///     charge.get() catch |err| {
+    ///         ctx.executeActivity(Release, opts, .{order}).get() catch {};
+    ///         return switch (err) {
+    ///             error.ActivityFailed => ctx.failWith(charge.failure().?),
+    ///             else => err,
+    ///         };
+    ///     };
+    ///
+    /// Call it only for the future's failure error (`error.ActivityFailed` and the like):
+    /// a `get` can return `error.Canceled` while `failure()` holds the activity's failure,
+    /// and returning `failWith`'s error then would fail a workflow that should be canceled.
+    ///
+    /// `fail` and `failWith` share one slot: the later call wins, and later failed `get`s
+    /// don't change it. In an update handler, returning the error rejects the update with
+    /// `f`. `f` itself is copied, but what it points to (message, details, cause) is read
+    /// after the function returns, so it must live as long as the run: a failure read from
+    /// a future (`future.failure()`) or built in `allocator()` does.
+    pub fn failWith(ctx: *Context, f: *const failure_mod.Failure) error{ApplicationFailure} {
+        ctx.instance.setPendingFailure(.{ .failure = f.* });
         return error.ApplicationFailure;
     }
 

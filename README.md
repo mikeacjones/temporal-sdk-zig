@@ -1312,7 +1312,7 @@ Notes:
 
 #### Failures
 
-A failed operation returns a Zig error (`error.ActivityFailed`, `error.WorkflowFailed`); the `temporal.Failure` itself, with message, type, details, and cause chain, is read afterwards from the future or handle. Code raises a failure by returning an error or by describing one with `ctx.fail`.
+A failed operation returns a Zig error (`error.ActivityFailed`, `error.WorkflowFailed`); the `temporal.Failure` itself, with message, type, details, and cause chain, is read afterwards from the future or handle. Code raises a failure by returning an error, by describing one with `ctx.fail`, or, in a workflow, by choosing an existing one with `ctx.failWith`.
 
 <!-- example: converter-failures -->
 ```zig
@@ -1333,12 +1333,35 @@ fn greeting(ctx: *workflow.Context, name: []const u8) ![]const u8 {
 }
 ```
 
+Cleanup that runs on the error path (an `errdefer`, a `defer`, a `catch` block) can call activities that fail too. `ctx.failWith(f)` records the failure the workflow fails with, here the charge's from `future.failure()`, and returns `error.ApplicationFailure` to return; failures that later `get` calls record don't replace it:
+
+<!-- example: converter-fail-with -->
+```zig
+fn checkout(ctx: *workflow.Context, order: []const u8) !void {
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+    try ctx.executeActivity(Hold, opts, .{order}).get();
+    // Releases the hold if anything below fails; the release can fail too.
+    errdefer ctx.executeActivity(Release, opts, .{order}).get() catch {};
+
+    const charge = ctx.executeActivity(Charge, opts, .{order});
+    // Keeps the charge's failure: without failWith, a failed release would replace it.
+    // Other errors, such as error.Canceled, are returned as they are.
+    charge.get() catch |err| return switch (err) {
+        error.ActivityFailed => ctx.failWith(charge.failure().?),
+        else => err,
+    };
+}
+```
+
 Notes:
 
 - A plain error becomes an application failure whose message and type are the error's name. An earlier `ctx.fail` replaces that failure, whatever the error, only for the code it was called in: one in the workflow function, or in a coroutine that it or a handler starts, applies to the error the workflow function returns; one in a signal handler applies to that handler's error when the error fails the workflow; one in an activity attempt applies to the error that attempt returns. An update handler uses its `ctx.fail` failure only when it returns `error.ApplicationFailure`; any other error rejects the update with the error's name. In a workflow, `error.Canceled` cancels it and `error.OutOfMemory` fails the workflow task for a retry; in an activity, `error.Canceled` after a cancel reports it canceled.
 - `ctx.fail` takes a `failure.Application` (`type`, `non_retryable`, `details`, `category`, `next_retry_delay`) and returns `error.ApplicationFailure`.
 - On the client, `run.failure()` reads the failure after `error.WorkflowFailed`; it borrows the arena passed to `get`.
-- A workflow that returns `error.ActivityFailed` (or a child, external, or session error) fails with the last failure a `get` returned, so return the error as soon as `get` gives it; `failure.rootCause` then reaches the original one. The last failure is kept per signal or update handler run, and once for the workflow function and every coroutine it or a handler starts, so a failed `get` in a sibling coroutine can supply it.
+- A workflow that returns `error.ActivityFailed` (or a child, external, or session error) fails with the last failure a `get` returned; `failure.rootCause` then reaches the original one. The last failure is kept per signal or update handler run, and once for the workflow function and every coroutine it or a handler starts, so a failed `get` in a sibling coroutine, or a cleanup activity that fails after it, can replace it. Return the error as soon as `get` gives it, or choose the failure with `ctx.failWith`.
+- `failWith` reports `f` as given: its kind (here an activity failure), message, details, and cause chain. `f` is copied, but what it points to is read after the function returns, so it must live as long as the run; a failure read from a future does, as does one built in `ctx.allocator()`.
+- Call `failWith` only for the future's failure error. A `get` can return `error.Canceled` while `failure()` already holds the activity's failure (it failed as the workflow was canceled); returning `failWith`'s error there would fail a workflow that should be canceled.
+- `ctx.fail` and `ctx.failWith` share one slot and follow the same rules: the later call wins, and once recorded it is reported for the error the code returns, so call it on the path that returns. In an update handler, returning its `error.ApplicationFailure` rejects the update with `f`; in a signal handler it fails the workflow with `f`.
 
 #### Failure converter
 <!-- stub: temporal-sdk-zig-d51.4.5 -->

@@ -1,6 +1,7 @@
 //! Saga: a money transfer that undoes its completed steps when a later step fails. Each step
 //! that succeeds registers its compensation with `errdefer`, so on the error path the
-//! compensations run in reverse order and the workflow still fails with the original failure.
+//! compensations run in reverse order. A failed step records its failure with
+//! `ctx.failWith`, so the workflow fails with it even when a compensation fails too.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -28,13 +29,24 @@ fn transferMoney(ctx: *workflow.Context, transfer_details: TransferDetails) !voi
         },
     };
 
-    try ctx.executeActivity(Withdraw, ao, .{transfer_details}).get();
+    try step(ctx, Withdraw, ao, transfer_details);
     errdefer compensate(ctx, WithdrawCompensation, ao, transfer_details);
 
-    try ctx.executeActivity(Deposit, ao, .{transfer_details}).get();
+    try step(ctx, Deposit, ao, transfer_details);
     errdefer compensate(ctx, DepositCompensation, ao, transfer_details);
 
-    try ctx.executeActivity(StepWithError, ao, .{transfer_details}).get();
+    try step(ctx, StepWithError, ao, transfer_details);
+}
+
+/// Runs a step. A step that fails fails the workflow with its own failure: a compensation
+/// that fails afterwards can't replace it. Any other error, such as error.Canceled when the
+/// workflow is canceled, is returned as it is.
+fn step(ctx: *workflow.Context, comptime Step: type, ao: workflow.ActivityOptions, transfer_details: TransferDetails) !void {
+    const future = ctx.executeActivity(Step, ao, .{transfer_details});
+    future.get() catch |err| return switch (err) {
+        error.ActivityFailed => ctx.failWith(future.failure().?),
+        else => err,
+    };
 }
 
 /// Runs a compensation on the error path. A compensation that fails is logged and the

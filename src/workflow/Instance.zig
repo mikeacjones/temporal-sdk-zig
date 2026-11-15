@@ -350,12 +350,27 @@ const HandlerRun = struct {
     },
     /// Set after spawning, before the coroutine first runs; freed when it returns.
     task: *WorkflowIo.Task = undefined,
-    /// This handler's `Context.fail` and the failure of the last activity or child future it
-    /// awaited; the workflow function's are in `Context`.
-    pending_failure: ?failure_mod.Application = null,
+    /// This handler's `Context.fail` or `Context.failWith` and the failure of the last activity
+    /// or child future it awaited; the workflow function's are in `Context`.
+    pending_failure: ?PendingFailure = null,
     last_failure: ?*const Failure = null,
     /// Set when a signal channel's handler appended the signal to its channel.
     taken: bool = false,
+};
+
+/// The failure a coroutine chose with `Context.fail` or `Context.failWith`; the later call
+/// replaces the earlier. `failure` is copied when recorded, so a failure on the caller's
+/// stack survives the return; what it points to (message, details, cause) is borrowed.
+pub const PendingFailure = union(enum) {
+    application: failure_mod.Application,
+    failure: Failure,
+
+    fn resolve(p: PendingFailure, a: Allocator) error{OutOfMemory}!Failure {
+        return switch (p) {
+            .application => |app| failure_mod.application(a, app),
+            .failure => |f| f,
+        };
+    }
 };
 
 /// `continued_as_new`: the workflow function returned error.ContinueAsNew after
@@ -1104,11 +1119,11 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
     }
 }
 
-/// An update handler's error as its rejection: the Application failure it described with
-/// `ctx.fail`, or the failure of the activity or child workflow whose error it returned.
+/// An update handler's error as its rejection: the failure it chose with `ctx.fail` or
+/// `ctx.failWith`, or the failure of the activity or child workflow whose error it returned.
 fn updateFailure(a: Allocator, run: *const HandlerRun, err: anyerror) error{OutOfMemory}!Failure {
     switch (err) {
-        error.ApplicationFailure => if (run.pending_failure) |p| return failure_mod.application(a, p),
+        error.ApplicationFailure => if (run.pending_failure) |p| return p.resolve(a),
         error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (run.last_failure) |f| return f.*,
         else => {},
     }
@@ -1136,9 +1151,9 @@ pub fn currentUpdate(inst: *Instance) ?workflow.UpdateInfo {
     };
 }
 
-/// Records `Context.fail`'s failure for the running coroutine: its handler run's, or the
-/// workflow function's.
-pub fn setPendingFailure(inst: *Instance, a: failure_mod.Application) void {
+/// Records `Context.fail`'s or `Context.failWith`'s failure for the running coroutine: its
+/// handler run's, or the workflow function's.
+pub fn setPendingFailure(inst: *Instance, a: PendingFailure) void {
     if (inst.currentHandler()) |run| run.pending_failure = a else inst.ctx.pending_failure = a;
 }
 
@@ -1350,7 +1365,7 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
         .{ run.pending_failure, run.last_failure }
     else
         .{ inst.ctx.pending_failure, inst.ctx.last_failure };
-    if (pending) |p| return failure_mod.application(a, p);
+    if (pending) |p| return p.resolve(a);
     switch (err) {
         error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (last) |f| return f.*,
         // Only the workflow function's return of ctx.continueAsNew's error continues as new.
@@ -3716,6 +3731,8 @@ const Updates = struct {
     const SetSlowly = workflow.UpdateDef("set_slowly", fn (value: i64) i64);
     const Break = workflow.UpdateDef("break", fn () void);
     const Done = workflow.SignalDef("done", fn () void);
+    const KeepUpdate = workflow.UpdateDef("keep", fn () void);
+    const KeepSignal = workflow.SignalDef("keep", fn () void);
 
     const State = struct {
         ctx: *workflow.Context,
@@ -3973,6 +3990,8 @@ const HandlerFailures = struct {
     const Plain = workflow.UpdateDef("plain", fn () void);
     const Explode = workflow.SignalDef("explode", fn () void);
     const Done = workflow.SignalDef("done", fn () void);
+    const KeepUpdate = workflow.UpdateDef("keep", fn () void);
+    const KeepSignal = workflow.SignalDef("keep", fn () void);
 
     const State = struct {
         ctx: *workflow.Context,
@@ -3991,6 +4010,18 @@ const HandlerFailures = struct {
         fn explode(s: *State) !void {
             _ = try s.ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"explode"}).get();
         }
+        /// A charge that fails, then a cleanup that fails too; fails with the charge's failure.
+        fn keepCharge(s: *State) !void {
+            const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+            const charged = s.ctx.executeActivity(Greet, opts, .{"charge"});
+            _ = charged.get() catch |err| {
+                _ = s.ctx.executeActivity(Greet, opts, .{"cleanup"}).get() catch "";
+                return switch (err) {
+                    error.ActivityFailed => s.ctx.failWith(charged.failure().?),
+                    else => err,
+                };
+            };
+        }
         fn finish(s: *State) void {
             s.done = true;
         }
@@ -4008,6 +4039,8 @@ const HandlerFailures = struct {
         try ctx.setUpdateHandler(Refuse, s, State.refuse);
         try ctx.setUpdateHandler(Plain, s, State.plain);
         try ctx.setSignalHandler(Explode, s, State.explode);
+        try ctx.setUpdateHandler(KeepUpdate, s, State.keepCharge);
+        try ctx.setSignalHandler(KeepSignal, s, State.keepCharge);
         try ctx.setSignalHandler(Done, s, State.finish);
         const early: ?error{ApplicationFailure} = if (fail_first) ctx.fail(.{ .message = "workflow failed", .type = "WorkflowFailed" }) else null;
         try ctx.await(s, State.finished);
@@ -4109,6 +4142,168 @@ test "a signal handler's activity failure fails the workflow with that failure" 
     const fail = cmds[0].variant.?.fail_workflow_execution.failure.?;
     try testing.expectEqualStrings("activity error", fail.message);
     try testing.expectEqualStrings("invalid Amount", fail.cause.?.message);
+}
+
+// `ctx.failWith` keeps a failure that cleanup on the error path would otherwise replace.
+const KeepFailure = struct {
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+
+    /// Runs "charge"; when it fails, runs "cleanup", then fails as `mode` says: "plain"
+    /// returns the charge's error, "keep" fails with the charge's failure, "fail_then_keep"
+    /// calls ctx.fail and then ctx.failWith, and "keep_then_fail" the other way round.
+    fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, mode, "errdefer_keep")) return withErrdefer(ctx, true);
+        if (std.mem.eql(u8, mode, "errdefer_plain")) return withErrdefer(ctx, false);
+        const charged = ctx.executeActivity(Greet, opts, .{"charge"});
+        _ = charged.get() catch |err| {
+            _ = ctx.executeActivity(Greet, opts, .{"cleanup"}).get() catch "";
+            if (std.mem.eql(u8, mode, "keep")) return switch (err) {
+                error.ActivityFailed => ctx.failWith(charged.failure().?),
+                else => err,
+            };
+            // Both calls return error.ApplicationFailure; the switch discards the first's.
+            if (std.mem.eql(u8, mode, "fail_then_keep")) return switch (ctx.fail(.{ .message = "replaced", .type = "Replaced" })) {
+                error.ApplicationFailure => ctx.failWith(charged.failure().?),
+            };
+            if (std.mem.eql(u8, mode, "keep_then_fail")) return switch (ctx.failWith(charged.failure().?)) {
+                error.ApplicationFailure => ctx.fail(.{ .message = "chosen later", .type = "Later" }),
+            };
+            return err;
+        };
+        return "charged";
+    }
+
+    /// The cleanup runs from an errdefer, after the charge's failure is chosen (or not).
+    fn withErrdefer(ctx: *workflow.Context, keep: bool) ![]const u8 {
+        errdefer _ = ctx.executeActivity(Greet, opts, .{"cleanup"}).get() catch "";
+        const charged = ctx.executeActivity(Greet, opts, .{"charge"});
+        _ = charged.get() catch |err| return if (keep) ctx.failWith(charged.failure().?) else err;
+        return "charged";
+    }
+};
+const KeepFailureWf = workflow.Def("KeepFailure", KeepFailure.run);
+
+/// Runs `KeepFailureWf` in `mode` with a charge (seq 1) and a cleanup (seq 2) that both
+/// fail, and returns the workflow's failure, which lives as long as `inst`.
+fn failureAfterCleanup(a: Allocator, inst: *Instance, mode: []const u8) !Failure {
+    const scheduled = commandsOf(try inst.activate(&try initActivation(a, "KeepFailure", .{mode}), a));
+    try testing.expectEqual(@as(usize, 1), scheduled.len);
+    const cleanup = commandsOf(try inst.activate(&try resolveFailed(a, 1, try activityFailure(a, "card declined", "Declined")), a));
+    try testing.expectEqual(@as(usize, 1), cleanup.len);
+    try testing.expectEqualStrings("\"cleanup\"", cleanup[0].variant.?.schedule_activity.arguments.items[0].data);
+    const done = commandsOf(try inst.activate(&try resolveFailed(a, 2, try activityFailure(a, "cleanup failed", "CleanupFailed")), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    return done[0].variant.?.fail_workflow_execution.failure.?;
+}
+
+/// Checks that `f` is the charge's activity failure, cause and all.
+fn expectChargeFailure(f: Failure) !void {
+    try testing.expectEqualStrings("activity error", f.message);
+    try testing.expect(f.failure_info.? == .activity_failure_info);
+    try testing.expectEqualStrings("card declined", f.cause.?.message);
+    try testing.expectEqualStrings("Declined", failure_mod.applicationType(f.cause.?.*).?);
+}
+
+test "failWith: a caught cleanup failure doesn't replace the failure the workflow chose" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const kept = try create(testing.allocator, KeepFailureWf.registered, .{});
+    defer kept.destroy();
+    try expectChargeFailure(try failureAfterCleanup(a, kept, "keep"));
+
+    // Without failWith, the returned error reports the last failure a get returned.
+    const plain = try create(testing.allocator, KeepFailureWf.registered, .{});
+    defer plain.destroy();
+    const f = try failureAfterCleanup(a, plain, "plain");
+    try testing.expectEqualStrings("activity error", f.message);
+    try testing.expectEqualStrings("cleanup failed", f.cause.?.message);
+}
+
+test "failWith: a workflow canceled as its activity fails is canceled, not failed" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, KeepFailureWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "KeepFailure", .{@as([]const u8, "keep")}), a);
+    var act = try resolveFailed(a, 1, try activityFailure(a, "card declined", "Declined"));
+    try act.jobs.append(a, .{ .variant = .{ .cancel_workflow = .{} } });
+    const cleanup = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 1), cleanup.len);
+    const done = commandsOf(try inst.activate(&try resolveFailed(a, 2, try activityFailure(a, "cleanup failed", "CleanupFailed")), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expect(done[0].variant.? == .cancel_workflow_execution);
+}
+
+test "failWith: an errdefer's failed cleanup activity doesn't replace the chosen failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const kept = try create(testing.allocator, KeepFailureWf.registered, .{});
+    defer kept.destroy();
+    try expectChargeFailure(try failureAfterCleanup(a, kept, "errdefer_keep"));
+
+    const plain = try create(testing.allocator, KeepFailureWf.registered, .{});
+    defer plain.destroy();
+    try testing.expectEqualStrings("cleanup failed", (try failureAfterCleanup(a, plain, "errdefer_plain")).cause.?.message);
+}
+
+test "failWith and fail share one slot: the later call is reported" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    const with_last = try create(testing.allocator, KeepFailureWf.registered, .{});
+    defer with_last.destroy();
+    try expectChargeFailure(try failureAfterCleanup(a, with_last, "fail_then_keep"));
+
+    const fail_last = try create(testing.allocator, KeepFailureWf.registered, .{});
+    defer fail_last.destroy();
+    const f = try failureAfterCleanup(a, fail_last, "keep_then_fail");
+    try testing.expectEqualStrings("chosen later", f.message);
+    try testing.expectEqualStrings("Later", failure_mod.applicationType(f).?);
+}
+
+test "update: failWith in a handler rejects it with that failure after a failed cleanup" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, HandlerFailuresWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "HandlerFailures", .{false}), a);
+    const scheduled = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "keep", .{}, true)), a));
+    try testing.expectEqual(@as(usize, 2), scheduled.len);
+    try testing.expect(scheduled[1].variant.? == .schedule_activity);
+    const cleanup = commandsOf(try inst.activate(&try resolveFailed(a, 1, try activityFailure(a, "card declined", "Declined")), a));
+    try testing.expectEqual(@as(usize, 1), cleanup.len);
+    const cmds = commandsOf(try inst.activate(&try resolveFailed(a, 2, try activityFailure(a, "cleanup failed", "CleanupFailed")), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try expectChargeFailure((try updateResponse(cmds[0], "u1")).rejected);
+
+    // The handler's chosen failure doesn't become the workflow's.
+    const done = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "done", .{})), a));
+    try testing.expectEqualStrings("Finished", done[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+test "failWith in a signal handler fails the workflow with that failure after a failed cleanup" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, HandlerFailuresWf.registered, .{});
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "HandlerFailures", .{false}), a);
+    const scheduled = commandsOf(try inst.activate(&try oneJob(a, try signalJob(a, "keep", .{})), a));
+    try testing.expectEqual(@as(usize, 1), scheduled.len);
+    _ = try inst.activate(&try resolveFailed(a, 1, try activityFailure(a, "card declined", "Declined")), a);
+    const cmds = commandsOf(try inst.activate(&try resolveFailed(a, 2, try activityFailure(a, "cleanup failed", "CleanupFailed")), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try expectChargeFailure(cmds[0].variant.?.fail_workflow_execution.failure.?);
 }
 
 // An activity raced against a timer.
@@ -5038,6 +5233,8 @@ const CurrentUpdateWf = struct {
     const Who = workflow.UpdateDef("who", fn (expected_id: []const u8) []const u8);
     const Probe = workflow.SignalDef("probe", fn () void);
     const Done = workflow.SignalDef("done", fn () void);
+    const KeepUpdate = workflow.UpdateDef("keep", fn () void);
+    const KeepSignal = workflow.SignalDef("keep", fn () void);
 
     const State = struct {
         ctx: *workflow.Context,
@@ -5125,6 +5322,8 @@ const NestedValidatorWf = struct {
     const A = workflow.UpdateDef("a", fn () []const u8);
     const B = workflow.UpdateDef("b", fn () void);
     const Done = workflow.SignalDef("done", fn () void);
+    const KeepUpdate = workflow.UpdateDef("keep", fn () void);
+    const KeepSignal = workflow.SignalDef("keep", fn () void);
 
     const State = struct {
         ctx: *workflow.Context,
