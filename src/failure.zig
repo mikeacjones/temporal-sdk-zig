@@ -950,9 +950,11 @@ const DeepChain = struct {
 };
 
 test "copying, encoding and decoding a deep cause chain use the same stack whatever its length" {
-    // A stack smaller than a workflow coroutine's: recursion down the chain would overflow it.
+    // The size of a workflow coroutine's default stack (worker.Options.workflow_stack_size):
+    // recursion down a 10,000-link chain would overflow it. Not smaller: glibc refuses thread
+    // stacks under PTHREAD_STACK_MIN, which is 128 KiB on aarch64 Linux.
     var result: anyerror!void = {};
-    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, DeepChain.run, .{&result});
+    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, DeepChain.run, .{&result});
     thread.join();
     try result;
 }
