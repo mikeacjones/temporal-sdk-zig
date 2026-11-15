@@ -302,8 +302,19 @@ pub const Context = struct {
     }
 
     /// Fails the activity with a failure you describe. Return the error this gives back.
+    /// The `a.details` list and the `a.cause` chain are copied into `allocator()` memory
+    /// here, so they may live on the stack; strings and payload data must outlive the
+    /// function, as `allocator()` memory does. The failure's stack trace is the return trace
+    /// of the error the activity function returns (see `worker.Options.failure_stack_traces`).
     pub fn fail(ctx: *Context, a: failure_mod.Application) error{ApplicationFailure} {
-        ctx.pending_failure = a;
+        const app = failure_mod.keep(ctx.arena, a) catch blk: {
+            ctx.logger_.warn("out of memory copying the details and cause of an activity failure; the failure is sent without them", .{ .message = a.message });
+            var bare = a;
+            bare.details = &.{};
+            bare.cause = null;
+            break :blk bare;
+        };
+        ctx.pending_failure = app;
         return error.ApplicationFailure;
     }
 

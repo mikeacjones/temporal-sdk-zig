@@ -1,0 +1,2 @@
+`failure.Application.cause` puts a failure under the one `ctx.fail` (in workflows, activities and Nexus operations) or `Client.failActivity` sends, such as a future's failure; the whole chain reaches the server.
+`failure.kind` reads a failure as `failure.Kind`, a tagged union with one case per failure kind, with details as `converter.EncodedValues`, durations as `std.Io.Duration`, and timeout types and retry states as Zig enums.

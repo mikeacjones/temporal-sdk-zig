@@ -855,3 +855,19 @@ test "the dev server gets each declared namespace once, without default or those
     try testing.expectEqualStrings("other", namespaces[2]);
     try testing.expectEqual(0, (try serverNamespaces(arena.allocator(), samples[0..1])).len);
 }
+
+test "a program whose module has no error tracing decodes the SDK's protobuf messages" {
+    // This test's module stands for a user's worker or client module: it doesn't set
+    // `.error_tracing`, while the SDK's module may. Decoding must still end cleanly at the
+    // end of the input in every build mode, ReleaseSafe included, without the user's module
+    // having to turn error tracing on.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sent: temporal.Failure = .{ .message = "card declined", .source = "ZigSDK" };
+    var encoded: std.Io.Writer.Allocating = .init(a);
+    try sent.encode(&encoded.writer, a);
+    var reader: std.Io.Reader = .fixed(encoded.written());
+    const received = try temporal.Failure.decode(&reader, a);
+    try std.testing.expectEqualStrings("card declined", received.message);
+}

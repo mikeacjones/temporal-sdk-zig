@@ -302,6 +302,9 @@ pub const WorkflowEnvironment = struct {
         /// replay of each finished workflow use too. Borrowed: they must outlive the
         /// environment.
         codecs: []const converter.PayloadCodec = &.{},
+        /// Encode the message and stack trace of failures the client and its worker send
+        /// (`client.Options.encode_failure_attributes`).
+        encode_failure_attributes: bool = false,
         /// Where the client's sdk-core logs and the worker's workflow and activity logs go
         /// (`client.Options.logger`). Borrowed: it must outlive the environment.
         logger: ?log_mod.Sink = null,
@@ -349,6 +352,7 @@ pub const WorkflowEnvironment = struct {
         errdefer env.server.stop(io);
         var client_options = env.server.clientOptions();
         client_options.codecs = options.codecs;
+        client_options.encode_failure_attributes = options.encode_failure_attributes;
         client_options.logger = options.logger;
         client_options.propagators = options.propagators;
         client_options.worker_interceptors = options.worker_interceptors;
@@ -1959,6 +1963,44 @@ const UpdateFailureFixtures = struct {
         try ctx.await(ctx, workflow.Context.allHandlersFinished);
     }
     const Payments = workflow.Def("Payments", payments);
+};
+
+const FailWithFixtures = struct {
+    fn charge(ctx: *activity.Context) !void {
+        return ctx.fail(.{ .message = "card declined", .type = "Declined", .non_retryable = true });
+    }
+    const Charge = activity.Def("FailWithCharge", charge);
+
+    fn release(ctx: *activity.Context) !void {
+        return ctx.fail(.{ .message = "release failed", .type = "ReleaseFailed", .non_retryable = true });
+    }
+    const Release = activity.Def("FailWithRelease", release);
+
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+
+    /// Charges, and when the charge fails releases the hold, which fails too; fails with the
+    /// charge's failure.
+    fn order(ctx: *workflow.Context) !void {
+        const charged = ctx.executeActivity(Charge, opts, .{});
+        charged.get() catch |err| {
+            ctx.executeActivity(Release, opts, .{}).get() catch {};
+            return switch (err) {
+                error.ActivityFailed => ctx.failWith(charged.failure().?),
+                else => err,
+            };
+        };
+    }
+    const Order = workflow.Def("FailWithOrder", order);
+
+    /// `order` without the release.
+    fn orderChanged(ctx: *workflow.Context) !void {
+        const charged = ctx.executeActivity(Charge, opts, .{});
+        charged.get() catch |err| return switch (err) {
+            error.ActivityFailed => ctx.failWith(charged.failure().?),
+            else => err,
+        };
+    }
+    const OrderChanged = workflow.Def("FailWithOrder", orderChanged);
 };
 
 const ChildFixtures = struct {
@@ -5740,6 +5782,37 @@ test "WorkflowReplayer replays a side effect without calling its function and ca
     defer changed.deinit();
     try changed.registerWorkflow(SideEffectFixtures.TakeTicketChanged);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(side_effect_history));
+}
+
+test "WorkflowReplayer replays a workflow that fails through failWith after a failed cleanup activity" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(FailWithFixtures.Order);
+    try env.registerActivity(FailWithFixtures.Charge);
+    try env.registerActivity(FailWithFixtures.Release);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(FailWithFixtures.Order, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    var failure: ?failure_mod.Failure = null;
+    // getResult replays the run too.
+    try testing.expectError(error.WorkflowFailed, env.getResult(FailWithFixtures.Order, &run, a, &failure));
+    try testing.expect(failure.?.failure_info.? == .activity_failure_info);
+    try testing.expectEqualStrings("FailWithCharge", failure.?.failure_info.?.activity_failure_info.activity_type.?.name);
+    try testing.expectEqualStrings("card declined", failure_mod.rootCause(&failure.?).message);
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(FailWithFixtures.Order);
+    try ok.replayHistory(history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(FailWithFixtures.OrderChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistory(history));
 }
 
 test "dev-server WorkflowEnvironment starts a workflow and awaits its result" {

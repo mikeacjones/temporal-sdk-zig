@@ -54,6 +54,17 @@ pub const Options = struct {
     /// the codecs must outlive the client and its workers. Called concurrently: workers run
     /// them from the threads that process workflow activations and run activities.
     codecs: []const converter.PayloadCodec = &.{},
+    /// Move each outgoing failure's message and stack trace, and those of every cause in its
+    /// chain, into its `encoded_attributes` before the codecs run, so a codec that encrypts
+    /// payloads hides them too: the failure travels with the message "Encoded failure" and
+    /// an empty stack trace, and `encoded_attributes` holds a `json/plain` payload of
+    /// `{"message": ..., "stack_trace": ...}` (`failure.EncodedAttributes`), the format other
+    /// Temporal SDKs write. Applies to this client and every worker on it, as `codecs` does.
+    /// A failure that already carries encoded attributes is sent as it is, and a failed
+    /// query's answer is not encoded: it never reaches history, and the server gives its
+    /// message to the caller in the clear (`QueryOptions.failure_message`).
+    /// Failures received are always decoded back, after the codecs, whatever this is set to.
+    encode_failure_attributes: bool = false,
     /// Where sdk-core's logs go, and the default for every worker on this client (see
     /// `worker.Options.logger`). Null uses `log.Sink.std_log`. Borrowed: it must outlive the
     /// client and its workers. Called concurrently from worker threads and sdk-core's threads.
@@ -448,6 +459,8 @@ pub const Client = struct {
     identity: []u8,
     /// `Options.codecs`, borrowed.
     codecs: []const converter.PayloadCodec,
+    /// `Options.encode_failure_attributes`.
+    encode_failure_attributes: bool = false,
     /// `Options.logger` or the default sink; workers on this client inherit it.
     logger: log_mod.Sink,
     /// A copy of `logger` that the runtime's core log forwarding points at, freed after the
@@ -534,6 +547,7 @@ pub const Client = struct {
             .namespace = namespace,
             .identity = identity,
             .codecs = options.codecs,
+            .encode_failure_attributes = options.encode_failure_attributes,
             .logger = logger,
             .core_log_sink = core_log_sink,
             .propagators = options.propagators,
@@ -1143,7 +1157,8 @@ pub const Client = struct {
 
     /// Fails an activity that returned `ctx.completeAsync()` with the failure `f`. The
     /// activity's retry policy applies, as for a failure returned by the activity itself.
-    /// Returns `error.NotFound` when the activity is no longer waiting.
+    /// Returns `error.NotFound` when the activity is no longer waiting. `f.cause` is read
+    /// until this returns.
     pub fn failActivity(c: *Client, task_token: []const u8, f: failure_mod.Application) ActivityCompletionError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
@@ -1883,6 +1898,7 @@ pub const Client = struct {
         var coded = request;
         var codec_context: converter.CodecContext = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
         requestIdentity(@TypeOf(coded), &coded, &codec_context);
+        if (c.encode_failure_attributes) try failure_mod.encodeAttributes(@TypeOf(coded), &coded, arena);
         converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io, &codec_context) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: encoding its payloads with the client's codecs failed", .{method});
             return err;
@@ -1919,6 +1935,7 @@ pub const Client = struct {
             if (err == error.CodecFailed) log.warn("{s} failed: decoding the response's payloads with the client's codecs failed", .{method});
             return err;
         };
+        try failure_mod.decodeAttributes(Response, &response, arena);
         return response;
     }
 };

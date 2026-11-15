@@ -601,8 +601,17 @@ pub const Context = struct {
     /// and details. The caller doesn't retry it. Return the error this gives back. `a` is
     /// stored as given, not copied: its strings and details must live until the response has
     /// been sent, as `ctx.allocator()` memory does, so never point them at the handler's stack.
+    /// The exceptions are the `a.details` list and the `a.cause` chain, which are copied into
+    /// `ctx.allocator()` memory here.
     pub fn fail(ctx: *Context, a: failure_mod.Application) error{OperationFailed} {
-        ctx.pending = .{ .operation = .{ .state = .failed, .failure = a } };
+        const app = failure_mod.keep(ctx.arena, a) catch blk: {
+            ctx.logger_.warn("out of memory copying the details and cause of a Nexus operation failure; the failure is sent without them", .{ .message = a.message });
+            var bare = a;
+            bare.details = &.{};
+            bare.cause = null;
+            break :blk bare;
+        };
+        ctx.pending = .{ .operation = .{ .state = .failed, .failure = app } };
         return error.OperationFailed;
     }
 
@@ -616,10 +625,16 @@ pub const Context = struct {
 
     /// Fails the request with a handler error, such as `.{ .type = .bad_request, .message =
     /// "the order ID is empty" }`. Return the error this gives back. `e` is stored as given:
-    /// its message and cause must live until the response has been sent, as `ctx.allocator()`
-    /// memory does.
+    /// its message and the cause's strings and payload data must live until the response has
+    /// been sent, as `ctx.allocator()` memory does. The cause's details list and cause chain
+    /// are copied here.
     pub fn handlerError(ctx: *Context, e: HandlerError) error{HandlerError} {
-        ctx.pending = .{ .handler = e };
+        var kept = e;
+        if (e.cause) |c| kept.cause = failure_mod.keep(ctx.arena, c) catch blk: {
+            ctx.logger_.warn("out of memory copying the cause of a Nexus handler error; the error is sent without it", .{ .message = e.message });
+            break :blk null;
+        };
+        ctx.pending = .{ .handler = kept };
         return error.HandlerError;
     }
 

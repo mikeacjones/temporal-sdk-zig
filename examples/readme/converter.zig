@@ -120,3 +120,128 @@ test "converter: a failure's cause chain reaches the caller" {
     try testing.expectEqualStrings("name is empty", root.message);
     try testing.expectEqualStrings("InvalidName", temporal.failure.applicationType(root.*).?);
 }
+
+// example: converter-fail-with
+fn checkout(ctx: *workflow.Context, order: []const u8) !void {
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+    try ctx.executeActivity(Hold, opts, .{order}).get();
+    // Releases the hold if anything below fails; the release can fail too.
+    errdefer ctx.executeActivity(Release, opts, .{order}).get() catch {};
+
+    const charge = ctx.executeActivity(Charge, opts, .{order});
+    // Keeps the charge's failure: without failWith, a failed release would replace it.
+    // Other errors, such as error.Canceled, are returned as they are.
+    charge.get() catch |err| return switch (err) {
+        error.ActivityFailed => ctx.failWith(charge.failure().?),
+        else => err,
+    };
+}
+// end-example
+
+fn holdFunds(_: *activity.Context, _: []const u8) !void {}
+fn chargeCard(ctx: *activity.Context, _: []const u8) !void {
+    return ctx.fail(.{ .message = "card declined", .type = "Declined", .non_retryable = true });
+}
+fn releaseFunds(ctx: *activity.Context, _: []const u8) !void {
+    return ctx.fail(.{ .message = "release failed", .non_retryable = true });
+}
+
+const Hold = activity.Def("hold", holdFunds);
+const Charge = activity.Def("charge", chargeCard);
+const Release = activity.Def("release", releaseFunds);
+const Checkout = workflow.Def("checkout", checkout);
+
+test "converter: failWith keeps a failure that a failed cleanup would replace" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Checkout);
+    try env.registerActivity(Hold);
+    try env.registerActivity(Charge);
+    try env.registerActivity(Release);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var failure: ?temporal.failure.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(Checkout, .{"order-1"}, arena.allocator(), &failure));
+    try testing.expectEqualStrings("card declined", temporal.failure.rootCause(&failure.?).message);
+    try testing.expectEqualStrings("charge", failure.?.failure_info.?.activity_failure_info.activity_type.?.name);
+}
+
+// example: converter-failure-kinds
+fn reserve(ctx: *activity.Context, sku: []const u8) !void {
+    const why = try temporal.failure.application(ctx.allocator(), .{ .message = "warehouse offline", .type = "WarehouseOffline" });
+    return ctx.fail(.{
+        .message = "reservation failed",
+        .type = "ReserveFailed",
+        .non_retryable = true,
+        .details = &.{try converter.toPayload(ctx.allocator(), sku)},
+        // Copied by ctx.fail, so it may live on the stack.
+        .cause = &why,
+    });
+}
+
+fn fulfill(ctx: *workflow.Context, sku: []const u8) ![]const u8 {
+    const future = ctx.executeActivity(Reserve, .{ .start_to_close_timeout = .fromSeconds(5) }, .{sku});
+    future.get() catch |err| {
+        const f = future.failure() orelse return err;
+        // f is the activity failure; its cause is the one the activity raised.
+        const reason = switch (temporal.failure.kind(f.cause orelse f)) {
+            .timeout => |t| try std.fmt.allocPrint(ctx.allocator(), "timed out ({t})", .{t.timeout_type}),
+            .application => |app| try std.fmt.allocPrint(ctx.allocator(), "{s} for {s}: {s}", .{
+                app.type,
+                try app.details.get([]const u8, ctx.allocator(), 0),
+                temporal.failure.rootCause(f).message,
+            }),
+            else => return err,
+        };
+        // The workflow's failure, with the activity's chain under it.
+        return ctx.fail(.{ .message = reason, .type = "FulfillFailed", .cause = f });
+    };
+    return "reserved";
+}
+// end-example
+
+const Reserve = activity.Def("reserve", reserve);
+const Fulfill = workflow.Def("fulfill", fulfill);
+
+test "converter: causes, kinds and stack traces of failures" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fulfill);
+    try env.registerActivity(Reserve);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var failure: ?temporal.failure.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(Fulfill, .{"sku-1"}, arena.allocator(), &failure));
+    try testing.expectEqualStrings("ReserveFailed for sku-1: warehouse offline", failure.?.message);
+    try testing.expectEqualStrings("warehouse offline", temporal.failure.rootCause(&failure.?).message);
+    // Built from ctx.fail and the error the workflow returned, so it has a stack trace.
+    try testing.expect(failure.?.stack_trace.len > 0);
+}
+
+test "converter: encoded failure attributes" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+
+    // example: converter-encoded-attributes
+    const zlib: converter.ZlibCodec = .{};
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, io, .{
+        .codecs = &codecs,
+        // client.Options.encode_failure_attributes, for the client and its workers.
+        .encode_failure_attributes = true,
+    });
+    defer env.deinit();
+
+    // What the client and its workers do to each failure they send, before the codecs run,
+    // and to each failure they receive, after them.
+    var f = try temporal.failure.application(arena, .{ .message = "card 4242 declined" });
+    try temporal.failure.encodeAttributes(temporal.Failure, &f, arena);
+    try testing.expectEqualStrings("Encoded failure", f.message);
+    try temporal.failure.decodeAttributes(temporal.Failure, &f, arena);
+    try testing.expectEqualStrings("card 4242 declined", f.message);
+    // end-example
+}

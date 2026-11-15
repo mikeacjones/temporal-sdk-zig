@@ -66,6 +66,10 @@ const Recorder = struct {
     fn deleteFile(ctx: *temporal.activity.Context, path: []const u8) !void {
         try fileActivity(ctx, "DeleteFile", path);
     }
+    fn deleteFileFails(ctx: *temporal.activity.Context, path: []const u8) !void {
+        try fileActivity(ctx, "DeleteFile", path);
+        return ctx.fail(.{ .message = "delete failed", .non_retryable = true });
+    }
 };
 
 /// The second worker of the sample's worker program, polling the worker-specific task queue.
@@ -73,12 +77,12 @@ const FileWorker = struct {
     worker: Worker,
     running: ?std.Io.Future(Worker.RunError!void) = null,
 
-    fn init(env: *temporal.testing.WorkflowEnvironment, comptime process_file: anytype) !FileWorker {
+    fn init(env: *temporal.testing.WorkflowEnvironment, comptime process_file: anytype, comptime delete_file: anytype) !FileWorker {
         var w = try Worker.init(testing.allocator, testing.io, &env.client, unique_task_queue, .{});
         errdefer w.deinit();
         try w.registerActivityImpl(temporal.activity.Def(activities.DownloadFile.activity_name, Recorder.downloadFile).registered);
         try w.registerActivityImpl(temporal.activity.Def(activities.ProcessFile.activity_name, process_file).registered);
-        try w.registerActivityImpl(temporal.activity.Def(activities.DeleteFile.activity_name, Recorder.deleteFile).registered);
+        try w.registerActivityImpl(temporal.activity.Def(activities.DeleteFile.activity_name, delete_file).registered);
         return .{ .worker = w };
     }
 
@@ -107,7 +111,7 @@ test "the file activities run on the worker-specific task queue" {
     Recorder.reset(0);
     const env = try startEnv();
     defer env.deinit();
-    var files = try FileWorker.init(env, Recorder.processFile);
+    var files = try FileWorker.init(env, Recorder.processFile, Recorder.deleteFile);
     defer files.deinit();
     try files.start();
 
@@ -126,7 +130,7 @@ test "a failed attempt is retried from the first activity" {
     Recorder.reset(2);
     const env = try startEnv();
     defer env.deinit();
-    var files = try FileWorker.init(env, Recorder.processFile);
+    var files = try FileWorker.init(env, Recorder.processFile, Recorder.deleteFile);
     defer files.deinit();
     try files.start();
 
@@ -147,7 +151,7 @@ test "the workflow fails after five failed attempts" {
     Recorder.reset(std.math.maxInt(usize));
     const env = try startEnv();
     defer env.deinit();
-    var files = try FileWorker.init(env, Recorder.processFile);
+    var files = try FileWorker.init(env, Recorder.processFile, Recorder.deleteFile);
     defer files.deinit();
     try files.start();
 
@@ -164,7 +168,7 @@ test "the file is deleted when processing fails, and the attempt fails with the 
     Recorder.reset(0);
     const env = try startEnv();
     defer env.deinit();
-    var files = try FileWorker.init(env, Recorder.processFileFails);
+    var files = try FileWorker.init(env, Recorder.processFileFails, Recorder.deleteFile);
     defer files.deinit();
     try files.start();
 
@@ -173,6 +177,25 @@ test "the file is deleted when processing fails, and the attempt fails with the 
     var failure: ?temporal.failure.Failure = null;
     try testing.expectError(error.WorkflowFailed, env.executeWorkflow(sample.FileProcessingWorkflow, .{}, arena.allocator(), &failure));
     try testing.expectEqualStrings("processing failed", temporal.failure.rootCause(&failure.?).message);
+    const attempt: []const []const u8 = &.{ "GetWorkerSpecificTaskQueue", "DownloadFile", "ProcessFile", "DeleteFile" };
+    try testing.expectEqual(5 * attempt.len, Recorder.recorded().len);
+    for (Recorder.recorded(), 0..) |call, i| try testing.expectEqualStrings(attempt[i % attempt.len], call);
+}
+
+test "when processing and the delete both fail, the workflow fails with the processing failure" {
+    Recorder.reset(0);
+    const env = try startEnv();
+    defer env.deinit();
+    var files = try FileWorker.init(env, Recorder.processFileFails, Recorder.deleteFileFails);
+    defer files.deinit();
+    try files.start();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var failure: ?temporal.failure.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(sample.FileProcessingWorkflow, .{}, arena.allocator(), &failure));
+    try testing.expectEqualStrings("processing failed", temporal.failure.rootCause(&failure.?).message);
+    try testing.expectEqualStrings("ProcessFile", failure.?.failure_info.?.activity_failure_info.activity_type.?.name);
     const attempt: []const []const u8 = &.{ "GetWorkerSpecificTaskQueue", "DownloadFile", "ProcessFile", "DeleteFile" };
     try testing.expectEqual(5 * attempt.len, Recorder.recorded().len);
     for (Recorder.recorded(), 0..) |call, i| try testing.expectEqualStrings(attempt[i % attempt.len], call);

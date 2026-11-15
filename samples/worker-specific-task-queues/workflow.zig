@@ -19,7 +19,8 @@ fn fileProcessing(ctx: *workflow.Context) !void {
     // whole sequence, on whichever worker picks up the first activity.
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
-        if (processFile(ctx)) |_| {
+        var processing_failure: ?*const temporal.failure.Failure = null;
+        if (processFile(ctx, &processing_failure)) |_| {
             logger.info("Workflow completed.", .{});
             return;
         } else |err| {
@@ -27,6 +28,8 @@ fn fileProcessing(ctx: *workflow.Context) !void {
             // failure (after the last attempt) is reported to whoever waits on it.
             if (attempt == max_attempts) {
                 logger.warn("Workflow failed after multiple retries.", .{ .err = err });
+                // A failed processing step is the failure to report, not the delete after it.
+                if (processing_failure) |f| return ctx.failWith(f);
                 return err;
             }
             logger.warn("Attempt failed, trying on new worker", .{ .attempt = attempt, .err = err });
@@ -34,7 +37,8 @@ fn fileProcessing(ctx: *workflow.Context) !void {
     }
 }
 
-fn processFile(ctx: *workflow.Context) !void {
+/// One attempt. When processing fails, `processing_failure` is set to its failure.
+fn processFile(ctx: *workflow.Context, processing_failure: *?*const temporal.failure.Failure) !void {
     const worker_task_queue = try ctx.executeActivity(activities.GetWorkerSpecificTaskQueue, .{
         .start_to_close_timeout = .fromSeconds(60),
         .retry_policy = .{ .maximum_attempts = 1 },
@@ -53,11 +57,14 @@ fn processFile(ctx: *workflow.Context) !void {
     try ctx.executeActivity(activities.DownloadFile, ao, .{ "https://temporal.io", download_path }).get();
 
     // The file is deleted whether or not processing succeeded. If processing failed, the
-    // attempt fails with that error, not the delete's: it is the one worth retrying for. (If
-    // both fail, the failure details recorded are the delete's, the last activity to fail.)
-    const processed = ctx.executeActivity(activities.ProcessFile, ao, .{download_path}).get();
+    // attempt fails with that failure, not the delete's: it is the one worth retrying for.
+    const processing = ctx.executeActivity(activities.ProcessFile, ao, .{download_path});
+    const processed = processing.get();
     const deleted = ctx.executeActivity(activities.DeleteFile, ao, .{download_path}).get();
-    try processed;
+    processed catch |err| {
+        if (err == error.ActivityFailed) processing_failure.* = processing.failure();
+        return err;
+    };
     try deleted;
 }
 

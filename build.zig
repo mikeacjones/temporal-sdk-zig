@@ -35,6 +35,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/temporal.zig"),
         .target = target,
         .optimize = optimize,
+        // No `.error_tracing`: the module a program's `main` (or test runner) is in decides
+        // it. A dependency that turns it on while the root module doesn't breaks the program
+        // in ReleaseSafe (decoding panics), so the SDK leaves it to the user's module.
         .link_libc = true,
         .imports = &.{
             .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
@@ -55,11 +58,12 @@ pub fn build(b: *std.Build) void {
         .protoc = protoc_opt,
         .have_submodule = have_submodule,
     }) orelse return;
-    temporal.addImport("core_c", b.addTranslateC(.{
+    const core_c = b.addTranslateC(.{
         .root_source_file = core.header,
         .target = target,
         .optimize = optimize,
-    }).createModule());
+    }).createModule();
+    temporal.addImport("core_c", core_c);
     linkCoreLib(temporal, target, core.lib);
 
     // zig build core: build only the Rust core library
@@ -68,7 +72,22 @@ pub fn build(b: *std.Build) void {
     core_step.dependOn(&b.addInstallFile(core.header, "include/" ++ core_header_name).step);
 
     // zig build test
-    const unit_tests = b.addTest(.{ .root_module = temporal, .filters = test_filters });
+    // The unit tests are their own root module, so they may turn error tracing on: in
+    // ReleaseSafe too, for the failure stack trace tests. Programs using `temporal` choose
+    // for themselves.
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/temporal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .error_tracing = testErrorTracing(optimize),
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
+            .{ .name = "core_c", .module = core_c },
+        },
+    });
+    linkCoreLib(test_module, target, core.lib);
+    const unit_tests = b.addTest(.{ .root_module = test_module, .filters = test_filters });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
@@ -106,6 +125,7 @@ fn addReadmeSteps(
             .root_source_file = b.path("examples/readme/root.zig"),
             .target = target,
             .optimize = optimize,
+            .error_tracing = testErrorTracing(optimize),
             .imports = &.{.{ .name = "temporal", .module = temporal }},
         }),
         .filters = test_filters,
@@ -381,7 +401,7 @@ fn buildCoreLib(b: *std.Build, target: std.Build.ResolvedTarget, protoc_opt: ?[]
         .{target.result.zigTriple(b.allocator) catch "this target"},
     );
 
-    const cargo = b.addSystemCommand(&.{ "cargo", "rustc" });
+    const cargo = b.addSystemCommand(&.{ findCargo(b), "rustc" });
     // rustup picks the toolchain from deps/rust-toolchain.toml based on the working directory.
     cargo.setCwd(b.path("deps"));
     cargo.addArgs(&.{ "--package", "temporalio-sdk-core-c-bridge" });
@@ -538,4 +558,20 @@ fn dispatchSource(b: *std.Build, samples: []const Sample) []const u8 {
         \\
     ) catch @panic("OOM");
     return out.written();
+}
+
+/// Error return tracing in ReleaseSafe too, for root modules whose tests check failure stack
+/// traces; Zig's default (Debug only) otherwise. Only for root modules: see `temporal`.
+fn testErrorTracing(optimize: std.builtin.OptimizeMode) ?bool {
+    return if (optimize == .safe) true else null;
+}
+
+/// `cargo` from PATH, or else from rustup's install directory, $CARGO_HOME/bin (default
+/// ~/.cargo/bin): rustup adds it to PATH from the shell's profile, which a non-login shell or
+/// a service doesn't read. Plain "cargo" when neither has it, so the build fails naming it.
+fn findCargo(b: *std.Build) []const u8 {
+    if (b.findProgram(.{ .names = &.{"cargo"} })) |found| return found;
+    const env = &b.graph.environ_map;
+    const bin = if (env.get("CARGO_HOME")) |home| b.pathJoin(&.{ home, "bin", "cargo" }) else if (env.get("HOME")) |home| b.pathJoin(&.{ home, ".cargo", "bin", "cargo" }) else return "cargo";
+    return b.findProgram(.{ .names = &.{bin} }) orelse "cargo";
 }
