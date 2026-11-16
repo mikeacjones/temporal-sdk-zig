@@ -43,7 +43,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Sessions](#sessions)
     - [Dynamic workflows](#dynamic-workflows)
     - [Workflow info](#workflow-info)
-    - [Failure policy and deadlock detection](#failure-policy-and-deadlock-detection)
+    - [Failure policy](#failure-policy)
     - [Stack trace and metadata queries](#stack-trace-and-metadata-queries)
   - [Activities](#activities)
     - [Definition](#definition-1)
@@ -59,6 +59,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Versioning](#versioning)
     - [Sessions](#sessions-1)
     - [Workflow memory limit](#workflow-memory-limit)
+    - [Deadlock detection](#deadlock-detection)
     - [Tuners and poller behavior](#tuners-and-poller-behavior)
     - [Plugins](#plugins)
   - [Data conversion](#data-conversion)
@@ -974,10 +975,10 @@ Notes:
 - `ctx.isReplaying()` says whether the task replays history. `ctx.metrics()` records nothing during replay, and `ctx.logger()` drops its records then unless `worker.Options.log_during_replay` is set.
 - `ctx.lastCompletionResult(T)` and `ctx.previousRunFailure()` read a cron or retried workflow's previous run.
 
-#### Failure policy and deadlock detection
-<!-- stub: temporal-sdk-zig-d51.6.7, temporal-sdk-zig-d51.6.8 -->
+#### Failure policy
+<!-- stub: temporal-sdk-zig-d51.6.8 -->
 Not implemented yet.
-A worker option and a per-definition override will choose which errors fail the workflow task and which fail the workflow, and a watchdog will report a coroutine that doesn't yield in time.
+A worker option and a per-definition override will choose which errors fail the workflow task and which fail the workflow. [Deadlock detection](#deadlock-detection), under Workers, fails the task of workflow code that doesn't yield in time.
 
 #### Stack trace and metadata queries
 <!-- stub: temporal-sdk-zig-d51.6.9 -->
@@ -1333,6 +1334,27 @@ Notes:
 - It is checked at the end of each activation that runs workflow code; allocations are never refused, and query-only and final activations aren't checked.
 - A run over the limit fails its workflow task with type `WorkflowMemoryLimitExceeded`, not the workflow; the retried task fails the same way until the limit is raised or the workflow keeps less state.
 - `testing.WorkflowReplayer.Options.workflow_memory_limit` checks that recorded histories fit a limit.
+
+#### Deadlock detection
+
+Workflow code that never yields, such as a loop that never waits or a call that blocks outside the workflow's `std.Io`, would hold its workflow task until the server times it out. `worker.Options.deadlock_detection_timeout` limits how long workflow code may run without returning to the workflow scheduler: without blocking on a future, timer, or other wait on `ctx.io()`, or finishing. It is 2 seconds by default; null turns detection off.
+
+<!-- example: worker-deadlock-detection -->
+```zig
+// Workflow code may run up to 5 s without waiting before its task fails (default: 2 s).
+var patient = try Worker.init(gpa, io, &client, "reports", .{ .deadlock_detection_timeout = .fromSeconds(5) });
+defer patient.deinit();
+// No detection, for workflow code stopped at a debugger's breakpoints.
+var debugging = try Worker.init(gpa, io, &client, "reports-debug", .{ .deadlock_detection_timeout = null });
+defer debugging.deinit();
+```
+
+Notes:
+- A watchdog on the worker's own `Io` and real clock, never the workflow's deterministic `std.Io`, times each stretch of an activation's workflow code between returns to the scheduler. Payload codecs decoding the activation and encoding its completion run outside workflow code and aren't counted; a workflow that waits often may run much longer than the limit in total.
+- Over the limit, the worker fails the workflow task with an application failure of type `worker.deadlock_failure_type` (`"WorkflowDeadlockDetected"`) whose message names the workflow type and the limit, logs one error with the workflow and run IDs, and evicts the run, so its next task replays it from history. The workflow does not fail; the server retries the task, and code that gets stuck on every attempt fails every attempt. Detection takes up to about 1.25 times the limit.
+- The SDK cannot stop stuck code: it keeps its thread until it returns. Whatever it produces then is discarded, no second completion is sent, and only then is the run's memory freed. Other runs, and a replay of the same run, keep being processed meanwhile. `Worker.stop` doesn't wait for stuck code, but `Worker.run` returns only after it has returned.
+- Turn detection off while a debugger may stop workflow code at a breakpoint, or the paused task fails.
+- Detection emits no command and changes none, so replay is unaffected. `testing.WorkflowReplayer.Options.deadlock_detection_timeout` (null by default) applies the same limit to replayed code.
 
 #### Tuners and poller behavior
 <!-- stub: temporal-sdk-zig-d51.9.3, temporal-sdk-zig-d51.9.4 -->

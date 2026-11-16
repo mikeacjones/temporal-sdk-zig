@@ -130,6 +130,34 @@ pub const Options = struct {
     /// queries, and one that finishes the workflow, are not checked. The workflow logger
     /// also records the failure, except while replaying unless `log_during_replay` is set.
     workflow_memory_limit: ?usize = null,
+    /// Deadlock detection: the longest that workflow code may run without returning to the
+    /// workflow scheduler, that is, without blocking on the workflow's `std.Io` (a future,
+    /// timer, condition, or other wait), yielding, or finishing. 2 seconds by default; null
+    /// turns detection off, for example while a debugger may stop workflow code at a
+    /// breakpoint. Must be positive.
+    ///
+    /// A watchdog on the worker's own `Io` and its real clock (`.awake`), never the
+    /// workflow's deterministic `std.Io`, times each stretch of an activation's workflow code
+    /// between returns to the scheduler. Work outside workflow code, such as payload codecs
+    /// decoding the activation and encoding its completion, isn't counted. Workflow code
+    /// that runs longer (a loop that never waits, or a call that blocks outside the
+    /// workflow's `std.Io`) fails that workflow task with an application failure of type
+    /// `deadlock_failure_type`, whose message names the workflow type and this limit, within
+    /// about 1.25 times the limit. The worker logs one error with the workflow and run IDs,
+    /// and the run is evicted, so its next workflow task replays it from history. The
+    /// workflow itself does not fail: the server retries the task, and code that gets stuck
+    /// every time fails every attempt. Detection never adds or changes a command, so replay
+    /// is unaffected.
+    ///
+    /// The SDK cannot stop stuck code. It keeps its thread until it returns; then whatever
+    /// it produced (commands, its completion) is discarded, no second completion is sent, and
+    /// only then is the run's memory freed. Other runs keep being processed meanwhile, and a
+    /// new task of the same run replays on a fresh copy of the run. `stop` doesn't wait for
+    /// stuck code, but `run` returns only after every activation has returned, so a worker
+    /// whose workflow code never returns never finishes `run`. Each activation's watchdog is
+    /// a concurrent task on the worker's `Io`; an activation that can't get one runs
+    /// unwatched, with a warning.
+    deadlock_detection_timeout: ?Io.Duration = .fromSeconds(2),
     /// Put the error's return trace, as text with source locations, in `Failure.stack_trace`
     /// when the worker builds a failure from an error a workflow function, signal or update
     /// handler, or activity function returned (from the error's name or from `ctx.fail`). Only
@@ -169,6 +197,10 @@ pub const Options = struct {
     /// sessions.
     sessions: ?SessionWorkerOptions = null,
 };
+
+/// The application failure type of a workflow task that deadlock detection failed
+/// (`Options.deadlock_detection_timeout`).
+pub const deadlock_failure_type = "WorkflowDeadlockDetected";
 
 /// How a worker hosts sessions (`Options.sessions`).
 ///
@@ -653,6 +685,10 @@ pub const Worker = struct {
                 return error.InvalidOptions;
             }
         }
+        if (o.deadlock_detection_timeout) |d| if (d.nanoseconds <= 0) {
+            log.warn("worker for task queue {s}: deadlock_detection_timeout is {f}; it must be positive, or null to turn deadlock detection off", .{ task_queue, d });
+            return error.InvalidOptions;
+        };
         if (o.default_heartbeat_throttle_interval.nanoseconds > o.max_heartbeat_throttle_interval.nanoseconds) {
             log.warn("worker for task queue {s}: default_heartbeat_throttle_interval ({f}) must not be above max_heartbeat_throttle_interval ({f})", .{ task_queue, o.default_heartbeat_throttle_interval, o.max_heartbeat_throttle_interval });
             return error.InvalidOptions;
@@ -872,6 +908,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .namespace = w.client.namespace,
         .stack_size = w.options.workflow_stack_size,
         .memory_limit = w.options.workflow_memory_limit,
+        .deadlock_timeout = w.options.deadlock_detection_timeout,
         .failure_stack_traces = w.options.failure_stack_traces,
         .codecs = w.client.codecs,
         .encode_failure_attributes = w.client.encode_failure_attributes,
@@ -926,6 +963,8 @@ pub const WorkflowRunner = struct {
     stack_size: usize,
     /// See `Options.workflow_memory_limit`.
     memory_limit: ?usize = null,
+    /// See `Options.deadlock_detection_timeout`. Null: workflow code isn't watched.
+    deadlock_timeout: ?Io.Duration = null,
     /// See `Options.failure_stack_traces`.
     failure_stack_traces: bool = true,
     /// Borrowed; see `client.Options.codecs`.
@@ -977,6 +1016,34 @@ pub const WorkflowRunner = struct {
         evict: struct { run_id: []const u8, reason: []const u8 },
         /// The activation's run ID can't be read, so nothing can be sent.
         none,
+        /// The deadlock watchdog already answered the activation; its code's results are
+        /// dropped.
+        discarded,
+    };
+
+    /// Where the deadlock watchdog sends a stuck activation's response, from the watchdog's
+    /// thread while the activation's thread is still in workflow code. `response` and its
+    /// bytes are valid only during the call.
+    pub const Sender = struct {
+        ctx: *anyopaque,
+        send: *const fn (ctx: *anyopaque, run_id: []const u8, response: Response) void,
+    };
+
+    /// Sends the watchdog's response to a core worker, as `process` sends its own.
+    const CoreSender = struct {
+        r: *WorkflowRunner,
+        core: bridge.Worker,
+        io: Io,
+
+        fn sender(c: *CoreSender) Sender {
+            return .{ .ctx = c, .send = send };
+        }
+
+        fn send(ctx: *anyopaque, run_id: []const u8, response: Response) void {
+            const c: *CoreSender = @ptrCast(@alignCast(ctx));
+            var fallback_buf: [fallback_buffer_size]u8 = undefined;
+            c.r.deliver(c.core, c.io, run_id, response, &fallback_buf);
+        }
     };
 
     /// Room for the fallback failed completion: half for building it, half for its encoding.
@@ -1003,7 +1070,15 @@ pub const WorkflowRunner = struct {
         var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
         defer arena_state.deinit();
         var fallback_buf: [fallback_buffer_size]u8 = undefined;
-        var response = r.respond(bytes, arena_state.allocator(), io, &fallback_buf);
+        var to_core: CoreSender = .{ .r = r, .core = core, .io = io };
+        const response = r.respond(bytes, arena_state.allocator(), io, &fallback_buf, to_core.sender());
+        r.deliver(core, io, runId(bytes), response, &fallback_buf);
+    }
+
+    /// Sends `first` for run `run_id` to `core`, falling back to a failed completion and then
+    /// to an eviction request when the core rejects it.
+    fn deliver(r: *WorkflowRunner, core: bridge.Worker, io: Io, run_id: ?[]const u8, first: Response, fallback_buf: []u8) void {
+        var response = first;
         while (true) switch (response) {
             .completion => |c| {
                 var message: ?[]u8 = null;
@@ -1013,17 +1088,17 @@ pub const WorkflowRunner = struct {
                         error.CompletionFailed => "the core rejected a workflow activation completion",
                         error.OutOfMemory => "a workflow activation completion could not be sent to the core: out of memory",
                     }, &.{
-                        .{ .key = "run_id", .value = runId(bytes) orelse "" },
+                        .{ .key = "run_id", .value = run_id orelse "" },
                         .{ .key = "error", .value = message orelse @errorName(err) },
                     });
                     // An eviction has nothing to fall back to: a failed completion or an
                     // eviction request for a run that is being evicted changes nothing.
                     if (c.eviction) return;
                     if (c.fallback) {
-                        response = .{ .evict = .{ .run_id = runId(bytes).?, .reason = "the core rejected the fallback failed completion" } };
+                        response = .{ .evict = .{ .run_id = run_id.?, .reason = "the core rejected the fallback failed completion" } };
                         continue;
                     }
-                    response = fallbackCompletion(bytes, @errorName(err), &fallback_buf);
+                    response = fallbackCompletion(run_id, @errorName(err), fallback_buf);
                     continue;
                 };
                 return;
@@ -1040,6 +1115,7 @@ pub const WorkflowRunner = struct {
                 r.logger.log(.err, "a workflow activation has no readable run ID, so no completion can be sent; its run stays stuck until the worker restarts", &.{});
                 return;
             },
+            .discarded => return,
         };
     }
 
@@ -1061,35 +1137,38 @@ pub const WorkflowRunner = struct {
 
     /// Decides what to send the core for `bytes`, without sending it. Falls back to a failed
     /// completion built in `fallback_buf` when the activation can't be handled.
-    fn respond(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io, fallback_buf: []u8) Response {
-        var handled = r.handle(bytes, a, io) catch |err| {
+    /// `sender` takes the watchdog's response when the activation's workflow code gets stuck.
+    fn respond(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io, fallback_buf: []u8, sender: ?Sender) Response {
+        const run_id = runId(bytes);
+        var handled = r.handleWatched(bytes, a, io, sender) catch |err| {
             r.logger.log(.err, "processing a workflow activation failed", &.{
-                .{ .key = "run_id", .value = runId(bytes) orelse "" },
+                .{ .key = "run_id", .value = run_id orelse "" },
                 .{ .key = "error", .value = @errorName(err) },
             });
-            return fallbackCompletion(bytes, @errorName(err), fallback_buf);
+            return fallbackCompletion(run_id, @errorName(err), fallback_buf);
         };
+        if (handled.discarded) return .discarded;
         // A task failure `handle` returned early (before the codecs, which it skips: it holds
         // no payloads) is recorded in history too. One already encoded is left as it is. The
         // heap-free fallback below isn't encoded: its message is only an error name.
         if (r.encode_failure_attributes) if (handled.completion.status) |*st| if (st.* == .failed)
             failure_mod.encodeAttributes(done_pb.WorkflowActivationCompletion, &handled.completion, a) catch
-                return fallbackCompletion(bytes, "OutOfMemory", fallback_buf);
+                return fallbackCompletion(run_id, "OutOfMemory", fallback_buf);
         var encoded: Io.Writer.Allocating = .init(a);
         handled.completion.encode(&encoded.writer, a) catch |err| {
             r.logger.log(.err, "encoding a workflow activation completion failed", &.{
-                .{ .key = "run_id", .value = runId(bytes) orelse "" },
+                .{ .key = "run_id", .value = run_id orelse "" },
                 .{ .key = "error", .value = @errorName(err) },
             });
-            return fallbackCompletion(bytes, @errorName(err), fallback_buf);
+            return fallbackCompletion(run_id, @errorName(err), fallback_buf);
         };
         return .{ .completion = .{ .bytes = encoded.written(), .eviction = handled.eviction } };
     }
 
     /// A failed completion for the activation's run, built in `buf` without the heap: the
     /// likeliest reason to need it is running out of memory.
-    fn fallbackCompletion(bytes: []const u8, err_name: []const u8, buf: []u8) Response {
-        const run_id = runId(bytes) orelse return .none;
+    fn fallbackCompletion(maybe_run_id: ?[]const u8, err_name: []const u8, buf: []u8) Response {
+        const run_id = maybe_run_id orelse return .none;
         const too_big: Response = .{ .evict = .{ .run_id = run_id, .reason = "the run ID is too long for the fallback failed completion" } };
         var fba: std.heap.FixedBufferAllocator = .init(buf[0 .. buf.len / 2]);
         const fa = fba.allocator();
@@ -1134,9 +1213,17 @@ pub const WorkflowRunner = struct {
         completion: done_pb.WorkflowActivationCompletion,
         /// The activation evicted its run.
         eviction: bool = false,
+        /// The deadlock watchdog answered the activation; `completion` must not be sent.
+        discarded: bool = false,
     };
 
     fn handle(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io) !Handled {
+        return r.handleWatched(bytes, a, io, null);
+    }
+
+    /// `handle`, watching the activation's workflow code for deadlocks when
+    /// `deadlock_timeout` and `sender` are set.
+    fn handleWatched(r: *WorkflowRunner, bytes: []const u8, a: Allocator, io: Io, sender: ?Sender) !Handled {
         var reader: Io.Reader = .fixed(bytes);
         var act = try act_pb.WorkflowActivation.decode(&reader, a);
 
@@ -1171,20 +1258,157 @@ pub const WorkflowRunner = struct {
                 error.RunBusy => return .{ .completion = try busyFailure(a, act.run_id) },
             };
         };
-        defer r.release(act.run_id, io);
+        // An abandoned run is no longer in `runs`, and its instance is already freed.
+        var abandoned = false;
+        defer if (!abandoned) r.release(act.run_id, io);
 
         r.decodeActivation(&act, cached, a, io) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // The task fails and is retried; the workflow never sees undecoded payloads.
             error.Canceled, error.CodecFailed => return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "decoding the workflow activation's payloads with the client's codecs failed: {t}", .{err})) },
         };
-        var completion = inst.activate(&act, a) catch |err| return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err})) };
+        const activated = switch (r.activateWatched(inst, &act, a, io, sender)) {
+            .returned => |result| result,
+            .abandoned => {
+                abandoned = true;
+                return .{ .completion = .{ .run_id = act.run_id }, .discarded = true };
+            },
+        };
+        var completion = activated catch |err| return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err})) };
         if (r.encode_failure_attributes) try encodeCompletionAttributes(&completion, a);
         converter.encodeMessage(done_pb.WorkflowActivationCompletion, &completion, r.codecs, a, io, &runCodecContext(r.namespace, inst)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled, error.CodecFailed => return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "encoding the workflow activation completion's payloads with the client's codecs failed: {t}", .{err})) },
         };
         return .{ .completion = completion };
+    }
+
+    const Activated = union(enum) {
+        returned: @typeInfo(@TypeOf(Instance.activate)).@"fn".return_type.?,
+        /// The watchdog gave up on the code and answered the activation; the code has since
+        /// returned, and the run's instance is freed.
+        abandoned,
+    };
+
+    /// Runs `inst.activate`, watched for deadlocks when `deadlock_timeout` and `sender` are
+    /// set. Codecs run before and after this, so they aren't counted.
+    fn activateWatched(r: *WorkflowRunner, inst: *Instance, act: *const act_pb.WorkflowActivation, a: Allocator, io: Io, sender: ?Sender) Activated {
+        const limit = r.deadlock_timeout orelse return .{ .returned = inst.activate(act, a) };
+        var watch: Watch = .{
+            .r = r,
+            .io = io,
+            .limit = limit,
+            .run_id = act.run_id,
+            .switches = &inst.sched.switches,
+            .sender = sender orelse return .{ .returned = inst.activate(act, a) },
+        };
+        var watchdog = io.concurrent(Watch.run, .{&watch}) catch {
+            r.logger.log(.warn, "no concurrent task available for the deadlock watchdog; this workflow activation runs unwatched", &.{.{ .key = "run_id", .value = act.run_id }});
+            return .{ .returned = inst.activate(act, a) };
+        };
+        const result = inst.activate(act, a);
+        watch.returned.set(io);
+        watchdog.await(io);
+        if (!watch.abandoned) return .{ .returned = result };
+        // The watchdog took the run out of `runs` and answered for it; nothing else holds the
+        // instance now that its code has returned.
+        if (watch.orphan) |o| r.destroyRun(o.key, o.value);
+        return .abandoned;
+    }
+
+    /// One activation's workflow code, as its deadlock watchdog sees it. Lives on the
+    /// activation thread's stack; the watchdog uses it until the activation thread has
+    /// awaited the watchdog.
+    const Watch = struct {
+        r: *WorkflowRunner,
+        io: Io,
+        limit: Io.Duration,
+        run_id: []const u8,
+        /// The run's `Scheduler.switches`, which advances each time workflow code returns to
+        /// the scheduler.
+        switches: *const std.atomic.Value(u64),
+        sender: Sender,
+        /// Set by the activation thread once workflow code has returned.
+        returned: Io.Event = .unset,
+        /// Written by the watchdog, read by the activation thread after awaiting it: the
+        /// watchdog gave up on the code, and `orphan` is the cache entry it removed from
+        /// `runs`, for the activation thread to free once the code has returned.
+        abandoned: bool = false,
+        orphan: ?std.StringHashMapUnmanaged(CachedRun).KV = null,
+
+        /// Samples `switches` every quarter of the limit on the worker's real clock. A count
+        /// unchanged since it was first seen at least `limit` ago means the code hasn't
+        /// returned to the scheduler for at least that long.
+        fn run(w: *Watch) void {
+            const io = w.io;
+            const tick: Io.Clock.Duration = .{ .raw = .fromNanoseconds(@max(@divTrunc(w.limit.nanoseconds, 4), 1)), .clock = .awake };
+            var seen = w.switches.load(.acquire);
+            var since = Io.Clock.awake.now(io);
+            while (true) {
+                if (w.returned.waitTimeout(io, .{ .duration = tick })) |_| {
+                    return;
+                } else |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => return,
+                }
+                const now = Io.Clock.awake.now(io);
+                const switches = w.switches.load(.acquire);
+                if (switches != seen) {
+                    seen = switches;
+                    since = now;
+                    continue;
+                }
+                if (since.durationTo(now).nanoseconds < w.limit.nanoseconds) continue;
+                // Returned between the timeout and now: it ran under the limit, or so close
+                // to it that answering normally is as right.
+                if (w.returned.isSet()) return;
+                w.r.abandon(w);
+                return;
+            }
+        }
+    };
+
+    /// Gives up on a stuck activation: takes its run out of `runs` (so the core's eviction and
+    /// a later replay of the run don't wait for it), logs, and sends the deadlock failure.
+    fn abandon(r: *WorkflowRunner, w: *Watch) void {
+        const io = w.io;
+        w.abandoned = true;
+        {
+            r.mutex.lockUncancelable(io);
+            defer r.mutex.unlock(io);
+            w.orphan = r.runs.fetchRemove(w.run_id);
+        }
+        const workflow_id = if (w.orphan) |o| o.value.workflow_id else "";
+        const workflow_type = if (w.orphan) |o| o.value.workflow_type else "";
+        var arena_state: std.heap.ArenaAllocator = .init(r.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var fallback_buf: [fallback_buffer_size]u8 = undefined;
+        var limit_buf: [64]u8 = undefined;
+        const limit = std.fmt.bufPrint(&limit_buf, "{f}", .{w.limit}) catch unreachable;
+        const message = deadlockMessage(a, workflow_type, limit) catch "workflow code ran longer than worker.Options.deadlock_detection_timeout without returning to the workflow scheduler";
+        r.logger.log(.err, message, &.{
+            .{ .key = "workflow_id", .value = workflow_id },
+            .{ .key = "run_id", .value = w.run_id },
+            .{ .key = "workflow_type", .value = workflow_type },
+            .{ .key = "deadlock_detection_timeout", .value = limit },
+        });
+        const response = r.deadlockResponse(a, w.run_id, message) catch fallbackCompletion(w.run_id, "OutOfMemory", &fallback_buf);
+        w.sender.send(w.sender.ctx, w.run_id, response);
+    }
+
+    fn deadlockMessage(a: Allocator, workflow_type: []const u8, limit: []const u8) error{OutOfMemory}![]const u8 {
+        return std.fmt.allocPrint(a, "potential deadlock: workflow code of type \"{s}\" ran longer than worker.Options.deadlock_detection_timeout ({s}) without returning to the workflow scheduler; look for a loop that never waits, or a call that blocks outside the workflow's std.Io. The workflow task fails and the run replays from history on its next attempt", .{ workflow_type, limit });
+    }
+
+    fn deadlockResponse(r: *WorkflowRunner, a: Allocator, run_id: []const u8, message: []const u8) error{OutOfMemory}!Response {
+        var completion: done_pb.WorkflowActivationCompletion = .{ .run_id = run_id, .status = .{ .failed = .{
+            .failure = try failure_mod.application(a, .{ .message = message, .type = deadlock_failure_type }),
+        } } };
+        if (r.encode_failure_attributes) try failure_mod.encodeAttributes(done_pb.WorkflowActivationCompletion, &completion, a);
+        var encoded: Io.Writer.Allocating = .init(a);
+        completion.encode(&encoded.writer, a) catch return error.OutOfMemory;
+        return .{ .completion = .{ .bytes = encoded.written() } };
     }
 
     /// `failure.encodeAttributes` for the completion, except query answers: they never reach
@@ -4269,7 +4493,7 @@ test "an activation that can't be handled gets a fallback failed completion" {
     defer runner.deinit();
     var buf: [WorkflowRunner.fallback_buffer_size]u8 = undefined;
 
-    const response = runner.respond(try ParallelTest.start(a, "run-1", "ParallelHold", "x"), failing.allocator(), testing.io, &buf);
+    const response = runner.respond(try ParallelTest.start(a, "run-1", "ParallelHold", "x"), failing.allocator(), testing.io, &buf, null);
     try testing.expect(response.completion.fallback);
     const completion = try ParallelTest.decodeCompletion(a, response.completion.bytes);
     try testing.expectEqualStrings("run-1", completion.run_id);
@@ -4279,13 +4503,53 @@ test "an activation that can't be handled gets a fallback failed completion" {
     // No run ID: nothing can be sent.
     var no_run_id: act_pb.WorkflowActivation = .{ .timestamp = .{ .seconds = 1 } };
     try no_run_id.jobs.append(a, .{ .variant = .{ .fire_timer = .{ .seq = 1 } } });
-    try testing.expect(runner.respond(try ParallelTest.encode(a, no_run_id), failing.allocator(), testing.io, &buf) == .none);
+    try testing.expect(runner.respond(try ParallelTest.encode(a, no_run_id), failing.allocator(), testing.io, &buf, null) == .none);
 
     // A run ID too long for the buffer: the core is asked to evict the run.
     const long_id = try a.alloc(u8, 2 * WorkflowRunner.fallback_buffer_size);
     @memset(long_id, 'r');
-    const evict = runner.respond(try ParallelTest.fireTimer(a, long_id, 1), failing.allocator(), testing.io, &buf).evict;
+    const evict = runner.respond(try ParallelTest.fireTimer(a, long_id, 1), failing.allocator(), testing.io, &buf, null).evict;
     try testing.expectEqualStrings(long_id, evict.run_id);
+}
+
+// With `encode_failure_attributes`, a task failure `handle` returns early has its attributes
+// encoded in `respond`; running out of memory there still answers the activation's own run.
+test "a fallback failed completion after encoding an early task failure's attributes runs out of memory names the activation's run" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workflows = try ParallelTest.registry(testing.allocator);
+    defer workflows.deinit(testing.allocator);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    runner.encode_failure_attributes = true;
+    defer runner.deinit();
+    var buf: [WorkflowRunner.fallback_buffer_size]u8 = undefined;
+    // Not registered: `handle` returns a task failure without running workflow code. That
+    // failure's std.log warning is expected.
+    testing.log_level = .err;
+    const bytes = try ParallelTest.start(a, "run-1", "NotRegistered", "x");
+
+    var fallbacks: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < 1000) : (fail_index += 1) {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        var failing: std.testing.FailingAllocator = .init(scratch.allocator(), .{ .fail_index = fail_index });
+        const response = runner.respond(bytes, failing.allocator(), testing.io, &buf, null);
+        if (!failing.has_induced_failure) break;
+        switch (response) {
+            .completion => |c| if (c.fallback) {
+                fallbacks += 1;
+                const completion = try ParallelTest.decodeCompletion(a, c.bytes);
+                try testing.expectEqualStrings("run-1", completion.run_id);
+            },
+            .evict => |e| try testing.expectEqualStrings("run-1", e.run_id),
+            else => {},
+        }
+    }
+    try testing.expect(fallbacks > 0);
 }
 
 // A core worker with workflows disabled rejects every workflow completion, which drives
@@ -4605,4 +4869,308 @@ test "two workflows run their code at the same time on one worker" {
     // Each run's code waits for the other's: processed one at a time, both would time out.
     try testing.expectEqualStrings("met", try first.get(arena.allocator()));
     try testing.expectEqualStrings("met", try second.get(arena.allocator()));
+}
+
+/// Deadlock detection. Workflow code here blocks or spins on the test's real Io, outside the
+/// workflow's: it stands in for code that never returns to the workflow scheduler. Real
+/// workflow code must never do this.
+const DeadlockTest = struct {
+    /// Collects what the watchdog sends, in place of a core.
+    const Sent = struct {
+        mutex: Io.Mutex = .init,
+        arena: std.heap.ArenaAllocator = .init(testing.allocator),
+        responses: std.ArrayList([]const u8) = .empty,
+        received: Io.Event = .unset,
+
+        fn sender(s: *Sent) WorkflowRunner.Sender {
+            return .{ .ctx = s, .send = send };
+        }
+
+        fn send(ctx: *anyopaque, run_id: []const u8, response: WorkflowRunner.Response) void {
+            const s: *Sent = @ptrCast(@alignCast(ctx));
+            s.mutex.lockUncancelable(testing.io);
+            defer s.mutex.unlock(testing.io);
+            const bytes = switch (response) {
+                .completion => |c| c.bytes,
+                else => "not a completion",
+            };
+            const copy = s.arena.allocator().dupe(u8, bytes) catch return;
+            _ = run_id;
+            s.responses.append(s.arena.allocator(), copy) catch return;
+            s.received.set(testing.io);
+        }
+
+        fn count(s: *Sent) usize {
+            s.mutex.lockUncancelable(testing.io);
+            defer s.mutex.unlock(testing.io);
+            return s.responses.items.len;
+        }
+
+        fn deinit(s: *Sent) void {
+            s.arena.deinit();
+        }
+    };
+
+    /// Responds to `bytes` on a thread of its own, watched, as `process` does.
+    const Watched = struct {
+        r: *WorkflowRunner,
+        bytes: []const u8,
+        sender: WorkflowRunner.Sender,
+        arena: std.heap.ArenaAllocator = .init(testing.allocator),
+        fallback_buf: [WorkflowRunner.fallback_buffer_size]u8 = undefined,
+        response: ?WorkflowRunner.Response = null,
+
+        fn run(t: *Watched) void {
+            t.response = t.r.respond(t.bytes, t.arena.allocator(), testing.io, &t.fallback_buf, t.sender);
+        }
+
+        fn deinit(t: *Watched) void {
+            t.arena.deinit();
+        }
+    };
+
+    /// Each step runs in a coroutine of its own that the workflow awaits, so the workflow
+    /// returns to the scheduler between steps.
+    fn steps(ctx: *workflow.Context, n: u32, step_ms: u32) ![]const u8 {
+        for (0..n) |_| {
+            var f = ctx.io().async(step, .{step_ms});
+            f.await(ctx.io());
+        }
+        return "stepped";
+    }
+    fn step(ms: u32) void {
+        testing.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+    }
+    const Steps = workflow.Def("DeadlockSteps", steps);
+
+    /// Codecs that take `delay` on the real clock for each call.
+    const SlowCodec = struct {
+        delay: Io.Duration,
+        calls: std.atomic.Value(u32) = .init(0),
+
+        fn codec(c: *SlowCodec) converter.PayloadCodec {
+            return .{ .ptr = c, .vtable = &.{ .encode = slow, .decode = slow } };
+        }
+
+        fn slow(ptr: *anyopaque, arena: Allocator, io: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+            const c: *SlowCodec = @ptrCast(@alignCast(ptr));
+            _ = c.calls.fetchAdd(1, .acq_rel);
+            io.sleep(c.delay, .awake) catch return error.Canceled;
+            return arena.dupe(converter.Payload, payloads);
+        }
+    };
+
+    /// Spins on the real clock for `spin_for` the first time any run executes, then returns.
+    var spun: std.atomic.Value(bool) = .init(false);
+    var spin_for: Io.Duration = .fromMilliseconds(600);
+
+    fn spinOnce(ctx: *workflow.Context) ![]const u8 {
+        _ = ctx;
+        if (!spun.swap(true, .acq_rel)) {
+            const until = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = spin_for, .clock = .awake });
+            while (until.durationFromNow(testing.io).raw.nanoseconds > 0) std.atomic.spinLoopHint();
+        }
+        return "done";
+    }
+    const SpinOnce = workflow.Def("DeadlockSpinOnce", spinOnce);
+
+    fn expectedMessage(a: Allocator, workflow_type: []const u8, limit: []const u8) ![]const u8 {
+        return WorkflowRunner.deadlockMessage(a, workflow_type, limit);
+    }
+
+    /// The failure messages of the run's failed workflow tasks.
+    fn taskFailures(a: Allocator, c: *client_mod.Client, id: []const u8, run_id: []const u8) ![]const []const u8 {
+        const history = try c.fetchHistory(a, id, run_id);
+        var out: std.ArrayList([]const u8) = .empty;
+        for (history.events.items) |event| switch (event.attributes orelse continue) {
+            .workflow_task_failed_event_attributes => |f| try out.append(a, if (f.failure) |fl| fl.message else ""),
+            else => {},
+        };
+        return out.items;
+    }
+};
+
+test "workflow code stuck past the deadlock limit fails its task once, and its results are dropped when it returns" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workflows = try ParallelTest.registry(testing.allocator);
+    defer workflows.deinit(testing.allocator);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    runner.deadlock_timeout = .fromMilliseconds(50);
+    defer runner.deinit();
+    var sent: DeadlockTest.Sent = .{};
+    defer sent.deinit();
+    ParallelTest.Gate.reset();
+    ParallelTest.hook = ParallelTest.Gate.hook;
+    defer ParallelTest.hook = ParallelTest.noHook;
+
+    // Run A is held in its workflow code until released.
+    var run_a: DeadlockTest.Watched = .{ .r = &runner, .bytes = try ParallelTest.start(a, "A", "ParallelHold", "A"), .sender = sent.sender() };
+    defer run_a.deinit();
+    const thread = try std.Thread.spawn(.{}, DeadlockTest.Watched.run, .{&run_a});
+    var joined = false;
+    defer if (!joined) {
+        ParallelTest.Gate.release.set(testing.io);
+        thread.join();
+    };
+    try sent.received.wait(testing.io);
+
+    // The watchdog failed the task while the code is still stuck.
+    try testing.expect(!ParallelTest.Gate.release.isSet());
+    const failed = try ParallelTest.decodeCompletion(a, sent.responses.items[0]);
+    try testing.expectEqualStrings("A", failed.run_id);
+    const failure = failed.status.?.failed.failure.?;
+    try testing.expectEqualStrings(deadlock_failure_type, failure_mod.applicationType(failure).?);
+    const message = try DeadlockTest.expectedMessage(a, "ParallelHold", "50ms");
+    try testing.expectEqualStrings(message, failure.message);
+    try testing.expect(std.mem.indexOf(u8, message, "\"ParallelHold\"") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "(50ms)") != null);
+    try testing.expectEqual(1, sink.countAt(.err, message, &.{
+        .{ .key = "workflow_id", .value = "wf-A" },
+        .{ .key = "run_id", .value = "A" },
+    }));
+    try testing.expectEqual(1, sink.count(message, &.{}));
+    // The run left the cache; its instance stays allocated for the stuck code.
+    {
+        runner.mutex.lockUncancelable(testing.io);
+        defer runner.mutex.unlock(testing.io);
+        try testing.expect(runner.runs.get("A") == null);
+    }
+
+    // Other runs are processed meanwhile; so are the core's eviction of A and A's next task,
+    // which replays the run on a fresh instance.
+    _ = try ParallelTest.timerSeq(try ParallelTest.decodeCompletion(a, try ParallelTest.handleEncoded(&runner, try ParallelTest.start(a, "B", "ParallelHold", "B"), a)));
+    const evicted = try runner.handle(try ParallelTest.evict(a, "A", .LANG_FAIL), a, testing.io);
+    try testing.expect(evicted.eviction);
+    try testing.expect(evicted.completion.status.? == .successful);
+    _ = try ParallelTest.timerSeq(try ParallelTest.decodeCompletion(a, try ParallelTest.handleEncoded(&runner, try ParallelTest.start(a, "A", "ParallelHold", "replayed"), a)));
+
+    // The stuck code returns: its timer command is dropped, and nothing more is sent.
+    ParallelTest.Gate.release.set(testing.io);
+    thread.join();
+    joined = true;
+    try testing.expect(run_a.response.? == .discarded);
+    try testing.expectEqual(1, sent.count());
+    // The replayed copy of A is untouched by the stuck code's teardown.
+    _ = try ParallelTest.timerSeq((try runner.handle(try ParallelTest.fireTimer(a, "A", 1), a, testing.io)).completion);
+}
+
+test "workflow code that returns to the scheduler between steps runs past the deadlock limit in total" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, DeadlockTest.Steps.workflow_name, DeadlockTest.Steps.registered);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    runner.deadlock_timeout = .fromMilliseconds(200);
+    defer runner.deinit();
+    var sent: DeadlockTest.Sent = .{};
+    defer sent.deinit();
+
+    // Ten 30 ms steps: 300 ms in all, none near the limit.
+    var init: act_pb.InitializeWorkflow = .{ .workflow_type = "DeadlockSteps", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    init.arguments = try converter.toPayloads(a, .{ @as(u32, 10), @as(u32, 30) });
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+    try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+    var buf: [WorkflowRunner.fallback_buffer_size]u8 = undefined;
+    const response = runner.respond(try ParallelTest.encode(a, act), a, testing.io, &buf, sent.sender());
+    const completion = try ParallelTest.decodeCompletion(a, response.completion.bytes);
+    const result = completion.status.?.successful.commands.items[0].variant.?.complete_workflow_execution.result.?;
+    try testing.expectEqualStrings("\"stepped\"", result.data);
+    try testing.expectEqual(0, sent.count());
+}
+
+test "time payload codecs spend decoding an activation and encoding its completion doesn't count toward the deadlock limit" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var slow: DeadlockTest.SlowCodec = .{ .delay = .fromMilliseconds(150) };
+    const codecs = [_]converter.PayloadCodec{slow.codec()};
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, CodecContextTest.Echo.workflow_name, CodecContextTest.Echo.registered);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    runner.codecs = &codecs;
+    runner.deadlock_timeout = .fromMilliseconds(50);
+    defer runner.deinit();
+    var sent: DeadlockTest.Sent = .{};
+    defer sent.deinit();
+
+    var init: act_pb.InitializeWorkflow = .{ .workflow_type = "Echo", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    init.arguments = try converter.toPayloads(a, .{@as([]const u8, "hi")});
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+    try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+    var buf: [WorkflowRunner.fallback_buffer_size]u8 = undefined;
+    const response = runner.respond(try ParallelTest.encode(a, act), a, testing.io, &buf, sent.sender());
+    const completion = try ParallelTest.decodeCompletion(a, response.completion.bytes);
+    const result = completion.status.?.successful.commands.items[0].variant.?.complete_workflow_execution.result.?;
+    try testing.expectEqualStrings("\"hi\"", result.data);
+    // Decoded and encoded, each call three times the limit.
+    try testing.expect(slow.calls.load(.acquire) >= 2);
+    try testing.expectEqual(0, sent.count());
+}
+
+test "a non-positive deadlock_detection_timeout is rejected; null turns detection off" {
+    const all: Worker.Registered = .{ .workflows = true, .activities = true, .nexus = false };
+    try testing.expectError(error.InvalidOptions, Worker.checkOptions(.{ .deadlock_detection_timeout = .zero }, "q", all));
+    try testing.expectError(error.InvalidOptions, Worker.checkOptions(.{ .deadlock_detection_timeout = .fromMilliseconds(-1) }, "q", all));
+    try Worker.checkOptions(.{ .deadlock_detection_timeout = null }, "q", all);
+    try Worker.checkOptions(.{ .deadlock_detection_timeout = .fromNanoseconds(1) }, "q", all);
+    const defaults: Options = .{};
+    try testing.expectEqual(Io.Duration.fromSeconds(2), defaults.deadlock_detection_timeout.?);
+}
+
+test "a worker fails the workflow task of code that spins past the deadlock limit, and the workflow completes on a later attempt" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    // The core's warnings about the failed task go here, not to std.log.
+    var client_sink: RecordingSink = .{};
+    defer client_sink.deinit();
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target, .logger = client_sink.sink() });
+    defer client.close();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]?Io.Duration{ .fromMilliseconds(200), null }, [_][]const u8{ "deadlock-on", "deadlock-off" }) |limit, queue| {
+        var sink: RecordingSink = .{};
+        defer sink.deinit();
+        var w = try Worker.init(testing.allocator, testing.io, &client, queue, .{ .deadlock_detection_timeout = limit, .logger = sink.sink() });
+        defer w.deinit();
+        try w.registerWorkflow(DeadlockTest.SpinOnce);
+        DeadlockTest.spun.store(false, .release);
+        var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+        defer {
+            w.stop();
+            running.await(testing.io) catch {};
+        }
+
+        var run = try client.executeWorkflow(DeadlockTest.SpinOnce, .{ .id = queue, .task_queue = queue }, .{});
+        defer run.deinit();
+        try testing.expectEqualStrings("done", try run.get(a));
+        try testing.expect(DeadlockTest.spun.load(.acquire));
+        const failures = try DeadlockTest.taskFailures(a, &client, queue, run.run_id);
+        if (limit == null) {
+            try testing.expectEqual(0, failures.len);
+            try testing.expectEqual(0, sink.count(try DeadlockTest.expectedMessage(a, "DeadlockSpinOnce", "200ms"), &.{}));
+        } else {
+            const message = try DeadlockTest.expectedMessage(a, "DeadlockSpinOnce", "200ms");
+            try testing.expectEqual(1, failures.len);
+            try testing.expectEqualStrings(message, failures[0]);
+            try testing.expectEqual(1, sink.countAt(.err, message, &.{
+                .{ .key = "workflow_id", .value = queue },
+                .{ .key = "run_id", .value = run.run_id },
+            }));
+        }
+    }
 }

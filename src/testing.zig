@@ -942,6 +942,12 @@ pub const WorkflowReplayer = struct {
         /// A history whose run goes over it fails with `error.ReplayFailed`: set it to the
         /// worker's value to check that its histories fit.
         workflow_memory_limit: ?usize = null,
+        /// Deadlock detection while replaying (`worker.Options.deadlock_detection_timeout`).
+        /// Null (the default) doesn't watch the replayed code. With a limit, a history whose
+        /// workflow code runs longer than it without returning to the workflow scheduler
+        /// fails with `error.ReplayFailed`, its message naming the deadlock. Must be positive:
+        /// replay calls return `error.ReplayFailed` otherwise.
+        deadlock_detection_timeout: ?Io.Duration = null,
     };
 
     pub fn init(gpa: Allocator, io: Io) WorkflowReplayer {
@@ -1105,6 +1111,10 @@ pub const WorkflowReplayer = struct {
         stopped: bool,
 
         fn init(s: *Session, r: *const WorkflowReplayer) error{ReplayFailed}!void {
+            if (r.options.deadlock_detection_timeout) |d| if (d.nanoseconds <= 0) {
+                log.warn("WorkflowReplayer.Options.deadlock_detection_timeout is {f}; it must be positive, or null to replay unwatched", .{d});
+                return error.ReplayFailed;
+            };
             var message: ?[]u8 = null;
             defer if (message) |m| r.gpa.free(m);
             const runtime = bridge.Runtime.init(r.gpa, .{}, &message) catch {
@@ -1135,6 +1145,7 @@ pub const WorkflowReplayer = struct {
                     .namespace = r.options.namespace,
                     .stack_size = 256 * 1024,
                     .memory_limit = r.options.workflow_memory_limit,
+                    .deadlock_timeout = r.options.deadlock_detection_timeout,
                     .codecs = r.options.codecs,
                     .propagators = r.options.propagators,
                     .interceptors = r.options.interceptors,
@@ -2741,6 +2752,24 @@ test "WorkflowReplayer applies workflow_memory_limit: a history fits a generous 
     tiny.options.workflow_memory_limit = 1;
     try tiny.registerWorkflow(Fixtures.Hello);
     try testing.expectError(error.ReplayFailed, tiny.replayHistoryJson(hello_history));
+}
+
+// Detection adds no command and changes none: a history replays the same under a limit its
+// code never reaches.
+test "WorkflowReplayer replays a history under a deadlock detection limit it never reaches" {
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    r.options.deadlock_detection_timeout = .fromSeconds(2);
+    try r.registerWorkflow(Fixtures.Hello);
+    try r.replayHistoryJson(hello_history);
+}
+
+test "WorkflowReplayer rejects a deadlock detection limit that isn't positive" {
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    r.options.deadlock_detection_timeout = .zero;
+    try r.registerWorkflow(Fixtures.Hello);
+    try testing.expectError(error.ReplayFailed, r.replayHistoryJson(hello_history));
 }
 
 // Queries leave no trace in history, so registering query handlers must not change the
