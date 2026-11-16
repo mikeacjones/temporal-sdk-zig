@@ -29,6 +29,7 @@ const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const nexus = @import("nexus.zig");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -117,8 +118,11 @@ pub const TestServer = struct {
     pub const Options = struct {
         /// Path to a temporal-test-server binary; empty downloads one (cached).
         existing_path: []const u8 = "",
-        /// Version to download when `existing_path` is empty: "default" or an exact version.
-        version: []const u8 = "default",
+        /// Release to download when `existing_path` is empty: "default" (the one sdk-core
+        /// picks, usually the newest) or a release tag with its `v`, such as "v1.40.0".
+        /// Defaults to the build's `-Dtest-server-version`, "default" in a project that
+        /// depends on the SDK.
+        version: []const u8 = build_options.test_server_version,
         /// 0 picks a free port.
         port: u16 = 0,
         extra_args: []const []const u8 = &.{},

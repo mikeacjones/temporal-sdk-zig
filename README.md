@@ -1960,6 +1960,7 @@ Notes:
 - Time moves at wall-clock speed except during `executeWorkflow`, `getResult`, and `env.sleep`.
 - Signals, queries, and updates leave time locked, so a workflow waiting for one doesn't skip to its timeout.
 - `env.now()` is the server's time, skipped time included.
+- The test server is downloaded once and cached; by default it's the release sdk-core picks, usually the newest. Pin one with `.test_server_version = "v1.40.0"` in the SDK's `b.dependency` arguments, or for a single server with `testing.TestServer.Options.version`. The 1.41.0 release never delivers a workflow task that carries an update, so a test that sends one waits forever.
 
 #### Activity environment
 
