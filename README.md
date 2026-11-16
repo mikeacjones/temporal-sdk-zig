@@ -387,6 +387,36 @@ Notes:
 - A failed query, or one with no handler, is `error.QueryFailed`. `updateWorkflow` waits for `UpdateOptions.wait_for_stage` (`.completed` by default). A rejected update is `error.UpdateFailed` from the handle's `get`, with the reason in `failure()`.
 - `updateWithStartWorkflow` requires `id_conflict_policy`. `signalWithStartWorkflow` ignores the start arguments when the workflow is running.
 
+A client that has no definition of a message, such as one talking to a dynamic workflow or to a workflow whose message names come from configuration, sends it by name. `signalWorkflowByName`, `queryWorkflowByName`, and `updateWorkflowByName` take the name as a string and the arguments as a tuple; `signalWithStartWorkflowByName` and `updateWithStartWorkflowByName` take the workflow type and the message name as strings. A workflow's handler for that name receives the message, or its dynamic handler when it has none.
+
+<!-- example: client-messages-by-name -->
+```zig
+/// Message names known only at run time, for example read from configuration.
+pub const MessageNames = struct { workflow_type: []const u8, signal: []const u8, query: []const u8, update: []const u8 };
+
+pub fn sendMessagesByName(client: *temporal.client.Client, arena: Allocator, names: MessageNames) !Replies {
+    const start: temporal.client.StartWorkflowOptions = .{ .id = "greeter-6", .task_queue = "greetings", .id_conflict_policy = .use_existing };
+    var started = try client.updateWithStartWorkflowByName([]const u8, names.workflow_type, start, .{"Kai"}, names.update, .{"Hiya"}, .{});
+    defer started.deinit();
+    _ = try started.get(arena); // "Hello"
+    var update = try client.updateWorkflowByName([]const u8, names.update, start.id, "", .{"Yo"}, .{});
+    defer update.deinit();
+    const previous = try update.get(arena); // "Hiya"
+    const reply = try client.queryWorkflowByName(names.query, arena, start.id, "", .{});
+    const current = try reply.get([]const u8, arena); // "Yo"
+    try client.signalWorkflowByName(names.signal, start.id, "", .{});
+    var signaled = try client.signalWithStartWorkflowByName([]const u8, names.workflow_type, .{ .id = "greeter-7", .task_queue = "greetings" }, .{"Ivy"}, names.signal, .{});
+    defer signaled.deinit();
+    var run = try client.getWorkflow([]const u8, start.id, started.run_id);
+    defer run.deinit();
+    return .{ .previous = previous, .current = current, .result = try run.get(arena) }; // result: "Yo, Kai!"
+}
+```
+Notes:
+- The update calls and `signalWithStartWorkflowByName` take the type the result decodes to first (`void` to ignore it); `queryWorkflowByName` returns a `converter.EncodedValue` to decode with `get(T, arena)`.
+- Options, wait stages, and errors are the typed calls'. A rejected update is `error.UpdateFailed` from the handle's `get`; client interceptors, propagators, and codecs see the calls as they see the typed ones.
+- `signalWorkflowByNameWithOptions` and `queryWorkflowByNameWithOptions` take `SignalOptions` and `QueryOptions` last.
+
 `updateWorkflow`, `updateWithStartWorkflow`, and the handle's `get` wait on the server for as long as the update takes: `Options.rpc_timeout` doesn't limit them. To bound the wait, cancel the task that waits, here by racing it against a timeout. The wait ends with `error.Canceled` and the update goes on in the workflow; `getWorkflowUpdateHandle` with the same update ID reads its result later. The handle from `updateWithStartWorkflow` carries the workflow ID and the run it started or found, so `getWorkflow` waits for that workflow's result without another call.
 
 <!-- example: client-update-wait -->

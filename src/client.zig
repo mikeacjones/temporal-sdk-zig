@@ -1382,6 +1382,18 @@ pub const Client = struct {
 
     /// `signalWorkflow` with options.
     pub fn signalWorkflowWithOptions(c: *Client, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args, options: SignalOptions) SignalError!void {
+        return c.signalWorkflowByNameWithOptions(Signal.signal_name, workflow_id, run_id, args, options);
+    }
+
+    /// Sends the signal named `signal_name` with the tuple `args` to a workflow, for a caller
+    /// with no `workflow.SignalDef`: a workflow's handler for that name, or its dynamic
+    /// signal handler, receives it. Otherwise behaves as `signalWorkflow`.
+    pub fn signalWorkflowByName(c: *Client, signal_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype) SignalError!void {
+        return c.signalWorkflowByNameWithOptions(signal_name, workflow_id, run_id, args, .{});
+    }
+
+    /// `signalWorkflowByName` with options, which behave as in `signalWorkflowWithOptions`.
+    pub fn signalWorkflowByNameWithOptions(c: *Client, signal_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype, options: SignalOptions) SignalError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
@@ -1389,7 +1401,7 @@ pub const Client = struct {
         _ = c.rpcCall(wfs.SignalWorkflowExecutionResponse, "SignalWorkflowExecution", wfs.SignalWorkflowExecutionRequest{
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
-            .signal_name = Signal.signal_name,
+            .signal_name = signal_name,
             .input = .{ .payloads = try converter.toPayloads(a, args) },
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
@@ -1413,14 +1425,30 @@ pub const Client = struct {
         comptime Signal: type,
         signal_args: Signal.Args,
     ) StartError!WorkflowRun(Workflow.Result) {
+        return c.signalWithStartWorkflowByName(Workflow.Result, Workflow.workflow_name, options, args, Signal.signal_name, signal_args);
+    }
+
+    /// `signalWithStartWorkflow` with the workflow type and the signal named at run time:
+    /// `args` and `signal_args` are tuples of their arguments, and `Result` the type the
+    /// run's result decodes to (`void` to ignore it). Pass a definition's `workflow_name` to
+    /// name only the signal at run time. Otherwise behaves as `signalWithStartWorkflow`.
+    pub fn signalWithStartWorkflowByName(
+        c: *Client,
+        comptime Result: type,
+        workflow_type: []const u8,
+        options: StartWorkflowOptions,
+        args: anytype,
+        signal_name: []const u8,
+        signal_args: anytype,
+    ) StartError!WorkflowRun(Result) {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
         const id = if (options.id.len > 0) options.id else try uuid(a, c.io);
 
-        const start = try c.startRequest(a, Workflow.workflow_name, id, options, args);
+        const start = try c.startRequest(a, workflow_type, id, options, args);
         var request: wfs.SignalWithStartWorkflowExecutionRequest = .{
-            .signal_name = Signal.signal_name,
+            .signal_name = signal_name,
             .signal_input = .{ .payloads = try converter.toPayloads(a, signal_args) },
         };
         // Every start field the two requests share, so a start option mapped in
@@ -2083,10 +2111,18 @@ pub const Client = struct {
     /// `error.UpdateFailed` from `get`, not an error here. Returns `error.NotFound` if no
     /// such workflow exists.
     pub fn updateWorkflow(c: *Client, comptime Update: type, workflow_id: []const u8, run_id: []const u8, args: Update.Args, options: UpdateOptions) UpdateError!WorkflowUpdateHandle(Update.Result) {
+        return c.updateWorkflowByName(Update.Result, Update.update_name, workflow_id, run_id, args, options);
+    }
+
+    /// Sends the update named `update_name` with the tuple `args` to a workflow, for a caller
+    /// with no `workflow.UpdateDef`: a workflow's handler for that name, or its dynamic
+    /// update handler, runs it. The handle's `get` decodes the result as `Result` (`void` to
+    /// ignore it). Options, wait stages and errors are `updateWorkflow`'s.
+    pub fn updateWorkflowByName(c: *Client, comptime Result: type, update_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype, options: UpdateOptions) UpdateError!WorkflowUpdateHandle(Result) {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        const request = try c.updateRequest(a, Update.update_name, workflow_id, run_id, args, options);
+        const request = try c.updateRequest(a, update_name, workflow_id, run_id, args, options);
         var header = try c.outgoingHeader(a, options.context);
         const response = try c.updateUntilStage(a, request, &header, options.context);
         const ref_run_id = if (response.update_ref) |r| if (r.workflow_execution) |e| e.run_id else "" else "";
@@ -2123,8 +2159,26 @@ pub const Client = struct {
         update_args: Update.Args,
         update_options: UpdateOptions,
     ) UpdateWithStartError!WorkflowUpdateHandle(Update.Result) {
+        return c.updateWithStartWorkflowByName(Update.Result, Workflow.workflow_name, start_options, args, Update.update_name, update_args, update_options);
+    }
+
+    /// `updateWithStartWorkflow` with the workflow type and the update named at run time:
+    /// `args` and `update_args` are tuples of their arguments, and the handle's `get`
+    /// decodes the update's result as `Result` (`void` to ignore it). Pass a definition's
+    /// `workflow_name` to name only the update at run time. Otherwise behaves as
+    /// `updateWithStartWorkflow`.
+    pub fn updateWithStartWorkflowByName(
+        c: *Client,
+        comptime Result: type,
+        workflow_type: []const u8,
+        start_options: StartWorkflowOptions,
+        args: anytype,
+        update_name: []const u8,
+        update_args: anytype,
+        update_options: UpdateOptions,
+    ) UpdateWithStartError!WorkflowUpdateHandle(Result) {
         if (start_options.id_conflict_policy == .unspecified) {
-            log.warn("updateWithStartWorkflow for update \"{s}\" on workflow type \"{s}\": StartWorkflowOptions.id_conflict_policy must be set (for example .use_existing), the server requires it for update-with-start", .{ Update.update_name, Workflow.workflow_name });
+            log.warn("update-with-start of update \"{s}\" on workflow type \"{s}\": StartWorkflowOptions.id_conflict_policy must be set (for example .use_existing), the server requires it for update-with-start", .{ update_name, workflow_type });
             return error.InvalidOptions;
         }
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
@@ -2132,9 +2186,9 @@ pub const Client = struct {
         const a = arena_state.allocator();
         const id = if (start_options.id.len > 0) start_options.id else try uuid(a, c.io);
 
-        var update = try c.updateRequest(a, Update.update_name, id, "", update_args, update_options);
+        var update = try c.updateRequest(a, update_name, id, "", update_args, update_options);
         update.request.?.input.?.header = try protoHeader(a, try c.outgoingHeader(a, update_options.context));
-        var start = try c.startRequest(a, Workflow.workflow_name, id, start_options, args);
+        var start = try c.startRequest(a, workflow_type, id, start_options, args);
         start.header = try protoHeader(a, try c.outgoingHeader(a, start_options.context));
         const Operation = wfs.ExecuteMultiOperationRequest.Operation;
         var operations: std.ArrayList(Operation) = .empty;
@@ -2154,7 +2208,7 @@ pub const Client = struct {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             error.RpcFailed => {
                 const s = status orelse return error.RpcFailed;
-                return multiOperationError(s, a, id, Update.update_name);
+                return multiOperationError(s, a, id, update_name);
             },
             else => |e| return e,
         };

@@ -157,6 +157,29 @@ pub fn sendMessages(client: *temporal.client.Client, arena: Allocator) !Replies 
 }
 // end-example
 
+// example: client-messages-by-name
+/// Message names known only at run time, for example read from configuration.
+pub const MessageNames = struct { workflow_type: []const u8, signal: []const u8, query: []const u8, update: []const u8 };
+
+pub fn sendMessagesByName(client: *temporal.client.Client, arena: Allocator, names: MessageNames) !Replies {
+    const start: temporal.client.StartWorkflowOptions = .{ .id = "greeter-6", .task_queue = "greetings", .id_conflict_policy = .use_existing };
+    var started = try client.updateWithStartWorkflowByName([]const u8, names.workflow_type, start, .{"Kai"}, names.update, .{"Hiya"}, .{});
+    defer started.deinit();
+    _ = try started.get(arena); // "Hello"
+    var update = try client.updateWorkflowByName([]const u8, names.update, start.id, "", .{"Yo"}, .{});
+    defer update.deinit();
+    const previous = try update.get(arena); // "Hiya"
+    const reply = try client.queryWorkflowByName(names.query, arena, start.id, "", .{});
+    const current = try reply.get([]const u8, arena); // "Yo"
+    try client.signalWorkflowByName(names.signal, start.id, "", .{});
+    var signaled = try client.signalWithStartWorkflowByName([]const u8, names.workflow_type, .{ .id = "greeter-7", .task_queue = "greetings" }, .{"Ivy"}, names.signal, .{});
+    defer signaled.deinit();
+    var run = try client.getWorkflow([]const u8, start.id, started.run_id);
+    defer run.deinit();
+    return .{ .previous = previous, .current = current, .result = try run.get(arena) }; // result: "Yo, Kai!"
+}
+// end-example
+
 // example: client-update-wait
 const UpdateWaitError = temporal.client.UpdateError || temporal.client.UpdateResultError;
 const Reply = union(enum) {
@@ -361,6 +384,13 @@ test "client: examples against a dev server" {
     defer updated.deinit();
     try std.testing.expectEqualStrings("Howdy, Ziggy!", try updated.get(arena));
     try std.testing.expectEqualStrings("Hey, Lin!", try updateThenWait(&client, arena));
+    const by_name = try sendMessagesByName(&client, arena, .{ .workflow_type = "greeter", .signal = "finish", .query = "current_greeting", .update = "set_greeting" });
+    try std.testing.expectEqualStrings("Hiya", by_name.previous);
+    try std.testing.expectEqualStrings("Yo", by_name.current);
+    try std.testing.expectEqualStrings("Yo, Kai!", by_name.result);
+    var signaled_by_name = try client.getWorkflow([]const u8, "greeter-7", "");
+    defer signaled_by_name.deinit();
+    try std.testing.expectEqualStrings("Hello, Ivy!", try signaled_by_name.get(arena));
     var bounded = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-5", .task_queue = "greetings" }, .{"Mo"});
     defer bounded.deinit();
     try std.testing.expectEqualStrings("Hello", (try setGreetingWithin(&client, io, arena, bounded.id, .fromSeconds(30))).?);

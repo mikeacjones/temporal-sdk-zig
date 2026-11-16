@@ -49,7 +49,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Signal, query, and update a workflow | all | GA | supported | [Signals, queries, and updates](README.md#signals-queries-and-updates), [reqrespupdate](samples/reqrespupdate) |
 | Signal-with-start | all | GA | supported | [Signals, queries, and updates](README.md#signals-queries-and-updates) |
 | Update-with-start | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Signals, queries, and updates](README.md#signals-queries-and-updates), [early-return](samples/early-return) |
-| Signal, query, and update by name from the client | all | GA | partial | `temporal-sdk-zig-d51.5.39`. Missing: signals and updates by name; queries by name (`Client.queryWorkflowByName`) exist. |
+| Signal, query, and update by name from the client | all | GA | supported | [Signals, queries, and updates](README.md#signals-queries-and-updates) |
 | Schedules: create, describe, update, pause, trigger, backfill, list, delete | all | GA | supported | [Schedules](README.md#schedules), [schedule](samples/schedule) |
 | Complete, fail, and heartbeat activities asynchronously from a client | all | GA | supported | [Completing activities asynchronously](README.md#completing-activities-asynchronously), [expense](samples/expense) |
 | Standalone activities (GA September 2026; Public Preview before) | Go, Java, Python, TypeScript, .NET | GA | partial | `temporal-sdk-zig-d51.5.24`. Missing: start delay, priority, and summary on the start, and typed pause, unpause, and delete calls (today only raw WorkflowService calls through `(try client.currentConnection()).call`). [Standalone activities](README.md#standalone-activities) has the rest. |

@@ -6972,6 +6972,134 @@ test "a dynamic signal handler receives the signals no handler is registered for
     try testing.expectEqualStrings("approved by ann, color=red, size=large", try env.getResult(RuntimeSignalFixtures.InboxWf, &run, a, null));
 }
 
+test "client: signals sent by name reach a typed handler and the dynamic handler" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(RuntimeSignalFixtures.InboxWf);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(RuntimeSignalFixtures.InboxWf, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    // "approve" first, so registration order and arrival order agree (see the test above).
+    try env.client.signalWorkflowByName("approve", run.id, run.run_id, .{"ann"});
+    try env.client.signalWorkflowByNameWithOptions("color", run.id, "", .{"red"}, .{});
+    const size: []const u8 = "large";
+    try env.client.signalWorkflowByName("size", run.id, "", .{size});
+    try testing.expectEqualStrings("approved by ann, color=red, size=large", try env.getResult(RuntimeSignalFixtures.InboxWf, &run, a, null));
+
+    try testing.expectError(error.NotFound, env.client.signalWorkflowByName("color", run.id, run.run_id, .{"late"}));
+    try testing.expectError(error.NotFound, env.client.signalWorkflowByName("color", "no-such-workflow", "", .{"nobody"}));
+}
+
+test "client: updates sent by name reach a typed handler and the dynamic handler; a rejected one is UpdateFailed" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFixtures.HandleDynamicUpdates);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(UpdateFixtures.HandleDynamicUpdates, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+
+    // "set" has a handler of its own, with a validator.
+    var set = try env.client.updateWorkflowByName(i64, "set", run.id, run.run_id, .{@as(i64, 5)}, .{});
+    defer set.deinit();
+    try testing.expectEqual(@as(i64, 0), try set.get(a));
+    try testing.expectEqualStrings(run.run_id, set.run_id);
+
+    var rejected = try env.client.updateWorkflowByName(i64, "set", run.id, "", .{@as(i64, -1)}, .{});
+    defer rejected.deinit();
+    try testing.expectError(error.UpdateFailed, rejected.get(a));
+    try testing.expectEqualStrings("NotPositive", rejected.failure().?.message);
+
+    // "greet" goes to the dynamic handler; accepted returns once it started.
+    var greet = try env.client.updateWorkflowByName([]const u8, "greet", run.id, run.run_id, .{"ann"}, .{ .update_id = "greet-ann", .wait_for_stage = .accepted });
+    defer greet.deinit();
+    try testing.expectEqualStrings("greet-ann", greet.update_id);
+    try testing.expectEqualStrings("Hello ann!", try greet.get(a));
+
+    // The dynamic handler's validator rejects every other name.
+    var unknown = try env.client.updateWorkflowByName(void, "unknown", run.id, run.run_id, .{"x"}, .{});
+    defer unknown.deinit();
+    try testing.expectError(error.UpdateFailed, unknown.get(a));
+    try testing.expectEqualStrings("UnknownUpdate", unknown.failure().?.message);
+
+    try env.client.signalWorkflowByName("done", run.id, run.run_id, .{});
+    try testing.expectEqualStrings("5 Hello ann!", try env.getResult(UpdateFixtures.HandleDynamicUpdates, &run, a, null));
+    try testing.expectError(error.NotFound, env.client.updateWorkflowByName(i64, "set", "no-such-workflow", "", .{@as(i64, 1)}, .{}));
+}
+
+test "client: signal-with-start and update-with-start by name start a workflow and deliver to typed and dynamic handlers" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    try env.registerWorkflow(RuntimeSignalFixtures.InboxWf);
+    try env.registerWorkflow(UpdateFixtures.HandleDynamicUpdates);
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try env.executeWorkflow(Fixtures.Hello, .{"warm-up"}, a, null); // starts the worker
+
+    // A typed signal handler; the second call only signals the running workflow.
+    const approvals: client_mod.StartWorkflowOptions = .{ .id = "signal-with-start-by-name", .task_queue = env.task_queue };
+    var run = try env.client.signalWithStartWorkflowByName([]const u8, "AwaitApprovals", approvals, .{@as(u32, 2)}, "approve", .{"ann"});
+    defer run.deinit();
+    try testing.expectEqualStrings("signal-with-start-by-name", run.id);
+    var again = try env.client.signalWithStartWorkflowByName([]const u8, "AwaitApprovals", approvals, .{@as(u32, 99)}, "approve", .{"bob"});
+    defer again.deinit();
+    try testing.expectEqualStrings(run.run_id, again.run_id);
+    try testing.expectEqualStrings("ann bob", try run.get(a));
+
+    // The dynamic signal handler, with a workflow definition's name and a signal named at run time.
+    var inbox = try env.client.signalWithStartWorkflowByName([]const u8, RuntimeSignalFixtures.InboxWf.workflow_name, .{ .task_queue = env.task_queue }, .{}, "color", .{"red"});
+    defer inbox.deinit();
+    try testing.expectEqual(@as(usize, 36), inbox.id.len);
+    try env.client.signalWorkflowByName("approve", inbox.id, "", .{"ann"});
+    try env.client.signalWorkflowByName("size", inbox.id, "", .{"large"});
+    const entries = try inbox.get(a);
+    for ([_][]const u8{ "color=red", "approved by ann", "size=large" }) |entry| {
+        if (std.mem.indexOf(u8, entries, entry) == null) {
+            std.debug.print("inbox result {s} lacks {s}\n", .{ entries, entry });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // Update-with-start: the typed "set" handler starts the workflow, then the dynamic
+    // handler takes "greet" on the running one.
+    var options: client_mod.StartWorkflowOptions = .{ .id = "update-with-start-by-name", .task_queue = env.task_queue };
+    try testing.expectError(error.InvalidOptions, env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", options, .{}, "set", .{@as(i64, 3)}, .{}));
+    options.id_conflict_policy = .use_existing;
+    var first = try env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", options, .{}, "set", .{@as(i64, 3)}, .{});
+    defer first.deinit();
+    try testing.expectEqual(@as(i64, 0), try first.get(a));
+    try testing.expect(first.run_id.len > 0);
+    var greeted = try env.client.updateWithStartWorkflowByName([]const u8, "HandleDynamicUpdates", options, .{}, "greet", .{"cy"}, .{ .wait_for_stage = .accepted });
+    defer greeted.deinit();
+    try testing.expectEqualStrings("Hello cy!", try greeted.get(a));
+    try testing.expectEqualStrings(first.run_id, greeted.run_id);
+
+    // A rejected update-with-start surfaces as the typed call's does.
+    var rejected = try env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", options, .{}, "set", .{@as(i64, -1)}, .{});
+    defer rejected.deinit();
+    try testing.expectError(error.UpdateFailed, rejected.get(a));
+    try testing.expectEqualStrings("NotPositive", rejected.failure().?.message);
+
+    var failing = options;
+    failing.id_conflict_policy = .fail;
+    try testing.expectError(error.WorkflowExecutionAlreadyStarted, env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", failing, .{}, "set", .{@as(i64, 9)}, .{}));
+
+    try env.client.signalWorkflowByName("done", options.id, "", .{});
+    var updated = try env.client.getWorkflow([]const u8, options.id, first.run_id);
+    defer updated.deinit();
+    try testing.expectEqualStrings("3 Hello cy!", try updated.get(a));
+}
+
 /// Replaces each payload with one of encoding "test/reversed" holding the original,
 /// serialized and reversed, so no payload text reaches the server in the clear; decoding
 /// undoes "test/reversed" payloads and passes others through.
@@ -7222,6 +7350,69 @@ test "codecs see the propagated key ID of the client call, the workflow run, and
         tagged += 1;
     }
     try testing.expectEqual(@as(usize, 4), tagged);
+}
+
+test "codecs and propagators apply to signals and updates sent by name" {
+    var key_ids: KeyIdCodec = .{};
+    const codecs = [_]converter.PayloadCodec{key_ids.codec()};
+    const propagators = [_]propagation.ContextPropagator{propagation.HeaderPropagator(KeyIdCodec.key_id).propagator};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs, .propagators = &propagators });
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFixtures.HandleDynamicUpdates);
+    try env.registerWorkflow(RuntimeSignalFixtures.InboxWf);
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var values: propagation.Values = .init(a);
+    try values.put(KeyIdCodec.key_id, KeyIdCodec.known_key);
+    _ = try env.executeWorkflowWithOptions(Fixtures.Hello, .{ .task_queue = "", .context = &values }, .{"warm-up"}, a, null); // starts the worker
+
+    const updates: client_mod.StartWorkflowOptions = .{ .id = "coded-by-name", .task_queue = env.task_queue, .id_conflict_policy = .use_existing, .context = &values };
+    var set = try env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", updates, .{}, "set", .{@as(i64, 4)}, .{ .context = &values });
+    defer set.deinit();
+    try testing.expectEqual(@as(i64, 0), try set.get(a));
+    var greet = try env.client.updateWorkflowByName([]const u8, "greet", updates.id, "", .{"ann"}, .{ .context = &values });
+    defer greet.deinit();
+    try testing.expectEqualStrings("Hello ann!", try greet.get(a));
+    try env.client.signalWorkflowByNameWithOptions("done", updates.id, "", .{}, .{ .context = &values });
+    var run = try env.client.getWorkflow([]const u8, updates.id, set.run_id);
+    defer run.deinit();
+    try testing.expectEqualStrings("4 Hello ann!", try run.get(a));
+
+    var inbox = try env.client.signalWithStartWorkflowByName([]const u8, "Inbox", .{ .id = "coded-inbox-by-name", .task_queue = env.task_queue, .context = &values }, .{}, "approve", .{"ann"});
+    defer inbox.deinit();
+    try env.client.signalWorkflowByNameWithOptions("color", inbox.id, "", .{"red"}, .{ .context = &values });
+    try env.client.signalWorkflowByNameWithOptions("size", inbox.id, "", .{"large"}, .{ .context = &values });
+    try testing.expectEqualStrings("approved by ann, color=red, size=large", try inbox.get(a));
+    try testing.expectEqual(@as(u32, 0), key_ids.without_key.load(.monotonic));
+
+    // The server stored each message's arguments tagged with the key ID, and each message's
+    // header carries the propagated value.
+    var plain = try client_mod.Client.connect(testing.allocator, testing.io, env.server.clientOptions());
+    defer plain.close();
+    const Message = struct { input: ?proto.temporal.api.common.v1.Payloads, header: ?proto.temporal.api.common.v1.Header };
+    var messages: usize = 0;
+    for ([_][]const u8{ updates.id, inbox.id }) |id| {
+        const raw = try plain.fetchHistory(a, id, "");
+        for (raw.events.items) |event| {
+            const m: Message = switch (event.attributes orelse continue) {
+                .workflow_execution_signaled_event_attributes => |e| .{ .input = e.input, .header = e.header },
+                .workflow_execution_update_accepted_event_attributes => |e| .{ .input = e.accepted_request.?.input.?.args, .header = e.accepted_request.?.input.?.header },
+                else => continue,
+            };
+            for (m.input.?.payloads.items) |p| try testing.expectEqualStrings(KeyIdCodec.known_key, KeyIdCodec.keyIdOf(p).?);
+            const header = m.header orelse return error.TestUnexpectedResult;
+            for (header.fields.items) |f| {
+                if (std.mem.eql(u8, f.key, KeyIdCodec.key_id.name)) break;
+            } else return error.TestUnexpectedResult;
+            messages += 1;
+        }
+    }
+    // Two updates and a signal, then three signals.
+    try testing.expectEqual(@as(usize, 6), messages);
 }
 
 const InfoTimeFixtures = struct {
