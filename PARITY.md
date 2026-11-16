@@ -35,8 +35,8 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Client RPC retry policy and a client-wide RPC timeout | all | GA | supported | [Connecting](README.md#connecting) |
 | RPC timeout and gRPC metadata on a single call | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |
 | Environment configuration: profiles from a TOML file and environment variables | Go, Python, TypeScript, .NET, Ruby, Java | GA | supported | [Connecting](README.md#connecting), [external-env-conf](samples/external-env-conf) |
-| HTTP CONNECT proxy for the client connection | Python, TypeScript, .NET, Ruby, Go | GA | partial | `temporal-sdk-zig-d51.5.36`. Missing: README.md documentation; `client.Options.http_connect_proxy` exists. |
-| gRPC keep-alive settings | Python, TypeScript, .NET, Ruby | GA | partial | `temporal-sdk-zig-d51.5.36`. Missing: README.md documentation; `client.Options.keep_alive` exists. |
+| HTTP CONNECT proxy for the client connection | Python, TypeScript, .NET, Ruby, Go | GA | supported | [Proxy, keep-alive, and worker heartbeats](README.md#proxy-keep-alive-and-worker-heartbeats) |
+| gRPC keep-alive settings | Python, TypeScript, .NET, Ruby | GA | supported | [Proxy, keep-alive, and worker heartbeats](README.md#proxy-keep-alive-and-worker-heartbeats) |
 | Lazy connection, and changing the API key or headers on a connected client | Go, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |
 | Clients for several namespaces over one connection | all | GA | supported | [Connecting](README.md#connecting) |
 | Start a workflow: ID reuse and conflict policies, timeouts, retry policy, memo, search attributes | all | GA | supported | [Starting workflows](README.md#starting-workflows), [helloworld](samples/helloworld) |
@@ -138,7 +138,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Resource-based slot tuner (Public Preview) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | missing | `temporal-sdk-zig-d51.9.3`. `worker.Options` has no option for it; only the SDK's internal bridge to sdk-core passes one. |
 | Custom slot suppliers | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | missing | `temporal-sdk-zig-d51.9.3`. `worker.Options` has no option for it; only the SDK's internal bridge to sdk-core passes one. |
 | Poller autoscaling (GA August 2026) | Go, Java, Python, TypeScript, .NET, Ruby | GA | missing | `temporal-sdk-zig-d51.9.4`. `worker.Options` has no option for it; only the SDK's internal bridge to sdk-core passes one. |
-| Worker heartbeats to the server (Public Preview) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | partial | `temporal-sdk-zig-d51.5.36`. Missing: README.md documentation; `client.Options.worker_heartbeat_interval` exists and sets the interval. |
+| Worker heartbeats to the server (Public Preview) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | supported | [Proxy, keep-alive, and worker heartbeats](README.md#proxy-keep-alive-and-worker-heartbeats) |
 | Client and worker plugins | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | partial | `temporal-sdk-zig-d51.9.7`. Missing: registering plugins on a client or worker and reporting their names to the server; `worker.Options` has no option for it, and only the SDK's internal bridge to sdk-core passes plugin names. A function that adjusts `client.Options` and `worker.Options` before use is plain code. |
 | Serverless workers on AWS Lambda and Cloud Run (Public Preview) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | partial | `temporal-sdk-zig-d51.13.5`. Missing: helpers that start a worker for an invocation, set defaults for it, and drain it before the invocation ends; a program can run `Worker.run` and call `Worker.stop` itself. |
 

@@ -18,6 +18,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
 - [Usage](#usage)
   - [Client](#client)
     - [Connecting](#connecting)
+    - [Proxy, keep-alive, and worker heartbeats](#proxy-keep-alive-and-worker-heartbeats)
     - [Starting workflows](#starting-workflows)
     - [Signals, queries, and updates](#signals-queries-and-updates)
     - [Describing, listing, cancelling, and terminating](#describing-listing-cancelling-and-terminating)
@@ -309,6 +310,29 @@ Notes:
 - `RpcOptions.timeout` replaces `Options.rpc_timeout` for each call (null keeps it). A call that runs out fails with `error.RpcFailed`, logged with gRPC status 1 ("Timeout expired") or 4 (DEADLINE_EXCEEDED). As with `rpc_timeout`, calls that long-poll aren't limited by it: waiting for a workflow's or an activity's result with `get`, for an update to reach its stage or its outcome, and following history with `wait_new_event`. Cancel the calling task to stop those.
 - `metadata` (ASCII) and `binary_metadata` (names ending in `-bin`, any bytes) are sent along with `Options.headers` and the API key, the long-polls included; for a name in both, the view's value is sent, and an `authorization` entry replaces the API key's. `withRpcOptions` returns `error.InvalidOptions`, logged, for a timeout that isn't positive or a name or value gRPC can't send.
 - The view borrows the client and the options' slices, which must outlive it and the handles it returns. It owns nothing: `close` on it does nothing. `forNamespace` on a view returns a full client without the view's options; a view of a client from `forNamespace` works in that client's namespace.
+
+#### Proxy, keep-alive, and worker heartbeats
+
+Three more `client.Options` fields shape the connection and what workers send over it: `http_connect_proxy` routes the connection through an HTTP CONNECT proxy, `keep_alive` sets the gRPC keep-alive pings, and `worker_heartbeat_interval` sets how often workers report themselves to the server.
+
+<!-- example: client-transport -->
+```zig
+var client = try temporal.client.Client.connect(gpa, io, .{
+    .host_port = "temporal.internal:7233",
+    // Tunnel the connection through an HTTP CONNECT proxy, with basic auth (both or neither).
+    .http_connect_proxy = .{ .host_port = "proxy.corp:3128", .username = "svc", .password = proxy_password },
+    // Ping every 10 s and drop the connection when a ping goes unanswered for 5 s.
+    .keep_alive = .{ .interval = .fromSeconds(10), .timeout = .fromSeconds(5) },
+    // Workers on this client heartbeat to the server every 30 s; `.zero` turns that off.
+    .worker_heartbeat_interval = .fromSeconds(30),
+});
+defer client.close();
+```
+Notes:
+- `http_connect_proxy` (default null: connect directly) sends the connection to `host_port` through an HTTP CONNECT tunnel; TLS, when set, still runs end to end with the server inside the tunnel. `username` and `password` send basic auth to the proxy and go together: set both or neither. An empty `host_port`, or only one of the credentials, makes `connect` and `init` return `error.InvalidOptions`, logged. Set it to null to connect directly.
+- `keep_alive` defaults to a ping every 30 s, sent even while the connection is idle; a ping not answered within 15 s drops the connection, and later calls connect again. Both durations must be positive, or `connect` and `init` return `error.InvalidOptions`, logged. Set `keep_alive` to null to send no pings.
+- `worker_heartbeat_interval` (default null: every 60 s) applies to every worker on the client's sdk-core runtime, so clients from `forNamespace` share it. It must be from 1 s to 60 s, or `.zero` to turn worker heartbeats off; any other value makes `connect` and `init` return `error.InvalidOptions`, logged. Workers send heartbeats only to a server whose namespace reports support for them, and skip them silently otherwise.
+- `Client.reconnect` takes a new `http_connect_proxy` and `keep_alive` in `client.ConnectionOptions`; `worker_heartbeat_interval` stays as `connect` or `init` set it.
 
 #### Starting workflows
 

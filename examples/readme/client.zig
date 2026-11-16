@@ -67,6 +67,21 @@ fn rpcOptionsExample(client: *temporal.client.Client, request_id: []const u8) !u
     return running;
 }
 
+fn transportExample(gpa: Allocator, io: Io, proxy_password: []const u8) !void {
+    // example: client-transport
+    var client = try temporal.client.Client.connect(gpa, io, .{
+        .host_port = "temporal.internal:7233",
+        // Tunnel the connection through an HTTP CONNECT proxy, with basic auth (both or neither).
+        .http_connect_proxy = .{ .host_port = "proxy.corp:3128", .username = "svc", .password = proxy_password },
+        // Ping every 10 s and drop the connection when a ping goes unanswered for 5 s.
+        .keep_alive = .{ .interval = .fromSeconds(10), .timeout = .fromSeconds(5) },
+        // Workers on this client heartbeat to the server every 30 s; `.zero` turns that off.
+        .worker_heartbeat_interval = .fromSeconds(30),
+    });
+    defer client.close();
+    // end-example
+}
+
 pub fn startWorkflows(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
     // example: client-start
     var run = try client.executeWorkflow(Greeting, .{ .id = "greeting-ada", .task_queue = "greetings", .execution_timeout = .fromSeconds(60) }, .{"Ada"});
@@ -255,6 +270,7 @@ fn runWorker(w: *temporal.worker.Worker) temporal.worker.Worker.RunError!void {
 
 test "client: connecting compiles" {
     _ = &connectExamples;
+    _ = &transportExample;
 }
 
 test "client: examples against a dev server" {
