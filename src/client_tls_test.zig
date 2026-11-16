@@ -195,7 +195,7 @@ const DockerServer = struct {
 fn describeStatus(c: *client_mod.Client, arena: Allocator) !u32 {
     var failure: ?bridge.Connection.RpcFailure = null;
     defer if (failure) |f| f.deinit(testing.allocator);
-    const bytes = c.currentConnection().call(testing.allocator, testing.io, .workflow, "DescribeNamespace", try encode(arena, wfs.DescribeNamespaceRequest{ .namespace = "default" }), .{}, &failure) catch |err| switch (err) {
+    const bytes = (try c.currentConnection()).call(testing.allocator, testing.io, .workflow, "DescribeNamespace", try encode(arena, wfs.DescribeNamespaceRequest{ .namespace = "default" }), .{}, &failure) catch |err| switch (err) {
         error.RpcFailed => return failure.?.status_code,
         else => return err,
     };
@@ -220,7 +220,7 @@ test "client credentials against a server with mutual TLS and JWT authorization"
 
     // An API key update applies to the next call.
     try testing.expectEqual(permission_denied, try describeStatus(&c, a));
-    c.updateApiKey(server.token);
+    try c.updateApiKey(server.token);
     try testing.expectEqual(0, try describeStatus(&c, a));
     try c.updateHeaders(&.{.{ .key = "x-deployment", .value = "blue" }});
     try testing.expectError(error.InvalidOptions, c.updateHeaders(&.{.{ .key = "x-deployment", .value = "gr\xc3\xbcn" }}));
@@ -251,9 +251,9 @@ test "client credentials against a server with mutual TLS and JWT authorization"
         r.await(testing.io) catch {};
     };
     try w.waitUntilRunning();
-    const before = c.currentConnection();
+    const before = (try c.currentConnection());
     try c.reconnect(rotated);
-    try testing.expect(c.currentConnection().ptr != before.ptr);
+    try testing.expect((try c.currentConnection()).ptr != before.ptr);
     var run_handle = try c.executeWorkflow(Fixtures.Greet, .{ .task_queue = "tls-rotation" }, .{"rotation"});
     defer run_handle.deinit();
     try testing.expectEqualStrings("Hello rotation!", try run_handle.get(a));
@@ -265,9 +265,9 @@ test "client credentials against a server with mutual TLS and JWT authorization"
     // its connection. Rotated back: the reconnect succeeds.
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "client.pem", .data = try readFile(a, server.server_cert_path) });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "client.key", .data = try readFile(a, server.server_key_path) });
-    const kept = c.currentConnection();
+    const kept = (try c.currentConnection());
     try testing.expectError(error.ConnectFailed, c.reconnect(rotated));
-    try testing.expectEqual(kept.ptr, c.currentConnection().ptr);
+    try testing.expectEqual(kept.ptr, (try c.currentConnection()).ptr);
     try testing.expectEqual(0, try describeStatus(&c, a));
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "client.pem", .data = good_cert });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "client.key", .data = good_key });

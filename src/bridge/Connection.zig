@@ -224,6 +224,183 @@ pub fn connect(gpa: Allocator, io: Io, runtime: Runtime, options: Options, failu
     return .{ .ptr = conn, .runtime = runtime };
 }
 
+/// A connection the core is making, which any number of threads may wait for, each until
+/// its own deadline, while the core's attempt runs on without a deadline of its own. The core
+/// copies the options before `start` returns, so nothing the caller passed is read after it.
+///
+/// Ownership. The caller's references (`start` returns one; `ref` adds more) are counted;
+/// the core's callback holds none. The callback only stores its result, wakes the waiters,
+/// and marks the attempt finished as its last write. The last `unref` frees the attempt, and
+/// any connection nobody took, on the calling thread once the callback has finished (waiting
+/// out a callback that is running, which takes microseconds). If the callback hasn't
+/// started, the last `unref` instead hands the attempt to it and returns `.orphaned`: the
+/// callback frees it, and the caller must then never free the runtime, because the core's
+/// task uses it until it calls back, and the callback could free a connection holding
+/// the last reference to the core on the core's own thread. The waiters' `io` must stay
+/// valid until the last `unref`.
+pub const Connecting = struct {
+    /// The flags below and a wake counter in the bits above them; waited on with the futex.
+    word: std.atomic.Value(u32) = .init(0),
+    refs: std.atomic.Value(u32) = .init(1),
+    /// Set by the callback before `done`.
+    conn: ?*c.TemporalCoreConnection = null,
+    fail: ?bytes.Owned = null,
+    /// Whether `take` handed `conn` out.
+    taken: bool = false,
+    io: Io,
+    runtime: Runtime,
+
+    /// The callback stored its result.
+    const done: u32 = 1;
+    /// `supersede` was called.
+    const superseded: u32 = 2;
+    /// The callback started.
+    const calling: u32 = 4;
+    /// The callback made its last write to the attempt.
+    const finished: u32 = 8;
+    /// The last reference was released before the callback started: the callback frees it.
+    const orphaned: u32 = 16;
+    /// `wakeWaiters` adds this, leaving the flags alone.
+    const wake_step: u32 = 32;
+    /// The callback may run after the caller's allocator is gone.
+    const allocator = std.heap.smp_allocator;
+
+    /// Starts connecting with `options` and checking the server (GetSystemInfo). Release
+    /// the reference it returns with `unref`.
+    pub fn start(gpa: Allocator, io: Io, runtime: Runtime, options: Options) error{ OutOfMemory, InvalidOptions }!*Connecting {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        var core: CoreOptions = undefined;
+        try core.init(arena_state.allocator(), options);
+        const self = try allocator.create(Connecting);
+        self.* = .{ .io = io, .runtime = runtime };
+        c.temporal_core_client_connect(runtime.ptr, &core.connection, self, onConnecting);
+        return self;
+    }
+
+    pub fn ref(self: *Connecting) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    pub const Released = enum {
+        /// Other references remain.
+        kept,
+        /// The attempt and its connection, if nobody took it, are freed.
+        freed,
+        /// The core hasn't called back: the callback will free the attempt, and the runtime
+        /// must never be freed.
+        orphaned,
+    };
+
+    pub fn unref(self: *Connecting) Released {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return .kept;
+        var w = self.word.load(.acquire);
+        while (true) {
+            if (w & finished != 0) break;
+            if (w & calling != 0) {
+                // The callback is running and touches nothing that can block.
+                std.atomic.spinLoopHint();
+                w = self.word.load(.acquire);
+                continue;
+            }
+            w = self.word.cmpxchgWeak(w, w | orphaned, .acq_rel, .acquire) orelse return .orphaned;
+        }
+        self.free();
+        return .freed;
+    }
+
+    fn free(self: *Connecting) void {
+        if (self.conn) |p| if (!self.taken) c.temporal_core_client_free(p);
+        if (self.fail) |f| f.deinit();
+        allocator.destroy(self);
+    }
+
+    /// Whether the callback has finished with the attempt.
+    pub fn calledBack(self: *const Connecting) bool {
+        return self.word.load(.acquire) & finished != 0;
+    }
+
+    pub fn isDone(self: *const Connecting) bool {
+        return self.word.load(.acquire) & done != 0;
+    }
+
+    /// Wakes every waiter, for an owner that no longer needs the connection (it connected
+    /// another way). The attempt goes on, and `isDone` is still false until it ends.
+    pub fn supersede(self: *Connecting) void {
+        _ = self.word.fetchOr(superseded, .acq_rel);
+        self.io.futexWake(u32, &self.word.raw, std.math.maxInt(u32));
+    }
+
+    /// Wakes every waiter to check its own `stop` flag again; set the flag first.
+    pub fn wakeWaiters(self: *Connecting) void {
+        _ = self.word.fetchAdd(wake_step, .acq_rel);
+        self.io.futexWake(u32, &self.word.raw, std.math.maxInt(u32));
+    }
+
+    /// Waits until the core calls back or `supersede` is called (then returns), or until
+    /// `deadline` passes (null: no deadline), `stop` is set (with a `wakeWaiters` after it), or
+    /// the calling task is canceled. The attempt goes on whatever this returns.
+    pub fn wait(self: *Connecting, deadline: ?Io.Clock.Timestamp, stop: ?*const std.atomic.Value(bool)) error{ Timeout, Canceled, Stopped }!void {
+        while (true) {
+            const seen = self.word.load(.acquire);
+            if (seen & (done | superseded) != 0) return;
+            if (stop) |f| if (f.load(.acquire)) return error.Stopped;
+            const d = deadline orelse {
+                try self.io.futexWait(u32, &self.word.raw, seen);
+                continue;
+            };
+            if (d.durationFromNow(self.io).raw.nanoseconds <= 0) return error.Timeout;
+            try self.io.futexWaitTimeout(u32, &self.word.raw, seen, .{ .deadline = d });
+        }
+    }
+
+    /// `wait` without a deadline, a stop flag or cancellation.
+    pub fn waitUncancelable(self: *Connecting) void {
+        while (true) {
+            const seen = self.word.load(.acquire);
+            if (seen & (done | superseded) != 0) return;
+            self.io.futexWaitUncancelable(u32, &self.word.raw, seen);
+        }
+    }
+
+    /// The connection, once done: the first call gets it and owns it, later calls and a
+    /// failed attempt get null. Callers serialize calls to it.
+    pub fn take(self: *Connecting) ?Connection {
+        std.debug.assert(self.isDone());
+        if (self.taken) return null;
+        const p = self.conn orelse return null;
+        self.taken = true;
+        return .{ .ptr = p, .runtime = self.runtime };
+    }
+
+    /// Why a done attempt failed: the core's message. Valid until the last `unref`.
+    pub fn failureMessage(self: *const Connecting) []const u8 {
+        std.debug.assert(self.isDone());
+        return if (self.fail) |f| f.bytes() else "the core gave no reason";
+    }
+
+    fn onConnecting(user_data: ?*anyopaque, conn: ?*c.TemporalCoreConnection, fail: ?*const c.TemporalCoreByteArray) callconv(.c) void {
+        const self: *Connecting = @ptrCast(@alignCast(user_data.?));
+        const fail_bytes = bytes.Owned.take(null, fail);
+        if (self.word.fetchOr(calling, .acq_rel) & orphaned != 0) {
+            // Nobody holds the attempt, and its runtime is never freed: the connection can't
+            // hold the last reference to the core.
+            if (conn) |p| c.temporal_core_client_free(p);
+            if (fail_bytes) |f| f.deinit();
+            allocator.destroy(self);
+            return;
+        }
+        // Once `calling` is set, the last `unref` waits for `finished`: `self` and `io` stay
+        // valid until then.
+        const io = self.io;
+        self.conn = conn;
+        self.fail = fail_bytes;
+        _ = self.word.fetchOr(done, .acq_rel);
+        io.futexWake(u32, &self.word.raw, std.math.maxInt(u32));
+        _ = self.word.fetchOr(finished, .release);
+    }
+};
+
 /// The core's connection options and the structs they point at, which point into this value
 /// and the arena passed to `init`: don't move it while the core reads it.
 const CoreOptions = struct {

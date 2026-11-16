@@ -253,6 +253,26 @@ Notes:
 - `api_key` alone doesn't turn TLS on; `loadOptions` does for a profile with an API key or TLS settings, and returns `error.InvalidConfig`, logged, for a named profile that doesn't exist (in a config file or a missing one), a config file that exists but can't be read or parsed, a key `strict` rejects, a certificate given as both a path and data, or both `disable_file` and `disable_env` set. A missing config file without a named profile isn't an error: its defaults are used. TLS file paths are read on each connect, so `Client.reconnect` picks up rotated certificates.
 - `Options.rpc_timeout` (default 30 s) bounds each call, but not waits for a result. `connect` copies `namespace` and `identity`; `codecs`, `logger`, `propagators`, `worker_interceptors`, and `interceptors` are borrowed and must outlive the client and its workers.
 
+`Client.init` takes the same options but connects on first use, so a process can build its client before the server is reachable. `Client.updateApiKey` and `Client.updateHeaders` rotate the API key and the gRPC headers of a client, connected or not.
+
+<!-- example: client-lazy -->
+```zig
+// Nothing goes over the network yet: the first call that needs the server connects.
+var client = try temporal.client.Client.init(gpa, io, options);
+defer client.close();
+// Optional: connect now, to see a failure here rather than on the first call.
+try client.ensureConnected();
+// Rotate the API key and headers: every later call, the workers' included, sends these.
+try client.updateApiKey(rotated_key);
+try client.updateHeaders(&.{.{ .key = "x-tenant", .value = "blue" }});
+```
+Notes:
+- `init` makes no network call, and an address nobody listens on doesn't fail it. It rejects the options `connect` rejects (header names and values, durations, a TLS certificate given as both PEM and path) with `error.InvalidOptions`, logged; TLS files are read when the client connects. It returns `error.RuntimeInitFailed` or `error.OutOfMemory` as `connect` does.
+- The first call that needs the server connects and checks it: a workflow, schedule, or activity call, `checkHealth`, `currentConnection`, `ensureConnected`, or `worker.Worker.run` on the client. Calls made together from several threads share one attempt, and each waits for it only until its own deadline, `Options.rpc_timeout` (30 s without one) from when the call began, so a server that accepts connections but never answers fails every call within its deadline. Canceling a call's task returns `error.Canceled` from it (`Worker.run` returns `error.ConnectFailed` and keeps the cancel request), and `Worker.stop` ends `run`'s wait at once, after which `run` returns success. A later call joins the attempt if it is still running, and starts another once no call waits for it. `updateApiKey` and `updateHeaders` don't wait, and what they change is sent on the new connection. `ensureConnected` connects explicitly and returns `client.ConnectError`.
+- A first connection that fails is logged as a warning with the reason and leaves the client unconnected, so the next call tries again. `ensureConnected` and `currentConnection` return `error.ConnectFailed` (or `error.InvalidOptions` for a TLS file that can't be read), the client's other calls `error.RpcFailed`, and `Worker.run` `error.ConnectFailed`.
+- `updateApiKey` replaces the API key every later call sends, this client's and its workers'; empty sends none. `updateHeaders` replaces `Options.headers` the same way, and returns `error.InvalidOptions`, logged, for a header name that isn't a gRPC ASCII header (or ends in `-bin`) or a value with bytes other than visible ASCII, space, and tab, leaving the headers unchanged. Calls already sent keep what they had. On a client that hasn't connected yet, they change what it connects with.
+- `Client.reconnect` connects again with its own `client.ConnectionOptions`, so after it the client sends that `api_key` and those `headers`, not those of earlier updates. On a client that hasn't connected yet, `reconnect` makes the first connection with its options, and calls waiting for a first connection get it; if that fails the client stays unconnected and keeps its own. `checkHealth` on such a client connects first. `close` frees a client whether it connected or not, without waiting on the network. If every call gave up on a first connection that sdk-core is still making (sdk-core gives it no deadline, and a server that never answers a TLS handshake keeps it going for good), sdk-core still uses the client's runtime, so `close` leaves the runtime and that attempt allocated for the rest of the process instead of freeing them. sdk-core's logs stop reaching `Options.logger`, but a custom metrics handler stays in use by that runtime and must then outlive the process.
+
 #### Starting workflows
 
 `Client.executeWorkflow` starts a workflow defined with `workflow.Def` and returns a `client.WorkflowRun`. `client.StartWorkflowOptions` sets the ID, task queue, timeouts, ID policies, retry policy, memo, search attributes, priority, and start delay.

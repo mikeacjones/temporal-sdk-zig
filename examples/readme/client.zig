@@ -27,6 +27,19 @@ fn connectExamples(gpa: Allocator, io: Io, arena: Allocator, api_key: []const u8
     // end-example
 }
 
+fn lazyConnectExample(gpa: Allocator, io: Io, options: temporal.client.Options, rotated_key: []const u8) !void {
+    // example: client-lazy
+    // Nothing goes over the network yet: the first call that needs the server connects.
+    var client = try temporal.client.Client.init(gpa, io, options);
+    defer client.close();
+    // Optional: connect now, to see a failure here rather than on the first call.
+    try client.ensureConnected();
+    // Rotate the API key and headers: every later call, the workers' included, sends these.
+    try client.updateApiKey(rotated_key);
+    try client.updateHeaders(&.{.{ .key = "x-tenant", .value = "blue" }});
+    // end-example
+}
+
 pub fn startWorkflows(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
     // example: client-start
     var run = try client.executeWorkflow(Greeting, .{ .id = "greeting-ada", .task_queue = "greetings", .execution_timeout = .fromSeconds(60) }, .{"Ada"});
@@ -224,6 +237,8 @@ test "client: examples against a dev server" {
         .extra_args = &temporal.testing.DevServer.standalone_activity_args,
     });
     defer server.stop(io);
+
+    try lazyConnectExample(gpa, io, server.clientOptions(), "rotated-key");
 
     var client = try temporal.client.Client.connect(gpa, io, server.clientOptions());
     defer client.close();

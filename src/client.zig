@@ -113,7 +113,8 @@ pub const Options = struct {
     /// gRPC status 1 (CANCELLED, "Timeout expired"), or 4 (DEADLINE_EXCEEDED) when the server
     /// gives up first, and isn't retried. Calls that wait on the server, such as
     /// waiting for a workflow's result or an update's outcome, aren't limited by it, and
-    /// workers' own calls aren't affected. Null keeps sdk-core's default of 30 s. Must be
+    /// workers' own calls aren't affected. It also bounds the first connection of a client
+    /// from `Client.init`, which a call makes. Null keeps sdk-core's default of 30 s. Must be
     /// positive; under 1 ms counts as 1 ms.
     rpc_timeout: ?Duration = null,
 
@@ -287,55 +288,129 @@ fn rpcTimeoutMs(timeout: ?Duration, rejection: *Rejection) error{InvalidOptions}
     return std.math.cast(u32, durationMs(d)) orelse std.math.maxInt(u32);
 }
 
-/// Connects to the server `options` names, reading the TLS files it names, and checks it.
-/// Logs why on failure: as an error, or as a warning for a `reconnect`, after which the
-/// client still works.
-fn openConnection(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []const u8, options: ConnectionOptions, comptime reconnecting: bool) ConnectError!bridge.Connection {
+/// Why `openConnection` connects, for its log message on failure.
+const Attempt = enum {
+    /// `Client.connect`, which then fails.
+    connect,
+    /// The first use of a client `Client.init` created, which then stays unconnected.
+    first_use,
+    /// `Client.reconnect` on a connected client, which keeps its connection.
+    reconnect,
+};
+
+/// Starts connecting to the server `options` names, reading the TLS files it names, and
+/// checking it. Logs a rejected option as `logConnectFailure` does. Release the attempt
+/// with `unref`.
+fn startConnecting(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []const u8, options: ConnectionOptions, comptime attempt: Attempt) error{ OutOfMemory, InvalidOptions }!*bridge.Connection.Connecting {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tls: ?bridge.Connection.Options.Tls = null;
-    if (options.tls) |t| tls = .{
-        .server_root_ca_cert = try tlsFile(arena, io, t.server_root_ca_cert, t.server_root_ca_cert_path, "server_root_ca_cert"),
-        .domain = t.server_name,
-        .client_cert = try tlsFile(arena, io, t.client_cert, t.client_cert_path, "client_cert"),
-        .client_private_key = try tlsFile(arena, io, t.client_private_key, t.client_private_key_path, "client_private_key"),
-    };
-    const scheme = if (options.tls != null) "https" else "http";
-    const url = try std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, options.host_port });
     var rejection: Rejection = .{};
-    const bridge_options = bridgeConnectionOptions(url, identity, options, tls, &rejection) catch |err| {
-        if (reconnecting)
-            log.warn("reconnecting to {s} failed, keeping the current connection: {s}", .{ options.host_port, rejection.message })
-        else
-            log.err("connecting to {s} failed: {s}", .{ options.host_port, rejection.message });
+    const bridge_options = connectionBridgeOptions(arena_state.allocator(), io, identity, options, &rejection) catch |err| {
+        if (err == error.InvalidOptions) logConnectFailure(attempt, options.host_port, rejection.message);
         return err;
     };
-    var message: ?[]u8 = null;
-    defer if (message) |m| gpa.free(m);
-    return bridge.Connection.connect(gpa, io, runtime, bridge_options, &message) catch |err| {
-        const reason = message orelse @errorName(err);
-        if (reconnecting)
-            log.warn("reconnecting to {s} failed, keeping the current connection: {s}", .{ options.host_port, reason })
-        else
-            log.err("connecting to {s} failed: {s}", .{ options.host_port, reason });
+    return bridge.Connection.Connecting.start(gpa, io, runtime, bridge_options) catch |err| {
+        // The headers were checked above; the core rejects what else contains a newline.
+        if (err == error.InvalidOptions) logConnectFailure(attempt, options.host_port, "an option contains a newline");
         return err;
     };
 }
 
-/// The PEM in `pem`, or else read from `path` into `arena`.
-fn tlsFile(arena: Allocator, io: Io, pem: []const u8, path: []const u8, comptime field: []const u8) ConnectError![]const u8 {
-    if (path.len == 0) return pem;
-    if (pem.len > 0) {
-        log.err("client options: set Options.tls." ++ field ++ " or Options.tls." ++ field ++ "_path ({s}), not both", .{path});
-        return error.InvalidOptions;
+/// Connects as `startConnecting` does and waits, without cancellation, for the connection.
+/// Logs why on failure: as an error for `Client.connect`, or as a warning when the client
+/// still works after it (a first connection on use, or a `reconnect`).
+fn openConnection(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []const u8, options: ConnectionOptions, comptime attempt: Attempt) ConnectError!bridge.Connection {
+    const connecting = try startConnecting(gpa, io, runtime, identity, options, attempt);
+    // Done once the wait returns (nothing supersedes an attempt that isn't shared), so the
+    // last reference frees it here rather than orphaning it.
+    defer std.debug.assert(connecting.unref() != .orphaned);
+    connecting.waitUncancelable();
+    return connecting.take() orelse {
+        logConnectFailure(attempt, options.host_port, connecting.failureMessage());
+        return error.ConnectFailed;
+    };
+}
+
+/// The bridge's options for `options`, with the TLS files read into `arena`.
+fn connectionBridgeOptions(arena: Allocator, io: Io, identity: []const u8, options: ConnectionOptions, rejection: *Rejection) error{ OutOfMemory, InvalidOptions }!bridge.Connection.Options {
+    for (options.headers) |h| try headerRejection(h, rejection);
+    var tls: ?bridge.Connection.Options.Tls = null;
+    if (options.tls) |t| tls = .{
+        .server_root_ca_cert = try tlsFile(arena, io, t.server_root_ca_cert, t.server_root_ca_cert_path, "server_root_ca_cert", rejection),
+        .domain = t.server_name,
+        .client_cert = try tlsFile(arena, io, t.client_cert, t.client_cert_path, "client_cert", rejection),
+        .client_private_key = try tlsFile(arena, io, t.client_private_key, t.client_private_key_path, "client_private_key", rejection),
+    };
+    const scheme = if (options.tls != null) "https" else "http";
+    const url = try std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, options.host_port });
+    return bridgeConnectionOptions(url, identity, options, tls, rejection);
+}
+
+fn logConnectFailure(comptime attempt: Attempt, host_port: []const u8, reason: []const u8) void {
+    switch (attempt) {
+        .connect => log.err("connecting to {s} failed: {s}", .{ host_port, reason }),
+        .first_use => log.warn("connecting to {s} failed; the client stays unconnected and its next call tries again: {s}", .{ host_port, reason }),
+        .reconnect => log.warn("reconnecting to {s} failed, keeping the current connection: {s}", .{ host_port, reason }),
     }
+}
+
+/// Rejects, as `openConnection` would, connection options that are wrong whatever the
+/// server: everything but the TLS files' contents, which are read when the client connects.
+/// Fills `rejection` when it returns `error.InvalidOptions`.
+fn checkConnectionOptions(options: ConnectionOptions, rejection: *Rejection) error{InvalidOptions}!void {
+    if (options.tls) |t| inline for (.{ "server_root_ca_cert", "client_cert", "client_private_key" }) |field| {
+        const path = @field(t, field ++ "_path");
+        if (path.len > 0 and @field(t, field).len > 0)
+            return rejection.reject("set Options.tls." ++ field ++ " or Options.tls." ++ field ++ "_path ({s}), not both", .{path});
+    };
+    for (options.headers) |h| try headerRejection(h, rejection);
+    _ = try bridgeConnectionOptions("", "", options, null, rejection);
+}
+
+/// The connection options a client that hasn't connected yet will connect with, copied
+/// into their own arena.
+const PendingConnection = struct {
+    arena: std.heap.ArenaAllocator,
+    options: ConnectionOptions,
+
+    fn init(gpa: Allocator, options: ConnectionOptions) error{OutOfMemory}!PendingConnection {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena_state.deinit();
+        const a = arena_state.allocator();
+        var o = options;
+        o.host_port = try a.dupe(u8, options.host_port);
+        o.api_key = try a.dupe(u8, options.api_key);
+        if (options.tls) |t| {
+            var copy = t;
+            inline for (@typeInfo(Options.Tls).@"struct".field_names) |name| @field(copy, name) = try a.dupe(u8, @field(t, name));
+            o.tls = copy;
+        }
+        const headers = try a.alloc(bridge.bytes.MetadataEntry, options.headers.len);
+        for (headers, options.headers) |*to, from| to.* = .{ .key = try a.dupe(u8, from.key), .value = try a.dupe(u8, from.value) };
+        o.headers = headers;
+        if (options.http_connect_proxy) |p| o.http_connect_proxy = .{
+            .host_port = try a.dupe(u8, p.host_port),
+            .username = try a.dupe(u8, p.username),
+            .password = try a.dupe(u8, p.password),
+        };
+        o.client_name = try a.dupe(u8, options.client_name);
+        o.client_version = try a.dupe(u8, options.client_version);
+        return .{ .arena = arena_state, .options = o };
+    }
+
+    fn deinit(p: *PendingConnection) void {
+        p.arena.deinit();
+    }
+};
+
+/// The PEM in `pem`, or else read from `path` into `arena`. Fills `rejection` when it
+/// returns `error.InvalidOptions`.
+fn tlsFile(arena: Allocator, io: Io, pem: []const u8, path: []const u8, comptime field: []const u8, rejection: *Rejection) error{ OutOfMemory, InvalidOptions }![]const u8 {
+    if (path.len == 0) return pem;
+    if (pem.len > 0) return rejection.reject("set Options.tls." ++ field ++ " or Options.tls." ++ field ++ "_path ({s}), not both", .{path});
     return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => {
-            log.err("client options: reading Options.tls." ++ field ++ "_path {s} failed: {t}", .{ path, err });
-            return error.InvalidOptions;
-        },
+        else => rejection.reject("reading Options.tls." ++ field ++ "_path {s} failed: {t}", .{ path, err }),
     };
 }
 
@@ -393,7 +468,7 @@ fn coreLogFields(a: Allocator, json: []const u8, out: []log_mod.Field) usize {
 
 /// The runtime's metrics options for `options`. A custom handler is wrapped in a core custom
 /// meter, which `bridge.Runtime.init` owns from then on.
-fn runtimeMetrics(gpa: Allocator, options: metrics_mod.Options) ConnectError!bridge.Runtime.Metrics {
+fn runtimeMetrics(gpa: Allocator, options: metrics_mod.Options) InitError!bridge.Runtime.Metrics {
     const exporter: bridge.Runtime.Metrics.Exporter = switch (options.exporter) {
         .prometheus => |p| .{ .prometheus = .{
             .bind_address = p.bind_address,
@@ -439,16 +514,52 @@ fn runtimeMetrics(gpa: Allocator, options: metrics_mod.Options) ConnectError!bri
     };
 }
 
-pub const ConnectError = error{ OutOfMemory, InvalidOptions, RuntimeInitFailed, ConnectFailed };
+/// What `Client.init` returns: an option was rejected (logged), or the core runtime couldn't
+/// be created (logged).
+pub const InitError = error{ OutOfMemory, InvalidOptions, RuntimeInitFailed };
+
+/// What `Client.connect`, `Client.ensureConnected` and `Client.reconnect` return:
+/// `InitError`, or `ConnectFailed` when the server couldn't be reached or refused the
+/// connection, or didn't answer within the call's deadline (logged with the reason).
+/// `InvalidOptions` also covers a TLS file that couldn't be read when connecting.
+/// `Canceled` comes only from a call that makes a first connection on use
+/// (`ensureConnected`, `currentConnection`) when its task is canceled. The attempt goes on
+/// for the calls still waiting for it; once none is, it is dropped and the next call starts
+/// another. `connect` and `reconnect` wait without cancellation.
+pub const ConnectError = InitError || error{ ConnectFailed, Canceled };
 
 pub const Client = struct {
     gpa: Allocator,
     io: Io,
     runtime: bridge.Runtime,
-    /// Read it with `currentConnection`: `reconnect` replaces it.
-    connection: bridge.Connection,
-    /// Guards `connection`, `retired_connections` and `running_workers`.
+    /// Null until the client connects: `connect` connects at once, a client from `init` on
+    /// first use. Read it with `currentConnection`: `reconnect` replaces it.
+    connection: ?bridge.Connection = null,
+    /// What the client connects with while `connection` is null; freed once it connects.
+    pending_connection: ?PendingConnection = null,
+    /// Guards `connection`, `pending_connection`, `pending_updates`, `connecting` and the
+    /// fields after it, `retired_connections` and `running_workers`. Never held while waiting
+    /// on the network.
     connection_mutex: Io.Mutex = .init,
+    /// Counts the changes to `pending_connection`, so a first connection started before an
+    /// update can be brought up to date.
+    pending_updates: u64 = 0,
+    /// The first connection in progress, which every call that needs the server waits for,
+    /// each until its own deadline, instead of starting its own. Holds a reference. Set while
+    /// some call waits for it; the call that sees it done, or the last one to give up on
+    /// it, clears it, and the next call starts another.
+    connecting: ?*bridge.Connection.Connecting = null,
+    /// The calls waiting for `connecting`; calls still waiting for an attempt that was
+    /// cleared aren't counted.
+    connecting_waiters: u32 = 0,
+    /// `pending_updates` when `connecting` started.
+    connecting_updates: u64 = 0,
+    /// Locked exactly while `connecting` is set, by the call that sets it and unlocked by the
+    /// call that clears it; nothing waits on it.
+    connect_mutex: Io.Mutex = .init,
+    /// Cleared attempts whose callback hadn't run when they were cleared, each with a
+    /// reference: `close` frees those called back since, and leaves the runtime to the rest.
+    abandoned_attempts: std.ArrayList(*bridge.Connection.Connecting) = .empty,
     /// Connections `reconnect` replaced, freed by `close`: calls already sent on one may
     /// still be using it.
     retired_connections: std.ArrayList(bridge.Connection) = .empty,
@@ -485,18 +596,57 @@ pub const Client = struct {
         return .{ .ptr = m, .vtable = &bridge.metric.Meter.vtable };
     }
 
-    /// Connects and checks the server. Close with `close`.
+    /// Connects and checks the server. Close with `close`. Fails, with the reason logged,
+    /// when an option is rejected or the server can't be reached.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
+        var c = try create(gpa, io, options, .connect);
+        errdefer c.close();
+        _ = try c.currentConnectionAs(.connect);
+        return c;
+    }
+
+    /// Creates a client that connects on first use, so a process can build its client before
+    /// the server is reachable: nothing goes over the network here, and an address nobody
+    /// listens on doesn't fail it. Options are checked as `connect` checks them
+    /// (`error.InvalidOptions`, logged), except the TLS files, which are read when the client
+    /// connects. The first call that needs the server (a workflow, schedule or activity call,
+    /// `checkHealth`, `currentConnection`, `ensureConnected`, or `worker.Worker.run` on this
+    /// client) connects and checks the server. Calls made together from several threads share
+    /// one attempt, and each waits for it only until its own deadline, `Options.rpc_timeout`
+    /// (30 s without one) from when the call began; canceling a call's task returns
+    /// `error.Canceled` from it. The attempt goes on for the calls still waiting, and once
+    /// none is, a later call starts another. `updateApiKey` and `updateHeaders` don't wait
+    /// for it, and what they change is sent on the new connection. A connection that fails or
+    /// doesn't answer in time is logged as a warning with the reason and leaves the client
+    /// unconnected, so a later call tries again: `ensureConnected` and `currentConnection`
+    /// return the `ConnectError`, the client's other calls `error.RpcFailed`, and
+    /// `worker.Worker.run` `error.ConnectFailed`. Close with `close`, connected or not, once
+    /// no call is running.
+    pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Client {
+        return create(gpa, io, options, .first_use);
+    }
+
+    /// The client without a connection: its runtime, and `options`' connection options kept
+    /// for the first connection.
+    fn create(gpa: Allocator, io: Io, options: Options, comptime attempt: Attempt) InitError!Client {
         var message: ?[]u8 = null;
         defer if (message) |m| gpa.free(m);
 
+        const what = switch (attempt) {
+            .connect => "connecting to",
+            else => "creating a client for",
+        };
         var rejection: Rejection = .{};
         const heartbeat_ms = heartbeatIntervalMs(options.worker_heartbeat_interval, &rejection) catch |err| {
-            log.err("connecting to {s} failed: {s}", .{ options.host_port, rejection.message });
+            log.err(what ++ " {s} failed: {s}", .{ options.host_port, rejection.message });
             return err;
         };
         const rpc_timeout_ms = rpcTimeoutMs(options.rpc_timeout, &rejection) catch |err| {
-            log.err("connecting to {s} failed: {s}", .{ options.host_port, rejection.message });
+            log.err(what ++ " {s} failed: {s}", .{ options.host_port, rejection.message });
+            return err;
+        };
+        checkConnectionOptions(options.connectionOptions(), &rejection) catch |err| {
+            log.err(what ++ " {s} failed: {s}", .{ options.host_port, rejection.message });
             return err;
         };
 
@@ -537,13 +687,13 @@ pub const Client = struct {
         errdefer gpa.free(identity);
         const namespace = try gpa.dupe(u8, options.namespace);
         errdefer gpa.free(namespace);
+        const pending: PendingConnection = try .init(gpa, options.connectionOptions());
 
-        const connection = try openConnection(gpa, io, runtime, identity, options.connectionOptions(), false);
         return .{
             .gpa = gpa,
             .io = io,
             .runtime = runtime,
-            .connection = connection,
+            .pending_connection = pending,
             .namespace = namespace,
             .identity = identity,
             .codecs = options.codecs,
@@ -556,6 +706,15 @@ pub const Client = struct {
             .meter = meter,
             .rpc_timeout_ms = rpc_timeout_ms,
         };
+    }
+
+    /// Connects now if the client hasn't yet (see `init`), and checks the server; does
+    /// nothing on a connected client. On failure, logged with the reason, the client stays
+    /// unconnected and a later call tries again. Waits until `Options.rpc_timeout`, and
+    /// returns `error.Canceled` if the calling task is canceled. Thread-safe: calls made
+    /// together share one attempt.
+    pub fn ensureConnected(c: *Client) ConnectError!void {
+        _ = try c.currentConnection();
     }
 
     /// The gRPC health service name `checkHealth` asks about: the service this client calls.
@@ -575,7 +734,12 @@ pub const Client = struct {
         (health.HealthCheckRequest{ .service = health_service }).encode(&encoded.writer, a) catch return error.OutOfMemory;
         var failure: ?bridge.Connection.RpcFailure = null;
         defer if (failure) |f| f.deinit(c.gpa);
-        const bytes = c.currentConnection().call(c.gpa, c.io, .health, "Check", encoded.written(), .{ .retry = false, .timeout_ms = c.rpc_timeout_ms }, &failure) catch |err| switch (err) {
+        const connection = c.currentConnection() catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Canceled => error.Canceled,
+            else => error.RpcFailed,
+        };
+        const bytes = connection.call(c.gpa, c.io, .health, "Check", encoded.written(), .{ .retry = false, .timeout_ms = c.rpc_timeout_ms }, &failure) catch |err| switch (err) {
             error.RpcFailed, error.InvalidOptions => {
                 const f = failure orelse {
                     log.warn("checking the health of " ++ health_service ++ " failed: {t}", .{err});
@@ -606,52 +770,230 @@ pub const Client = struct {
         return error.NotServing;
     }
 
+    /// Frees the client, connected or not, once no call on it is running. Doesn't wait on
+    /// the network. A first connection attempt that every call gave up on (see `init`) may
+    /// still be running in sdk-core, which has no deadline of its own for it (a server that
+    /// never answers a TLS handshake keeps it running for good). sdk-core's task uses the
+    /// client's runtime until the attempt ends, so `close` then leaves the runtime to it
+    /// instead of freeing it: the runtime, its threads, and the attempt stay allocated for
+    /// the rest of the process (the attempt frees itself if it ends). sdk-core's logs stop
+    /// reaching `Options.logger` when `close` returns, but a custom metrics handler
+    /// (`Options.metrics`) stays in use by that runtime, so it must then outlive the process.
     pub fn close(c: *Client) void {
         c.running_workers.deinit(c.gpa);
         for (c.retired_connections.items) |conn| conn.deinit();
         c.retired_connections.deinit(c.gpa);
-        c.connection.deinit();
+        if (c.connection) |conn| conn.deinit();
+        if (c.pending_connection) |*p| p.deinit();
+        // Set only while a call is still waiting for it, which `close` must not race.
+        // `firstConnection` made room for it when it started the attempt.
+        if (c.connecting) |p| c.abandoned_attempts.appendAssumeCapacity(p);
+        // Frees, here, every attempt the core has called back and any connection it made that
+        // nobody took. The core's connect task uses the runtime until it calls back, so
+        // the runtime of an attempt still in flight is left to the core, never freed.
+        var in_flight = false;
+        for (c.abandoned_attempts.items) |p| {
+            if (p.unref() == .orphaned) in_flight = true;
+        }
+        c.abandoned_attempts.deinit(c.gpa);
         if (c.meter) |m| m.destroy();
-        c.runtime.deinit();
+        if (in_flight) c.runtime.abandon() else c.runtime.deinit();
         if (c.core_log_sink) |s| c.gpa.destroy(s);
         c.gpa.free(c.namespace);
         c.gpa.free(c.identity);
         c.* = undefined;
     }
 
-    /// The connection calls go over now. It stays valid until `close`, even after a
-    /// `reconnect` replaces it. Thread-safe.
-    pub fn currentConnection(c: *Client) bridge.Connection {
+    /// The connection calls go over now, connecting first on a client that hasn't connected
+    /// yet (see `init`; the failure is logged, and the client stays unconnected). It stays
+    /// valid until `close`, even after a `reconnect` replaces it. Thread-safe.
+    pub fn currentConnection(c: *Client) ConnectError!bridge.Connection {
+        return c.currentConnectionAs(.first_use);
+    }
+
+    fn currentConnectionAs(c: *Client, comptime attempt: Attempt) ConnectError!bridge.Connection {
+        return c.firstConnection(attempt, null) catch |err| switch (err) {
+            error.Stopped => unreachable, // Only with a stop flag.
+            else => |e| e,
+        };
+    }
+
+    /// For `worker.Worker.run`: `currentConnection`, which also returns `error.Stopped`, without
+    /// connecting, once `stop` is set and `wakeConnecting` has been called after it.
+    pub fn currentConnectionUnless(c: *Client, stop: *const std.atomic.Value(bool)) (ConnectError || error{Stopped})!bridge.Connection {
+        return c.firstConnection(.first_use, stop);
+    }
+
+    /// For `worker.Worker.stop`: wakes the calls waiting for a first connection to check their
+    /// stop flags. Thread-safe.
+    pub fn wakeConnecting(c: *Client) void {
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        if (c.connecting) |p| p.wakeWaiters();
+    }
+
+    /// The connection, connecting first if there is none: every call shares one attempt and
+    /// waits for it until its own deadline (`Options.rpc_timeout` from now), its `stop` flag,
+    /// or a cancel of its task, whichever comes first. A `.connect` waits without either.
+    fn firstConnection(c: *Client, comptime attempt: Attempt, stop: ?*const std.atomic.Value(bool)) (ConnectError || error{Stopped})!bridge.Connection {
+        // sdk-core's connect has no deadline of its own: a first connection made by a call
+        // gets the call's, counted from now.
+        const deadline: ?Io.Clock.Timestamp = switch (attempt) {
+            .first_use => .fromNow(c.io, .{ .raw = .fromMilliseconds(if (c.rpc_timeout_ms > 0) c.rpc_timeout_ms else default_rpc_timeout_ms), .clock = .awake }),
+            else => null,
+        };
+        const connecting = blk: {
+            c.connection_mutex.lockUncancelable(c.io);
+            defer c.connection_mutex.unlock(c.io);
+            if (c.connection) |conn| return conn;
+            if (stop) |f| if (f.load(.acquire)) return error.Stopped;
+            if (c.connecting == null) {
+                // Make room to keep the attempt for `close` if it is cleared before the core
+                // calls back, dropping those whose callback has run.
+                var i: usize = 0;
+                while (i < c.abandoned_attempts.items.len) {
+                    const p = c.abandoned_attempts.items[i];
+                    if (p.calledBack()) {
+                        _ = p.unref();
+                        _ = c.abandoned_attempts.swapRemove(i);
+                    } else i += 1;
+                }
+                try c.abandoned_attempts.ensureUnusedCapacity(c.gpa, 1);
+                // Starting doesn't wait on the network: the core connects on its own threads.
+                c.connecting = try startConnecting(c.gpa, c.io, c.runtime, c.identity, c.pending_connection.?.options, attempt);
+                c.connecting_updates = c.pending_updates;
+                c.connect_mutex.lockUncancelable(c.io);
+            }
+            const connecting = c.connecting.?;
+            connecting.ref();
+            c.connecting_waiters += 1;
+            break :blk connecting;
+        };
+        // Never the reference that orphans it: `connecting` or `abandoned_attempts` holds one
+        // until the callback has finished.
+        defer _ = connecting.unref();
+        const waited: error{ Timeout, Canceled, Stopped }!void = if (attempt == .connect) connecting.waitUncancelable() else connecting.wait(deadline, stop);
+
+        c.connection_mutex.lockUncancelable(c.io);
+        defer c.connection_mutex.unlock(c.io);
+        if (c.connecting == connecting) c.connecting_waiters -= 1;
+        if (connecting.isDone()) return c.finishConnecting(connecting, attempt);
+        if (c.connecting == connecting and c.connecting_waiters == 0) c.stopWaitingForConnecting();
+        // A `reconnect` connected meanwhile and woke the waiters (`supersede`).
+        if (c.connection) |conn| return conn;
+        waited catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Stopped => return error.Stopped,
+            error.Timeout => {
+                logConnectFailure(attempt, c.pending_connection.?.options.host_port, "the server didn't answer within the call's deadline (Options.rpc_timeout)");
+                return error.ConnectFailed;
+            },
+        };
+        unreachable; // A wait returns without an error once the attempt is done or superseded.
+    }
+
+    /// Ends a first connection the core has finished, for each call that waited for it:
+    /// the first takes the connection, or logs why there is none. Call with
+    /// `connection_mutex` held.
+    fn finishConnecting(c: *Client, connecting: *bridge.Connection.Connecting, comptime attempt: Attempt) ConnectError!bridge.Connection {
+        // Only the first call to see it done finds it still set.
+        if (c.connecting != connecting) {
+            if (c.connection) |conn| return conn;
+            return error.ConnectFailed;
+        }
+        const updates = c.connecting_updates;
+        c.stopWaitingForConnecting();
+        // A `reconnect` connected meanwhile: the attempt's connection is freed with it.
+        if (c.connection) |conn| return conn;
+        const conn = connecting.take() orelse {
+            logConnectFailure(attempt, c.pending_connection.?.options.host_port, connecting.failureMessage());
+            return error.ConnectFailed;
+        };
+        if (c.pending_updates != updates) {
+            const latest = c.pending_connection.?.options;
+            conn.setApiKey(latest.api_key);
+            conn.setMetadata(c.gpa, latest.headers) catch |err| {
+                conn.deinit();
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    // The headers were checked when they were set.
+                    error.NewlineInKey, error.NewlineInValue => unreachable,
+                };
+            };
+        }
+        c.connected(conn);
+        return conn;
+    }
+
+    /// Clears `connecting`, so the next call starts another attempt. Call with
+    /// `connection_mutex` held.
+    fn stopWaitingForConnecting(c: *Client) void {
+        const p = c.connecting.?;
+        // `firstConnection` made room before it started the attempt.
+        if (p.calledBack()) _ = p.unref() else c.abandoned_attempts.appendAssumeCapacity(p);
+        c.connecting = null;
+        c.connecting_waiters = 0;
+        c.connect_mutex.unlock(c.io);
+    }
+
+    /// sdk-core's deadline for a call, which `Options.rpc_timeout` replaces.
+    const default_rpc_timeout_ms = 30_000;
+
+    fn connectionIfAny(c: *Client) ?bridge.Connection {
         c.connection_mutex.lockUncancelable(c.io);
         defer c.connection_mutex.unlock(c.io);
         return c.connection;
     }
 
+    /// Takes `conn` as the first connection. Call with `connection_mutex` held.
+    fn connected(c: *Client, conn: bridge.Connection) void {
+        c.connection = conn;
+        c.pending_connection.?.deinit();
+        c.pending_connection = null;
+    }
+
     /// Replaces the API key sent with every call from now on, by this client and every worker
     /// on it; empty sends none. Calls already sent keep the key they had. Use it to rotate a
-    /// key before it expires. A later `reconnect` sends its own `ConnectionOptions.api_key`
-    /// instead. Thread-safe.
-    pub fn updateApiKey(c: *Client, api_key: []const u8) void {
+    /// key before it expires. On a client that hasn't connected yet (see `init`), it is the
+    /// key the client connects with. A later `reconnect` sends its own
+    /// `ConnectionOptions.api_key` instead. Thread-safe.
+    pub fn updateApiKey(c: *Client, api_key: []const u8) error{OutOfMemory}!void {
         c.connection_mutex.lockUncancelable(c.io);
         defer c.connection_mutex.unlock(c.io);
-        c.connection.setApiKey(api_key);
+        if (c.connection) |conn| return conn.setApiKey(api_key);
+        var options = c.pending_connection.?.options;
+        options.api_key = api_key;
+        try c.replacePending(options);
     }
 
     /// Replaces the gRPC headers (`Options.headers`) sent with every call from now on, by
     /// this client and every worker on it. Returns `error.InvalidOptions` (logged) for a key
     /// that isn't a valid header name or ends in "-bin" (binary headers aren't supported), or
     /// a value with characters other than visible ASCII, space and tab; the headers are then
-    /// unchanged. A later `reconnect` sends its own `ConnectionOptions.headers` instead.
-    /// Thread-safe.
+    /// unchanged. On a client that hasn't connected yet (see `init`), they are the headers
+    /// the client connects with. A later `reconnect` sends its own `ConnectionOptions.headers`
+    /// instead. Thread-safe.
     pub fn updateHeaders(c: *Client, headers: []const bridge.bytes.MetadataEntry) error{ OutOfMemory, InvalidOptions }!void {
         for (headers) |h| try validateHeader(h);
         c.connection_mutex.lockUncancelable(c.io);
         defer c.connection_mutex.unlock(c.io);
-        c.connection.setMetadata(c.gpa, headers) catch |err| switch (err) {
+        if (c.connection) |conn| return conn.setMetadata(c.gpa, headers) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // validateHeader already rejects newlines.
             error.NewlineInKey, error.NewlineInValue => unreachable,
         };
+        var options = c.pending_connection.?.options;
+        options.headers = headers;
+        try c.replacePending(options);
+    }
+
+    /// Replaces the options an unconnected client connects with by copies of `options`, which
+    /// may borrow from the current ones. Call with `connection_mutex` held.
+    fn replacePending(c: *Client, options: ConnectionOptions) error{OutOfMemory}!void {
+        const next: PendingConnection = try .init(c.gpa, options);
+        c.pending_connection.?.deinit();
+        c.pending_connection = next;
+        c.pending_updates += 1;
     }
 
     /// Connects again with `options` (address, API key, TLS, headers, keep-alive, proxy,
@@ -664,12 +1006,25 @@ pub const Client = struct {
     /// (`ConnectError`, logged as a warning), the client keeps the current one. The old
     /// connection is freed by `close`, since calls already sent may still be using it. A
     /// worker that is already shutting down can't move and finishes on the old connection
-    /// (logged as a warning). Thread-safe.
+    /// (logged as a warning). On a client that hasn't connected yet (see `init`), it makes
+    /// the first connection with `options` in place of those the client was created with;
+    /// if that fails (logged as a warning), the client stays unconnected and keeps its own
+    /// options for its next call. Calls waiting for a first connection in progress then get
+    /// this one. Like a reconnect, it waits without a deadline or cancellation, but other
+    /// calls don't wait for it. Thread-safe.
     pub fn reconnect(c: *Client, options: ConnectionOptions) ConnectError!void {
-        const next = try openConnection(c.gpa, c.io, c.runtime, c.identity, options, true);
+        const next = if (c.connectionIfAny() == null)
+            try openConnection(c.gpa, c.io, c.runtime, c.identity, options, .first_use)
+        else
+            try openConnection(c.gpa, c.io, c.runtime, c.identity, options, .reconnect);
         c.connection_mutex.lockUncancelable(c.io);
         defer c.connection_mutex.unlock(c.io);
-        c.retired_connections.append(c.gpa, c.connection) catch {
+        if (c.connection == null) {
+            // Calls waiting for a first connection in progress take this one instead.
+            if (c.connecting) |p| p.supersede();
+            return c.connected(next);
+        }
+        c.retired_connections.append(c.gpa, c.connection.?) catch {
             next.deinit();
             return error.OutOfMemory;
         };
@@ -684,7 +1039,9 @@ pub const Client = struct {
         c.connection_mutex.lockUncancelable(c.io);
         defer c.connection_mutex.unlock(c.io);
         try c.running_workers.append(c.gpa, ptr);
-        if (created_on.ptr != c.connection.ptr) replaceWorkerClient(c, ptr, c.connection);
+        // A worker runs on a connection `currentConnection` returned, so there is one.
+        const current = c.connection.?;
+        if (created_on.ptr != current.ptr) replaceWorkerClient(c, ptr, current);
     }
 
     /// For `worker.Worker.run`: unregisters a core worker `trackWorker` registered; does
@@ -1908,7 +2265,13 @@ pub const Client = struct {
         var failure: ?bridge.Connection.RpcFailure = null;
         defer if (failure) |f| f.deinit(c.gpa);
         const call_options: bridge.Connection.CallOptions = .{ .retry = callRetries(method), .timeout_ms = callTimeoutMs(@TypeOf(coded), method, &coded, c.rpc_timeout_ms) };
-        const bytes = c.currentConnection().call(c.gpa, c.io, .workflow, method, encoded.written(), call_options, &failure) catch |err| switch (err) {
+        // A failed first connection was logged by `currentConnection`.
+        const connection = c.currentConnection() catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Canceled => error.Canceled,
+            else => error.RpcFailed,
+        };
+        const bytes = connection.call(c.gpa, c.io, .workflow, method, encoded.written(), call_options, &failure) catch |err| switch (err) {
             error.RpcFailed => {
                 const f = failure.?;
                 // gRPC ALREADY_EXISTS and NOT_FOUND are expected outcomes callers handle.
@@ -3767,20 +4130,24 @@ fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
 }
 
 /// Rejects what sdk-core would silently drop from `Client.updateHeaders`: gRPC ASCII headers
-/// only.
+/// only. Logs why as a warning.
 fn validateHeader(h: bridge.bytes.MetadataEntry) error{InvalidOptions}!void {
+    var rejection: Rejection = .{};
+    headerRejection(h, &rejection) catch |err| {
+        log.warn("updating the client's headers failed: {s}", .{rejection.message});
+        return err;
+    };
+}
+
+/// `validateHeader` without the log: fills `rejection` instead.
+fn headerRejection(h: bridge.bytes.MetadataEntry, rejection: *Rejection) error{InvalidOptions}!void {
     const token_symbols = "!#$%&'*+-.^_`|~";
     const key_ok = h.key.len > 0 and !std.ascii.endsWithIgnoreCase(h.key, "-bin") and for (h.key) |ch| {
         if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, token_symbols, ch) == null) break false;
     } else true;
-    if (!key_ok) {
-        log.warn("updating the client's headers failed: \"{s}\" is not a valid header name (letters, digits and {s}, not ending in -bin)", .{ h.key, token_symbols });
-        return error.InvalidOptions;
-    }
-    for (h.value) |ch| if (ch != '\t' and (ch < ' ' or ch > '~')) {
-        log.warn("updating the client's headers failed: the value of header {s} has a byte (0x{x:0>2}) other than visible ASCII, space or tab", .{ h.key, ch });
-        return error.InvalidOptions;
-    };
+    if (!key_ok) return rejection.reject("\"{s}\" is not a valid header name (letters, digits and {s}, not ending in -bin)", .{ h.key, token_symbols });
+    for (h.value) |ch| if (ch != '\t' and (ch < ' ' or ch > '~'))
+        return rejection.reject("the value of header {s} has a byte (0x{x:0>2}) other than visible ASCII, space or tab", .{ h.key, ch });
 }
 
 fn defaultIdentity(gpa: Allocator) error{OutOfMemory}![]u8 {
@@ -4040,8 +4407,9 @@ test "TLS PEM is read from the paths when connecting" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const path = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path, "ca.pem" });
-    try testing.expectEqualStrings("PEM BYTES", try tlsFile(arena.allocator(), testing.io, "", path, "server_root_ca_cert"));
-    try testing.expectEqualStrings("inline", try tlsFile(arena.allocator(), testing.io, "inline", "", "server_root_ca_cert"));
+    var r: Rejection = .{};
+    try testing.expectEqualStrings("PEM BYTES", try tlsFile(arena.allocator(), testing.io, "", path, "server_root_ca_cert", &r));
+    try testing.expectEqualStrings("inline", try tlsFile(arena.allocator(), testing.io, "inline", "", "server_root_ca_cert", &r));
 }
 
 test "header updates accept gRPC ASCII headers only" {
@@ -4215,4 +4583,386 @@ test "rpc_timeout cuts short a query the server holds" {
         return error.TestUnexpectedResult;
     }
     try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
+}
+
+// Port 1 on the loopback address: nothing listens there, so connecting fails at once.
+const closed_port = "127.0.0.1:1";
+
+test "a client from init makes no connection, and a failed first connection leaves it to try again" {
+    // The failed connections and the rejected header are logged as warnings.
+    testing.log_level = .err;
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null });
+    defer c.close();
+    try testing.expect(c.connection == null);
+
+    try testing.expectError(error.ConnectFailed, c.ensureConnected());
+    try testing.expect(c.connection == null);
+    try testing.expectError(error.ConnectFailed, c.currentConnection());
+    // The client's own calls return RpcFailed for a connection that fails.
+    try testing.expectError(error.RpcFailed, c.checkHealth());
+    try testing.expectError(error.RpcFailed, c.countWorkflows(""));
+    try testing.expectError(error.ConnectFailed, c.ensureConnected());
+    try testing.expect(c.connection == null);
+    try testing.expectEqualStrings(closed_port, c.pending_connection.?.options.host_port);
+}
+
+test "a client that hasn't connected keeps an updated API key and headers for its connection" {
+    // The failed connections and the rejected header are logged as warnings.
+    testing.log_level = .err;
+    var key: [6]u8 = "secret".*;
+    var header_value: [4]u8 = "blue".*;
+    var c = try Client.init(testing.allocator, testing.io, .{
+        .host_port = closed_port,
+        .core_log_level = null,
+        .api_key = "first",
+        .headers = &.{.{ .key = "x-deployment", .value = "green" }},
+        .tls = .{ .server_name = "temporal.example" },
+        .http_connect_proxy = .{ .host_port = "proxy:3128", .username = "svc", .password = "pw" },
+    });
+    defer c.close();
+
+    // The client keeps its own copies: the caller's buffers may change after the update.
+    try c.updateApiKey(&key);
+    key = "XXXXXX".*;
+    try c.updateHeaders(&.{.{ .key = "x-deployment", .value = &header_value }});
+    header_value = "XXXX".*;
+    try testing.expectError(error.InvalidOptions, c.updateHeaders(&.{.{ .key = "bad key", .value = "v" }}));
+
+    const o = c.pending_connection.?.options;
+    try testing.expectEqualStrings("secret", o.api_key);
+    try testing.expectEqual(@as(usize, 1), o.headers.len);
+    try testing.expectEqualStrings("x-deployment", o.headers[0].key);
+    try testing.expectEqualStrings("blue", o.headers[0].value);
+    // The other options are kept as they were.
+    try testing.expectEqualStrings(closed_port, o.host_port);
+    try testing.expectEqualStrings("temporal.example", o.tls.?.server_name);
+    try testing.expectEqualStrings("svc", o.http_connect_proxy.?.username);
+    try testing.expectEqualStrings(bridge.Connection.default_client_name, o.client_name);
+
+    try c.updateApiKey("");
+    try c.updateHeaders(&.{});
+    try testing.expectEqualStrings("", c.pending_connection.?.options.api_key);
+    try testing.expectEqual(@as(usize, 0), c.pending_connection.?.options.headers.len);
+    try testing.expect(c.connection == null);
+}
+
+test "a failed reconnect of a client that hasn't connected keeps its own options" {
+    // The failed connections and the rejected header are logged as warnings.
+    testing.log_level = .err;
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .api_key = "mine" });
+    defer c.close();
+    try testing.expectError(error.ConnectFailed, c.reconnect(.{ .host_port = "127.0.0.1:2", .api_key = "theirs" }));
+    try testing.expect(c.connection == null);
+    try testing.expectEqualStrings(closed_port, c.pending_connection.?.options.host_port);
+    try testing.expectEqualStrings("mine", c.pending_connection.?.options.api_key);
+    try testing.expectEqual(@as(usize, 0), c.retired_connections.items.len);
+}
+
+test "a client from init is closed without ever connecting" {
+    var c = try Client.init(testing.allocator, testing.io, .{
+        .host_port = closed_port,
+        .identity = "lazy",
+        .headers = &.{.{ .key = "x-a", .value = "1" }},
+    });
+    try c.updateApiKey("k");
+    c.close();
+}
+
+test "creating a client rejects the options connect rejects" {
+    var r: Rejection = .{};
+    try checkConnectionOptions(.{}, &r);
+    try checkConnectionOptions(.{ .tls = .{ .server_root_ca_cert_path = "/does/not/exist.pem" } }, &r);
+    try expectRejected(checkConnectionOptions(.{ .tls = .{ .client_cert = "PEM", .client_cert_path = "cert.pem" } }, &r), &r, "Options.tls.client_cert");
+    try expectRejected(checkConnectionOptions(.{ .tls = .{ .server_root_ca_cert = "PEM", .server_root_ca_cert_path = "ca.pem" } }, &r), &r, "Options.tls.server_root_ca_cert");
+    try expectRejected(checkConnectionOptions(.{ .tls = .{ .client_private_key = "PEM", .client_private_key_path = "key.pem" } }, &r), &r, "Options.tls.client_private_key");
+    try expectRejected(checkConnectionOptions(.{ .headers = &.{.{ .key = "bad key", .value = "v" }} }, &r), &r, "header name");
+    try expectRejected(checkConnectionOptions(.{ .headers = &.{.{ .key = "k", .value = "a\nb" }} }, &r), &r, "value of header k");
+    try expectRejected(checkConnectionOptions(.{ .keep_alive = .{ .interval = .zero } }, &r), &r, "keep_alive.interval");
+    try expectRejected(checkConnectionOptions(.{ .retry = .{ .max_interval = .fromSeconds(-1) } }, &r), &r, "retry.max_interval");
+    try expectRejected(checkConnectionOptions(.{ .http_connect_proxy = .{ .host_port = "" } }, &r), &r, "http_connect_proxy.host_port");
+    try expectRejected(checkConnectionOptions(.{ .client_version = "" }, &r), &r, "client_version");
+}
+
+test "a client from init connects on its first call to a dev server" {
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var c = try Client.init(testing.allocator, testing.io, server.clientOptions());
+    defer c.close();
+    try testing.expect(c.connection == null);
+    _ = try c.countWorkflows("");
+    try testing.expect(c.connection != null);
+    try testing.expect(c.pending_connection == null);
+    try c.checkHealth();
+    try c.ensureConnected();
+    // Once connected, the updates go to the connection.
+    try c.updateApiKey("");
+    try c.updateHeaders(&.{.{ .key = "x-deployment", .value = "blue" }});
+    _ = try c.countWorkflows("");
+}
+
+test "reconnect makes the first connection of a client from init" {
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var options = server.clientOptions();
+    options.host_port = closed_port;
+    options.core_log_level = null;
+    var c = try Client.init(testing.allocator, testing.io, options);
+    defer c.close();
+    try c.reconnect(server.clientOptions().connectionOptions());
+    try testing.expect(c.connection != null);
+    try testing.expectEqual(@as(usize, 0), c.retired_connections.items.len);
+    try c.checkHealth();
+}
+
+const LazyConnectTest = struct {
+    fn firstCall(c: *Client, out: *?bridge.Connection, failed: *std.atomic.Value(bool)) void {
+        out.* = c.currentConnection() catch {
+            failed.store(true, .release);
+            return;
+        };
+    }
+};
+
+test "first calls made together from several threads open one connection" {
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var c = try Client.init(testing.allocator, testing.io, server.clientOptions());
+    defer c.close();
+
+    var connections: [8]?bridge.Connection = @splat(null);
+    var failed: std.atomic.Value(bool) = .init(false);
+    var threads: [connections.len]std.Thread = undefined;
+    for (&threads, &connections) |*t, *out| t.* = try std.Thread.spawn(.{}, LazyConnectTest.firstCall, .{ &c, out, &failed });
+    for (threads) |t| t.join();
+    try testing.expect(!failed.load(.acquire));
+    for (connections) |conn| try testing.expectEqual(c.connection.?.ptr, conn.?.ptr);
+    try testing.expectEqual(@as(usize, 0), c.retired_connections.items.len);
+}
+
+test "the first call of a client from init gives up within rpc_timeout when the server never answers" {
+    // The failed connection is logged as a warning.
+    testing.log_level = .err;
+    // A listener that never accepts: the kernel completes the TCP handshake, and nothing
+    // ever answers, as with a load balancer whose backend isn't up yet.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var server = try any.listen(testing.io, .{});
+    defer server.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{server.socket.address.getPort()});
+
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .rpc_timeout = .fromSeconds(1) });
+    defer c.close();
+    const start = Io.Clock.awake.now(testing.io);
+    try testing.expectError(error.RpcFailed, c.checkHealth());
+    const waited = start.durationTo(Io.Clock.awake.now(testing.io));
+    // `Options.rpc_timeout` is the deadline of `checkHealth`, the first call included.
+    try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
+}
+
+const SilentServerTest = struct {
+    fn firstCall(c: *Client, done: *std.atomic.Value(bool)) void {
+        _ = c.checkHealth() catch {};
+        done.store(true, .release);
+    }
+};
+
+test "updates to a client from init don't wait for a first connection in progress, and apply to it" {
+    // The failed connection is logged as a warning.
+    testing.log_level = .err;
+    // A listener that never accepts: connecting waits until the client gives up.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var server = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{server.socket.address.getPort()});
+
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .rpc_timeout = .fromSeconds(3) });
+    defer c.close();
+    // Before `close`, which waits for the core's attempt: this ends it at once.
+    defer server.deinit(testing.io);
+    var done: std.atomic.Value(bool) = .init(false);
+    const thread = try std.Thread.spawn(.{}, SilentServerTest.firstCall, .{ &c, &done });
+    defer thread.join();
+    // Wait until the first call holds the connect lock.
+    while (c.connect_mutex.tryLock()) c.connect_mutex.unlock(testing.io);
+
+    try c.updateApiKey("rotated");
+    try c.updateHeaders(&.{.{ .key = "x-tenant", .value = "blue" }});
+    // Both returned while the first call was still connecting.
+    try testing.expect(!done.load(.acquire));
+    try testing.expectEqual(@as(u64, 2), c.pending_updates);
+    try testing.expectEqualStrings("rotated", c.pending_connection.?.options.api_key);
+}
+
+test "reconnect rejects the headers connect rejects" {
+    // The rejections are logged as warnings.
+    testing.log_level = .err;
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null });
+    defer c.close();
+    try testing.expectError(error.InvalidOptions, c.reconnect(.{ .host_port = closed_port, .headers = &.{.{ .key = "bad key", .value = "v" }} }));
+    try testing.expectError(error.InvalidOptions, c.reconnect(.{ .host_port = closed_port, .headers = &.{.{ .key = "k", .value = "caf\xc3\xa9" }} }));
+    try testing.expectError(error.InvalidOptions, c.reconnect(.{ .host_port = closed_port, .tls = .{ .client_cert_path = "/does/not/exist.pem" } }));
+}
+
+const CanceledFirstCallTest = struct {
+    fn health(c: *Client) CheckHealthError!void {
+        return c.checkHealth();
+    }
+    fn count(c: *Client) interceptor.ClientError!void {
+        _ = try c.countWorkflows("");
+    }
+};
+
+test "canceling a call while a client from init makes its first connection returns Canceled" {
+    // The abandoned connections are logged as warnings.
+    testing.log_level = .err;
+    // A listener that never accepts: connecting waits until the client gives up.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var server = try any.listen(testing.io, .{});
+    defer server.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{server.socket.address.getPort()});
+
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .rpc_timeout = .fromSeconds(60) });
+    defer c.close();
+
+    // `checkHealth` documents that canceling the calling task cancels it, as a connected
+    // client's calls return Canceled.
+    var health = try testing.io.concurrent(CanceledFirstCallTest.health, .{&c});
+    while (c.connect_mutex.tryLock()) c.connect_mutex.unlock(testing.io);
+    try testing.expectError(error.Canceled, health.cancel(testing.io));
+
+    var count = try testing.io.concurrent(CanceledFirstCallTest.count, .{&c});
+    while (c.connect_mutex.tryLock()) c.connect_mutex.unlock(testing.io);
+    try testing.expectError(error.Canceled, count.cancel(testing.io));
+}
+
+const QueuedFirstCallTest = struct {
+    fn health(c: *Client, waited: *Io.Duration) void {
+        const start = Io.Clock.awake.now(testing.io);
+        _ = c.checkHealth() catch {};
+        waited.* = start.durationTo(Io.Clock.awake.now(testing.io));
+    }
+};
+
+test "first calls made together on a client from init each give up within rpc_timeout when the server never answers" {
+    // The failed connections are logged as warnings.
+    testing.log_level = .err;
+    // A listener that never accepts: connecting waits until the client gives up.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var server = try any.listen(testing.io, .{});
+    defer server.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{server.socket.address.getPort()});
+
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .rpc_timeout = .fromSeconds(1) });
+    defer c.close();
+
+    var waited: [6]Io.Duration = @splat(.zero);
+    var threads: [waited.len]std.Thread = undefined;
+    for (&threads, &waited) |*t, *w| t.* = try std.Thread.spawn(.{}, QueuedFirstCallTest.health, .{ &c, w });
+    for (threads) |t| t.join();
+    // Each call's deadline is `Options.rpc_timeout`, the first connection included: none
+    // waits for the others' attempts one after another (6 s here).
+    for (waited) |w| try testing.expect(w.nanoseconds < 4 * std.time.ns_per_s);
+}
+
+const OvertakenFirstCallTest = struct {
+    fn first(c: *Client, out: *?bridge.Connection, waited: *Io.Duration) void {
+        const start = Io.Clock.awake.now(testing.io);
+        out.* = c.currentConnection() catch null;
+        waited.* = start.durationTo(Io.Clock.awake.now(testing.io));
+    }
+};
+
+test "a reconnect that connects a client from init first hands its connection to the calls waiting" {
+    var dev = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer dev.stop(testing.io);
+    // A listener that never accepts: the first call's own attempt never finishes in time.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    var options = dev.clientOptions();
+    options.host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    options.rpc_timeout = .fromSeconds(60);
+
+    var c = try Client.init(testing.allocator, testing.io, options);
+    defer c.close();
+    // Before `close`, which waits for the core's attempt: this ends it at once.
+    defer silent.deinit(testing.io);
+    var got: ?bridge.Connection = null;
+    var waited: Io.Duration = .zero;
+    const thread = try std.Thread.spawn(.{}, OvertakenFirstCallTest.first, .{ &c, &got, &waited });
+    // Wait until the first call's attempt is in progress.
+    while (c.connect_mutex.tryLock()) c.connect_mutex.unlock(testing.io);
+    try c.reconnect(dev.clientOptions().connectionOptions());
+    thread.join();
+    try testing.expectEqual(c.connection.?.ptr, got.?.ptr);
+    try testing.expect(waited.nanoseconds < 30 * std.time.ns_per_s);
+    try testing.expect(c.connecting == null);
+    try c.checkHealth();
+}
+
+test "closing a client from init frees a first connection attempt the core is still making" {
+    // The abandoned connection is logged as a warning.
+    testing.log_level = .err;
+    // A listener that never accepts: the attempt outlives the call that started it.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .rpc_timeout = .fromMilliseconds(50) });
+    try testing.expectError(error.RpcFailed, c.checkHealth());
+    try testing.expectError(error.RpcFailed, c.checkHealth());
+    // Both attempts were cleared before the core called back. `close` frees those the core
+    // has called back by then, and leaves the runtime to the others, which free themselves.
+    try testing.expect(c.connecting == null);
+    try testing.expectEqual(@as(usize, 2), c.abandoned_attempts.items.len);
+    try testing.expect(!c.abandoned_attempts.items[0].calledBack());
+    // Closing the listener resets the connections it never accepted, so the core's
+    // attempts end soon instead of after its own 30 s.
+    silent.deinit(testing.io);
+    c.close();
+}
+
+const StuckTlsCloseTest = struct {
+    fn close(c: *Client, done: *std.atomic.Value(u32)) void {
+        c.close();
+        done.store(1, .release);
+        testing.io.futexWake(u32, &done.raw, 1);
+    }
+};
+
+test "closing a client from init returns while a first connection it gave up on is stuck in the TLS handshake" {
+    // The failed first call is logged as a warning.
+    testing.log_level = .err;
+    // A listener that never accepts: the kernel completes the TCP handshake, and the core's
+    // TLS handshake then waits for a server hello that never comes.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .tls = .{}, .rpc_timeout = .fromMilliseconds(100) });
+    {
+        errdefer c.close();
+        errdefer silent.deinit(testing.io);
+        try testing.expectError(error.RpcFailed, c.checkHealth());
+    }
+
+    var done: std.atomic.Value(u32) = .init(0);
+    const thread = std.Thread.spawn(.{}, StuckTlsCloseTest.close, .{ &c, &done }) catch |err| {
+        silent.deinit(testing.io);
+        c.close();
+        return err;
+    };
+    // Well past the 30 s `close` documents for a server that never answers.
+    const deadline: Io.Clock.Timestamp = .fromNow(testing.io, .{ .raw = .fromSeconds(60), .clock = .awake });
+    while (done.load(.acquire) == 0 and deadline.durationFromNow(testing.io).raw.nanoseconds > 0) {
+        testing.io.futexWaitTimeout(u32, &done.raw, 0, .{ .deadline = deadline }) catch {};
+    }
+    const returned = done.load(.acquire) != 0;
+    // Closing the listener resets the connection it never accepted, which ends the core's
+    // attempt, so a `close` still waiting returns and the thread can be joined.
+    silent.deinit(testing.io);
+    thread.join();
+    try testing.expect(returned);
 }

@@ -294,8 +294,12 @@ pub const Worker = struct {
     /// The activities of each running activity loop, so `stop` can tell them the worker is
     /// stopping (`activity.Context.isWorkerStopping`). Guarded by `stop_mutex`.
     activity_runs: [3]?*RunningActivities = @splat(null),
-    /// Set by `stop` before it notifies `activity_runs`; an activity starting later reads it.
+    /// Set by `stop` before it notifies `activity_runs`; an activity starting later reads it,
+    /// and so does `run` while its client makes its first connection.
     stopping: std.atomic.Value(bool) = .init(false),
+    /// Whether `run` is waiting for its client's first connection, which `stop` then wakes.
+    /// Guarded by `stop_mutex`.
+    waiting_for_connection: bool = false,
     /// The first poll failure of the current or last run, and its text (owned; null if it
     /// couldn't be allocated). See `fatalMessage`.
     fatal: ?PollError = null,
@@ -498,21 +502,28 @@ pub const Worker = struct {
     /// - `NothingRegistered`: the worker has no workflow, activity, or Nexus service; nothing
     ///   starts.
     /// - `InvalidOptions`: the worker's options, before anything starts (the reason is
-    ///   logged).
+    ///   logged), or a TLS file that a client from `client.Client.init` couldn't read when
+    ///   connecting.
+    /// - `ConnectFailed`: the worker's client hadn't connected yet (`client.Client.init`) and
+    ///   couldn't, or the calling task was canceled while it connected (the cancel request
+    ///   is kept); the reason is logged, and the client tries again on its next call.
     /// - `WorkerInitFailed`, `ValidationFailed`: the core rejected the worker or the server
     ///   rejected its namespace or task queue (the core's message is logged).
     /// - `ConcurrencyUnavailable`: the worker's Io couldn't start a poll loop.
     /// - `PollFailed`: the core gave up polling for tasks; `fatalMessage` has its text.
     /// - `ShutdownFailed`: finalizing a core worker failed (logged).
     /// - `OutOfMemory`.
-    pub const RunError = error{ OutOfMemory, NothingRegistered, WorkerInitFailed, InvalidOptions, ValidationFailed, ShutdownFailed, ConcurrencyUnavailable, PollFailed };
+    pub const RunError = error{ OutOfMemory, NothingRegistered, WorkerInitFailed, InvalidOptions, ConnectFailed, ValidationFailed, ShutdownFailed, ConcurrencyUnavailable, PollFailed };
 
     /// Polls and runs tasks until `stop` is called, or until polling fails for good: workflow
     /// tasks when a workflow is registered, activity tasks when an activity or a workflow is
     /// (workflows' side effects run as local activities; with `poll_activity_tasks` false,
     /// only local ones), and Nexus tasks when a Nexus service is. Returns after in-flight
     /// work finishes and every core worker is shut down:
-    /// - success after `stop` (or a signal, with `runUntilSignal`);
+    /// - success after `stop` (or a signal, with `runUntilSignal`), at once if the worker's
+    ///   client (from `client.Client.init`) hasn't connected yet: `run` stops waiting for the
+    ///   connection, and nothing has started (`waitUntilRunning` returns
+    ///   `error.WorkerFailedToStart`);
     /// - `error.PollFailed` (or `error.OutOfMemory`) when the core gave up polling, after
     ///   shutting down as `stop` does; `fatalMessage` has the task queue and the core's text;
     /// - an error from starting the worker or from shutting it down. A loop that couldn't
@@ -545,7 +556,38 @@ pub const Worker = struct {
         var message: ?[]u8 = null;
         defer if (message) |m| w.gpa.free(m);
 
-        const created_on = w.client.currentConnection();
+        // A client from `Client.init` connects here if it hasn't yet, and logs the reason of a
+        // failure. `stop` ends the wait: without a connection there is nothing to shut down.
+        {
+            w.stop_mutex.lockUncancelable(w.io);
+            defer w.stop_mutex.unlock(w.io);
+            w.waiting_for_connection = true;
+        }
+        const connected = w.client.currentConnectionUnless(&w.stopping);
+        {
+            w.stop_mutex.lockUncancelable(w.io);
+            defer w.stop_mutex.unlock(w.io);
+            w.waiting_for_connection = false;
+        }
+        const created_on = connected catch |err| {
+            if (err == error.Stopped) {
+                log.info("Worker stopped before its client connected TaskQueue={s}", .{w.task_queue});
+                return;
+            }
+            log.warn("starting the worker for task queue {s} failed: the client couldn't connect ({t})", .{ w.task_queue, err });
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidOptions => error.InvalidOptions,
+                error.RuntimeInitFailed, error.ConnectFailed => error.ConnectFailed,
+                error.Stopped => unreachable,
+                error.Canceled => {
+                    // `run` can't return Canceled: keep the request for the caller's next
+                    // cancelation point.
+                    w.io.recancel();
+                    return error.ConnectFailed;
+                },
+            };
+        };
         const core = try w.createCore(created_on, core_options, &message);
         defer core.deinit();
 
@@ -873,7 +915,9 @@ pub const Worker = struct {
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
         w.stop_requested = true;
+        // Sets `stopping`, which a wait for the client's first connection checks once woken.
         w.notifyActivitiesOfStop();
+        if (w.waiting_for_connection) w.client.wakeConnecting();
         for (w.core_ptrs) |p| if (p) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
     }
 
@@ -2677,6 +2721,99 @@ test "a worker runs a workflow and its activity started by a client" {
     defer failed.deinit();
     try testing.expectError(error.WorkflowFailed, failed.get(arena.allocator()));
     try testing.expectEqualStrings("NotToday", failure_mod.applicationType(failed.failure().?.*).?);
+}
+
+test "a worker on a client from init connects it and runs a workflow" {
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var client = try client_mod.Client.init(testing.allocator, testing.io, server.clientOptions());
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, testing.io, &client, "lazy-hello-world", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    try w.waitUntilRunning();
+    try testing.expect(client.connection != null);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try client.executeWorkflow(HelloTest.Hello, .{ .id = "lazy_hello_world", .task_queue = "lazy-hello-world" }, .{"Temporal"});
+    defer run.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try run.get(arena.allocator()));
+}
+
+test "a worker on a client from init that can't connect returns ConnectFailed, and can run again" {
+    // The failed connections are logged as warnings.
+    testing.log_level = .err;
+    var client = try client_mod.Client.init(testing.allocator, testing.io, .{ .host_port = "127.0.0.1:1", .core_log_level = null });
+    defer client.close();
+    var w = try Worker.init(testing.allocator, testing.io, &client, "lazy-unreachable", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try testing.expectError(error.ConnectFailed, w.run());
+    try testing.expectError(error.WorkerFailedToStart, w.waitUntilRunning());
+    try testing.expectError(error.ConnectFailed, w.run());
+    try testing.expect(client.connection == null);
+}
+
+test "stopping a worker while its client from init makes its first connection returns from run at once" {
+    // The abandoned connection is logged as a warning.
+    testing.log_level = .err;
+    // A listener that never accepts: connecting waits until the client gives up.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    defer silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var client = try client_mod.Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .rpc_timeout = .fromSeconds(20) });
+    defer client.close();
+    var w = try Worker.init(testing.allocator, testing.io, &client, "lazy-stopped-while-connecting", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    // Wait until `run` is making the client's first connection.
+    while (client.connect_mutex.tryLock()) client.connect_mutex.unlock(testing.io);
+    const start = Io.Clock.awake.now(testing.io);
+    w.stop();
+    const result = running.await(testing.io);
+    const waited = start.durationTo(Io.Clock.awake.now(testing.io));
+    // `stop` asks `run` to return, and `runUntilSignal` calls it on SIGTERM: it doesn't wait
+    // out the first connection's deadline (20 s here, 30 s without `rpc_timeout`).
+    try testing.expect(waited.nanoseconds < 5 * std.time.ns_per_s);
+    // `run` returns success after `stop`.
+    try result;
+}
+
+test "a worker stopped before run on a client from init returns from run at once" {
+    // The abandoned connection is logged as a warning.
+    testing.log_level = .err;
+    // A listener that never accepts: connecting waits until the client gives up.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    defer silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var client = try client_mod.Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .rpc_timeout = .fromSeconds(20) });
+    defer client.close();
+    var w = try Worker.init(testing.allocator, testing.io, &client, "lazy-stopped-before-run", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+
+    // `stop` is documented as safe before `run`, and a worker on a connected client then
+    // returns success from `run` at once.
+    w.stop();
+    const start = Io.Clock.awake.now(testing.io);
+    const result = w.run();
+    const waited = start.durationTo(Io.Clock.awake.now(testing.io));
+    try testing.expect(waited.nanoseconds < 5 * std.time.ns_per_s);
+    try result;
 }
 
 test "registering an activity type with the SDK's reserved prefix is rejected" {
@@ -4626,7 +4763,7 @@ test "a completion the core rejects falls back to a failed completion, then to a
     defer client.close();
     var message: ?[]u8 = null;
     defer if (message) |m| testing.allocator.free(m);
-    const core = try bridge.Worker.init(testing.allocator, client.connection, .{
+    const core = try bridge.Worker.init(testing.allocator, try client.currentConnection(), .{
         .namespace = "default",
         .task_queue = "rejecting",
         .task_types = .{ .workflows = false, .remote_activities = true, .local_activities = false, .nexus = false },
