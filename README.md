@@ -387,6 +387,49 @@ Notes:
 - A failed query, or one with no handler, is `error.QueryFailed`. `updateWorkflow` waits for `UpdateOptions.wait_for_stage` (`.completed` by default). A rejected update is `error.UpdateFailed` from the handle's `get`, with the reason in `failure()`.
 - `updateWithStartWorkflow` requires `id_conflict_policy`. `signalWithStartWorkflow` ignores the start arguments when the workflow is running.
 
+`updateWorkflow`, `updateWithStartWorkflow`, and the handle's `get` wait on the server for as long as the update takes: `Options.rpc_timeout` doesn't limit them. To bound the wait, cancel the task that waits, here by racing it against a timeout. The wait ends with `error.Canceled` and the update goes on in the workflow; `getWorkflowUpdateHandle` with the same update ID reads its result later. The handle from `updateWithStartWorkflow` carries the workflow ID and the run it started or found, so `getWorkflow` waits for that workflow's result without another call.
+
+<!-- example: client-update-wait -->
+```zig
+const UpdateWaitError = temporal.client.UpdateError || temporal.client.UpdateResultError;
+const Reply = union(enum) {
+    greeting: UpdateWaitError![]const u8,
+    timeout: Io.Cancelable!void,
+};
+
+fn setGreeting(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8, greeting: []const u8) UpdateWaitError![]const u8 {
+    var update = try client.updateWorkflow(SetGreeting, workflow_id, "", .{greeting}, .{ .update_id = "set-greeting-1" });
+    defer update.deinit();
+    return update.get(arena);
+}
+
+/// The previous greeting, or null when the update didn't complete within `timeout`. The
+/// update goes on in the workflow either way.
+pub fn setGreetingWithin(client: *temporal.client.Client, io: Io, arena: Allocator, workflow_id: []const u8, timeout: Io.Duration) !?[]const u8 {
+    var buffer: [2]Reply = undefined;
+    var select: Io.Select(Reply) = .init(io, &buffer);
+    defer select.cancelDiscard(); // cancels the task still waiting
+    try select.concurrent(.greeting, setGreeting, .{ client, arena, workflow_id, "Hey" });
+    try select.concurrent(.timeout, Io.sleep, .{ io, timeout, .awake });
+    return switch (try select.await()) {
+        .greeting => |previous| try previous,
+        .timeout => null,
+    };
+}
+
+/// Updates the workflow `greeter-4`, starting it first if it isn't running, then waits for
+/// that workflow's result.
+pub fn updateThenWait(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
+    var update = try client.updateWithStartWorkflow(GreeterWorkflow, .{ .id = "greeter-4", .task_queue = "greetings", .id_conflict_policy = .use_existing }, .{"Lin"}, SetGreeting, .{"Hey"}, .{});
+    defer update.deinit();
+    // The handle names the run that the call started or found.
+    var run = try client.getWorkflow([]const u8, update.workflow_id, update.run_id);
+    defer run.deinit();
+    try client.signalWorkflow(Finish, run.id, run.run_id, .{});
+    return run.get(arena); // "Hey, Lin!"
+}
+```
+
 #### Describing, listing, cancelling, and terminating
 
 `Client.describeWorkflow` reports a run's status and times, and `Client.fetchHistory` reads its events. `Client.listWorkflows` and `Client.countWorkflows` take a visibility query. `Client.cancelWorkflow` asks a workflow to stop, and `Client.terminateWorkflow` stops it with no cleanup.

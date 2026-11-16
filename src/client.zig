@@ -2179,23 +2179,38 @@ pub const Client = struct {
 
     /// Maps a failed ExecuteMultiOperation to an error, logging which operation failed.
     fn multiOperationError(s: RpcStatus, arena: Allocator, workflow_id: []const u8, update_name: []const u8) UpdateWithStartError {
+        var line: Io.Writer.Allocating = .init(arena);
+        const err = multiOperationFailure(&line.writer, s, arena, workflow_id, update_name);
+        if (err != error.OutOfMemory) log.err("{s}", .{line.written()});
+        return err;
+    }
+
+    /// The error for a failed ExecuteMultiOperation, after writing its log line to `w`: the
+    /// line names the operation that failed when the status's MultiOperationExecutionFailure
+    /// detail says which, and has the call's own status otherwise. A failed write is
+    /// `error.OutOfMemory`.
+    fn multiOperationFailure(w: *Io.Writer, s: RpcStatus, arena: Allocator, workflow_id: []const u8, update_name: []const u8) UpdateWithStartError {
         const detail_name = "temporal.api.errordetails.v1.MultiOperationExecutionFailure";
+        w.print("update-with-start of update \"{s}\" on workflow {s} failed: ", .{ update_name, workflow_id }) catch return error.OutOfMemory;
         var reader: Io.Reader = .fixed(s.details);
         const decoded = proto.google.rpc.Status.decode(&reader, arena) catch proto.google.rpc.Status{};
         for (decoded.details.items) |any| {
             if (!std.mem.endsWith(u8, any.type_url, "/" ++ detail_name)) continue;
             var detail_reader: Io.Reader = .fixed(any.value);
             const detail = proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure.decode(&detail_reader, arena) catch break;
+            var named = false;
             for (detail.statuses.items, 0..) |op, i| {
                 // The server marks the operations it didn't run because another failed as
                 // ABORTED; only the failing one says why.
                 if (op.code == 0 or op.code == 10) continue;
                 const what = if (i == 0) "starting the workflow" else "the update";
-                log.err("update-with-start of update \"{s}\" on workflow {s} failed: {s} failed: {s} (gRPC status {d})", .{ update_name, workflow_id, what, op.message, op.code });
+                w.print("{s}{s} failed: {s} (gRPC status {d})", .{ if (named) "; " else "", what, op.message, op.code }) catch return error.OutOfMemory;
+                named = true;
             }
-            return error.RpcFailed;
+            if (named) return error.RpcFailed;
+            break;
         }
-        log.err("update-with-start of update \"{s}\" on workflow {s} failed: {s} (gRPC status {d})", .{ update_name, workflow_id, s.message, s.code });
+        w.print("{s} (gRPC status {d})", .{ s.message, s.code }) catch return error.OutOfMemory;
         return error.RpcFailed;
     }
 
@@ -5246,4 +5261,70 @@ test "closing a client from init returns while a first connection it gave up on 
     silent.deinit(testing.io);
     thread.join();
     try testing.expect(returned);
+}
+
+/// A failed ExecuteMultiOperation's status: `code` and `message`, with a
+/// MultiOperationExecutionFailure detail holding `statuses` unless it's null.
+fn multiOperationStatus(arena: Allocator, code: u32, message: []const u8, statuses: ?[]const proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure.OperationStatus) !Client.RpcStatus {
+    var status: proto.google.rpc.Status = .{ .code = @intCast(code), .message = message };
+    if (statuses) |ops| {
+        var failure: proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure = .{};
+        try failure.statuses.appendSlice(arena, ops);
+        var value: Io.Writer.Allocating = .init(arena);
+        try failure.encode(&value.writer, arena);
+        try status.details.append(arena, .{ .type_url = "type.googleapis.com/temporal.api.errordetails.v1.MultiOperationExecutionFailure", .value = value.written() });
+    }
+    var details: Io.Writer.Allocating = .init(arena);
+    try status.encode(&details.writer, arena);
+    return .{ .code = code, .message = message, .details = details.written() };
+}
+
+test "a failed update-with-start names the operation that failed" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const prefix = "update-with-start of update \"set\" on workflow cart-1 failed: ";
+    const Case = struct {
+        status: Client.RpcStatus,
+        line: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .status = try multiOperationStatus(a, 3, "MultiOperation could not be executed.", &.{
+                .{ .code = 3, .message = "missing task queue" },
+                .{ .code = 10, .message = "Operation was aborted." },
+            }),
+            .line = prefix ++ "starting the workflow failed: missing task queue (gRPC status 3)",
+        },
+        .{
+            .status = try multiOperationStatus(a, 8, "MultiOperation could not be executed.", &.{
+                .{ .code = 10, .message = "Operation was aborted." },
+                .{ .code = 8, .message = "too many outstanding updates" },
+            }),
+            .line = prefix ++ "the update failed: too many outstanding updates (gRPC status 8)",
+        },
+        // Without the detail, or with one that names no failing operation, the line has the
+        // call's own status.
+        .{
+            .status = try multiOperationStatus(a, 14, "connection reset", null),
+            .line = prefix ++ "connection reset (gRPC status 14)",
+        },
+        .{
+            .status = try multiOperationStatus(a, 10, "MultiOperation could not be executed.", &.{
+                .{ .code = 10, .message = "Operation was aborted." },
+                .{ .code = 10, .message = "Operation was aborted." },
+            }),
+            .line = prefix ++ "MultiOperation could not be executed. (gRPC status 10)",
+        },
+        .{
+            .status = .{ .code = 13, .message = "internal", .details = "\xff\xff" },
+            .line = prefix ++ "internal (gRPC status 13)",
+        },
+    };
+    for (cases) |case| {
+        var line: Io.Writer.Allocating = .init(testing.allocator);
+        defer line.deinit();
+        try testing.expectEqual(error.RpcFailed, Client.multiOperationFailure(&line.writer, case.status, a, "cart-1", "set"));
+        try testing.expectEqualStrings(case.line, line.written());
+    }
 }

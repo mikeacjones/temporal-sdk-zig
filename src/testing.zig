@@ -1925,6 +1925,136 @@ const UpdateFixtures = struct {
     const Napper = workflow.Def("Napper", napper);
 };
 
+/// A workflow whose `pass` update handler blocks until the `open` signal, so a client's
+/// wait on the update outlasts any check the test makes.
+const GateFixtures = struct {
+    const Pass = workflow.UpdateDef("pass", fn (name: []const u8) []const u8);
+    const Open = workflow.SignalDef("open", fn () void);
+    const Waiting = workflow.QueryDef("waiting", fn () i64);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        open: bool = false,
+        waiting: i64 = 0,
+
+        fn pass(s: *State, name: []const u8) ![]const u8 {
+            s.waiting += 1;
+            try s.ctx.await(s, isOpen);
+            return name;
+        }
+        fn isOpen(s: *State) bool {
+            return s.open;
+        }
+        fn openGate(s: *State) void {
+            s.open = true;
+        }
+        fn waitingCount(s: *State) i64 {
+            return s.waiting;
+        }
+    };
+
+    /// Ends once the gate is open and the updates waiting at it have passed; returns how
+    /// many waited.
+    fn gate(ctx: *workflow.Context) !i64 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandler(Pass, s, State.pass);
+        try ctx.setSignalHandler(Open, s, State.openGate);
+        try ctx.setQueryHandler(Waiting, s, State.waitingCount);
+        try ctx.await(s, State.isOpen);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return s.waiting;
+    }
+    const Gate = workflow.Def("Gate", gate);
+
+    /// The calls whose wait the tests end early. Each owns what it allocates, so a canceled
+    /// one leaks nothing.
+    fn update(c: *client_mod.Client, id: []const u8, update_id: []const u8) client_mod.UpdateError!void {
+        var handle = try c.updateWorkflow(Pass, id, "", .{"ann"}, .{ .update_id = update_id });
+        handle.deinit();
+    }
+    fn updateWithStart(c: *client_mod.Client, task_queue: []const u8, id: []const u8, update_id: []const u8) client_mod.UpdateWithStartError!void {
+        var handle = try c.updateWithStartWorkflow(Gate, .{ .id = id, .task_queue = task_queue, .id_conflict_policy = .use_existing }, .{}, Pass, .{"ann"}, .{ .update_id = update_id });
+        handle.deinit();
+    }
+    fn get(c: *client_mod.Client, id: []const u8, update_id: []const u8) client_mod.UpdateResultError!void {
+        var handle = try c.getWorkflowUpdateHandle([]const u8, id, "", update_id);
+        defer handle.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        _ = try handle.get(scratch.allocator());
+    }
+
+    const Race = union(enum) { update: anyerror!void, timeout: Io.Cancelable!void };
+
+    const Call = enum { update, update_with_start, get };
+
+    /// Waits on update `pass` of a new gate workflow through `call`, ends the wait once the
+    /// handler is running (by canceling the waiting task, or, `bounded`, by a 100 ms timeout
+    /// that wins the race and then cancels it), then opens the gate and reads the update's
+    /// result through a new handle with the same update ID.
+    fn endWaitEarly(env: *WorkflowEnvironment, call: Call, bounded: bool) !void {
+        const c = &env.client;
+        var id_buf: [64]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "gate-{t}-{s}-{s}", .{ call, if (bounded) "bounded" else "canceled", env.task_queue });
+        const update_id = "pass-ann";
+        try env.ensureWorker();
+        if (call != .update_with_start) {
+            var run = try env.startWorkflow(Gate, .{ .id = id, .task_queue = "" }, .{});
+            run.deinit();
+        }
+        if (call == .get) {
+            var accepted = try c.updateWorkflow(Pass, id, "", .{"ann"}, .{ .update_id = update_id, .wait_for_stage = .accepted });
+            accepted.deinit();
+        }
+
+        var buffer: [2]Race = undefined;
+        var select: Io.Select(Race) = .init(testing.io, &buffer);
+        defer select.cancelDiscard();
+        switch (call) {
+            .update => try select.concurrent(.update, update, .{ c, id, update_id }),
+            .update_with_start => try select.concurrent(.update, updateWithStart, .{ c, env.task_queue, id, update_id }),
+            .get => try select.concurrent(.update, get, .{ c, id, update_id }),
+        }
+        // The update must reach the workflow before the wait ends, or there would be no
+        // update left running to read.
+        while (true) {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            const waiting = c.queryWorkflow(Waiting, scratch.allocator(), id, "", .{}) catch |err| switch (err) {
+                error.NotFound => 0, // update-with-start hasn't started the workflow yet
+                else => |e| return e,
+            };
+            if (waiting > 0) break;
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+
+        const start = Io.Clock.awake.now(testing.io);
+        if (bounded) {
+            try select.concurrent(.timeout, Io.sleep, .{ testing.io, .fromMilliseconds(100), .awake });
+            const first = try select.await();
+            try testing.expect(first == .timeout);
+            try first.timeout;
+        }
+        const ended = select.cancel() orelse return error.TestUnexpectedResult;
+        try testing.expectError(error.Canceled, ended.update);
+        const waited = start.durationTo(Io.Clock.awake.now(testing.io));
+        try testing.expect(waited.nanoseconds < 5 * std.time.ns_per_s);
+
+        // Ending the wait left the update running in the workflow.
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectEqual(@as(i64, 1), try c.queryWorkflow(Waiting, arena.allocator(), id, "", .{}));
+        try c.signalWorkflow(Open, id, "", .{});
+        var again = try c.getWorkflowUpdateHandle([]const u8, id, "", update_id);
+        defer again.deinit();
+        try testing.expectEqualStrings("ann", try again.get(arena.allocator()));
+        var run = try c.getWorkflow(i64, id, "");
+        defer run.deinit();
+        try testing.expectEqual(@as(i64, 1), try env.getResult(Gate, &run, arena.allocator(), null));
+    }
+};
+
 // Struct workflows: handlers declared on the workflow type.
 const StructFixtures = struct {
     /// `UpdateFixtures.HandleUpdates` with its handlers declared instead of registered from
@@ -5273,6 +5403,20 @@ test "client: update-with-start starts a workflow, then updates the running one"
     var run = try env.client.getWorkflow([]const u8, options.id, first.run_id);
     defer run.deinit();
     try testing.expectEqualStrings("7 ", try env.getResult(UpdateFixtures.HandleUpdates, &run, a, null));
+}
+
+test "client: canceling the task waiting on an update, or a timeout bounding it, returns Canceled and leaves the update running" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(GateFixtures.Gate);
+    for ([_]bool{ false, true }) |bounded| {
+        for (std.enums.values(GateFixtures.Call)) |call| {
+            GateFixtures.endWaitEarly(env, call, bounded) catch |err| {
+                std.debug.print("ending the wait of {t} early ({s}) failed\n", .{ call, if (bounded) "timeout" else "cancel" });
+                return err;
+            };
+        }
+    }
 }
 
 test "time-skipping WorkflowEnvironment: a workflow mid-timer answers a query while time is locked" {
