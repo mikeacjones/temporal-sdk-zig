@@ -80,6 +80,61 @@ test "testing: a day-long timer fires at once" {
 
 const Reminder = workflow.Def("reminder", reminder);
 
+// example: testing-time-skipping-options
+/// Counts the workflow runs it sees start, on the worker and in replays.
+const CountRuns = struct {
+    runs: std.atomic.Value(u32) = .init(0),
+
+    pub fn interceptWorkflow(c: *CountRuns, _: *workflow.Context) error{OutOfMemory}!temporal.interceptor.Workflow {
+        _ = c.runs.fetchAdd(1, .monotonic);
+        return .{};
+    }
+};
+
+test "testing: time skipping with a codec and a worker interceptor" {
+    const zlib: temporal.converter.ZlibCodec = .{};
+    const codecs = [_]temporal.converter.PayloadCodec{zlib.codec()};
+    var counter: CountRuns = .{};
+    const interceptors = [_]temporal.interceptor.Worker{.from(CountRuns, &counter)};
+    const env = try WorkflowEnvironment.startTimeSkippingWithOptions(testing.allocator, testing.io, .{
+        .codecs = &codecs,
+        .worker_interceptors = &interceptors,
+    });
+    defer env.deinit();
+    try env.registerWorkflow(Reminder);
+    try env.registerActivity(Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(Reminder, .{"Ziggy"}, arena.allocator(), null);
+    try testing.expectEqualStrings("Hello, Ziggy!", result);
+    // Once on the worker, once in the replay that checks the run's history.
+    try testing.expectEqual(2, counter.runs.load(.monotonic));
+}
+// end-example
+
+const ChainStep = workflow.Def("chain_step", chainStep);
+
+// example: testing-get-result-options
+fn chainStep(ctx: *workflow.Context, step: u32) !u32 {
+    if (step < 2) return ctx.continueAsNew(ChainStep, .{}, .{step + 1});
+    return step;
+}
+
+test "testing: stop at the first run of a continue-as-new chain" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChainStep);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try env.startWorkflow(ChainStep, .{}, .{0});
+    defer run.deinit();
+    // Waits for the first run alone, and replays it.
+    try testing.expectError(error.WorkflowContinuedAsNew, env.getResultWithOptions(ChainStep, &run, .{ .follow_runs = false }, arena.allocator(), null));
+    // Follows the chain to the last run's result, and replays the last run.
+    try testing.expectEqual(2, try env.getResult(ChainStep, &run, arena.allocator(), null));
+}
+// end-example
+
 // example: testing-activity-environment
 test "testing: an activity on its own" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

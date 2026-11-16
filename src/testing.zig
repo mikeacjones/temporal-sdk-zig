@@ -259,7 +259,8 @@ fn serviceCall(client: *client_mod.Client, service: bridge.Connection.Service, c
 
 /// A server, client and worker for running workflows in tests.
 ///
-/// `start` runs a dev server with `custom_search_attributes` registered; `startTimeSkipping` runs the time-skipping test server;
+/// `start` runs a dev server with `custom_search_attributes` registered; `startTimeSkipping`
+/// (or `startTimeSkippingWithOptions`) runs the time-skipping test server;
 /// `fromClient` uses the server of a client the test already has. On the
 /// test server time is locked (it moves at wall-clock speed) except while the test waits on
 /// a workflow result through `getResult` or `executeWorkflow`, or calls `sleep`. Then it
@@ -349,6 +350,18 @@ pub const WorkflowEnvironment = struct {
     /// Starts the environment on the time-skipping test server. Free with `deinit`.
     pub fn startTimeSkipping(gpa: Allocator, io: Io) !*WorkflowEnvironment {
         return create(gpa, io, .time_skipping, .{});
+    }
+
+    /// `startTimeSkipping` with the client's options: codecs, the failure attribute
+    /// encoding, a logger, propagators, worker and client interceptors, and metrics, as
+    /// `startWithOptions` takes them. `dev_server_extra_args` is for the dev server only: a
+    /// non-empty one returns `error.InvalidOptions` before any server starts.
+    pub fn startTimeSkippingWithOptions(gpa: Allocator, io: Io, options: Options) !*WorkflowEnvironment {
+        if (options.dev_server_extra_args.len > 0) {
+            log.warn("WorkflowEnvironment.startTimeSkippingWithOptions: dev_server_extra_args ({d} arguments) applies only to the dev server (startWithOptions); the time-skipping test server takes none", .{options.dev_server_extra_args.len});
+            return error.InvalidOptions;
+        }
+        return create(gpa, io, .time_skipping, options);
     }
 
     /// Makes an environment on the server `client` is connected to, in `client`'s namespace,
@@ -698,9 +711,11 @@ pub const WorkflowEnvironment = struct {
     }
 
     /// Waits for a run from `startWorkflow` to close and returns its result, allocated from
-    /// `arena`, then replays its history as `executeWorkflow` does. On the time-skipping
-    /// server, time skipping is unlocked for the wait. On `error.WorkflowFailed`, `failure`
-    /// (if given) receives the workflow's failure. The run stays owned by the caller.
+    /// `arena`, then replays its history as `executeWorkflow` does. It follows the run's
+    /// continue-as-new, cron and retry runs to the last one (`run.run_id` moves along), and
+    /// replays that last run. On the time-skipping server, time skipping is unlocked for the
+    /// wait. On `error.WorkflowFailed`, `failure` (if given) receives the workflow's failure.
+    /// The run stays owned by the caller.
     pub fn getResult(
         env: *WorkflowEnvironment,
         comptime Workflow: type,
@@ -708,7 +723,27 @@ pub const WorkflowEnvironment = struct {
         arena: Allocator,
         failure: ?*?failure_mod.Failure,
     ) !Workflow.Result {
-        return env.getResultByName(Workflow.Result, run, arena, failure);
+        return env.getResultByNameWithOptions(Workflow.Result, run, .{}, arena, failure);
+    }
+
+    /// `getResult` with `client.WorkflowRun.GetOptions`. With `.follow_runs = false` it waits
+    /// for the run `run.run_id` names alone and replays that run: a run that continued as
+    /// new is replayed and then returns `error.WorkflowContinuedAsNew`, and a cron or retry
+    /// run returns its own result or failure. What the workflow code did in the run decides
+    /// which, as its replay shows, whatever its retry policy or cron schedule. A handle with
+    /// an empty run ID (from `Client.getWorkflow(id, "")`) is first set to the run that is
+    /// latest when the call starts, and that run is waited for and replayed. With
+    /// `.follow_runs = true` it is `getResult`.
+    /// Time skipping is unlocked for the wait and locked again, as in `getResult`.
+    pub fn getResultWithOptions(
+        env: *WorkflowEnvironment,
+        comptime Workflow: type,
+        run: *client_mod.WorkflowRun(Workflow.Result),
+        options: client_mod.WorkflowRun(Workflow.Result).GetOptions,
+        arena: Allocator,
+        failure: ?*?failure_mod.Failure,
+    ) !Workflow.Result {
+        return env.getResultByNameWithOptions(Workflow.Result, run, options, arena, failure);
     }
 
     /// `getResult` for a run from `startWorkflowByName`: `Result` is the type its result
@@ -720,19 +755,171 @@ pub const WorkflowEnvironment = struct {
         arena: Allocator,
         failure: ?*?failure_mod.Failure,
     ) !Result {
+        return env.getResultByNameWithOptions(Result, run, .{}, arena, failure);
+    }
+
+    /// `getResultWithOptions` for a run from `startWorkflowByName`: `Result` is the type its
+    /// result decodes as. It replays the same run `getResultWithOptions` does.
+    pub fn getResultByNameWithOptions(
+        env: *WorkflowEnvironment,
+        comptime Result: type,
+        run: *client_mod.WorkflowRun(Result),
+        options: client_mod.WorkflowRun(Result).GetOptions,
+        arena: Allocator,
+        failure: ?*?failure_mod.Failure,
+    ) !Result {
+        // The wait, the outcome and the replay must all be of one run. An empty run ID names
+        // whichever run is latest at each call, which a continue-as-new, retry or cron run
+        // changes while the wait goes on, so the handle is pinned to the latest run first.
+        if (run.run_id.len == 0) {
+            var scratch: std.heap.ArenaAllocator = .init(env.gpa);
+            defer scratch.deinit();
+            const latest = try env.client.describeWorkflow(scratch.allocator(), run.id, "");
+            const pinned = try run.client.gpa.dupe(u8, latest.run_id);
+            run.client.gpa.free(run.run_id);
+            run.run_id = pinned;
+        }
         const skipping = env.server == .time_skipping;
         if (skipping) _ = try env.testService(ts.UnlockTimeSkippingResponse, "UnlockTimeSkipping", ts.UnlockTimeSkippingRequest{}, arena);
-        const result = run.get(arena);
+        var result = run.getWithOptions(arena, options);
         if (skipping) _ = try env.testService(ts.LockTimeSkippingResponse, "LockTimeSkipping", ts.LockTimeSkippingRequest{}, arena);
+        // The close event a wait sees can say continued-as-new for a run that a retry or its
+        // cron schedule followed: the dev server's close-event poll reports a retried or cron
+        // run that way, and the time-skipping server ends such a run's history with that
+        // event. `ownOutcome` reads the run's own outcome and replays the run.
+        var replayed = false;
+        if (result) |_| {} else |err| if (err == error.WorkflowContinuedAsNew) {
+            result = try env.ownOutcome(Result, run, arena);
+            replayed = true;
+        }
         if (result) |_| {} else |err| {
             if (failure) |f| f.* = if (run.failure()) |fl| fl.* else null;
             switch (err) {
-                error.WorkflowFailed, error.WorkflowCanceled, error.WorkflowTimedOut => {},
+                error.WorkflowFailed, error.WorkflowCanceled, error.WorkflowTimedOut, error.WorkflowContinuedAsNew => {},
                 else => return err,
             }
         }
-        try env.replayRun(run.id, run.run_id);
+        if (!replayed) try env.replayRun(run.id, run.run_id);
         return result;
+    }
+
+    /// Replays the run `run` names, whose close event a wait read as continued-as-new, and
+    /// returns its own outcome: the error is the replay's, the outcome is the inner value.
+    ///
+    /// A history that ends in a close event other than continued-as-new, or in a
+    /// continued-as-new event the server says the workflow made, is that outcome. A
+    /// continued-as-new event that a retry or a cron schedule may have made (the
+    /// time-skipping server names no initiator on any of them) is dropped before the
+    /// replay, since no workflow command made it, and the replay reports what the workflow
+    /// code did: returned a result, failed, or continued as new itself. A run the workflow
+    /// didn't finish (it timed out) takes the server's failure.
+    fn ownOutcome(env: *WorkflowEnvironment, comptime Result: type, run: *client_mod.WorkflowRun(Result), arena: Allocator) !(client_mod.ResultError!Result) {
+        var history = try env.client.fetchHistory(arena, run.id, run.run_id);
+        const events = history.events.items;
+        if (events.len == 0) return error.InvalidResponse;
+        const attrs = events[events.len - 1].attributes orelse return error.InvalidResponse;
+        const continued = switch (attrs) {
+            .workflow_execution_continued_as_new_event_attributes => |c| c,
+            else => {
+                const outcome: client_mod.ResultError!Result = switch (attrs) {
+                    .workflow_execution_completed_event_attributes => |done| decodeResult(Result, arena, done.result),
+                    .workflow_execution_failed_event_attributes => |failed| blk: {
+                        run.failure_ = failed.failure;
+                        break :blk error.WorkflowFailed;
+                    },
+                    .workflow_execution_timed_out_event_attributes => error.WorkflowTimedOut,
+                    .workflow_execution_canceled_event_attributes => error.WorkflowCanceled,
+                    .workflow_execution_terminated_event_attributes => error.WorkflowTerminated,
+                    else => error.InvalidResponse,
+                };
+                try env.replayHistoryOf(run.id, history, null);
+                return outcome;
+            },
+        };
+        if (continued.initiator == .CONTINUE_AS_NEW_INITIATOR_WORKFLOW) {
+            try env.replayHistoryOf(run.id, history, null);
+            return @as(client_mod.ResultError!Result, error.WorkflowContinuedAsNew);
+        }
+        var watch: OutcomeWatch = .{ .arena = arena };
+        history.events.items.len -= 1;
+        try env.replayHistoryOf(run.id, history, &watch);
+        return env.watchedOutcome(Result, run, arena, continued, watch.outcome);
+    }
+
+    /// The outcome of a run whose replay `outcome` watched, `continued` being its last event.
+    fn watchedOutcome(
+        env: *WorkflowEnvironment,
+        comptime Result: type,
+        run: *client_mod.WorkflowRun(Result),
+        arena: Allocator,
+        continued: proto.temporal.api.history.v1.WorkflowExecutionContinuedAsNewEventAttributes,
+        outcome: OutcomeWatch.Outcome,
+    ) client_mod.ResultError!Result {
+        switch (outcome) {
+            .continued_as_new => return error.WorkflowContinuedAsNew,
+            .returned => |payload| {
+                if (Result == void) return;
+                return converter.fromPayload(Result, arena, payload);
+            },
+            .failed, .unfinished => {
+                // The time-skipping server records a retried run's failure only on the run
+                // it starts.
+                var why = continued.failure;
+                if (why == null and continued.new_execution_run_id.len > 0)
+                    why = (try env.startedEvent(arena, run.id, continued.new_execution_run_id)).continued_failure;
+                run.failure_ = why;
+                if (why) |f| if (f.failure_info) |info| if (info == .timeout_failure_info) return error.WorkflowTimedOut;
+                // A run the workflow didn't finish and the server didn't fail.
+                if (outcome == .unfinished and why == null) return error.WorkflowContinuedAsNew;
+                return error.WorkflowFailed;
+            },
+        }
+    }
+
+    /// Records how the workflow function of the run being replayed ended. It is the
+    /// outermost inbound interceptor, so it sees what the workflow sends as its command.
+    const OutcomeWatch = struct {
+        arena: Allocator,
+        outcome: Outcome = .unfinished,
+
+        const Outcome = union(enum) { unfinished, returned: converter.Payload, failed, continued_as_new };
+
+        pub fn interceptWorkflow(w: *OutcomeWatch, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+            const run = try ctx.allocator().create(Run);
+            run.* = .{ .w = w };
+            return .{ .inbound = interceptor.WorkflowInbound.from(Run, run) };
+        }
+
+        const Run = struct {
+            w: *OutcomeWatch,
+
+            pub fn executeWorkflow(r: *Run, input: interceptor.ExecuteWorkflowInput, next: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
+                const result = next.executeWorkflow(input) catch |err| {
+                    r.w.outcome = if (err == error.ContinueAsNew) .continued_as_new else .failed;
+                    return err;
+                };
+                r.w.outcome = .{ .returned = try result.dupe(r.w.arena) };
+                return result;
+            }
+        };
+    };
+
+    fn decodeResult(comptime Result: type, arena: Allocator, payloads: ?proto.temporal.api.common.v1.Payloads) client_mod.ResultError!Result {
+        if (Result == void) return;
+        const p = payloads orelse return error.InvalidPayload;
+        if (p.payloads.items.len == 0) return error.InvalidPayload;
+        return converter.fromPayload(Result, arena, p.payloads.items[0]);
+    }
+
+    /// The started event of run `run_id`, from `arena`.
+    fn startedEvent(env: *WorkflowEnvironment, arena: Allocator, workflow_id: []const u8, run_id: []const u8) client_mod.ResultError!proto.temporal.api.history.v1.WorkflowExecutionStartedEventAttributes {
+        var it = try env.client.historyIterator(workflow_id, run_id, .{});
+        defer it.deinit();
+        const event = try it.next(arena) orelse return error.InvalidResponse;
+        return switch (event.attributes orelse return error.InvalidResponse) {
+            .workflow_execution_started_event_attributes => |started| started,
+            else => error.InvalidResponse,
+        };
     }
 
     /// Lets `duration` of server time pass. On the time-skipping server this skips time
@@ -809,7 +996,16 @@ pub const WorkflowEnvironment = struct {
     pub fn replayRun(env: *WorkflowEnvironment, workflow_id: []const u8, run_id: []const u8) !void {
         var scratch: std.heap.ArenaAllocator = .init(env.gpa);
         defer scratch.deinit();
-        const history = try env.client.fetchHistory(scratch.allocator(), workflow_id, run_id);
+        return env.replayHistoryOf(workflow_id, try env.client.fetchHistory(scratch.allocator(), workflow_id, run_id), null);
+    }
+
+    /// Replays `history` against the registered workflows, with `watch`, if given, as the
+    /// outermost workflow interceptor.
+    fn replayHistoryOf(env: *WorkflowEnvironment, workflow_id: []const u8, history: history_mod.History, watch: ?*OutcomeWatch) !void {
+        var interceptors: std.ArrayList(interceptor.Worker) = .empty;
+        defer interceptors.deinit(env.gpa);
+        if (watch) |w| try interceptors.append(env.gpa, interceptor.Worker.from(OutcomeWatch, w));
+        try interceptors.appendSlice(env.gpa, env.client.worker_interceptors);
         var replayer: WorkflowReplayer = .{
             .gpa = env.gpa,
             .io = env.io,
@@ -821,7 +1017,7 @@ pub const WorkflowEnvironment = struct {
                 .task_queue = env.task_queue,
                 .codecs = env.client.codecs,
                 .propagators = env.client.propagators,
-                .interceptors = env.client.worker_interceptors,
+                .interceptors = interceptors.items,
             },
         };
         return replayer.replayHistory(history);
@@ -3730,6 +3926,291 @@ test "continue-as-new: WorkflowRun.get follows the chain to the last run's resul
     try testing.expectEqualStrings("3 round=2 run_timeout=600 task_timeout=7", try env.getResult(ContinueFixtures.CountUp, &run, a, null));
     try testing.expect(!std.mem.eql(u8, first_run_id, run.run_id));
     try env.replayRun(run.id, first_run_id);
+}
+
+/// A worker interceptor that records, for each run a workflow function starts in, whether it
+/// started live on the worker or in a replay, and the run's ID.
+const RunWatch = struct {
+    gpa: Allocator,
+    io: Io,
+    mutex: Io.Mutex = .init,
+    live: std.ArrayList([]u8) = .empty,
+    replayed: std.ArrayList([]u8) = .empty,
+
+    fn deinit(w: *RunWatch) void {
+        for (w.live.items) |id| w.gpa.free(id);
+        for (w.replayed.items) |id| w.gpa.free(id);
+        w.live.deinit(w.gpa);
+        w.replayed.deinit(w.gpa);
+    }
+
+    pub fn interceptWorkflow(w: *RunWatch, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+        const run = try ctx.allocator().create(Run);
+        run.* = .{ .w = w, .ctx = ctx };
+        return .{ .inbound = interceptor.WorkflowInbound.from(Run, run) };
+    }
+
+    const Run = struct {
+        w: *RunWatch,
+        ctx: *workflow.Context,
+
+        pub fn executeWorkflow(r: *Run, input: interceptor.ExecuteWorkflowInput, next: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
+            const w = r.w;
+            const id = try w.gpa.dupe(u8, r.ctx.info().run_id);
+            w.mutex.lockUncancelable(w.io);
+            defer w.mutex.unlock(w.io);
+            const list = if (r.ctx.isReplaying()) &w.replayed else &w.live;
+            list.append(w.gpa, id) catch |err| {
+                w.gpa.free(id);
+                return err;
+            };
+            return next.executeWorkflow(input);
+        }
+    };
+
+    fn count(w: *RunWatch, replayed: bool) usize {
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
+        return (if (replayed) w.replayed else w.live).items.len;
+    }
+
+    fn lastReplayed(w: *RunWatch) ?[]const u8 {
+        w.mutex.lockUncancelable(w.io);
+        defer w.mutex.unlock(w.io);
+        return if (w.replayed.items.len > 0) w.replayed.items[w.replayed.items.len - 1] else null;
+    }
+};
+
+const ChainFixtures = struct {
+    /// Sleeps `seconds`, then continues as new once; the second run returns at once.
+    fn sleepThenContinue(ctx: *workflow.Context, seconds: u32, continued: bool) ![]const u8 {
+        if (continued) return "second run";
+        try ctx.io().sleep(.fromSeconds(seconds), .awake);
+        return ctx.continueAsNew(SleepThenContinue, .{}, .{ seconds, true });
+    }
+    const SleepThenContinue = workflow.Def("SleepThenContinue", sleepThenContinue);
+};
+
+test "WorkflowEnvironment.getResultWithOptions: without following runs it stops at a run that continued as new and replays that run" {
+    for (env_kinds) |kind| {
+        var watch: RunWatch = .{ .gpa = testing.allocator, .io = testing.io };
+        defer watch.deinit();
+        const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RunWatch, &watch)};
+        const env = try WorkflowEnvironment.create(testing.allocator, testing.io, kind, .{ .worker_interceptors = &interceptors });
+        defer env.deinit();
+        try env.registerWorkflow(ChainFixtures.SleepThenContinue);
+        try env.registerWorkflow(Fixtures.Queryable);
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        // A day on the time-skipping server, which must be unlocked for the wait to end.
+        const seconds: u32 = if (kind == .time_skipping) std.time.s_per_day else 1;
+
+        // By type.
+        var run = try env.startWorkflow(ChainFixtures.SleepThenContinue, .{ .task_queue = "" }, .{ seconds, false });
+        defer run.deinit();
+        const first_run_id = try a.dupe(u8, run.run_id);
+        try testing.expectError(error.WorkflowContinuedAsNew, env.getResultWithOptions(ChainFixtures.SleepThenContinue, &run, .{ .follow_runs = false }, a, null));
+        try testing.expectEqualStrings(first_run_id, run.run_id);
+        try testing.expectEqualStrings(first_run_id, watch.lastReplayed() orelse return error.TestUnexpectedResult);
+        // Following the chain from there gets the last run's result and replays that run.
+        try testing.expectEqualStrings("second run", try env.getResultWithOptions(ChainFixtures.SleepThenContinue, &run, .{ .follow_runs = true }, a, null));
+        try testing.expect(!std.mem.eql(u8, first_run_id, run.run_id));
+        try testing.expectEqualStrings(run.run_id, watch.lastReplayed().?);
+
+        // By name.
+        var by_name = try env.startWorkflowByName([]const u8, ChainFixtures.SleepThenContinue.workflow_name, .{ .task_queue = "" }, .{ seconds, false });
+        defer by_name.deinit();
+        const first_by_name = try a.dupe(u8, by_name.run_id);
+        try testing.expectError(error.WorkflowContinuedAsNew, env.getResultByNameWithOptions([]const u8, &by_name, .{ .follow_runs = false }, a, null));
+        try testing.expectEqualStrings(first_by_name, by_name.run_id);
+        try testing.expectEqualStrings(first_by_name, watch.lastReplayed().?);
+        try testing.expectEqualStrings("second run", try env.getResultByName([]const u8, &by_name, a, null));
+        try testing.expectEqualStrings(by_name.run_id, watch.lastReplayed().?);
+
+        if (kind == .time_skipping) {
+            // Time is locked again: a workflow in the middle of a 2h timer stays there.
+            const start = try env.now();
+            var sleeper = try env.startWorkflow(Fixtures.Queryable, .{ .task_queue = "" }, .{2 * std.time.s_per_hour});
+            defer sleeper.deinit();
+            try Fixtures.waitForTimer(&env.client, sleeper.id, sleeper.run_id);
+            try testing.expectEqualStrings("sleeping", try env.client.queryWorkflow(Fixtures.Status, a, sleeper.id, sleeper.run_id, .{}));
+            try testing.expect(start.durationTo(try env.now()).nanoseconds < std.time.ns_per_hour);
+            try testing.expectEqualStrings("finished", try env.getResult(Fixtures.Queryable, &sleeper, a, null));
+        }
+    }
+}
+
+const RunEndFixtures = struct {
+    fn cronRun(ctx: *workflow.Context) ![]const u8 {
+        _ = ctx;
+        return "cron run";
+    }
+    const CronRun = workflow.Def("CronRun", cronRun);
+};
+
+test "WorkflowEnvironment.getResultWithOptions: without following runs a retried run on the dev server returns its own failure" {
+    var watch: RunWatch = .{ .gpa = testing.allocator, .io = testing.io };
+    defer watch.deinit();
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RunWatch, &watch)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(StartOptionFixtures.FailFirstAttempt);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(StartOptionFixtures.FailFirstAttempt, .{
+        .task_queue = "",
+        .retry_policy = .{ .initial_interval = .fromSeconds(1), .maximum_attempts = 2 },
+    }, .{});
+    defer run.deinit();
+    const first_run_id = try a.dupe(u8, run.run_id);
+    // The doc comment: "a cron or retry run returns its own result or failure".
+    var why: ?failure_mod.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.getResultWithOptions(StartOptionFixtures.FailFirstAttempt, &run, .{ .follow_runs = false }, a, &why));
+    try testing.expect(why != null);
+    try testing.expectEqualStrings(first_run_id, run.run_id);
+    try testing.expectEqualStrings(first_run_id, watch.lastReplayed() orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(@as(u32, 2), try env.getResult(StartOptionFixtures.FailFirstAttempt, &run, a, null));
+}
+
+test "time-skipping WorkflowEnvironment.getResultWithOptions: a retried or cron run without following runs passes its replay" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(StartOptionFixtures.FailFirstAttempt);
+    try env.registerWorkflow(RunEndFixtures.CronRun);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A retried run: the workflow is deterministic, so the replay of its first attempt must
+    // not report nondeterminism.
+    var retried = try env.startWorkflow(StartOptionFixtures.FailFirstAttempt, .{
+        .task_queue = "",
+        .retry_policy = .{ .initial_interval = .fromSeconds(std.time.s_per_hour), .maximum_attempts = 2 },
+    }, .{});
+    defer retried.deinit();
+    const first_attempt = try a.dupe(u8, retried.run_id);
+    if (env.getResultWithOptions(StartOptionFixtures.FailFirstAttempt, &retried, .{ .follow_runs = false }, a, null)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.WorkflowFailed, error.WorkflowContinuedAsNew => {},
+        else => return err,
+    }
+    try testing.expectEqualStrings(first_attempt, retried.run_id);
+    try testing.expectEqual(@as(u32, 2), try env.getResult(StartOptionFixtures.FailFirstAttempt, &retried, a, null));
+
+    // A cron run: the same for its first run.
+    var cron = try env.startWorkflow(RunEndFixtures.CronRun, .{ .task_queue = "", .cron_schedule = "0 * * * *" }, .{});
+    defer cron.deinit();
+    defer env.client.terminateWorkflow(cron.id, "", "test cleanup") catch {};
+    if (env.getResultWithOptions(RunEndFixtures.CronRun, &cron, .{ .follow_runs = false }, a, null)) |result| {
+        try testing.expectEqualStrings("cron run", result);
+    } else |err| switch (err) {
+        error.WorkflowContinuedAsNew => {},
+        else => return err,
+    }
+}
+
+test "time-skipping WorkflowEnvironment.getResultWithOptions: without following runs a retried run returns its failure and a cron run its result" {
+    var watch: RunWatch = .{ .gpa = testing.allocator, .io = testing.io };
+    defer watch.deinit();
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RunWatch, &watch)};
+    const env = try WorkflowEnvironment.startTimeSkippingWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(StartOptionFixtures.FailFirstAttempt);
+    try env.registerWorkflow(RunEndFixtures.CronRun);
+    try env.registerWorkflow(ChainFixtures.SleepThenContinue);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var retried = try env.startWorkflow(StartOptionFixtures.FailFirstAttempt, .{
+        .task_queue = "",
+        .retry_policy = .{ .initial_interval = .fromSeconds(std.time.s_per_hour), .maximum_attempts = 2 },
+    }, .{});
+    defer retried.deinit();
+    const first_attempt = try a.dupe(u8, retried.run_id);
+    var why: ?failure_mod.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.getResultWithOptions(StartOptionFixtures.FailFirstAttempt, &retried, .{ .follow_runs = false }, a, &why));
+    try testing.expectEqualStrings("FirstAttemptFails", why.?.message);
+    try testing.expectEqualStrings(first_attempt, watch.lastReplayed().?);
+
+    var cron = try env.startWorkflow(RunEndFixtures.CronRun, .{ .task_queue = "", .cron_schedule = "0 * * * *" }, .{});
+    defer cron.deinit();
+    defer env.client.terminateWorkflow(cron.id, "", "test cleanup") catch {};
+    const first_cron = try a.dupe(u8, cron.run_id);
+    try testing.expectEqualStrings("cron run", try env.getResultWithOptions(RunEndFixtures.CronRun, &cron, .{ .follow_runs = false }, a, null));
+    try testing.expectEqualStrings(first_cron, cron.run_id);
+    try testing.expectEqualStrings(first_cron, watch.lastReplayed().?);
+
+    // A run the workflow continued as new still says so.
+    var chain = try env.startWorkflow(ChainFixtures.SleepThenContinue, .{ .task_queue = "" }, .{ 60, false });
+    defer chain.deinit();
+    try testing.expectError(error.WorkflowContinuedAsNew, env.getResultWithOptions(ChainFixtures.SleepThenContinue, &chain, .{ .follow_runs = false }, a, null));
+}
+
+const OwnOutcomeFixtures = struct {
+    /// Continues as new itself on its first run, whatever its retry policy.
+    fn continueOnce(ctx: *workflow.Context, continued: bool) !u32 {
+        if (continued) return ctx.info().attempt;
+        return ctx.continueAsNew(ContinueOnce, .{}, .{true});
+    }
+    const ContinueOnce = workflow.Def("ContinueOnce", continueOnce);
+
+    fn nothing(_: *workflow.Context) !void {}
+    const Nothing = workflow.Def("Nothing", nothing);
+};
+
+test "time-skipping WorkflowEnvironment.getResultWithOptions: a run with a retry policy that continued as new itself, and a void cron run, return their own outcome" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(OwnOutcomeFixtures.ContinueOnce);
+    try env.registerWorkflow(OwnOutcomeFixtures.Nothing);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var retrying = try env.startWorkflow(OwnOutcomeFixtures.ContinueOnce, .{
+        .task_queue = "",
+        .retry_policy = .{ .initial_interval = .fromSeconds(std.time.s_per_hour), .maximum_attempts = 3 },
+    }, .{false});
+    defer retrying.deinit();
+    try testing.expectError(error.WorkflowContinuedAsNew, env.getResultWithOptions(OwnOutcomeFixtures.ContinueOnce, &retrying, .{ .follow_runs = false }, a, null));
+    try testing.expectEqual(@as(u32, 1), try env.getResult(OwnOutcomeFixtures.ContinueOnce, &retrying, a, null));
+
+    var cron = try env.startWorkflow(OwnOutcomeFixtures.Nothing, .{ .task_queue = "", .cron_schedule = "0 * * * *" }, .{});
+    defer cron.deinit();
+    defer env.client.terminateWorkflow(cron.id, "", "test cleanup") catch {};
+    try env.getResultWithOptions(OwnOutcomeFixtures.Nothing, &cron, .{ .follow_runs = false }, a, null);
+}
+
+test "WorkflowEnvironment.getResultWithOptions: without following runs a handle with no run ID gets the retried run's own failure and replays that run" {
+    var watch: RunWatch = .{ .gpa = testing.allocator, .io = testing.io };
+    defer watch.deinit();
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RunWatch, &watch)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(StartOptionFixtures.FailFirstAttempt);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var started = try env.startWorkflow(StartOptionFixtures.FailFirstAttempt, .{
+        .task_queue = "",
+        .retry_policy = .{ .initial_interval = .fromSeconds(1), .maximum_attempts = 2 },
+    }, .{});
+    defer started.deinit();
+    var latest = try env.client.getWorkflow(u32, started.id, "");
+    defer latest.deinit();
+    var why: ?failure_mod.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.getResultWithOptions(StartOptionFixtures.FailFirstAttempt, &latest, .{ .follow_runs = false }, a, &why));
+    try testing.expect(why != null);
+    // The handle now names the run it waited for, which is the run replayed.
+    try testing.expectEqualStrings(started.run_id, latest.run_id);
+    try testing.expectEqualStrings(started.run_id, watch.lastReplayed().?);
+    try testing.expectEqual(@as(u32, 2), try env.getResult(StartOptionFixtures.FailFirstAttempt, &latest, a, null));
 }
 
 test "WorkflowEnvironment runs local activities, retrying one after workflow timers" {
@@ -7675,6 +8156,68 @@ test "codecs encode every payload the client and worker send and decode what the
     try replayer.replayHistory(raw);
 }
 
+const TimeSkippingFixtures = struct {
+    fn dayLater(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        try ctx.io().sleep(.fromSeconds(std.time.s_per_day), .awake);
+        return std.fmt.allocPrint(ctx.allocator(), "a day later, {s}", .{name});
+    }
+    const DayLater = workflow.Def("DayLater", dayLater);
+};
+
+test "time-skipping WorkflowEnvironment with options: a codec and a worker interceptor see a day-long workflow and its replay" {
+    var reversing: ReversingCodec = .{};
+    const codecs = [_]converter.PayloadCodec{reversing.codec()};
+    var watch: RunWatch = .{ .gpa = testing.allocator, .io = testing.io };
+    defer watch.deinit();
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RunWatch, &watch)};
+    const env = try WorkflowEnvironment.startTimeSkippingWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs, .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try testing.expect(env.server == .time_skipping);
+    try env.registerWorkflow(TimeSkippingFixtures.DayLater);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const wall_start = Io.Timestamp.now(testing.io, .awake);
+    const server_start = try env.now();
+    var run = try env.startWorkflow(TimeSkippingFixtures.DayLater, .{ .task_queue = "" }, .{"secret-name"});
+    defer run.deinit();
+    try testing.expectEqualStrings("a day later, secret-name", try env.getResult(TimeSkippingFixtures.DayLater, &run, a, null));
+    try testing.expect(server_start.durationTo(try env.now()).nanoseconds >= std.time.ns_per_day);
+    try testing.expect(wall_start.durationTo(Io.Timestamp.now(testing.io, .awake)).nanoseconds < 60 * std.time.ns_per_s);
+
+    // The interceptor ran once on the worker and once in the replay `getResult` ran.
+    try testing.expectEqual(@as(usize, 1), watch.count(false));
+    try testing.expectEqual(@as(usize, 1), watch.count(true));
+    try testing.expectEqualStrings(run.run_id, watch.lastReplayed().?);
+
+    // The codec encoded the workflow's input and result: the server stored neither in the clear.
+    try testing.expect(reversing.encoded.load(.monotonic) >= 2);
+    var plain = try client_mod.Client.connect(testing.allocator, testing.io, env.server.clientOptions());
+    defer plain.close();
+    const raw = try plain.fetchHistory(a, run.id, run.run_id);
+    var raw_bytes: Io.Writer.Allocating = .init(a);
+    try raw.encode(&raw_bytes.writer, a);
+    try testing.expect(std.mem.indexOf(u8, raw_bytes.written(), "secret") == null);
+    const input = raw.events.items[0].attributes.?.workflow_execution_started_event_attributes.input.?.payloads.items[0];
+    try testing.expectEqualStrings(ReversingCodec.encoding, converter.encodingOf(input).?);
+
+    // The replay decoded that history with the codec: without it, the same history can't
+    // replay, because the workflow can't read its encoded input.
+    var uncoded: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .namespace = env.client.namespace, .task_queue = env.task_queue });
+    defer uncoded.deinit();
+    uncoded.workflow_id = run.id;
+    try uncoded.registerWorkflow(TimeSkippingFixtures.DayLater);
+    testing.log_level = .err; // The failed replay is logged as a warning.
+    try testing.expectError(error.Nondeterminism, uncoded.replayHistory(raw));
+}
+
+test "startTimeSkippingWithOptions refuses the dev server's extra arguments" {
+    // The refusal is logged as a warning.
+    testing.log_level = .err;
+    try testing.expectError(error.InvalidOptions, WorkflowEnvironment.startTimeSkippingWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args }));
+}
+
 /// Tags every payload it encodes with the propagated key ID in its context, as an encryption
 /// codec picking its key per tenant would, and on decode accepts only payloads tagged with a
 /// known key ID. Counts encodes that had no key ID, and those for the Greet activity.
@@ -8226,4 +8769,60 @@ test "failure policy: a listed error from an update handler fails the task, and 
     const message = (try PolicyFixtures.taskFailureMessage(env, a, run.id, run.run_id)) orelse return error.TestExpectedTaskFailure;
     try testing.expect(std.mem.indexOf(u8, message, "update handler \"poke\"") != null);
     try testing.expect(std.mem.indexOf(u8, message, "returned error.ConfigMissing") != null);
+}
+
+const CronContinueFixtures = struct {
+    /// A cron workflow whose run continues as new itself; the run it starts returns.
+    fn cronContinue(ctx: *workflow.Context, continued: bool) ![]const u8 {
+        if (continued) return "continued run";
+        return ctx.continueAsNew(CronContinue, .{}, .{true});
+    }
+    const CronContinue = workflow.Def("CronContinue", cronContinue);
+};
+
+test "time-skipping WorkflowEnvironment.getResultWithOptions: a cron run that continued as new itself returns error.WorkflowContinuedAsNew" {
+    var watch: RunWatch = .{ .gpa = testing.allocator, .io = testing.io };
+    defer watch.deinit();
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RunWatch, &watch)};
+    const env = try WorkflowEnvironment.startTimeSkippingWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(CronContinueFixtures.CronContinue);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cron = try env.startWorkflow(CronContinueFixtures.CronContinue, .{ .task_queue = "", .cron_schedule = "0 * * * *" }, .{false});
+    defer cron.deinit();
+    defer env.client.terminateWorkflow(cron.id, "", "test cleanup") catch {};
+    const first_run = try a.dupe(u8, cron.run_id);
+    // The workflow continued as new itself: the doc comment says that run "is replayed and
+    // then returns error.WorkflowContinuedAsNew", whatever its cron schedule.
+    try testing.expectError(error.WorkflowContinuedAsNew, env.getResultWithOptions(CronContinueFixtures.CronContinue, &cron, .{ .follow_runs = false }, a, null));
+    try testing.expectEqualStrings(first_run, cron.run_id);
+    try testing.expectEqualStrings(first_run, watch.lastReplayed() orelse return error.TestUnexpectedResult);
+}
+
+test "WorkflowEnvironment.getResultWithOptions: without following runs a run handle with no run ID stops at the run that continued as new" {
+    for (env_kinds) |kind| {
+        var watch: RunWatch = .{ .gpa = testing.allocator, .io = testing.io };
+        defer watch.deinit();
+        const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RunWatch, &watch)};
+        const env = try WorkflowEnvironment.create(testing.allocator, testing.io, kind, .{ .worker_interceptors = &interceptors });
+        defer env.deinit();
+        try env.registerWorkflow(ChainFixtures.SleepThenContinue);
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const seconds: u32 = if (kind == .time_skipping) std.time.s_per_day else 1;
+
+        var started = try env.startWorkflow(ChainFixtures.SleepThenContinue, .{ .task_queue = "" }, .{ seconds, false });
+        defer started.deinit();
+        // `client.getWorkflow` with an empty run ID follows the latest run, and the client
+        // itself stops at that run's continue-as-new with `.follow_runs = false`.
+        var latest = try env.client.getWorkflow([]const u8, started.id, "");
+        defer latest.deinit();
+        try testing.expectError(error.WorkflowContinuedAsNew, env.getResultWithOptions(ChainFixtures.SleepThenContinue, &latest, .{ .follow_runs = false }, a, null));
+        // The run replayed is the one that continued as new, not the run it started.
+        try testing.expectEqualStrings(started.run_id, watch.lastReplayed() orelse return error.TestUnexpectedResult);
+    }
 }
