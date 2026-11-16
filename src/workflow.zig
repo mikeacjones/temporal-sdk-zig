@@ -745,6 +745,17 @@ pub const Context = struct {
         return .{ .nanoseconds = ctx.instance.now_ns };
     }
 
+    /// A random (version 4) UUID as lowercase text (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`),
+    /// drawn from the run's seeded randomness (`ctx.io().random`), so a replay gets the same
+    /// values in the same order and each call returns a new one. Use it for IDs workflow code
+    /// sends in commands, such as child workflow IDs or activity arguments. Not secure
+    /// randomness. The text lives in `allocator()`; in a query handler or update validator it
+    /// draws from the handler's own copy of the generator and leaves the run's sequence as it
+    /// was.
+    pub fn randomUuid(ctx: *Context) error{OutOfMemory}![]const u8 {
+        return @import("client.zig").uuid(ctx.allocator(), ctx.io());
+    }
+
     /// Blocks the calling coroutine on a durable timer, as `ctx.io().sleep` does, with
     /// `options` on the timer. To race or cancel it, run it as a coroutine (`io.async`, or a
     /// `std.Io.Select` case): canceling the coroutine cancels the timer and returns

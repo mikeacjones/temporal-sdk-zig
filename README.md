@@ -578,6 +578,18 @@ Workflow code runs again on replay and must make the same calls in the same orde
 - File, network, and process calls and secure randomness fail on it.
 - Don't use threads, the wall clock, other randomness, unordered hash map iteration, or other I/O; use an activity or `ctx.sideEffect`.
 
+`workflow.Context.randomUuid` returns a random (version 4) UUID as text, drawn from the run's seeded randomness: a replay gets the same values in the same order, so it can name a child workflow or go in an activity's arguments.
+
+<!-- example: workflow-uuid -->
+```zig
+fn greetChildById(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const id = try ctx.randomUuid(); // the same on replay
+    const child = ctx.executeChildWorkflow(Greeting, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{name});
+    return std.fmt.allocPrint(ctx.allocator(), "{s} ({s})", .{ try child.get(), id });
+}
+pub const GreetChildById = workflow.Def("greet_child_by_id", greetChildById);
+```
+
 #### Activities and local activities
 `workflow.Context.executeActivity` schedules an activity and returns a `workflow.ActivityFuture`; `executeLocalActivity` runs a short one on the workflow's own worker.
 

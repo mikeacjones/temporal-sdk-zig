@@ -42,6 +42,32 @@ test "workflows: function and struct definitions run" {
     try testing.expectEqualStrings("Hello, Bo!", try env.executeWorkflow(GreeterWorkflow, .{"Bo"}, arena.allocator(), null));
 }
 
+// example: workflow-uuid
+fn greetChildById(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const id = try ctx.randomUuid(); // the same on replay
+    const child = ctx.executeChildWorkflow(Greeting, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{name});
+    return std.fmt.allocPrint(ctx.allocator(), "{s} ({s})", .{ try child.get(), id });
+}
+pub const GreetChildById = workflow.Def("greet_child_by_id", greetChildById);
+// end-example
+
+test "workflows: a UUID from the run's seeded randomness names a child" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(GreetChildById);
+    try env.registerWorkflow(Greeting);
+    try env.registerActivity(Greet);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try env.startWorkflow(GreetChildById, .{}, .{"Ann"});
+    defer run.deinit();
+    const result = try env.getResult(GreetChildById, &run, arena.allocator(), null);
+    try testing.expect(std.mem.startsWith(u8, result, "Hello, Ann! ("));
+    try testing.expectEqual(@as(usize, "Hello, Ann! ()".len + 36), result.len);
+    try env.replayRun(run.id, run.run_id);
+}
+
 // example: workflow-activities
 fn greetTwice(ctx: *workflow.Context, name: []const u8) ![]const u8 {
     // Both start now; `get` waits for each result.

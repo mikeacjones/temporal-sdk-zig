@@ -68,7 +68,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Workflow initialization that sees the start arguments before handlers run | Java, Python, .NET, PHP, Ruby | GA | supported | [Definition](README.md#definition) (a function workflow reads its arguments, then registers its handlers) |
 | Determinism enforcement at run time (sandbox, illegal-call checks) | Python, TypeScript, .NET, Ruby | GA | supported | [Determinism](README.md#determinism) |
 | Deterministic random numbers | Java, Python, TypeScript, .NET, Ruby, PHP | GA | supported | [Determinism](README.md#determinism) |
-| Deterministic UUIDs | Java, Python, TypeScript, .NET, PHP | GA | partial | `temporal-sdk-zig-d51.7.33`. Missing: a workflow API for it and README.md documentation; `temporal.client.uuid(ctx.allocator(), ctx.io())` already gives a UUID that is the same on replay, because the workflow `std.Io`'s randomness is seeded from the run. |
+| Deterministic UUIDs | Java, Python, TypeScript, .NET, PHP | GA | supported | [Determinism](README.md#determinism) |
 | Activities from workflows: timeouts, retry policy, cancellation types | all | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [retryactivity](samples/retryactivity) |
 | Local activities | all | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [greetingslocal](samples/greetingslocal) |
 | Activities by name, without a typed definition | all | GA | supported | [Dynamic activities](README.md#dynamic-activities), [dynamic](samples/dynamic) |
