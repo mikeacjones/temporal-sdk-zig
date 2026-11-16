@@ -1052,6 +1052,11 @@ pub const ActivityEnvironment = struct {
     /// What `ctx.metrics()` returns, such as a custom handler that keeps what the activity
     /// records. Borrowed.
     metrics: metrics_mod.Handler = .noop,
+    /// Where `ctx.logger()` writes, such as a sink that keeps the records for the test to read.
+    /// Messages carry the context fields a worker adds, taken from `info`. Null writes to
+    /// `std.log` with no context fields. Borrowed: it must outlive the activities it logs for,
+    /// and be thread-safe, since activities run on tasks of their own.
+    logger: ?log_mod.Sink = null,
     /// Guards `running` and `worker_stopped`, which `cancel` and `stopWorker` share with the
     /// activities running from other threads.
     mutex: Io.Mutex = .init,
@@ -1090,11 +1095,27 @@ pub const ActivityEnvironment = struct {
     pub fn executeActivityWith(env: *ActivityEnvironment, comptime Activity: type, receiver: ?*Activity.Receiver, args: Activity.Args, arena: Allocator) !Activity.Result {
         var info = env.info;
         info.activity_type = Activity.activity_name;
+        // The fields a worker adds, kept on this frame, which outlives the activity: building
+        // them allocates nothing, so the option adds no error to the activity's.
+        var attempt_text: [10]u8 = undefined;
+        const context: [6]log_mod.Field = .{
+            .{ .key = "ActivityID", .value = info.activity_id },
+            .{ .key = "ActivityType", .value = info.activity_type },
+            .{ .key = "Attempt", .value = std.fmt.bufPrint(&attempt_text, "{d}", .{info.attempt}) catch unreachable },
+            .{ .key = "WorkflowType", .value = info.workflow_type },
+            .{ .key = "WorkflowID", .value = info.workflow_id },
+            .{ .key = "RunID", .value = info.workflow_run_id },
+        };
+        const logger: log_mod.Logger = if (env.logger) |sink| .{
+            .sink = sink,
+            // As a worker does for a standalone activity, which has no workflow.
+            .context = if (info.workflow_id.len > 0) &context else context[0..3],
+        } else .{};
         var ctx: activity.Context = .{
             .arena = arena,
             .io_ = env.io,
             .info_ = info,
-            .logger_ = .{},
+            .logger_ = logger,
             .heartbeat_details = env.heartbeat_details,
             .heartbeat_sink = env.on_heartbeat,
             .client_ = env.client,
@@ -3150,6 +3171,112 @@ test "ActivityEnvironment's info has no timeouts, retry policy or priority unles
     env.info.retry_policy = .{ .maximum_attempts = 3 };
     env.info.priority = .{ .priority_key = 1, .fairness_key = "tenant", .fairness_weight = 2 };
     try testing.expectEqualStrings("1m|10s|2s|3|1|tenant|2|true", try env.executeActivity(EnvironmentStopFixtures.Info, .{}, arena.allocator()));
+}
+
+const EnvironmentLogFixtures = struct {
+    /// Keeps copies of the records it gets, for a test to read.
+    const Recorder = struct {
+        arena: std.heap.ArenaAllocator,
+        mutex: Io.Mutex = .init,
+        records: std.ArrayList(Record) = .empty,
+
+        const Record = struct { level: log_mod.Level, message: []const u8, fields: []const log_mod.Field };
+
+        fn sink(r: *Recorder) log_mod.Sink {
+            return .{ .ptr = r, .vtable = &.{ .log = write } };
+        }
+
+        fn write(ptr: ?*anyopaque, level: log_mod.Level, message: []const u8, fields: []const log_mod.Field) void {
+            const r: *Recorder = @ptrCast(@alignCast(ptr.?));
+            r.mutex.lockUncancelable(testing.io);
+            defer r.mutex.unlock(testing.io);
+            const a = r.arena.allocator();
+            const copy = a.alloc(log_mod.Field, fields.len) catch @panic("out of memory");
+            for (fields, copy) |f, *c| c.* = .{ .key = a.dupe(u8, f.key) catch @panic("out of memory"), .value = a.dupe(u8, f.value) catch @panic("out of memory") };
+            r.records.append(a, .{ .level = level, .message = a.dupe(u8, message) catch @panic("out of memory"), .fields = copy }) catch @panic("out of memory");
+        }
+
+        fn field(rec: Record, key: []const u8) ?[]const u8 {
+            for (rec.fields) |f| if (std.mem.eql(u8, f.key, key)) return f.value;
+            return null;
+        }
+    };
+
+    fn chatty(ctx: *activity.Context, order: u32) !void {
+        ctx.logger().info("charging", .{ .order = order });
+        // Through std.log this would fail the test that runs it.
+        ctx.logger().err("card declined", .{ .order = order });
+    }
+    const Chatty = activity.Def("Chatty", chatty);
+
+    const Shop = struct {
+        name: []const u8,
+
+        pub fn open(s: *Shop, ctx: *activity.Context) !void {
+            ctx.logger().err("shop closed", .{ .shop = s.name });
+        }
+    };
+    const shop_acts = activity.defs(Shop, .{ .prefix = "Shop." });
+
+    /// Reports whether the activity's logger is the default one: `std.log`, no context fields.
+    fn defaultLogger(ctx: *activity.Context) !bool {
+        const l = ctx.logger();
+        return l.sink.vtable == log_mod.Sink.std_log.vtable and l.context.len == 0;
+    }
+    const DefaultLogger = activity.Def("DefaultLogger", defaultLogger);
+};
+
+test "ActivityEnvironment.logger receives an activity's info and error logs with the worker's context fields" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var recorder: EnvironmentLogFixtures.Recorder = .{ .arena = .init(testing.allocator) };
+    defer recorder.arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    env.logger = recorder.sink();
+    env.info.activity_id = "act-7";
+    env.info.attempt = 3;
+    env.info.workflow_id = "wf-9";
+    env.info.workflow_run_id = "run-9";
+    env.info.workflow_type = "Checkout";
+
+    try env.executeActivity(EnvironmentLogFixtures.Chatty, .{@as(u32, 42)}, arena.allocator());
+    const records = recorder.records.items;
+    try testing.expectEqual(2, records.len);
+    try testing.expectEqual(log_mod.Level.info, records[0].level);
+    try testing.expectEqualStrings("charging", records[0].message);
+    try testing.expectEqual(log_mod.Level.err, records[1].level);
+    try testing.expectEqualStrings("card declined", records[1].message);
+    const Rec = EnvironmentLogFixtures.Recorder;
+    for (records) |rec| {
+        try testing.expectEqualStrings("42", Rec.field(rec, "order").?);
+        try testing.expectEqualStrings("act-7", Rec.field(rec, "ActivityID").?);
+        try testing.expectEqualStrings("Chatty", Rec.field(rec, "ActivityType").?);
+        try testing.expectEqualStrings("3", Rec.field(rec, "Attempt").?);
+        try testing.expectEqualStrings("Checkout", Rec.field(rec, "WorkflowType").?);
+        try testing.expectEqualStrings("wf-9", Rec.field(rec, "WorkflowID").?);
+        try testing.expectEqualStrings("run-9", Rec.field(rec, "RunID").?);
+    }
+
+    // A method activity, standalone (no workflow): no empty workflow fields, as on a worker.
+    env.info.workflow_id = "";
+    var shop: EnvironmentLogFixtures.Shop = .{ .name = "corner" };
+    try env.executeActivityWith(EnvironmentLogFixtures.shop_acts.open, &shop, .{}, arena.allocator());
+    try testing.expectEqual(3, recorder.records.items.len);
+    const rec = recorder.records.items[2];
+    try testing.expectEqual(log_mod.Level.err, rec.level);
+    try testing.expectEqualStrings("shop closed", rec.message);
+    try testing.expectEqualStrings("corner", Rec.field(rec, "shop").?);
+    try testing.expectEqualStrings("act-7", Rec.field(rec, "ActivityID").?);
+    try testing.expectEqualStrings("Shop.open", Rec.field(rec, "ActivityType").?);
+    try testing.expectEqual(null, Rec.field(rec, "WorkflowID"));
+    try testing.expectEqual(null, Rec.field(rec, "RunID"));
+}
+
+test "ActivityEnvironment without a logger gives the activity the default std.log logger" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    try testing.expect(try env.executeActivity(EnvironmentLogFixtures.DefaultLogger, .{}, arena.allocator()));
 }
 
 /// A history of samples/helloworld, whose workflow `Fixtures.Hello` matches.
@@ -8825,4 +8952,36 @@ test "WorkflowEnvironment.getResultWithOptions: without following runs a run han
         // The run replayed is the one that continued as new, not the run it started.
         try testing.expectEqualStrings(started.run_id, watch.lastReplayed() orelse return error.TestUnexpectedResult);
     }
+}
+
+test "ActivityEnvironment.executeActivity adds only error.Canceled to the activity's own errors" {
+    // An activity that can only fail with error.Declined: the environment's call may add
+    // error.Canceled (a canceled task), and with no logger set it has nothing to allocate,
+    // so callers that switch exhaustively over its errors still compile as before.
+    const S = struct {
+        fn declined(_: *activity.Context, fail: bool) error{Declined}!void {
+            if (fail) return error.Declined;
+        }
+        const Declined = activity.Def("Declined", declined);
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    const E = @typeInfo(@TypeOf(env.executeActivity(S.Declined, .{false}, arena.allocator()))).error_union.error_set;
+    const names = comptime @typeInfo(E).error_set.error_names.?;
+    for (names) |name| {
+        if (!std.mem.eql(u8, name, "Declined") and !std.mem.eql(u8, name, "Canceled")) {
+            std.debug.print("executeActivity added error.{s} to the activity's errors\n", .{name});
+            return error.TestUnexpectedError;
+        }
+    }
+    try env.executeActivity(S.Declined, .{false}, arena.allocator());
+
+    // Setting a logger builds its context fields without allocating, so it adds nothing either.
+    var recorder: EnvironmentLogFixtures.Recorder = .{ .arena = .init(testing.allocator) };
+    defer recorder.arena.deinit();
+    env.logger = recorder.sink();
+    const Logged = @typeInfo(@TypeOf(env.executeActivity(S.Declined, .{false}, arena.allocator()))).error_union.error_set;
+    try testing.expect(Logged == E);
+    try testing.expectError(error.Declined, env.executeActivity(S.Declined, .{true}, arena.allocator()));
 }

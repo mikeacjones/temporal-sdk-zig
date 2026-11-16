@@ -186,6 +186,55 @@ fn isStopping(ctx: *activity.Context) !bool {
 }
 // end-example
 
+// example: testing-activity-logger
+/// Keeps the levels and `ActivityID` fields of the records it gets. The activity logs from a
+/// task of its own, so the sink takes a lock.
+const Captured = struct {
+    mutex: std.Io.Mutex = .init,
+    levels: [4]temporal.log.Level = undefined,
+    ids: [4][16]u8 = undefined,
+    count: usize = 0,
+
+    fn sink(c: *Captured) temporal.log.Sink {
+        return .{ .ptr = c, .vtable = &.{ .log = record } };
+    }
+
+    fn record(ptr: ?*anyopaque, level: temporal.log.Level, _: []const u8, fields: []const temporal.log.Field) void {
+        const c: *Captured = @ptrCast(@alignCast(ptr.?));
+        c.mutex.lockUncancelable(testing.io);
+        defer c.mutex.unlock(testing.io);
+        if (c.count == c.levels.len) return;
+        c.levels[c.count] = level;
+        for (fields) |f| if (std.mem.eql(u8, f.key, "ActivityID")) {
+            // The fields are only valid during the call: copy what the test reads.
+            const n = @min(f.value.len, c.ids[0].len);
+            @memcpy(c.ids[c.count][0..n], f.value[0..n]);
+        };
+        c.count += 1;
+    }
+};
+
+fn charge(ctx: *activity.Context, amount: u32) !void {
+    ctx.logger().info("charging", .{ .amount = amount });
+    ctx.logger().err("card declined", .{ .amount = amount }); // through std.log, this fails the test
+}
+
+test "testing: read what an activity logs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var captured: Captured = .{};
+    var env: ActivityEnvironment = .init(testing.io);
+    env.logger = captured.sink();
+    env.info.activity_id = "charge-1";
+
+    try env.executeActivity(activity.Def("charge", charge), .{@as(u32, 10)}, arena.allocator());
+    try testing.expectEqual(2, captured.count);
+    try testing.expectEqual(.info, captured.levels[0]);
+    try testing.expectEqual(.err, captured.levels[1]);
+    try testing.expectEqualStrings("charge-1", captured.ids[1][0.."charge-1".len]);
+}
+// end-example
+
 /// `greeting` after a change that drops its activity call.
 fn greetingWithoutActivity(_: *workflow.Context, name: []const u8) ![]const u8 {
     _ = name;

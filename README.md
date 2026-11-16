@@ -1984,7 +1984,7 @@ test "testing: an activity on its own" {
 Notes:
 
 - The result comes from the arena passed in; the failure a `ctx.fail` call describes isn't exposed.
-- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, and `metrics` to control what the activity sees; `info.activity_type` is always the activity's name. Its timeouts and `retry_policy` start out null and its `priority` zero.
+- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, `metrics`, and `logger` to control what the activity sees; `info.activity_type` is always the activity's name. Its timeouts and `retry_policy` start out null and its `priority` zero.
 - `executeActivity` takes the environment by pointer (`var env`) and runs the activity on a task of its own while it waits; canceling the calling task cancels the activity, without a `cancelReason`.
 
 `cancel(reason)` cancels the running activity as a worker does, and `stopWorker()` fires the worker-stop signal:
@@ -2032,6 +2032,64 @@ Notes:
 
 - `cancel` reaches the activities running at the time, from any thread; with none running it does nothing. An activity already canceled keeps its first reason.
 - After `stopWorker`, every activity the environment runs, now or later, sees `isWorkerStopping()` true.
+
+Set `logger` to a `log.Sink` to read or silence what the activity logs through `ctx.logger()`:
+
+<!-- example: testing-activity-logger -->
+```zig
+/// Keeps the levels and `ActivityID` fields of the records it gets. The activity logs from a
+/// task of its own, so the sink takes a lock.
+const Captured = struct {
+    mutex: std.Io.Mutex = .init,
+    levels: [4]temporal.log.Level = undefined,
+    ids: [4][16]u8 = undefined,
+    count: usize = 0,
+
+    fn sink(c: *Captured) temporal.log.Sink {
+        return .{ .ptr = c, .vtable = &.{ .log = record } };
+    }
+
+    fn record(ptr: ?*anyopaque, level: temporal.log.Level, _: []const u8, fields: []const temporal.log.Field) void {
+        const c: *Captured = @ptrCast(@alignCast(ptr.?));
+        c.mutex.lockUncancelable(testing.io);
+        defer c.mutex.unlock(testing.io);
+        if (c.count == c.levels.len) return;
+        c.levels[c.count] = level;
+        for (fields) |f| if (std.mem.eql(u8, f.key, "ActivityID")) {
+            // The fields are only valid during the call: copy what the test reads.
+            const n = @min(f.value.len, c.ids[0].len);
+            @memcpy(c.ids[c.count][0..n], f.value[0..n]);
+        };
+        c.count += 1;
+    }
+};
+
+fn charge(ctx: *activity.Context, amount: u32) !void {
+    ctx.logger().info("charging", .{ .amount = amount });
+    ctx.logger().err("card declined", .{ .amount = amount }); // through std.log, this fails the test
+}
+
+test "testing: read what an activity logs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var captured: Captured = .{};
+    var env: ActivityEnvironment = .init(testing.io);
+    env.logger = captured.sink();
+    env.info.activity_id = "charge-1";
+
+    try env.executeActivity(activity.Def("charge", charge), .{@as(u32, 10)}, arena.allocator());
+    try testing.expectEqual(2, captured.count);
+    try testing.expectEqual(.info, captured.levels[0]);
+    try testing.expectEqual(.err, captured.levels[1]);
+    try testing.expectEqualStrings("charge-1", captured.ids[1][0.."charge-1".len]);
+}
+```
+
+Notes:
+
+- Each record carries the context fields a worker adds: `ActivityID`, `ActivityType`, and `Attempt`, then `WorkflowType`, `WorkflowID`, and `RunID` when `info.workflow_id` isn't empty, all taken from `info`.
+- Without `logger`, the activity logs to `std.log` with no context fields, where an error-level message fails the Zig test that runs it.
+- The sink is borrowed and must outlive the activities it receives records from. It is called from the activity's task, so it must be thread-safe, and the message and fields are only valid during the call.
 
 #### Replaying histories
 
