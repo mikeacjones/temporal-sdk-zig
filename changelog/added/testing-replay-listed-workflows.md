@@ -1,0 +1,1 @@
+`testing.WorkflowReplayer.replayListedWorkflows` replays every workflow run a visibility query lists, fetching each run's history through a client and returning a result per run. See [Replaying histories](https://github.com/mikeacjones/temporal-sdk-zig#replaying-histories).

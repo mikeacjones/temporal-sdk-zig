@@ -1259,8 +1259,8 @@ pub const WorkflowReplayer = struct {
         Nondeterminism,
     };
 
-    /// How one history replayed, from `replayHistories` or `replayWorkflowExecution`. The
-    /// slices borrow the arena passed to that call.
+    /// How one history replayed, from `replayHistories`, `replayWorkflowExecution` or
+    /// `replayListedWorkflows`. The slices borrow the arena passed to that call.
     pub const ReplayResult = struct {
         workflow_id: []const u8,
         /// The run ID in the history's started event; empty for an invalid history.
@@ -1372,6 +1372,62 @@ pub const WorkflowReplayer = struct {
         return session.replay(arena, workflow_id, history);
     }
 
+    pub const ReplayListedError = client_mod.ListError || client_mod.HistoryError || error{ReplayFailed};
+
+    /// Replays every workflow run the visibility `query` matches (see `Client.listWorkflows`)
+    /// through one replay worker, and returns a result for each run in listing order. It
+    /// pages through the listing and fetches each run's history by its workflow ID and run
+    /// ID as replay reaches it. A run that fails to replay doesn't stop the rest: its result
+    /// carries its workflow ID, run ID, error and message. A listing or fetch failure ends
+    /// the batch and is returned, logged with the query or the workflow and run IDs, and so
+    /// is a replay worker that couldn't start (`error.ReplayFailed`). Visibility is
+    /// eventually consistent: a run that closed a moment ago may not be listed yet.
+    ///
+    /// Only the results (their IDs and messages) are allocated from `arena`, and they grow
+    /// with the number of runs. The current listing page is held with the client's
+    /// allocator. One run's history at a time is held in scratch arenas on `r.gpa`, decoded
+    /// and once more encoded for the replay worker, reused for each run and keeping the
+    /// capacity of the largest one, so a batch holds at most the results, one page, and about
+    /// twice the largest single history. The page and the histories are freed before the
+    /// call returns. A listed run with no workflow task yet (a cron run waiting for its next
+    /// fire, a delayed start) has run no workflow code and gets a clean result.
+    pub fn replayListedWorkflows(
+        r: *WorkflowReplayer,
+        arena: Allocator,
+        client: *client_mod.Client,
+        query: []const u8,
+    ) ReplayListedError![]ReplayResult {
+        var executions = try client.listWorkflows(query, .{});
+        defer executions.deinit();
+        var results: std.ArrayList(ReplayResult) = .empty;
+        var scratch: std.heap.ArenaAllocator = .init(r.gpa);
+        defer scratch.deinit();
+        // Created on the first run, so an empty listing starts no worker.
+        var session: Session = undefined;
+        var started = false;
+        defer if (started) session.deinit();
+        while (true) {
+            _ = scratch.reset(.retain_capacity);
+            const s = scratch.allocator();
+            const info = executions.next(s) catch |err| {
+                log.err("listing the workflows to replay for query \"{s}\" failed: {t}", .{ query, err });
+                return err;
+            } orelse break;
+            // The listed run ID, so a run started since the listing isn't read instead.
+            const history = client.fetchHistory(s, info.workflow_id, info.run_id) catch |err| {
+                log.err("fetching the history of workflow {s} run {s} to replay (query \"{s}\") failed: {t}", .{ info.workflow_id, info.run_id, query, err });
+                return err;
+            };
+            if (!started) try session.init(r);
+            started = true;
+            var result = try session.replay(arena, info.workflow_id, history);
+            // The started event keeps the original run ID across a reset; report the listed run.
+            if (!std.mem.eql(u8, result.run_id, info.run_id)) result.run_id = try arena.dupe(u8, info.run_id);
+            try results.append(arena, result);
+        }
+        return results.toOwnedSlice(arena);
+    }
+
     /// A replay worker with the workflow runner that answers its activations. Pinned in
     /// memory once `init` returns: the runner points at its `outcome`.
     const Session = struct {
@@ -1465,6 +1521,10 @@ pub const WorkflowReplayer = struct {
                 return result;
             };
             result.run_id = try arena.dupe(u8, started.original_execution_run_id);
+            // A run with no workflow task scheduled yet (a cron run waiting for its next fire,
+            // a delayed start) has run no workflow code, so it has nothing to check; the core
+            // would never activate or evict it, and replay would wait forever.
+            if (!hasWorkflowTask(history)) return result;
             if (s.stopped) {
                 result.err = error.ReplayFailed;
                 result.message = "the replay worker stopped while replaying an earlier history";
@@ -1507,6 +1567,14 @@ pub const WorkflowReplayer = struct {
             return result;
         }
     };
+
+    fn hasWorkflowTask(history: history_mod.History) bool {
+        for (history.events.items) |event| switch (event.attributes orelse continue) {
+            .workflow_task_scheduled_event_attributes => return true,
+            else => {},
+        };
+        return false;
+    }
 
     fn startedEvent(history: history_mod.History) ?proto.temporal.api.history.v1.WorkflowExecutionStartedEventAttributes {
         if (history.events.items.len == 0) return null;
@@ -3892,6 +3960,20 @@ test "WorkflowReplayer replays a batch of histories through one worker and repor
     try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, error.Nondeterminism), fed[1].err);
 
     try testing.expectEqual(@as(usize, 0), (try r.replayHistories(a, &[_]history_mod.WorkflowHistory{})).len);
+
+    // A run waiting for its first workflow task (a cron or delayed start) has only its
+    // started event; it replays cleanly instead of waiting for an activation that never comes.
+    var started_only: history_mod.History = .{};
+    try started_only.events.append(a, hello.events.items[0]);
+    const waiting = try r.replayHistories(a, &[_]history_mod.WorkflowHistory{
+        .{ .workflow_id = "waiting", .history = started_only },
+        .{ .workflow_id = "hello-3", .history = hello },
+    });
+    try testing.expectEqual(@as(usize, 2), waiting.len);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), waiting[0].err);
+    try testing.expectEqualStrings(hello_run_id, waiting[0].run_id);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), waiting[1].err);
+    try r.replayHistory(started_only);
 }
 
 test "WorkflowReplayer replays a run fetched through a client, seeing the options' task queue" {
@@ -3923,6 +4005,127 @@ test "WorkflowReplayer replays a run fetched through a client, seeing the option
     try testing.expect(changed.message.len > 0);
 
     try testing.expectError(error.NotFound, r.replayWorkflowExecution(a, &env.client, "no-such-workflow", ""));
+}
+
+test "WorkflowReplayer replays every run a visibility query lists and reports each outcome" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    try env.registerWorkflow(Fixtures.QueueDependent);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const runs = 3;
+    var run_ids: [runs][]const u8 = undefined;
+    for (&run_ids, 0..) |*run_id, i| {
+        const id = try std.fmt.allocPrint(a, "listed-hello-{d}", .{i});
+        var run = try env.startWorkflow(Fixtures.Hello, .{ .id = id, .task_queue = "" }, .{"Temporal"});
+        defer run.deinit();
+        try testing.expectEqualStrings("Hello Temporal!", try env.getResult(Fixtures.Hello, &run, a, null));
+        run_id.* = try a.dupe(u8, run.run_id);
+    }
+    for (0..2) |_| {
+        var run = try env.startWorkflow(Fixtures.QueueDependent, .{ .task_queue = "" }, .{});
+        defer run.deinit();
+        try testing.expectEqualStrings("timer", try env.getResult(Fixtures.QueueDependent, &run, a, null));
+    }
+    const query = try std.fmt.allocPrint(a, "TaskQueue='{s}' AND WorkflowType='HelloWorld'", .{env.task_queue});
+    try waitForCount(&env.client, try std.fmt.allocPrint(a, "{s} AND ExecutionStatus='Completed'", .{query}), runs);
+    try waitForCount(&env.client, try std.fmt.allocPrint(a, "TaskQueue='{s}' AND WorkflowType='QueueDependent' AND ExecutionStatus='Completed'", .{env.task_queue}), 2);
+
+    // Only Hello is registered: listing QueueDependent's runs too would fail them.
+    var r: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .task_queue = env.task_queue });
+    defer r.deinit();
+    try r.registerWorkflow(Fixtures.Hello);
+    const results = try r.replayListedWorkflows(a, &env.client, query);
+    try testing.expectEqual(@as(usize, runs), results.len);
+    var seen: [runs]bool = @splat(false);
+    for (results) |result| {
+        try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), result.err);
+        try testing.expectEqualStrings("", result.message);
+        try testing.expect(std.mem.startsWith(u8, result.workflow_id, "listed-hello-"));
+        for (run_ids, 0..) |run_id, i| {
+            if (std.mem.eql(u8, run_id, result.run_id)) {
+                try testing.expect(!seen[i]);
+                seen[i] = true;
+                break;
+            }
+        } else return error.TestUnexpectedResult;
+    }
+
+    var changed: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .task_queue = env.task_queue });
+    defer changed.deinit();
+    try changed.registerWorkflow(Fixtures.Different);
+    const changed_results = try changed.replayListedWorkflows(a, &env.client, query);
+    try testing.expectEqual(@as(usize, runs), changed_results.len);
+    for (changed_results) |result| {
+        try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, error.Nondeterminism), result.err);
+        try testing.expect(std.mem.startsWith(u8, result.message, "NONDETERMINISM: "));
+        try testing.expect(std.mem.startsWith(u8, result.workflow_id, "listed-hello-"));
+        try testing.expect(result.run_id.len > 0);
+    }
+
+    const none = try r.replayListedWorkflows(a, &env.client, "WorkflowType='NoSuchWorkflow'");
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+const ListedReplayCall = struct {
+    replayer: *WorkflowReplayer,
+    arena: Allocator,
+    client: *client_mod.Client,
+    query: []const u8,
+    results: WorkflowReplayer.ReplayListedError![]WorkflowReplayer.ReplayResult = &.{},
+    done: Io.Event = .unset,
+
+    fn run(call: *ListedReplayCall) void {
+        call.results = call.replayer.replayListedWorkflows(call.arena, call.client, call.query);
+        call.done.set(testing.io);
+    }
+};
+
+test "WorkflowReplayer replayListedWorkflows returns when a listed run has no workflow task yet" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var completed = try env.startWorkflow(Fixtures.Hello, .{ .id = "listed-no-task-completed", .task_queue = "" }, .{"Temporal"});
+    defer completed.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try env.getResult(Fixtures.Hello, &completed, a, null));
+    // Both runs are open with only their started event: a cron run waiting for its next
+    // fire and a delayed start. A query on the workflow type lists them.
+    var cron = try env.startWorkflow(Fixtures.Hello, .{ .id = "listed-no-task-cron", .task_queue = "", .cron_schedule = "0 0 1 1 *" }, .{"Temporal"});
+    defer cron.deinit();
+    var delayed = try env.startWorkflow(Fixtures.Hello, .{ .id = "listed-no-task-delayed", .task_queue = "", .start_delay = .fromSeconds(3600) }, .{"Temporal"});
+    defer delayed.deinit();
+    const query = "WorkflowId STARTS_WITH 'listed-no-task-'";
+    try waitForCount(&env.client, query, 3);
+    try waitForCount(&env.client, "WorkflowId STARTS_WITH 'listed-no-task-' AND ExecutionStatus='Completed'", 1);
+
+    var r: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .task_queue = env.task_queue });
+    defer r.deinit();
+    try r.registerWorkflow(Fixtures.Hello);
+    var call: ListedReplayCall = .{ .replayer = &r, .arena = a, .client = &env.client, .query = query };
+    const thread = try std.Thread.spawn(.{}, ListedReplayCall.run, .{&call});
+    // A replay that never returns can't be cleaned up after: stop the dev server, so it
+    // doesn't outlive the test process, and end the test run.
+    call.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } }) catch |err| {
+        env.deinit();
+        std.debug.panic("replayListedWorkflows(\"{s}\") hasn't returned after 60s ({t}): it hangs on a listed run whose history has no workflow task", .{ query, err });
+    };
+    thread.join();
+    const results = try call.results;
+    try testing.expectEqual(@as(usize, 3), results.len);
+    for (results) |result| {
+        if (std.mem.eql(u8, result.workflow_id, "listed-no-task-completed")) {
+            try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), result.err);
+        }
+    }
 }
 
 test "client: a history iterator pages lazily, matches fetchHistory, and filters the close event" {

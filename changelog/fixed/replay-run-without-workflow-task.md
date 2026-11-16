@@ -1,0 +1,1 @@
+`testing.WorkflowReplayer` no longer waits forever on a history with no workflow task yet, such as a cron run waiting for its next fire or a run started with `start_delay`: it replays cleanly, since no workflow code has run.

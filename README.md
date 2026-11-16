@@ -2114,6 +2114,7 @@ Notes:
 
 - `replayHistoryJson` and `replayHistoryFromJsonFile` read histories exported by the Temporal CLI or Web UI.
 - `replayHistories` replays many histories and returns a result for each instead of stopping at the first failure.
+- `replayListedWorkflows(arena, client, query)` replays every run a visibility query lists, such as `WorkflowType='greeting' AND ExecutionStatus='Completed'`, through one replay worker. It pages through the listing and fetches each run's history itself, and returns a result per run with its workflow ID, run ID, and any error and message; a listing or fetch failure ends the batch with an error. Only the results are allocated from `arena`; the histories are fetched one at a time into memory the call reuses and frees, so a batch holds the results, one listing page, and about twice the largest single history. A run with no workflow task yet, such as a cron run waiting for its next fire, gets a clean result.
 - Set `workflow_id` and `initWithOptions` to the original values when the workflow's commands depend on them.
 
 #### Metrics recorder
