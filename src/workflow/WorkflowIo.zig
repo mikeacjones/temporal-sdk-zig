@@ -21,6 +21,7 @@
 const WorkflowIo = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
@@ -333,6 +334,7 @@ const block_classes = 11; // 64 bytes to 64 KiB
 const block_max = block_min << (block_classes - 1);
 const block_align: Alignment = .@"16";
 const FreeBlock = struct { next: ?*FreeBlock };
+const free_poison: u8 = 0xdf;
 const OversizeBlock = struct { next: ?*OversizeBlock, len: usize, alignment: Alignment };
 
 fn isOversize(size: usize, alignment: Alignment) bool {
@@ -374,6 +376,8 @@ fn freeBlock(w: *WorkflowIo, mem: []u8, alignment: Alignment) void {
     }
     const class = blockClass(mem.len);
     assert(mem.len == @as(usize, block_min) << class);
+    // Tests check that no freed block is written to before it is reused.
+    if (builtin.is_test) @memset(mem[@sizeOf(FreeBlock)..], free_poison);
     const b: *FreeBlock = @ptrCast(@alignCast(mem.ptr));
     b.next = w.free_blocks[class];
     w.free_blocks[class] = b;
@@ -676,10 +680,12 @@ fn finishGroup(w: *WorkflowIo, group: *Io.Group, g: *GroupState) void {
 fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Cancelable!void {
     const w = self(userdata);
     const g: *GroupState = @ptrCast(@alignCast(token));
+    var result: Io.Cancelable!void = {};
     if (g.pending > 0) {
         if (w.refuse("Group.await")) return error.Canceled;
         var wait = w.newWait(.{ .what = "the coroutines of a std.Io.Group (Group.await)" });
         g.awaiter = &wait;
+        // Runs before finishGroup below frees `g`.
         defer g.awaiter = null;
         w.block(&wait, true) catch |err| {
             // As `std.Io.Group.await` says: the cancellation goes to every member, and the
@@ -690,11 +696,11 @@ fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Can
                 wait = w.newWait(.{ .what = "the coroutines of a std.Io.Group (Group.await)" });
                 w.block(&wait, false) catch unreachable;
             }
-            w.finishGroup(group, g);
-            return err;
+            result = err;
         };
     }
     w.finishGroup(group, g);
+    return result;
 }
 
 fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
@@ -1118,6 +1124,68 @@ test "canceling a coroutine waiting in Group.await cancels every member and retu
     try testing.expectEqual(@as(?anyerror, error.Canceled), inner[1]);
     try testing.expectEqual(@as(u32, 2), e.fake.canceled);
     try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+/// Fails if anything wrote to a pooled block after freeBlock put it on the free list.
+fn expectFreeBlocksUntouched(w: *const WorkflowIo) !void {
+    var free: usize = 0;
+    for (w.free_blocks, 0..) |head, class| {
+        const len = @as(usize, block_min) << @intCast(class);
+        var it = head;
+        while (it) |b| : (it = b.next) {
+            const p: [*]const u8 = @ptrCast(b);
+            for (p[@sizeOf(FreeBlock)..len]) |byte| try testing.expectEqual(free_poison, byte);
+            free += 1;
+        }
+    }
+    try testing.expect(free > 0);
+}
+
+/// Cancels a group of two hour-long sleepers with Group.cancel after a second.
+fn cancelSleeperGroup(i: Io, inner: *[2]?anyerror) void {
+    var g: Io.Group = .init;
+    for (inner) |*r| g.async(i, sleepForever, .{ i, r });
+    i.sleep(.fromSeconds(1), .awake) catch unreachable;
+    g.cancel(i);
+}
+
+test "finishing a group with pending members leaves its freed state untouched" {
+    {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var inner: [2]?anyerror = .{ error.Unset, error.Unset };
+        var result: ?anyerror = error.Unset;
+        const task = try e.wio.spawn("wf", awaitSleeperGroup, .{ e.wio.io(), &inner, &result });
+        e.wio.run();
+        e.wio.cancelTask(task);
+        e.wio.run();
+        try testing.expectEqual(@as(?anyerror, error.Canceled), result);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+        try expectFreeBlocksUntouched(&e.wio);
+    }
+    {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var inner: [2]?anyerror = .{ error.Unset, error.Unset };
+        _ = try e.wio.spawn("wf", cancelSleeperGroup, .{ e.wio.io(), &inner });
+        e.fake.runAll(&e.wio);
+        try testing.expectEqual(@as(?anyerror, error.Canceled), inner[0]);
+        try testing.expectEqual(@as(?anyerror, error.Canceled), inner[1]);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+        try expectFreeBlocksUntouched(&e.wio);
+    }
+    {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var trace: Trace = .{};
+        _ = try e.wio.spawn("wf", sleepers, .{ e.wio.io(), &trace });
+        e.fake.runAll(&e.wio);
+        try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 99 }, trace.items());
+        try expectFreeBlocksUntouched(&e.wio);
+    }
 }
 
 fn protectedSleep(i: Io, result: *?anyerror) void {
