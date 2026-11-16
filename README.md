@@ -484,8 +484,34 @@ Notes:
 - Visibility is eventually consistent. An invalid query is `error.RpcFailed`, logged with the server's reason.
 - A cancelled workflow sees `error.Canceled` from its next cancelable wait and may clean up first. `Client.historyIterator` reads history a page at a time, optionally waiting for new events.
 - `Client.terminateWorkflowWithOptions` records details (any value the converter encodes, or `{}` for none) in the terminated event. With `TerminateOptions.first_execution_run_id`, it terminates only the chain of runs that started with that run; another chain is `error.NotFound`, and the workflow keeps running.
-<!-- stub: temporal-sdk-zig-d51.5.30 -->
-- Not implemented yet: a first-execution run ID on `cancelWorkflow`, and links on a termination.
+
+`Client.cancelWorkflowWithOptions` is `cancelWorkflow` with `client.CancelOptions`. Both it and `terminateWorkflowWithOptions` take a `first_execution_run_id`, which limits the call to the chain of runs that started with that run, and `links`, which the server records on the cancel-requested or terminated event:
+
+<!-- example: client-cancel-options -->
+```zig
+// Links record in the workflow's history what asked for the stop.
+const links = [_]temporal.proto.temporal.api.common.v1.Link{.{ .variant = .{ .workflow_event = .{
+    .namespace = client.namespace,
+    .workflow_id = requester_id,
+    .run_id = requester_run_id,
+} } }};
+// Only the chain of runs that began with `first_run_id`: if the workflow ID has since
+// started a new chain, the call returns error.NotFound and changes nothing.
+if (force) {
+    try client.terminateWorkflowWithOptions(workflow_id, "", "forced stop", {}, .{
+        .first_execution_run_id = first_run_id,
+        .links = &links,
+    });
+} else {
+    try client.cancelWorkflowWithOptions(workflow_id, "", "no longer needed", .{
+        .first_execution_run_id = first_run_id,
+        .links = &links,
+    });
+}
+```
+Notes:
+- The chain's first run stays the same across continue-as-new and resets, so naming it reaches the chain's current run. A later run's ID, or another chain's, is `error.NotFound`, and nothing is canceled or terminated.
+- `links` are `temporal.proto.temporal.api.common.v1.Link` values, read only during the call. The server accepts `workflow_event` links, which need a namespace, workflow ID, and run ID, and `batch_job` links; it refuses other kinds, or a link missing a field, with `error.RpcFailed`, logged with its reason.
 
 #### Schedules
 

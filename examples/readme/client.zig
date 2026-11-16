@@ -240,6 +240,43 @@ pub fn manageWorkflows(client: *temporal.client.Client, arena: Allocator) !void 
     defer stuck.deinit();
     try client.terminateWorkflow(stuck.id, stuck.run_id, "stuck");
     try std.testing.expectError(error.WorkflowTerminated, stuck.get(arena));
+
+    var chain = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-chain", .task_queue = "greetings" }, .{"Cy"});
+    defer chain.deinit();
+    // Another chain's first run changes nothing.
+    try std.testing.expectError(error.NotFound, stopChain(client, chain.id, run.run_id, run.id, run.run_id, false));
+    try stopChain(client, chain.id, chain.run_id, run.id, run.run_id, false);
+    try std.testing.expectError(error.WorkflowCanceled, chain.get(arena));
+    var forced = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-forced", .task_queue = "greetings" }, .{"Di"});
+    defer forced.deinit();
+    try stopChain(client, forced.id, forced.run_id, run.id, run.run_id, true);
+    try std.testing.expectError(error.WorkflowTerminated, forced.get(arena));
+}
+
+/// Cancels, or with `force` terminates, the workflow `workflow_id` if its chain of runs
+/// began with the run `first_run_id`, linking the request to the run that asked for it.
+pub fn stopChain(client: *temporal.client.Client, workflow_id: []const u8, first_run_id: []const u8, requester_id: []const u8, requester_run_id: []const u8, force: bool) !void {
+    // example: client-cancel-options
+    // Links record in the workflow's history what asked for the stop.
+    const links = [_]temporal.proto.temporal.api.common.v1.Link{.{ .variant = .{ .workflow_event = .{
+        .namespace = client.namespace,
+        .workflow_id = requester_id,
+        .run_id = requester_run_id,
+    } } }};
+    // Only the chain of runs that began with `first_run_id`: if the workflow ID has since
+    // started a new chain, the call returns error.NotFound and changes nothing.
+    if (force) {
+        try client.terminateWorkflowWithOptions(workflow_id, "", "forced stop", {}, .{
+            .first_execution_run_id = first_run_id,
+            .links = &links,
+        });
+    } else {
+        try client.cancelWorkflowWithOptions(workflow_id, "", "no longer needed", .{
+            .first_execution_run_id = first_run_id,
+            .links = &links,
+        });
+    }
+    // end-example
 }
 
 pub fn resetGreeter(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8) ![]const u8 {

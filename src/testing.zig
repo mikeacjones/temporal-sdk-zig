@@ -3992,7 +3992,7 @@ test "client: summary, details, priority and a versioning override set at start 
     try testing.expect(plain_started.priority == null);
 }
 
-/// A client interceptor that keeps a copy of every terminate, reset and execution-options
+/// A client interceptor that keeps a copy of every terminate, cancel, reset and execution-options
 /// request, recorded before the call goes on so a refused call is recorded too. It can play
 /// the server for those calls: `options_answer` (or `reset_answer`) answers
 /// UpdateWorkflowExecutionOptions (or ResetWorkflowExecution), `fail_with` fails them, and
@@ -4005,6 +4005,7 @@ const RequestCapture = struct {
     mutex: Io.Mutex = .init,
     arena: std.heap.ArenaAllocator,
     terminates: std.ArrayList(wfs.TerminateWorkflowExecutionRequest) = .empty,
+    cancels: std.ArrayList(wfs.RequestCancelWorkflowExecutionRequest) = .empty,
     resets: std.ArrayList(wfs.ResetWorkflowExecutionRequest) = .empty,
     option_updates: std.ArrayList(wfs.UpdateWorkflowExecutionOptionsRequest) = .empty,
     options_answer: ?wfs.UpdateWorkflowExecutionOptionsResponse = null,
@@ -4021,6 +4022,8 @@ const RequestCapture = struct {
             // The request's memory is the call's arena, freed when the call returns.
             if (input.request(wfs.TerminateWorkflowExecutionRequest)) |req| {
                 try r.terminates.append(a, try req.dupe(a));
+            } else if (input.request(wfs.RequestCancelWorkflowExecutionRequest)) |req| {
+                try r.cancels.append(a, try req.dupe(a));
             } else if (input.request(wfs.ResetWorkflowExecutionRequest)) |req| {
                 try r.resets.append(a, try req.dupe(a));
             } else if (input.request(wfs.UpdateWorkflowExecutionOptionsRequest)) |req| {
@@ -4248,6 +4251,94 @@ test "client: terminate with details and a first-execution run ID; unknown, clos
     // A closed chain and an unknown workflow.
     try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(guarded.id, "", "again", {}, .{}));
     try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions("no-such-workflow", "", "x", {}, .{}));
+}
+
+test "client: cancel with a first-execution run ID after continue-as-new, and links on cancel and terminate requests" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    try env.registerWorkflow(ResetFixtures.Hop);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+    const common = proto.temporal.api.common.v1;
+
+    // cancelWorkflow keeps its signature and error set.
+    try testing.expect(@TypeOf(client_mod.Client.cancelWorkflow) == fn (*client_mod.Client, []const u8, []const u8, []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void);
+    const cancel_defaults: client_mod.CancelOptions = .{};
+    try testing.expectEqualStrings("", cancel_defaults.first_execution_run_id);
+    try testing.expectEqual(0, cancel_defaults.links.len);
+    try testing.expectEqual(0, (client_mod.TerminateOptions{}).links.len);
+
+    // A chain that continued as new once: its second run waits for an approval.
+    var chain = try env.startWorkflow(ResetFixtures.Hop, .{ .id = "cancel-chain", .task_queue = "" }, .{1});
+    defer chain.deinit();
+    defer c.terminateWorkflow(chain.id, "", "test cleanup") catch {};
+    var close = try c.historyIterator(chain.id, chain.run_id, .{ .wait_new_event = true, .filter = .close_event });
+    defer close.deinit();
+    const hopped = switch (((try close.next(a)) orelse return error.TestUnexpectedResult).attributes orelse return error.TestUnexpectedResult) {
+        .workflow_execution_continued_as_new_event_attributes => |attrs| attrs.new_execution_run_id,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = try ResetFixtures.firstTaskCompleted(c, chain.id, hopped);
+
+    // Another run's ID, or an unrelated one, isn't the chain's first: nothing is canceled.
+    try testing.expectError(error.NotFound, c.cancelWorkflowWithOptions(chain.id, "", "later run", .{ .first_execution_run_id = hopped }));
+    try testing.expectError(error.NotFound, c.cancelWorkflowWithOptions(chain.id, "", "other chain", .{ .first_execution_run_id = try client_mod.uuid(a, testing.io) }));
+    const still = try c.describeWorkflow(a, chain.id, "");
+    try testing.expectEqualStrings(hopped, still.run_id);
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, still.status);
+    try testing.expectEqual(0, try ResetFixtures.countEvents(c, a, chain.id, hopped, .workflow_execution_cancel_requested_event_attributes));
+
+    // The chain's first run ID cancels the current run, with the links in the request.
+    const cancel_links = [_]common.Link{.{ .variant = .{ .workflow_event = .{ .namespace = c.namespace, .workflow_id = "cancel-cause", .run_id = "cause-run" } } }};
+    try c.cancelWorkflowWithOptions(chain.id, "", "operator request", .{ .first_execution_run_id = chain.run_id, .links = &cancel_links });
+    _ = try ResetFixtures.awaitEvent(c, chain.id, hopped, .workflow_execution_canceled_event_attributes, 1);
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.canceled, (try c.describeWorkflow(a, chain.id, hopped)).status);
+    for ((try c.fetchHistory(a, chain.id, hopped)).events.items) |event| switch (event.attributes orelse continue) {
+        .workflow_execution_cancel_requested_event_attributes => |attrs| {
+            try testing.expectEqualStrings("operator request", attrs.cause);
+            // The server records the links on the event.
+            try testing.expectEqual(1, event.links.items.len);
+            try testing.expectEqualStrings("cancel-cause", event.links.items[0].variant.?.workflow_event.workflow_id);
+        },
+        else => {},
+    };
+
+    try testing.expectEqual(3, capture.cancels.items.len);
+    for (capture.cancels.items, [_][]const u8{ hopped, "", chain.run_id }) |request, first| {
+        try testing.expectEqualStrings(chain.id, request.workflow_execution.?.workflow_id);
+        if (first.len > 0) try testing.expectEqualStrings(first, request.first_execution_run_id);
+    }
+    try testing.expectEqual(0, capture.cancels.items[0].links.items.len);
+    const sent_cancel = capture.cancels.items[2];
+    try testing.expectEqualStrings("operator request", sent_cancel.reason);
+    try testing.expectEqual(1, sent_cancel.links.items.len);
+    try testing.expectEqualStrings("cancel-cause", sent_cancel.links.items[0].variant.?.workflow_event.workflow_id);
+    try testing.expectEqualStrings("cause-run", sent_cancel.links.items[0].variant.?.workflow_event.run_id);
+
+    // Links on a terminate reach its request.
+    var run = try c.executeWorkflow(Fixtures.Hello, .{ .id = "terminate-links", .task_queue = "nobody-polls-this" }, .{"linked"});
+    defer run.deinit();
+    defer c.terminateWorkflow(run.id, "", "test cleanup") catch {};
+    const terminate_links = [_]common.Link{
+        .{ .variant = .{ .workflow_event = .{ .namespace = c.namespace, .workflow_id = "terminate-cause", .run_id = "cause-run" } } },
+        .{ .variant = .{ .batch_job = .{ .job_id = "batch-7" } } },
+    };
+    try c.terminateWorkflowWithOptions(run.id, "", "linked", {}, .{ .links = &terminate_links });
+    try testing.expectError(error.WorkflowTerminated, run.get(a));
+    const terminated_event = try ResetFixtures.lastEvent(c, a, run.id, run.run_id);
+    try testing.expectEqual(2, terminated_event.links.items.len);
+    try testing.expectEqualStrings("batch-7", terminated_event.links.items[1].variant.?.batch_job.job_id);
+    const sent_terminate = capture.terminates.items[capture.terminates.items.len - 1];
+    try testing.expectEqualStrings("terminate-links", sent_terminate.workflow_execution.?.workflow_id);
+    try testing.expectEqual(2, sent_terminate.links.items.len);
+    try testing.expectEqualStrings("terminate-cause", sent_terminate.links.items[0].variant.?.workflow_event.workflow_id);
+    try testing.expectEqualStrings("batch-7", sent_terminate.links.items[1].variant.?.batch_job.job_id);
 }
 
 test "client: terminate details pass through the client's codecs" {

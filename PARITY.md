@@ -45,7 +45,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Eager workflow start (Public Preview) | Go, Java, Python, .NET, Ruby | pre-release | supported | [eager-workflow-start](samples/eager-workflow-start) |
 | Workflow handles: result, describe, and history | all | GA | supported | [Describing, listing, cancelling, and terminating](README.md#describing-listing-cancelling-and-terminating) |
 | List and count workflows with a visibility query | all | GA | supported | [Describing, listing, cancelling, and terminating](README.md#describing-listing-cancelling-and-terminating) |
-| Cancel and terminate workflows | all | GA | partial | `temporal-sdk-zig-d51.5.38`. Missing: a first-execution run ID on cancel, and links on a termination. |
+| Cancel and terminate workflows | all | GA | supported | [Describing, listing, cancelling, and terminating](README.md#describing-listing-cancelling-and-terminating) |
 | Signal, query, and update a workflow | all | GA | supported | [Signals, queries, and updates](README.md#signals-queries-and-updates), [reqrespupdate](samples/reqrespupdate) |
 | Signal-with-start | all | GA | supported | [Signals, queries, and updates](README.md#signals-queries-and-updates) |
 | Update-with-start | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Signals, queries, and updates](README.md#signals-queries-and-updates), [early-return](samples/early-return) |

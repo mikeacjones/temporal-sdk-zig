@@ -1480,19 +1480,22 @@ pub const Client = struct {
     /// `terminateWorkflow` with `details` recorded in the terminated event (any value the
     /// converter encodes, encoded with the client's codecs, or `{}` for none) and
     /// `options`. A `first_execution_run_id` that isn't the chain's first run is
-    /// `error.NotFound`, and the workflow keeps running. Only read during the call.
+    /// `error.NotFound`, and the workflow keeps running. `options.links` are recorded in the
+    /// terminated event. Only read during the call.
     pub fn terminateWorkflowWithOptions(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8, details: anytype, options: TerminateOptions) TerminateError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        _ = c.rpc(wfs.TerminateWorkflowExecutionResponse, "TerminateWorkflowExecution", wfs.TerminateWorkflowExecutionRequest{
+        var request: wfs.TerminateWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .reason = reason,
             .details = try detailPayloads(a, details),
             .identity = c.identity,
             .first_execution_run_id = options.first_execution_run_id,
-        }, a) catch |err| switch (err) {
+        };
+        try request.links.appendSlice(a, options.links);
+        _ = c.rpc(wfs.TerminateWorkflowExecutionResponse, "TerminateWorkflowExecution", request, a) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
         };
@@ -1604,17 +1607,28 @@ pub const Client = struct {
     /// from its next cancelable wait and may clean up before it returns; the run ends
     /// canceled when the workflow returns `error.Canceled`. An empty `run_id` targets the
     /// latest run. Returns `error.NotFound` if no such workflow exists.
+    /// `cancelWorkflowWithOptions` takes options.
     pub fn cancelWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void {
+        return c.cancelWorkflowWithOptions(workflow_id, run_id, reason, .{});
+    }
+
+    /// `cancelWorkflow` with `options`. A `first_execution_run_id` that isn't the chain's
+    /// first run is `error.NotFound`, and nothing is canceled. `options.links` are recorded
+    /// in the cancel-requested event. Only read during the call.
+    pub fn cancelWorkflowWithOptions(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8, options: CancelOptions) CancelError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        _ = c.rpc(wfs.RequestCancelWorkflowExecutionResponse, "RequestCancelWorkflowExecution", wfs.RequestCancelWorkflowExecutionRequest{
+        var request: wfs.RequestCancelWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
             .reason = reason,
-        }, a) catch |err| switch (err) {
+            .first_execution_run_id = options.first_execution_run_id,
+        };
+        try request.links.appendSlice(a, options.links);
+        _ = c.rpc(wfs.RequestCancelWorkflowExecutionResponse, "RequestCancelWorkflowExecution", request, a) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
         };
@@ -2719,6 +2733,30 @@ pub const TerminateOptions = struct {
     /// chain that didn't is `error.NotFound`. The chain's first run stays the original one
     /// across resets and continue-as-new. Empty checks nothing.
     first_execution_run_id: []const u8 = "",
+    /// Links to related executions or events, recorded in the terminated event.
+    links: []const proto.temporal.api.common.v1.Link = &.{},
+};
+
+/// How `Client.cancelWorkflowWithOptions` requests cancellation.
+pub const CancelOptions = struct {
+    /// Requests cancellation only if the workflow's chain of runs started with the run of
+    /// this ID; a chain that didn't is `error.NotFound`. The chain's first run stays the
+    /// original one across resets and continue-as-new. Empty checks nothing.
+    first_execution_run_id: []const u8 = "",
+    /// Links to related executions or events, recorded in the cancel-requested event.
+    links: []const proto.temporal.api.common.v1.Link = &.{},
+};
+
+pub const CancelError = error{
+    OutOfMemory,
+    Canceled,
+    /// The server refused; logged with its reason.
+    RpcFailed,
+    /// No such workflow, the run has closed, or it isn't the chain `first_execution_run_id`
+    /// names.
+    NotFound,
+    InvalidResponse,
+    CodecFailed,
 };
 
 pub const TerminateError = error{
