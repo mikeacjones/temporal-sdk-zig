@@ -192,6 +192,49 @@ pub fn noteProgress(s: *Scheduler) void {
     _ = s.switches.fetchAdd(1, .release);
 }
 
+/// Keeps `switches` advancing, from a thread of its own, while the scheduler's thread does SDK
+/// work that can't call `noteProgress` often enough itself: the first read of debug info to
+/// answer the stack trace query is one call into std that can take seconds on a slow machine,
+/// longer than the worker's deadlock detection allows. Notes progress every
+/// `heartbeat_interval` from `start` until `stop`. Where no thread can be started (a
+/// single-threaded build, or the spawn fails) it does nothing, and only the caller's own
+/// `noteProgress` calls count.
+pub const Heartbeat = struct {
+    sched: *Scheduler,
+    stopped: std.Io.Event = .unset,
+    thread: ?std.Thread = null,
+
+    pub fn start(hb: *Heartbeat) void {
+        hb.sched.noteProgress();
+        if (builtin.single_threaded) return;
+        hb.thread = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, beat, .{hb}) catch null;
+    }
+
+    pub fn stop(hb: *Heartbeat) void {
+        hb.sched.noteProgress();
+        const t = hb.thread orelse return;
+        hb.stopped.set(std.Options.debug_io);
+        t.join();
+        hb.thread = null;
+    }
+
+    fn beat(hb: *Heartbeat) void {
+        const io = std.Options.debug_io;
+        const interval: std.Io.Clock.Duration = .{ .raw = heartbeat_interval, .clock = .awake };
+        while (true) {
+            if (hb.stopped.waitTimeout(io, .{ .duration = interval })) |_| {
+                return;
+            } else |err| switch (err) {
+                error.Timeout => hb.sched.noteProgress(),
+                error.Canceled => return,
+            }
+        }
+    }
+};
+
+/// How often a `Heartbeat` notes progress.
+pub const heartbeat_interval: std.Io.Duration = .fromMilliseconds(10);
+
 /// The oldest unfinished fiber; `Fiber.live_next` gives the rest in spawn order.
 pub fn firstLive(s: *const Scheduler) ?*Fiber {
     return s.live_head;

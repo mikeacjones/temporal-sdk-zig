@@ -433,3 +433,53 @@ test "__stack_trace: names that aren't valid UTF-8 or hold newlines are escaped,
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n\ncoroutine "));
     _ = try entry(text, "coroutine 1 \"main\\n\\ncoroutine 9 \\\"fake\\\", the workflow function, waits on nothing\u{fffd}\", the workflow function, waits on activity \"bad\u{fffd}\u{fffd}\\\"type\\n\"");
 }
+
+/// Watches a scheduler's `switches` as the worker's deadlock detector does, and keeps the
+/// longest stretch it saw the count unchanged.
+const ProgressWatch = struct {
+    switches: *const std.atomic.Value(u64),
+    done: std.atomic.Value(bool) = .init(false),
+    longest: std.Io.Duration = .zero,
+
+    fn run(w: *ProgressWatch) void {
+        const io = std.Options.debug_io;
+        var seen = w.switches.load(.acquire);
+        var since = std.Io.Clock.awake.now(io);
+        while (!w.done.load(.acquire)) {
+            std.Io.sleep(io, .fromMilliseconds(2), .awake) catch return;
+            const now = std.Io.Clock.awake.now(io);
+            const gap = since.durationTo(now);
+            if (gap.nanoseconds > w.longest.nanoseconds) w.longest = gap;
+            const switches = w.switches.load(.acquire);
+            if (switches != seen) {
+                seen = switches;
+                since = now;
+            }
+        }
+    }
+};
+
+test "__stack_trace keeps noting progress while a slow read of debug info runs, so deadlock detection doesn't fire" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try Instance.create(testing.allocator, WaitsWf.registered, .{});
+    defer inst.destroy();
+    try startWaits(inst, a, false);
+
+    // Stands in for a first read of debug info that is slower than the deadlock limit.
+    const stall: std.Io.Duration = .fromMilliseconds(500);
+    Instance.stack_trace_test_stall = stall;
+    defer Instance.stack_trace_test_stall = null;
+    var watch: ProgressWatch = .{ .switches = &inst.sched.switches };
+    const thread = try std.Thread.spawn(.{}, ProgressWatch.run, .{&watch});
+    const text = stackTrace(inst, a);
+    watch.done.store(true, .release);
+    thread.join();
+    _ = try entry(try text, "coroutine 1 \"workflow\", the workflow function, waits on activity \"slow\"");
+    if (watch.longest.nanoseconds >= @divTrunc(stall.nanoseconds, 2)) {
+        std.debug.print("the progress count stood still for {f} while the answer stalled for {f}\n", .{ watch.longest, stall });
+        return error.TestUnexpectedResult;
+    }
+}

@@ -36,6 +36,7 @@ const propagation = @import("../propagation.zig");
 const interceptor = @import("../interceptor.zig");
 const metrics_mod = @import("../metrics.zig");
 const deployment = @import("../deployment.zig");
+const builtin = @import("builtin");
 const Scheduler = @import("Scheduler.zig");
 const WorkflowIo = @import("WorkflowIo.zig");
 const call_sites = @import("call_sites.zig");
@@ -993,7 +994,10 @@ pub const stack_trace_query = "__stack_trace";
 /// nothing, so a replayed run answers as the run that first got there did. Recording costs
 /// each wait a few stores (`WorkflowIo.Wait.Reason` and `Task.waiting_on`), and an activity's
 /// wait a copy of up to `max_wait_name` bytes of its type to the waiting coroutine's stack; it
-/// allocates nothing, so a long run grows no more for it. Stacks are unwound and debug info is read only when the query arrives.
+/// allocates nothing, so a long run grows no more for it. Stacks are unwound and debug info is
+/// read only when the query arrives. While answering, a thread of its own notes progress
+/// (`Scheduler.Heartbeat`), since the first read of debug info can outlast
+/// `worker.Options.deadlock_detection_timeout` and isn't workflow code.
 fn stackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}![]const u8 {
     var text: std.Io.Writer.Allocating = .init(out);
     errdefer text.deinit();
@@ -1002,6 +1006,10 @@ fn stackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}![]const u8 {
     };
     return text.toOwnedSlice() catch return error.OutOfMemory;
 }
+
+/// Test builds only: how long `writeStackTrace` stalls after reading debug info, standing in
+/// for a slow first read.
+pub var stack_trace_test_stall: ?std.Io.Duration = null;
 
 fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{OutOfMemory} || std.Io.Writer.Error)!void {
     if (inst.finished) {
@@ -1017,10 +1025,14 @@ fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{Ou
     while (it) |f| : (it = f.live_next) count += 1;
     try w.print("workflow \"{f}\": {d} coroutine{s}\n", .{ call_sites.text(inst.info.workflow_type), count, if (count == 1) "" else "s" });
 
-    // Reading debug info the first time can take a while; it isn't workflow code.
+    // Reading debug info the first time can take seconds, in one call into std; it isn't
+    // workflow code, so the heartbeat keeps the deadlock detector from taking it for some.
+    var heartbeat: Scheduler.Heartbeat = .{ .sched = &inst.sched };
+    heartbeat.start();
+    defer heartbeat.stop();
     var reader = try call_sites.Reader.init(out);
     defer if (reader) |*r| r.deinit();
-    inst.sched.noteProgress();
+    if (builtin.is_test) if (stack_trace_test_stall) |d| std.Io.sleep(std.Options.debug_io, d, .awake) catch {};
     it = inst.sched.firstLive();
     while (it) |f| : (it = f.live_next) {
         try w.print("\ncoroutine {d} \"{f}\", ", .{ f.id, call_sites.text(f.name) });
