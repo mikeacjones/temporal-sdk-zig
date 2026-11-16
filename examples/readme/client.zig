@@ -27,6 +27,61 @@ fn connectExamples(gpa: Allocator, io: Io, arena: Allocator, api_key: []const u8
     // end-example
 }
 
+fn lazyConnectExample(gpa: Allocator, io: Io, options: temporal.client.Options, rotated_key: []const u8) !void {
+    // example: client-lazy
+    // Nothing goes over the network yet: the first call that needs the server connects.
+    var client = try temporal.client.Client.init(gpa, io, options);
+    defer client.close();
+    // Optional: connect now, to see a failure here rather than on the first call.
+    try client.ensureConnected();
+    // Rotate the API key and headers: every later call, the workers' included, sends these.
+    try client.updateApiKey(rotated_key);
+    try client.updateHeaders(&.{.{ .key = "x-tenant", .value = "blue" }});
+    // end-example
+}
+
+fn namespacesExample(gpa: Allocator, io: Io, options: temporal.client.Options) !u64 {
+    // example: client-namespaces
+    var client = try temporal.client.Client.connect(gpa, io, options);
+    defer client.close();
+    // Another namespace of the same server, over the same connection and runtime.
+    var billing = try client.forNamespace("billing");
+    defer billing.close();
+    // Its calls, and workers on it, work in "billing".
+    const open_invoices = try billing.countWorkflows("ExecutionStatus = 'Running'");
+    // end-example
+    return open_invoices;
+}
+
+fn rpcOptionsExample(client: *temporal.client.Client, request_id: []const u8) !u64 {
+    // example: client-rpc-options
+    // A view of the client whose calls get their own deadline and extra gRPC metadata.
+    var quick = try client.withRpcOptions(.{
+        .timeout = .fromSeconds(2),
+        .metadata = &.{.{ .key = "x-request-id", .value = request_id }},
+        .binary_metadata = &.{.{ .key = "x-trace-bin", .value = &.{ 0x01, 0x02 } }},
+    });
+    // Calls through it, and the handles they return, send those; `client`'s own calls don't.
+    const running = try quick.countWorkflows("ExecutionStatus = 'Running'");
+    // end-example
+    return running;
+}
+
+fn transportExample(gpa: Allocator, io: Io, proxy_password: []const u8) !void {
+    // example: client-transport
+    var client = try temporal.client.Client.connect(gpa, io, .{
+        .host_port = "temporal.internal:7233",
+        // Tunnel the connection through an HTTP CONNECT proxy, with basic auth (both or neither).
+        .http_connect_proxy = .{ .host_port = "proxy.corp:3128", .username = "svc", .password = proxy_password },
+        // Ping every 10 s and drop the connection when a ping goes unanswered for 5 s.
+        .keep_alive = .{ .interval = .fromSeconds(10), .timeout = .fromSeconds(5) },
+        // Workers on this client heartbeat to the server every 30 s; `.zero` turns that off.
+        .worker_heartbeat_interval = .fromSeconds(30),
+    });
+    defer client.close();
+    // end-example
+}
+
 pub fn startWorkflows(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
     // example: client-start
     var run = try client.executeWorkflow(Greeting, .{ .id = "greeting-ada", .task_queue = "greetings", .execution_timeout = .fromSeconds(60) }, .{"Ada"});
@@ -215,18 +270,23 @@ fn runWorker(w: *temporal.worker.Worker) temporal.worker.Worker.RunError!void {
 
 test "client: connecting compiles" {
     _ = &connectExamples;
+    _ = &transportExample;
 }
 
 test "client: examples against a dev server" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var server = try temporal.testing.DevServer.start(gpa, io, .{
-        .extra_args = &temporal.testing.DevServer.standalone_activity_args,
+        .extra_args = &(temporal.testing.DevServer.standalone_activity_args ++ [_][]const u8{ "--namespace", "billing" }),
     });
     defer server.stop(io);
 
+    try lazyConnectExample(gpa, io, server.clientOptions(), "rotated-key");
+    try std.testing.expectEqual(0, try namespacesExample(gpa, io, server.clientOptions()));
+
     var client = try temporal.client.Client.connect(gpa, io, server.clientOptions());
     defer client.close();
+    try std.testing.expectEqual(0, try rpcOptionsExample(&client, "req-1"));
 
     var outbox: Outbox = .{ .gpa = gpa };
     defer gpa.free(outbox.task_token);

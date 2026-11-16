@@ -18,6 +18,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
 - [Usage](#usage)
   - [Client](#client)
     - [Connecting](#connecting)
+    - [Proxy, keep-alive, and worker heartbeats](#proxy-keep-alive-and-worker-heartbeats)
     - [Starting workflows](#starting-workflows)
     - [Signals, queries, and updates](#signals-queries-and-updates)
     - [Describing, listing, cancelling, and terminating](#describing-listing-cancelling-and-terminating)
@@ -252,6 +253,87 @@ Notes:
 - `connect` checks the connection. It returns `error.ConnectFailed`, `error.InvalidOptions`, or `error.RuntimeInitFailed` (sdk-core's runtime couldn't be created), logged with the reason, or `error.OutOfMemory`. Free the client with `close`.
 - `api_key` alone doesn't turn TLS on; `loadOptions` does for a profile with an API key or TLS settings, and returns `error.InvalidConfig`, logged, for a named profile that doesn't exist (in a config file or a missing one), a config file that exists but can't be read or parsed, a key `strict` rejects, a certificate given as both a path and data, or both `disable_file` and `disable_env` set. A missing config file without a named profile isn't an error: its defaults are used. TLS file paths are read on each connect, so `Client.reconnect` picks up rotated certificates.
 - `Options.rpc_timeout` (default 30 s) bounds each call, but not waits for a result. `connect` copies `namespace` and `identity`; `codecs`, `logger`, `propagators`, `worker_interceptors`, and `interceptors` are borrowed and must outlive the client and its workers.
+
+`Client.init` takes the same options but connects on first use, so a process can build its client before the server is reachable. `Client.updateApiKey` and `Client.updateHeaders` rotate the API key and the gRPC headers of a client, connected or not.
+
+<!-- example: client-lazy -->
+```zig
+// Nothing goes over the network yet: the first call that needs the server connects.
+var client = try temporal.client.Client.init(gpa, io, options);
+defer client.close();
+// Optional: connect now, to see a failure here rather than on the first call.
+try client.ensureConnected();
+// Rotate the API key and headers: every later call, the workers' included, sends these.
+try client.updateApiKey(rotated_key);
+try client.updateHeaders(&.{.{ .key = "x-tenant", .value = "blue" }});
+```
+Notes:
+- `init` makes no network call, and an address nobody listens on doesn't fail it. It rejects the options `connect` rejects (header names and values, durations, a TLS certificate given as both PEM and path) with `error.InvalidOptions`, logged; TLS files are read when the client connects. It returns `error.RuntimeInitFailed` or `error.OutOfMemory` as `connect` does.
+- The first call that needs the server connects and checks it: a workflow, schedule, or activity call, `checkHealth`, `currentConnection`, `ensureConnected`, or `worker.Worker.run` on the client. Calls made together from several threads share one attempt, and each waits for it only until its own deadline, `Options.rpc_timeout` (30 s without one) from when the call began, so a server that accepts connections but never answers fails every call within its deadline. Canceling a call's task returns `error.Canceled` from it (`Worker.run` returns `error.ConnectFailed` and keeps the cancel request), and `Worker.stop` ends `run`'s wait at once, after which `run` returns success. A later call joins the attempt if it is still running, and starts another once no call waits for it. `updateApiKey` and `updateHeaders` don't wait, and what they change is sent on the new connection. `ensureConnected` connects explicitly and returns `client.ConnectError`.
+- A first connection that fails is logged as a warning with the reason and leaves the client unconnected, so the next call tries again. `ensureConnected` and `currentConnection` return `error.ConnectFailed` (or `error.InvalidOptions` for a TLS file that can't be read), the client's other calls `error.RpcFailed`, and `Worker.run` `error.ConnectFailed`.
+- `updateApiKey` replaces the API key every later call sends, this client's and its workers'; empty sends none. `updateHeaders` replaces `Options.headers` the same way, and returns `error.InvalidOptions`, logged, for a header name that isn't a gRPC ASCII header (or ends in `-bin`) or a value with bytes other than visible ASCII, space, and tab, leaving the headers unchanged. Calls already sent keep what they had. On a client that hasn't connected yet, they change what it connects with.
+- `Client.reconnect` connects again with its own `client.ConnectionOptions`, so after it the client sends that `api_key` and those `headers`, not those of earlier updates. On a client that hasn't connected yet, `reconnect` makes the first connection with its options, and calls waiting for a first connection get it; if that fails the client stays unconnected and keeps its own. `checkHealth` on such a client connects first. `close` frees a client whether it connected or not, without waiting on the network. If every call gave up on a first connection that sdk-core is still making (sdk-core gives it no deadline, and a server that never answers a TLS handshake keeps it going for good), sdk-core still uses the client's runtime, so `close` leaves the runtime and that attempt allocated for the rest of the process instead of freeing them. sdk-core's logs stop reaching `Options.logger`, but a custom metrics handler stays in use by that runtime and must then outlive the process.
+
+A program that works in several namespaces of one server connects once: `Client.forNamespace` returns a client for another namespace that uses the existing client's connection and sdk-core runtime.
+
+<!-- example: client-namespaces -->
+```zig
+var client = try temporal.client.Client.connect(gpa, io, options);
+defer client.close();
+// Another namespace of the same server, over the same connection and runtime.
+var billing = try client.forNamespace("billing");
+defer billing.close();
+// Its calls, and workers on it, work in "billing".
+const open_invoices = try billing.countWorkflows("ExecutionStatus = 'Running'");
+```
+Notes:
+- `forNamespace` makes no network call and creates no connection or runtime; it returns only `error.OutOfMemory`. The new client copies the namespace, and has the first client's identity, codecs, logger, propagators, interceptors, metrics, and `rpc_timeout`, borrowed from the same `Options`. Workers on it poll its namespace. A client made from it shares the same connection too.
+- The clients own the connection and the runtime together: `close` on one leaves them to the others, and the last to close frees them, so they may be closed in any order, each once, after the calls and workers on it have finished. sdk-core's logs go to the first client's `Options.logger` until then.
+- `reconnect`, `updateApiKey`, and `updateHeaders` on any of them change the connection of all of them, and `reconnect` moves the workers running on any of them. A client from `init` shares its first connection the same way: whichever client needs the server first connects for all.
+- Each `Client.connect` and `Client.init` still creates its own runtime: clients of different servers don't share one.
+
+`Client.withRpcOptions` gives a single call, or a group of calls, its own deadline and gRPC metadata without changing `client.Options`: it returns a view of the client whose calls send `client.RpcOptions`.
+
+<!-- example: client-rpc-options -->
+```zig
+// A view of the client whose calls get their own deadline and extra gRPC metadata.
+var quick = try client.withRpcOptions(.{
+    .timeout = .fromSeconds(2),
+    .metadata = &.{.{ .key = "x-request-id", .value = request_id }},
+    .binary_metadata = &.{.{ .key = "x-trace-bin", .value = &.{ 0x01, 0x02 } }},
+});
+// Calls through it, and the handles they return, send those; `client`'s own calls don't.
+const running = try quick.countWorkflows("ExecutionStatus = 'Running'");
+```
+Notes:
+- Every call made through the view sends its options: workflow start, signal, query, update, describe, list and count, cancel, terminate and reset, history, schedules, worker deployments, standalone activities, asynchronous activity completion and heartbeats, `checkHealth`, and the calls of the handles and iterators the view returns.
+- A view is for single calls: build workers on the client, not on a view. A worker built on a view keeps the view, so `ctx.client()` in its activities and Nexus handlers returns the view and their calls send its timeout and metadata; on a client from `Client.init` that hasn't connected yet, the worker's first connection waits only as long as the view's timeout.
+- `RpcOptions.timeout` replaces `Options.rpc_timeout` for each call (null keeps it). A call that runs out fails with `error.RpcFailed`, logged with gRPC status 1 ("Timeout expired") or 4 (DEADLINE_EXCEEDED). As with `rpc_timeout`, calls that long-poll aren't limited by it: waiting for a workflow's or an activity's result with `get`, for an update to reach its stage or its outcome, and following history with `wait_new_event`. Cancel the calling task to stop those.
+- `metadata` (ASCII) and `binary_metadata` (names ending in `-bin`, any bytes) are sent along with `Options.headers` and the API key, the long-polls included; for a name in both, the view's value is sent, and an `authorization` entry replaces the API key's. `withRpcOptions` returns `error.InvalidOptions`, logged, for a timeout that isn't positive or a name or value gRPC can't send.
+- The view borrows the client and the options' slices, which must outlive it and the handles it returns. It owns nothing: `close` on it does nothing. `forNamespace` on a view returns a full client without the view's options; a view of a client from `forNamespace` works in that client's namespace.
+
+#### Proxy, keep-alive, and worker heartbeats
+
+Three more `client.Options` fields shape the connection and what workers send over it: `http_connect_proxy` routes the connection through an HTTP CONNECT proxy, `keep_alive` sets the gRPC keep-alive pings, and `worker_heartbeat_interval` sets how often workers report themselves to the server.
+
+<!-- example: client-transport -->
+```zig
+var client = try temporal.client.Client.connect(gpa, io, .{
+    .host_port = "temporal.internal:7233",
+    // Tunnel the connection through an HTTP CONNECT proxy, with basic auth (both or neither).
+    .http_connect_proxy = .{ .host_port = "proxy.corp:3128", .username = "svc", .password = proxy_password },
+    // Ping every 10 s and drop the connection when a ping goes unanswered for 5 s.
+    .keep_alive = .{ .interval = .fromSeconds(10), .timeout = .fromSeconds(5) },
+    // Workers on this client heartbeat to the server every 30 s; `.zero` turns that off.
+    .worker_heartbeat_interval = .fromSeconds(30),
+});
+defer client.close();
+```
+Notes:
+- `http_connect_proxy` (default null: connect directly) sends the connection to `host_port` through an HTTP CONNECT tunnel; TLS, when set, still runs end to end with the server inside the tunnel. `username` and `password` send basic auth to the proxy and go together: set both or neither. An empty `host_port`, or only one of the credentials, makes `connect` and `init` return `error.InvalidOptions`, logged. Set it to null to connect directly.
+- `keep_alive` defaults to a ping every 30 s, sent even while the connection is idle; a ping not answered within 15 s drops the connection, and later calls connect again. Both durations must be positive, or `connect` and `init` return `error.InvalidOptions`, logged. Set `keep_alive` to null to send no pings.
+- `worker_heartbeat_interval` (default null: every 60 s) applies to every worker on the client's sdk-core runtime, so clients from `forNamespace` share it. It must be from 1 s to 60 s, or `.zero` to turn worker heartbeats off; any other value makes `connect` and `init` return `error.InvalidOptions`, logged. Workers send heartbeats only to a server whose namespace reports support for them, and skip them silently otherwise.
+- `Client.reconnect` takes a new `http_connect_proxy` and `keep_alive` in `client.ConnectionOptions`; `worker_heartbeat_interval` stays as `connect` or `init` set it.
 
 #### Starting workflows
 

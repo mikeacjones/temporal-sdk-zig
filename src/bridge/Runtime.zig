@@ -286,6 +286,19 @@ pub fn deinit(r: Runtime) void {
     if (r.forward_slot) |i| releaseForwardSlot(i);
 }
 
+/// Gives up the runtime without freeing it, for an owner that can't free it because a core
+/// task still uses it: its log forwarding stops (once this returns, the forwarding callback
+/// isn't running and forwards nothing more), and the runtime, its threads and its forwarding
+/// slot stay in use for the rest of the process.
+pub fn abandon(r: Runtime) void {
+    const i = r.forward_slot orelse return;
+    const slot = &forward_slots[i];
+    slot.live.store(false, .seq_cst);
+    while (slot.busy.load(.seq_cst) != 0) std.atomic.spinLoopHint();
+    // Still claimed: the core may still call this slot's callback, which must not reach
+    // another runtime's sink.
+}
+
 fn mapEncodeError(err: bytes.EncodeError) InitError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,

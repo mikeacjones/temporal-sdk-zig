@@ -228,7 +228,12 @@ fn serviceCall(client: *client_mod.Client, service: bridge.Connection.Service, c
     request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
     var rpc_failure: ?bridge.Connection.RpcFailure = null;
     defer if (rpc_failure) |f| f.deinit(client.gpa);
-    const bytes = client.currentConnection().call(client.gpa, client.io, service, method, encoded.written(), .{}, &rpc_failure) catch |err| switch (err) {
+    const connection = client.currentConnection() catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
+        else => error.RpcFailed,
+    };
+    const bytes = connection.call(client.gpa, client.io, service, method, encoded.written(), .{}, &rpc_failure) catch |err| switch (err) {
         error.RpcFailed => {
             const f = rpc_failure.?;
             if (status) |out| {
