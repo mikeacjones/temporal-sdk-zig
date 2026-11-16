@@ -856,6 +856,21 @@ pub const Context = struct {
         return error.ContinueAsNew;
     }
 
+    /// Ends this run and starts a new run of the workflow type `workflow_type`, named at run
+    /// time, with the same workflow ID and `args` (a tuple of argument values, encoded here),
+    /// like `continueAsNew`. A dynamic workflow continues as the type it runs as by passing
+    /// `ctx.info().workflow_type`; an empty name does the same. The name is copied.
+    ///
+    ///     return ctx.continueAsNewByName(ctx.info().workflow_type, .{}, .{ count + 1 });
+    ///
+    /// Return the error this gives back from the workflow function; everything else is as for
+    /// `continueAsNew`, and workflow outbound interceptors see both alike.
+    pub fn continueAsNewByName(ctx: *Context, workflow_type: []const u8, options: ContinueAsNewOptions, args: anytype) error{ ContinueAsNew, OutOfMemory, InvalidSearchAttribute } {
+        const name = if (workflow_type.len == 0) ctx.info().workflow_type else workflow_type;
+        try ctx.instance.requestContinueAsNew(name, options, args);
+        return error.ContinueAsNew;
+    }
+
     /// Whether the server suggests continuing as new because the history is getting large.
     /// Updated with each workflow task, the same way on replay.
     pub fn continueAsNewSuggested(ctx: *const Context) bool {

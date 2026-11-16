@@ -482,6 +482,27 @@ test "workflows: continue-as-new carries state to the next run" {
     try testing.expectEqual(5, total);
 }
 
+// example: workflow-continue-as-new-by-name
+fn anyCountdown(ctx: *workflow.Context, args: temporal.converter.EncodedValues) ![]const u8 {
+    const left = try args.get(u32, ctx.allocator(), 0);
+    // Continues under whichever type this run was started as.
+    if (left > 0) return ctx.continueAsNewByName(ctx.info().workflow_type, .{}, .{left - 1});
+    return std.fmt.allocPrint(ctx.allocator(), "{s} done", .{ctx.info().workflow_type});
+}
+pub const AnyCountdown = workflow.DynamicDef(anyCountdown);
+// end-example
+
+test "workflows: a dynamic workflow continues as new under its own type" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerDynamicWorkflow(AnyCountdown);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflowByName([]const u8, "launch_countdown", .{}, .{@as(u32, 2)}, arena.allocator(), null);
+    try testing.expectEqualStrings("launch_countdown done", result);
+}
+
 // example: workflow-cancellation
 fn greetUntilCanceled(ctx: *workflow.Context, name: []const u8) ![]const u8 {
     ctx.io().sleep(.fromSeconds(24 * 60 * 60), .awake) catch |err| switch (err) {

@@ -1667,11 +1667,13 @@ pub fn requestContinueAsNew(inst: *Instance, workflow_type: []const u8, options:
 }
 
 /// Records the ContinueAsNewWorkflowExecution command to send if the workflow function returns
-/// error.ContinueAsNew, replacing any earlier request. `args` and `header` are arena memory.
+/// error.ContinueAsNew, replacing any earlier request. `args` and `header` are arena memory;
+/// `workflow_type` is copied.
 fn recordContinueAsNew(inst: *Instance, workflow_type: []const u8, options: workflow.ContinueAsNewOptions, args: []const converter.Payload, header: converter.Header) sa.EncodeError!void {
     const a = inst.arena();
     var cmd: cmd_pb.ContinueAsNewWorkflowExecution = .{
-        .workflow_type = workflow_type,
+        // Copied: a name given at run time (or by an interceptor) may not outlive the call.
+        .workflow_type = try a.dupe(u8, workflow_type),
         // Empty: core and the server keep this run's task queue.
         .task_queue = try a.dupe(u8, options.task_queue),
         .arguments = try payloadList(a, args),

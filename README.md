@@ -948,6 +948,24 @@ Notes:
 - `ctx.continueAsNewSuggested()` says when the server suggests it; `historyLength` and `historySizeBytes` give the size.
 - `ContinueAsNewOptions` fields left null keep this run's values; a client waiting on the result follows the chain.
 
+`workflow.Context.continueAsNewByName` continues as a workflow type named at run time, with the arguments as a tuple. A dynamic workflow uses it to continue under the type it runs as:
+
+<!-- example: workflow-continue-as-new-by-name -->
+```zig
+fn anyCountdown(ctx: *workflow.Context, args: temporal.converter.EncodedValues) ![]const u8 {
+    const left = try args.get(u32, ctx.allocator(), 0);
+    // Continues under whichever type this run was started as.
+    if (left > 0) return ctx.continueAsNewByName(ctx.info().workflow_type, .{}, .{left - 1});
+    return std.fmt.allocPrint(ctx.allocator(), "{s} done", .{ctx.info().workflow_type});
+}
+pub const AnyCountdown = workflow.DynamicDef(anyCountdown);
+```
+
+Notes:
+- It takes the same `ContinueAsNewOptions` and behaves as `continueAsNew` otherwise, workflow outbound interceptors included.
+- The name is copied; an empty name continues as this run's own type.
+- The new run's type needs a `Def` or a dynamic workflow on the worker that polls its task queue.
+
 #### Cancellation
 A cancellation request reaches the workflow function as `error.Canceled` at its next cancelable wait.
 
@@ -1063,6 +1081,7 @@ Notes:
 - `workflow.DynamicDefWithOptions` takes `task_failure_errors` for it; see [Failure policy](#failure-policy).
 - A worker has at most one dynamic workflow, and a registered `Def` wins for its own type.
 - Clients start it by type name with `executeWorkflowByName`; it reads that name from `ctx.info().workflow_type`.
+- It continues as new under its own type with `ctx.continueAsNewByName(ctx.info().workflow_type, ...)`; see [Continue-as-new](#continue-as-new).
 - It registers handlers with the `Context` setters, as a function workflow does.
 
 #### Workflow info

@@ -88,7 +88,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Child workflows: options, parent close policy, signals, cancellation | all | GA | supported | [Child workflows](README.md#child-workflows), [child-workflow](samples/child-workflow) |
 | Signal and cancel external workflows | all | GA | supported | [External workflows](README.md#external-workflows), [synchronous-proxy](samples/synchronous-proxy) |
 | Continue-as-new, with the server's suggestion and history size | all | GA | supported | [Continue-as-new](README.md#continue-as-new), [child-workflow-continue-as-new](samples/child-workflow-continue-as-new) |
-| Continue-as-new by workflow name | all | GA | partial | `temporal-sdk-zig-d51.7.36`. Missing: `continueAsNewByName`, continuing as a workflow type named at run time; `ctx.continueAsNew` takes any `Def`, so a run can continue as another type it has a definition for. |
+| Continue-as-new by workflow name | all | GA | supported | [Continue-as-new](README.md#continue-as-new) |
 | Upgrade on continue-as-new (Public Preview) | Go, Java, Python, TypeScript, .NET | pre-release | partial | `temporal-sdk-zig-d51.7.35`. Missing: a `ContinueAsNewOptions` field that chooses the new run's initial versioning behavior; continuing as a definition whose behavior is `auto_upgrade` moves the new run to the current version only after its first workflow task, which runs on the old version. |
 | Cancellation, with cleanup that runs after the cancel | all | GA | supported | [Cancellation](README.md#cancellation), [cancellation](samples/cancellation) |
 | Shielding work from cancellation (cancellation scopes, non-cancellable sections) | Java, TypeScript, Python, .NET | GA | supported | [Cancellation](README.md#cancellation) |

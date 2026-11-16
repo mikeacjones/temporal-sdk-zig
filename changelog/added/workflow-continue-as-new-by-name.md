@@ -1,0 +1,1 @@
+`workflow.Context.continueAsNewByName` continues as new under a workflow type named at run time, with the arguments as a tuple and the same `ContinueAsNewOptions`; a dynamic workflow passes `ctx.info().workflow_type` to continue under the type it runs as. See [Continue-as-new](https://github.com/mikeacjones/temporal-sdk-zig#continue-as-new).
