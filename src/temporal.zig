@@ -36,6 +36,7 @@ test {
     _ = @import("metrics_test.zig");
     _ = @import("client_tls_test.zig");
     _ = @import("client_namespace_test.zig");
+    _ = @import("client_rpc_options_test.zig");
     _ = @import("nexus_test.zig");
     _ = @import("failure_test.zig");
 }

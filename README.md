@@ -291,6 +291,25 @@ Notes:
 - `reconnect`, `updateApiKey`, and `updateHeaders` on any of them change the connection of all of them, and `reconnect` moves the workers running on any of them. A client from `init` shares its first connection the same way: whichever client needs the server first connects for all.
 - Each `Client.connect` and `Client.init` still creates its own runtime: clients of different servers don't share one.
 
+`Client.withRpcOptions` gives a single call, or a group of calls, its own deadline and gRPC metadata without changing `client.Options`: it returns a view of the client whose calls send `client.RpcOptions`.
+
+<!-- example: client-rpc-options -->
+```zig
+// A view of the client whose calls get their own deadline and extra gRPC metadata.
+var quick = try client.withRpcOptions(.{
+    .timeout = .fromSeconds(2),
+    .metadata = &.{.{ .key = "x-request-id", .value = request_id }},
+    .binary_metadata = &.{.{ .key = "x-trace-bin", .value = &.{ 0x01, 0x02 } }},
+});
+// Calls through it, and the handles they return, send those; `client`'s own calls don't.
+const running = try quick.countWorkflows("ExecutionStatus = 'Running'");
+```
+Notes:
+- Every call made through the view sends its options: workflow start, signal, query, update, describe, list and count, cancel, terminate and reset, history, schedules, worker deployments, standalone activities, asynchronous activity completion and heartbeats, `checkHealth`, and the calls of the handles and iterators the view returns. Workers on the view use the client's options.
+- `RpcOptions.timeout` replaces `Options.rpc_timeout` for each call (null keeps it). A call that runs out fails with `error.RpcFailed`, logged with gRPC status 1 ("Timeout expired") or 4 (DEADLINE_EXCEEDED). As with `rpc_timeout`, calls that long-poll aren't limited by it: waiting for a workflow's or an activity's result with `get`, for an update to reach its stage or its outcome, and following history with `wait_new_event`. Cancel the calling task to stop those.
+- `metadata` (ASCII) and `binary_metadata` (names ending in `-bin`, any bytes) are sent along with `Options.headers` and the API key, the long-polls included; for a name in both, the view's value is sent, and an `authorization` entry replaces the API key's. `withRpcOptions` returns `error.InvalidOptions`, logged, for a timeout that isn't positive or a name or value gRPC can't send.
+- The view borrows the client and the options' slices, which must outlive it and the handles it returns. It owns nothing: `close` on it does nothing. `forNamespace` on a view returns a full client without the view's options; a view of a client from `forNamespace` works in that client's namespace.
+
 #### Starting workflows
 
 `Client.executeWorkflow` starts a workflow defined with `workflow.Def` and returns a `client.WorkflowRun`. `client.StartWorkflowOptions` sets the ID, task queue, timeouts, ID policies, retry policy, memo, search attributes, priority, and start delay.

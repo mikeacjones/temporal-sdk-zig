@@ -53,6 +53,20 @@ fn namespacesExample(gpa: Allocator, io: Io, options: temporal.client.Options) !
     return open_invoices;
 }
 
+fn rpcOptionsExample(client: *temporal.client.Client, request_id: []const u8) !u64 {
+    // example: client-rpc-options
+    // A view of the client whose calls get their own deadline and extra gRPC metadata.
+    var quick = try client.withRpcOptions(.{
+        .timeout = .fromSeconds(2),
+        .metadata = &.{.{ .key = "x-request-id", .value = request_id }},
+        .binary_metadata = &.{.{ .key = "x-trace-bin", .value = &.{ 0x01, 0x02 } }},
+    });
+    // Calls through it, and the handles they return, send those; `client`'s own calls don't.
+    const running = try quick.countWorkflows("ExecutionStatus = 'Running'");
+    // end-example
+    return running;
+}
+
 pub fn startWorkflows(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
     // example: client-start
     var run = try client.executeWorkflow(Greeting, .{ .id = "greeting-ada", .task_queue = "greetings", .execution_timeout = .fromSeconds(60) }, .{"Ada"});
@@ -256,6 +270,7 @@ test "client: examples against a dev server" {
 
     var client = try temporal.client.Client.connect(gpa, io, server.clientOptions());
     defer client.close();
+    try std.testing.expectEqual(0, try rpcOptionsExample(&client, "req-1"));
 
     var outbox: Outbox = .{ .gpa = gpa };
     defer gpa.free(outbox.task_token);

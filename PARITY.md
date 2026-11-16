@@ -33,7 +33,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Connect with TLS, mutual TLS, and gRPC headers | all | GA | supported | [Connecting](README.md#connecting) |
 | API key authentication | all | GA | supported | [Connecting](README.md#connecting) |
 | Client RPC retry policy and a client-wide RPC timeout | all | GA | supported | [Connecting](README.md#connecting) |
-| RPC timeout and gRPC metadata on a single call | Go, Java, Python, TypeScript, .NET, Ruby | GA | partial | `temporal-sdk-zig-d51.5.35`. Missing: per-call options on the typed client calls (start, signal, query, update, and the rest), which use `client.Options.rpc_timeout` and `client.Options.headers`; a raw call through `(try client.currentConnection()).call` takes its own `CallOptions.timeout_ms`, `metadata`, and `binary_metadata`. |
+| RPC timeout and gRPC metadata on a single call | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |
 | Environment configuration: profiles from a TOML file and environment variables | Go, Python, TypeScript, .NET, Ruby, Java | GA | supported | [Connecting](README.md#connecting), [external-env-conf](samples/external-env-conf) |
 | HTTP CONNECT proxy for the client connection | Python, TypeScript, .NET, Ruby, Go | GA | partial | `temporal-sdk-zig-d51.5.36`. Missing: README.md documentation; `client.Options.http_connect_proxy` exists. |
 | gRPC keep-alive settings | Python, TypeScript, .NET, Ruby | GA | partial | `temporal-sdk-zig-d51.5.36`. Missing: README.md documentation; `client.Options.keep_alive` exists. |

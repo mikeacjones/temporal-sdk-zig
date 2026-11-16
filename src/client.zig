@@ -43,7 +43,8 @@ pub const Options = struct {
     identity: []const u8 = "",
     api_key: []const u8 = "",
     tls: ?Tls = null,
-    /// gRPC headers sent with every call.
+    /// gRPC headers sent with every call. A view from `Client.withRpcOptions` sends its own
+    /// `RpcOptions.metadata` in place of these for the same name.
     headers: []const bridge.bytes.MetadataEntry = &.{},
     /// Payload codecs, such as `converter.ZlibCodec` or encryption, applied in order to every
     /// payload this client sends and in reverse to every payload it receives (results,
@@ -114,7 +115,8 @@ pub const Options = struct {
     /// gives up first, and isn't retried. Calls that wait on the server, such as
     /// waiting for a workflow's result or an update's outcome, aren't limited by it, and
     /// workers' own calls aren't affected. It also bounds the first connection of a client
-    /// from `Client.init`, which a call makes. Null keeps sdk-core's default of 30 s. Must be
+    /// from `Client.init`, which a call makes. `RpcOptions.timeout` replaces it for the calls
+    /// of a view from `Client.withRpcOptions`. Null keeps sdk-core's default of 30 s. Must be
     /// positive; under 1 ms counts as 1 ms.
     rpc_timeout: ?Duration = null,
 
@@ -627,6 +629,9 @@ pub const Client = struct {
     interceptors: []const interceptor.Client,
     /// `Options.rpc_timeout` in milliseconds; 0 sends none.
     rpc_timeout_ms: u32 = 0,
+    /// Set on a view from `withRpcOptions`, which borrows the rest from the client it was
+    /// made from: the timeout and metadata its calls send.
+    rpc_options: ?RpcOptions = null,
 
     /// Records through this client's metrics exporter (`Options.metrics`) with the runtime's
     /// default attributes, or records nothing without one. Clients made by `forNamespace`
@@ -783,7 +788,55 @@ pub const Client = struct {
         other.shared = c.shared;
         other.namespace = ns;
         other.identity = identity;
+        other.rpc_options = null;
         return other;
+    }
+
+    /// Returns a view of this client whose calls send `options`: their own deadline and extra
+    /// gRPC metadata, without changing `Options` or any other call. Every call made through
+    /// the view uses them: workflow start, signal, query, update, describe, list and count,
+    /// cancel, terminate and reset, history, schedules, worker deployments, standalone
+    /// activities, asynchronous activity completion and heartbeats, `checkHealth`, and the
+    /// calls of the handles and iterators the view returns. Workers on the view are not
+    /// affected: their calls use the client's options.
+    ///
+    /// `options.timeout` replaces `Options.rpc_timeout` for each call, as that option
+    /// applies: it is the deadline of each call and of each of its retries, a call that runs
+    /// out fails with `error.RpcFailed` (gRPC status 1, "Timeout expired", or 4,
+    /// DEADLINE_EXCEEDED, logged), and a first connection made by a call waits for it. Calls
+    /// that long-poll the server until something happens aren't limited by it: waiting for a
+    /// workflow's or an activity's result (`get` on the handles), for an update to reach its
+    /// wait stage or its outcome, and following history with `wait_new_event`. Cancel the
+    /// calling task to stop those. Null keeps `Options.rpc_timeout`.
+    ///
+    /// `options.metadata` and `options.binary_metadata` are sent with each call, the
+    /// long-polls included, along with `Options.headers` (as `updateHeaders` last set them)
+    /// and the API key: for a key in both, the view's value is sent. An `authorization`
+    /// entry replaces the API key's bearer token.
+    ///
+    /// The view is a `Client` that borrows this client's state and `options`' slices: both
+    /// must outlive it and everything it returns. It owns nothing; `close` on it does nothing,
+    /// and closing this client ends it. `withRpcOptions` on a view replaces its options, and
+    /// `forNamespace` on a view returns a full client without them. Returns
+    /// `error.InvalidOptions`, logged, for a timeout that isn't positive, a metadata name
+    /// that isn't a gRPC header name (an ASCII one ending in "-bin", or a binary one that
+    /// doesn't), or an ASCII value with bytes other than visible ASCII, space and tab.
+    pub fn withRpcOptions(c: *const Client, options: RpcOptions) error{InvalidOptions}!Client {
+        var rejection: Rejection = .{};
+        options.check(&rejection) catch |err| {
+            log.err("withRpcOptions failed: {s}", .{rejection.message});
+            return err;
+        };
+        var view = c.*;
+        view.rpc_options = options;
+        return view;
+    }
+
+    /// The deadline of this client's calls in milliseconds: `RpcOptions.timeout` on a view
+    /// that sets one, otherwise `Options.rpc_timeout`; 0 sends none.
+    fn callDeadlineMs(c: *const Client) u32 {
+        if (c.rpc_options) |o| if (o.timeout) |t| return std.math.cast(u32, durationMs(t)) orelse std.math.maxInt(u32);
+        return c.rpc_timeout_ms;
     }
 
     /// Connects now if the client hasn't yet (see `init`), and checks the server; does
@@ -817,7 +870,7 @@ pub const Client = struct {
             error.Canceled => error.Canceled,
             else => error.RpcFailed,
         };
-        const bytes = connection.call(c.gpa, c.io, .health, "Check", encoded.written(), .{ .retry = false, .timeout_ms = c.rpc_timeout_ms }, &failure) catch |err| switch (err) {
+        const bytes = connection.call(c.gpa, c.io, .health, "Check", encoded.written(), c.callOptions(false, c.callDeadlineMs()), &failure) catch |err| switch (err) {
             error.RpcFailed, error.InvalidOptions => {
                 const f = failure orelse {
                     log.warn("checking the health of " ++ health_service ++ " failed: {t}", .{err});
@@ -871,6 +924,8 @@ pub const Client = struct {
         // A client made by `forNamespace` shares the connection and the runtime: the last
         // client to close frees them. Acquire pairs with the releases of the clients closed
         // before, so their last uses of the shared state happen before it is freed.
+        // A view from `withRpcOptions` owns nothing.
+        if (c.rpc_options != null) return;
         const prev = c.shared.refs.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0); // Closed more times than there are clients.
         if (prev == 1) c.shared.destroy();
@@ -915,7 +970,7 @@ pub const Client = struct {
         // sdk-core's connect has no deadline of its own: a first connection made by a call
         // gets the call's, counted from now.
         const deadline: ?Io.Clock.Timestamp = switch (attempt) {
-            .first_use => .fromNow(c.io, .{ .raw = .fromMilliseconds(if (c.rpc_timeout_ms > 0) c.rpc_timeout_ms else default_rpc_timeout_ms), .clock = .awake }),
+            .first_use => .fromNow(c.io, .{ .raw = .fromMilliseconds(if (c.callDeadlineMs() > 0) c.callDeadlineMs() else default_rpc_timeout_ms), .clock = .awake }),
             else => null,
         };
         const connecting = blk: {
@@ -2317,6 +2372,14 @@ pub const Client = struct {
         return rpc_timeout_ms;
     }
 
+    /// The bridge's options for one call: `timeout_ms`, and the metadata of a view from
+    /// `withRpcOptions`, which sdk-core sends in place of the connection's headers for the
+    /// same key.
+    fn callOptions(c: *const Client, retry: bool, timeout_ms: u32) bridge.Connection.CallOptions {
+        const o = c.rpc_options orelse return .{ .retry = retry, .timeout_ms = timeout_ms };
+        return .{ .retry = retry, .timeout_ms = timeout_ms, .metadata = o.metadata, .binary_metadata = o.binary_metadata };
+    }
+
     /// Whether the core retries a failed call. Not a reset: an attempt the server applied
     /// before the transport failed would be applied again, and the server doesn't
     /// deduplicate resets.
@@ -2343,7 +2406,7 @@ pub const Client = struct {
         coded.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var failure: ?bridge.Connection.RpcFailure = null;
         defer if (failure) |f| f.deinit(c.gpa);
-        const call_options: bridge.Connection.CallOptions = .{ .retry = callRetries(method), .timeout_ms = callTimeoutMs(@TypeOf(coded), method, &coded, c.rpc_timeout_ms) };
+        const call_options = c.callOptions(callRetries(method), callTimeoutMs(@TypeOf(coded), method, &coded, c.callDeadlineMs()));
         // A failed first connection was logged by `currentConnection`.
         const connection = c.currentConnection() catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -2441,6 +2504,36 @@ pub const StartWorkflowOptions = struct {
     /// the workflow reads them with `ctx.propagated()`. Signal-with-start and update-with-start
     /// send them with the start. Only read during the call.
     context: ?*const propagation.Values = null,
+};
+
+/// A call's own deadline and gRPC metadata, which replace or add to the client's
+/// (`Options.rpc_timeout` and `Options.headers`) for the calls made with them; see
+/// `Client.withRpcOptions`. The slices are borrowed.
+pub const RpcOptions = struct {
+    /// The deadline of each call, which replaces `Options.rpc_timeout`. Calls that long-poll
+    /// the server (waiting for a result or an update's outcome) aren't limited by it. Null
+    /// keeps the client's. Must be positive; under 1 ms counts as 1 ms.
+    timeout: ?Duration = null,
+    /// gRPC ASCII headers sent with each call. For a name in `Options.headers` too, this
+    /// value is sent. Names are gRPC header names, which gRPC sends in lower case, not
+    /// ending in "-bin"; values are visible ASCII, space and tab.
+    metadata: []const bridge.bytes.MetadataEntry = &.{},
+    /// gRPC binary headers sent with each call: names end in "-bin", and values are any
+    /// bytes (gRPC sends them base64-encoded).
+    binary_metadata: []const bridge.bytes.MetadataEntry = &.{},
+
+    fn check(o: RpcOptions, rejection: *Rejection) error{InvalidOptions}!void {
+        if (o.timeout) |t| if (t.nanoseconds <= 0)
+            return rejection.reject("RpcOptions.timeout must be positive, not {f}; set it to null for the client's Options.rpc_timeout", .{t});
+        for (o.metadata) |h| {
+            var header: Rejection = .{};
+            headerRejection(h, &header) catch return rejection.reject("RpcOptions.metadata: {s}", .{header.message});
+        }
+        for (o.binary_metadata) |h| {
+            if (!std.ascii.endsWithIgnoreCase(h.key, "-bin") or !isHeaderName(h.key))
+                return rejection.reject("RpcOptions.binary_metadata: \"{s}\" is not a valid binary header name (letters, digits and {s}, ending in -bin)", .{ h.key, header_name_symbols });
+        }
+    }
 };
 
 /// What `Client.startNexusWorkflow` attaches to the workflow it starts. Borrowed for the call.
@@ -4220,13 +4313,19 @@ fn validateHeader(h: bridge.bytes.MetadataEntry) error{InvalidOptions}!void {
 
 /// `validateHeader` without the log: fills `rejection` instead.
 fn headerRejection(h: bridge.bytes.MetadataEntry, rejection: *Rejection) error{InvalidOptions}!void {
-    const token_symbols = "!#$%&'*+-.^_`|~";
-    const key_ok = h.key.len > 0 and !std.ascii.endsWithIgnoreCase(h.key, "-bin") and for (h.key) |ch| {
-        if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, token_symbols, ch) == null) break false;
-    } else true;
-    if (!key_ok) return rejection.reject("\"{s}\" is not a valid header name (letters, digits and {s}, not ending in -bin)", .{ h.key, token_symbols });
+    if (std.ascii.endsWithIgnoreCase(h.key, "-bin") or !isHeaderName(h.key))
+        return rejection.reject("\"{s}\" is not a valid header name (letters, digits and {s}, not ending in -bin)", .{ h.key, header_name_symbols });
     for (h.value) |ch| if (ch != '\t' and (ch < ' ' or ch > '~'))
         return rejection.reject("the value of header {s} has a byte (0x{x:0>2}) other than visible ASCII, space or tab", .{ h.key, ch });
+}
+
+/// The symbols an HTTP/2 header name may hold besides letters and digits.
+const header_name_symbols = "!#$%&'*+-.^_`|~";
+
+fn isHeaderName(key: []const u8) bool {
+    if (key.len == 0) return false;
+    for (key) |ch| if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, header_name_symbols, ch) == null) return false;
+    return true;
 }
 
 fn defaultIdentity(gpa: Allocator) error{OutOfMemory}![]u8 {
@@ -4662,6 +4761,104 @@ test "rpc_timeout cuts short a query the server holds" {
         return error.TestUnexpectedResult;
     }
     try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
+}
+
+test "RpcOptions are rejected for a timeout that isn't positive and metadata gRPC can't send" {
+    var r: Rejection = .{};
+    try expectRejected(RpcOptions.check(.{ .timeout = .zero }, &r), &r, "RpcOptions.timeout");
+    try expectRejected(RpcOptions.check(.{ .timeout = .fromSeconds(-1) }, &r), &r, "RpcOptions.timeout");
+    try expectRejected(RpcOptions.check(.{ .metadata = &.{.{ .key = "bad key", .value = "v" }} }, &r), &r, "RpcOptions.metadata");
+    try expectRejected(RpcOptions.check(.{ .metadata = &.{.{ .key = "x-ok", .value = "a\nb" }} }, &r), &r, "RpcOptions.metadata");
+    try expectRejected(RpcOptions.check(.{ .metadata = &.{.{ .key = "x-trace-bin", .value = "v" }} }, &r), &r, "x-trace-bin");
+    try expectRejected(RpcOptions.check(.{ .binary_metadata = &.{.{ .key = "x-trace", .value = "v" }} }, &r), &r, "RpcOptions.binary_metadata");
+    try expectRejected(RpcOptions.check(.{ .binary_metadata = &.{.{ .key = "bad key-bin", .value = "v" }} }, &r), &r, "bad key-bin");
+    // Binary values may hold any bytes, and a timeout under 1 ms counts as 1 ms.
+    try RpcOptions.check(.{ .timeout = .fromNanoseconds(1), .binary_metadata = &.{.{ .key = "x-trace-bin", .value = "\n\x00" }} }, &r);
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .rpc_timeout = .fromSeconds(9) });
+    defer c.close();
+    try testing.expectEqual(@as(u32, 9000), c.callDeadlineMs());
+    var view = try c.withRpcOptions(.{ .timeout = .fromNanoseconds(1) });
+    try testing.expectEqual(@as(u32, 1), view.callDeadlineMs());
+    // Closing a view leaves the client untouched.
+    view.close();
+    try testing.expectEqual(@as(u32, 1), c.shared.refs.load(.monotonic));
+    try testing.expectEqual(@as(u32, 9000), (try c.withRpcOptions(.{})).callDeadlineMs());
+}
+
+const RpcOptionsFixtures = struct {
+    const Status = workflow.QueryDef("status", fn () []const u8);
+    const Answers = struct {
+        pub const queries = .{ .status = Status };
+        pub fn run(_: *Answers, _: *workflow.Context) !void {}
+        pub fn status(_: *Answers) []const u8 {
+            return "ready";
+        }
+    };
+    const AnswersWorkflow = workflow.Def("rpc_options_answers", Answers);
+
+    fn query(c: *Client, id: []const u8) ![]const u8 {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const answer = try c.queryWorkflow(Status, arena.allocator(), id, "", .{});
+        if (!std.mem.eql(u8, answer, "ready")) return error.TestUnexpectedResult;
+        return "ready";
+    }
+
+    fn runWorker(w: *@import("worker.zig").Worker) @import("worker.zig").Worker.RunError!void {
+        return w.run();
+    }
+};
+
+test "a per-call timeout cuts short a query the client's own deadline lets finish" {
+    const Worker = @import("worker.zig").Worker;
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var options = server.clientOptions();
+    options.rpc_timeout = .fromSeconds(60);
+    var c = try Client.connect(testing.allocator, testing.io, options);
+    defer c.close();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No worker polls the task queue yet, so the server holds queries until one does.
+    const id = try uuid(a, testing.io);
+    const task_queue = try uuid(a, testing.io);
+    var run = try c.executeWorkflow(RpcOptionsFixtures.AnswersWorkflow, .{ .id = id, .task_queue = task_queue }, .{});
+    defer run.deinit();
+    // The same query through a view with a short timeout fails with the deadline error. A
+    // typed call would log it as an error, which fails the test, so this sends the query
+    // the way the typed calls do and reads the status.
+    var view = try c.withRpcOptions(.{ .timeout = .fromMilliseconds(500) });
+    const start = Io.Timestamp.now(testing.io, .awake);
+    var status: ?Client.RpcStatus = null;
+    try testing.expectError(error.RpcFailed, view.rpcWithStatus(wfs.QueryWorkflowResponse, "QueryWorkflow", wfs.QueryWorkflowRequest{
+        .namespace = view.namespace,
+        .execution = .{ .workflow_id = id },
+        .query = .{ .query_type = RpcOptionsFixtures.Status.query_name },
+    }, a, &status));
+    const waited = start.durationTo(Io.Timestamp.now(testing.io, .awake));
+    // sdk-core reports its own deadline as CANCELLED; the server's would be DEADLINE_EXCEEDED.
+    const s = status.?;
+    if (!(s.code == 1 and std.mem.indexOf(u8, s.message, "Timeout expired") != null) and s.code != 4) {
+        std.debug.print("want a timeout, got gRPC status {d}: {s}\n", .{ s.code, s.message });
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
+
+    // The same query without the per-call timeout waits, under the client's 60 s, until a
+    // worker answers it. (The server buffers one query per workflow before its first task.)
+    var without = try testing.io.concurrent(RpcOptionsFixtures.query, .{ &c, id });
+    defer _ = without.cancel(testing.io) catch {};
+    var w = try Worker.init(testing.allocator, testing.io, &c, task_queue, .{});
+    defer w.deinit();
+    try w.registerWorkflow(RpcOptionsFixtures.AnswersWorkflow);
+    var running = try testing.io.concurrent(RpcOptionsFixtures.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    try testing.expectEqualStrings("ready", try without.await(testing.io));
 }
 
 // Port 1 on the loopback address: nothing listens there, so connecting fails at once.
