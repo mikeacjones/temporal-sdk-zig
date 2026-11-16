@@ -456,6 +456,9 @@ pub const ChildState = struct {
     /// The start failed because the workflow ID is taken.
     already_started: bool = false,
     cancel_requested: bool = false,
+    /// With `wait_cancellation_requested`: the RequestCancelExternalWorkflowExecution this
+    /// workflow sent itself once the child started, whose resolution reports the cancellation.
+    cancel_request: ?*ExternalState = null,
 
     pub const Outcome = ActivityState.Outcome;
 
@@ -521,6 +524,8 @@ pub const ExternalState = struct {
     waiter: ?*WorkflowIo.Wait = null,
     outcome: ?Outcome = null,
     cancel_requested: bool = false,
+    /// Set for a request canceling this child under `wait_cancellation_requested`.
+    child: ?*ChildState = null,
 
     pub const Kind = enum { signal, cancel };
 
@@ -2244,11 +2249,17 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
         .cron_schedule = options.cron_schedule,
         .cancellation_type = switch (options.cancellation_type) {
             .try_cancel => .TRY_CANCEL,
+            .wait_cancellation_requested => .WAIT_CANCELLATION_REQUESTED,
             .wait_cancellation_completed => .WAIT_CANCELLATION_COMPLETED,
             .abandon => .ABANDON,
         },
     };
     if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
+    if (options.priority) |p| cmd.priority = .{
+        .priority_key = p.priority_key,
+        .fairness_key = p.fairness_key,
+        .fairness_weight = p.fairness_weight,
+    };
     try cmd.memo.ensureTotalCapacity(a, options.memo.len);
     for (options.memo) |f| cmd.memo.appendAssumeCapacity(.{ .key = f.name, .value = f.value });
     if (options.search_attributes.len > 0) cmd.search_attributes = sa.toProto(a, options.search_attributes, .start) catch |err| switch (err) {
@@ -2270,8 +2281,9 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
 /// Blocks the calling coroutine until the child reaches `phase` (started, or closed), or
 /// can't: a child that fails to start or closes before it started reaches both. Cancellation
 /// works as in `awaitActivity`: it cancels the child, and with `wait_cancellation_completed`
-/// waits for the core to resolve it (the child closed, or never started). Eviction ends the
-/// wait with error.Canceled.
+/// waits for the core to resolve it (the child closed, or never started), and with
+/// `wait_cancellation_requested` until the server recorded the request too. Eviction ends
+/// the wait with error.Canceled.
 pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) error{Canceled}!void {
     if (state.reached(phase)) return;
     if (inst.wio.refuse(switch (phase) {
@@ -2291,8 +2303,10 @@ pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) 
         wait = inst.wio.newWaitPoint();
         inst.wio.waitFor(&wait, !canceled) catch |err| {
             inst.cancelChild(state);
-            if (state.cancellation_type != .wait_cancellation_completed) return err;
-            canceled = true;
+            switch (state.cancellation_type) {
+                .try_cancel, .abandon => return err,
+                .wait_cancellation_requested, .wait_cancellation_completed => canceled = true,
+            }
         };
     }
     if (!canceled) return;
@@ -2302,10 +2316,16 @@ pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) 
 
 /// Sends CancelChildWorkflowExecution; the core resolves the child as its cancellation type
 /// says (and resolves a child whose start it hasn't sent yet as canceled before starting).
+/// The core never reports when the server recorded the request it sends, so for a started
+/// child under `wait_cancellation_requested` this sends RequestCancelExternalWorkflowExecution
+/// itself instead, and `resolveExternal` resolves the child as canceled once it succeeds. A
+/// child not started yet goes to the core, which cancels it before it is sent or requests its
+/// cancellation; `resolveChildStart` then sends that request once the child starts.
 pub fn cancelChild(inst: *Instance, state: *ChildState) void {
     if (state.outcome != null or state.cancel_requested) return;
     if (inst.wio.refuse("ChildWorkflowFuture.cancel")) return;
     state.cancel_requested = true;
+    if (state.cancellation_type == .wait_cancellation_requested and state.run_id != null) return inst.requestChildCancel(state);
     inst.emit(.{ .variant = .{ .cancel_child_workflow_execution = .{
         .child_workflow_seq = state.seq,
         .reason = "the parent canceled the child workflow",
@@ -2314,11 +2334,49 @@ pub fn cancelChild(inst: *Instance, state: *ChildState) void {
     };
 }
 
+/// Sends RequestCancelExternalWorkflowExecution for a started child canceled under
+/// `wait_cancellation_requested`.
+fn requestChildCancel(inst: *Instance, state: *ChildState) void {
+    const ext = inst.requestCancelExternal(state.workflow_id, state.run_id.?) catch {
+        inst.task_failure = "out of memory requesting child workflow cancellation";
+        return;
+    };
+    ext.child = state;
+    state.cancel_request = ext;
+}
+
+/// The server recorded the cancellation request `requestChildCancel` sent: the child resolves
+/// as canceled unless it already closed. A refused request (the child already closed) leaves
+/// it to the core's resolution.
+fn childCancelRecorded(inst: *Instance, state: *ChildState) !void {
+    if (state.outcome != null) return;
+    if (!inst.children.remove(state.seq)) return;
+    const a = inst.arena();
+    const cause = try a.create(Failure);
+    cause.* = .{ .message = "the server recorded the child workflow's cancellation request", .source = failure_mod.source, .failure_info = .{ .canceled_failure_info = .{} } };
+    const out = try a.create(Failure);
+    out.* = .{
+        .message = "Child Workflow execution cancelled",
+        .source = failure_mod.source,
+        .cause = cause,
+        .failure_info = .{ .child_workflow_execution_failure_info = .{
+            .namespace = inst.namespace,
+            .workflow_execution = .{ .workflow_id = state.workflow_id, .run_id = state.run_id orelse "" },
+            .workflow_type = .{ .name = state.workflow_type },
+        } },
+    };
+    state.outcome = .{ .cancelled = out };
+    state.wake(&inst.wio);
+}
+
 fn resolveChildStart(inst: *Instance, r: *const act_pb.ResolveChildWorkflowExecutionStart) !void {
     const state = inst.children.get(r.seq) orelse return;
     const a = inst.arena();
     switch (r.status orelse return) {
-        .succeeded => |s| state.run_id = try a.dupe(u8, s.run_id),
+        .succeeded => |s| {
+            state.run_id = try a.dupe(u8, s.run_id);
+            if (state.cancel_requested and state.cancellation_type == .wait_cancellation_requested and state.cancel_request == null) inst.requestChildCancel(state);
+        },
         .failed => |f| {
             _ = inst.children.remove(r.seq);
             state.already_started = f.cause == .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS;
@@ -2634,6 +2692,7 @@ fn resolveExternal(inst: *Instance, seq: u32, failure: ?Failure, not_found: bool
     const f = failure orelse {
         state.outcome = .delivered;
         if (state.waiter) |w| inst.wio.wake(w);
+        if (state.child) |child| try inst.childCancelRecorded(child);
         return;
     };
     const a = inst.arena();
@@ -7292,6 +7351,7 @@ const ChildWf = struct {
             .id_reuse_policy = .reject_duplicate,
             .memo = try converter.toFields(a, .{ .owner = "parent" }),
             .search_attributes = &.{ sa.key(.keyword, "Owner").set("parent"), sa.key(.int, "Skipped").unset() },
+            .priority = .{ .priority_key = 2, .fairness_key = "tenant-b" },
         }, .{"kid"});
         const exec = f.started() catch |err| switch (err) {
             error.ChildWorkflowAlreadyStarted => return std.fmt.allocPrint(a, "already started: {s}", .{f.failure().?.message}),
@@ -7336,6 +7396,15 @@ const ChildWf = struct {
         return ctx.executeChildWorkflow(Kid, .{ .id = "kid-1", .static_summary = summary, .static_details = details }, .{"kid"}).get();
     }
     const Described = workflow.Def("DescribedChild", described);
+
+    /// Starts `Kid` and waits only for its start, then sleeps: no coroutine waits on the
+    /// child's future when the workflow is canceled.
+    fn unawaited(ctx: *workflow.Context) !void {
+        const f = ctx.executeChildWorkflow(Kid, .{ .id = "kid-1", .parent_close_policy = .request_cancel }, .{"kid"});
+        _ = try f.started();
+        try ctx.io().sleep(.fromSeconds(60), .awake);
+    }
+    const Unawaited = workflow.Def("UnawaitedChild", unawaited);
 };
 
 /// Runs `DescribedChild` with `summary` and `details` and checks its StartChildWorkflowExecution
@@ -7415,6 +7484,10 @@ test "child workflow: StartChildWorkflowExecution with the options, then the sta
     try testing.expectEqual(@as(usize, 1), child_sa.len);
     try testing.expectEqualStrings("Owner", child_sa[0].key);
     try testing.expectEqualStrings("\"parent\"", child_sa[0].value.?.data);
+    // Zero fields are sent as zero, for the server to inherit them from the parent.
+    try testing.expectEqual(@as(i32, 2), start.priority.?.priority_key);
+    try testing.expectEqualStrings("tenant-b", start.priority.?.fairness_key);
+    try testing.expectEqual(@as(f32, 0), start.priority.?.fairness_weight);
     // A version 4 UUID from the seeded randomness: the same seed generates the same ID.
     try testing.expectEqual(@as(usize, 36), start.workflow_id.len);
     try testing.expectEqual(@as(u8, '4'), start.workflow_id[14]);
@@ -7543,6 +7616,185 @@ test "child workflow: wait_cancellation_completed canceled before it started end
     } } } }), a));
     try testing.expectEqual(@as(usize, 1), done.len);
     try testing.expect(done[0].variant.? == .cancel_workflow_execution);
+}
+
+test "child workflow: no priority sends none, so the child inherits the parent's" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "try_cancel")}), a));
+    try testing.expect(first[0].variant.?.start_child_workflow_execution.priority == null);
+}
+
+test "child workflow: wait_cancellation_requested requests the started child's cancellation and returns once the server recorded it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{ .namespace = "ns" });
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_requested")}), a));
+    try testing.expect(first[0].variant.?.start_child_workflow_execution.cancellation_type == .WAIT_CANCELLATION_REQUESTED);
+    _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+
+    // The workflow sends the request itself, to the child's run, so that it learns when the
+    // server recorded it; the core isn't told.
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    const req = canceled[0].variant.?.request_cancel_external_workflow_execution;
+    try testing.expectEqual(@as(u32, 1), req.seq);
+    try testing.expectEqualStrings("ns", req.workflow_execution.?.namespace);
+    try testing.expectEqualStrings("kid-1", req.workflow_execution.?.workflow_id);
+    try testing.expectEqualStrings("kid-run", req.workflow_execution.?.run_id);
+    try testing.expect(!inst.finished);
+
+    // Recorded: get returns error.Canceled while the child still runs.
+    const recorded = commandsOf(try inst.activate(&try cancelResolved(a, 1, null, .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a));
+    try testing.expectEqual(@as(usize, 1), recorded.len);
+    try testing.expect(recorded[0].variant.? == .cancel_workflow_execution);
+    // The child closing canceled afterwards changes nothing.
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try childCanceled(a, 1), a)).len);
+}
+
+test "child workflow: wait_cancellation_requested through the future, get reports the cancellation once recorded" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_requested+future")}), a);
+    const cmds = commandsOf(try inst.activate(&try childStarted(a, 1, "kid-run"), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expectEqualStrings("kid-run", cmds[0].variant.?.request_cancel_external_workflow_execution.workflow_execution.?.run_id);
+    const done = commandsOf(try inst.activate(&try cancelResolved(a, 1, null, .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a));
+    try testing.expectEqualStrings("\"child canceled\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "child workflow: wait_cancellation_requested canceled before its start was sent ends on the start's cancellation" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_requested")}), a);
+    // Not started yet: the core cancels it, before sending its start.
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.cancel_child_workflow_execution.child_workflow_seq);
+    try testing.expect(!inst.finished);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .resolve_child_workflow_execution_start = .{ .seq = 1, .status = .{ .cancelled = .{
+        .failure = .{ .message = "Child Workflow Execution cancelled before scheduled" },
+    } } } }), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expect(done[0].variant.? == .cancel_workflow_execution);
+}
+
+test "child workflow: wait_cancellation_requested canceled while its start is in flight sends the request once it started" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_requested")}), a);
+    _ = try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a);
+    // The start was already sent: the child starts, and the workflow then sends the request
+    // whose recording it waits for.
+    const started = commandsOf(try inst.activate(&try childStarted(a, 1, "kid-run"), a));
+    try testing.expectEqual(@as(usize, 1), started.len);
+    try testing.expectEqualStrings("kid-run", started[0].variant.?.request_cancel_external_workflow_execution.workflow_execution.?.run_id);
+    try testing.expect(!inst.finished);
+    const done = commandsOf(try inst.activate(&try cancelResolved(a, 1, null, .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expect(done[0].variant.? == .cancel_workflow_execution);
+}
+
+test "child workflow: wait_cancellation_requested, a child that closes before the request is recorded returns how it closed" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    {
+        // It completes: get returns its result, and the re-armed cancel ends the sleep.
+        const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_requested")}), a);
+        _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+        _ = try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a);
+        const done = commandsOf(try inst.activate(&try childResolved(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, @as([]const u8, "hi")) } }), a));
+        try testing.expect(done[done.len - 1].variant.? == .cancel_workflow_execution);
+        for (done) |c| try testing.expect(c.variant.? != .complete_workflow_execution);
+    }
+    {
+        // The server refuses the request (the child closed), and the core then reports the
+        // child canceled.
+        const inst = try create(testing.allocator, ChildWf.Cancel.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "CancelChild", .{@as([]const u8, "wait_cancellation_requested")}), a);
+        _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+        _ = try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a);
+        const refused = commandsOf(try inst.activate(&try cancelResolved(a, 1, .{ .message = "not found" }, .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND), a));
+        try testing.expectEqual(@as(usize, 0), refused.len);
+        try testing.expect(!inst.finished);
+        const done = commandsOf(try inst.activate(&try childCanceled(a, 1), a));
+        try testing.expectEqual(@as(usize, 1), done.len);
+        try testing.expect(done[0].variant.? == .cancel_workflow_execution);
+    }
+}
+
+test "child workflow: canceling the workflow leaves a child nobody awaits to its parent close policy" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Unawaited.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "UnawaitedChild", .{}), a));
+    try testing.expect(first[0].variant.?.start_child_workflow_execution.parent_close_policy == .PARENT_CLOSE_POLICY_REQUEST_CANCEL);
+    _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expect(canceled[canceled.len - 1].variant.? == .cancel_workflow_execution);
+    for (canceled) |c| switch (c.variant.?) {
+        .cancel_child_workflow_execution, .request_cancel_external_workflow_execution => return error.TestUnexpectedResult,
+        else => {},
+    };
+}
+
+/// Waits in the child's `get` from a coroutine of its own, which the workflow function awaits.
+const SideAwaitedChild = struct {
+    fn getChild(f: workflow.ChildWorkflowFuture([]const u8)) workflow.ChildWorkflowError![]const u8 {
+        return f.get();
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const f = ctx.executeChildWorkflow(ChildWf.Kid, .{ .id = "kid-1" }, .{"kid"});
+        var waiting = io.async(getChild, .{f});
+        return waiting.await(io);
+    }
+    const Def = workflow.Def("SideAwaitedChild", run);
+};
+
+test "child workflow: canceling the workflow cancels a child that a coroutine other than the workflow function waits on" {
+    // ChildWorkflowOptions and README.md: "Canceling the parent cancels only the children a
+    // coroutine is waiting on in `get` or `started`" and "the coroutines blocked in a child's
+    // `get` or `started` are canceled with the rest". Here a coroutine the workflow function
+    // awaits waits in `get`, so the child (`try_cancel`) is canceled and the workflow ends.
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SideAwaitedChild.Def.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "SideAwaitedChild", .{}), a));
+    try testing.expect(first[0].variant.? == .start_child_workflow_execution);
+    _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    var child_canceled = false;
+    for (canceled) |c| switch (c.variant.?) {
+        .cancel_child_workflow_execution => |cc| child_canceled = cc.child_workflow_seq == 1,
+        .cancel_workflow_execution => try testing.expect(child_canceled),
+        else => {},
+    };
+    try testing.expect(child_canceled);
 }
 
 test "child workflow: canceling the future cancels the child, and get reports the cancellation" {

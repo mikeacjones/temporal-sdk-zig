@@ -908,7 +908,13 @@ fn greetFamily(ctx: *workflow.Context, names: []const []const u8) ![]const []con
     const children = try a.alloc(workflow.ChildWorkflowFuture([]const u8), names.len);
     for (names, children) |name, *child| {
         const id = try std.fmt.allocPrint(a, "{s}-{s}", .{ ctx.info().workflow_id, name });
-        child.* = ctx.executeChildWorkflow(Greeting, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{name});
+        child.* = ctx.executeChildWorkflow(Greeting, .{
+            .id = id,
+            .execution_timeout = .fromSeconds(60),
+            // Shares dispatch fairly among family members; the priority key is the parent's.
+            .priority = .{ .fairness_key = name },
+            .cancellation_type = .wait_cancellation_requested,
+        }, .{name});
     }
     const greetings = try a.alloc([]const u8, names.len);
     for (children, greetings) |child, *out| out.* = try child.get();
@@ -921,6 +927,14 @@ Notes:
 - `started` returns the child's execution; `error.ChildWorkflowAlreadyStarted` means its ID is taken.
 - `get` returns `error.ChildWorkflowFailed` for a failed, timed-out, canceled, or terminated child, `future.failure()` saying which, and `error.ChildWorkflowAlreadyStarted` when the child's ID is taken.
 - `parent_close_policy` defaults to `.terminate`; `future.signal` signals the child and `future.cancel()` cancels it.
+- `priority` sets the child's priority key and fairness key and weight. Null uses the parent's priority; inside a set priority, each zero field inherits the parent's value. The child reads the result in `ctx.info().priority`.
+- `cancellation_type` says what canceling the child does, through `future.cancel()` or by canceling the coroutine waiting in its `get` (which then returns `error.Canceled`):
+  - `.try_cancel` (the default) requests the child's cancellation and reports it at once.
+  - `.wait_cancellation_requested` requests it and reports it once the server has recorded the request, while the child may still be cleaning up.
+  - `.wait_cancellation_completed` requests it and waits for the child to close; a child that completes or fails instead reports that.
+  - `.abandon` reports it at once and sends no request, leaving the child running.
+  - With any type, a child canceled before its start was sent is never started.
+- Canceling the parent cancels only the children a canceled coroutine is waiting on in `get` or `started`. The cancellation reaches the workflow function, and from it every coroutine it waits on in `Future.await`, `Group.await` or a `Select`. A child nobody waits on that way keeps running, and its `parent_close_policy` applies when the parent closes: by default the server terminates it. Call `future.cancel()` to cancel it with the parent.
 - `static_summary` (a short single line) and `static_details` (longer text) describe the child; the UI and CLI show them on its started event. Each is sent as a JSON string payload through the worker's payload codecs, and empty sends none. They don't take part in replay.
 
 #### External workflows
@@ -987,6 +1001,7 @@ Notes:
 - Delivering the cancellation consumes it, so cleanup can still run activities and timers.
 - Returning `error.Canceled` ends the workflow canceled; a result or another error completes or fails it.
 - `ctx.io().swapCancelProtection(.blocked)` protects a section; `std.Io.recancel` re-arms a consumed cancellation.
+- A coroutine waiting in `Future.await` or `Group.await` passes the cancellation on to the coroutines it awaits, as `std.Io` specifies; if an awaited future finishes without consuming it, the awaiting coroutine's next cancelable wait gets it.
 
 #### Versioning and patching
 `workflow.Context.patched` keeps old and new code paths until runs on the old one are gone; `getVersion` does the same with version numbers.

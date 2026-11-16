@@ -1,0 +1,1 @@
+Canceling a workflow coroutine that waits in `std.Io.Future.await` or `std.Io.Group.await` now passes the cancellation on to the awaited coroutines, as `std.Io` specifies; before, `Future.await` ignored it and `Group.await` returned `error.Canceled` while the members kept running.

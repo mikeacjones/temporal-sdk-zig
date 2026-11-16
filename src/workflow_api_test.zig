@@ -223,3 +223,208 @@ test "WorkflowReplayer replays a run that continued as new by name and catches o
     try changed.registerDynamicWorkflow(workflow.DynamicDef(countDirectly));
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(continue_as_new_by_name_history));
 }
+
+const ChildCancel = struct {
+    const Finish = workflow.SignalDef("finish", fn () void);
+
+    /// Reports the priority it runs with as "<key>|<fairness key>|<weight>".
+    fn reportPriority(ctx: *workflow.Context) ![]const u8 {
+        const p = ctx.info().priority;
+        return std.fmt.allocPrint(ctx.allocator(), "{d}|{s}|{d}", .{ p.priority_key, p.fairness_key, p.fairness_weight });
+    }
+    const ReportPriority = workflow.Def("child_report_priority", reportPriority);
+
+    /// Starts `ReportPriority` once with a priority that sets only the key and once without,
+    /// and returns both answers joined by a space.
+    fn prioritizedChildren(ctx: *workflow.Context) ![]const u8 {
+        const a = ctx.allocator();
+        const id = ctx.info().workflow_id;
+        const set = ctx.executeChildWorkflow(ReportPriority, .{ .id = try std.fmt.allocPrint(a, "{s}-set", .{id}), .priority = .{ .priority_key = 2 } }, .{});
+        const unset = ctx.executeChildWorkflow(ReportPriority, .{ .id = try std.fmt.allocPrint(a, "{s}-unset", .{id}) }, .{});
+        return std.fmt.allocPrint(a, "{s} {s}", .{ try set.get(), try unset.get() });
+    }
+    const PrioritizedChildren = workflow.Def("child_prioritized_children", prioritizedChildren);
+
+    /// Waits until canceled, then cleans up until the `Finish` signal and ends canceled.
+    fn slowCleanup(ctx: *workflow.Context) ![]const u8 {
+        const finish = try ctx.signalChannel(Finish);
+        ctx.io().sleep(.fromSeconds(24 * 60 * 60), .awake) catch |err| switch (err) {
+            error.Canceled => {
+                _ = try finish.receive();
+                return error.Canceled;
+            },
+        };
+        return "not canceled";
+    }
+    const SlowCleanup = workflow.Def("child_slow_cleanup", slowCleanup);
+
+    fn getChild(f: workflow.ChildWorkflowFuture([]const u8)) workflow.ChildWorkflowError![]const u8 {
+        return f.get();
+    }
+
+    /// Starts `SlowCleanup` as `child_id` with a priority under `cancellation_type`,
+    /// abandoned when this workflow closes, waits in its `get` in a coroutine, and cancels
+    /// that coroutine once the child started. Returns what the canceled `get` returned.
+    fn cancelChild(ctx: *workflow.Context, cancellation_type: workflow.ChildWorkflowCancellationType, child_id: []const u8) ![]const u8 {
+        const io = ctx.io();
+        const f = ctx.executeChildWorkflow(SlowCleanup, .{
+            .id = child_id,
+            .cancellation_type = cancellation_type,
+            .parent_close_policy = .abandon,
+            .priority = .{ .priority_key = 2 },
+        }, .{});
+        _ = try f.started();
+        var waiting = io.async(getChild, .{f});
+        _ = waiting.cancel(io) catch |err| return @errorName(err);
+        return "not canceled";
+    }
+    const CancelChild = workflow.Def("child_cancel_requested", cancelChild);
+
+    /// `cancelChild` under another cancellation type.
+    fn cancelChildCompleted(ctx: *workflow.Context, cancellation_type: workflow.ChildWorkflowCancellationType, child_id: []const u8) ![]const u8 {
+        _ = cancellation_type;
+        return cancelChild(ctx, .wait_cancellation_completed, child_id);
+    }
+    fn cancelChildAbandon(ctx: *workflow.Context, cancellation_type: workflow.ChildWorkflowCancellationType, child_id: []const u8) ![]const u8 {
+        _ = cancellation_type;
+        return cancelChild(ctx, .abandon, child_id);
+    }
+    /// `cancelChild` without the child.
+    fn noChild(ctx: *workflow.Context, cancellation_type: workflow.ChildWorkflowCancellationType, child_id: []const u8) ![]const u8 {
+        _ = ctx;
+        _ = cancellation_type;
+        _ = child_id;
+        return "Canceled";
+    }
+
+    /// Sleeps for a day; canceled, it ends canceled.
+    fn sleepLong(ctx: *workflow.Context) !void {
+        try ctx.io().sleep(.fromSeconds(24 * 60 * 60), .awake);
+    }
+    const SleepLong = workflow.Def("child_sleep_long", sleepLong);
+
+    /// Starts `SleepLong` with the default parent close policy, waits for its start but not
+    /// its result, then sleeps until canceled.
+    fn leaveChild(ctx: *workflow.Context) !void {
+        const f = ctx.executeChildWorkflow(SleepLong, .{ .id = try std.fmt.allocPrint(ctx.allocator(), "{s}-child", .{ctx.info().workflow_id}) }, .{});
+        _ = try f.started();
+        try ctx.io().sleep(.fromSeconds(24 * 60 * 60), .awake);
+    }
+    const LeaveChild = workflow.Def("child_left_unawaited", leaveChild);
+
+    const EventTag = std.meta.Tag(@import("proto.zig").temporal.api.history.v1.HistoryEvent.attributes_union);
+
+    /// Waits, long-polling the server, until the run records an event of kind `tag`. Fails if
+    /// the run closes first.
+    fn awaitEvent(c: anytype, id: []const u8, comptime tag: EventTag) !void {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        var it = try c.historyIterator(id, "", .{ .wait_new_event = true });
+        defer it.deinit();
+        while (try it.next(scratch.allocator())) |event| {
+            if (event.attributes) |attrs| if (attrs == tag) return;
+        }
+        return error.TestUnexpectedResult;
+    }
+};
+
+test "workflow: a child gets the priority its parent sets, and the parent's when it sets none" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChildCancel.PrioritizedChildren);
+    try env.registerWorkflow(ChildCancel.ReportPriority);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflowWithOptions(ChildCancel.PrioritizedChildren, .{
+        .priority = .{ .priority_key = 3, .fairness_key = "tenant-a", .fairness_weight = 1.5 },
+    }, .{}, arena.allocator(), null);
+    // The set key overrides the parent's; the zero fields inherit its values.
+    try testing.expectEqualStrings("2|tenant-a|1.5 3|tenant-a|1.5", result);
+}
+
+test "workflow: wait_cancellation_requested lets the parent go on while the canceled child cleans up" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChildCancel.CancelChild);
+    try env.registerWorkflow(ChildCancel.SlowCleanup);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var suffix: [4]u8 = undefined;
+    testing.io.random(&suffix);
+    const child_id = try std.fmt.allocPrint(a, "cancel-requested-child-{x}", .{suffix});
+    var run = try env.startWorkflow(ChildCancel.CancelChild, .{}, .{ .wait_cancellation_requested, child_id });
+    defer run.deinit();
+    // Replays the run too.
+    try testing.expectEqualStrings("Canceled", try env.getResult(ChildCancel.CancelChild, &run, a, null));
+
+    // The parent closed while the child, its cancellation recorded, still cleans up.
+    const child = try env.client.describeWorkflow(a, child_id, "");
+    try testing.expectEqual(.running, child.status);
+    try testing.expectEqual(@as(i32, 2), child.raw.workflow_execution_info.?.priority.?.priority_key);
+    var recorded = false;
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    for (history.events.items) |event| switch (event.attributes orelse continue) {
+        .external_workflow_execution_cancel_requested_event_attributes => recorded = true,
+        .child_workflow_execution_canceled_event_attributes => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try testing.expect(recorded);
+
+    try env.client.signalWorkflow(ChildCancel.Finish, child_id, "", .{});
+    var child_run = try env.client.getWorkflow([]const u8, child_id, "");
+    defer child_run.deinit();
+    try testing.expectError(error.WorkflowCanceled, child_run.get(a));
+}
+
+test "workflow: canceling a parent leaves the child nobody awaits to its parent close policy" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChildCancel.LeaveChild);
+    try env.registerWorkflow(ChildCancel.SleepLong);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(ChildCancel.LeaveChild, .{}, .{});
+    defer run.deinit();
+    try ChildCancel.awaitEvent(&env.client, run.id, .timer_started_event_attributes);
+    try env.client.cancelWorkflow(run.id, "", "stop");
+    try testing.expectError(error.WorkflowCanceled, env.getResult(ChildCancel.LeaveChild, &run, a, null));
+
+    // Not canceled by the parent (it would have ended canceled): terminated by the default
+    // parent close policy when the parent closed.
+    const child_id = try std.fmt.allocPrint(a, "{s}-child", .{run.id});
+    try ChildCancel.awaitEvent(&env.client, child_id, .workflow_execution_terminated_event_attributes);
+    const child_history = try env.client.fetchHistory(a, child_id, "");
+    for (child_history.events.items) |event| switch (event.attributes orelse continue) {
+        .workflow_execution_cancel_requested_event_attributes => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try testing.expectEqual(.terminated, (try env.client.describeWorkflow(a, child_id, "")).status);
+}
+
+/// A dev-server run of `ChildCancel.CancelChild` under `wait_cancellation_requested`: it
+/// starts the child with priority key 2, cancels the coroutine waiting in its `get`, and
+/// completes once the server recorded the request, while the child still runs. Fetched with
+/// `Client.fetchHistory` and encoded as ProtoJSON (`History.jsonEncode`), the worker's
+/// identity replaced.
+const child_cancel_requested_history = @embedFile("testdata/child_cancel_requested_history.json");
+
+test "WorkflowReplayer replays a child canceled under wait_cancellation_requested and catches another type or a removed child" {
+    var ok: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(ChildCancel.CancelChild);
+    try ok.replayHistoryJson(child_cancel_requested_history);
+
+    // `try_cancel` sends the same request and isn't caught: the core accepts the completion
+    // in the task after the request's, where this history has it.
+    inline for (.{ ChildCancel.cancelChildCompleted, ChildCancel.cancelChildAbandon, ChildCancel.noChild }) |changed_fn| {
+        var changed: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+        defer changed.deinit();
+        try changed.registerWorkflow(workflow.Def("child_cancel_requested", changed_fn));
+        try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(child_cancel_requested_history));
+    }
+}

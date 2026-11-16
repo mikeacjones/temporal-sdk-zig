@@ -548,11 +548,27 @@ fn concurrent(
     return @ptrCast(task);
 }
 
-fn awaitTask(w: *WorkflowIo, task: *Task, result: []u8) void {
+/// Waits for `task` to finish and copies its result out. With `pass_cancel`, a cancellation
+/// of the waiting coroutine is passed on to `task`, as `std.Io.Threaded` does in `await`: the
+/// wait goes on until `task` finishes, and if `task` didn't consume the cancellation (it had
+/// already finished, or never reached a cancelable wait), the waiting coroutine's
+/// cancellation is re-armed for its next cancelable wait.
+fn awaitTask(w: *WorkflowIo, task: *Task, result: []u8, pass_cancel: bool) void {
     if (!task.done) {
         var wait = w.newWait();
         task.awaiter = &wait;
-        w.block(&wait, false) catch unreachable;
+        if (w.block(&wait, pass_cancel)) |_| {} else |_| {
+            const was_running = !task.done;
+            w.requestCancel(task);
+            // The cancel that ended the block woke `wait`; wait on a fresh one.
+            while (!task.done) {
+                wait = w.newWait();
+                w.block(&wait, false) catch unreachable;
+            }
+            if (!was_running or task.cancel_requested) {
+                if (w.ownCancelTask()) |t| t.cancel_requested = true;
+            }
+        }
         assert(task.done);
     }
     @memcpy(result, task.result);
@@ -561,14 +577,14 @@ fn awaitTask(w: *WorkflowIo, task: *Task, result: []u8) void {
 
 fn await(userdata: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, _: Alignment) void {
     const w = self(userdata);
-    w.awaitTask(@ptrCast(@alignCast(any_future)), result);
+    w.awaitTask(@ptrCast(@alignCast(any_future)), result, true);
 }
 
 fn cancel(userdata: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, _: Alignment) void {
     const w = self(userdata);
     const task: *Task = @ptrCast(@alignCast(any_future));
     w.requestCancel(task);
-    w.awaitTask(task, result);
+    w.awaitTask(task, result, false);
 }
 
 fn groupState(w: *WorkflowIo, group: *Io.Group) !*GroupState {
@@ -636,7 +652,18 @@ fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Can
         var wait = w.newWait();
         g.awaiter = &wait;
         defer g.awaiter = null;
-        try w.block(&wait, true);
+        w.block(&wait, true) catch |err| {
+            // As `std.Io.Group.await` says: the cancellation goes to every member, and the
+            // group finishes before the error is returned.
+            var it = g.head;
+            while (it) |t| : (it = t.group_next) w.requestCancel(t);
+            while (g.pending > 0) {
+                wait = w.newWait();
+                w.block(&wait, false) catch unreachable;
+            }
+            w.finishGroup(group, g);
+            return err;
+        };
     }
     w.finishGroup(group, g);
 }
@@ -981,6 +1008,83 @@ test "canceling a sleeping future cancels its timer and delivers error.Canceled"
     e.fake.runAll(&e.wio);
     try testing.expectEqual(@as(?anyerror, error.Canceled), result);
     try testing.expectEqual(@as(u32, 1), e.fake.canceled);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+/// Awaits a future that sleeps for an hour (`sleepForever`, or `protectedSleep` when
+/// `protected`), then records how its own next cancelable wait ends in `after`.
+fn awaitSleeper(i: Io, inner: *?anyerror, protected: bool, after: *?anyerror) void {
+    if (protected) {
+        var f = i.async(protectedSleep, .{ i, inner });
+        f.await(i);
+    } else {
+        var f = i.async(sleepForever, .{ i, inner });
+        f.await(i);
+    }
+    i.sleep(.fromSeconds(1), .awake) catch |err| {
+        after.* = err;
+        return;
+    };
+    after.* = null;
+}
+
+test "canceling a coroutine waiting in Future.await cancels the awaited one, which consumes it" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var inner: ?anyerror = error.Unset;
+    var after: ?anyerror = error.Unset;
+    const task = try e.wio.spawn("wf", awaitSleeper, .{ e.wio.io(), &inner, false, &after });
+    e.wio.run();
+    e.wio.cancelTask(task);
+    e.fake.runAll(&e.wio);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), inner);
+    // The awaited coroutine took the cancellation; the awaiting one goes on uncanceled.
+    try testing.expectEqual(@as(?anyerror, null), after);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+test "a cancellation the awaited future doesn't consume stays with the coroutine waiting in Future.await" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var inner: ?anyerror = error.Unset;
+    var after: ?anyerror = error.Unset;
+    const task = try e.wio.spawn("wf", awaitSleeper, .{ e.wio.io(), &inner, true, &after });
+    e.wio.run();
+    e.wio.cancelTask(task);
+    e.fake.runAll(&e.wio);
+    // The protected sleep finished; its awaiter's next cancelable wait gets the cancellation.
+    try testing.expectEqual(@as(?anyerror, null), inner);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), after);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+/// Awaits a group of two hour-long sleepers and records how the await ended.
+fn awaitSleeperGroup(i: Io, inner: *[2]?anyerror, result: *?anyerror) void {
+    var g: Io.Group = .init;
+    for (inner) |*r| g.async(i, sleepForever, .{ i, r });
+    g.await(i) catch |err| {
+        result.* = err;
+        return;
+    };
+    result.* = null;
+}
+
+test "canceling a coroutine waiting in Group.await cancels every member and returns once they finished" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var inner: [2]?anyerror = .{ error.Unset, error.Unset };
+    var result: ?anyerror = error.Unset;
+    const task = try e.wio.spawn("wf", awaitSleeperGroup, .{ e.wio.io(), &inner, &result });
+    e.wio.run();
+    e.wio.cancelTask(task);
+    e.wio.run();
+    try testing.expectEqual(@as(?anyerror, error.Canceled), result);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), inner[0]);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), inner[1]);
+    try testing.expectEqual(@as(u32, 2), e.fake.canceled);
     try testing.expectEqual(@as(usize, 0), e.sched.live);
 }
 

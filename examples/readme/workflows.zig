@@ -436,7 +436,13 @@ fn greetFamily(ctx: *workflow.Context, names: []const []const u8) ![]const []con
     const children = try a.alloc(workflow.ChildWorkflowFuture([]const u8), names.len);
     for (names, children) |name, *child| {
         const id = try std.fmt.allocPrint(a, "{s}-{s}", .{ ctx.info().workflow_id, name });
-        child.* = ctx.executeChildWorkflow(Greeting, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{name});
+        child.* = ctx.executeChildWorkflow(Greeting, .{
+            .id = id,
+            .execution_timeout = .fromSeconds(60),
+            // Shares dispatch fairly among family members; the priority key is the parent's.
+            .priority = .{ .fairness_key = name },
+            .cancellation_type = .wait_cancellation_requested,
+        }, .{name});
     }
     const greetings = try a.alloc([]const u8, names.len);
     for (children, greetings) |child, *out| out.* = try child.get();

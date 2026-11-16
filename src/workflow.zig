@@ -531,15 +531,42 @@ pub const LocalActivityOptions = struct {
     summary: []const u8 = "",
 };
 
-/// What canceling a child workflow's future does: `try_cancel` requests the child's
-/// cancellation and reports it at once, `wait_cancellation_completed` requests it and waits for
-/// the child to end, and `abandon` reports it at once and leaves the child running.
-pub const ChildWorkflowCancellationType = enum { try_cancel, wait_cancellation_completed, abandon };
+/// What canceling a child workflow does: `ChildWorkflowFuture.cancel`, or canceling the
+/// coroutine waiting in its `get` or `started`. A canceled coroutine's wait returns
+/// `error.Canceled` when the type says; after `ChildWorkflowFuture.cancel`, `get` returns
+/// `error.ChildWorkflowFailed` then, with a canceled failure as the root cause.
+///
+/// - `try_cancel`, the default: requests the child's cancellation and reports it at once (in
+///   the same activation), without waiting for the server. The request may not reach the
+///   server if this workflow closes first.
+/// - `wait_cancellation_requested`: requests the cancellation and reports it once the server
+///   has recorded the request (the parent's history has the child's cancel-requested event),
+///   while the child may still be running its cleanup. If the child closes first, it reports
+///   how the child closed instead, as `wait_cancellation_completed` does.
+/// - `wait_cancellation_completed`: requests the cancellation and waits for the child to close.
+///   If it completes or fails instead of being canceled, that result is reported.
+/// - `abandon`: sends no request; reports the cancellation at once and leaves the child
+///   running. Its `parent_close_policy` still applies when this workflow closes.
+///
+/// A child canceled before its start was sent to the server is never started, with any type:
+/// it reports a canceled start ("cancelled before scheduled") in the next activation. One whose
+/// start was already sent is canceled as its type says; `wait_cancellation_requested` then
+/// waits for the child to start before it can confirm the request.
+pub const ChildWorkflowCancellationType = enum { try_cancel, wait_cancellation_requested, wait_cancellation_completed, abandon };
 
 /// What the server does to a child workflow still running when its parent closes.
 pub const ParentClosePolicy = enum { terminate, abandon, request_cancel };
 
 /// How a child workflow is started.
+///
+/// Canceling the parent workflow cancels only the children it is waiting on. The cancellation
+/// reaches the workflow function's coroutine, and from it every coroutine it waits on in
+/// `Future.await`, `Group.await` or `Select` (and so on down); a coroutine canceled while it
+/// waits in a child's `get` or `started` cancels that child as its `cancellation_type` says.
+/// A child whose future no canceled coroutine is waiting on (one started and left, or awaited
+/// by a coroutine started with `io.async` that nothing awaits) is left running; call its
+/// future's `cancel` to cancel it, or rely on its `parent_close_policy`, which the server
+/// applies when the parent closes (by default it terminates the child).
 pub const ChildWorkflowOptions = struct {
     /// Empty generates a UUID from the workflow's seeded randomness, the same on replay.
     id: []const u8 = "",
@@ -571,6 +598,11 @@ pub const ChildWorkflowOptions = struct {
     /// A longer description of the child, shown in the UI and CLI. Sent as a JSON string
     /// payload (through the codecs); empty sends none.
     static_details: []const u8 = "",
+    /// The priority of the child's tasks. Null uses the parent workflow's priority; inside a
+    /// set priority, each zero field inherits the parent's value. The child reads the result
+    /// in `Info.priority`. The server checks the values: one it rejects fails the workflow
+    /// task.
+    priority: ?Priority = null,
 };
 
 /// What canceling a Nexus operation does: `NexusOperationFuture.cancel`, or canceling the
@@ -1805,9 +1837,11 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// the failure with `failure`. If the calling coroutine is canceled while waiting (the
         /// workflow is canceled, or an enclosing future, `Select`, or `Group` is), the child's
         /// cancellation is requested and this returns `error.Canceled`: at once for
-        /// `try_cancel` and `abandon`, and once the child has closed for
-        /// `wait_cancellation_completed`. If that child completes or fails instead, this
-        /// returns its result or error, and the next cancelable wait returns `error.Canceled`.
+        /// `try_cancel` and `abandon`, once the server has recorded the request for
+        /// `wait_cancellation_requested`, and once the child has closed for
+        /// `wait_cancellation_completed` (see `ChildWorkflowCancellationType`). If the child
+        /// completes or fails first, this returns its result or error, and the next
+        /// cancelable wait returns `error.Canceled`.
         pub fn get(f: Self) ChildWorkflowError!T {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .result);
@@ -1843,7 +1877,10 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
             return state.outcome != null;
         }
 
-        /// Requests cancellation of the child, as its `cancellation_type` says.
+        /// Requests cancellation of the child, as its `cancellation_type` says; `get` then
+        /// returns `error.ChildWorkflowFailed` with a canceled failure once the type reports
+        /// the cancellation. Nothing else cancels a child no coroutine is waiting on (see
+        /// `ChildWorkflowOptions`).
         pub fn cancel(f: Self) void {
             if (f.state) |s| f.ctx.instance.cancelChild(s) else |_| {}
         }

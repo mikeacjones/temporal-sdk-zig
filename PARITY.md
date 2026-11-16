@@ -107,7 +107,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Enhanced stack trace query | TypeScript, Python | GA, deferred | partial | `temporal-sdk-zig-d51.6.9`. Missing: the SDK answering `__enhanced_stack_trace` with each coroutine's location and the source around it; a workflow can register a query of that name (it isn't reserved) and answer it from its own bookkeeping. |
 | Workflow metadata query and handler descriptions | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | partial | `temporal-sdk-zig-d51.6.9`. Missing: the SDK answering `__temporal_workflow_metadata` from its registered handlers, and handler descriptions; a workflow can register that query itself. |
 | Event groups: tying a workflow's commands and their history events to a named group (experimental) | Go, TypeScript | pre-release | missing | `temporal-sdk-zig-d51.13.7`. Commands carry no event group markers, and workflow options have no field for them. |
-| Priority and fairness keys on workflows, activities, and children (Task Queue Priority and Fairness GA, Replay 2026) | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [Starting workflows](README.md#starting-workflows) |
+| Priority and fairness keys on workflows, activities, and children (Task Queue Priority and Fairness GA, Replay 2026) | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [Starting workflows](README.md#starting-workflows), [Child workflows](README.md#child-workflows) |
 
 ### Activities
 
