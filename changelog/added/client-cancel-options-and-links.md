@@ -1,0 +1,1 @@
+`Client.cancelWorkflowWithOptions` requests cancellation with `client.CancelOptions`: a `first_execution_run_id` that limits it to the chain of runs that started with that run, and `links` recorded on the cancel-requested event. `client.TerminateOptions` gains `links`, recorded on the terminated event.

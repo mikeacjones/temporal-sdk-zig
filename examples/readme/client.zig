@@ -95,6 +95,33 @@ pub fn startWorkflows(client: *temporal.client.Client, arena: Allocator) ![]cons
     return greeting;
 }
 
+pub fn controlStandaloneActivity(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
+    // example: client-standalone-activity-control
+    var handle = try client.executeActivity(Greet, .{
+        .id = "greet-later",
+        .task_queue = "greetings",
+        .start_to_close_timeout = .fromSeconds(10),
+        .start_delay = .fromSeconds(1), // no worker gets it before then
+        .priority = .{ .priority_key = 1 },
+        .summary = "greet Grace once the delay passes",
+        .id_conflict_policy = .use_existing,
+    }, .{"Grace"});
+    defer handle.deinit();
+    std.log.info("started a new activity: {}", .{handle.started}); // false if it was running
+    try handle.pause("hold on");
+    try handle.unpause(.{ .reason = "go ahead" });
+    const greeting = try handle.get(arena);
+    const description = try handle.describe(arena);
+    std.log.info("{s}: {s}", .{ description.summary, @tagName(description.status) });
+    if (description.heartbeat_details.len() > 0) {
+        const progress = try description.heartbeat_details.get(u32, arena, 0);
+        std.log.info("last progress: {d}", .{progress});
+    }
+    try handle.delete(); // forget it: describe now returns error.NotFound
+    // end-example
+    return greeting;
+}
+
 /// Holds a greeting that updates change, until the `finish` signal ends it with
 /// "<greeting>, <name>!".
 const Greeter = struct {
@@ -157,6 +184,69 @@ pub fn sendMessages(client: *temporal.client.Client, arena: Allocator) !Replies 
 }
 // end-example
 
+// example: client-messages-by-name
+/// Message names known only at run time, for example read from configuration.
+pub const MessageNames = struct { workflow_type: []const u8, signal: []const u8, query: []const u8, update: []const u8 };
+
+pub fn sendMessagesByName(client: *temporal.client.Client, arena: Allocator, names: MessageNames) !Replies {
+    const start: temporal.client.StartWorkflowOptions = .{ .id = "greeter-6", .task_queue = "greetings", .id_conflict_policy = .use_existing };
+    var started = try client.updateWithStartWorkflowByName([]const u8, names.workflow_type, start, .{"Kai"}, names.update, .{"Hiya"}, .{});
+    defer started.deinit();
+    _ = try started.get(arena); // "Hello"
+    var update = try client.updateWorkflowByName([]const u8, names.update, start.id, "", .{"Yo"}, .{});
+    defer update.deinit();
+    const previous = try update.get(arena); // "Hiya"
+    const reply = try client.queryWorkflowByName(names.query, arena, start.id, "", .{});
+    const current = try reply.get([]const u8, arena); // "Yo"
+    try client.signalWorkflowByName(names.signal, start.id, "", .{});
+    var signaled = try client.signalWithStartWorkflowByName([]const u8, names.workflow_type, .{ .id = "greeter-7", .task_queue = "greetings" }, .{"Ivy"}, names.signal, .{});
+    defer signaled.deinit();
+    var run = try client.getWorkflow([]const u8, start.id, started.run_id);
+    defer run.deinit();
+    return .{ .previous = previous, .current = current, .result = try run.get(arena) }; // result: "Yo, Kai!"
+}
+// end-example
+
+// example: client-update-wait
+const UpdateWaitError = temporal.client.UpdateError || temporal.client.UpdateResultError;
+const Reply = union(enum) {
+    greeting: UpdateWaitError![]const u8,
+    timeout: Io.Cancelable!void,
+};
+
+fn setGreeting(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8, greeting: []const u8) UpdateWaitError![]const u8 {
+    var update = try client.updateWorkflow(SetGreeting, workflow_id, "", .{greeting}, .{ .update_id = "set-greeting-1" });
+    defer update.deinit();
+    return update.get(arena);
+}
+
+/// The previous greeting, or null when the update didn't complete within `timeout`. The
+/// update goes on in the workflow either way.
+pub fn setGreetingWithin(client: *temporal.client.Client, io: Io, arena: Allocator, workflow_id: []const u8, timeout: Io.Duration) !?[]const u8 {
+    var buffer: [2]Reply = undefined;
+    var select: Io.Select(Reply) = .init(io, &buffer);
+    defer select.cancelDiscard(); // cancels the task still waiting
+    try select.concurrent(.greeting, setGreeting, .{ client, arena, workflow_id, "Hey" });
+    try select.concurrent(.timeout, Io.sleep, .{ io, timeout, .awake });
+    return switch (try select.await()) {
+        .greeting => |previous| try previous,
+        .timeout => null,
+    };
+}
+
+/// Updates the workflow `greeter-4`, starting it first if it isn't running, then waits for
+/// that workflow's result.
+pub fn updateThenWait(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
+    var update = try client.updateWithStartWorkflow(GreeterWorkflow, .{ .id = "greeter-4", .task_queue = "greetings", .id_conflict_policy = .use_existing }, .{"Lin"}, SetGreeting, .{"Hey"}, .{});
+    defer update.deinit();
+    // The handle names the run that the call started or found.
+    var run = try client.getWorkflow([]const u8, update.workflow_id, update.run_id);
+    defer run.deinit();
+    try client.signalWorkflow(Finish, run.id, run.run_id, .{});
+    return run.get(arena); // "Hey, Lin!"
+}
+// end-example
+
 pub fn manageWorkflows(client: *temporal.client.Client, arena: Allocator) !void {
     // example: client-manage
     var run = try client.executeWorkflow(GreeterWorkflow, .{ .task_queue = "greetings" }, .{"Ada"});
@@ -177,6 +267,43 @@ pub fn manageWorkflows(client: *temporal.client.Client, arena: Allocator) !void 
     defer stuck.deinit();
     try client.terminateWorkflow(stuck.id, stuck.run_id, "stuck");
     try std.testing.expectError(error.WorkflowTerminated, stuck.get(arena));
+
+    var chain = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-chain", .task_queue = "greetings" }, .{"Cy"});
+    defer chain.deinit();
+    // Another chain's first run changes nothing.
+    try std.testing.expectError(error.NotFound, stopChain(client, chain.id, run.run_id, run.id, run.run_id, false));
+    try stopChain(client, chain.id, chain.run_id, run.id, run.run_id, false);
+    try std.testing.expectError(error.WorkflowCanceled, chain.get(arena));
+    var forced = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-forced", .task_queue = "greetings" }, .{"Di"});
+    defer forced.deinit();
+    try stopChain(client, forced.id, forced.run_id, run.id, run.run_id, true);
+    try std.testing.expectError(error.WorkflowTerminated, forced.get(arena));
+}
+
+/// Cancels, or with `force` terminates, the workflow `workflow_id` if its chain of runs
+/// began with the run `first_run_id`, linking the request to the run that asked for it.
+pub fn stopChain(client: *temporal.client.Client, workflow_id: []const u8, first_run_id: []const u8, requester_id: []const u8, requester_run_id: []const u8, force: bool) !void {
+    // example: client-cancel-options
+    // Links record in the workflow's history what asked for the stop.
+    const links = [_]temporal.proto.temporal.api.common.v1.Link{.{ .variant = .{ .workflow_event = .{
+        .namespace = client.namespace,
+        .workflow_id = requester_id,
+        .run_id = requester_run_id,
+    } } }};
+    // Only the chain of runs that began with `first_run_id`: if the workflow ID has since
+    // started a new chain, the call returns error.NotFound and changes nothing.
+    if (force) {
+        try client.terminateWorkflowWithOptions(workflow_id, "", "forced stop", {}, .{
+            .first_execution_run_id = first_run_id,
+            .links = &links,
+        });
+    } else {
+        try client.cancelWorkflowWithOptions(workflow_id, "", "no longer needed", .{
+            .first_execution_run_id = first_run_id,
+            .links = &links,
+        });
+    }
+    // end-example
 }
 
 pub fn resetGreeter(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8) ![]const u8 {
@@ -320,6 +447,19 @@ test "client: examples against a dev server" {
     var updated = try client.getWorkflow([]const u8, "greeter-3", "");
     defer updated.deinit();
     try std.testing.expectEqualStrings("Howdy, Ziggy!", try updated.get(arena));
+    try std.testing.expectEqualStrings("Hey, Lin!", try updateThenWait(&client, arena));
+    const by_name = try sendMessagesByName(&client, arena, .{ .workflow_type = "greeter", .signal = "finish", .query = "current_greeting", .update = "set_greeting" });
+    try std.testing.expectEqualStrings("Hiya", by_name.previous);
+    try std.testing.expectEqualStrings("Yo", by_name.current);
+    try std.testing.expectEqualStrings("Yo, Kai!", by_name.result);
+    var signaled_by_name = try client.getWorkflow([]const u8, "greeter-7", "");
+    defer signaled_by_name.deinit();
+    try std.testing.expectEqualStrings("Hello, Ivy!", try signaled_by_name.get(arena));
+    var bounded = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-5", .task_queue = "greetings" }, .{"Mo"});
+    defer bounded.deinit();
+    try std.testing.expectEqualStrings("Hello", (try setGreetingWithin(&client, io, arena, bounded.id, .fromSeconds(30))).?);
+    try client.signalWorkflow(Finish, bounded.id, "", .{});
+    try std.testing.expectEqualStrings("Hey, Mo!", try bounded.get(arena));
 
     try manageWorkflows(&client, arena);
 
@@ -355,6 +495,7 @@ test "client: examples against a dev server" {
     try std.testing.expectEqualStrings("Hi, Ada!", try reset.get(arena));
     try scheduleGreetings(&client, arena);
     try std.testing.expectEqualStrings("Hello, Ada!", try runStandaloneActivity(&client, arena));
+    try std.testing.expectEqualStrings("Hello, Grace!", try controlStandaloneActivity(&client, arena));
 
     var later = try client.executeWorkflow(GreetLaterWorkflow, .{ .task_queue = "greetings" }, .{"Lin"});
     defer later.deinit();

@@ -1382,6 +1382,18 @@ pub const Client = struct {
 
     /// `signalWorkflow` with options.
     pub fn signalWorkflowWithOptions(c: *Client, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args, options: SignalOptions) SignalError!void {
+        return c.signalWorkflowByNameWithOptions(Signal.signal_name, workflow_id, run_id, args, options);
+    }
+
+    /// Sends the signal named `signal_name` with the tuple `args` to a workflow, for a caller
+    /// with no `workflow.SignalDef`: a workflow's handler for that name, or its dynamic
+    /// signal handler, receives it. Otherwise behaves as `signalWorkflow`.
+    pub fn signalWorkflowByName(c: *Client, signal_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype) SignalError!void {
+        return c.signalWorkflowByNameWithOptions(signal_name, workflow_id, run_id, args, .{});
+    }
+
+    /// `signalWorkflowByName` with options, which behave as in `signalWorkflowWithOptions`.
+    pub fn signalWorkflowByNameWithOptions(c: *Client, signal_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype, options: SignalOptions) SignalError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
@@ -1389,7 +1401,7 @@ pub const Client = struct {
         _ = c.rpcCall(wfs.SignalWorkflowExecutionResponse, "SignalWorkflowExecution", wfs.SignalWorkflowExecutionRequest{
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
-            .signal_name = Signal.signal_name,
+            .signal_name = signal_name,
             .input = .{ .payloads = try converter.toPayloads(a, args) },
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
@@ -1413,14 +1425,30 @@ pub const Client = struct {
         comptime Signal: type,
         signal_args: Signal.Args,
     ) StartError!WorkflowRun(Workflow.Result) {
+        return c.signalWithStartWorkflowByName(Workflow.Result, Workflow.workflow_name, options, args, Signal.signal_name, signal_args);
+    }
+
+    /// `signalWithStartWorkflow` with the workflow type and the signal named at run time:
+    /// `args` and `signal_args` are tuples of their arguments, and `Result` the type the
+    /// run's result decodes to (`void` to ignore it). Pass a definition's `workflow_name` to
+    /// name only the signal at run time. Otherwise behaves as `signalWithStartWorkflow`.
+    pub fn signalWithStartWorkflowByName(
+        c: *Client,
+        comptime Result: type,
+        workflow_type: []const u8,
+        options: StartWorkflowOptions,
+        args: anytype,
+        signal_name: []const u8,
+        signal_args: anytype,
+    ) StartError!WorkflowRun(Result) {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
         const id = if (options.id.len > 0) options.id else try uuid(a, c.io);
 
-        const start = try c.startRequest(a, Workflow.workflow_name, id, options, args);
+        const start = try c.startRequest(a, workflow_type, id, options, args);
         var request: wfs.SignalWithStartWorkflowExecutionRequest = .{
-            .signal_name = Signal.signal_name,
+            .signal_name = signal_name,
             .signal_input = .{ .payloads = try converter.toPayloads(a, signal_args) },
         };
         // Every start field the two requests share, so a start option mapped in
@@ -1452,19 +1480,22 @@ pub const Client = struct {
     /// `terminateWorkflow` with `details` recorded in the terminated event (any value the
     /// converter encodes, encoded with the client's codecs, or `{}` for none) and
     /// `options`. A `first_execution_run_id` that isn't the chain's first run is
-    /// `error.NotFound`, and the workflow keeps running. Only read during the call.
+    /// `error.NotFound`, and the workflow keeps running. `options.links` are recorded in the
+    /// terminated event. Only read during the call.
     pub fn terminateWorkflowWithOptions(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8, details: anytype, options: TerminateOptions) TerminateError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        _ = c.rpc(wfs.TerminateWorkflowExecutionResponse, "TerminateWorkflowExecution", wfs.TerminateWorkflowExecutionRequest{
+        var request: wfs.TerminateWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .reason = reason,
             .details = try detailPayloads(a, details),
             .identity = c.identity,
             .first_execution_run_id = options.first_execution_run_id,
-        }, a) catch |err| switch (err) {
+        };
+        try request.links.appendSlice(a, options.links);
+        _ = c.rpc(wfs.TerminateWorkflowExecutionResponse, "TerminateWorkflowExecution", request, a) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
         };
@@ -1576,17 +1607,28 @@ pub const Client = struct {
     /// from its next cancelable wait and may clean up before it returns; the run ends
     /// canceled when the workflow returns `error.Canceled`. An empty `run_id` targets the
     /// latest run. Returns `error.NotFound` if no such workflow exists.
+    /// `cancelWorkflowWithOptions` takes options.
     pub fn cancelWorkflow(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void {
+        return c.cancelWorkflowWithOptions(workflow_id, run_id, reason, .{});
+    }
+
+    /// `cancelWorkflow` with `options`. A `first_execution_run_id` that isn't the chain's
+    /// first run is `error.NotFound`, and nothing is canceled. `options.links` are recorded
+    /// in the cancel-requested event. Only read during the call.
+    pub fn cancelWorkflowWithOptions(c: *Client, workflow_id: []const u8, run_id: []const u8, reason: []const u8, options: CancelOptions) CancelError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        _ = c.rpc(wfs.RequestCancelWorkflowExecutionResponse, "RequestCancelWorkflowExecution", wfs.RequestCancelWorkflowExecutionRequest{
+        var request: wfs.RequestCancelWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
             .reason = reason,
-        }, a) catch |err| switch (err) {
+            .first_execution_run_id = options.first_execution_run_id,
+        };
+        try request.links.appendSlice(a, options.links);
+        _ = c.rpc(wfs.RequestCancelWorkflowExecutionResponse, "RequestCancelWorkflowExecution", request, a) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
         };
@@ -1896,6 +1938,9 @@ pub const Client = struct {
         };
         if (options.retry_policy) |rp| request.retry_policy = try protoRetryPolicy(a, rp);
         if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
+        if (options.summary.len > 0) request.user_metadata = .{ .summary = try converter.toPayload(a, options.summary) };
+        if (options.priority) |p| request.priority = .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight };
+        request.start_delay = protoDuration(options.start_delay);
         var status: ?RpcStatus = null;
         var header = try c.outgoingHeader(a, options.context);
         const response = c.rpcCall(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status, &header, options.context) catch |err| switch (err) {
@@ -1907,7 +1952,9 @@ pub const Client = struct {
             },
             else => |e| return e,
         };
-        return c.getActivityHandle(Result, id, response.run_id);
+        var handle = try c.getActivityHandle(Result, id, response.run_id);
+        handle.started = response.started;
+        return handle;
     }
 
     /// A handle to an activity started with `executeActivity`, for example by another
@@ -2083,10 +2130,18 @@ pub const Client = struct {
     /// `error.UpdateFailed` from `get`, not an error here. Returns `error.NotFound` if no
     /// such workflow exists.
     pub fn updateWorkflow(c: *Client, comptime Update: type, workflow_id: []const u8, run_id: []const u8, args: Update.Args, options: UpdateOptions) UpdateError!WorkflowUpdateHandle(Update.Result) {
+        return c.updateWorkflowByName(Update.Result, Update.update_name, workflow_id, run_id, args, options);
+    }
+
+    /// Sends the update named `update_name` with the tuple `args` to a workflow, for a caller
+    /// with no `workflow.UpdateDef`: a workflow's handler for that name, or its dynamic
+    /// update handler, runs it. The handle's `get` decodes the result as `Result` (`void` to
+    /// ignore it). Options, wait stages and errors are `updateWorkflow`'s.
+    pub fn updateWorkflowByName(c: *Client, comptime Result: type, update_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype, options: UpdateOptions) UpdateError!WorkflowUpdateHandle(Result) {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        const request = try c.updateRequest(a, Update.update_name, workflow_id, run_id, args, options);
+        const request = try c.updateRequest(a, update_name, workflow_id, run_id, args, options);
         var header = try c.outgoingHeader(a, options.context);
         const response = try c.updateUntilStage(a, request, &header, options.context);
         const ref_run_id = if (response.update_ref) |r| if (r.workflow_execution) |e| e.run_id else "" else "";
@@ -2123,8 +2178,26 @@ pub const Client = struct {
         update_args: Update.Args,
         update_options: UpdateOptions,
     ) UpdateWithStartError!WorkflowUpdateHandle(Update.Result) {
+        return c.updateWithStartWorkflowByName(Update.Result, Workflow.workflow_name, start_options, args, Update.update_name, update_args, update_options);
+    }
+
+    /// `updateWithStartWorkflow` with the workflow type and the update named at run time:
+    /// `args` and `update_args` are tuples of their arguments, and the handle's `get`
+    /// decodes the update's result as `Result` (`void` to ignore it). Pass a definition's
+    /// `workflow_name` to name only the update at run time. Otherwise behaves as
+    /// `updateWithStartWorkflow`.
+    pub fn updateWithStartWorkflowByName(
+        c: *Client,
+        comptime Result: type,
+        workflow_type: []const u8,
+        start_options: StartWorkflowOptions,
+        args: anytype,
+        update_name: []const u8,
+        update_args: anytype,
+        update_options: UpdateOptions,
+    ) UpdateWithStartError!WorkflowUpdateHandle(Result) {
         if (start_options.id_conflict_policy == .unspecified) {
-            log.warn("updateWithStartWorkflow for update \"{s}\" on workflow type \"{s}\": StartWorkflowOptions.id_conflict_policy must be set (for example .use_existing), the server requires it for update-with-start", .{ Update.update_name, Workflow.workflow_name });
+            log.warn("update-with-start of update \"{s}\" on workflow type \"{s}\": StartWorkflowOptions.id_conflict_policy must be set (for example .use_existing), the server requires it for update-with-start", .{ update_name, workflow_type });
             return error.InvalidOptions;
         }
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
@@ -2132,9 +2205,9 @@ pub const Client = struct {
         const a = arena_state.allocator();
         const id = if (start_options.id.len > 0) start_options.id else try uuid(a, c.io);
 
-        var update = try c.updateRequest(a, Update.update_name, id, "", update_args, update_options);
+        var update = try c.updateRequest(a, update_name, id, "", update_args, update_options);
         update.request.?.input.?.header = try protoHeader(a, try c.outgoingHeader(a, update_options.context));
-        var start = try c.startRequest(a, Workflow.workflow_name, id, start_options, args);
+        var start = try c.startRequest(a, workflow_type, id, start_options, args);
         start.header = try protoHeader(a, try c.outgoingHeader(a, start_options.context));
         const Operation = wfs.ExecuteMultiOperationRequest.Operation;
         var operations: std.ArrayList(Operation) = .empty;
@@ -2154,7 +2227,7 @@ pub const Client = struct {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             error.RpcFailed => {
                 const s = status orelse return error.RpcFailed;
-                return multiOperationError(s, a, id, Update.update_name);
+                return multiOperationError(s, a, id, update_name);
             },
             else => |e| return e,
         };
@@ -2179,23 +2252,38 @@ pub const Client = struct {
 
     /// Maps a failed ExecuteMultiOperation to an error, logging which operation failed.
     fn multiOperationError(s: RpcStatus, arena: Allocator, workflow_id: []const u8, update_name: []const u8) UpdateWithStartError {
+        var line: Io.Writer.Allocating = .init(arena);
+        const err = multiOperationFailure(&line.writer, s, arena, workflow_id, update_name);
+        if (err != error.OutOfMemory) log.err("{s}", .{line.written()});
+        return err;
+    }
+
+    /// The error for a failed ExecuteMultiOperation, after writing its log line to `w`: the
+    /// line names the operation that failed when the status's MultiOperationExecutionFailure
+    /// detail says which, and has the call's own status otherwise. A failed write is
+    /// `error.OutOfMemory`.
+    fn multiOperationFailure(w: *Io.Writer, s: RpcStatus, arena: Allocator, workflow_id: []const u8, update_name: []const u8) UpdateWithStartError {
         const detail_name = "temporal.api.errordetails.v1.MultiOperationExecutionFailure";
+        w.print("update-with-start of update \"{s}\" on workflow {s} failed: ", .{ update_name, workflow_id }) catch return error.OutOfMemory;
         var reader: Io.Reader = .fixed(s.details);
         const decoded = proto.google.rpc.Status.decode(&reader, arena) catch proto.google.rpc.Status{};
         for (decoded.details.items) |any| {
             if (!std.mem.endsWith(u8, any.type_url, "/" ++ detail_name)) continue;
             var detail_reader: Io.Reader = .fixed(any.value);
             const detail = proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure.decode(&detail_reader, arena) catch break;
+            var named = false;
             for (detail.statuses.items, 0..) |op, i| {
                 // The server marks the operations it didn't run because another failed as
                 // ABORTED; only the failing one says why.
                 if (op.code == 0 or op.code == 10) continue;
                 const what = if (i == 0) "starting the workflow" else "the update";
-                log.err("update-with-start of update \"{s}\" on workflow {s} failed: {s} failed: {s} (gRPC status {d})", .{ update_name, workflow_id, what, op.message, op.code });
+                w.print("{s}{s} failed: {s} (gRPC status {d})", .{ if (named) "; " else "", what, op.message, op.code }) catch return error.OutOfMemory;
+                named = true;
             }
-            return error.RpcFailed;
+            if (named) return error.RpcFailed;
+            break;
         }
-        log.err("update-with-start of update \"{s}\" on workflow {s} failed: {s} (gRPC status {d})", .{ update_name, workflow_id, s.message, s.code });
+        w.print("{s} (gRPC status {d})", .{ s.message, s.code }) catch return error.OutOfMemory;
         return error.RpcFailed;
     }
 
@@ -2399,11 +2487,30 @@ pub const Client = struct {
     /// request and decode the response with `values` and the workflow or activity the request
     /// names.
     fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values) RpcError!Response {
-        var coded = request;
         var codec_context: converter.CodecContext = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
-        requestIdentity(@TypeOf(coded), &coded, &codec_context);
+        requestIdentity(@TypeOf(request), &request, &codec_context);
+        return c.sendInContext(Response, method, request, arena, status, &codec_context);
+    }
+
+    /// For `worker.Worker`: records a heartbeat of the activity attempt `task_token` with
+    /// `details`, which the codecs encode under the worker's `context` for the activity, as
+    /// its other heartbeats are, and returns the server's answer (whether the activity has
+    /// been canceled, paused or reset). Like the worker's other heartbeats, it bypasses the
+    /// client's interceptors. Memory comes from `arena`.
+    pub fn recordWorkerHeartbeat(c: *Client, arena: Allocator, task_token: []const u8, details: []const converter.Payload, context: *const converter.CodecContext) RpcError!wfs.RecordActivityTaskHeartbeatResponse {
+        var request: wfs.RecordActivityTaskHeartbeatRequest = .{ .namespace = c.namespace, .task_token = task_token, .identity = c.identity };
+        if (details.len > 0) {
+            var payloads: proto.temporal.api.common.v1.Payloads = .{};
+            try payloads.payloads.appendSlice(arena, details);
+            request.details = payloads;
+        }
+        return c.sendInContext(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", request, arena, null, context);
+    }
+
+    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.CodecContext) RpcError!Response {
+        var coded = request;
         if (c.encode_failure_attributes) try failure_mod.encodeAttributes(@TypeOf(coded), &coded, arena);
-        converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io, &codec_context) catch |err| {
+        converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io, codec_context) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: encoding its payloads with the client's codecs failed", .{method});
             return err;
         };
@@ -2441,7 +2548,7 @@ pub const Client = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidResponse,
         };
-        converter.decodeMessage(Response, &response, c.codecs, arena, c.io, &codec_context) catch |err| {
+        converter.decodeMessage(Response, &response, c.codecs, arena, c.io, codec_context) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: decoding the response's payloads with the client's codecs failed", .{method});
             return err;
         };
@@ -2650,6 +2757,30 @@ pub const TerminateOptions = struct {
     /// chain that didn't is `error.NotFound`. The chain's first run stays the original one
     /// across resets and continue-as-new. Empty checks nothing.
     first_execution_run_id: []const u8 = "",
+    /// Links to related executions or events, recorded in the terminated event.
+    links: []const proto.temporal.api.common.v1.Link = &.{},
+};
+
+/// How `Client.cancelWorkflowWithOptions` requests cancellation.
+pub const CancelOptions = struct {
+    /// Requests cancellation only if the workflow's chain of runs started with the run of
+    /// this ID; a chain that didn't is `error.NotFound`. The chain's first run stays the
+    /// original one across resets and continue-as-new. Empty checks nothing.
+    first_execution_run_id: []const u8 = "",
+    /// Links to related executions or events, recorded in the cancel-requested event.
+    links: []const proto.temporal.api.common.v1.Link = &.{},
+};
+
+pub const CancelError = error{
+    OutOfMemory,
+    Canceled,
+    /// The server refused; logged with its reason.
+    RpcFailed,
+    /// No such workflow, the run has closed, or it isn't the chain `first_execution_run_id`
+    /// names.
+    NotFound,
+    InvalidResponse,
+    CodecFailed,
 };
 
 pub const TerminateError = error{
@@ -2921,6 +3052,16 @@ pub const StartActivityOptions = struct {
     /// Indexed values for `Client.listActivities` queries, built with
     /// `search_attributes.Key.set`; unsets are ignored. Only read while starting.
     search_attributes: []const search_attributes.Update = &.{},
+    /// How long the server waits before scheduling the first attempt. The activity counts
+    /// as running meanwhile, but no worker gets it before the delay has passed. Null
+    /// schedules it at once.
+    start_delay: ?Duration = null,
+    /// The activity's task priority and fairness. Null uses the server's defaults.
+    priority: ?workflow.Priority = null,
+    /// A single-line description of the activity for people reading it in the UI or CLI,
+    /// stored as a JSON string payload (through the codecs); empty sends none. Read it back
+    /// as `ActivityDescription.summary`.
+    summary: []const u8 = "",
     /// Values the client's propagators write into the activity's header; the activity reads
     /// them with `ctx.propagated()`. Only read during the call.
     context: ?*const propagation.Values = null,
@@ -2972,7 +3113,7 @@ pub const ActivityError = error{
     /// No such activity.
     NotFound,
     InvalidResponse,
-    /// `cancel` or `terminate` of an activity that has already closed.
+    /// `cancel`, `terminate`, `pause` or `unpause` of an activity that has already closed.
     ActivityClosed,
 };
 
@@ -3007,8 +3148,21 @@ pub const ActivityDescription = struct {
     close_time: ?Io.Timestamp,
     /// Read a value with `search_attributes.get(arena, key)`.
     search_attributes: search_attributes.View,
-    /// The server's record, with the last heartbeat's details and the last attempt's
-    /// failure, for anything not lifted into the fields above.
+    /// The details of the latest heartbeat, decoded through the client's codecs; read each
+    /// value with `heartbeat_details.get(T, arena, index)`. Empty before the first heartbeat
+    /// with details.
+    heartbeat_details: converter.EncodedValues,
+    /// When the latest heartbeat was recorded; null before the first.
+    last_heartbeat_time: ?Io.Timestamp,
+    /// `StartActivityOptions.start_delay`; null without one, or for a zero delay.
+    start_delay: ?Duration,
+    /// `StartActivityOptions.priority`; null when every field is at its default (the
+    /// server's defaults).
+    priority: ?workflow.Priority,
+    /// `StartActivityOptions.summary`; empty without one.
+    summary: []const u8,
+    /// The server's record, with the last attempt's failure, for anything not lifted into the
+    /// fields above.
     raw: proto.temporal.api.activity.v1.ActivityExecutionInfo,
 };
 
@@ -3044,6 +3198,10 @@ pub fn ActivityHandle(comptime T: type) type {
         id: []u8,
         /// Empty when the handle follows the latest run of `id`.
         run_id: []u8,
+        /// From `Client.executeActivity`: true when the call started a new activity, false
+        /// when `StartActivityOptions.id_conflict_policy = .use_existing` returned the one
+        /// already running with the ID. Always false from `Client.getActivityHandle`.
+        started: bool = false,
         failure_: ?failure_mod.Failure = null,
 
         pub fn deinit(h: *Self) void {
@@ -3131,6 +3289,18 @@ pub fn ActivityHandle(comptime T: type) type {
                 .last_started_time = timestamp(info.last_started_time),
                 .close_time = timestamp(info.close_time),
                 .search_attributes = try .fromProto(arena, info.search_attributes),
+                .heartbeat_details = .{ .payloads = if (info.heartbeat_details) |d| d.payloads.items else &.{} },
+                .last_heartbeat_time = timestamp(info.last_heartbeat_time),
+                .start_delay = if (duration(info.start_delay)) |d| if (d.nanoseconds == 0) null else d else null,
+                .priority = if (info.priority) |p| if (p.priority_key == 0 and p.fairness_key.len == 0 and p.fairness_weight == 0) null else .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight } else null,
+                .summary = summary: {
+                    const md = info.user_metadata orelse break :summary "";
+                    const p = md.summary orelse break :summary "";
+                    break :summary converter.fromPayload([]const u8, arena, p) catch |err| {
+                        log.err("DescribeActivityExecution for activity {s} returned a summary that doesn't decode as a string: {t}", .{ h.id, err });
+                        return error.InvalidResponse;
+                    };
+                },
                 .raw = info,
             };
         }
@@ -3170,6 +3340,24 @@ pub fn ActivityHandle(comptime T: type) type {
             }
         }
 
+        /// `controlError` for `pause` and `unpause`, whose FAILED_PRECONDITION means either a
+        /// closed activity or one in the wrong state (already pausing, or not paused): the
+        /// activity's status tells them apart.
+        fn pauseError(h: *const Self, err: Client.RpcError, status: ?Client.RpcStatus, comptime what: []const u8) ActivityError {
+            const s = status orelse return h.controlError(err, status, what);
+            if (err != error.RpcFailed or s.code != 9) return h.controlError(err, status, what);
+            var arena_state: std.heap.ArenaAllocator = .init(h.client.gpa);
+            defer arena_state.deinit();
+            const d = try h.describe(arena_state.allocator());
+            switch (d.status) {
+                .running, .paused, .unspecified, _ => {
+                    log.warn(what ++ " activity {s} failed: {s} (gRPC status {d})", .{ h.id, s.message, s.code });
+                    return error.RpcFailed;
+                },
+                .completed, .failed, .canceled, .terminated, .timed_out => return error.ActivityClosed,
+            }
+        }
+
         /// Terminates the activity: it closes at once, and a running attempt's result is
         /// discarded. Returns `error.ActivityClosed` if the activity has already closed.
         pub fn terminate(h: *const Self, reason: []const u8) ActivityError!void {
@@ -3187,8 +3375,84 @@ pub fn ActivityHandle(comptime T: type) type {
                 .reason = reason,
             }, a, &status) catch |err| return h.controlError(err, status, "terminating");
         }
+
+        /// Pauses the activity: no new attempt is scheduled until `unpause`, and a running
+        /// attempt learns of the pause from its next heartbeat as `std.Io` cancellation, with
+        /// `ctx.cancelReason()` `.paused`; once it returns `error.Canceled`, the worker ends
+        /// the attempt as a retryable `ActivityPause` failure. `describe` reports the status
+        /// `.paused`. That failure counts against the retry policy: pausing a running attempt
+        /// that is the last `maximum_attempts` allows fails the activity instead. A cancel
+        /// requested before the paused attempt ends still ends the activity canceled.
+        /// `reason` is recorded with the request.
+        /// Returns `error.NotFound` for no such activity, `error.ActivityClosed` if it has
+        /// already closed, and `error.RpcFailed` (logging the server's reason) for anything
+        /// else the server refuses, such as an activity that is already paused or pausing.
+        pub fn pause(h: *const Self, reason: []const u8) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.PauseActivityExecutionResponse, "PauseActivityExecution", wfs.PauseActivityExecutionRequest{
+                .namespace = c.namespace,
+                .activity_id = h.id,
+                .run_id = h.run_id,
+                .identity = c.identity,
+                .reason = reason,
+                .resource_id = try std.fmt.allocPrint(a, "activity:{s}", .{h.id}),
+                .request_id = try uuid(a, c.io),
+            }, a, &status) catch |err| return h.pauseError(err, status, "pausing");
+        }
+
+        /// Resumes a paused activity: its next attempt is scheduled at once, or at a random
+        /// time within `options.jitter`. Errors as for `pause`; unpausing an activity that
+        /// isn't paused returns `error.RpcFailed`.
+        pub fn unpause(h: *const Self, options: UnpauseActivityOptions) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.UnpauseActivityExecutionResponse, "UnpauseActivityExecution", wfs.UnpauseActivityExecutionRequest{
+                .namespace = c.namespace,
+                .activity_id = h.id,
+                .run_id = h.run_id,
+                .identity = c.identity,
+                .reason = options.reason,
+                .jitter = protoDuration(options.jitter),
+                .resource_id = try std.fmt.allocPrint(a, "activity:{s}", .{h.id}),
+                .request_id = try uuid(a, c.io),
+            }, a, &status) catch |err| return h.pauseError(err, status, "unpausing");
+        }
+
+        /// Deletes the activity and its record; a running activity is terminated first.
+        /// Afterwards `describe` and `get` return `error.NotFound`, and visibility queries
+        /// stop listing it once they catch up. Returns `error.NotFound` for no such activity
+        /// and `error.RpcFailed` (logging the server's reason) for anything else the server
+        /// refuses.
+        pub fn delete(h: *const Self) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.DeleteActivityExecutionResponse, "DeleteActivityExecution", wfs.DeleteActivityExecutionRequest{
+                .namespace = c.namespace,
+                .activity_id = h.id,
+                .run_id = h.run_id,
+            }, a, &status) catch |err| return h.controlError(err, status, "deleting");
+        }
     };
 }
+
+/// How `ActivityHandle.unpause` resumes an activity.
+pub const UnpauseActivityOptions = struct {
+    /// Recorded with the request.
+    reason: []const u8 = "",
+    /// Schedules the next attempt at a random time within this long, to spread out many
+    /// activities unpaused at once. Null schedules it at once.
+    jitter: ?Duration = null,
+};
 
 /// The standalone activities matching a visibility query, from `Client.listActivities`.
 /// Fetches a page from the server whenever `next` runs past the last one. Owns its memory
@@ -4354,6 +4618,11 @@ fn timestamp(t: ?proto.google.protobuf.Timestamp) ?Io.Timestamp {
     return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
 }
 
+fn duration(d: ?proto.google.protobuf.Duration) ?Duration {
+    const v = d orelse return null;
+    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
+}
+
 fn protoDuration(d: ?Duration) ?proto.google.protobuf.Duration {
     const v = d orelse return null;
     return .{
@@ -5246,4 +5515,70 @@ test "closing a client from init returns while a first connection it gave up on 
     silent.deinit(testing.io);
     thread.join();
     try testing.expect(returned);
+}
+
+/// A failed ExecuteMultiOperation's status: `code` and `message`, with a
+/// MultiOperationExecutionFailure detail holding `statuses` unless it's null.
+fn multiOperationStatus(arena: Allocator, code: u32, message: []const u8, statuses: ?[]const proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure.OperationStatus) !Client.RpcStatus {
+    var status: proto.google.rpc.Status = .{ .code = @intCast(code), .message = message };
+    if (statuses) |ops| {
+        var failure: proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure = .{};
+        try failure.statuses.appendSlice(arena, ops);
+        var value: Io.Writer.Allocating = .init(arena);
+        try failure.encode(&value.writer, arena);
+        try status.details.append(arena, .{ .type_url = "type.googleapis.com/temporal.api.errordetails.v1.MultiOperationExecutionFailure", .value = value.written() });
+    }
+    var details: Io.Writer.Allocating = .init(arena);
+    try status.encode(&details.writer, arena);
+    return .{ .code = code, .message = message, .details = details.written() };
+}
+
+test "a failed update-with-start names the operation that failed" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const prefix = "update-with-start of update \"set\" on workflow cart-1 failed: ";
+    const Case = struct {
+        status: Client.RpcStatus,
+        line: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .status = try multiOperationStatus(a, 3, "MultiOperation could not be executed.", &.{
+                .{ .code = 3, .message = "missing task queue" },
+                .{ .code = 10, .message = "Operation was aborted." },
+            }),
+            .line = prefix ++ "starting the workflow failed: missing task queue (gRPC status 3)",
+        },
+        .{
+            .status = try multiOperationStatus(a, 8, "MultiOperation could not be executed.", &.{
+                .{ .code = 10, .message = "Operation was aborted." },
+                .{ .code = 8, .message = "too many outstanding updates" },
+            }),
+            .line = prefix ++ "the update failed: too many outstanding updates (gRPC status 8)",
+        },
+        // Without the detail, or with one that names no failing operation, the line has the
+        // call's own status.
+        .{
+            .status = try multiOperationStatus(a, 14, "connection reset", null),
+            .line = prefix ++ "connection reset (gRPC status 14)",
+        },
+        .{
+            .status = try multiOperationStatus(a, 10, "MultiOperation could not be executed.", &.{
+                .{ .code = 10, .message = "Operation was aborted." },
+                .{ .code = 10, .message = "Operation was aborted." },
+            }),
+            .line = prefix ++ "MultiOperation could not be executed. (gRPC status 10)",
+        },
+        .{
+            .status = .{ .code = 13, .message = "internal", .details = "\xff\xff" },
+            .line = prefix ++ "internal (gRPC status 13)",
+        },
+    };
+    for (cases) |case| {
+        var line: Io.Writer.Allocating = .init(testing.allocator);
+        defer line.deinit();
+        try testing.expectEqual(error.RpcFailed, Client.multiOperationFailure(&line.writer, case.status, a, "cart-1", "set"));
+        try testing.expectEqualStrings(case.line, line.written());
+    }
 }

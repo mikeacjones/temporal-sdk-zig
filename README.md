@@ -387,6 +387,79 @@ Notes:
 - A failed query, or one with no handler, is `error.QueryFailed`. `updateWorkflow` waits for `UpdateOptions.wait_for_stage` (`.completed` by default). A rejected update is `error.UpdateFailed` from the handle's `get`, with the reason in `failure()`.
 - `updateWithStartWorkflow` requires `id_conflict_policy`. `signalWithStartWorkflow` ignores the start arguments when the workflow is running.
 
+A client that has no definition of a message, such as one talking to a dynamic workflow or to a workflow whose message names come from configuration, sends it by name. `signalWorkflowByName`, `queryWorkflowByName`, and `updateWorkflowByName` take the name as a string and the arguments as a tuple; `signalWithStartWorkflowByName` and `updateWithStartWorkflowByName` take the workflow type and the message name as strings. A workflow's handler for that name receives the message, or its dynamic handler when it has none.
+
+<!-- example: client-messages-by-name -->
+```zig
+/// Message names known only at run time, for example read from configuration.
+pub const MessageNames = struct { workflow_type: []const u8, signal: []const u8, query: []const u8, update: []const u8 };
+
+pub fn sendMessagesByName(client: *temporal.client.Client, arena: Allocator, names: MessageNames) !Replies {
+    const start: temporal.client.StartWorkflowOptions = .{ .id = "greeter-6", .task_queue = "greetings", .id_conflict_policy = .use_existing };
+    var started = try client.updateWithStartWorkflowByName([]const u8, names.workflow_type, start, .{"Kai"}, names.update, .{"Hiya"}, .{});
+    defer started.deinit();
+    _ = try started.get(arena); // "Hello"
+    var update = try client.updateWorkflowByName([]const u8, names.update, start.id, "", .{"Yo"}, .{});
+    defer update.deinit();
+    const previous = try update.get(arena); // "Hiya"
+    const reply = try client.queryWorkflowByName(names.query, arena, start.id, "", .{});
+    const current = try reply.get([]const u8, arena); // "Yo"
+    try client.signalWorkflowByName(names.signal, start.id, "", .{});
+    var signaled = try client.signalWithStartWorkflowByName([]const u8, names.workflow_type, .{ .id = "greeter-7", .task_queue = "greetings" }, .{"Ivy"}, names.signal, .{});
+    defer signaled.deinit();
+    var run = try client.getWorkflow([]const u8, start.id, started.run_id);
+    defer run.deinit();
+    return .{ .previous = previous, .current = current, .result = try run.get(arena) }; // result: "Yo, Kai!"
+}
+```
+Notes:
+- The update calls and `signalWithStartWorkflowByName` take the type the result decodes to first (`void` to ignore it); `queryWorkflowByName` returns a `converter.EncodedValue` to decode with `get(T, arena)`.
+- Options, wait stages, and errors are the typed calls'. A rejected update is `error.UpdateFailed` from the handle's `get`; client interceptors, propagators, and codecs see the calls as they see the typed ones.
+- `signalWorkflowByNameWithOptions` and `queryWorkflowByNameWithOptions` take `SignalOptions` and `QueryOptions` last.
+
+`updateWorkflow`, `updateWithStartWorkflow`, and the handle's `get` wait on the server for as long as the update takes: `Options.rpc_timeout` doesn't limit them. To bound the wait, cancel the task that waits, here by racing it against a timeout. The wait ends with `error.Canceled` and the update goes on in the workflow; `getWorkflowUpdateHandle` with the same update ID reads its result later. The handle from `updateWithStartWorkflow` carries the workflow ID and the run it started or found, so `getWorkflow` waits for that workflow's result without another call.
+
+<!-- example: client-update-wait -->
+```zig
+const UpdateWaitError = temporal.client.UpdateError || temporal.client.UpdateResultError;
+const Reply = union(enum) {
+    greeting: UpdateWaitError![]const u8,
+    timeout: Io.Cancelable!void,
+};
+
+fn setGreeting(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8, greeting: []const u8) UpdateWaitError![]const u8 {
+    var update = try client.updateWorkflow(SetGreeting, workflow_id, "", .{greeting}, .{ .update_id = "set-greeting-1" });
+    defer update.deinit();
+    return update.get(arena);
+}
+
+/// The previous greeting, or null when the update didn't complete within `timeout`. The
+/// update goes on in the workflow either way.
+pub fn setGreetingWithin(client: *temporal.client.Client, io: Io, arena: Allocator, workflow_id: []const u8, timeout: Io.Duration) !?[]const u8 {
+    var buffer: [2]Reply = undefined;
+    var select: Io.Select(Reply) = .init(io, &buffer);
+    defer select.cancelDiscard(); // cancels the task still waiting
+    try select.concurrent(.greeting, setGreeting, .{ client, arena, workflow_id, "Hey" });
+    try select.concurrent(.timeout, Io.sleep, .{ io, timeout, .awake });
+    return switch (try select.await()) {
+        .greeting => |previous| try previous,
+        .timeout => null,
+    };
+}
+
+/// Updates the workflow `greeter-4`, starting it first if it isn't running, then waits for
+/// that workflow's result.
+pub fn updateThenWait(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
+    var update = try client.updateWithStartWorkflow(GreeterWorkflow, .{ .id = "greeter-4", .task_queue = "greetings", .id_conflict_policy = .use_existing }, .{"Lin"}, SetGreeting, .{"Hey"}, .{});
+    defer update.deinit();
+    // The handle names the run that the call started or found.
+    var run = try client.getWorkflow([]const u8, update.workflow_id, update.run_id);
+    defer run.deinit();
+    try client.signalWorkflow(Finish, run.id, run.run_id, .{});
+    return run.get(arena); // "Hey, Lin!"
+}
+```
+
 #### Describing, listing, cancelling, and terminating
 
 `Client.describeWorkflow` reports a run's status and times, and `Client.fetchHistory` reads its events. `Client.listWorkflows` and `Client.countWorkflows` take a visibility query. `Client.cancelWorkflow` asks a workflow to stop, and `Client.terminateWorkflow` stops it with no cleanup.
@@ -411,8 +484,34 @@ Notes:
 - Visibility is eventually consistent. An invalid query is `error.RpcFailed`, logged with the server's reason.
 - A cancelled workflow sees `error.Canceled` from its next cancelable wait and may clean up first. `Client.historyIterator` reads history a page at a time, optionally waiting for new events.
 - `Client.terminateWorkflowWithOptions` records details (any value the converter encodes, or `{}` for none) in the terminated event. With `TerminateOptions.first_execution_run_id`, it terminates only the chain of runs that started with that run; another chain is `error.NotFound`, and the workflow keeps running.
-<!-- stub: temporal-sdk-zig-d51.5.30 -->
-- Not implemented yet: a first-execution run ID on `cancelWorkflow`, and links on a termination.
+
+`Client.cancelWorkflowWithOptions` is `cancelWorkflow` with `client.CancelOptions`. Both it and `terminateWorkflowWithOptions` take a `first_execution_run_id`, which limits the call to the chain of runs that started with that run, and `links`, which the server records on the cancel-requested or terminated event:
+
+<!-- example: client-cancel-options -->
+```zig
+// Links record in the workflow's history what asked for the stop.
+const links = [_]temporal.proto.temporal.api.common.v1.Link{.{ .variant = .{ .workflow_event = .{
+    .namespace = client.namespace,
+    .workflow_id = requester_id,
+    .run_id = requester_run_id,
+} } }};
+// Only the chain of runs that began with `first_run_id`: if the workflow ID has since
+// started a new chain, the call returns error.NotFound and changes nothing.
+if (force) {
+    try client.terminateWorkflowWithOptions(workflow_id, "", "forced stop", {}, .{
+        .first_execution_run_id = first_run_id,
+        .links = &links,
+    });
+} else {
+    try client.cancelWorkflowWithOptions(workflow_id, "", "no longer needed", .{
+        .first_execution_run_id = first_run_id,
+        .links = &links,
+    });
+}
+```
+Notes:
+- The chain's first run stays the same across continue-as-new and resets, so naming it reaches the chain's current run. A later run's ID, or another chain's, is `error.NotFound`, and nothing is canceled or terminated.
+- `links` are `temporal.proto.temporal.api.common.v1.Link` values, read only during the call. The server accepts `workflow_event` links, which need a namespace, workflow ID, and run ID, and `batch_job` links; it refuses other kinds, or a link missing a field, with `error.RpcFailed`, logged with its reason.
 
 #### Schedules
 
@@ -455,6 +554,38 @@ Notes:
 - The server must enable standalone activities (`testing.DevServer.standalone_activity_args` on a dev server); otherwise the start is `error.RpcFailed`.
 - `start_to_close_timeout` or `schedule_to_close_timeout` is required: the client doesn't check and sends the request as given; the server validates it, and a start it refuses is `error.RpcFailed`, logged. `get` returns `error.ActivityFailed`, `ActivityCanceled`, `ActivityTerminated`, or `ActivityTimedOut`, with `failure()`.
 - `cancel` and `terminate` return `error.ActivityClosed` for a closed activity. `listActivities` and `countActivities` cover only standalone activities.
+
+`StartActivityOptions` also takes a `start_delay`, a `priority` (`workflow.Priority`) and a `summary`, and `describe` reads them back. `ActivityHandle` pauses, unpauses and deletes the activity.
+
+<!-- example: client-standalone-activity-control -->
+```zig
+var handle = try client.executeActivity(Greet, .{
+    .id = "greet-later",
+    .task_queue = "greetings",
+    .start_to_close_timeout = .fromSeconds(10),
+    .start_delay = .fromSeconds(1), // no worker gets it before then
+    .priority = .{ .priority_key = 1 },
+    .summary = "greet Grace once the delay passes",
+    .id_conflict_policy = .use_existing,
+}, .{"Grace"});
+defer handle.deinit();
+std.log.info("started a new activity: {}", .{handle.started}); // false if it was running
+try handle.pause("hold on");
+try handle.unpause(.{ .reason = "go ahead" });
+const greeting = try handle.get(arena);
+const description = try handle.describe(arena);
+std.log.info("{s}: {s}", .{ description.summary, @tagName(description.status) });
+if (description.heartbeat_details.len() > 0) {
+    const progress = try description.heartbeat_details.get(u32, arena, 0);
+    std.log.info("last progress: {d}", .{progress});
+}
+try handle.delete(); // forget it: describe now returns error.NotFound
+```
+Notes:
+- `handle.started` is false when `id_conflict_policy = .use_existing` returned the activity already running with the ID.
+- A running attempt learns of `pause` from its next heartbeat as `std.Io` cancellation with `ctx.cancelReason()` `.paused`; the worker ends it as a retryable `ActivityPause` failure, and `describe` reports `.paused`. That failure counts against the retry policy, so pausing a running attempt that is the last `maximum_attempts` allows fails the activity; a cancel requested before the paused attempt ends still ends it canceled. `unpause` schedules the next attempt, within `.jitter` if set.
+- `pause`, `unpause` and `delete` return `error.NotFound` for no such activity, and `pause` and `unpause` return `error.ActivityClosed` for a closed one. The server's other refusals, such as pausing a paused activity or unpausing a running one, are `error.RpcFailed`, logged.
+- `ActivityDescription.heartbeat_details` holds the latest heartbeat's details, decoded through the client's codecs; read each with `get(T, arena, index)`. `delete` terminates a running activity first.
 
 #### Completing activities asynchronously
 

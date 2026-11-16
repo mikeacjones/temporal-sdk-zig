@@ -470,3 +470,74 @@ test "rejectActivity and rejectChildWorkflow copy the refusal's cause, which the
     defer arena.deinit();
     try testing.expectEqualStrings("over budget|over budget", try env.executeWorkflow(RefusingWithCause.Refused, .{}, arena.allocator(), null));
 }
+
+/// Records each signal and update request's method and message name, as "method name".
+const MessageNames = struct {
+    mutex: std.Io.Mutex = .init,
+    io: std.Io,
+    arena: std.heap.ArenaAllocator,
+    calls: std.ArrayList([]const u8) = .empty,
+
+    pub fn call(r: *MessageNames, input: *interceptor.ClientCall, next: interceptor.Client.Next) interceptor.ClientError!void {
+        const wfs = proto.temporal.api.workflowservice.v1;
+        const name: ?[]const u8 = if (input.request(wfs.SignalWorkflowExecutionRequest)) |q|
+            q.signal_name
+        else if (input.request(wfs.SignalWithStartWorkflowExecutionRequest)) |q|
+            q.signal_name
+        else if (input.request(wfs.UpdateWorkflowExecutionRequest)) |q|
+            q.request.?.input.?.name
+        else if (input.request(wfs.ExecuteMultiOperationRequest)) |q|
+            q.operations.items[1].operation.?.update_workflow.request.?.input.?.name
+        else
+            null;
+        if (name) |n| {
+            r.mutex.lockUncancelable(r.io);
+            defer r.mutex.unlock(r.io);
+            try r.calls.append(r.arena.allocator(), try std.fmt.allocPrint(r.arena.allocator(), "{s} {s}", .{ input.method, n }));
+        }
+        try next.call(input);
+    }
+};
+
+test "a client interceptor sees signals and updates sent by name as it sees typed ones" {
+    var names: MessageNames = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer names.arena.deinit();
+    const interceptors = [_]interceptor.Client{interceptor.Client.from(MessageNames, &names)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(ClientFixtures.Tagged);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var run = try env.startWorkflow(ClientFixtures.Tagged, .{ .id = "tagged-by-name", .task_queue = "" }, .{});
+    defer run.deinit();
+    var bumped = try c.updateWorkflowByName(u32, "bump", "tagged-by-name", "", .{}, .{});
+    defer bumped.deinit();
+    try testing.expectEqual(@as(u32, 1), try bumped.get(a));
+    try c.signalWorkflowByName("done", "tagged-by-name", "", .{});
+    try testing.expectEqualStrings("untagged", try run.get(a));
+
+    var other = try c.signalWithStartWorkflowByName([]const u8, "Tagged", .{ .id = "other-by-name", .task_queue = env.task_queue }, .{}, "done", .{});
+    defer other.deinit();
+    try testing.expectEqualStrings("untagged", try other.get(a));
+    var with_start = try c.updateWithStartWorkflowByName(u32, "Tagged", .{ .id = "third-by-name", .task_queue = env.task_queue, .id_conflict_policy = .use_existing }, .{}, "bump", .{}, .{});
+    defer with_start.deinit();
+    try testing.expectEqual(@as(u32, 1), try with_start.get(a));
+    try c.signalWorkflow(ClientFixtures.Done, "third-by-name", "", .{});
+
+    const want = [_][]const u8{
+        "UpdateWorkflowExecution bump",
+        "SignalWorkflowExecution done",
+        "SignalWithStartWorkflowExecution done",
+        "ExecuteMultiOperation bump",
+        "SignalWorkflowExecution done",
+    };
+    const got = names.calls.items;
+    if (got.len != want.len) {
+        std.debug.print("client interceptor saw {any}\n", .{got});
+        return error.TestUnexpectedResult;
+    }
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}

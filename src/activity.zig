@@ -134,7 +134,12 @@ pub const CancelReason = enum(u8) {
     timed_out,
     /// The worker is shutting down and its graceful shutdown period has passed.
     worker_shutdown,
+    /// The activity was paused (`client.ActivityHandle.pause` for a standalone activity).
+    /// The worker reports the attempt's `error.Canceled` as a retryable failure of type
+    /// `ActivityPause`, and the next attempt runs once the activity is unpaused.
     paused,
+    /// The activity was reset. The worker reports the attempt's `error.Canceled` as a
+    /// retryable failure of type `ActivityReset`.
     reset,
 };
 
