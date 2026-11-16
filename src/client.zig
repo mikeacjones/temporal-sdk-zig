@@ -797,8 +797,13 @@ pub const Client = struct {
     /// the view uses them: workflow start, signal, query, update, describe, list and count,
     /// cancel, terminate and reset, history, schedules, worker deployments, standalone
     /// activities, asynchronous activity completion and heartbeats, `checkHealth`, and the
-    /// calls of the handles and iterators the view returns. Workers on the view are not
-    /// affected: their calls use the client's options.
+    /// calls of the handles and iterators the view returns.
+    ///
+    /// A view is for single calls: build workers on this client, not on a view. A worker
+    /// built on a view keeps the view, so `ctx.client()` in its activities and Nexus
+    /// handlers returns the view and their calls send its timeout and metadata, and if this
+    /// client is from `init` and hasn't connected yet, the worker's first connection waits
+    /// only as long as the view's timeout.
     ///
     /// `options.timeout` replaces `Options.rpc_timeout` for each call, as that option
     /// applies: it is the deadline of each call and of each of its retries, a call that runs
