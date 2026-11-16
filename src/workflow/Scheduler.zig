@@ -38,6 +38,10 @@ free_stacks: std.ArrayList(Stack) = .empty,
 /// Fibers spawned and not yet finished.
 live: usize = 0,
 next_id: u32 = 1,
+/// How many times a fiber has returned control to `run`. The only field another thread may
+/// read (atomically), while `run` executes: the worker's deadlock detector watches it advance.
+/// Workflow code never sees it, so it doesn't affect determinism.
+switches: std.atomic.Value(u64) = .init(0),
 
 pub const Options = struct {
     /// Usable stack bytes per fiber. Memory is reserved virtually and only touched pages
@@ -153,6 +157,7 @@ pub fn run(s: *Scheduler) void {
         s.current = f;
         switchStack(&s.main_sp, f.sp);
         // Back on the scheduler: the fiber blocked, yielded, or finished.
+        _ = s.switches.fetchAdd(1, .release);
         const prev = s.current.?;
         s.current = null;
         if (prev.state == .done) s.releaseStack(prev.stack);
@@ -481,6 +486,20 @@ test "a blocked fiber resumes after wake on the next run" {
     s.run();
     try testing.expectEqualSlices(u32, &.{ 1, 2 }, log.items());
     try testing.expectEqual(@as(usize, 0), s.live);
+}
+
+test "switches counts each return of a fiber to the scheduler" {
+    var s: Scheduler = .init(testing.allocator, .{});
+    defer s.deinit();
+    var log: Log = .{};
+    var gate: Gate = .{ .log = &log };
+    _ = try s.spawn("waiter", waitOnGate, .{ &s, &gate });
+    try testing.expectEqual(0, s.switches.load(.acquire));
+    s.run(); // blocks once
+    try testing.expectEqual(1, s.switches.load(.acquire));
+    s.wake(gate.waiter.?);
+    s.run(); // finishes
+    try testing.expectEqual(2, s.switches.load(.acquire));
 }
 
 fn child(log: *Log, id: u32) void {

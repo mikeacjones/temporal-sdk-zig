@@ -942,6 +942,16 @@ pub const WorkflowReplayer = struct {
         /// A history whose run goes over it fails with `error.ReplayFailed`: set it to the
         /// worker's value to check that its histories fit.
         workflow_memory_limit: ?usize = null,
+        /// Deadlock detection while replaying (`worker.Options.deadlock_detection_timeout`).
+        /// Null (the default) doesn't watch the replayed code. With a limit, a history whose
+        /// workflow code runs longer than it without returning to the workflow scheduler
+        /// fails with `error.ReplayFailed`, its message naming the deadlock. Must be positive:
+        /// replay calls return `error.ReplayFailed` otherwise.
+        deadlock_detection_timeout: ?Io.Duration = null,
+        /// The worker's `worker.Options.workflow_task_failure_errors`, so that replayed code
+        /// returning one of them fails with `error.ReplayFailed` as its task would, not by
+        /// failing the workflow, which the history doesn't record.
+        workflow_task_failure_errors: []const anyerror = &.{},
     };
 
     pub fn init(gpa: Allocator, io: Io) WorkflowReplayer {
@@ -1105,6 +1115,10 @@ pub const WorkflowReplayer = struct {
         stopped: bool,
 
         fn init(s: *Session, r: *const WorkflowReplayer) error{ReplayFailed}!void {
+            if (r.options.deadlock_detection_timeout) |d| if (d.nanoseconds <= 0) {
+                log.warn("WorkflowReplayer.Options.deadlock_detection_timeout is {f}; it must be positive, or null to replay unwatched", .{d});
+                return error.ReplayFailed;
+            };
             var message: ?[]u8 = null;
             defer if (message) |m| r.gpa.free(m);
             const runtime = bridge.Runtime.init(r.gpa, .{}, &message) catch {
@@ -1135,6 +1149,8 @@ pub const WorkflowReplayer = struct {
                     .namespace = r.options.namespace,
                     .stack_size = 256 * 1024,
                     .memory_limit = r.options.workflow_memory_limit,
+                    .task_failure_errors = r.options.workflow_task_failure_errors,
+                    .deadlock_timeout = r.options.deadlock_detection_timeout,
                     .codecs = r.options.codecs,
                     .propagators = r.options.propagators,
                     .interceptors = r.options.interceptors,
@@ -1580,6 +1596,52 @@ const Fixtures = struct {
         return "Canceled";
     }
     const SummaryNapsChanged = workflow.Def("SummaryNaps", summaryNapsChanged);
+
+    /// Holds a `std.Io.Mutex` across a timer while two coroutines wait to lock it, then
+    /// cancels the first waiter and unlocks, so the second locks it and naps. The canceled
+    /// branch naps too, so a waiter whose cancel was lost changes the commands.
+    fn cancelMutexWaiter(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var mutex: std.Io.Mutex = .init;
+        mutex.lockUncancelable(io);
+        var canceled = io.async(lockMutex, .{ io, &mutex });
+        var next = io.async(lockMutexAndNap, .{ io, &mutex });
+        try io.sleep(.fromMilliseconds(100), .awake);
+        const outcome = canceled.cancel(io);
+        mutex.unlock(io);
+        try next.await(io);
+        if (outcome) |_| return "locked" else |err| {
+            try io.sleep(.fromMilliseconds(100), .awake);
+            return @errorName(err);
+        }
+    }
+    const CancelMutexWaiter = workflow.Def("CancelMutexWaiter", cancelMutexWaiter);
+
+    fn lockMutex(io: std.Io, mutex: *std.Io.Mutex) std.Io.Cancelable!void {
+        try mutex.lock(io);
+        mutex.unlock(io);
+    }
+
+    fn lockMutexAndNap(io: std.Io, mutex: *std.Io.Mutex) std.Io.Cancelable!void {
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
+        try io.sleep(.fromMilliseconds(100), .awake);
+    }
+
+    /// `cancelMutexWaiter` without the canceled branch's nap.
+    fn cancelMutexWaiterChanged(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var mutex: std.Io.Mutex = .init;
+        mutex.lockUncancelable(io);
+        var canceled = io.async(lockMutex, .{ io, &mutex });
+        var next = io.async(lockMutexAndNap, .{ io, &mutex });
+        try io.sleep(.fromMilliseconds(100), .awake);
+        const outcome = canceled.cancel(io);
+        mutex.unlock(io);
+        try next.await(io);
+        if (outcome) |_| return "locked" else |err| return @errorName(err);
+    }
+    const CancelMutexWaiterChanged = workflow.Def("CancelMutexWaiter", cancelMutexWaiterChanged);
 };
 
 const SideEffectFixtures = struct {
@@ -2695,6 +2757,24 @@ test "WorkflowReplayer applies workflow_memory_limit: a history fits a generous 
     tiny.options.workflow_memory_limit = 1;
     try tiny.registerWorkflow(Fixtures.Hello);
     try testing.expectError(error.ReplayFailed, tiny.replayHistoryJson(hello_history));
+}
+
+// Detection adds no command and changes none: a history replays the same under a limit its
+// code never reaches.
+test "WorkflowReplayer replays a history under a deadlock detection limit it never reaches" {
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    r.options.deadlock_detection_timeout = .fromSeconds(2);
+    try r.registerWorkflow(Fixtures.Hello);
+    try r.replayHistoryJson(hello_history);
+}
+
+test "WorkflowReplayer rejects a deadlock detection limit that isn't positive" {
+    var r: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer r.deinit();
+    r.options.deadlock_detection_timeout = .zero;
+    try r.registerWorkflow(Fixtures.Hello);
+    try testing.expectError(error.ReplayFailed, r.replayHistoryJson(hello_history));
 }
 
 // Queries leave no trace in history, so registering query handlers must not change the
@@ -5753,6 +5833,22 @@ test "WorkflowReplayer replays timers started by ctx.sleep with a summary and ca
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(summary_timer_history));
 }
 
+/// A dev-server run of `Fixtures.CancelMutexWaiter`, which cancels a coroutine blocked on a
+/// `std.Io.Mutex`, exported as ProtoJSON from `Client.fetchHistory`.
+const mutex_cancel_history = @embedFile("testdata/mutex_cancel_history.json");
+
+test "WorkflowReplayer replays a workflow that cancels a coroutine blocked on a mutex and catches a changed one" {
+    var ok: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(Fixtures.CancelMutexWaiter);
+    try ok.replayHistoryJson(mutex_cancel_history);
+
+    var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(Fixtures.CancelMutexWaiterChanged);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(mutex_cancel_history));
+}
+
 test "ctx.sleep summaries are recorded on the timer started events" {
     const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
@@ -7270,4 +7366,105 @@ test "sessions: a session fails when its host stops, and then its activities are
     host.stop();
     const result = try env.getResult(SessionFixtures.LostHost, &run, arena.allocator(), null);
     try testing.expectEqualStrings("failed SessionFailed SessionWorkerStopped", result);
+}
+
+// Failure policy: a listed error fails the workflow task; the run stays open and completes
+// once the code no longer returns it.
+const PolicyFixtures = struct {
+    const Poke = workflow.UpdateDef("poke", fn () u32);
+    /// How many times the code below ran; each returns error.ConfigMissing the first time.
+    /// Test-only global state.
+    var calls: std.atomic.Value(u32) = .init(0);
+
+    fn flaky(_: *workflow.Context) ![]const u8 {
+        if (calls.fetchAdd(1, .acq_rel) == 0) return error.ConfigMissing;
+        return "configured";
+    }
+    fn alwaysMissing(_: *workflow.Context) ![]const u8 {
+        return error.ConfigMissing;
+    }
+
+    const State = struct {
+        poked: bool = false,
+        fn poke(s: *State) !u32 {
+            if (calls.fetchAdd(1, .acq_rel) == 0) return error.ConfigMissing;
+            s.poked = true;
+            return 7;
+        }
+        fn isPoked(s: *State) bool {
+            return s.poked;
+        }
+    };
+    fn waitForPoke(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{};
+        try ctx.setUpdateHandler(Poke, s, State.poke);
+        try ctx.await(s, State.isPoked);
+        return "poked";
+    }
+
+    const Flaky = workflow.Def("PolicyFlaky", flaky);
+    const AlwaysMissing = workflow.Def("PolicyFlaky", alwaysMissing);
+    const WaitForPoke = workflow.DefWithOptions("PolicyWaitForPoke", waitForPoke, .{ .task_failure_errors = &.{error.ConfigMissing} });
+
+    /// The message of the first workflow task failure in the run's history, or null.
+    fn taskFailureMessage(env: *WorkflowEnvironment, a: Allocator, id: []const u8, run_id: []const u8) !?[]const u8 {
+        const history = try env.client.fetchHistory(a, id, run_id);
+        for (history.events.items) |event| switch (event.attributes orelse continue) {
+            .workflow_task_failed_event_attributes => |f| return if (f.failure) |failure| failure.message else "",
+            else => {},
+        };
+        return null;
+    }
+};
+
+test "failure policy: a listed error fails the workflow task, the workflow completes on retry, and its history replays" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    env.worker.options.workflow_task_failure_errors = &.{error.ConfigMissing};
+    try env.registerWorkflow(PolicyFixtures.Flaky);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    PolicyFixtures.calls.store(0, .release);
+
+    var run = try env.startWorkflow(PolicyFixtures.Flaky, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("configured", try env.getResult(PolicyFixtures.Flaky, &run, a, null));
+    const message = (try PolicyFixtures.taskFailureMessage(env, a, run.id, run.run_id)) orelse return error.TestExpectedTaskFailure;
+    try testing.expect(std.mem.indexOf(u8, message, "the workflow function of workflow \"PolicyFlaky\" returned error.ConfigMissing") != null);
+
+    // The failed task isn't replayed: code that no longer returns the error matches.
+    var r: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .task_queue = env.task_queue, .workflow_task_failure_errors = &.{error.ConfigMissing} });
+    defer r.deinit();
+    try r.registerWorkflow(PolicyFixtures.Flaky);
+    const ok = try r.replayWorkflowExecution(a, &env.client, run.id, run.run_id);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), ok.err);
+
+    // Code that still returns it fails its task in replay too.
+    var still: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .task_queue = env.task_queue, .workflow_task_failure_errors = &.{error.ConfigMissing} });
+    defer still.deinit();
+    try still.registerWorkflow(PolicyFixtures.AlwaysMissing);
+    const failed = try still.replayWorkflowExecution(a, &env.client, run.id, run.run_id);
+    try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, error.ReplayFailed), failed.err);
+}
+
+test "failure policy: a listed error from an update handler fails the task, and the retried task completes the update" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(PolicyFixtures.WaitForPoke);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    PolicyFixtures.calls.store(0, .release);
+
+    var run = try env.startWorkflow(PolicyFixtures.WaitForPoke, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    var update = try env.client.updateWorkflow(PolicyFixtures.Poke, run.id, run.run_id, .{}, .{});
+    defer update.deinit();
+    try testing.expectEqual(@as(u32, 7), try update.get(a));
+    try testing.expectEqualStrings("poked", try env.getResult(PolicyFixtures.WaitForPoke, &run, a, null));
+    const message = (try PolicyFixtures.taskFailureMessage(env, a, run.id, run.run_id)) orelse return error.TestExpectedTaskFailure;
+    try testing.expect(std.mem.indexOf(u8, message, "update handler \"poke\"") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "returned error.ConfigMissing") != null);
 }

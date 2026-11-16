@@ -115,6 +115,23 @@ fn runVersionedWorker(gpa: std.mem.Allocator, io: std.Io, client: *temporal.clie
 }
 // end-example
 
+test "workers: deadlock detection takes a limit, or null to turn it off" {
+    var client: temporal.client.Client = undefined; // never used: the workers don't run
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    // example: worker-deadlock-detection
+    // Workflow code may run up to 5 s without waiting before its task fails (default: 2 s).
+    var patient = try Worker.init(gpa, io, &client, "reports", .{ .deadlock_detection_timeout = .fromSeconds(5) });
+    defer patient.deinit();
+    // No detection, for workflow code stopped at a debugger's breakpoints.
+    var debugging = try Worker.init(gpa, io, &client, "reports-debug", .{ .deadlock_detection_timeout = null });
+    defer debugging.deinit();
+    // end-example
+    try testing.expectEqual(std.Io.Duration.fromSeconds(5), patient.options.deadlock_detection_timeout.?);
+    try testing.expect(debugging.options.deadlock_detection_timeout == null);
+}
+
 test "workers: a versioned worker compiles" {
     _ = &runVersionedWorker;
 }

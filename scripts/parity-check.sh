@@ -2,8 +2,10 @@
 # Checks PARITY.md's feature table, the rows between "## Feature table" and the next "## "
 # heading. Each row is `| Feature | SDKs | Stage | Zig | Where |`, and the check fails on:
 #
-# - a stage other than `GA` or `pre-release`, or a Zig status other than `supported`,
-#   `partial`, `missing`, or `not applicable`;
+# - a stage other than `GA`, `GA, deferred`, or `pre-release`, or a Zig status other than
+#   `supported`, `partial`, `missing`, or `not applicable`;
+# - `GA, deferred` (a GA feature the owner deferred past the first release) on a row that
+#   isn't partial or missing, or that names no bead ID (`unfiled` is not enough);
 # - an SDKs cell that isn't "all" or a list of two or more official SDKs;
 # - a supported row with no link to README.md (`](README.md#anchor)`) or to a sample
 #   (`](samples/<name>)` or a file in one), or with a README.md anchor no heading has
@@ -14,7 +16,8 @@
 #   or a partial row that doesn't say what is missing (`Missing:`);
 # - a not-applicable row that gives no reason.
 #
-# It then prints the GA rows that are partial or missing: what the first release still needs.
+# It then prints the GA rows that are partial or missing: what the first release still needs,
+# and, under their own heading, the deferred ones.
 # Exits 1 when any row fails, 0 otherwise.
 #
 # Usage: scripts/parity-check.sh [<repository root>]
@@ -147,6 +150,8 @@ sdk_count() {
     { for (i = 1; i <= NF; i++) { if (!($i in ok) || seen[$i]++) { print "bad"; exit } } print NF }'
 }
 ga_gaps=""
+deferred=""
+bead_re='temporal-sdk-zig-[a-z0-9]+(\.[0-9]+)*'
 
 while IFS="$sep" read -r line columns feature sdks stage status where; do
   case "$columns" in
@@ -170,7 +175,16 @@ while IFS="$sep" read -r line columns feature sdks stage status where; do
   esac
   case "$stage" in
     GA | pre-release) ;;
-    *) fail "$line" "\"$feature\": unknown stage \"$stage\" (GA or pre-release)" ;;
+    "GA, deferred")
+      case "$status" in
+        partial | missing)
+          printf '%s\n' "$where" | grep -qE "$bead_re" ||
+            fail "$line" "\"$feature\": a deferred row names the bead that still tracks it (\"unfiled\" is not enough)"
+          ;;
+        *) fail "$line" "\"$feature\": only a partial or missing GA row can be deferred, not a $status one; its stage is \"GA\"" ;;
+      esac
+      ;;
+    *) fail "$line" "\"$feature\": unknown stage \"$stage\" (GA, GA, deferred, or pre-release)" ;;
   esac
   case "$status" in
     supported)
@@ -215,16 +229,19 @@ $links
 LINKS
       ;;
     partial | missing)
-      if ! printf '%s\n' "$where" | grep -qE 'temporal-sdk-zig-[a-z0-9]+(\.[0-9]+)*|(^|[^a-z])unfiled([^a-z]|$)'; then
+      if ! printf '%s\n' "$where" | grep -qE "$bead_re"'|(^|[^a-z])unfiled([^a-z]|$)'; then
         fail "$line" "\"$feature\": a $status row names its bead ID or \"unfiled\""
       fi
       if [ "$status" = partial ] && ! printf '%s\n' "$where" | grep -q 'Missing:'; then
         fail "$line" "\"$feature\": a partial row says what is missing (\"Missing: ...\")"
       fi
-      if [ "$stage" = GA ]; then
-        ga_gaps="$ga_gaps$(printf '  %-8s %s (%s)' "$status" "$feature" "$(printf '%s\n' "$where" | grep -oE 'temporal-sdk-zig-[a-z0-9]+(\.[0-9]+)*|unfiled' | tr '\n' ' ' | sed 's/ $//; s/ /, /g')")
-"
-      fi
+      gap="$(printf '  %-8s %s (%s)' "$status" "$feature" "$(printf '%s\n' "$where" | grep -oE "$bead_re"'|unfiled' | tr '\n' ' ' | sed 's/ $//; s/ /, /g')")"
+      case "$stage" in
+        GA) ga_gaps="$ga_gaps$gap
+" ;;
+        "GA, deferred") deferred="$deferred$gap
+" ;;
+      esac
       ;;
     "not applicable")
       [ -n "$where" ] || fail "$line" "\"$feature\": a not-applicable row gives the reason"
@@ -245,6 +262,12 @@ rows="$(wc -l < "$tmp/rows" | tr -d ' ')"
 if [ -n "$ga_gaps" ]; then
   echo "parity-check: $rows rows checked. GA features the first release still needs:"
   printf '%s' "$ga_gaps"
+elif [ -n "$deferred" ]; then
+  echo "parity-check: $rows rows checked. Every GA feature the first release needs is supported or not applicable."
 else
   echo "parity-check: $rows rows checked. Every GA feature is supported or not applicable."
+fi
+if [ -n "$deferred" ]; then
+  echo "GA features deferred past the first release:"
+  printf '%s' "$deferred"
 fi

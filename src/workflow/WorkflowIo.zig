@@ -14,7 +14,9 @@
 //!
 //! Cancellation follows `std.Io`: a cancel request is delivered as `error.Canceled` at the
 //! next cancelable wait of the target task unless the task has blocked cancellation with
-//! `swapCancelProtection`. Delivering it consumes the request; `recancel` re-arms it.
+//! `swapCancelProtection`. Delivering it consumes the request; `recancel` re-arms it. A wait
+//! that is both woken and canceled before its coroutine runs again returns `error.Canceled`;
+//! a futex wake it was given goes on to the next waiter on the same address.
 
 const WorkflowIo = @This();
 
@@ -41,6 +43,14 @@ rng: std.Random.DefaultPrng,
 /// Coroutines blocked in a futex wait, in the order they started waiting.
 futex_head: ?*Wait = null,
 futex_tail: ?*Wait = null,
+/// The address of a futex wake that the running coroutine was given and then gave up by
+/// returning error.Canceled. The rule: such a wake reaches some other waiter on the address
+/// before the coroutine gives up control, at most once, and never the coroutine itself. A
+/// `futexWake` on that address from the same coroutine pays it (std.Io.Condition hands a
+/// canceled waiter's signal on itself); otherwise `settleOwedWake` passes it on before the
+/// coroutine queues another futex wait, blocks, or ends. Non-null only while that coroutine
+/// runs, so it is never another coroutine's debt.
+owed_wake: ?*const u32 = null,
 /// Calls that would make replay depend on the outside world (secure randomness).
 determinism_violations: u32 = 0,
 /// The read-only sections that have begun and not ended, newest first (see `ReadOnly`).
@@ -242,6 +252,8 @@ pub const Task = struct {
 pub const Wait = struct {
     fiber: *Fiber,
     woken: bool = false,
+    /// Set when `futexWake` chose this wait, so a wait that then fails can pass the wake on.
+    futex_woken: bool = false,
     // Futex wait list link and address.
     futex_ptr: ?*const u32 = null,
     next: ?*Wait = null,
@@ -370,6 +382,7 @@ pub fn releasePooledBlocks(w: *WorkflowIo) void {
 
 fn taskMain(w: *WorkflowIo, task: *Task) void {
     task.start(task.context.ptr, task.result.ptr);
+    w.settleOwedWake();
     task.done = true;
     switch (task.kind) {
         .future => if (task.awaiter) |a| w.wakeWait(a),
@@ -416,7 +429,11 @@ fn wakeWait(w: *WorkflowIo, wait: *Wait) void {
 }
 
 /// Blocks the current coroutine until `wait` is woken. A cancelable block also returns
-/// `error.Canceled` when the current task has a pending, unblocked cancel request.
+/// `error.Canceled` when the current task has a pending, unblocked cancel request, and the
+/// cancel wins when the wait was both woken and canceled before the coroutine ran again: it
+/// returns `error.Canceled`, so the wait's outcome doesn't depend on the order of the two.
+/// A futex wait passes such a wake on unless its coroutine wakes the address itself first
+/// (see `owed_wake`); other callers own their waits.
 fn block(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void {
     const task = w.ownCancelTask();
     // Read-only code reaches here only through a wait that can't fail, so can't be refused: it
@@ -433,6 +450,7 @@ fn block(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void {
         if (cancelable) if (task) |t| {
             t.blocked_in = wait;
         };
+        w.settleOwedWake();
         w.scheduler.block();
         if (task) |t| t.blocked_in = null;
     }
@@ -674,6 +692,9 @@ fn futexWaitInner(w: *WorkflowIo, ptr: *const u32, expected: u32, timeout: Io.Ti
     if (duration) |d| if (d.nanoseconds <= 0) return;
     // An uncancelable wait can't be refused: it blocks (or, outside a coroutine, panics).
     if (cancelable and w.refuse("a futex wait (std.Io.Mutex, Condition, Event, Queue)")) return error.Canceled;
+    // Before this coroutine's own wait is queued, where a wake on the same address (a relock
+    // of the same Mutex, a Condition at the same stack address) would land on it.
+    w.settleOwedWake();
     var wait = w.newWait();
     wait.futex_ptr = ptr;
     w.futexEnqueue(&wait);
@@ -684,7 +705,31 @@ fn futexWaitInner(w: *WorkflowIo, ptr: *const u32, expected: u32, timeout: Io.Ti
         w.host.vtable.startTimer(w.host.ctx, &timer, d);
     }
     defer if (duration != null and !timer.fired) w.host.vtable.cancelTimer(w.host.ctx, &timer);
-    try w.block(&wait, cancelable);
+    w.block(&wait, cancelable) catch |err| {
+        // A wake that `futexWake` gave this wait would be lost with it: a single-waiter wake
+        // (Mutex.unlock) would leave the next waiter blocked on a free primitive. Owe it to
+        // the next waiter rather than wake one now: the caller may hand it on itself, as
+        // Condition does, and a second wake would make a timed waiter restart its timer.
+        if (wait.futex_woken) {
+            assert(w.owed_wake == null);
+            w.owed_wake = ptr;
+        }
+        return err;
+    };
+}
+
+/// Passes an owed futex wake (see `owed_wake`) to the next waiter on its address. Called
+/// before the running coroutine queues a futex wait, blocks, or ends, so the wake can't
+/// outlive it, and only while none of its own waits is queued, so the wake can't land on it.
+fn settleOwedWake(w: *WorkflowIo) void {
+    const ptr = w.owed_wake orelse return;
+    w.owed_wake = null;
+    if (std.debug.runtime_safety) {
+        const current = w.scheduler.currentFiber();
+        var it = w.futex_head;
+        while (it) |wait| : (it = wait.next) assert(wait.fiber != current);
+    }
+    futexWake(w, ptr, 1);
 }
 
 fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
@@ -697,6 +742,7 @@ fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) 
 
 fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     const w = self(userdata);
+    if (w.owed_wake == ptr and max_waiters > 0) w.owed_wake = null;
     if (w.currentReadOnly() != null) {
         // Read-only code changed a std.Io primitive a coroutine waits on. std.Io already changed
         // the primitive's memory (a Condition's count, a Queue's buffer) before this call, and
@@ -715,6 +761,7 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
         it = wait.next;
         if (wait.futex_ptr == ptr) {
             w.futexRemove(wait);
+            wait.futex_woken = true;
             w.wakeWait(wait);
             remaining -= 1;
         }
@@ -1302,6 +1349,274 @@ test "a coroutine canceled while blocked on a Semaphore, Event, or Condition get
     e.fake.runAll(&e.wio);
     try testing.expectEqualSlices(?anyerror, &.{ error.Canceled, error.Canceled, error.Canceled }, &b.results);
     try testing.expectEqual(@as(?*Wait, null), e.wio.futex_head);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+/// A holder releases a primitive that two spawned waiters, B and C, block on, and B is canceled
+/// before it runs again, either just before the release or just after it. The single wake the
+/// release gives must not be lost with B.
+const LostWake = struct {
+    wio: *WorkflowIo,
+    kind: Kind,
+    cancel_first: bool,
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
+    sem: Io.Semaphore = .{},
+    signaled: bool = false,
+    /// B's and C's outcomes: null when they got the primitive.
+    results: [2]?anyerror = @splat(error.Unset),
+    b: *Task = undefined,
+    /// C's outcome when B, after its canceled wait, wakes from a long sleep: a wake B owed
+    /// must reach C before B blocks, not when B ends.
+    c_when_b_slept: ?anyerror = error.Unset,
+
+    const Kind = enum { mutex, condition, semaphore };
+
+    fn holder(s: *LostWake) void {
+        const i = s.wio.io();
+        if (s.kind == .mutex) s.mutex.lockUncancelable(i);
+        // B and C block meanwhile.
+        i.sleep(.fromSeconds(1), .awake) catch unreachable;
+        if (s.cancel_first) s.wio.cancelTask(s.b);
+        switch (s.kind) {
+            .mutex => s.mutex.unlock(i),
+            .condition => {
+                s.mutex.lockUncancelable(i);
+                s.signaled = true;
+                s.cond.signal(i);
+                s.mutex.unlock(i);
+            },
+            .semaphore => s.sem.post(i),
+        }
+        if (!s.cancel_first) s.wio.cancelTask(s.b);
+    }
+
+    fn waiter(s: *LostWake, index: usize) void {
+        s.results[index] = s.acquire(s.wio.io());
+        if (index == 0) {
+            s.wio.io().sleep(.fromSeconds(100), .awake) catch unreachable;
+            s.c_when_b_slept = s.results[1];
+        }
+    }
+
+    fn acquire(s: *LostWake, i: Io) ?anyerror {
+        switch (s.kind) {
+            .mutex => {
+                s.mutex.lock(i) catch |err| return err;
+                s.mutex.unlock(i);
+            },
+            .condition => {
+                s.mutex.lockUncancelable(i);
+                defer s.mutex.unlock(i);
+                while (!s.signaled) s.cond.wait(i, &s.mutex) catch |err| return err;
+                s.signaled = false;
+            },
+            .semaphore => s.sem.wait(i) catch |err| return err,
+        }
+        return null;
+    }
+
+    fn expectWakeReachesC(kind: Kind, cancel_first: bool) !void {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var s: LostWake = .{ .wio = &e.wio, .kind = kind, .cancel_first = cancel_first };
+        _ = try e.wio.spawn("holder", holder, .{&s});
+        s.b = try e.wio.spawn("b", waiter, .{ &s, 0 });
+        _ = try e.wio.spawn("c", waiter, .{ &s, 1 });
+        e.fake.runAll(&e.wio);
+        try testing.expectEqualSlices(?anyerror, &.{ error.Canceled, null }, &s.results);
+        try testing.expectEqual(@as(?anyerror, null), s.c_when_b_slept);
+        try testing.expectEqual(@as(?*Wait, null), e.wio.futex_head);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+        if (kind == .semaphore) try testing.expectEqual(@as(usize, 0), s.sem.permits);
+    }
+};
+
+test "a std.Io.Mutex unlock that wakes a waiter canceled before it runs reaches the next waiter" {
+    try LostWake.expectWakeReachesC(.mutex, false);
+    try LostWake.expectWakeReachesC(.mutex, true);
+}
+
+test "a std.Io.Condition signal to a waiter canceled before it runs reaches the next waiter" {
+    try LostWake.expectWakeReachesC(.condition, false);
+    try LostWake.expectWakeReachesC(.condition, true);
+}
+
+test "a std.Io.Semaphore permit for a waiter canceled before it runs reaches the next waiter" {
+    try LostWake.expectWakeReachesC(.semaphore, false);
+    try LostWake.expectWakeReachesC(.semaphore, true);
+}
+
+/// std.Io.Condition already hands a canceled waiter's signal on (its `deregister` wakes one
+/// waiter), so a canceled Condition waiter must not cost a third waiter a wake as well: a
+/// spurious wake makes a waitTimeout restart its durable timer, which adds CancelTimer and
+/// StartTimer commands that histories recorded before the fix don't have.
+const CondTimedThird = struct {
+    wio: *WorkflowIo,
+    cancel_first: bool,
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
+    signaled: bool = false,
+    results: [3]?anyerror = @splat(error.Unset),
+    b: *Task = undefined,
+
+    fn holder(s: *CondTimedThird) void {
+        const i = s.wio.io();
+        i.sleep(.fromSeconds(1), .awake) catch unreachable;
+        if (s.cancel_first) s.wio.cancelTask(s.b);
+        s.mutex.lockUncancelable(i);
+        s.signaled = true;
+        s.cond.signal(i);
+        s.mutex.unlock(i);
+        if (!s.cancel_first) s.wio.cancelTask(s.b);
+    }
+
+    fn waiter(s: *CondTimedThird, index: usize) void {
+        const i = s.wio.io();
+        s.mutex.lockUncancelable(i);
+        defer s.mutex.unlock(i);
+        s.results[index] = while (!s.signaled) {
+            if (index == 2) {
+                s.cond.waitTimeout(i, &s.mutex, .{ .duration = .{ .raw = .fromSeconds(3600), .clock = .awake } }) catch |err| break err;
+            } else s.cond.wait(i, &s.mutex) catch |err| break err;
+        } else blk: {
+            s.signaled = false;
+            break :blk null;
+        };
+    }
+
+    fn expectOneTimerForD(cancel_first: bool) !void {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var s: CondTimedThird = .{ .wio = &e.wio, .cancel_first = cancel_first };
+        _ = try e.wio.spawn("holder", holder, .{&s});
+        s.b = try e.wio.spawn("b", waiter, .{ &s, 0 });
+        _ = try e.wio.spawn("c", waiter, .{ &s, 1 });
+        _ = try e.wio.spawn("d", waiter, .{ &s, 2 });
+        e.fake.runAll(&e.wio);
+        try testing.expectEqualSlices(?anyerror, &.{ error.Canceled, null, error.Timeout }, &s.results);
+        // The holder's sleep and D's one timer; D is never woken before its timer fires.
+        try testing.expectEqual(@as(u32, 2), e.fake.started);
+        try testing.expectEqual(@as(u32, 0), e.fake.canceled);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+    }
+};
+
+test "a canceled std.Io.Condition waiter doesn't spuriously wake a timed waiter behind the one its signal goes to" {
+    try CondTimedThird.expectOneTimerForD(false);
+    try CondTimedThird.expectOneTimerForD(true);
+}
+
+/// B, woken by an unlock and canceled before it runs, falls back to `lockUncancelable` on the
+/// same mutex, which the holder has locked again meanwhile. B's own wait is then the only one
+/// on the address, so the wake B owes for its canceled wait must not land on that wait: B
+/// would block with its wait already woken and never run again.
+const RelockAfterCancel = struct {
+    wio: *WorkflowIo,
+    mutex: Io.Mutex = .init,
+    b: *Task = undefined,
+    /// B's canceled lock's outcome, and whether B then got the mutex.
+    b_lock: ?anyerror = error.Unset,
+    b_relocked: bool = false,
+
+    fn holder(s: *RelockAfterCancel) void {
+        const i = s.wio.io();
+        s.mutex.lockUncancelable(i);
+        i.sleep(.fromSeconds(1), .awake) catch unreachable;
+        // Wakes B, then takes the mutex back before B runs.
+        s.mutex.unlock(i);
+        s.mutex.lockUncancelable(i);
+        s.wio.cancelTask(s.b);
+        i.sleep(.fromSeconds(1), .awake) catch unreachable;
+        s.mutex.unlock(i);
+    }
+
+    fn waiter(s: *RelockAfterCancel) void {
+        const i = s.wio.io();
+        s.mutex.lock(i) catch |err| {
+            s.b_lock = err;
+            s.mutex.lockUncancelable(i);
+            s.b_relocked = true;
+            s.mutex.unlock(i);
+            return;
+        };
+        s.b_lock = null;
+        s.mutex.unlock(i);
+    }
+};
+
+test "a waiter canceled after an unlock woke it can lock the same std.Io.Mutex uncancelably" {
+    var e: Env = undefined;
+    e.init();
+    var s: RelockAfterCancel = .{ .wio = &e.wio };
+    _ = try e.wio.spawn("holder", RelockAfterCancel.holder, .{&s});
+    s.b = try e.wio.spawn("b", RelockAfterCancel.waiter, .{&s});
+    e.fake.runAll(&e.wio);
+    // A coroutine left blocked forever can't be torn down normally.
+    defer if (e.sched.live == 0) e.deinit() else {
+        e.fake.deinit();
+        e.sched.deinitLeakingLive();
+    };
+    try testing.expectEqual(@as(?anyerror, error.Canceled), s.b_lock);
+    try testing.expect(s.b_relocked);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+/// A consumer is canceled after a put handed it an element but before it ran, so its get
+/// returns the element (std.Io.Queue reports what it received, and re-arms the cancel, which
+/// the next get returns), and the consumer keeps draining the queue. Each get waits on a
+/// Condition in its own frame, so a later get waits at the same address as the first: the
+/// wake owed for the first wait mustn't land on the later one, or the consumer never runs
+/// again and the next element is lost with it.
+const QueueConsumer = struct {
+    wio: *WorkflowIo,
+    buf: [4]u32 = undefined,
+    q: Io.Queue(u32) = undefined,
+    consumer: *Task = undefined,
+    got: [2]?u32 = .{ null, null },
+    canceled: u32 = 0,
+
+    fn producer(s: *QueueConsumer) void {
+        const i = s.wio.io();
+        i.sleep(.fromSeconds(1), .awake) catch unreachable;
+        s.q.putOne(i, 7) catch unreachable;
+        s.wio.cancelTask(s.consumer);
+        i.sleep(.fromSeconds(1), .awake) catch unreachable;
+        s.q.putOne(i, 8) catch unreachable;
+    }
+
+    fn consume(s: *QueueConsumer) void {
+        const i = s.wio.io();
+        for (&s.got) |*g| while (true) {
+            g.* = s.q.getOne(i) catch |err| switch (err) {
+                error.Canceled => {
+                    s.canceled += 1;
+                    continue;
+                },
+                error.Closed => return,
+            };
+            break;
+        };
+    }
+};
+
+test "a std.Io.Queue consumer canceled after a put woke it receives the next element too" {
+    var e: Env = undefined;
+    e.init();
+    var s: QueueConsumer = .{ .wio = &e.wio };
+    s.q = .init(&s.buf);
+    _ = try e.wio.spawn("producer", QueueConsumer.producer, .{&s});
+    s.consumer = try e.wio.spawn("consumer", QueueConsumer.consume, .{&s});
+    e.fake.runAll(&e.wio);
+    // A coroutine left blocked forever can't be torn down normally.
+    defer if (e.sched.live == 0) e.deinit() else {
+        e.fake.deinit();
+        e.sched.deinitLeakingLive();
+    };
+    try testing.expectEqualSlices(?u32, &.{ 7, 8 }, &s.got);
+    try testing.expectEqual(@as(u32, 1), s.canceled);
     try testing.expectEqual(@as(usize, 0), e.sched.live);
 }
 
