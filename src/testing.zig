@@ -1925,6 +1925,136 @@ const UpdateFixtures = struct {
     const Napper = workflow.Def("Napper", napper);
 };
 
+/// A workflow whose `pass` update handler blocks until the `open` signal, so a client's
+/// wait on the update outlasts any check the test makes.
+const GateFixtures = struct {
+    const Pass = workflow.UpdateDef("pass", fn (name: []const u8) []const u8);
+    const Open = workflow.SignalDef("open", fn () void);
+    const Waiting = workflow.QueryDef("waiting", fn () i64);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        open: bool = false,
+        waiting: i64 = 0,
+
+        fn pass(s: *State, name: []const u8) ![]const u8 {
+            s.waiting += 1;
+            try s.ctx.await(s, isOpen);
+            return name;
+        }
+        fn isOpen(s: *State) bool {
+            return s.open;
+        }
+        fn openGate(s: *State) void {
+            s.open = true;
+        }
+        fn waitingCount(s: *State) i64 {
+            return s.waiting;
+        }
+    };
+
+    /// Ends once the gate is open and the updates waiting at it have passed; returns how
+    /// many waited.
+    fn gate(ctx: *workflow.Context) !i64 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandler(Pass, s, State.pass);
+        try ctx.setSignalHandler(Open, s, State.openGate);
+        try ctx.setQueryHandler(Waiting, s, State.waitingCount);
+        try ctx.await(s, State.isOpen);
+        try ctx.await(ctx, workflow.Context.allHandlersFinished);
+        return s.waiting;
+    }
+    const Gate = workflow.Def("Gate", gate);
+
+    /// The calls whose wait the tests end early. Each owns what it allocates, so a canceled
+    /// one leaks nothing.
+    fn update(c: *client_mod.Client, id: []const u8, update_id: []const u8) client_mod.UpdateError!void {
+        var handle = try c.updateWorkflow(Pass, id, "", .{"ann"}, .{ .update_id = update_id });
+        handle.deinit();
+    }
+    fn updateWithStart(c: *client_mod.Client, task_queue: []const u8, id: []const u8, update_id: []const u8) client_mod.UpdateWithStartError!void {
+        var handle = try c.updateWithStartWorkflow(Gate, .{ .id = id, .task_queue = task_queue, .id_conflict_policy = .use_existing }, .{}, Pass, .{"ann"}, .{ .update_id = update_id });
+        handle.deinit();
+    }
+    fn get(c: *client_mod.Client, id: []const u8, update_id: []const u8) client_mod.UpdateResultError!void {
+        var handle = try c.getWorkflowUpdateHandle([]const u8, id, "", update_id);
+        defer handle.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        _ = try handle.get(scratch.allocator());
+    }
+
+    const Race = union(enum) { update: anyerror!void, timeout: Io.Cancelable!void };
+
+    const Call = enum { update, update_with_start, get };
+
+    /// Waits on update `pass` of a new gate workflow through `call`, ends the wait once the
+    /// handler is running (by canceling the waiting task, or, `bounded`, by a 100 ms timeout
+    /// that wins the race and then cancels it), then opens the gate and reads the update's
+    /// result through a new handle with the same update ID.
+    fn endWaitEarly(env: *WorkflowEnvironment, call: Call, bounded: bool) !void {
+        const c = &env.client;
+        var id_buf: [64]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "gate-{t}-{s}-{s}", .{ call, if (bounded) "bounded" else "canceled", env.task_queue });
+        const update_id = "pass-ann";
+        try env.ensureWorker();
+        if (call != .update_with_start) {
+            var run = try env.startWorkflow(Gate, .{ .id = id, .task_queue = "" }, .{});
+            run.deinit();
+        }
+        if (call == .get) {
+            var accepted = try c.updateWorkflow(Pass, id, "", .{"ann"}, .{ .update_id = update_id, .wait_for_stage = .accepted });
+            accepted.deinit();
+        }
+
+        var buffer: [2]Race = undefined;
+        var select: Io.Select(Race) = .init(testing.io, &buffer);
+        defer select.cancelDiscard();
+        switch (call) {
+            .update => try select.concurrent(.update, update, .{ c, id, update_id }),
+            .update_with_start => try select.concurrent(.update, updateWithStart, .{ c, env.task_queue, id, update_id }),
+            .get => try select.concurrent(.update, get, .{ c, id, update_id }),
+        }
+        // The update must reach the workflow before the wait ends, or there would be no
+        // update left running to read.
+        while (true) {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            const waiting = c.queryWorkflow(Waiting, scratch.allocator(), id, "", .{}) catch |err| switch (err) {
+                error.NotFound => 0, // update-with-start hasn't started the workflow yet
+                else => |e| return e,
+            };
+            if (waiting > 0) break;
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+
+        const start = Io.Clock.awake.now(testing.io);
+        if (bounded) {
+            try select.concurrent(.timeout, Io.sleep, .{ testing.io, .fromMilliseconds(100), .awake });
+            const first = try select.await();
+            try testing.expect(first == .timeout);
+            try first.timeout;
+        }
+        const ended = select.cancel() orelse return error.TestUnexpectedResult;
+        try testing.expectError(error.Canceled, ended.update);
+        const waited = start.durationTo(Io.Clock.awake.now(testing.io));
+        try testing.expect(waited.nanoseconds < 5 * std.time.ns_per_s);
+
+        // Ending the wait left the update running in the workflow.
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectEqual(@as(i64, 1), try c.queryWorkflow(Waiting, arena.allocator(), id, "", .{}));
+        try c.signalWorkflow(Open, id, "", .{});
+        var again = try c.getWorkflowUpdateHandle([]const u8, id, "", update_id);
+        defer again.deinit();
+        try testing.expectEqualStrings("ann", try again.get(arena.allocator()));
+        var run = try c.getWorkflow(i64, id, "");
+        defer run.deinit();
+        try testing.expectEqual(@as(i64, 1), try env.getResult(Gate, &run, arena.allocator(), null));
+    }
+};
+
 // Struct workflows: handlers declared on the workflow type.
 const StructFixtures = struct {
     /// `UpdateFixtures.HandleUpdates` with its handlers declared instead of registered from
@@ -3862,7 +3992,7 @@ test "client: summary, details, priority and a versioning override set at start 
     try testing.expect(plain_started.priority == null);
 }
 
-/// A client interceptor that keeps a copy of every terminate, reset and execution-options
+/// A client interceptor that keeps a copy of every terminate, cancel, reset and execution-options
 /// request, recorded before the call goes on so a refused call is recorded too. It can play
 /// the server for those calls: `options_answer` (or `reset_answer`) answers
 /// UpdateWorkflowExecutionOptions (or ResetWorkflowExecution), `fail_with` fails them, and
@@ -3875,6 +4005,7 @@ const RequestCapture = struct {
     mutex: Io.Mutex = .init,
     arena: std.heap.ArenaAllocator,
     terminates: std.ArrayList(wfs.TerminateWorkflowExecutionRequest) = .empty,
+    cancels: std.ArrayList(wfs.RequestCancelWorkflowExecutionRequest) = .empty,
     resets: std.ArrayList(wfs.ResetWorkflowExecutionRequest) = .empty,
     option_updates: std.ArrayList(wfs.UpdateWorkflowExecutionOptionsRequest) = .empty,
     options_answer: ?wfs.UpdateWorkflowExecutionOptionsResponse = null,
@@ -3891,6 +4022,8 @@ const RequestCapture = struct {
             // The request's memory is the call's arena, freed when the call returns.
             if (input.request(wfs.TerminateWorkflowExecutionRequest)) |req| {
                 try r.terminates.append(a, try req.dupe(a));
+            } else if (input.request(wfs.RequestCancelWorkflowExecutionRequest)) |req| {
+                try r.cancels.append(a, try req.dupe(a));
             } else if (input.request(wfs.ResetWorkflowExecutionRequest)) |req| {
                 try r.resets.append(a, try req.dupe(a));
             } else if (input.request(wfs.UpdateWorkflowExecutionOptionsRequest)) |req| {
@@ -4118,6 +4251,94 @@ test "client: terminate with details and a first-execution run ID; unknown, clos
     // A closed chain and an unknown workflow.
     try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions(guarded.id, "", "again", {}, .{}));
     try testing.expectError(error.NotFound, c.terminateWorkflowWithOptions("no-such-workflow", "", "x", {}, .{}));
+}
+
+test "client: cancel with a first-execution run ID after continue-as-new, and links on cancel and terminate requests" {
+    var capture: RequestCapture = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer capture.arena.deinit();
+    const interceptors = capture.interceptors();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    try env.registerWorkflow(ResetFixtures.Hop);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+    const common = proto.temporal.api.common.v1;
+
+    // cancelWorkflow keeps its signature and error set.
+    try testing.expect(@TypeOf(client_mod.Client.cancelWorkflow) == fn (*client_mod.Client, []const u8, []const u8, []const u8) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void);
+    const cancel_defaults: client_mod.CancelOptions = .{};
+    try testing.expectEqualStrings("", cancel_defaults.first_execution_run_id);
+    try testing.expectEqual(0, cancel_defaults.links.len);
+    try testing.expectEqual(0, (client_mod.TerminateOptions{}).links.len);
+
+    // A chain that continued as new once: its second run waits for an approval.
+    var chain = try env.startWorkflow(ResetFixtures.Hop, .{ .id = "cancel-chain", .task_queue = "" }, .{1});
+    defer chain.deinit();
+    defer c.terminateWorkflow(chain.id, "", "test cleanup") catch {};
+    var close = try c.historyIterator(chain.id, chain.run_id, .{ .wait_new_event = true, .filter = .close_event });
+    defer close.deinit();
+    const hopped = switch (((try close.next(a)) orelse return error.TestUnexpectedResult).attributes orelse return error.TestUnexpectedResult) {
+        .workflow_execution_continued_as_new_event_attributes => |attrs| attrs.new_execution_run_id,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = try ResetFixtures.firstTaskCompleted(c, chain.id, hopped);
+
+    // Another run's ID, or an unrelated one, isn't the chain's first: nothing is canceled.
+    try testing.expectError(error.NotFound, c.cancelWorkflowWithOptions(chain.id, "", "later run", .{ .first_execution_run_id = hopped }));
+    try testing.expectError(error.NotFound, c.cancelWorkflowWithOptions(chain.id, "", "other chain", .{ .first_execution_run_id = try client_mod.uuid(a, testing.io) }));
+    const still = try c.describeWorkflow(a, chain.id, "");
+    try testing.expectEqualStrings(hopped, still.run_id);
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, still.status);
+    try testing.expectEqual(0, try ResetFixtures.countEvents(c, a, chain.id, hopped, .workflow_execution_cancel_requested_event_attributes));
+
+    // The chain's first run ID cancels the current run, with the links in the request.
+    const cancel_links = [_]common.Link{.{ .variant = .{ .workflow_event = .{ .namespace = c.namespace, .workflow_id = "cancel-cause", .run_id = "cause-run" } } }};
+    try c.cancelWorkflowWithOptions(chain.id, "", "operator request", .{ .first_execution_run_id = chain.run_id, .links = &cancel_links });
+    _ = try ResetFixtures.awaitEvent(c, chain.id, hopped, .workflow_execution_canceled_event_attributes, 1);
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.canceled, (try c.describeWorkflow(a, chain.id, hopped)).status);
+    for ((try c.fetchHistory(a, chain.id, hopped)).events.items) |event| switch (event.attributes orelse continue) {
+        .workflow_execution_cancel_requested_event_attributes => |attrs| {
+            try testing.expectEqualStrings("operator request", attrs.cause);
+            // The server records the links on the event.
+            try testing.expectEqual(1, event.links.items.len);
+            try testing.expectEqualStrings("cancel-cause", event.links.items[0].variant.?.workflow_event.workflow_id);
+        },
+        else => {},
+    };
+
+    try testing.expectEqual(3, capture.cancels.items.len);
+    for (capture.cancels.items, [_][]const u8{ hopped, "", chain.run_id }) |request, first| {
+        try testing.expectEqualStrings(chain.id, request.workflow_execution.?.workflow_id);
+        if (first.len > 0) try testing.expectEqualStrings(first, request.first_execution_run_id);
+    }
+    try testing.expectEqual(0, capture.cancels.items[0].links.items.len);
+    const sent_cancel = capture.cancels.items[2];
+    try testing.expectEqualStrings("operator request", sent_cancel.reason);
+    try testing.expectEqual(1, sent_cancel.links.items.len);
+    try testing.expectEqualStrings("cancel-cause", sent_cancel.links.items[0].variant.?.workflow_event.workflow_id);
+    try testing.expectEqualStrings("cause-run", sent_cancel.links.items[0].variant.?.workflow_event.run_id);
+
+    // Links on a terminate reach its request.
+    var run = try c.executeWorkflow(Fixtures.Hello, .{ .id = "terminate-links", .task_queue = "nobody-polls-this" }, .{"linked"});
+    defer run.deinit();
+    defer c.terminateWorkflow(run.id, "", "test cleanup") catch {};
+    const terminate_links = [_]common.Link{
+        .{ .variant = .{ .workflow_event = .{ .namespace = c.namespace, .workflow_id = "terminate-cause", .run_id = "cause-run" } } },
+        .{ .variant = .{ .batch_job = .{ .job_id = "batch-7" } } },
+    };
+    try c.terminateWorkflowWithOptions(run.id, "", "linked", {}, .{ .links = &terminate_links });
+    try testing.expectError(error.WorkflowTerminated, run.get(a));
+    const terminated_event = try ResetFixtures.lastEvent(c, a, run.id, run.run_id);
+    try testing.expectEqual(2, terminated_event.links.items.len);
+    try testing.expectEqualStrings("batch-7", terminated_event.links.items[1].variant.?.batch_job.job_id);
+    const sent_terminate = capture.terminates.items[capture.terminates.items.len - 1];
+    try testing.expectEqualStrings("terminate-links", sent_terminate.workflow_execution.?.workflow_id);
+    try testing.expectEqual(2, sent_terminate.links.items.len);
+    try testing.expectEqualStrings("terminate-cause", sent_terminate.links.items[0].variant.?.workflow_event.workflow_id);
+    try testing.expectEqualStrings("batch-7", sent_terminate.links.items[1].variant.?.batch_job.job_id);
 }
 
 test "client: terminate details pass through the client's codecs" {
@@ -5275,6 +5496,20 @@ test "client: update-with-start starts a workflow, then updates the running one"
     try testing.expectEqualStrings("7 ", try env.getResult(UpdateFixtures.HandleUpdates, &run, a, null));
 }
 
+test "client: canceling the task waiting on an update, or a timeout bounding it, returns Canceled and leaves the update running" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(GateFixtures.Gate);
+    for ([_]bool{ false, true }) |bounded| {
+        for (std.enums.values(GateFixtures.Call)) |call| {
+            GateFixtures.endWaitEarly(env, call, bounded) catch |err| {
+                std.debug.print("ending the wait of {t} early ({s}) failed\n", .{ call, if (bounded) "timeout" else "cancel" });
+                return err;
+            };
+        }
+    }
+}
+
 test "time-skipping WorkflowEnvironment: a workflow mid-timer answers a query while time is locked" {
     const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
     defer env.deinit();
@@ -6138,6 +6373,243 @@ test "client: standalone activities run without a workflow; get, describe, cance
     try testing.expectEqualStrings("charge-0,charge-1,hold-cancel,hold-terminate", try std.mem.join(a, ",", ids.items));
 }
 
+const StandaloneFollowUpFixtures = struct {
+    const Progress = struct { step: u32, note: []const u8 };
+
+    /// Heartbeats its progress until it is canceled or paused.
+    fn beat(ctx: *activity.Context) ![]const u8 {
+        while (true) {
+            ctx.heartbeat(Progress{ .step = 3, .note = "halfway" });
+            try ctx.io().sleep(.fromMilliseconds(50), .awake);
+        }
+    }
+    const Beat = activity.Def("Beat", beat);
+
+    fn waitForStatus(handle: anytype, arena: Allocator, want: client_mod.ActivityExecutionStatus) !client_mod.ActivityDescription {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            const d = try handle.describe(arena);
+            if (d.status == want) return d;
+            if (tries == 300) {
+                log.err("activity {s} stayed {t}, never {t}", .{ d.activity_id, d.status, want });
+                return error.TestUnexpectedResult;
+            }
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    }
+};
+
+test "client: a standalone activity starts with a delay, a priority and a summary, and reports whether it started" {
+    const zlib: converter.ZlibCodec = .{ .always_encode = true };
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args, .codecs = &codecs });
+    defer env.deinit();
+    try env.registerActivity(StandaloneFixtures.Charge);
+    try env.registerActivity(StandaloneFixtures.Hold);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var delayed = try c.executeActivity(StandaloneFixtures.Charge, .{
+        .id = "delayed",
+        .task_queue = env.task_queue,
+        .start_to_close_timeout = .fromSeconds(10),
+        .start_delay = .fromSeconds(2),
+        .priority = .{ .priority_key = 2, .fairness_key = "tenant-a", .fairness_weight = 1.5 },
+        .summary = "charge c-7 later",
+    }, .{ "c-7", 300 });
+    defer delayed.deinit();
+    try testing.expect(delayed.started);
+    const pending = try delayed.describe(a);
+    try testing.expectEqual(client_mod.ActivityExecutionStatus.running, pending.status);
+    try testing.expectEqual(Io.Duration.fromSeconds(2), pending.start_delay.?);
+    try testing.expectEqual(@as(i32, 2), pending.priority.?.priority_key);
+    try testing.expectEqualStrings("tenant-a", pending.priority.?.fairness_key);
+    try testing.expectEqual(@as(f32, 1.5), pending.priority.?.fairness_weight);
+    try testing.expectEqualStrings("charge c-7 later", pending.summary);
+    try testing.expectEqualStrings("charged c-7 300", try delayed.get(a));
+    // The server's own clock: the first attempt started no sooner than the delay after the
+    // activity was scheduled.
+    const done = try delayed.describe(a);
+    const waited = done.schedule_time.?.durationTo(done.last_started_time.?);
+    try testing.expect(waited.nanoseconds >= Io.Duration.fromSeconds(2).nanoseconds);
+
+    var plain = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "undelayed", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{ "c-8", 1 });
+    defer plain.deinit();
+    _ = try plain.get(a);
+    const plain_d = try plain.describe(a);
+    try testing.expectEqual(@as(?Io.Duration, null), plain_d.start_delay);
+    try testing.expect(plain_d.priority == null);
+    try testing.expectEqualStrings("", plain_d.summary);
+    // A zero delay and an all-default priority read back as none.
+    var zeroed = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "zeroed", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10), .start_delay = .fromMilliseconds(0), .priority = .{} }, .{ "c-8", 2 });
+    defer zeroed.deinit();
+    _ = try zeroed.get(a);
+    const zeroed_d = try zeroed.describe(a);
+    try testing.expectEqual(@as(?Io.Duration, null), zeroed_d.start_delay);
+    try testing.expect(zeroed_d.priority == null);
+
+    const hold: client_mod.StartActivityOptions = .{ .id = "attach", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(2), .id_conflict_policy = .use_existing };
+    var first = try c.executeActivity(StandaloneFixtures.Hold, hold, .{});
+    defer first.deinit();
+    try testing.expect(first.started);
+    var again = try c.executeActivity(StandaloneFixtures.Hold, hold, .{});
+    defer again.deinit();
+    try testing.expect(!again.started);
+    try testing.expectEqualStrings(first.run_id, again.run_id);
+    var by_id = try c.getActivityHandle(void, "attach", "");
+    defer by_id.deinit();
+    try testing.expect(!by_id.started);
+    try first.terminate("done");
+}
+
+test "client: a standalone activity can be paused, unpaused and deleted, and reports its heartbeat details" {
+    const zlib: converter.ZlibCodec = .{ .always_encode = true };
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args, .codecs = &codecs });
+    defer env.deinit();
+    try env.registerActivity(StandaloneFollowUpFixtures.Beat);
+    try env.registerActivity(StandaloneFixtures.Charge);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+    const Progress = StandaloneFollowUpFixtures.Progress;
+
+    var beat = try c.executeActivity(StandaloneFollowUpFixtures.Beat, .{ .id = "beat", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(2) }, .{});
+    defer beat.deinit();
+    const beating = blk: {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            const d = try beat.describe(a);
+            if (d.heartbeat_details.len() > 0) break :blk d;
+            if (tries == 300) return error.TestUnexpectedResult;
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    };
+    const progress = try beating.heartbeat_details.get(Progress, a, 0);
+    try testing.expectEqual(@as(u32, 3), progress.step);
+    try testing.expectEqualStrings("halfway", progress.note);
+    try testing.expect(beating.last_heartbeat_time != null);
+    try testing.expectEqual(@as(?Progress, null), try beating.heartbeat_details.get(?Progress, a, 1));
+
+    try beat.pause("maintenance");
+    const paused = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .paused);
+    // The worker ended the running attempt as a pause, not a cancellation.
+    const ended = blk: {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            const d = try beat.describe(a);
+            if (d.raw.last_failure) |f| break :blk f;
+            if (tries == 300) return error.TestUnexpectedResult;
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    };
+    try testing.expectEqualStrings("ActivityPause", failure_mod.applicationType(ended).?);
+    // Ending the paused attempt kept its last heartbeat's details for the next one.
+    try testing.expectEqualStrings("halfway", (try (try beat.describe(a)).heartbeat_details.get(Progress, a, 0)).note);
+    try testing.expectEqual(client_mod.ActivityExecutionStatus.paused, (try beat.describe(a)).status);
+    try beat.unpause(.{ .reason = "maintenance over" });
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        const d = try beat.describe(a);
+        if (d.status == .running and d.attempt > 1 and d.last_started_time != null and
+            d.last_started_time.?.nanoseconds > paused.last_started_time.?.nanoseconds) break;
+        if (tries == 300) return error.TestUnexpectedResult;
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    // Unpausing an activity that isn't paused does nothing.
+    // The server refuses to unpause a running activity, or to pause one twice.
+    try testing.expectError(error.RpcFailed, beat.unpause(.{ .jitter = .fromSeconds(1) }));
+    try beat.pause("again");
+    try testing.expectError(error.RpcFailed, beat.pause("again"));
+    _ = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .paused);
+    try beat.unpause(.{ .reason = "jittered", .jitter = .fromMilliseconds(500) });
+    _ = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .running);
+
+    try beat.delete();
+    try testing.expectError(error.NotFound, beat.describe(a));
+
+    var done = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "charged", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{ "c-9", 5 });
+    defer done.deinit();
+    _ = try done.get(a);
+    try testing.expectError(error.ActivityClosed, done.pause("too late"));
+    try testing.expectError(error.ActivityClosed, done.unpause(.{}));
+    try done.delete();
+    try testing.expectError(error.NotFound, done.describe(a));
+
+    var missing = try c.getActivityHandle(void, "no-such-activity", "");
+    defer missing.deinit();
+    try testing.expectError(error.NotFound, missing.pause("nothing"));
+    try testing.expectError(error.NotFound, missing.unpause(.{}));
+    try testing.expectError(error.NotFound, missing.delete());
+}
+
+const PauseThenCancelFixtures = struct {
+    /// Set when the running attempt has learned of the pause.
+    var learned: Io.Event = .unset;
+    /// Set by the test once it has canceled the activity.
+    var release: Io.Event = .unset;
+
+    /// Heartbeats until canceled, then holds the attempt open until `release`, and ends
+    /// it with the cancellation.
+    fn hold(ctx: *activity.Context) !void {
+        while (true) {
+            ctx.heartbeat({});
+            ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
+                learned.set(ctx.io());
+                release.waitUncancelable(ctx.io());
+                return err;
+            };
+        }
+    }
+    const Hold = activity.Def("PauseThenCancelHold", hold);
+};
+
+test "client: cancelling a standalone activity while its pause reaches the running attempt cancels it" {
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args });
+    defer env.deinit();
+    try env.registerActivity(PauseThenCancelFixtures.Hold);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var held = try c.executeActivity(PauseThenCancelFixtures.Hold, .{ .id = "pause-then-cancel", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(5) }, .{});
+    defer held.deinit();
+    try StandaloneFixtures.waitUntilStarted(&held, a);
+    // An operator pauses the activity, then cancels it before the running attempt it
+    // paused has ended: the caller asked for a cancellation, so the activity must end
+    // canceled, not as a failure of the attempt the pause ended.
+    try held.pause("hold on");
+    var tries: usize = 0;
+    while (!PauseThenCancelFixtures.learned.isSet()) : (tries += 1) {
+        if (tries == 300) {
+            PauseThenCancelFixtures.release.set(testing.io);
+            return error.TestUnexpectedResult;
+        }
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    held.cancel("no longer needed") catch |err| {
+        PauseThenCancelFixtures.release.set(testing.io);
+        return err;
+    };
+    PauseThenCancelFixtures.release.set(testing.io);
+    held.get(a) catch |err| {
+        if (err != error.ActivityCanceled) {
+            const message = if (held.failure()) |f| f.message else "";
+            std.debug.print("activity ended {t}: {s}\n", .{ err, message });
+        }
+        try testing.expectEqual(error.ActivityCanceled, err);
+        return;
+    };
+    return error.TestUnexpectedResult;
+}
+
 test "WorkflowEnvironment runs a child workflow on the same worker, or a test double in its place" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -6828,6 +7300,134 @@ test "a dynamic signal handler receives the signals no handler is registered for
     try testing.expectEqualStrings("approved by ann, color=red, size=large", try env.getResult(RuntimeSignalFixtures.InboxWf, &run, a, null));
 }
 
+test "client: signals sent by name reach a typed handler and the dynamic handler" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(RuntimeSignalFixtures.InboxWf);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(RuntimeSignalFixtures.InboxWf, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    // "approve" first, so registration order and arrival order agree (see the test above).
+    try env.client.signalWorkflowByName("approve", run.id, run.run_id, .{"ann"});
+    try env.client.signalWorkflowByNameWithOptions("color", run.id, "", .{"red"}, .{});
+    const size: []const u8 = "large";
+    try env.client.signalWorkflowByName("size", run.id, "", .{size});
+    try testing.expectEqualStrings("approved by ann, color=red, size=large", try env.getResult(RuntimeSignalFixtures.InboxWf, &run, a, null));
+
+    try testing.expectError(error.NotFound, env.client.signalWorkflowByName("color", run.id, run.run_id, .{"late"}));
+    try testing.expectError(error.NotFound, env.client.signalWorkflowByName("color", "no-such-workflow", "", .{"nobody"}));
+}
+
+test "client: updates sent by name reach a typed handler and the dynamic handler; a rejected one is UpdateFailed" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFixtures.HandleDynamicUpdates);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(UpdateFixtures.HandleDynamicUpdates, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+
+    // "set" has a handler of its own, with a validator.
+    var set = try env.client.updateWorkflowByName(i64, "set", run.id, run.run_id, .{@as(i64, 5)}, .{});
+    defer set.deinit();
+    try testing.expectEqual(@as(i64, 0), try set.get(a));
+    try testing.expectEqualStrings(run.run_id, set.run_id);
+
+    var rejected = try env.client.updateWorkflowByName(i64, "set", run.id, "", .{@as(i64, -1)}, .{});
+    defer rejected.deinit();
+    try testing.expectError(error.UpdateFailed, rejected.get(a));
+    try testing.expectEqualStrings("NotPositive", rejected.failure().?.message);
+
+    // "greet" goes to the dynamic handler; accepted returns once it started.
+    var greet = try env.client.updateWorkflowByName([]const u8, "greet", run.id, run.run_id, .{"ann"}, .{ .update_id = "greet-ann", .wait_for_stage = .accepted });
+    defer greet.deinit();
+    try testing.expectEqualStrings("greet-ann", greet.update_id);
+    try testing.expectEqualStrings("Hello ann!", try greet.get(a));
+
+    // The dynamic handler's validator rejects every other name.
+    var unknown = try env.client.updateWorkflowByName(void, "unknown", run.id, run.run_id, .{"x"}, .{});
+    defer unknown.deinit();
+    try testing.expectError(error.UpdateFailed, unknown.get(a));
+    try testing.expectEqualStrings("UnknownUpdate", unknown.failure().?.message);
+
+    try env.client.signalWorkflowByName("done", run.id, run.run_id, .{});
+    try testing.expectEqualStrings("5 Hello ann!", try env.getResult(UpdateFixtures.HandleDynamicUpdates, &run, a, null));
+    try testing.expectError(error.NotFound, env.client.updateWorkflowByName(i64, "set", "no-such-workflow", "", .{@as(i64, 1)}, .{}));
+}
+
+test "client: signal-with-start and update-with-start by name start a workflow and deliver to typed and dynamic handlers" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SignalFixtures.AwaitApprovals);
+    try env.registerWorkflow(RuntimeSignalFixtures.InboxWf);
+    try env.registerWorkflow(UpdateFixtures.HandleDynamicUpdates);
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try env.executeWorkflow(Fixtures.Hello, .{"warm-up"}, a, null); // starts the worker
+
+    // A typed signal handler; the second call only signals the running workflow.
+    const approvals: client_mod.StartWorkflowOptions = .{ .id = "signal-with-start-by-name", .task_queue = env.task_queue };
+    var run = try env.client.signalWithStartWorkflowByName([]const u8, "AwaitApprovals", approvals, .{@as(u32, 2)}, "approve", .{"ann"});
+    defer run.deinit();
+    try testing.expectEqualStrings("signal-with-start-by-name", run.id);
+    var again = try env.client.signalWithStartWorkflowByName([]const u8, "AwaitApprovals", approvals, .{@as(u32, 99)}, "approve", .{"bob"});
+    defer again.deinit();
+    try testing.expectEqualStrings(run.run_id, again.run_id);
+    try testing.expectEqualStrings("ann bob", try run.get(a));
+
+    // The dynamic signal handler, with a workflow definition's name and a signal named at run time.
+    var inbox = try env.client.signalWithStartWorkflowByName([]const u8, RuntimeSignalFixtures.InboxWf.workflow_name, .{ .task_queue = env.task_queue }, .{}, "color", .{"red"});
+    defer inbox.deinit();
+    try testing.expectEqual(@as(usize, 36), inbox.id.len);
+    try env.client.signalWorkflowByName("approve", inbox.id, "", .{"ann"});
+    try env.client.signalWorkflowByName("size", inbox.id, "", .{"large"});
+    const entries = try inbox.get(a);
+    for ([_][]const u8{ "color=red", "approved by ann", "size=large" }) |entry| {
+        if (std.mem.indexOf(u8, entries, entry) == null) {
+            std.debug.print("inbox result {s} lacks {s}\n", .{ entries, entry });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // Update-with-start: the typed "set" handler starts the workflow, then the dynamic
+    // handler takes "greet" on the running one.
+    var options: client_mod.StartWorkflowOptions = .{ .id = "update-with-start-by-name", .task_queue = env.task_queue };
+    try testing.expectError(error.InvalidOptions, env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", options, .{}, "set", .{@as(i64, 3)}, .{}));
+    options.id_conflict_policy = .use_existing;
+    var first = try env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", options, .{}, "set", .{@as(i64, 3)}, .{});
+    defer first.deinit();
+    try testing.expectEqual(@as(i64, 0), try first.get(a));
+    try testing.expect(first.run_id.len > 0);
+    var greeted = try env.client.updateWithStartWorkflowByName([]const u8, "HandleDynamicUpdates", options, .{}, "greet", .{"cy"}, .{ .wait_for_stage = .accepted });
+    defer greeted.deinit();
+    try testing.expectEqualStrings("Hello cy!", try greeted.get(a));
+    try testing.expectEqualStrings(first.run_id, greeted.run_id);
+
+    // A rejected update-with-start surfaces as the typed call's does.
+    var rejected = try env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", options, .{}, "set", .{@as(i64, -1)}, .{});
+    defer rejected.deinit();
+    try testing.expectError(error.UpdateFailed, rejected.get(a));
+    try testing.expectEqualStrings("NotPositive", rejected.failure().?.message);
+
+    var failing = options;
+    failing.id_conflict_policy = .fail;
+    try testing.expectError(error.WorkflowExecutionAlreadyStarted, env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", failing, .{}, "set", .{@as(i64, 9)}, .{}));
+
+    try env.client.signalWorkflowByName("done", options.id, "", .{});
+    var updated = try env.client.getWorkflow([]const u8, options.id, first.run_id);
+    defer updated.deinit();
+    try testing.expectEqualStrings("3 Hello cy!", try updated.get(a));
+}
+
 /// Replaces each payload with one of encoding "test/reversed" holding the original,
 /// serialized and reversed, so no payload text reaches the server in the clear; decoding
 /// undoes "test/reversed" payloads and passes others through.
@@ -7078,6 +7678,69 @@ test "codecs see the propagated key ID of the client call, the workflow run, and
         tagged += 1;
     }
     try testing.expectEqual(@as(usize, 4), tagged);
+}
+
+test "codecs and propagators apply to signals and updates sent by name" {
+    var key_ids: KeyIdCodec = .{};
+    const codecs = [_]converter.PayloadCodec{key_ids.codec()};
+    const propagators = [_]propagation.ContextPropagator{propagation.HeaderPropagator(KeyIdCodec.key_id).propagator};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs, .propagators = &propagators });
+    defer env.deinit();
+    try env.registerWorkflow(UpdateFixtures.HandleDynamicUpdates);
+    try env.registerWorkflow(RuntimeSignalFixtures.InboxWf);
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var values: propagation.Values = .init(a);
+    try values.put(KeyIdCodec.key_id, KeyIdCodec.known_key);
+    _ = try env.executeWorkflowWithOptions(Fixtures.Hello, .{ .task_queue = "", .context = &values }, .{"warm-up"}, a, null); // starts the worker
+
+    const updates: client_mod.StartWorkflowOptions = .{ .id = "coded-by-name", .task_queue = env.task_queue, .id_conflict_policy = .use_existing, .context = &values };
+    var set = try env.client.updateWithStartWorkflowByName(i64, "HandleDynamicUpdates", updates, .{}, "set", .{@as(i64, 4)}, .{ .context = &values });
+    defer set.deinit();
+    try testing.expectEqual(@as(i64, 0), try set.get(a));
+    var greet = try env.client.updateWorkflowByName([]const u8, "greet", updates.id, "", .{"ann"}, .{ .context = &values });
+    defer greet.deinit();
+    try testing.expectEqualStrings("Hello ann!", try greet.get(a));
+    try env.client.signalWorkflowByNameWithOptions("done", updates.id, "", .{}, .{ .context = &values });
+    var run = try env.client.getWorkflow([]const u8, updates.id, set.run_id);
+    defer run.deinit();
+    try testing.expectEqualStrings("4 Hello ann!", try run.get(a));
+
+    var inbox = try env.client.signalWithStartWorkflowByName([]const u8, "Inbox", .{ .id = "coded-inbox-by-name", .task_queue = env.task_queue, .context = &values }, .{}, "approve", .{"ann"});
+    defer inbox.deinit();
+    try env.client.signalWorkflowByNameWithOptions("color", inbox.id, "", .{"red"}, .{ .context = &values });
+    try env.client.signalWorkflowByNameWithOptions("size", inbox.id, "", .{"large"}, .{ .context = &values });
+    try testing.expectEqualStrings("approved by ann, color=red, size=large", try inbox.get(a));
+    try testing.expectEqual(@as(u32, 0), key_ids.without_key.load(.monotonic));
+
+    // The server stored each message's arguments tagged with the key ID, and each message's
+    // header carries the propagated value.
+    var plain = try client_mod.Client.connect(testing.allocator, testing.io, env.server.clientOptions());
+    defer plain.close();
+    const Message = struct { input: ?proto.temporal.api.common.v1.Payloads, header: ?proto.temporal.api.common.v1.Header };
+    var messages: usize = 0;
+    for ([_][]const u8{ updates.id, inbox.id }) |id| {
+        const raw = try plain.fetchHistory(a, id, "");
+        for (raw.events.items) |event| {
+            const m: Message = switch (event.attributes orelse continue) {
+                .workflow_execution_signaled_event_attributes => |e| .{ .input = e.input, .header = e.header },
+                .workflow_execution_update_accepted_event_attributes => |e| .{ .input = e.accepted_request.?.input.?.args, .header = e.accepted_request.?.input.?.header },
+                else => continue,
+            };
+            for (m.input.?.payloads.items) |p| try testing.expectEqualStrings(KeyIdCodec.known_key, KeyIdCodec.keyIdOf(p).?);
+            const header = m.header orelse return error.TestUnexpectedResult;
+            for (header.fields.items) |f| {
+                if (std.mem.eql(u8, f.key, KeyIdCodec.key_id.name)) break;
+            } else return error.TestUnexpectedResult;
+            messages += 1;
+        }
+    }
+    // Two updates and a signal, then three signals.
+    try testing.expectEqual(@as(usize, 6), messages);
 }
 
 const InfoTimeFixtures = struct {

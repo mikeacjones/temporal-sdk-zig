@@ -1856,9 +1856,19 @@ const Heartbeats = struct {
     core: bridge.Worker,
     task_token: []const u8,
     codec_context: *const converter.CodecContext,
+    /// The latest details, before the codecs: the attempt's last heartbeat's, or those it
+    /// started with. `last_arena` owns them once the attempt has heartbeated.
+    last: []const converter.Payload,
+    last_arena: std.heap.ArenaAllocator,
+    mutex: Io.Mutex = .init,
+
+    fn deinit(h: *Heartbeats) void {
+        h.last_arena.deinit();
+    }
 
     fn record(context: *anyopaque, details: []const proto.temporal.api.common.v1.Payload) void {
         const h: *Heartbeats = @ptrCast(@alignCast(context));
+        h.remember(details);
         var scratch: std.heap.ArenaAllocator = .init(h.w.gpa);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -1875,6 +1885,33 @@ const Heartbeats = struct {
         h.core.recordActivityHeartbeat(h.w.gpa, encoded.written(), &message) catch {
             log.warn("recording an activity heartbeat failed: {s}", .{message orelse "unknown error"});
         };
+    }
+
+    fn remember(h: *Heartbeats, details: []const converter.Payload) void {
+        h.mutex.lockUncancelable(h.w.io);
+        defer h.mutex.unlock(h.w.io);
+        // Copy before resetting: `details` may be the previous copy.
+        var next: std.heap.ArenaAllocator = .init(h.w.gpa);
+        const copy = next.allocator().alloc(converter.Payload, details.len) catch return next.deinit();
+        for (details, copy) |d, *c| c.* = d.dupe(next.allocator()) catch return next.deinit();
+        h.last_arena.deinit();
+        h.last_arena = next;
+        h.last = copy;
+    }
+
+    /// Whether the server has a cancel request for the attempt, asked with a heartbeat that
+    /// repeats the latest details so the request doesn't clear them. False when the server
+    /// no longer knows the attempt or the call fails.
+    fn cancelRequested(h: *Heartbeats) bool {
+        h.mutex.lockUncancelable(h.w.io);
+        defer h.mutex.unlock(h.w.io);
+        var scratch: std.heap.ArenaAllocator = .init(h.w.gpa);
+        defer scratch.deinit();
+        const response = h.w.client.recordWorkerHeartbeat(scratch.allocator(), h.task_token, h.last, h.codec_context) catch |err| {
+            log.debug("asking whether a paused or reset activity was canceled failed: {t}", .{err});
+            return false;
+        };
+        return response.cancel_requested;
     }
 };
 
@@ -1919,6 +1956,9 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .ActivityID = start.activity_id,
         .ActivityType = start.activity_type,
         .Attempt = start.attempt,
+    });
+    // A standalone activity has no workflow: leave the workflow fields out rather than empty.
+    if (execution.workflow_id.len > 0) ctx.logger_ = try ctx.logger_.with(a, .{
         .WorkflowType = start.workflow_type,
         .WorkflowID = execution.workflow_id,
         .RunID = execution.run_id,
@@ -1930,7 +1970,8 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .workflow_type = start.workflow_type,
     });
     defer ctx.metrics_.deinit();
-    var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token, .codec_context = &run.codec_context };
+    var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token, .codec_context = &run.codec_context, .last = start.heartbeat_details.items, .last_arena = .init(w.gpa) };
+    defer heartbeats.deinit();
     ctx.heartbeat_details = start.heartbeat_details.items;
     // The core keeps no heartbeat state for local activities and warns on each heartbeat.
     if (!start.is_local) ctx.heartbeat_sink = .{ .gpa = w.gpa, .context = &heartbeats, .record = Heartbeats.record };
@@ -1959,8 +2000,19 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
                 .non_retryable = true,
             }) } } };
         }
+        // The server refuses a canceled completion it didn't ask for: a paused or reset
+        // attempt ends as a retryable failure, retried once the activity is unpaused. A
+        // cancel requested since the pause reached the attempt still wins, but only a
+        // heartbeat would tell the core of it, so ask the server.
+        if (err == error.Canceled) if (ctx.cancelReason()) |reason| if ((reason == .paused or reason == .reset) and !heartbeats.cancelRequested()) {
+            ctx.logger_.debug("Activity attempt ended", .{ .Reason = @tagName(reason) });
+            return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
+                .message = try std.fmt.allocPrint(a, "activity attempt ended because the activity was {s}", .{if (reason == .paused) "paused" else "reset"}),
+                .type = if (reason == .paused) "ActivityPause" else "ActivityReset",
+            }) } } };
+        };
         if (err == error.Canceled) if (ctx.cancelReason()) |reason| return .{ .status = .{ .cancelled = .{ .failure = .{
-            .message = try std.fmt.allocPrint(a, "activity canceled: {t}", .{reason}),
+            .message = try std.fmt.allocPrint(a, "activity canceled: {t}", .{if (reason == .paused or reason == .reset) .canceled else reason}),
             .source = failure_mod.source,
             .failure_info = .{ .canceled_failure_info = .{} },
         } } } };
@@ -4203,6 +4255,60 @@ test "a worker without its own sink uses its client's" {
     _ = try run.get(arena.allocator());
     try testing.expectEqual(1, sink.count("HelloWorld workflow started", &.{.{ .key = "WorkflowID", .value = "client-logs-wf" }}));
     try testing.expectEqual(1, sink.count("Activity", &.{.{ .key = "WorkflowID", .value = "client-logs-wf" }}));
+}
+
+const StandaloneLogTest = struct {
+    fn refuse(ctx: *activity.Context) !void {
+        ctx.logger().info("Refusing", .{});
+        return ctx.fail(.{ .message = "not today", .non_retryable = true });
+    }
+    const Refuse = activity.Def("Refuse", refuse);
+};
+
+test "a standalone activity's logs carry its activity fields and no empty workflow fields" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{ .extra_args = &@import("testing.zig").DevServer.standalone_activity_args }, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var w = try Worker.init(testing.allocator, testing.io, &client, "standalone-logs", .{ .logger = sink.sink() });
+    defer w.deinit();
+    try w.registerActivity(StandaloneLogTest.Refuse);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var handle = try client.executeActivity(StandaloneLogTest.Refuse, .{ .id = "standalone-logs-act", .task_queue = "standalone-logs", .start_to_close_timeout = .fromSeconds(10) }, .{});
+    defer handle.deinit();
+    try testing.expectError(error.ActivityFailed, handle.get(arena.allocator()));
+    const fields = [_]log_mod.Field{
+        .{ .key = "ActivityID", .value = "standalone-logs-act" },
+        .{ .key = "ActivityType", .value = "Refuse" },
+        .{ .key = "Attempt", .value = "1" },
+    };
+    try sink.waitFor("Activity failed", &fields, .fromSeconds(10));
+    try testing.expectEqual(1, sink.count("Refusing", &fields));
+    sink.mutex.lockUncancelable(testing.io);
+    defer sink.mutex.unlock(testing.io);
+    var checked: usize = 0;
+    for (sink.records.items) |rec| {
+        if (!std.mem.eql(u8, rec.message, "Activity failed") and !std.mem.eql(u8, rec.message, "Refusing")) continue;
+        checked += 1;
+        for (rec.fields) |f| for ([_][]const u8{ "WorkflowType", "WorkflowID", "RunID" }) |absent| {
+            if (std.mem.eql(u8, f.key, absent)) {
+                std.log.err("record \"{s}\" has the field {s}=\"{s}\"", .{ rec.message, f.key, f.value });
+                return error.TestUnexpectedResult;
+            }
+        };
+    }
+    try testing.expectEqual(2, checked);
 }
 
 /// Passes payloads through and records, for each call, the propagated tenant and the
