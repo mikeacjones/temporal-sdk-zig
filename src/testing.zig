@@ -5,7 +5,8 @@
 //! - `DevServer`: a local Temporal dev server.
 //! - `WorkflowEnvironment`: a dev server, client and worker on a fresh task queue. Register
 //!   workflows and activities, replace activities with test doubles, and
-//!   execute workflows to their result.
+//!   execute workflows to their result. `WorkflowEnvironment.fromClient` makes one on a
+//!   server the test already runs.
 //! - `ActivityEnvironment`: runs an activity function with a test context, and cancels it or
 //!   stops its "worker" on request.
 //! - `WorkflowReplayer`: replays recorded histories against current workflow code to catch
@@ -258,7 +259,8 @@ fn serviceCall(client: *client_mod.Client, service: bridge.Connection.Service, c
 
 /// A server, client and worker for running workflows in tests.
 ///
-/// `start` runs a dev server with `custom_search_attributes` registered; `startTimeSkipping` runs the time-skipping test server. On the
+/// `start` runs a dev server with `custom_search_attributes` registered; `startTimeSkipping` runs the time-skipping test server;
+/// `fromClient` uses the server of a client the test already has. On the
 /// test server time is locked (it moves at wall-clock speed) except while the test waits on
 /// a workflow result through `getResult` or `executeWorkflow`, or calls `sleep`. Then it
 /// jumps ahead whenever every workflow is waiting on a timer, so a 2h sleep finishes at
@@ -285,15 +287,21 @@ pub const WorkflowEnvironment = struct {
     pub const Server = union(enum) {
         dev: DevServer,
         time_skipping: TestServer,
+        /// A server the environment didn't start, reached through the client given to
+        /// `fromClient`. The environment never stops it.
+        existing,
 
+        /// Options for another client of a server the environment started. Unit tests use it.
         fn clientOptions(s: *const Server) client_mod.Options {
             return switch (s.*) {
+                .existing => unreachable, // Its client's options aren't kept.
                 inline else => |*server| server.clientOptions(),
             };
         }
 
         fn stop(s: *Server, io: Io) void {
             switch (s.*) {
+                .existing => {},
                 inline else => |*server| server.stop(io),
             }
         }
@@ -343,19 +351,53 @@ pub const WorkflowEnvironment = struct {
         return create(gpa, io, .time_skipping, .{});
     }
 
-    fn create(gpa: Allocator, io: Io, kind: std.meta.Tag(Server), options: Options) !*WorkflowEnvironment {
+    /// Makes an environment on the server `client` is connected to, in `client`'s namespace,
+    /// for a test that already runs a server (a shared dev server, one started with special
+    /// settings, a staging namespace). It starts no server, and `deinit` stops none: it
+    /// stops the environment's worker and leaves the server and `client` as they were.
+    ///
+    /// The environment works through its own client for the same namespace on `client`'s
+    /// connection (`Client.forNamespace`), so it uses `client`'s codecs, logger,
+    /// propagators, interceptors and metrics, and `client` and the environment may be closed
+    /// in either order. A view from `Client.withRpcOptions` gives an environment without
+    /// the view's RPC options. `client` is only read during the call.
+    ///
+    /// The helpers run workers, activity test doubles and workflows as on the dev server
+    /// (`start`). Time is the server's own: the environment never skips time, even on a
+    /// time-skipping test server, so `sleep` is a real sleep and `now` the wall clock, as on
+    /// the dev server. Use `startTimeSkipping` for time skipping. The server needs whatever
+    /// the test uses that `start` sets up on its own dev server, such as
+    /// `custom_search_attributes`. Free with `deinit`.
+    pub fn fromClient(gpa: Allocator, io: Io, client: *client_mod.Client) !*WorkflowEnvironment {
+        const env = try gpa.create(WorkflowEnvironment);
+        errdefer gpa.destroy(env);
+        env.* = .{ .gpa = gpa, .io = io, .server = .existing, .client = try client.forNamespace(client.namespace), .worker = undefined, .task_queue = undefined };
+        errdefer env.client.close();
+        try env.initWorker();
+        return env;
+    }
+
+    /// The servers an environment starts for itself.
+    const OwnServer = enum { dev, time_skipping };
+
+    fn create(gpa: Allocator, io: Io, kind: OwnServer, options: Options) !*WorkflowEnvironment {
         const env = try gpa.create(WorkflowEnvironment);
         errdefer gpa.destroy(env);
         env.gpa = gpa;
         env.io = io;
         env.running = null;
         env.next_id = 0;
-        env.server = switch (kind) {
-            .dev => .{ .dev = try DevServer.start(gpa, io, .{ .search_attributes = &custom_search_attributes, .extra_args = options.dev_server_extra_args }) },
-            .time_skipping => .{ .time_skipping = try TestServer.start(gpa, io, .{}) },
+        var client_options = switch (kind) {
+            .dev => blk: {
+                env.server = .{ .dev = try DevServer.start(gpa, io, .{ .search_attributes = &custom_search_attributes, .extra_args = options.dev_server_extra_args }) };
+                break :blk env.server.clientOptions();
+            },
+            .time_skipping => blk: {
+                env.server = .{ .time_skipping = try TestServer.start(gpa, io, .{}) };
+                break :blk env.server.time_skipping.clientOptions();
+            },
         };
         errdefer env.server.stop(io);
-        var client_options = env.server.clientOptions();
         client_options.codecs = options.codecs;
         client_options.encode_failure_attributes = options.encode_failure_attributes;
         client_options.logger = options.logger;
@@ -368,12 +410,17 @@ pub const WorkflowEnvironment = struct {
         if (kind == .time_skipping) client_options.core_log_level = .err;
         env.client = try client_mod.Client.connect(gpa, io, client_options);
         errdefer env.client.close();
-        var suffix: [8]u8 = undefined;
-        io.random(&suffix);
-        env.task_queue = try std.fmt.allocPrint(gpa, "test-{x}", .{suffix});
-        errdefer gpa.free(env.task_queue);
-        env.worker = try worker_mod.Worker.init(gpa, io, &env.client, env.task_queue, .{});
+        try env.initWorker();
         return env;
+    }
+
+    /// Sets `task_queue` to a fresh one and `worker` to a worker on it.
+    fn initWorker(env: *WorkflowEnvironment) !void {
+        var suffix: [8]u8 = undefined;
+        env.io.random(&suffix);
+        env.task_queue = try std.fmt.allocPrint(env.gpa, "test-{x}", .{suffix});
+        errdefer env.gpa.free(env.task_queue);
+        env.worker = try worker_mod.Worker.init(env.gpa, env.io, &env.client, env.task_queue, .{});
     }
 
     pub fn deinit(env: *WorkflowEnvironment) void {
@@ -693,7 +740,7 @@ pub const WorkflowEnvironment = struct {
     /// the dev server it is a real sleep.
     pub fn sleep(env: *WorkflowEnvironment, duration: Io.Duration) !void {
         switch (env.server) {
-            .dev => try env.io.sleep(duration, .awake),
+            .dev, .existing => try env.io.sleep(duration, .awake),
             .time_skipping => {
                 var scratch: std.heap.ArenaAllocator = .init(env.gpa);
                 defer scratch.deinit();
@@ -709,7 +756,7 @@ pub const WorkflowEnvironment = struct {
     /// wall clock on the dev server.
     pub fn now(env: *WorkflowEnvironment) !Io.Timestamp {
         switch (env.server) {
-            .dev => return Io.Timestamp.now(env.io, .real),
+            .dev, .existing => return Io.Timestamp.now(env.io, .real),
             .time_skipping => {
                 var scratch: std.heap.ArenaAllocator = .init(env.gpa);
                 defer scratch.deinit();
@@ -2670,6 +2717,50 @@ test "WorkflowEnvironment runs a workflow with a test double for its activity" {
     defer arena.deinit();
     const result = try env.executeWorkflow(Fixtures.Hello, .{"Temporal"}, arena.allocator(), null);
     try testing.expectEqualStrings("Hello from the test double!", result);
+}
+
+test "WorkflowEnvironment.fromClient runs a workflow on the test's own server and leaves it and the client running" {
+    var server = try DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var first_id: []const u8 = undefined;
+    {
+        const env = try WorkflowEnvironment.fromClient(testing.allocator, testing.io, &client);
+        defer env.deinit();
+        try testing.expect(env.server == .existing);
+        try testing.expectEqualStrings(client.namespace, env.client.namespace);
+        try env.registerWorkflow(Fixtures.Hello);
+        try env.registerActivityAs(Fixtures.Greet, Fixtures.greetDouble);
+        var run = try env.startWorkflow(Fixtures.Hello, .{}, .{"Temporal"});
+        defer run.deinit();
+        first_id = try a.dupe(u8, run.id);
+        try testing.expectEqualStrings("Hello from the test double!", try env.getResult(Fixtures.Hello, &run, a, null));
+
+        // No time skipping: `now` is the wall clock and `sleep` a real sleep.
+        const before = try env.now();
+        try env.sleep(.fromMilliseconds(20));
+        const after = try env.now();
+        try testing.expect(before.durationTo(after).nanoseconds >= 20 * std.time.ns_per_ms);
+        try testing.expect(before.durationTo(after).nanoseconds < std.time.ns_per_s * 60);
+    }
+
+    // The environment is gone; the client and the server still answer, with its run on record.
+    const description = try client.describeWorkflow(a, first_id, "");
+    try testing.expectEqual(.completed, description.status);
+
+    // A second environment on the same client, closed after the client it came from.
+    var other = try client.forNamespace(client.namespace);
+    const env = try WorkflowEnvironment.fromClient(testing.allocator, testing.io, &other);
+    defer env.deinit();
+    other.close();
+    try env.registerWorkflow(Fixtures.Hello);
+    try env.registerActivity(Fixtures.Greet);
+    _ = try env.executeWorkflow(Fixtures.Hello, .{"again"}, a, null);
 }
 
 const StructActivities = struct {
@@ -5569,9 +5660,9 @@ test "WorkflowEnvironment: a struct workflow's declared handlers take signal-wit
 }
 
 /// Both kinds of `WorkflowEnvironment`, for tests that run on each.
-const env_kinds = [_]std.meta.Tag(WorkflowEnvironment.Server){ .dev, .time_skipping };
+const env_kinds = [_]WorkflowEnvironment.OwnServer{ .dev, .time_skipping };
 
-fn startEnv(kind: std.meta.Tag(WorkflowEnvironment.Server)) !*WorkflowEnvironment {
+fn startEnv(kind: WorkflowEnvironment.OwnServer) !*WorkflowEnvironment {
     return WorkflowEnvironment.create(testing.allocator, testing.io, kind, .{});
 }
 

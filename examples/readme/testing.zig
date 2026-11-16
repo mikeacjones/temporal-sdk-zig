@@ -41,6 +41,24 @@ test "testing: a workflow with a test double for its activity" {
 }
 // end-example
 
+// example: testing-existing-client
+test "testing: a workflow environment on the test's own server" {
+    var server = try temporal.testing.DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var client = try temporal.client.Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer client.close();
+
+    const env = try WorkflowEnvironment.fromClient(testing.allocator, testing.io, &client);
+    defer env.deinit(); // stops the environment's worker; the client and the server stay up
+    try env.registerWorkflow(Greeting);
+    try env.registerActivityAs(Greet, greetDouble);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(Greeting, .{"Ziggy"}, arena.allocator(), null);
+    try testing.expectEqualStrings("Hi, Ziggy!", result);
+}
+// end-example
+
 // example: testing-time-skipping
 fn reminder(ctx: *workflow.Context, name: []const u8) ![]const u8 {
     try ctx.io().sleep(.fromSeconds(std.time.s_per_day), .awake);

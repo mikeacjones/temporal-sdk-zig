@@ -1841,6 +1841,34 @@ Notes:
 - `createNexusEndpoint` creates a Nexus endpoint on the dev server that routes to a namespace and task queue (the environment's by default), for workflows that call [Nexus operations](#calling-operations-from-workflows); a name that exists returns `error.AlreadyExists`. `testing.createNexusEndpoint(client, name, target)` does the same through any client, for a server without an environment such as a `testing.DevServer`; its target names both the namespace, which must exist on the server, and the task queue.
 - `startWithOptions` takes extra dev server arguments, codecs, a logger, propagators, worker and client interceptors, and metrics, borrowed for the environment's life. `startTimeSkipping` takes no options.
 
+`WorkflowEnvironment.fromClient` makes an environment on a server the test already runs, such as a shared dev server, one started with special settings, or a staging namespace, through a `client.Client` the test has:
+
+<!-- example: testing-existing-client -->
+```zig
+test "testing: a workflow environment on the test's own server" {
+    var server = try temporal.testing.DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var client = try temporal.client.Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer client.close();
+
+    const env = try WorkflowEnvironment.fromClient(testing.allocator, testing.io, &client);
+    defer env.deinit(); // stops the environment's worker; the client and the server stay up
+    try env.registerWorkflow(Greeting);
+    try env.registerActivityAs(Greet, greetDouble);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(Greeting, .{"Ziggy"}, arena.allocator(), null);
+    try testing.expectEqualStrings("Hi, Ziggy!", result);
+}
+```
+
+Notes:
+
+- It starts no server and `deinit` stops none: it stops the environment's worker and leaves the server and the client as they were. The environment works through its own client for the same namespace on the client's connection (`Client.forNamespace`), so the two may be closed in either order, and it uses the client's codecs, logger, propagators, interceptors, and metrics.
+- Workers, activity test doubles, and workflows behave as on the environment's own dev server, in the client's namespace and on a fresh task queue.
+- The environment never skips time, even on a time-skipping test server: `env.sleep` is a real sleep and `env.now()` the wall clock, as on the dev server. Use `startTimeSkipping` for time skipping.
+- `env.server` is `.existing`. Whatever the test relies on that `start` sets up on its own dev server, such as `testing.custom_search_attributes` or extra dev server arguments, the test's server must have.
+
 #### Time skipping
 
 `WorkflowEnvironment.startTimeSkipping` uses the time-skipping test server: while a test waits for a result, time jumps ahead whenever every workflow is waiting on a timer.
