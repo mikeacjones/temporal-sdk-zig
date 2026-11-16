@@ -273,6 +273,24 @@ Notes:
 - `updateApiKey` replaces the API key every later call sends, this client's and its workers'; empty sends none. `updateHeaders` replaces `Options.headers` the same way, and returns `error.InvalidOptions`, logged, for a header name that isn't a gRPC ASCII header (or ends in `-bin`) or a value with bytes other than visible ASCII, space, and tab, leaving the headers unchanged. Calls already sent keep what they had. On a client that hasn't connected yet, they change what it connects with.
 - `Client.reconnect` connects again with its own `client.ConnectionOptions`, so after it the client sends that `api_key` and those `headers`, not those of earlier updates. On a client that hasn't connected yet, `reconnect` makes the first connection with its options, and calls waiting for a first connection get it; if that fails the client stays unconnected and keeps its own. `checkHealth` on such a client connects first. `close` frees a client whether it connected or not, without waiting on the network. If every call gave up on a first connection that sdk-core is still making (sdk-core gives it no deadline, and a server that never answers a TLS handshake keeps it going for good), sdk-core still uses the client's runtime, so `close` leaves the runtime and that attempt allocated for the rest of the process instead of freeing them. sdk-core's logs stop reaching `Options.logger`, but a custom metrics handler stays in use by that runtime and must then outlive the process.
 
+A program that works in several namespaces of one server connects once: `Client.forNamespace` returns a client for another namespace that uses the existing client's connection and sdk-core runtime.
+
+<!-- example: client-namespaces -->
+```zig
+var client = try temporal.client.Client.connect(gpa, io, options);
+defer client.close();
+// Another namespace of the same server, over the same connection and runtime.
+var billing = try client.forNamespace("billing");
+defer billing.close();
+// Its calls, and workers on it, work in "billing".
+const open_invoices = try billing.countWorkflows("ExecutionStatus = 'Running'");
+```
+Notes:
+- `forNamespace` makes no network call and creates no connection or runtime; it returns only `error.OutOfMemory`. The new client copies the namespace, and has the first client's identity, codecs, logger, propagators, interceptors, metrics, and `rpc_timeout`, borrowed from the same `Options`. Workers on it poll its namespace. A client made from it shares the same connection too.
+- The clients own the connection and the runtime together: `close` on one leaves them to the others, and the last to close frees them, so they may be closed in any order, each once, after the calls and workers on it have finished. sdk-core's logs go to the first client's `Options.logger` until then.
+- `reconnect`, `updateApiKey`, and `updateHeaders` on any of them change the connection of all of them, and `reconnect` moves the workers running on any of them. A client from `init` shares its first connection the same way: whichever client needs the server first connects for all.
+- Each `Client.connect` and `Client.init` still creates its own runtime: clients of different servers don't share one.
+
 #### Starting workflows
 
 `Client.executeWorkflow` starts a workflow defined with `workflow.Def` and returns a `client.WorkflowRun`. `client.StartWorkflowOptions` sets the ID, task queue, timeouts, ID policies, retry policy, memo, search attributes, priority, and start delay.

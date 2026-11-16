@@ -2739,7 +2739,7 @@ test "a worker on a client from init connects it and runs a workflow" {
         running.await(testing.io) catch {};
     }
     try w.waitUntilRunning();
-    try testing.expect(client.connection != null);
+    try testing.expect(client.shared.connection != null);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -2759,7 +2759,7 @@ test "a worker on a client from init that can't connect returns ConnectFailed, a
     try testing.expectError(error.ConnectFailed, w.run());
     try testing.expectError(error.WorkerFailedToStart, w.waitUntilRunning());
     try testing.expectError(error.ConnectFailed, w.run());
-    try testing.expect(client.connection == null);
+    try testing.expect(client.shared.connection == null);
 }
 
 test "stopping a worker while its client from init makes its first connection returns from run at once" {
@@ -2779,7 +2779,7 @@ test "stopping a worker while its client from init makes its first connection re
 
     var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
     // Wait until `run` is making the client's first connection.
-    while (client.connect_mutex.tryLock()) client.connect_mutex.unlock(testing.io);
+    while (client.shared.connect_mutex.tryLock()) client.shared.connect_mutex.unlock(testing.io);
     const start = Io.Clock.awake.now(testing.io);
     w.stop();
     const result = running.await(testing.io);

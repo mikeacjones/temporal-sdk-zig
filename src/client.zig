@@ -528,10 +528,21 @@ pub const InitError = error{ OutOfMemory, InvalidOptions, RuntimeInitFailed };
 /// another. `connect` and `reconnect` wait without cancellation.
 pub const ConnectError = InitError || error{ ConnectFailed, Canceled };
 
-pub const Client = struct {
+/// What a client shares with the clients `Client.forNamespace` makes from it: the sdk-core
+/// runtime and the connection, with everything `reconnect`, `updateApiKey` and
+/// `updateHeaders` change. Reference-counted: each client holds one reference, and the
+/// client that drops the last one frees it in `close`.
+const Shared = struct {
     gpa: Allocator,
     io: Io,
+    /// The clients holding it.
+    refs: std.atomic.Value(u32) = .init(1),
     runtime: bridge.Runtime,
+    /// The runtime's meter; null without `Options.metrics`.
+    meter: ?*bridge.metric.Meter,
+    /// A copy of the first client's logger that the runtime's core log forwarding points
+    /// at, freed after the runtime.
+    core_log_sink: ?*log_mod.Sink,
     /// Null until the client connects: `connect` connects at once, a client from `init` on
     /// first use. Read it with `currentConnection`: `reconnect` replaces it.
     connection: ?bridge.Connection = null,
@@ -558,14 +569,48 @@ pub const Client = struct {
     /// call that clears it; nothing waits on it.
     connect_mutex: Io.Mutex = .init,
     /// Cleared attempts whose callback hadn't run when they were cleared, each with a
-    /// reference: `close` frees those called back since, and leaves the runtime to the rest.
+    /// reference: `destroy` frees those called back since, and leaves the runtime to the
+    /// rest.
     abandoned_attempts: std.ArrayList(*bridge.Connection.Connecting) = .empty,
-    /// Connections `reconnect` replaced, freed by `close`: calls already sent on one may
+    /// Connections `reconnect` replaced, freed by `destroy`: calls already sent on one may
     /// still be using it.
     retired_connections: std.ArrayList(bridge.Connection) = .empty,
-    /// The core workers running on this client, which `reconnect` moves to the new
-    /// connection. Registered by `worker.Worker.run`.
+    /// The core workers running on any client sharing the connection, which `reconnect`
+    /// moves to the new one. Registered by `worker.Worker.run`.
     running_workers: std.ArrayList(*bridge.c.TemporalCoreWorker) = .empty,
+
+    /// Frees the connections, the runtime and `s`. Called by the last client to close.
+    fn destroy(s: *Shared) void {
+        const gpa = s.gpa;
+        s.running_workers.deinit(gpa);
+        for (s.retired_connections.items) |conn| conn.deinit();
+        s.retired_connections.deinit(gpa);
+        if (s.connection) |conn| conn.deinit();
+        if (s.pending_connection) |*p| p.deinit();
+        // Set only while a call is still waiting for it, which `close` must not race.
+        // `firstConnection` made room for it when it started the attempt.
+        if (s.connecting) |p| s.abandoned_attempts.appendAssumeCapacity(p);
+        // Frees, here, every attempt the core has called back and any connection it made that
+        // nobody took. The core's connect task uses the runtime until it calls back, so
+        // the runtime of an attempt still in flight is left to the core, never freed.
+        var in_flight = false;
+        for (s.abandoned_attempts.items) |p| {
+            if (p.unref() == .orphaned) in_flight = true;
+        }
+        s.abandoned_attempts.deinit(gpa);
+        if (s.meter) |m| m.destroy();
+        if (in_flight) s.runtime.abandon() else s.runtime.deinit();
+        if (s.core_log_sink) |sink| gpa.destroy(sink);
+        gpa.destroy(s);
+    }
+};
+
+pub const Client = struct {
+    gpa: Allocator,
+    io: Io,
+    /// The runtime and the connection, shared with the clients `forNamespace` makes from
+    /// this one and those made from them. Not for use outside the SDK.
+    shared: *Shared,
     namespace: []u8,
     identity: []u8,
     /// `Options.codecs`, borrowed.
@@ -574,25 +619,21 @@ pub const Client = struct {
     encode_failure_attributes: bool = false,
     /// `Options.logger` or the default sink; workers on this client inherit it.
     logger: log_mod.Sink,
-    /// A copy of `logger` that the runtime's core log forwarding points at, freed after the
-    /// runtime.
-    core_log_sink: ?*log_mod.Sink,
     /// `Options.propagators`, borrowed; workers on this client use them too.
     propagators: []const propagation.ContextPropagator,
     /// `Options.worker_interceptors`, borrowed.
     worker_interceptors: []const interceptor.Worker,
     /// `Options.interceptors`, borrowed.
     interceptors: []const interceptor.Client,
-    /// The runtime's meter; null without `Options.metrics`.
-    meter: ?*bridge.metric.Meter,
     /// `Options.rpc_timeout` in milliseconds; 0 sends none.
     rpc_timeout_ms: u32 = 0,
 
     /// Records through this client's metrics exporter (`Options.metrics`) with the runtime's
-    /// default attributes, or records nothing without one. Valid until `close`; metrics
+    /// default attributes, or records nothing without one. Clients made by `forNamespace`
+    /// share it. Valid until the last client sharing it closes (see `close`); metrics
     /// created from it, and handlers from its `with`, must be freed first. Thread-safe.
     pub fn metrics(c: *const Client) metrics_mod.Handler {
-        const m = c.meter orelse return .noop;
+        const m = c.shared.meter orelse return .noop;
         return .{ .ptr = m, .vtable = &bridge.metric.Meter.vtable };
     }
 
@@ -687,25 +728,62 @@ pub const Client = struct {
         errdefer gpa.free(identity);
         const namespace = try gpa.dupe(u8, options.namespace);
         errdefer gpa.free(namespace);
+        const shared = try gpa.create(Shared);
+        errdefer gpa.destroy(shared);
         const pending: PendingConnection = try .init(gpa, options.connectionOptions());
+        shared.* = .{
+            .gpa = gpa,
+            .io = io,
+            .runtime = runtime,
+            .meter = meter,
+            .core_log_sink = core_log_sink,
+            .pending_connection = pending,
+        };
 
         return .{
             .gpa = gpa,
             .io = io,
-            .runtime = runtime,
-            .pending_connection = pending,
+            .shared = shared,
             .namespace = namespace,
             .identity = identity,
             .codecs = options.codecs,
             .encode_failure_attributes = options.encode_failure_attributes,
             .logger = logger,
-            .core_log_sink = core_log_sink,
             .propagators = options.propagators,
             .worker_interceptors = options.worker_interceptors,
             .interceptors = options.interceptors,
-            .meter = meter,
             .rpc_timeout_ms = rpc_timeout_ms,
         };
+    }
+
+    /// Returns a client for `namespace` on this client's connection and sdk-core runtime:
+    /// nothing goes over the network, no connection is opened and no runtime is created. A
+    /// program that works in several namespaces of one server connects once and makes a
+    /// client for each of the others with this. Workers on the new client poll `namespace`.
+    /// The new client has this one's identity, codecs, `encode_failure_attributes`,
+    /// logger, propagators, interceptors (client and worker), metrics (`metrics`) and
+    /// `Options.rpc_timeout`; they are borrowed from the same `Options` as this client's, so
+    /// those must outlive it too. `namespace` is copied.
+    ///
+    /// The clients share the connection and the runtime, and own them together: closing
+    /// one leaves both to the others, and the last of them to close frees them. The clients
+    /// may be closed in any order, each once, on any thread, by the rules `close` gives
+    /// for one client. `reconnect`, `updateApiKey` and `updateHeaders` on any of them change
+    /// the connection of all of them and move the workers running on any of them. A client
+    /// from `init` that hasn't connected yet shares its first connection the same way:
+    /// whichever client needs the server first connects for all. Clients made from the new
+    /// one share the same connection too. Thread-safe.
+    pub fn forNamespace(c: *Client, namespace: []const u8) error{OutOfMemory}!Client {
+        const ns = try c.gpa.dupe(u8, namespace);
+        errdefer c.gpa.free(ns);
+        const identity = try c.gpa.dupe(u8, c.identity);
+        const prev = c.shared.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(prev > 0); // `c` was closed.
+        var other = c.*;
+        other.shared = c.shared;
+        other.namespace = ns;
+        other.identity = identity;
+        return other;
     }
 
     /// Connects now if the client hasn't yet (see `init`), and checks the server; does
@@ -770,35 +848,32 @@ pub const Client = struct {
         return error.NotServing;
     }
 
-    /// Frees the client, connected or not, once no call on it is running. Doesn't wait on
-    /// the network. A first connection attempt that every call gave up on (see `init`) may
+    /// Frees the client, connected or not, once no call on it is running and the workers on
+    /// it have stopped. Doesn't wait on the network. Close each client exactly once.
+    ///
+    /// The connection and the runtime belong to every client that shares them (see
+    /// `forNamespace`), and `close` frees them only when it closes the last of those
+    /// clients, whichever that is: they may be closed in any order. Until then, the others
+    /// keep working, and so do the connections `currentConnection` returned and the
+    /// handlers `metrics` returned on the closed one; sdk-core's logs keep reaching the
+    /// first client's `Options.logger`.
+    ///
+    /// A first connection attempt that every call gave up on (see `init`) may
     /// still be running in sdk-core, which has no deadline of its own for it (a server that
     /// never answers a TLS handshake keeps it running for good). sdk-core's task uses the
     /// client's runtime until the attempt ends, so `close` then leaves the runtime to it
     /// instead of freeing it: the runtime, its threads, and the attempt stay allocated for
     /// the rest of the process (the attempt frees itself if it ends). sdk-core's logs stop
-    /// reaching `Options.logger` when `close` returns, but a custom metrics handler
-    /// (`Options.metrics`) stays in use by that runtime, so it must then outlive the process.
+    /// reaching `Options.logger` when the last client sharing the runtime closes, but a
+    /// custom metrics handler (`Options.metrics`) stays in use by that runtime, so it must
+    /// then outlive the process.
     pub fn close(c: *Client) void {
-        c.running_workers.deinit(c.gpa);
-        for (c.retired_connections.items) |conn| conn.deinit();
-        c.retired_connections.deinit(c.gpa);
-        if (c.connection) |conn| conn.deinit();
-        if (c.pending_connection) |*p| p.deinit();
-        // Set only while a call is still waiting for it, which `close` must not race.
-        // `firstConnection` made room for it when it started the attempt.
-        if (c.connecting) |p| c.abandoned_attempts.appendAssumeCapacity(p);
-        // Frees, here, every attempt the core has called back and any connection it made that
-        // nobody took. The core's connect task uses the runtime until it calls back, so
-        // the runtime of an attempt still in flight is left to the core, never freed.
-        var in_flight = false;
-        for (c.abandoned_attempts.items) |p| {
-            if (p.unref() == .orphaned) in_flight = true;
-        }
-        c.abandoned_attempts.deinit(c.gpa);
-        if (c.meter) |m| m.destroy();
-        if (in_flight) c.runtime.abandon() else c.runtime.deinit();
-        if (c.core_log_sink) |s| c.gpa.destroy(s);
+        // A client made by `forNamespace` shares the connection and the runtime: the last
+        // client to close frees them. Acquire pairs with the releases of the clients closed
+        // before, so their last uses of the shared state happen before it is freed.
+        const prev = c.shared.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0); // Closed more times than there are clients.
+        if (prev == 1) c.shared.destroy();
         c.gpa.free(c.namespace);
         c.gpa.free(c.identity);
         c.* = undefined;
@@ -806,7 +881,8 @@ pub const Client = struct {
 
     /// The connection calls go over now, connecting first on a client that hasn't connected
     /// yet (see `init`; the failure is logged, and the client stays unconnected). It stays
-    /// valid until `close`, even after a `reconnect` replaces it. Thread-safe.
+    /// valid until the last client sharing it closes (see `forNamespace`), even after a
+    /// `reconnect` replaces it. Thread-safe.
     pub fn currentConnection(c: *Client) ConnectError!bridge.Connection {
         return c.currentConnectionAs(.first_use);
     }
@@ -827,9 +903,9 @@ pub const Client = struct {
     /// For `worker.Worker.stop`: wakes the calls waiting for a first connection to check their
     /// stop flags. Thread-safe.
     pub fn wakeConnecting(c: *Client) void {
-        c.connection_mutex.lockUncancelable(c.io);
-        defer c.connection_mutex.unlock(c.io);
-        if (c.connecting) |p| p.wakeWaiters();
+        c.shared.connection_mutex.lockUncancelable(c.io);
+        defer c.shared.connection_mutex.unlock(c.io);
+        if (c.shared.connecting) |p| p.wakeWaiters();
     }
 
     /// The connection, connecting first if there is none: every call shares one attempt and
@@ -843,30 +919,30 @@ pub const Client = struct {
             else => null,
         };
         const connecting = blk: {
-            c.connection_mutex.lockUncancelable(c.io);
-            defer c.connection_mutex.unlock(c.io);
-            if (c.connection) |conn| return conn;
+            c.shared.connection_mutex.lockUncancelable(c.io);
+            defer c.shared.connection_mutex.unlock(c.io);
+            if (c.shared.connection) |conn| return conn;
             if (stop) |f| if (f.load(.acquire)) return error.Stopped;
-            if (c.connecting == null) {
+            if (c.shared.connecting == null) {
                 // Make room to keep the attempt for `close` if it is cleared before the core
                 // calls back, dropping those whose callback has run.
                 var i: usize = 0;
-                while (i < c.abandoned_attempts.items.len) {
-                    const p = c.abandoned_attempts.items[i];
+                while (i < c.shared.abandoned_attempts.items.len) {
+                    const p = c.shared.abandoned_attempts.items[i];
                     if (p.calledBack()) {
                         _ = p.unref();
-                        _ = c.abandoned_attempts.swapRemove(i);
+                        _ = c.shared.abandoned_attempts.swapRemove(i);
                     } else i += 1;
                 }
-                try c.abandoned_attempts.ensureUnusedCapacity(c.gpa, 1);
+                try c.shared.abandoned_attempts.ensureUnusedCapacity(c.gpa, 1);
                 // Starting doesn't wait on the network: the core connects on its own threads.
-                c.connecting = try startConnecting(c.gpa, c.io, c.runtime, c.identity, c.pending_connection.?.options, attempt);
-                c.connecting_updates = c.pending_updates;
-                c.connect_mutex.lockUncancelable(c.io);
+                c.shared.connecting = try startConnecting(c.gpa, c.io, c.shared.runtime, c.identity, c.shared.pending_connection.?.options, attempt);
+                c.shared.connecting_updates = c.shared.pending_updates;
+                c.shared.connect_mutex.lockUncancelable(c.io);
             }
-            const connecting = c.connecting.?;
+            const connecting = c.shared.connecting.?;
             connecting.ref();
-            c.connecting_waiters += 1;
+            c.shared.connecting_waiters += 1;
             break :blk connecting;
         };
         // Never the reference that orphans it: `connecting` or `abandoned_attempts` holds one
@@ -874,18 +950,18 @@ pub const Client = struct {
         defer _ = connecting.unref();
         const waited: error{ Timeout, Canceled, Stopped }!void = if (attempt == .connect) connecting.waitUncancelable() else connecting.wait(deadline, stop);
 
-        c.connection_mutex.lockUncancelable(c.io);
-        defer c.connection_mutex.unlock(c.io);
-        if (c.connecting == connecting) c.connecting_waiters -= 1;
+        c.shared.connection_mutex.lockUncancelable(c.io);
+        defer c.shared.connection_mutex.unlock(c.io);
+        if (c.shared.connecting == connecting) c.shared.connecting_waiters -= 1;
         if (connecting.isDone()) return c.finishConnecting(connecting, attempt);
-        if (c.connecting == connecting and c.connecting_waiters == 0) c.stopWaitingForConnecting();
+        if (c.shared.connecting == connecting and c.shared.connecting_waiters == 0) c.stopWaitingForConnecting();
         // A `reconnect` connected meanwhile and woke the waiters (`supersede`).
-        if (c.connection) |conn| return conn;
+        if (c.shared.connection) |conn| return conn;
         waited catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.Stopped => return error.Stopped,
             error.Timeout => {
-                logConnectFailure(attempt, c.pending_connection.?.options.host_port, "the server didn't answer within the call's deadline (Options.rpc_timeout)");
+                logConnectFailure(attempt, c.shared.pending_connection.?.options.host_port, "the server didn't answer within the call's deadline (Options.rpc_timeout)");
                 return error.ConnectFailed;
             },
         };
@@ -897,20 +973,20 @@ pub const Client = struct {
     /// `connection_mutex` held.
     fn finishConnecting(c: *Client, connecting: *bridge.Connection.Connecting, comptime attempt: Attempt) ConnectError!bridge.Connection {
         // Only the first call to see it done finds it still set.
-        if (c.connecting != connecting) {
-            if (c.connection) |conn| return conn;
+        if (c.shared.connecting != connecting) {
+            if (c.shared.connection) |conn| return conn;
             return error.ConnectFailed;
         }
-        const updates = c.connecting_updates;
+        const updates = c.shared.connecting_updates;
         c.stopWaitingForConnecting();
         // A `reconnect` connected meanwhile: the attempt's connection is freed with it.
-        if (c.connection) |conn| return conn;
+        if (c.shared.connection) |conn| return conn;
         const conn = connecting.take() orelse {
-            logConnectFailure(attempt, c.pending_connection.?.options.host_port, connecting.failureMessage());
+            logConnectFailure(attempt, c.shared.pending_connection.?.options.host_port, connecting.failureMessage());
             return error.ConnectFailed;
         };
-        if (c.pending_updates != updates) {
-            const latest = c.pending_connection.?.options;
+        if (c.shared.pending_updates != updates) {
+            const latest = c.shared.pending_connection.?.options;
             conn.setApiKey(latest.api_key);
             conn.setMetadata(c.gpa, latest.headers) catch |err| {
                 conn.deinit();
@@ -928,46 +1004,48 @@ pub const Client = struct {
     /// Clears `connecting`, so the next call starts another attempt. Call with
     /// `connection_mutex` held.
     fn stopWaitingForConnecting(c: *Client) void {
-        const p = c.connecting.?;
+        const p = c.shared.connecting.?;
         // `firstConnection` made room before it started the attempt.
-        if (p.calledBack()) _ = p.unref() else c.abandoned_attempts.appendAssumeCapacity(p);
-        c.connecting = null;
-        c.connecting_waiters = 0;
-        c.connect_mutex.unlock(c.io);
+        if (p.calledBack()) _ = p.unref() else c.shared.abandoned_attempts.appendAssumeCapacity(p);
+        c.shared.connecting = null;
+        c.shared.connecting_waiters = 0;
+        c.shared.connect_mutex.unlock(c.io);
     }
 
     /// sdk-core's deadline for a call, which `Options.rpc_timeout` replaces.
     const default_rpc_timeout_ms = 30_000;
 
     fn connectionIfAny(c: *Client) ?bridge.Connection {
-        c.connection_mutex.lockUncancelable(c.io);
-        defer c.connection_mutex.unlock(c.io);
-        return c.connection;
+        c.shared.connection_mutex.lockUncancelable(c.io);
+        defer c.shared.connection_mutex.unlock(c.io);
+        return c.shared.connection;
     }
 
     /// Takes `conn` as the first connection. Call with `connection_mutex` held.
     fn connected(c: *Client, conn: bridge.Connection) void {
-        c.connection = conn;
-        c.pending_connection.?.deinit();
-        c.pending_connection = null;
+        c.shared.connection = conn;
+        c.shared.pending_connection.?.deinit();
+        c.shared.pending_connection = null;
     }
 
     /// Replaces the API key sent with every call from now on, by this client and every worker
-    /// on it; empty sends none. Calls already sent keep the key they had. Use it to rotate a
+    /// on it, and by the clients sharing its connection (see `forNamespace`) and their
+    /// workers; empty sends none. Calls already sent keep the key they had. Use it to rotate a
     /// key before it expires. On a client that hasn't connected yet (see `init`), it is the
     /// key the client connects with. A later `reconnect` sends its own
     /// `ConnectionOptions.api_key` instead. Thread-safe.
     pub fn updateApiKey(c: *Client, api_key: []const u8) error{OutOfMemory}!void {
-        c.connection_mutex.lockUncancelable(c.io);
-        defer c.connection_mutex.unlock(c.io);
-        if (c.connection) |conn| return conn.setApiKey(api_key);
-        var options = c.pending_connection.?.options;
+        c.shared.connection_mutex.lockUncancelable(c.io);
+        defer c.shared.connection_mutex.unlock(c.io);
+        if (c.shared.connection) |conn| return conn.setApiKey(api_key);
+        var options = c.shared.pending_connection.?.options;
         options.api_key = api_key;
         try c.replacePending(options);
     }
 
     /// Replaces the gRPC headers (`Options.headers`) sent with every call from now on, by
-    /// this client and every worker on it. Returns `error.InvalidOptions` (logged) for a key
+    /// this client and every worker on it, and by the clients sharing its connection (see
+    /// `forNamespace`) and their workers. Returns `error.InvalidOptions` (logged) for a key
     /// that isn't a valid header name or ends in "-bin" (binary headers aren't supported), or
     /// a value with characters other than visible ASCII, space and tab; the headers are then
     /// unchanged. On a client that hasn't connected yet (see `init`), they are the headers
@@ -975,14 +1053,14 @@ pub const Client = struct {
     /// instead. Thread-safe.
     pub fn updateHeaders(c: *Client, headers: []const bridge.bytes.MetadataEntry) error{ OutOfMemory, InvalidOptions }!void {
         for (headers) |h| try validateHeader(h);
-        c.connection_mutex.lockUncancelable(c.io);
-        defer c.connection_mutex.unlock(c.io);
-        if (c.connection) |conn| return conn.setMetadata(c.gpa, headers) catch |err| switch (err) {
+        c.shared.connection_mutex.lockUncancelable(c.io);
+        defer c.shared.connection_mutex.unlock(c.io);
+        if (c.shared.connection) |conn| return conn.setMetadata(c.gpa, headers) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // validateHeader already rejects newlines.
             error.NewlineInKey, error.NewlineInValue => unreachable,
         };
-        var options = c.pending_connection.?.options;
+        var options = c.shared.pending_connection.?.options;
         options.headers = headers;
         try c.replacePending(options);
     }
@@ -991,22 +1069,23 @@ pub const Client = struct {
     /// may borrow from the current ones. Call with `connection_mutex` held.
     fn replacePending(c: *Client, options: ConnectionOptions) error{OutOfMemory}!void {
         const next: PendingConnection = try .init(c.gpa, options);
-        c.pending_connection.?.deinit();
-        c.pending_connection = next;
-        c.pending_updates += 1;
+        c.shared.pending_connection.?.deinit();
+        c.shared.pending_connection = next;
+        c.shared.pending_updates += 1;
     }
 
     /// Connects again with `options` (address, API key, TLS, headers, keep-alive, proxy,
-    /// retry policy, and client name and version) and sends every
-    /// later call over the new connection: this client's, and those of the workers running
-    /// on it, which move over without stopping (their polls already waiting finish on the old
-    /// connection). Workers started later use it too. TLS files named by `options.tls` are
+    /// retry policy, and client name and version) and sends every later call over the new
+    /// connection: this client's, and those of the workers running on it, which move over
+    /// without stopping (their polls already waiting finish on the old connection). Workers
+    /// started later use it too. The clients sharing this client's connection (see
+    /// `forNamespace`) and their workers move with it. TLS files named by `options.tls` are
     /// read again, so this is how to rotate a client certificate: sdk-core can't change the
     /// certificate of a live connection. The new connection is checked first; if that fails
     /// (`ConnectError`, logged as a warning), the client keeps the current one. The old
-    /// connection is freed by `close`, since calls already sent may still be using it. A
-    /// worker that is already shutting down can't move and finishes on the old connection
-    /// (logged as a warning). On a client that hasn't connected yet (see `init`), it makes
+    /// connection is freed when the last client sharing it closes, since calls already sent
+    /// may still be using it. A worker that is already shutting down can't move and
+    /// finishes on the old connection (logged as a warning). On a client that hasn't connected yet (see `init`), it makes
     /// the first connection with `options` in place of those the client was created with;
     /// if that fails (logged as a warning), the client stays unconnected and keeps its own
     /// options for its next call. Calls waiting for a first connection in progress then get
@@ -1014,43 +1093,43 @@ pub const Client = struct {
     /// calls don't wait for it. Thread-safe.
     pub fn reconnect(c: *Client, options: ConnectionOptions) ConnectError!void {
         const next = if (c.connectionIfAny() == null)
-            try openConnection(c.gpa, c.io, c.runtime, c.identity, options, .first_use)
+            try openConnection(c.gpa, c.io, c.shared.runtime, c.identity, options, .first_use)
         else
-            try openConnection(c.gpa, c.io, c.runtime, c.identity, options, .reconnect);
-        c.connection_mutex.lockUncancelable(c.io);
-        defer c.connection_mutex.unlock(c.io);
-        if (c.connection == null) {
+            try openConnection(c.gpa, c.io, c.shared.runtime, c.identity, options, .reconnect);
+        c.shared.connection_mutex.lockUncancelable(c.io);
+        defer c.shared.connection_mutex.unlock(c.io);
+        if (c.shared.connection == null) {
             // Calls waiting for a first connection in progress take this one instead.
-            if (c.connecting) |p| p.supersede();
+            if (c.shared.connecting) |p| p.supersede();
             return c.connected(next);
         }
-        c.retired_connections.append(c.gpa, c.connection.?) catch {
+        c.shared.retired_connections.append(c.gpa, c.shared.connection.?) catch {
             next.deinit();
             return error.OutOfMemory;
         };
-        c.connection = next;
-        for (c.running_workers.items) |ptr| replaceWorkerClient(c, ptr, next);
+        c.shared.connection = next;
+        for (c.shared.running_workers.items) |ptr| replaceWorkerClient(c, ptr, next);
     }
 
     /// For `worker.Worker.run`: registers a core worker it created on `created_on`, so
     /// `reconnect` moves it, and moves it at once if a `reconnect` came in between. Pair with
     /// `untrackWorker` before the core worker is freed.
     pub fn trackWorker(c: *Client, ptr: *bridge.c.TemporalCoreWorker, created_on: bridge.Connection) error{OutOfMemory}!void {
-        c.connection_mutex.lockUncancelable(c.io);
-        defer c.connection_mutex.unlock(c.io);
-        try c.running_workers.append(c.gpa, ptr);
+        c.shared.connection_mutex.lockUncancelable(c.io);
+        defer c.shared.connection_mutex.unlock(c.io);
+        try c.shared.running_workers.append(c.gpa, ptr);
         // A worker runs on a connection `currentConnection` returned, so there is one.
-        const current = c.connection.?;
+        const current = c.shared.connection.?;
         if (created_on.ptr != current.ptr) replaceWorkerClient(c, ptr, current);
     }
 
     /// For `worker.Worker.run`: unregisters a core worker `trackWorker` registered; does
     /// nothing if it isn't registered.
     pub fn untrackWorker(c: *Client, ptr: *bridge.c.TemporalCoreWorker) void {
-        c.connection_mutex.lockUncancelable(c.io);
-        defer c.connection_mutex.unlock(c.io);
-        for (c.running_workers.items, 0..) |p, i| if (p == ptr) {
-            _ = c.running_workers.swapRemove(i);
+        c.shared.connection_mutex.lockUncancelable(c.io);
+        defer c.shared.connection_mutex.unlock(c.io);
+        for (c.shared.running_workers.items, 0..) |p, i| if (p == ptr) {
+            _ = c.shared.running_workers.swapRemove(i);
             return;
         };
     }
@@ -1058,7 +1137,7 @@ pub const Client = struct {
     /// sdk-core refuses to move a worker that is shutting down: it finishes on the old
     /// connection.
     fn replaceWorkerClient(c: *Client, ptr: *bridge.c.TemporalCoreWorker, connection: bridge.Connection) void {
-        const w: bridge.Worker = .{ .ptr = ptr, .runtime = c.runtime };
+        const w: bridge.Worker = .{ .ptr = ptr, .runtime = c.shared.runtime };
         var message: ?[]u8 = null;
         defer if (message) |m| c.gpa.free(m);
         w.replaceClient(c.gpa, connection, &message) catch {
@@ -4593,17 +4672,17 @@ test "a client from init makes no connection, and a failed first connection leav
     testing.log_level = .err;
     var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null });
     defer c.close();
-    try testing.expect(c.connection == null);
+    try testing.expect(c.shared.connection == null);
 
     try testing.expectError(error.ConnectFailed, c.ensureConnected());
-    try testing.expect(c.connection == null);
+    try testing.expect(c.shared.connection == null);
     try testing.expectError(error.ConnectFailed, c.currentConnection());
     // The client's own calls return RpcFailed for a connection that fails.
     try testing.expectError(error.RpcFailed, c.checkHealth());
     try testing.expectError(error.RpcFailed, c.countWorkflows(""));
     try testing.expectError(error.ConnectFailed, c.ensureConnected());
-    try testing.expect(c.connection == null);
-    try testing.expectEqualStrings(closed_port, c.pending_connection.?.options.host_port);
+    try testing.expect(c.shared.connection == null);
+    try testing.expectEqualStrings(closed_port, c.shared.pending_connection.?.options.host_port);
 }
 
 test "a client that hasn't connected keeps an updated API key and headers for its connection" {
@@ -4628,7 +4707,7 @@ test "a client that hasn't connected keeps an updated API key and headers for it
     header_value = "XXXX".*;
     try testing.expectError(error.InvalidOptions, c.updateHeaders(&.{.{ .key = "bad key", .value = "v" }}));
 
-    const o = c.pending_connection.?.options;
+    const o = c.shared.pending_connection.?.options;
     try testing.expectEqualStrings("secret", o.api_key);
     try testing.expectEqual(@as(usize, 1), o.headers.len);
     try testing.expectEqualStrings("x-deployment", o.headers[0].key);
@@ -4641,9 +4720,9 @@ test "a client that hasn't connected keeps an updated API key and headers for it
 
     try c.updateApiKey("");
     try c.updateHeaders(&.{});
-    try testing.expectEqualStrings("", c.pending_connection.?.options.api_key);
-    try testing.expectEqual(@as(usize, 0), c.pending_connection.?.options.headers.len);
-    try testing.expect(c.connection == null);
+    try testing.expectEqualStrings("", c.shared.pending_connection.?.options.api_key);
+    try testing.expectEqual(@as(usize, 0), c.shared.pending_connection.?.options.headers.len);
+    try testing.expect(c.shared.connection == null);
 }
 
 test "a failed reconnect of a client that hasn't connected keeps its own options" {
@@ -4652,10 +4731,10 @@ test "a failed reconnect of a client that hasn't connected keeps its own options
     var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .api_key = "mine" });
     defer c.close();
     try testing.expectError(error.ConnectFailed, c.reconnect(.{ .host_port = "127.0.0.1:2", .api_key = "theirs" }));
-    try testing.expect(c.connection == null);
-    try testing.expectEqualStrings(closed_port, c.pending_connection.?.options.host_port);
-    try testing.expectEqualStrings("mine", c.pending_connection.?.options.api_key);
-    try testing.expectEqual(@as(usize, 0), c.retired_connections.items.len);
+    try testing.expect(c.shared.connection == null);
+    try testing.expectEqualStrings(closed_port, c.shared.pending_connection.?.options.host_port);
+    try testing.expectEqualStrings("mine", c.shared.pending_connection.?.options.api_key);
+    try testing.expectEqual(@as(usize, 0), c.shared.retired_connections.items.len);
 }
 
 test "a client from init is closed without ever connecting" {
@@ -4688,10 +4767,10 @@ test "a client from init connects on its first call to a dev server" {
     defer server.stop(testing.io);
     var c = try Client.init(testing.allocator, testing.io, server.clientOptions());
     defer c.close();
-    try testing.expect(c.connection == null);
+    try testing.expect(c.shared.connection == null);
     _ = try c.countWorkflows("");
-    try testing.expect(c.connection != null);
-    try testing.expect(c.pending_connection == null);
+    try testing.expect(c.shared.connection != null);
+    try testing.expect(c.shared.pending_connection == null);
     try c.checkHealth();
     try c.ensureConnected();
     // Once connected, the updates go to the connection.
@@ -4709,8 +4788,8 @@ test "reconnect makes the first connection of a client from init" {
     var c = try Client.init(testing.allocator, testing.io, options);
     defer c.close();
     try c.reconnect(server.clientOptions().connectionOptions());
-    try testing.expect(c.connection != null);
-    try testing.expectEqual(@as(usize, 0), c.retired_connections.items.len);
+    try testing.expect(c.shared.connection != null);
+    try testing.expectEqual(@as(usize, 0), c.shared.retired_connections.items.len);
     try c.checkHealth();
 }
 
@@ -4735,8 +4814,8 @@ test "first calls made together from several threads open one connection" {
     for (&threads, &connections) |*t, *out| t.* = try std.Thread.spawn(.{}, LazyConnectTest.firstCall, .{ &c, out, &failed });
     for (threads) |t| t.join();
     try testing.expect(!failed.load(.acquire));
-    for (connections) |conn| try testing.expectEqual(c.connection.?.ptr, conn.?.ptr);
-    try testing.expectEqual(@as(usize, 0), c.retired_connections.items.len);
+    for (connections) |conn| try testing.expectEqual(c.shared.connection.?.ptr, conn.?.ptr);
+    try testing.expectEqual(@as(usize, 0), c.shared.retired_connections.items.len);
 }
 
 test "the first call of a client from init gives up within rpc_timeout when the server never answers" {
@@ -4783,14 +4862,14 @@ test "updates to a client from init don't wait for a first connection in progres
     const thread = try std.Thread.spawn(.{}, SilentServerTest.firstCall, .{ &c, &done });
     defer thread.join();
     // Wait until the first call holds the connect lock.
-    while (c.connect_mutex.tryLock()) c.connect_mutex.unlock(testing.io);
+    while (c.shared.connect_mutex.tryLock()) c.shared.connect_mutex.unlock(testing.io);
 
     try c.updateApiKey("rotated");
     try c.updateHeaders(&.{.{ .key = "x-tenant", .value = "blue" }});
     // Both returned while the first call was still connecting.
     try testing.expect(!done.load(.acquire));
-    try testing.expectEqual(@as(u64, 2), c.pending_updates);
-    try testing.expectEqualStrings("rotated", c.pending_connection.?.options.api_key);
+    try testing.expectEqual(@as(u64, 2), c.shared.pending_updates);
+    try testing.expectEqualStrings("rotated", c.shared.pending_connection.?.options.api_key);
 }
 
 test "reconnect rejects the headers connect rejects" {
@@ -4828,11 +4907,11 @@ test "canceling a call while a client from init makes its first connection retur
     // `checkHealth` documents that canceling the calling task cancels it, as a connected
     // client's calls return Canceled.
     var health = try testing.io.concurrent(CanceledFirstCallTest.health, .{&c});
-    while (c.connect_mutex.tryLock()) c.connect_mutex.unlock(testing.io);
+    while (c.shared.connect_mutex.tryLock()) c.shared.connect_mutex.unlock(testing.io);
     try testing.expectError(error.Canceled, health.cancel(testing.io));
 
     var count = try testing.io.concurrent(CanceledFirstCallTest.count, .{&c});
-    while (c.connect_mutex.tryLock()) c.connect_mutex.unlock(testing.io);
+    while (c.shared.connect_mutex.tryLock()) c.shared.connect_mutex.unlock(testing.io);
     try testing.expectError(error.Canceled, count.cancel(testing.io));
 }
 
@@ -4893,12 +4972,12 @@ test "a reconnect that connects a client from init first hands its connection to
     var waited: Io.Duration = .zero;
     const thread = try std.Thread.spawn(.{}, OvertakenFirstCallTest.first, .{ &c, &got, &waited });
     // Wait until the first call's attempt is in progress.
-    while (c.connect_mutex.tryLock()) c.connect_mutex.unlock(testing.io);
+    while (c.shared.connect_mutex.tryLock()) c.shared.connect_mutex.unlock(testing.io);
     try c.reconnect(dev.clientOptions().connectionOptions());
     thread.join();
-    try testing.expectEqual(c.connection.?.ptr, got.?.ptr);
+    try testing.expectEqual(c.shared.connection.?.ptr, got.?.ptr);
     try testing.expect(waited.nanoseconds < 30 * std.time.ns_per_s);
-    try testing.expect(c.connecting == null);
+    try testing.expect(c.shared.connecting == null);
     try c.checkHealth();
 }
 
@@ -4915,9 +4994,9 @@ test "closing a client from init frees a first connection attempt the core is st
     try testing.expectError(error.RpcFailed, c.checkHealth());
     // Both attempts were cleared before the core called back. `close` frees those the core
     // has called back by then, and leaves the runtime to the others, which free themselves.
-    try testing.expect(c.connecting == null);
-    try testing.expectEqual(@as(usize, 2), c.abandoned_attempts.items.len);
-    try testing.expect(!c.abandoned_attempts.items[0].calledBack());
+    try testing.expect(c.shared.connecting == null);
+    try testing.expectEqual(@as(usize, 2), c.shared.abandoned_attempts.items.len);
+    try testing.expect(!c.shared.abandoned_attempts.items[0].calledBack());
     // Closing the listener resets the connections it never accepted, so the core's
     // attempts end soon instead of after its own 30 s.
     silent.deinit(testing.io);

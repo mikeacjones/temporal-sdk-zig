@@ -40,6 +40,19 @@ fn lazyConnectExample(gpa: Allocator, io: Io, options: temporal.client.Options, 
     // end-example
 }
 
+fn namespacesExample(gpa: Allocator, io: Io, options: temporal.client.Options) !u64 {
+    // example: client-namespaces
+    var client = try temporal.client.Client.connect(gpa, io, options);
+    defer client.close();
+    // Another namespace of the same server, over the same connection and runtime.
+    var billing = try client.forNamespace("billing");
+    defer billing.close();
+    // Its calls, and workers on it, work in "billing".
+    const open_invoices = try billing.countWorkflows("ExecutionStatus = 'Running'");
+    // end-example
+    return open_invoices;
+}
+
 pub fn startWorkflows(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
     // example: client-start
     var run = try client.executeWorkflow(Greeting, .{ .id = "greeting-ada", .task_queue = "greetings", .execution_timeout = .fromSeconds(60) }, .{"Ada"});
@@ -234,11 +247,12 @@ test "client: examples against a dev server" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var server = try temporal.testing.DevServer.start(gpa, io, .{
-        .extra_args = &temporal.testing.DevServer.standalone_activity_args,
+        .extra_args = &(temporal.testing.DevServer.standalone_activity_args ++ [_][]const u8{ "--namespace", "billing" }),
     });
     defer server.stop(io);
 
     try lazyConnectExample(gpa, io, server.clientOptions(), "rotated-key");
+    try std.testing.expectEqual(0, try namespacesExample(gpa, io, server.clientOptions()));
 
     var client = try temporal.client.Client.connect(gpa, io, server.clientOptions());
     defer client.close();

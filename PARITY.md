@@ -38,6 +38,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | HTTP CONNECT proxy for the client connection | Python, TypeScript, .NET, Ruby, Go | GA | partial | `temporal-sdk-zig-d51.5.36`. Missing: README.md documentation; `client.Options.http_connect_proxy` exists. |
 | gRPC keep-alive settings | Python, TypeScript, .NET, Ruby | GA | partial | `temporal-sdk-zig-d51.5.36`. Missing: README.md documentation; `client.Options.keep_alive` exists. |
 | Lazy connection, and changing the API key or headers on a connected client | Go, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |
+| Clients for several namespaces over one connection | all | GA | supported | [Connecting](README.md#connecting) |
 | Start a workflow: ID reuse and conflict policies, timeouts, retry policy, memo, search attributes | all | GA | supported | [Starting workflows](README.md#starting-workflows), [helloworld](samples/helloworld) |
 | Workflow start delay | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [start-delay](samples/start-delay) |
 | Cron workflows | all | GA | supported | [cron](samples/cron) |

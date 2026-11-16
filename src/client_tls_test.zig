@@ -226,6 +226,26 @@ test "client credentials against a server with mutual TLS and JWT authorization"
     try testing.expectError(error.InvalidOptions, c.updateHeaders(&.{.{ .key = "x-deployment", .value = "gr\xc3\xbcn" }}));
     try testing.expectEqual(0, try describeStatus(&c, a));
 
+    // A client for another namespace shares the connection: an API key or header update on
+    // either applies to both. The key is sent as an "authorization" header, which an
+    // update to the headers can carry instead once the key is empty.
+    {
+        var shared = try c.forNamespace("another-namespace");
+        defer shared.close();
+        try c.updateApiKey(server.other_token);
+        try testing.expectEqual(permission_denied, try describeStatus(&shared, a));
+        try shared.updateApiKey(server.token);
+        try testing.expectEqual(0, try describeStatus(&c, a));
+        try c.updateApiKey("");
+        try shared.updateHeaders(&.{.{ .key = "authorization", .value = try std.fmt.allocPrint(a, "Bearer {s}", .{server.other_token}) }});
+        try testing.expectEqual(permission_denied, try describeStatus(&c, a));
+        try c.updateHeaders(&.{.{ .key = "authorization", .value = try std.fmt.allocPrint(a, "Bearer {s}", .{server.token}) }});
+        try testing.expectEqual(0, try describeStatus(&shared, a));
+        try shared.updateHeaders(&.{});
+        try shared.updateApiKey(server.token);
+    }
+    try testing.expectEqual(0, try describeStatus(&c, a));
+
     // A reconnect moves a running worker: the workflow started after it runs on the worker
     // started before it. The reconnect reads the certificate files again, as after a
     // rotation on disk.
