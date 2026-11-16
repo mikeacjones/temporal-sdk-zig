@@ -26,6 +26,7 @@ const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
 const Scheduler = @import("Scheduler.zig");
+const call_sites = @import("call_sites.zig");
 const Fiber = Scheduler.Fiber;
 
 /// The run's allocator. Task blocks and group state come from it and go back to `free_blocks`
@@ -144,8 +145,9 @@ pub fn cancelTask(w: *WorkflowIo, task: *Task) void {
 
 /// A blocking point for SDK code built on this Io (activity futures, signals): create it on
 /// the waiting coroutine with `newWait`, block with `waitFor`, and resume it with `wake`.
-pub fn newWaitPoint(w: *WorkflowIo) Wait {
-    return w.newWait();
+/// `reason` says what it waits on, for `Task.waiting_on`.
+pub fn newWaitPoint(w: *WorkflowIo, reason: Wait.Reason) Wait {
+    return w.newWait(reason);
 }
 
 /// Blocks the current coroutine until `wait` is woken, or until the task is canceled when
@@ -239,6 +241,10 @@ pub const Task = struct {
     cancel_protection: Io.CancelProtection = .unblocked,
     /// The cancelable wait this task is blocked in, if any.
     blocked_in: ?*Wait = null,
+    /// The wait this task is blocked in, cancelable or not, if any: for describing where the
+    /// coroutine waits (the stack trace query). Set and cleared around each block, with no
+    /// allocation.
+    waiting_on: ?*const Wait = null,
     group: ?*GroupState = null,
     group_next: ?*Task = null,
     /// Allocation backing this Task, its context, and its result.
@@ -258,6 +264,26 @@ pub const Wait = struct {
     futex_ptr: ?*const u32 = null,
     next: ?*Wait = null,
     prev: ?*Wait = null,
+    reason: Reason,
+
+    /// What a wait waits on, as text: `what` ("a timer", "activity"), then `name` quoted
+    /// when set (an activity type, escaped with `call_sites.text`), then `seq` when set (an activity's, when its name isn't
+    /// known), then `duration` in parentheses when set (a timer's). The strings are borrowed
+    /// and must outlive the wait; they are static, belong to the run, or are on the waiting
+    /// coroutine's stack.
+    pub const Reason = struct {
+        what: []const u8,
+        name: []const u8 = "",
+        seq: ?u32 = null,
+        duration: ?Io.Duration = null,
+
+        pub fn format(r: Reason, writer: *Io.Writer) Io.Writer.Error!void {
+            try writer.writeAll(r.what);
+            if (r.name.len > 0) try writer.print(" \"{f}\"", .{call_sites.text(r.name)});
+            if (r.seq) |seq| try writer.print(" (seq {d})", .{seq});
+            if (r.duration) |d| try writer.print(" ({f})", .{d});
+        }
+    };
 };
 
 const GroupState = struct {
@@ -451,13 +477,16 @@ fn block(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void {
             t.blocked_in = wait;
         };
         w.settleOwedWake();
+        const current = w.currentTask();
+        if (current) |t| t.waiting_on = wait;
         w.scheduler.block();
+        if (current) |t| t.waiting_on = null;
         if (task) |t| t.blocked_in = null;
     }
 }
 
-fn newWait(w: *WorkflowIo) Wait {
-    return .{ .fiber = w.scheduler.currentFiber() orelse
+fn newWait(w: *WorkflowIo, reason: Wait.Reason) Wait {
+    return .{ .reason = reason, .fiber = w.scheduler.currentFiber() orelse
         @panic("a workflow Io operation that blocks was called outside a workflow coroutine") };
 }
 
@@ -555,14 +584,14 @@ fn concurrent(
 /// cancellation is re-armed for its next cancelable wait.
 fn awaitTask(w: *WorkflowIo, task: *Task, result: []u8, pass_cancel: bool) void {
     if (!task.done) {
-        var wait = w.newWait();
+        var wait = w.newWait(.{ .what = "the result of a coroutine started with io.async or io.concurrent (Future.await or Future.cancel)" });
         task.awaiter = &wait;
         if (w.block(&wait, pass_cancel)) |_| {} else |_| {
             const was_running = !task.done;
             w.requestCancel(task);
             // The cancel that ended the block woke `wait`; wait on a fresh one.
             while (!task.done) {
-                wait = w.newWait();
+                wait = w.newWait(.{ .what = "the result of a coroutine started with io.async or io.concurrent (Future.await or Future.cancel)" });
                 w.block(&wait, false) catch unreachable;
             }
             if (!was_running or task.cancel_requested) {
@@ -649,7 +678,7 @@ fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Can
     const g: *GroupState = @ptrCast(@alignCast(token));
     if (g.pending > 0) {
         if (w.refuse("Group.await")) return error.Canceled;
-        var wait = w.newWait();
+        var wait = w.newWait(.{ .what = "the coroutines of a std.Io.Group (Group.await)" });
         g.awaiter = &wait;
         defer g.awaiter = null;
         w.block(&wait, true) catch |err| {
@@ -658,7 +687,7 @@ fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Can
             var it = g.head;
             while (it) |t| : (it = t.group_next) w.requestCancel(t);
             while (g.pending > 0) {
-                wait = w.newWait();
+                wait = w.newWait(.{ .what = "the coroutines of a std.Io.Group (Group.await)" });
                 w.block(&wait, false) catch unreachable;
             }
             w.finishGroup(group, g);
@@ -674,7 +703,7 @@ fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void 
     var it = g.head;
     while (it) |t| : (it = t.group_next) w.requestCancel(t);
     if (g.pending > 0) {
-        var wait = w.newWait();
+        var wait = w.newWait(.{ .what = "the coroutines of a std.Io.Group (Group.cancel)" });
         g.awaiter = &wait;
         defer g.awaiter = null;
         w.block(&wait, false) catch unreachable;
@@ -722,7 +751,10 @@ fn futexWaitInner(w: *WorkflowIo, ptr: *const u32, expected: u32, timeout: Io.Ti
     // Before this coroutine's own wait is queued, where a wake on the same address (a relock
     // of the same Mutex, a Condition at the same stack address) would land on it.
     w.settleOwedWake();
-    var wait = w.newWait();
+    var wait = w.newWait(.{
+        .what = if (duration == null) "a std.Io Mutex, Condition, Event, Semaphore or Queue" else "a std.Io Mutex, Condition, Event, Semaphore or Queue, with a timeout",
+        .duration = duration,
+    });
     wait.futex_ptr = ptr;
     w.futexEnqueue(&wait);
     defer w.futexRemove(&wait);
@@ -815,12 +847,12 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     } else if (w.currentReadOnly() != null) return;
     const duration = d orelse {
         // Sleeping forever: wait for cancellation.
-        var wait = w.newWait();
+        var wait = w.newWait(.{ .what = "a sleep with no timeout, until canceled" });
         return w.block(&wait, true);
     };
     try checkCancel(userdata);
     if (duration.nanoseconds <= 0) return;
-    var wait = w.newWait();
+    var wait = w.newWait(.{ .what = "a timer", .duration = duration });
     var timer: Timer = .{ .wait = &wait };
     w.host.vtable.startTimer(w.host.ctx, &timer, duration);
     w.block(&wait, true) catch |err| {

@@ -694,3 +694,34 @@ test "workflows: a failure policy lists errors that fail the workflow task" {
     defer run.deinit();
     try testing.expectEqualStrings("shipped by courier for 12", try env.getResult(ShipOrder, &run, arena.allocator(), null));
 }
+
+// example: workflow-stack-trace
+fn reminder(ctx: *workflow.Context, minutes: i64) ![]const u8 {
+    try ctx.io().sleep(.fromSeconds(minutes * 60), .awake);
+    return "reminded";
+}
+pub const Reminder = workflow.Def("reminder", reminder);
+
+// From any client: the worker answers for every workflow, with no handler to register.
+fn whereIsIt(client: *temporal.client.Client, arena: std.mem.Allocator, workflow_id: []const u8) ![]const u8 {
+    return client.queryWorkflow(workflow.StackTraceQuery, arena, workflow_id, "", .{});
+}
+// end-example
+
+test "workflows: the worker answers the stack trace query for every workflow" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Reminder);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(Reminder, .{}, .{60});
+    defer run.deinit();
+    // The workflow's first task may not have run yet; ask until it waits.
+    const answer = for (0..200) |_| {
+        const text = try whereIsIt(&env.client, a, run.id);
+        if (std.mem.find(u8, text, "waits on") != null) break text;
+    } else return error.TestNeverWaited;
+    try testing.expect(std.mem.startsWith(u8, answer, "workflow \"reminder\": 1 coroutine\n\ncoroutine 1 \"workflow\", the workflow function, waits on a timer (1h)\n  at "));
+}

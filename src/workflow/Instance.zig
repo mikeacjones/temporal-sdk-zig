@@ -38,6 +38,7 @@ const metrics_mod = @import("../metrics.zig");
 const deployment = @import("../deployment.zig");
 const Scheduler = @import("Scheduler.zig");
 const WorkflowIo = @import("WorkflowIo.zig");
+const call_sites = @import("call_sites.zig");
 const Allocator = std.mem.Allocator;
 
 const act_pb = proto.coresdk.workflow_activation;
@@ -87,6 +88,9 @@ logger: log.Logger = .{},
 /// silent while replaying, freed by `destroy`.
 metrics: metrics_mod.Handler = .noop,
 now_ns: i96 = 0,
+/// How many activations `activate` has begun, for telling whether memory a call borrowed for
+/// the activation it was made in is still valid (see `ActivityState.activity_type`).
+activations: u64 = 0,
 replaying: bool = false,
 /// Commands produced during the current activation.
 commands: std.ArrayList(cmd_pb.WorkflowCommand) = .empty,
@@ -269,6 +273,8 @@ const Signal = struct { name: []const u8, args: []const converter.Payload, heade
 /// `createSignalChannel`.
 pub const SignalChannel = struct {
     inst: *Instance,
+    /// The signal name, which outlives the run (see `setSignalHandler`).
+    name: []const u8 = "",
     /// Unread signals are `items[head..]`, oldest first.
     items: std.ArrayList(Item) = .empty,
     head: usize = 0,
@@ -301,7 +307,7 @@ pub const SignalChannel = struct {
         while (true) {
             if (ch.inst.wio.refuse("SignalChannel.receive")) return error.Canceled;
             if (ch.take()) |args| return args;
-            var waiter: Waiter = .{ .wait = ch.inst.wio.newWaitPoint(), .next = ch.waiters };
+            var waiter: Waiter = .{ .wait = ch.inst.wio.newWaitPoint(.{ .what = "signal channel", .name = ch.name }), .next = ch.waiters };
             ch.waiters = &waiter;
             defer ch.removeWaiter(&waiter);
             try ch.inst.wio.waitFor(&waiter.wait, true);
@@ -414,6 +420,13 @@ pub const ActivityState = struct {
     outcome: ?Outcome = null,
     cancel_requested: bool = false,
     cancellation_type: CancellationType = .try_cancel,
+    /// Borrowed from the caller of `executeActivity`, and valid only during activation
+    /// `scheduled_in`: the ScheduleActivity command borrows it as long, and nothing more is
+    /// promised. Read only then (by `awaitActivity`), and never copied into the run's memory,
+    /// so recording waits allocates nothing. Empty for an activity an interceptor refused.
+    activity_type: []const u8 = "",
+    /// The `Instance.activations` count when the activity was scheduled.
+    scheduled_in: u64 = 0,
     /// Set for a local activity; null for a remote one.
     local: ?*Local = null,
 
@@ -717,6 +730,7 @@ fn emit(inst: *Instance, command: cmd_pb.WorkflowCommand) error{OutOfMemory}!voi
 /// query-only activation just answers: coroutines don't run, so it emits no other command and
 /// leaves workflow time and state as they were.
 pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: Allocator) !done_pb.WorkflowActivationCompletion {
+    inst.activations += 1;
     const query_only = act.jobs.items.len > 0 and for (act.jobs.items) |job| {
         const v = job.variant orelse break false;
         if (v != .query_workflow) break false;
@@ -962,6 +976,83 @@ fn readOnlyFailure(a: Allocator, what: []const u8, name: []const u8, call: []con
     });
 }
 
+// ---------------------------------------------------------------- stack trace query
+
+/// The query type Temporal's UI and CLI send to show where a running workflow waits. The
+/// worker answers it for every workflow with `stackTrace`, unless the workflow registered a
+/// handler of its own for it.
+pub const stack_trace_query = "__stack_trace";
+
+/// The answer to the `__stack_trace` query: a line naming the workflow and how many
+/// coroutines it has, then an entry per live coroutine in the order they started, each a
+/// line saying which coroutine it is and what it waits on, followed by its call sites in
+/// workflow code (see `call_sites`). Once the workflow has closed, the answer says so in one
+/// line instead. Memory comes from `out`.
+///
+/// Read-only: it reads the coroutines' recorded waits and unwinds their stacks, and changes
+/// nothing, so a replayed run answers as the run that first got there did. Recording costs
+/// each wait a few stores (`WorkflowIo.Wait.Reason` and `Task.waiting_on`), and an activity's
+/// wait a copy of up to `max_wait_name` bytes of its type to the waiting coroutine's stack; it
+/// allocates nothing, so a long run grows no more for it. Stacks are unwound and debug info is read only when the query arrives.
+fn stackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}![]const u8 {
+    var text: std.Io.Writer.Allocating = .init(out);
+    errdefer text.deinit();
+    inst.writeStackTrace(out, &text.writer) catch |err| switch (err) {
+        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+    };
+    return text.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{OutOfMemory} || std.Io.Writer.Error)!void {
+    if (inst.finished) {
+        const how = switch (inst.root_outcome orelse return w.print("workflow \"{f}\" has closed: no coroutine is waiting\n", .{call_sites.text(inst.info.workflow_type)})) {
+            .completed => "completed",
+            .continued_as_new => "continued as new",
+            .failed => |err| if (err == error.Canceled) "been canceled" else "failed",
+        };
+        return w.print("workflow \"{f}\" has {s} and closed: no coroutine is waiting\n", .{ call_sites.text(inst.info.workflow_type), how });
+    }
+    var count: usize = 0;
+    var it = inst.sched.firstLive();
+    while (it) |f| : (it = f.live_next) count += 1;
+    try w.print("workflow \"{f}\": {d} coroutine{s}\n", .{ call_sites.text(inst.info.workflow_type), count, if (count == 1) "" else "s" });
+
+    // Reading debug info the first time can take a while; it isn't workflow code.
+    var reader = try call_sites.Reader.init(out);
+    defer if (reader) |*r| r.deinit();
+    inst.sched.noteProgress();
+    it = inst.sched.firstLive();
+    while (it) |f| : (it = f.live_next) {
+        try w.print("\ncoroutine {d} \"{f}\", ", .{ f.id, call_sites.text(f.name) });
+        try inst.writeCoroutineRole(w, f);
+        const task: ?*const WorkflowIo.Task = @ptrCast(@alignCast(f.user));
+        const wait = if (task) |t| t.waiting_on else null;
+        if (f.state != .blocked) {
+            try w.writeAll(", is ready to run\n");
+        } else if (wait) |wt| {
+            try w.print(", waits on {f}\n", .{wt.reason});
+        } else {
+            try w.writeAll(", waits\n");
+        }
+        try call_sites.write(if (reader) |*r| r else null, &inst.sched, w, f, "  ");
+    }
+}
+
+/// Which part of the workflow coroutine `f` runs.
+fn writeCoroutineRole(inst: *const Instance, w: *std.Io.Writer, f: *const Scheduler.Fiber) std.Io.Writer.Error!void {
+    if (inst.root) |root| if (root.fiber == f) return w.writeAll("the workflow function");
+    for (inst.handlers.items) |run| if (run.task.fiber == f) return switch (run.kind) {
+        .signal => w.print("signal handler \"{f}\"", .{call_sites.text(run.name)}),
+        .update => |u| w.print("update handler \"{f}\" (update ID {f})", .{ call_sites.text(run.name), call_sites.text(u.update.id) }),
+    };
+    const task: *const WorkflowIo.Task = @ptrCast(@alignCast(f.user orelse return w.writeAll("a coroutine")));
+    return w.writeAll(switch (task.kind) {
+        .future => "started with io.async or io.concurrent",
+        .group => "started in a std.Io.Group",
+        .detached => "a coroutine",
+    });
+}
+
 // ---------------------------------------------------------------- signals
 
 /// Registers `handler` for signals called `name`, replacing any handler registered under it,
@@ -1011,7 +1102,7 @@ pub fn setDynamicSignalHandler(inst: *Instance, handler: SignalHandler, context_
 /// decoded arguments to the channel; buffered signals of that name start theirs here.
 /// `ch` is arena memory the caller allocated.
 pub fn createSignalChannel(inst: *Instance, name: []const u8, ch: *SignalChannel, decode: *const fn (out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque) error{OutOfMemory}!void {
-    ch.* = .{ .inst = inst };
+    ch.* = .{ .inst = inst, .name = name };
     if (inst.wio.refuse("signalChannel")) return;
     try inst.signal_channels.append(inst.arena(), ch);
     inst.setSignalHandler(name, .{ .context = ch, .decode = decode, .call = SignalChannel.handlerCall }, null) catch |err| switch (err) {
@@ -1420,7 +1511,10 @@ pub fn awaitCondition(inst: *Instance, check: *const fn (context: *const anyopaq
     const timed = if (timeout) |d| d.nanoseconds > 0 else false;
     if (timeout != null and !timed) return false;
     if (inst.wio.refuse(if (timeout == null) "await" else "awaitTimeout")) return error.Canceled;
-    var wait = inst.wio.newWaitPoint();
+    var wait = inst.wio.newWaitPoint(if (timed)
+        .{ .what = "a condition, with a timeout (Context.awaitTimeout)", .duration = timeout.? }
+    else
+        .{ .what = "a condition (Context.await)" });
     var cond: Condition = .{ .check = check, .context = context, .wait = &wait };
     try inst.conditions.append(inst.arena(), &cond);
     defer if (!cond.met) inst.removeCondition(&cond);
@@ -1961,10 +2055,10 @@ pub const ScheduleError = error{ OutOfMemory, InvalidOptions };
 pub const ActivityScheduleError = ScheduleError || error{SessionFailed};
 
 /// Creates the state of a new activity, local or remote: both share one sequence space.
-fn newActivity(inst: *Instance, cancellation_type: ActivityState.CancellationType) !*ActivityState {
+fn newActivity(inst: *Instance, activity_type: []const u8, cancellation_type: ActivityState.CancellationType) !*ActivityState {
     const a = inst.arena();
     const state = try a.create(ActivityState);
-    state.* = .{ .seq = inst.next_activity_seq, .cancellation_type = cancellation_type };
+    state.* = .{ .seq = inst.next_activity_seq, .cancellation_type = cancellation_type, .activity_type = activity_type, .scheduled_in = inst.activations };
     try inst.activities.put(a, state.seq, state);
     inst.next_activity_seq += 1;
     return state;
@@ -1972,7 +2066,7 @@ fn newActivity(inst: *Instance, cancellation_type: ActivityState.CancellationTyp
 
 fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflow.ActivityOptions, args: []const converter.Payload, header: converter.Header) ScheduleError!*ActivityState {
     const a = inst.arena();
-    const state = try inst.newActivity(options.cancellation_type);
+    const state = try inst.newActivity(activity_type, options.cancellation_type);
     const seq = state.seq;
 
     var cmd: cmd_pb.ScheduleActivity = .{
@@ -2019,7 +2113,7 @@ fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: wo
         return error.InvalidOptions;
     }
     const a = inst.arena();
-    const state = try inst.newActivity(options.cancellation_type);
+    const state = try inst.newActivity(activity_type, options.cancellation_type);
     const local = try a.create(ActivityState.Local);
     local.* = .{
         .cmd = .{
@@ -2115,6 +2209,24 @@ fn protoRetryPolicy(a: Allocator, rp: workflow.RetryPolicy) !common.RetryPolicy 
     return p;
 }
 
+/// The longest activity type name a wait records; longer ones end in "...".
+const max_wait_name = 64;
+
+/// `name`, or as much of it as fits in `buf` with "..." after it, cut before a UTF-8 lead
+/// byte so no character is split. The answer escapes what's left anyway
+/// (`call_sites.text`); the cut keeps a valid name readable.
+fn truncatedName(buf: *[max_wait_name]u8, name: []const u8) []const u8 {
+    if (name.len <= buf.len) {
+        @memcpy(buf[0..name.len], name);
+        return buf[0..name.len];
+    }
+    var cut: usize = buf.len - 3;
+    while (cut > 0 and name[cut] & 0xc0 == 0x80) cut -= 1;
+    @memcpy(buf[0..cut], name[0..cut]);
+    @memcpy(buf[cut..][0..3], "...");
+    return buf[0 .. cut + 3];
+}
+
 /// Blocks the calling coroutine until the activity resolves. When the coroutine is canceled
 /// while waiting, requests the activity's cancellation and returns error.Canceled: at once
 /// for `try_cancel` and `abandon`, and for `wait_cancellation_completed` once the core
@@ -2125,14 +2237,26 @@ fn protoRetryPolicy(a: Allocator, rp: workflow.RetryPolicy) !common.RetryPolicy 
 pub fn awaitActivity(inst: *Instance, state: *ActivityState) error{Canceled}!void {
     if (state.outcome != null) return;
     if (inst.wio.refuse("ActivityFuture.get")) return error.Canceled;
-    var wait = inst.wio.newWaitPoint();
+    // The type name is copied to this coroutine's stack while it is still valid (the wait
+    // began in the activation that scheduled the activity); later, only the seq is known.
+    var name_buf: [max_wait_name]u8 = undefined;
+    const known = state.scheduled_in == inst.activations;
+    const name = if (known) truncatedName(&name_buf, state.activity_type) else "";
+    const seq: ?u32 = if (known) null else state.seq;
+    const reason: WorkflowIo.Wait.Reason = if (state.local == null)
+        .{ .what = "activity", .name = name, .seq = seq }
+    else if (state.activity_type.ptr == side_effect_activity_type.ptr)
+        .{ .what = "a side effect (Context.sideEffect)" }
+    else
+        .{ .what = "local activity", .name = name, .seq = seq };
+    var wait = inst.wio.newWaitPoint(reason);
     state.waiter = &wait;
     defer state.waiter = null;
     var canceled = false;
     while (state.outcome == null) {
         if (inst.evicting) return error.Canceled;
         // A cancel also wakes the wait point, so each block starts from a fresh one.
-        wait = inst.wio.newWaitPoint();
+        wait = inst.wio.newWaitPoint(reason);
         inst.wio.waitFor(&wait, !canceled) catch |err| {
             inst.cancelActivity(state);
             if (state.cancellation_type != .wait_cancellation_completed) return err;
@@ -2290,7 +2414,11 @@ pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) 
         .started => "ChildWorkflowFuture.started",
         .result => "ChildWorkflowFuture.get",
     })) return error.Canceled;
-    var wait = inst.wio.newWaitPoint();
+    const reason: WorkflowIo.Wait.Reason = .{ .what = switch (phase) {
+        .started => "the start of child workflow",
+        .result => "child workflow",
+    }, .name = state.workflow_type };
+    var wait = inst.wio.newWaitPoint(reason);
     const waiter = switch (phase) {
         .started => &state.start_waiter,
         .result => &state.result_waiter,
@@ -2300,7 +2428,7 @@ pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) 
     var canceled = false;
     while (!state.reached(phase)) {
         if (inst.evicting) return error.Canceled;
-        wait = inst.wio.newWaitPoint();
+        wait = inst.wio.newWaitPoint(reason);
         inst.wio.waitFor(&wait, !canceled) catch |err| {
             inst.cancelChild(state);
             switch (state.cancellation_type) {
@@ -2496,7 +2624,11 @@ pub fn awaitNexusOperation(inst: *Instance, state: *NexusOperationState, phase: 
         .started => "NexusOperationFuture.started",
         .result => "NexusOperationFuture.get",
     })) return error.Canceled;
-    var wait = inst.wio.newWaitPoint();
+    const reason: WorkflowIo.Wait.Reason = .{ .what = switch (phase) {
+        .started => "the start of Nexus operation",
+        .result => "Nexus operation",
+    }, .name = state.operation };
+    var wait = inst.wio.newWaitPoint(reason);
     const waiter = switch (phase) {
         .started => &state.start_waiter,
         .result => &state.result_waiter,
@@ -2506,7 +2638,7 @@ pub fn awaitNexusOperation(inst: *Instance, state: *NexusOperationState, phase: 
     var canceled = false;
     while (!state.reached(phase)) {
         if (inst.evicting) return error.Canceled;
-        wait = inst.wio.newWaitPoint();
+        wait = inst.wio.newWaitPoint(reason);
         inst.wio.waitFor(&wait, !canceled) catch {
             inst.cancelNexusOperation(state);
             canceled = true;
@@ -2662,12 +2794,16 @@ pub fn awaitExternal(inst: *Instance, state: *ExternalState) error{Canceled}!voi
         .signal => "SignalExternalFuture.get",
         .cancel => "CancelExternalFuture.get",
     })) return error.Canceled;
-    var wait = inst.wio.newWaitPoint();
+    const reason: WorkflowIo.Wait.Reason = .{ .what = switch (state.kind) {
+        .signal => "a signal to external workflow",
+        .cancel => "a cancellation request to external workflow",
+    }, .name = state.workflow_id };
+    var wait = inst.wio.newWaitPoint(reason);
     state.waiter = &wait;
     defer state.waiter = null;
     while (state.outcome == null) {
         if (inst.evicting) return error.Canceled;
-        wait = inst.wio.newWaitPoint();
+        wait = inst.wio.newWaitPoint(reason);
         inst.wio.waitFor(&wait, true) catch |err| {
             inst.cancelExternal(state);
             return err;
@@ -2772,6 +2908,7 @@ fn rootHandleSignal(ptr: *anyopaque, input: interceptor.HandleSignalInput, _: in
 fn rootHandleQuery(ptr: *anyopaque, input: interceptor.HandleQueryInput, _: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
     if (inst.queries.get(input.query_type)) |handler| return handler.call(handler.context, input.arena, input.args.payloads);
+    if (std.mem.eql(u8, input.query_type, stack_trace_query)) return converter.toPayload(input.arena, try inst.stackTrace(input.arena));
     if (reservedQuery(input.query_type)) return error.QueryNotRegistered;
     const dynamic = inst.dynamic_query_handler orelse return error.QueryNotRegistered;
     return dynamic.call(dynamic.context, input.arena, input.query_type, input.args.payloads);
@@ -6063,7 +6200,8 @@ test "query: an unknown query type fails naming the registered types; a failing 
     const unknown = answer(c, 0).variant.?.failed;
     try testing.expectEqualStrings("query type \"nope\" is not registered on workflow \"Queries\"; registered query types: [status, add, fails]", unknown.message);
     try testing.expectEqualStrings("QueryNotRegistered", failure_mod.applicationType(unknown).?);
-    try testing.expect(answer(c, 1).variant.? == .failed);
+    // The worker answers the stack trace query itself (src/workflow/stack_trace_test.zig).
+    try testing.expect(answer(c, 1).variant.? == .succeeded);
     const failed = answer(c, 2).variant.?.failed;
     try testing.expectEqualStrings("NotReady", failed.message);
     try testing.expectEqualStrings("NotReady", failure_mod.applicationType(failed).?);
@@ -7102,13 +7240,16 @@ test "query: read-only code keeps the run's state as replay sees it" {
     // An unsupported version fails the query, not the workflow task.
     try testing.expectEqualStrings("UnsupportedVersion", answer(try readOnlyQuery(a, inst, "version"), 0).variant.?.failed.message);
 
-    // Reserved query types don't go to the dynamic handler.
+    // Reserved query types don't go to the dynamic handler: the worker answers the stack
+    // trace query itself, here for a workflow function the refused set woke, which hasn't
+    // run since.
     const c = try inst.activate(&try queryActivation(a, &.{
         .{ "q1", "__stack_trace", &.{} },
         .{ "q2", "__temporal_workflow_metadata", &.{} },
         .{ "q3", "custom", &.{} },
     }), a);
-    try testing.expectEqualStrings("QueryNotRegistered", failure_mod.applicationType(answer(c, 0).variant.?.failed).?);
+    const trace = try converter.fromPayload([]const u8, a, answer(c, 0).variant.?.succeeded.response.?);
+    try testing.expect(std.mem.startsWith(u8, trace, "workflow \"ReadOnlyState\": 1 coroutine\n\ncoroutine 1 \"workflow\", the workflow function, is ready to run\n"));
     try testing.expectEqualStrings("QueryNotRegistered", failure_mod.applicationType(answer(c, 1).variant.?.failed).?);
     try testing.expectEqualStrings("\"custom\"", answer(c, 2).variant.?.succeeded.response.?.data);
 

@@ -428,3 +428,59 @@ test "WorkflowReplayer replays a child canceled under wait_cancellation_requeste
         try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(child_cancel_requested_history));
     }
 }
+
+const StackTraceQuery = workflow.StackTraceQuery;
+const ReleaseBlocked = workflow.SignalDef("release", fn () void);
+
+/// Waits until `release` is signaled, with a coroutine sleeping for an hour beside it.
+const BlockedWorkflow = workflow.Def("stack_trace_blocked", struct {
+    fn release(released: *bool) void {
+        released.* = true;
+    }
+    fn isReleased(released: *bool) bool {
+        return released.*;
+    }
+    fn nap(ctx: *workflow.Context) void {
+        ctx.sleep(.fromSeconds(3600), .{}) catch {};
+    }
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const released = try ctx.allocator().create(bool);
+        released.* = false;
+        try ctx.setSignalHandler(ReleaseBlocked, released, release);
+        var napping = ctx.io().async(nap, .{ctx});
+        defer napping.cancel(ctx.io());
+        try ctx.await(released, isReleased);
+        return "released";
+    }
+}.run);
+
+test "workflow: the worker answers __stack_trace with no handler, and the run's history replays" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(BlockedWorkflow);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(BlockedWorkflow, .{}, .{});
+    defer run.deinit();
+
+    // The first answer can come before the workflow's first task has run its coroutines;
+    // ask until both coroutines wait.
+    const answer = for (0..200) |_| {
+        const text = try env.queryWorkflow(StackTraceQuery, a, run.id, .{});
+        if (std.mem.find(u8, text, "2 coroutines") != null) break text;
+    } else return error.TestNeverWaited;
+    try testing.expect(std.mem.find(u8, answer, "the workflow function, waits on a condition (Context.await)") != null);
+    try testing.expect(std.mem.find(u8, answer, "started with io.async or io.concurrent, waits on a timer (1h)") != null);
+
+    try env.signalWorkflow(ReleaseBlocked, run.id, .{});
+    try testing.expectEqualStrings("released", try env.getResult(BlockedWorkflow, &run, a, null));
+    try testing.expect(std.mem.find(u8, try env.queryWorkflow(StackTraceQuery, a, run.id, .{}), "has completed and closed") != null);
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var replayer: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(BlockedWorkflow);
+    try replayer.replayHistory(history);
+}

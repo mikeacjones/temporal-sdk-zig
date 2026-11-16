@@ -45,6 +45,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Dynamic workflows](#dynamic-workflows)
     - [Workflow info](#workflow-info)
     - [Failure policy](#failure-policy)
+    - [Stack trace query](#stack-trace-query)
     - [Stack trace and metadata queries](#stack-trace-and-metadata-queries)
   - [Activities](#activities)
     - [Definition](#definition-1)
@@ -803,7 +804,7 @@ Notes:
 - An error from the handler, or an argument that doesn't decode, fails the query with the error's name. Registering again replaces the dynamic handler; its context must outlive the run, and one on the calling coroutine's stack returns `error.QueryContextOnStack`.
 - Query handlers and update validators must not change workflow state: history doesn't record queries or rejected updates, so a change would make the run differ from its replay. A call from one that would start an activity, timer, child workflow or any other command (`executeActivity`, `sleep`, `executeChildWorkflow`, `signalExternalWorkflow`, `upsertMemo`, `completeSession`, ...), register or remove a handler (`setSignalHandler`, `signalChannel`, `setUpdateHandler`, ...), take a signal from a channel (`receive`, `tryReceive`), change the run's settings (`setVersioningBehavior`), start a coroutine (`io.concurrent`), or block (`ctx.await`, a pending future's `get`) is refused: it returns `error.InvalidOptions` or `error.Canceled` (or does nothing, where it can't fail), the query fails or the update is rejected with a `ReadOnlyViolation` failure whose message names the call, whatever the handler returns, no command is sent, and the workflow task doesn't fail. A zero `sleep` returns at once, `io.async` runs its function inline, and `io.random` draws without moving the workflow's random sequence. `ctx.fail` and `ctx.failWith` describe the query's failure or the update's rejection, not the workflow's.
 - `setCoroutineName` does nothing in a query handler or a validator run on delivery, which run outside any coroutine, so the query or update goes on. It is refused like the calls above in a validator that runs in a coroutine, which happens when the workflow function or a handler registers the handler of an update that is waiting for one: it would otherwise rename that coroutine.
-- Query types Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, and those starting with `__temporal`) don't go to the dynamic handler.
+- Query types Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, and those starting with `__temporal`) don't go to the dynamic handler. The worker answers `__stack_trace` itself (see [Stack trace query](#stack-trace-query)); the others fail with `QueryNotRegistered`.
 - In a query handler, `ctx.allocator()` is the query's memory, freed once the answer is sent, so decoding arguments there doesn't grow the run.
 - Waits that can't fail can't be refused: an uncancelable wait that would block (such as `std.Io.Mutex.lockUncancelable` on a mutex the workflow holds), or awaiting or canceling a pending `std.Io.Future`, panics the worker in a query handler or a validator run on delivery. A validator run in a handler's coroutine (when the handler registers the update's handler) blocks only that coroutine, and its update is rejected with `ReadOnlyViolation` once the wait ends. Don't wait in them.
 - A handler or validator that wakes a workflow coroutine through `std.Io` (`Event.set`, `Condition.signal`, `Queue.put`, `Mutex.unlock` on something a coroutine waits for) also fails the query or has the update rejected with `ReadOnlyViolation`. The wake itself still happens, since `std.Io` has already changed the primitive: the woken coroutine runs in the next workflow task that runs workflow code.
@@ -1144,10 +1145,53 @@ Notes:
 - `@panic` in workflow code, and in Debug and ReleaseSafe builds safety-checked illegal behavior such as integer overflow or an out-of-bounds index, ends the worker process: Zig has no way to recover from a panic. The workflow task that was running gets no completion, so the server retries it once its workflow task timeout passes, on whichever worker polls the task queue then (the restarted one, or another). Every run cached on the process is replayed from history by its next task. Code that panics on every attempt ends every worker that takes its task, so return an error instead, and list it if it should fail the task.
 - `testing.WorkflowReplayer.Options.workflow_task_failure_errors` replays with the worker's list. Replay doesn't re-run a task that failed: a history in which a listed error failed a task replays with code that no longer returns it, and code that still does fails replay with `error.ReplayFailed`.
 
+#### Stack trace query
+
+Temporal's UI and CLI send a running workflow the `__stack_trace` query to show where it waits. A worker answers it for every workflow it runs, function, struct, and dynamic, with no handler to register. The answer is text: a line naming the workflow and how many coroutines it has, then one entry per live coroutine of the run, in the order they started: the workflow function, each running signal and update handler, and each coroutine the workflow started with `io.async`, `io.concurrent`, or a `std.Io.Group`. Each entry says what the coroutine waits on (an activity, a timer, a child workflow, a condition, a signal channel, a `std.Io` primitive, ...) and where, as the call sites in workflow code, innermost first. `workflow.StackTraceQuery` sends it from a client:
+
+<!-- example: workflow-stack-trace -->
+```zig
+fn reminder(ctx: *workflow.Context, minutes: i64) ![]const u8 {
+    try ctx.io().sleep(.fromSeconds(minutes * 60), .awake);
+    return "reminded";
+}
+pub const Reminder = workflow.Def("reminder", reminder);
+
+// From any client: the worker answers for every workflow, with no handler to register.
+fn whereIsIt(client: *temporal.client.Client, arena: std.mem.Allocator, workflow_id: []const u8) ![]const u8 {
+    return client.queryWorkflow(workflow.StackTraceQuery, arena, workflow_id, "", .{});
+}
+```
+
+A workflow waiting on an activity, with a coroutine it started on a timer and an update handler waiting on a condition, answers like this in a Debug build:
+
+```text
+workflow "order": 3 coroutines
+
+coroutine 1 "workflow", the workflow function, waits on activity "charge"
+  at /src/order.zig:41:83 in run
+
+coroutine 2 "async", started with io.async or io.concurrent, waits on a timer (1m)
+  at /src/order.zig:27:18 in remind
+
+coroutine 3 "update", update handler "approve" (update ID 7f3e), waits on a condition (Context.await)
+  at /src/order.zig:19:24 in approve
+```
+
+Notes:
+- A call site is a frame in workflow code: frames in the SDK's own source files and in the standard library are left out. Locations come from the executable's debug info. Where there is none (a stripped build, or a target the worker can't unwind a stack on), or where optimization inlined every workflow frame into SDK or standard library code, the entry says `at an unknown location: ...` instead; what the coroutine waits on is always given. In ReleaseSafe and ReleaseFast builds on Linux, debug info records inlined calls and the entry lists them; on macOS it doesn't, so an inlined workflow call site is left out and the entry starts at the nearest caller that wasn't inlined, or says `unknown location` when none is left.
+- Answering is read-only: it emits no command and changes no workflow state, so it works at any point of a run, and a run restored from history (after eviction, or on another worker) answers as the run that first got there did.
+- Once the workflow has closed by returning (completed, failed, canceled, or continued as new), the answer is one line saying how: `workflow "order" has completed and closed: no coroutine is waiting`. A workflow closed from outside its code (terminated, or timed out) answers with the coroutines that were waiting when it closed.
+- An activity's type is named when the wait began in the workflow task that scheduled it, and cut to 64 bytes; a future awaited in a later task names the activity by its sequence number instead (`waits on activity (seq 2)`), since the type name the workflow passed is only borrowed for the task that scheduled it. An entry lists at most 16 call sites, innermost first, and says so when it leaves deeper ones out.
+- A handler the workflow registers for `__stack_trace` with `ctx.setQueryHandler` (or in a struct workflow's `queries`) answers instead of the worker. A dynamic query handler never gets `__stack_trace`.
+- When no query comes, the cost is a few stores at each wait, recording what it waits on, plus copying up to 64 bytes of an activity's type name to the waiting coroutine's stack; nothing is allocated, so a long run grows no more than it would without the query. Stacks are unwound and debug info is read only to answer, on the worker's thread; the first answer in a process reads the executable's debug info from disk.
+- Paths are those of the build machine, as in failure stack traces.
+- The answer is always valid UTF-8, so clients receive it as a JSON string. Names in it (workflow and activity types, coroutine names, update IDs, paths) are written as they are when they are valid UTF-8, with bytes that aren't replaced by U+FFFD and control characters, `"` and `\` escaped as in Zig string literals (`\n`, `\"`), so a name can't add lines or entries of its own. A cut activity type is cut between characters.
+
 #### Stack trace and metadata queries
 <!-- stub: temporal-sdk-zig-d51.6.9 -->
 Not implemented yet.
-The built-in `__stack_trace`, `__enhanced_stack_trace`, and `__temporal_workflow_metadata` queries will report where each coroutine is blocked and which handlers are registered.
+The built-in `__enhanced_stack_trace` and `__temporal_workflow_metadata` queries will report each coroutine's location with the source around it, and which handlers are registered with their descriptions. The plain `__stack_trace` query is answered already: see [Stack trace query](#stack-trace-query).
 
 ### Activities
 

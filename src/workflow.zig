@@ -1288,7 +1288,8 @@ pub const Context = struct {
 
     /// Answers queries of type `Query` (a `QueryDef`) with `handler(context, args...)`, which
     /// returns `Query.Result` or an error union of it; an error fails the query with the
-    /// error's name. Registering the same query type again replaces its handler.
+    /// error's name. Registering the same query type again replaces its handler. A handler
+    /// for `__stack_trace` (`StackTraceQuery`) replaces the worker's own answer to it.
     ///
     /// Handlers run synchronously on the worker thread, outside any coroutine, possibly after
     /// the workflow function has returned. They must only read workflow state. A handler that
@@ -1338,8 +1339,10 @@ pub const Context = struct {
     /// encodes) or an error union of it; an error fails the query with the error's name.
     /// Registering again replaces the dynamic handler. A handler registered for a query type
     /// with `setQueryHandler` still answers that type. Without a dynamic handler, a query of
-    /// an unregistered type fails with `QueryNotRegistered`, and so do the query types
-    /// Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, `__temporal...`).
+    /// an unregistered type fails with `QueryNotRegistered`. The query types Temporal's tools
+    /// send never reach the dynamic handler: the worker answers `__stack_trace` itself
+    /// (`StackTraceQuery`), and `__enhanced_stack_trace` and `__temporal...` fail with
+    /// `QueryNotRegistered`.
     ///
     /// The handler is read-only and its `context` must outlive the run, as in
     /// `setQueryHandler`; a pointer into the calling coroutine's stack returns
@@ -2554,6 +2557,25 @@ pub fn DynamicDefWithOptions(comptime func: anytype, comptime options: DefOption
         pub const registered: Registered = .{ .name = "", .invoke = invoke, .task_failure_errors = options.task_failure_errors };
     };
 }
+
+/// The query Temporal's UI and CLI send to see where a running workflow waits, which a worker
+/// answers for every workflow it runs without any registration: text with an entry per live
+/// coroutine of the run (the workflow function, running signal and update handlers, and the
+/// coroutines the workflow started), saying what it waits on and its call sites in workflow
+/// code. Clients send it like any query:
+///
+///     const where = try client.queryWorkflow(temporal.workflow.StackTraceQuery, arena, id, "", .{});
+///
+/// A handler the workflow registers for `__stack_trace` with `Context.setQueryHandler`
+/// answers it instead; a dynamic query handler never gets it. README.md's "Stack trace query"
+/// section shows the answer.
+///
+/// Answering is read-only: it emits no command and changes no workflow state, so a run
+/// restored from history answers as the run that first got there did. When no query comes,
+/// the cost is a few stores at each wait, recording what it waits on (an activity's type is
+/// copied, cut to 64 bytes, to the waiting coroutine's stack), and no allocation; the
+/// coroutines' stacks are unwound and debug info is read only to answer.
+pub const StackTraceQuery = QueryDef(Instance.stack_trace_query, fn () []const u8);
 
 /// Names a query and its signature: `F` is a function type whose parameters are the query's
 /// arguments and whose return type is its result. Workflows answer it with
