@@ -602,3 +602,42 @@ test "workflows: a dynamic workflow runs unregistered types" {
     const result = try env.executeWorkflowByName([]const u8, "birthday_greeting", .{}, .{"Ann"}, arena.allocator(), null);
     try testing.expectEqualStrings("Hello, Ann! (birthday_greeting)", result);
 }
+
+// example: workflow-failure-policy
+fn carrierRate(carrier: []const u8) ?u32 {
+    if (std.mem.eql(u8, carrier, "post")) return 5;
+    if (std.mem.eql(u8, carrier, "courier")) return 12;
+    return null;
+}
+fn shipOrder(ctx: *workflow.Context, carrier: []const u8) ![]const u8 {
+    // A carrier missing from the table is a bug to fix and deploy, not a reason to fail the
+    // order: listed, the error fails the workflow task, which is retried until fixed code runs.
+    const rate = carrierRate(carrier) orelse return error.UnknownCarrier;
+    return std.fmt.allocPrint(ctx.allocator(), "shipped by {s} for {d}", .{ carrier, rate });
+}
+pub const ShipOrder = workflow.DefWithOptions("ship_order", shipOrder, .{
+    .task_failure_errors = &.{error.UnknownCarrier},
+    // Fail this workflow, not just its task, if its code stops matching its history.
+    .nondeterminism_fails_workflow = true,
+});
+
+// For every workflow of a worker.
+const strict_worker: temporal.worker.Options = .{
+    .workflow_task_failure_errors = &.{error.InvariantBroken},
+    .nondeterminism_fails_workflow = true,
+};
+// end-example
+
+test "workflows: a failure policy lists errors that fail the workflow task" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    env.worker.options.workflow_task_failure_errors = strict_worker.workflow_task_failure_errors;
+    env.worker.options.nondeterminism_fails_workflow = strict_worker.nondeterminism_fails_workflow;
+    try env.registerWorkflow(ShipOrder);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try env.startWorkflow(ShipOrder, .{}, .{"courier"});
+    defer run.deinit();
+    try testing.expectEqualStrings("shipped by courier for 12", try env.getResult(ShipOrder, &run, arena.allocator(), null));
+}

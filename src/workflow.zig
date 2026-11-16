@@ -2084,6 +2084,10 @@ pub const Registered = struct {
     name: []const u8,
     invoke: *const fn (ctx: *Context, args: []const converter.Payload) anyerror!converter.Payload,
     versioning_behavior: VersioningBehavior = .unspecified,
+    /// See `DefOptions.task_failure_errors`.
+    task_failure_errors: []const anyerror = &.{},
+    /// See `DefOptions.nondeterminism_fails_workflow`.
+    nondeterminism_fails_workflow: bool = false,
     /// Set for a struct workflow: called when each run is initialized, before its first
     /// coroutine starts and before the activation's signals and updates are delivered. It
     /// allocates the run's state in `ctx.allocator()`, registers the declared handlers, and
@@ -2108,6 +2112,29 @@ pub const VersioningBehavior = enum(i32) {
 pub const DefOptions = struct {
     /// Sent with each of the run's workflow task completions; see `VersioningBehavior`.
     versioning_behavior: VersioningBehavior = .unspecified,
+    /// Errors that fail the workflow task instead of the workflow when the workflow
+    /// function, a signal handler, or an update handler returns them, in addition to the
+    /// worker's `worker.Options.workflow_task_failure_errors`: an error either lists fails the
+    /// task. The task failure names the error; the workflow stays running, and the server
+    /// retries the task until code that no longer returns the error completes it. An update
+    /// handler's listed error doesn't reject or fail the update; the retried task runs the
+    /// handler again. Listing `error.Canceled` doesn't stop a cancellation: the workflow
+    /// function or a signal handler that returns it cancels the workflow, listed or not. An
+    /// update handler that returns a listed `error.Canceled` fails the task, where unlisted it
+    /// rejects the update. Listing `error.ContinueAsNew` doesn't stop a continue-as-new the
+    /// workflow function requested; only its misuse (returned without
+    /// `Context.continueAsNew`, or by a signal handler) then fails the task instead of the
+    /// workflow. `error.OutOfMemory` from the workflow function or a signal handler fails the
+    /// task whether listed or not; from an update handler it rejects the update unless listed.
+    ///
+    ///     pub const Charge = temporal.workflow.DefWithOptions("Charge", charge, .{ .task_failure_errors = &.{error.ConfigMissing} });
+    task_failure_errors: []const anyerror = &.{},
+    /// Fail the workflow, instead of its workflow task, when a run's code no longer matches
+    /// its history (nondeterminism). Without it, or the worker's
+    /// `worker.Options.nondeterminism_fails_workflow`, the task fails and is retried until
+    /// the code matches. Not available for a dynamic workflow, which has no type name the
+    /// worker can declare; use the worker option.
+    nondeterminism_fails_workflow: bool = false,
 };
 
 /// Names a workflow. The result is a type that clients pass to `executeWorkflow` and workers
@@ -2188,7 +2215,13 @@ pub fn DefWithOptions(comptime name: []const u8, comptime definition: anytype, c
         }
 
         pub const versioning_behavior = options.versioning_behavior;
-        pub const registered: Registered = .{ .name = name, .invoke = invoke, .versioning_behavior = options.versioning_behavior };
+        pub const registered: Registered = .{
+            .name = name,
+            .invoke = invoke,
+            .versioning_behavior = options.versioning_behavior,
+            .task_failure_errors = options.task_failure_errors,
+            .nondeterminism_fails_workflow = options.nondeterminism_fails_workflow,
+        };
     };
 }
 
@@ -2242,6 +2275,8 @@ fn StructDef(comptime name: []const u8, comptime W: type, comptime options: DefO
             .name = name,
             .invoke = invoke,
             .versioning_behavior = options.versioning_behavior,
+            .task_failure_errors = options.task_failure_errors,
+            .nondeterminism_fails_workflow = options.nondeterminism_fails_workflow,
             .init_run = initRun,
         };
     };
@@ -2417,6 +2452,20 @@ fn entryNames(comptime W: type, comptime decl: []const u8) []const [:0]const u8 
 /// chooses each run's versioning behavior with `Context.setVersioningBehavior`, or the
 /// worker's default applies.
 pub fn DynamicDef(comptime func: anytype) type {
+    return DynamicDefWithOptions(func, .{});
+}
+
+/// `DynamicDef` with options. Only `task_failure_errors` applies to a dynamic workflow;
+/// setting `versioning_behavior` (choose it with `Context.setVersioningBehavior`) or
+/// `nondeterminism_fails_workflow` (set `worker.Options.nondeterminism_fails_workflow`) is a
+/// compile error.
+///
+///     pub const AnyWorkflow = temporal.workflow.DynamicDefWithOptions(anyWorkflow, .{ .task_failure_errors = &.{error.ConfigMissing} });
+pub fn DynamicDefWithOptions(comptime func: anytype, comptime options: DefOptions) type {
+    if (options.versioning_behavior != .unspecified)
+        @compileError("DynamicDefWithOptions: a dynamic workflow has no versioning_behavior of its own; choose each run's with ctx.setVersioningBehavior");
+    if (options.nondeterminism_fails_workflow)
+        @compileError("DynamicDefWithOptions: nondeterminism_fails_workflow needs a workflow type name, which a dynamic workflow doesn't have; set worker.Options.nondeterminism_fails_workflow instead");
     const F = @TypeOf(func);
     const bad = "a dynamic workflow must be fn (*temporal.workflow.Context, temporal.converter.EncodedValues) !Result, not " ++ @typeName(F);
     const fn_info = switch (@typeInfo(F)) {
@@ -2439,7 +2488,7 @@ pub fn DynamicDef(comptime func: anytype) type {
         }
 
         /// The registration. Its name is empty: it answers to every unregistered type.
-        pub const registered: Registered = .{ .name = "", .invoke = invoke };
+        pub const registered: Registered = .{ .name = "", .invoke = invoke, .task_failure_errors = options.task_failure_errors };
     };
 }
 

@@ -100,7 +100,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Search attributes, typed and upserted | all | GA | supported | [searchattributes](samples/searchattributes) |
 | Workflow info, replay state, and the previous run's result or failure | all | GA | supported | [Workflow info](README.md#workflow-info) |
 | Dynamic workflows | all | GA | supported | [Dynamic workflows](README.md#dynamic-workflows), [dynamic-workflows](samples/dynamic-workflows) |
-| Choosing which errors fail the workflow and which fail the workflow task | Go, Java, Python, TypeScript, .NET, Ruby | GA | partial | `temporal-sdk-zig-d51.6.8`. Missing: a worker option and a per-workflow setting; today only `error.OutOfMemory` fails the task instead of the workflow, so a workflow, or a workflow inbound interceptor around it, can fail the task only by returning that. |
+| Choosing which errors fail the workflow and which fail the workflow task | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Failure policy](README.md#failure-policy) |
 | Deadlock detection | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Deadlock detection](README.md#deadlock-detection) |
 | Stack trace query | all | GA | partial | `temporal-sdk-zig-d51.6.15`. Missing: the SDK answering `__stack_trace` with where each coroutine is blocked; a workflow can register a query of that name (it isn't reserved) and answer it from its own bookkeeping. |
 | Enhanced stack trace query | TypeScript, Python | GA, deferred | partial | `temporal-sdk-zig-d51.6.9`. Missing: the SDK answering `__enhanced_stack_trace` with each coroutine's location and the source around it; a workflow can register a query of that name (it isn't reserved) and answer it from its own bookkeeping. |

@@ -145,9 +145,10 @@ pub const Options = struct {
     /// `deadlock_failure_type`, whose message names the workflow type and this limit, within
     /// about 1.25 times the limit. The worker logs one error with the workflow and run IDs,
     /// and the run is evicted, so its next workflow task replays it from history. The
-    /// workflow itself does not fail: the server retries the task, and code that gets stuck
-    /// every time fails every attempt. Detection never adds or changes a command, so replay
-    /// is unaffected.
+    /// workflow itself does not fail: the server retries the task. Only the first attempt's
+    /// failure is reported to the server; code that gets stuck on later attempts sends no
+    /// failure, so those attempts end in a workflow task timeout. Detection never adds or
+    /// changes a command, so replay is unaffected.
     ///
     /// The SDK cannot stop stuck code. It keeps its thread until it returns; then whatever
     /// it produced (commands, its completion) is discarded, no second completion is sent, and
@@ -167,6 +168,39 @@ pub const Options = struct {
     /// otherwise the stack trace is empty. A failure passed on unchanged (a future's failure,
     /// `ctx.failWith`) keeps its own.
     failure_stack_traces: bool = true,
+    /// Errors that fail the workflow task instead of the workflow when a workflow function,
+    /// signal handler, or update handler returns them, for every workflow of this worker. A
+    /// workflow definition adds its own with `workflow.DefOptions.task_failure_errors`; an
+    /// error either lists fails the task. Empty (the default) keeps the default policy:
+    /// error.OutOfMemory fails the task, error.Canceled cancels the workflow, and every other
+    /// error fails the workflow.
+    ///
+    /// The task failure is an application failure whose type is the error's name and whose
+    /// message names the error and what returned it. The workflow stays running: the run is
+    /// evicted, the server retries the task, and the retry replays the history, so code that
+    /// still returns the error fails again, and a worker whose code no longer does completes
+    /// the task. Only a task's first failed attempt is reported to the server; later ones
+    /// send nothing and end in a workflow task timeout before the next retry.
+    ///
+    /// A listed error from an update handler doesn't reject or fail the update: the retried
+    /// task runs the handler again and answers it. An update delivered in the failed task
+    /// was never accepted, so the server delivers it again and its validator runs again.
+    /// Errors from update validators, and an update handler's unlisted errors
+    /// (error.OutOfMemory included), reject the update.
+    ///
+    /// Listing error.Canceled doesn't stop a cancellation: the workflow function or a signal
+    /// handler that returns it cancels the workflow, listed or not. An update handler that
+    /// returns a listed error.Canceled fails the task, where unlisted it rejects the update.
+    /// Listing error.ContinueAsNew doesn't stop a continue-as-new the workflow function
+    /// requested; only its misuse (returned without `ctx.continueAsNew`, or by a signal
+    /// handler) then fails the task instead of the workflow.
+    workflow_task_failure_errors: []const anyerror = &.{},
+    /// Fail the workflow, instead of its workflow task, when a run's code no longer matches
+    /// its history (nondeterminism), for every workflow of this worker. A workflow definition
+    /// can ask for it alone with `workflow.DefOptions.nondeterminism_fails_workflow`. Off
+    /// (the default): the task fails and is retried until the code matches, so a fixed
+    /// worker can still finish the run.
+    nondeterminism_fails_workflow: bool = false,
     /// How long running activities and Nexus handlers may keep running after `stop` before
     /// they are canceled with reason `worker_shutdown`.
     graceful_shutdown_period: Io.Duration = .zero,
@@ -500,7 +534,10 @@ pub const Worker = struct {
         const registered: Registered = .{ .workflows = w.hasWorkflows(), .activities = w.hasActivities(), .nexus = w.hasNexusServices() };
         try checkOptions(w.options, w.task_queue, registered);
         const strategy = try w.versioningStrategy();
-        const core_options = coreOptions(w.options, w.client.namespace, w.task_queue, strategy, registered);
+        var core_options = coreOptions(w.options, w.client.namespace, w.task_queue, strategy, registered);
+        const nondeterminism_types = try w.nondeterminismFailTypes();
+        defer w.gpa.free(nondeterminism_types);
+        core_options.nondeterminism_as_workflow_fail_for_types = nondeterminism_types;
         const interceptors = try std.mem.concat(w.gpa, interceptor.Worker, &.{ w.client.worker_interceptors, w.options.interceptors });
         defer w.gpa.free(interceptors);
         w.interceptors = interceptors;
@@ -734,7 +771,23 @@ pub const Worker = struct {
             // The core checks this even on a worker that polls no Nexus tasks.
             .nexus_task_pollers = .{ .simple_maximum = if (registered.nexus) o.max_concurrent_nexus_task_pollers else 1 },
             .graceful_shutdown_period_ms = millis(o.graceful_shutdown_period),
+            .nondeterminism_as_workflow_fail = o.nondeterminism_fails_workflow,
         };
+    }
+
+    /// The registered workflow types whose definitions set `nondeterminism_fails_workflow`,
+    /// sorted. Allocated in `gpa`; the names are the definitions' own.
+    fn nondeterminismFailTypes(w: *const Worker) error{OutOfMemory}![]const []const u8 {
+        var types: std.ArrayList([]const u8) = .empty;
+        errdefer types.deinit(w.gpa);
+        var it = w.workflows.iterator();
+        while (it.next()) |kv| if (kv.value_ptr.nondeterminism_fails_workflow) try types.append(w.gpa, kv.value_ptr.name);
+        std.mem.sort([]const u8, types.items, {}, struct {
+            fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lessThan);
+        return types.toOwnedSlice(w.gpa);
     }
 
     /// The core options of a session queue: activities only, unversioned so a rollout can't
@@ -910,6 +963,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .memory_limit = w.options.workflow_memory_limit,
         .deadlock_timeout = w.options.deadlock_detection_timeout,
         .failure_stack_traces = w.options.failure_stack_traces,
+        .task_failure_errors = w.options.workflow_task_failure_errors,
         .codecs = w.client.codecs,
         .encode_failure_attributes = w.client.encode_failure_attributes,
         .propagators = w.client.propagators,
@@ -967,6 +1021,8 @@ pub const WorkflowRunner = struct {
     deadlock_timeout: ?Io.Duration = null,
     /// See `Options.failure_stack_traces`.
     failure_stack_traces: bool = true,
+    /// Borrowed; see `Options.workflow_task_failure_errors`.
+    task_failure_errors: []const anyerror = &.{},
     /// Borrowed; see `client.Options.codecs`.
     codecs: []const converter.PayloadCodec = &.{},
     /// See `client.Options.encode_failure_attributes`.
@@ -1454,6 +1510,7 @@ pub const WorkflowRunner = struct {
             .stack_size = r.stack_size,
             .memory_limit = r.memory_limit,
             .failure_stack_traces = r.failure_stack_traces,
+            .task_failure_errors = r.task_failure_errors,
             .logger = r.logger,
             .log_during_replay = r.log_during_replay,
             .propagators = r.propagators,
@@ -5173,4 +5230,108 @@ test "a worker fails the workflow task of code that spins past the deadlock limi
             }));
         }
     }
+}
+
+// Nondeterminism as a workflow failure: a run whose code changed after its first task fails
+// as a workflow with the worker's or the definition's option set, and fails only its task
+// without either.
+const NondeterminismPolicy = struct {
+    /// False: the code waits on a timer; true: it schedules an activity instead, which the
+    /// timer in the history doesn't match. Test-only global state.
+    var drifted: std.atomic.Value(bool) = .init(false);
+
+    fn drift(ctx: *workflow.Context) ![]const u8 {
+        if (!drifted.load(.acquire)) {
+            try ctx.io().sleep(.fromSeconds(3600), .awake);
+        } else {
+            _ = try ctx.executeActivity(HelloTest.Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"drift"}).get();
+        }
+        return "done";
+    }
+    const Plain = workflow.Def("NondeterminismPlain", drift);
+    const Listed = workflow.DefWithOptions("NondeterminismListed", drift, .{ .nondeterminism_fails_workflow = true });
+
+    /// Waits for the run's history to record a workflow task that failed for nondeterminism.
+    fn waitForTaskFailure(c: *client_mod.Client, id: []const u8, run_id: []const u8) !void {
+        const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = .fromSeconds(30), .clock = .awake });
+        while (true) {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            const history = try c.fetchHistory(scratch.allocator(), id, run_id);
+            for (history.events.items) |event| switch (event.attributes orelse continue) {
+                .workflow_task_failed_event_attributes => |f| if (f.cause == .WORKFLOW_TASK_FAILED_CAUSE_NON_DETERMINISTIC_ERROR) return,
+                .workflow_execution_failed_event_attributes => return error.TestUnexpectedResult,
+                else => {},
+            };
+            if (deadline.durationFromNow(testing.io).raw.nanoseconds <= 0) return error.Timeout;
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+    }
+
+    fn expectWorkflowFailed(run: anytype) !void {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectError(error.WorkflowFailed, run.get(arena.allocator()));
+        const f = run.failure() orelse return error.TestExpectedFailure;
+        try testing.expect(std.mem.indexOf(u8, f.message, "ondeterminism") != null);
+    }
+};
+
+test "nondeterminism fails the workflow with the worker's or the definition's option, and only the task without" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    // The core's warnings about the failing task go here, not to std.log.
+    var client_sink: RecordingSink = .{};
+    defer client_sink.deinit();
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target, .logger = client_sink.sink() });
+    defer client.close();
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    NondeterminismPolicy.drifted.store(false, .release);
+
+    // No cache: the signal's task replays each run from its history with the changed code.
+    var plain_worker = try Worker.init(testing.allocator, testing.io, &client, "nd-definition", .{ .max_cached_workflows = 0, .logger = sink.sink() });
+    defer plain_worker.deinit();
+    try plain_worker.registerWorkflow(NondeterminismPolicy.Plain);
+    try plain_worker.registerWorkflow(NondeterminismPolicy.Listed);
+    {
+        const types = try plain_worker.nondeterminismFailTypes();
+        defer testing.allocator.free(types);
+        try testing.expectEqual(@as(usize, 1), types.len);
+        try testing.expectEqualStrings("NondeterminismListed", types[0]);
+    }
+    var all_worker = try Worker.init(testing.allocator, testing.io, &client, "nd-worker", .{ .max_cached_workflows = 0, .nondeterminism_fails_workflow = true, .logger = sink.sink() });
+    defer all_worker.deinit();
+    try all_worker.registerWorkflow(NondeterminismPolicy.Plain);
+    var running_plain = try testing.io.concurrent(HelloTest.runWorker, .{&plain_worker});
+    defer {
+        plain_worker.stop();
+        running_plain.await(testing.io) catch {};
+    }
+    var running_all = try testing.io.concurrent(HelloTest.runWorker, .{&all_worker});
+    defer {
+        all_worker.stop();
+        running_all.await(testing.io) catch {};
+    }
+
+    var plain = try client.executeWorkflow(NondeterminismPolicy.Plain, .{ .id = "nd-plain", .task_queue = "nd-definition" }, .{});
+    defer plain.deinit();
+    defer client.terminateWorkflow("nd-plain", plain.run_id, "test done") catch {};
+    // A run whose task kept failing would time out instead of failing, ending the test.
+    var listed = try client.executeWorkflow(NondeterminismPolicy.Listed, .{ .id = "nd-listed", .task_queue = "nd-definition", .execution_timeout = .fromSeconds(60) }, .{});
+    defer listed.deinit();
+    var by_worker = try client.executeWorkflow(NondeterminismPolicy.Plain, .{ .id = "nd-by-worker", .task_queue = "nd-worker", .execution_timeout = .fromSeconds(60) }, .{});
+    defer by_worker.deinit();
+    for ([_]*const client_mod.WorkflowRun([]const u8){ &plain, &listed, &by_worker }) |run| try CacheTest.waitForTimer(&client, run.id, run.run_id);
+
+    NondeterminismPolicy.drifted.store(true, .release);
+    for ([_]*const client_mod.WorkflowRun([]const u8){ &plain, &listed, &by_worker }) |run| try client.signalWorkflow(CacheTest.Release, run.id, run.run_id, .{});
+    try NondeterminismPolicy.expectWorkflowFailed(&listed);
+    try NondeterminismPolicy.expectWorkflowFailed(&by_worker);
+    try NondeterminismPolicy.waitForTaskFailure(&client, "nd-plain", plain.run_id);
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    try testing.expect((try client.describeWorkflow(scratch.allocator(), "nd-plain", plain.run_id)).status == .running);
 }

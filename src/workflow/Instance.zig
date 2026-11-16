@@ -148,6 +148,8 @@ failed_handler: ?*HandlerRun = null,
 root_trace: []const usize = &.{},
 /// See `Options.failure_stack_traces`.
 failure_stack_traces: bool = true,
+/// See `Options.task_failure_errors`. Borrowed.
+task_failure_errors: []const anyerror = &.{},
 /// Update rejections built in a handler coroutine from a returned error, whose stack trace
 /// is filled in once the coroutines have run: reading debug info to symbolize a trace can
 /// take more stack than a coroutine has. Arena memory.
@@ -545,6 +547,10 @@ pub const Options = struct {
     /// Put the error's return trace in the stack trace of a failure built from an error the
     /// workflow function or a handler returned. See `worker.Options.failure_stack_traces`.
     failure_stack_traces: bool = true,
+    /// Errors that fail the workflow task instead of the workflow, besides the registered
+    /// workflow's `task_failure_errors`. Borrowed: must outlive the instance. See
+    /// `worker.Options.workflow_task_failure_errors`.
+    task_failure_errors: []const anyerror = &.{},
     /// Where the workflow's logger writes.
     logger: log.Sink = .std_log,
     /// Keep the workflow's logger on while it replays history.
@@ -577,6 +583,7 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
         .send_versioning_behavior = options.send_versioning_behavior,
         .memory_limit = options.memory_limit,
         .failure_stack_traces = options.failure_stack_traces,
+        .task_failure_errors = options.task_failure_errors,
     };
     inst.wio = .init(inst.arena(), &inst.sched, .{ .ctx = inst, .vtable = &host_vtable }, 0);
     inst.ctx = .{ .instance = inst };
@@ -1265,6 +1272,11 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
             const response: cmd_pb.UpdateResponse.response_union = if (result) |payload|
                 .{ .completed = payload }
             else |err| rejected: {
+                // The update stays accepted and unanswered; the retried task runs it again.
+                if (inst.failsTask(err)) {
+                    inst.failTaskWith("update handler \"{s}\" (update ID {s})", .{ u.update.name, u.update.id }, err);
+                    return;
+                }
                 if (inst.failure_stack_traces) run.trace = failure_mod.captureTrace(a, @errorReturnTrace()) catch &.{};
                 const rejected = updateFailure(a, run, err) catch {
                     inst.task_failure = "out of memory rejecting an update whose handler failed";
@@ -1529,10 +1541,38 @@ fn rootMain(inst: *Instance) void {
     inst.root = null; // the task frees itself when this returns
 }
 
+/// Whether the worker's or the workflow definition's `task_failure_errors` list `err`, so
+/// that the workflow function or a signal or update handler returning it fails the workflow
+/// task. The workflow function's and signal handlers' error.OutOfMemory fails it too (see
+/// `finishIfDone`); an unlisted one from an update handler rejects the update.
+fn failsTask(inst: *const Instance, err: anyerror) bool {
+    return std.mem.findScalar(anyerror, inst.task_failure_errors, err) != null or
+        std.mem.findScalar(anyerror, inst.entry.task_failure_errors, err) != null;
+}
+
+/// Fails the workflow task because `what` returned `err`, which `failsTask` picks. The
+/// failure's type is the error's name.
+fn failTaskWith(inst: *Instance, comptime what: []const u8, args: anytype, err: anyerror) void {
+    inst.task_failure_type = @errorName(err);
+    if (err == error.OutOfMemory) {
+        inst.task_failure = "out of memory running the workflow";
+        return;
+    }
+    inst.task_failure = std.fmt.allocPrint(inst.arena(), what ++ " of workflow \"{s}\" returned error.{t}, which task_failure_errors lists (worker.Options.workflow_task_failure_errors or the workflow's DefOptions), so the workflow task fails and is retried; the workflow keeps running", args ++ .{ inst.info.workflow_type, err }) catch "workflow code returned an error that task_failure_errors lists; the workflow task fails and is retried";
+}
+
 fn finishIfDone(inst: *Instance) !void {
     if (inst.finished) return;
     const outcome = inst.root_outcome orelse return;
     inst.finished = true;
+    // Canceled always cancels: the workflow accepted its cancellation.
+    if (outcome == .failed and outcome.failed != error.Canceled and (outcome.failed == error.OutOfMemory or inst.failsTask(outcome.failed))) {
+        if (inst.failed_handler) |run|
+            inst.failTaskWith("signal handler \"{s}\"", .{run.name}, outcome.failed)
+        else
+            inst.failTaskWith("the workflow function", .{}, outcome.failed);
+        return;
+    }
     const a = inst.arena();
     const unhandled = try inst.unhandledSignals(a);
     if (unhandled.len > 0) {
@@ -1559,8 +1599,6 @@ fn finishIfDone(inst: *Instance) !void {
             .continue_as_new_workflow_execution = inst.continue_as_new.?,
         } }),
         .failed => |err| switch (err) {
-            // The workflow can't make progress; fail the task so the server retries it.
-            error.OutOfMemory => inst.task_failure = "out of memory running the workflow",
             error.Canceled => try inst.emit(.{ .variant = .{ .cancel_workflow_execution = .{} } }),
             else => try inst.emit(.{ .variant = .{
                 .fail_workflow_execution = .{ .failure = try inst.workflowFailure(err) },
@@ -8936,3 +8974,187 @@ test "update: a validator that sleeps in a canceled workflow's coroutine is refu
     try expectReadOnlyViolation(rejected.?, "update validator", "set", "sleep");
     try testing.expect(canceled);
 }
+
+// Failure policy: which errors fail the workflow task instead of the workflow.
+const Policy = struct {
+    fn missing(_: *workflow.Context) ![]const u8 {
+        return error.ConfigMissing;
+    }
+    fn outOfMemory(_: *workflow.Context) ![]const u8 {
+        return error.OutOfMemory;
+    }
+    fn canceled(ctx: *workflow.Context) ![]const u8 {
+        try ctx.io().sleep(.fromSeconds(3600), .awake);
+        return "slept";
+    }
+    fn dynamic(_: *workflow.Context, _: converter.EncodedValues) ![]const u8 {
+        return error.ConfigMissing;
+    }
+    const Stateful = struct {
+        calls: u32 = 0,
+        pub fn run(s: *Stateful, _: *workflow.Context) ![]const u8 {
+            s.calls += 1;
+            return error.ConfigMissing;
+        }
+    };
+    const Missing = workflow.Def("Missing", missing);
+    const MissingListed = workflow.DefWithOptions("MissingListed", missing, .{ .task_failure_errors = &.{error.ConfigMissing} });
+    const OutOfMemoryWf = workflow.Def("OutOfMemory", outOfMemory);
+    const Canceled = workflow.DefWithOptions("Canceled", canceled, .{ .task_failure_errors = &.{error.Canceled} });
+    const StructListed = workflow.DefWithOptions("StructListed", Stateful, .{ .task_failure_errors = &.{error.ConfigMissing} });
+    const StructPlain = workflow.Def("StructPlain", Stateful);
+    const DynamicListed = workflow.DynamicDefWithOptions(dynamic, .{ .task_failure_errors = &.{error.ConfigMissing} });
+    const DynamicPlain = workflow.DynamicDef(dynamic);
+};
+
+/// The workflow task failure of `c`, checking it has no commands.
+fn taskFailure(c: done_pb.WorkflowActivationCompletion) !Failure {
+    return switch (c.status.?) {
+        .failed => |f| f.failure.?,
+        .successful => error.TestUnexpectedResult,
+    };
+}
+
+/// Asserts `c` fails the workflow task for error.ConfigMissing returned by `what`.
+fn expectConfigMissingTask(c: done_pb.WorkflowActivationCompletion, what: []const u8) !void {
+    const f = try taskFailure(c);
+    try testing.expectEqualStrings("ConfigMissing", failure_mod.applicationType(f).?);
+    try testing.expect(std.mem.indexOf(u8, f.message, "error.ConfigMissing") != null);
+    try testing.expect(std.mem.indexOf(u8, f.message, what) != null);
+}
+
+fn expectWorkflowFailed(c: done_pb.WorkflowActivationCompletion, message: []const u8) !void {
+    const cmds = commandsOf(c);
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expectEqualStrings(message, cmds[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+test "failure policy: error.OutOfMemory from workflow code fails the workflow task by default" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, Policy.OutOfMemoryWf.registered, .{});
+    defer inst.destroy();
+    const f = try taskFailure(try inst.activate(&try initActivation(a, "OutOfMemory", .{}), a));
+    try testing.expectEqualStrings("OutOfMemory", failure_mod.applicationType(f).?);
+    try testing.expectEqualStrings("out of memory running the workflow", f.message);
+}
+
+test "failure policy: with no lists, an error fails the workflow" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    inline for (.{ Policy.Missing, Policy.StructPlain, Policy.DynamicPlain }) |D| {
+        const inst = try create(testing.allocator, D.registered, .{});
+        defer inst.destroy();
+        try expectWorkflowFailed(try inst.activate(&try initActivation(a, "Missing", .{}), a), "ConfigMissing");
+    }
+}
+
+test "failure policy: the worker's list fails the task for function, struct and dynamic workflows" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const listed: []const anyerror = &.{ error.Unrelated, error.ConfigMissing };
+    inline for (.{ Policy.Missing, Policy.StructPlain, Policy.DynamicPlain }) |D| {
+        const inst = try create(testing.allocator, D.registered, .{ .task_failure_errors = listed });
+        defer inst.destroy();
+        try expectConfigMissingTask(try inst.activate(&try initActivation(a, "Missing", .{}), a), "the workflow function of workflow \"Missing\"");
+    }
+    // A list without the error leaves it failing the workflow.
+    const inst = try create(testing.allocator, Policy.Missing.registered, .{ .task_failure_errors = &.{error.Unrelated} });
+    defer inst.destroy();
+    try expectWorkflowFailed(try inst.activate(&try initActivation(a, "Missing", .{}), a), "ConfigMissing");
+}
+
+test "failure policy: the definition's list fails the task for function, struct and dynamic workflows" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    inline for (.{ Policy.MissingListed, Policy.StructListed, Policy.DynamicListed }) |D| {
+        // Either list is enough: the worker's lists something else.
+        const inst = try create(testing.allocator, D.registered, .{ .task_failure_errors = &.{error.Unrelated} });
+        defer inst.destroy();
+        try expectConfigMissingTask(try inst.activate(&try initActivation(a, "Listed", .{}), a), "returned error.ConfigMissing");
+    }
+}
+
+test "failure policy: a listed error from a signal handler fails the task, not the workflow" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, RejectableWf.registered, .{ .task_failure_errors = &.{error.Rejected} });
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Rejectable", .{}), a);
+    const f = try taskFailure(try inst.activate(&try oneJob(a, try signalJob(a, "reject", .{})), a));
+    try testing.expectEqualStrings("Rejected", failure_mod.applicationType(f).?);
+    try testing.expect(std.mem.indexOf(u8, f.message, "signal handler \"reject\" of workflow \"Rejectable\" returned error.Rejected") != null);
+}
+
+test "failure policy: a listed error from an update handler fails the task without rejecting the update" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, UpdatesWf.registered, .{ .task_failure_errors = &.{error.Broken} });
+    defer inst.destroy();
+
+    _ = try inst.activate(&try initActivation(a, "Updates", .{}), a);
+    const f = try taskFailure(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "break", .{}, true)), a));
+    try testing.expectEqualStrings("Broken", failure_mod.applicationType(f).?);
+    try testing.expect(std.mem.indexOf(u8, f.message, "update handler \"break\" (update ID u1) of workflow \"Updates\" returned error.Broken") != null);
+}
+
+test "failure policy: listing error.Canceled doesn't stop an accepted cancellation" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, Policy.Canceled.registered, .{ .task_failure_errors = &.{error.Canceled} });
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "Canceled", .{}), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expect(cmds[cmds.len - 1].variant.? == .cancel_workflow_execution);
+}
+
+test "failure policy: listing error.ContinueAsNew keeps a requested continue-as-new and fails the task on its misuse" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const listed: []const anyerror = &.{error.ContinueAsNew};
+    {
+        const inst = try create(testing.allocator, Continue.Defaults.registered, .{ .task_failure_errors = listed });
+        defer inst.destroy();
+        const cmds = commandsOf(try inst.activate(&try initActivation(a, "Defaults", .{@as(u32, 1)}), a));
+        try testing.expect(cmds[cmds.len - 1].variant.? == .continue_as_new_workflow_execution);
+    }
+    {
+        const inst = try create(testing.allocator, Continue.Bare.registered, .{ .task_failure_errors = listed });
+        defer inst.destroy();
+        const f = try taskFailure(try inst.activate(&try initActivation(a, "Bare", .{}), a));
+        try testing.expectEqualStrings("ContinueAsNew", failure_mod.applicationType(f).?);
+    }
+}
+
+test "failure policy: by default an update handler's error.OutOfMemory rejects the update" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, PolicyUpdatesWf.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "PolicyUpdates", .{}), a);
+    const cmds = commandsOf(try inst.activate(&try oneJob(a, try updateJob(a, "u1", "exhaust", .{}, true)), a));
+    try testing.expectEqualStrings("OutOfMemory", (try updateResponse(cmds[1], "u1")).rejected.message);
+}
+
+const PolicyUpdates = struct {
+    const Exhaust = workflow.UpdateDef("exhaust", fn () void);
+    fn exhaust(_: *workflow.Context) error{OutOfMemory}!void {
+        return error.OutOfMemory;
+    }
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        try ctx.setUpdateHandler(Exhaust, ctx, exhaust);
+        try ctx.io().sleep(.fromSeconds(3600), .awake);
+        return "slept";
+    }
+};
+const PolicyUpdatesWf = workflow.Def("PolicyUpdates", PolicyUpdates.run);

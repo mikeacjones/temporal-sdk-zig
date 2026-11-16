@@ -966,6 +966,7 @@ pub const AnyGreeting = workflow.DynamicDef(anyGreeting);
 ```
 
 Notes:
+- `workflow.DynamicDefWithOptions` takes `task_failure_errors` for it; see [Failure policy](#failure-policy).
 - A worker has at most one dynamic workflow, and a registered `Def` wins for its own type.
 - Clients start it by type name with `executeWorkflowByName`; it reads that name from `ctx.info().workflow_type`.
 - It registers handlers with the `Context` setters, as a function workflow does.
@@ -976,9 +977,44 @@ Notes:
 - `ctx.lastCompletionResult(T)` and `ctx.previousRunFailure()` read a cron or retried workflow's previous run.
 
 #### Failure policy
-<!-- stub: temporal-sdk-zig-d51.6.8 -->
-Not implemented yet.
-A worker option and a per-definition override will choose which errors fail the workflow task and which fail the workflow. [Deadlock detection](#deadlock-detection), under Workers, fails the task of workflow code that doesn't yield in time.
+
+An error that workflow code returns either fails the workflow, which closes the run, or fails the workflow task, which leaves the run open: the server retries the task, and the retry replays the history with whatever code the worker that takes it runs. By default `error.OutOfMemory` fails the task, `error.Canceled` cancels the workflow, and every other error fails the workflow, because a Zig workflow that returns an error means to fail. `worker.Options.workflow_task_failure_errors` lists errors that fail the task instead, for every workflow of a worker, and `workflow.DefOptions.task_failure_errors` lists them for one definition; an error either list names fails the task. `nondeterminism_fails_workflow`, on either, fails the workflow instead of the task when a run's code no longer matches its history.
+
+<!-- example: workflow-failure-policy -->
+```zig
+fn carrierRate(carrier: []const u8) ?u32 {
+    if (std.mem.eql(u8, carrier, "post")) return 5;
+    if (std.mem.eql(u8, carrier, "courier")) return 12;
+    return null;
+}
+fn shipOrder(ctx: *workflow.Context, carrier: []const u8) ![]const u8 {
+    // A carrier missing from the table is a bug to fix and deploy, not a reason to fail the
+    // order: listed, the error fails the workflow task, which is retried until fixed code runs.
+    const rate = carrierRate(carrier) orelse return error.UnknownCarrier;
+    return std.fmt.allocPrint(ctx.allocator(), "shipped by {s} for {d}", .{ carrier, rate });
+}
+pub const ShipOrder = workflow.DefWithOptions("ship_order", shipOrder, .{
+    .task_failure_errors = &.{error.UnknownCarrier},
+    // Fail this workflow, not just its task, if its code stops matching its history.
+    .nondeterminism_fails_workflow = true,
+});
+
+// For every workflow of a worker.
+const strict_worker: temporal.worker.Options = .{
+    .workflow_task_failure_errors = &.{error.InvariantBroken},
+    .nondeterminism_fails_workflow = true,
+};
+```
+
+Notes:
+- The lists apply to errors the workflow function, a signal handler, or an update handler returns, in function, struct, and dynamic workflows (`workflow.DynamicDefWithOptions`). They are slices of `anyerror`, compared by error value.
+- The task failure is an application failure whose type is the error's name and whose message names the error and the function or handler that returned it. The run is evicted and the workflow stays running; a worker whose code no longer returns the error completes the retried task, and history keeps one failed task.
+- An update handler's listed error doesn't reject or fail the update: the retried task runs the handler again and answers it. An update delivered in the failed task was never accepted, so the server delivers it again and its validator runs again. An update handler's unlisted errors, `error.OutOfMemory` included, and errors from update validators reject the update as before.
+- Listing `error.Canceled` doesn't stop a cancellation: the workflow function or a signal handler that returns it cancels the workflow, listed or not. An update handler that returns a listed `error.Canceled` fails the task, where unlisted it rejects the update. Listing `error.ContinueAsNew` doesn't stop a continue-as-new the workflow function requested with `ctx.continueAsNew`; only returning it otherwise (without the request, or from a signal handler) then fails the task instead of the workflow.
+- Without `nondeterminism_fails_workflow`, a nondeterministic run fails its task and waits for code that matches. With it, the run fails with the nondeterminism failure. The definition's option needs a workflow type name, so a dynamic workflow takes only the worker's (`DynamicDefWithOptions` rejects it at compile time).
+- What happens to a failed workflow task: it is reported to the server only on its first attempt, which records it in history and retries it at once. A retry that fails again is not reported; the server retries it once the workflow task timeout (`StartWorkflowOptions.task_timeout`, 10 s by default) passes, so code that keeps failing retries about once per task timeout until it is fixed or the run is terminated. The worker logs each failure. [Deadlock detection](#deadlock-detection) and the [workflow memory limit](#workflow-memory-limit), under Workers, fail tasks the same way.
+- `@panic` in workflow code, and in Debug and ReleaseSafe builds safety-checked illegal behavior such as integer overflow or an out-of-bounds index, ends the worker process: Zig has no way to recover from a panic. The workflow task that was running gets no completion, so the server retries it once its workflow task timeout passes, on whichever worker polls the task queue then (the restarted one, or another). Every run cached on the process is replayed from history by its next task. Code that panics on every attempt ends every worker that takes its task, so return an error instead, and list it if it should fail the task.
+- `testing.WorkflowReplayer.Options.workflow_task_failure_errors` replays with the worker's list. Replay doesn't re-run a task that failed: a history in which a listed error failed a task replays with code that no longer returns it, and code that still does fails replay with `error.ReplayFailed`.
 
 #### Stack trace and metadata queries
 <!-- stub: temporal-sdk-zig-d51.6.9 -->
@@ -1258,6 +1294,7 @@ Notes:
 - `poll_activity_tasks` (true): false stops the worker polling its task queue for activity tasks, so its registered activities run only as local activities of its own workflows (`workflow.Context.executeLocalActivity`); activities scheduled through the task queue wait for another worker or time out. It needs a registered workflow when activities are registered, and can't be combined with `sessions`.
 - `run` returns `error.InvalidOptions`, and logs the option and why, for a per-second limit that is zero, negative, infinite or NaN (or a `max_activities_per_second` below one per 2^61 seconds, about 4.4e-19 per second), a negative duration among the ones above, a default heartbeat throttle interval above the maximum, or `poll_activity_tasks = false` with `sessions` or with activities but no workflow.
 - `graceful_shutdown_period` (zero) and `workflow_memory_limit` (null): see below.
+- `workflow_task_failure_errors` (empty) and `nondeterminism_fails_workflow` (false): which errors and whether nondeterminism fail the workflow task or the workflow; see [Failure policy](#failure-policy).
 - `logger` (null uses the client's sink) and `log_during_replay` (false): where workflow and activity logs go, and whether replay logs.
 - `interceptors`: run after the client's `worker_interceptors`; borrowed, called from several threads.
 - `deployment`, `build_id`, `use_build_id_versioning`, and `sessions`: see below.
@@ -1351,7 +1388,7 @@ defer debugging.deinit();
 
 Notes:
 - A watchdog on the worker's own `Io` and real clock, never the workflow's deterministic `std.Io`, times each stretch of an activation's workflow code between returns to the scheduler. Payload codecs decoding the activation and encoding its completion run outside workflow code and aren't counted; a workflow that waits often may run much longer than the limit in total.
-- Over the limit, the worker fails the workflow task with an application failure of type `worker.deadlock_failure_type` (`"WorkflowDeadlockDetected"`) whose message names the workflow type and the limit, logs one error with the workflow and run IDs, and evicts the run, so its next task replays it from history. The workflow does not fail; the server retries the task, and code that gets stuck on every attempt fails every attempt. Detection takes up to about 1.25 times the limit.
+- Over the limit, the worker fails the workflow task with an application failure of type `worker.deadlock_failure_type` (`"WorkflowDeadlockDetected"`) whose message names the workflow type and the limit, logs one error with the workflow and run IDs, and evicts the run, so its next task replays it from history. The workflow does not fail; the server retries the task. As with any failed workflow task (see [Failure policy](#failure-policy)), only the first attempt's failure is reported: code that gets stuck on every later attempt sends no failure, so those attempts end in a workflow task timeout. Detection takes up to about 1.25 times the limit.
 - The SDK cannot stop stuck code: it keeps its thread until it returns. Whatever it produces then is discarded, no second completion is sent, and only then is the run's memory freed. Other runs, and a replay of the same run, keep being processed meanwhile. `Worker.stop` doesn't wait for stuck code, but `Worker.run` returns only after it has returned.
 - Turn detection off while a debugger may stop workflow code at a breakpoint, or the paused task fails.
 - Detection emits no command and changes none, so replay is unaffected. `testing.WorkflowReplayer.Options.deadlock_detection_timeout` (null by default) applies the same limit to replayed code.
