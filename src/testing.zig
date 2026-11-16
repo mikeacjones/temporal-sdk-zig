@@ -6373,6 +6373,243 @@ test "client: standalone activities run without a workflow; get, describe, cance
     try testing.expectEqualStrings("charge-0,charge-1,hold-cancel,hold-terminate", try std.mem.join(a, ",", ids.items));
 }
 
+const StandaloneFollowUpFixtures = struct {
+    const Progress = struct { step: u32, note: []const u8 };
+
+    /// Heartbeats its progress until it is canceled or paused.
+    fn beat(ctx: *activity.Context) ![]const u8 {
+        while (true) {
+            ctx.heartbeat(Progress{ .step = 3, .note = "halfway" });
+            try ctx.io().sleep(.fromMilliseconds(50), .awake);
+        }
+    }
+    const Beat = activity.Def("Beat", beat);
+
+    fn waitForStatus(handle: anytype, arena: Allocator, want: client_mod.ActivityExecutionStatus) !client_mod.ActivityDescription {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            const d = try handle.describe(arena);
+            if (d.status == want) return d;
+            if (tries == 300) {
+                log.err("activity {s} stayed {t}, never {t}", .{ d.activity_id, d.status, want });
+                return error.TestUnexpectedResult;
+            }
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    }
+};
+
+test "client: a standalone activity starts with a delay, a priority and a summary, and reports whether it started" {
+    const zlib: converter.ZlibCodec = .{ .always_encode = true };
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args, .codecs = &codecs });
+    defer env.deinit();
+    try env.registerActivity(StandaloneFixtures.Charge);
+    try env.registerActivity(StandaloneFixtures.Hold);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var delayed = try c.executeActivity(StandaloneFixtures.Charge, .{
+        .id = "delayed",
+        .task_queue = env.task_queue,
+        .start_to_close_timeout = .fromSeconds(10),
+        .start_delay = .fromSeconds(2),
+        .priority = .{ .priority_key = 2, .fairness_key = "tenant-a", .fairness_weight = 1.5 },
+        .summary = "charge c-7 later",
+    }, .{ "c-7", 300 });
+    defer delayed.deinit();
+    try testing.expect(delayed.started);
+    const pending = try delayed.describe(a);
+    try testing.expectEqual(client_mod.ActivityExecutionStatus.running, pending.status);
+    try testing.expectEqual(Io.Duration.fromSeconds(2), pending.start_delay.?);
+    try testing.expectEqual(@as(i32, 2), pending.priority.?.priority_key);
+    try testing.expectEqualStrings("tenant-a", pending.priority.?.fairness_key);
+    try testing.expectEqual(@as(f32, 1.5), pending.priority.?.fairness_weight);
+    try testing.expectEqualStrings("charge c-7 later", pending.summary);
+    try testing.expectEqualStrings("charged c-7 300", try delayed.get(a));
+    // The server's own clock: the first attempt started no sooner than the delay after the
+    // activity was scheduled.
+    const done = try delayed.describe(a);
+    const waited = done.schedule_time.?.durationTo(done.last_started_time.?);
+    try testing.expect(waited.nanoseconds >= Io.Duration.fromSeconds(2).nanoseconds);
+
+    var plain = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "undelayed", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{ "c-8", 1 });
+    defer plain.deinit();
+    _ = try plain.get(a);
+    const plain_d = try plain.describe(a);
+    try testing.expectEqual(@as(?Io.Duration, null), plain_d.start_delay);
+    try testing.expect(plain_d.priority == null);
+    try testing.expectEqualStrings("", plain_d.summary);
+    // A zero delay and an all-default priority read back as none.
+    var zeroed = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "zeroed", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10), .start_delay = .fromMilliseconds(0), .priority = .{} }, .{ "c-8", 2 });
+    defer zeroed.deinit();
+    _ = try zeroed.get(a);
+    const zeroed_d = try zeroed.describe(a);
+    try testing.expectEqual(@as(?Io.Duration, null), zeroed_d.start_delay);
+    try testing.expect(zeroed_d.priority == null);
+
+    const hold: client_mod.StartActivityOptions = .{ .id = "attach", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(2), .id_conflict_policy = .use_existing };
+    var first = try c.executeActivity(StandaloneFixtures.Hold, hold, .{});
+    defer first.deinit();
+    try testing.expect(first.started);
+    var again = try c.executeActivity(StandaloneFixtures.Hold, hold, .{});
+    defer again.deinit();
+    try testing.expect(!again.started);
+    try testing.expectEqualStrings(first.run_id, again.run_id);
+    var by_id = try c.getActivityHandle(void, "attach", "");
+    defer by_id.deinit();
+    try testing.expect(!by_id.started);
+    try first.terminate("done");
+}
+
+test "client: a standalone activity can be paused, unpaused and deleted, and reports its heartbeat details" {
+    const zlib: converter.ZlibCodec = .{ .always_encode = true };
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args, .codecs = &codecs });
+    defer env.deinit();
+    try env.registerActivity(StandaloneFollowUpFixtures.Beat);
+    try env.registerActivity(StandaloneFixtures.Charge);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+    const Progress = StandaloneFollowUpFixtures.Progress;
+
+    var beat = try c.executeActivity(StandaloneFollowUpFixtures.Beat, .{ .id = "beat", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(2) }, .{});
+    defer beat.deinit();
+    const beating = blk: {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            const d = try beat.describe(a);
+            if (d.heartbeat_details.len() > 0) break :blk d;
+            if (tries == 300) return error.TestUnexpectedResult;
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    };
+    const progress = try beating.heartbeat_details.get(Progress, a, 0);
+    try testing.expectEqual(@as(u32, 3), progress.step);
+    try testing.expectEqualStrings("halfway", progress.note);
+    try testing.expect(beating.last_heartbeat_time != null);
+    try testing.expectEqual(@as(?Progress, null), try beating.heartbeat_details.get(?Progress, a, 1));
+
+    try beat.pause("maintenance");
+    const paused = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .paused);
+    // The worker ended the running attempt as a pause, not a cancellation.
+    const ended = blk: {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            const d = try beat.describe(a);
+            if (d.raw.last_failure) |f| break :blk f;
+            if (tries == 300) return error.TestUnexpectedResult;
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    };
+    try testing.expectEqualStrings("ActivityPause", failure_mod.applicationType(ended).?);
+    // Ending the paused attempt kept its last heartbeat's details for the next one.
+    try testing.expectEqualStrings("halfway", (try (try beat.describe(a)).heartbeat_details.get(Progress, a, 0)).note);
+    try testing.expectEqual(client_mod.ActivityExecutionStatus.paused, (try beat.describe(a)).status);
+    try beat.unpause(.{ .reason = "maintenance over" });
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        const d = try beat.describe(a);
+        if (d.status == .running and d.attempt > 1 and d.last_started_time != null and
+            d.last_started_time.?.nanoseconds > paused.last_started_time.?.nanoseconds) break;
+        if (tries == 300) return error.TestUnexpectedResult;
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    // Unpausing an activity that isn't paused does nothing.
+    // The server refuses to unpause a running activity, or to pause one twice.
+    try testing.expectError(error.RpcFailed, beat.unpause(.{ .jitter = .fromSeconds(1) }));
+    try beat.pause("again");
+    try testing.expectError(error.RpcFailed, beat.pause("again"));
+    _ = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .paused);
+    try beat.unpause(.{ .reason = "jittered", .jitter = .fromMilliseconds(500) });
+    _ = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .running);
+
+    try beat.delete();
+    try testing.expectError(error.NotFound, beat.describe(a));
+
+    var done = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "charged", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{ "c-9", 5 });
+    defer done.deinit();
+    _ = try done.get(a);
+    try testing.expectError(error.ActivityClosed, done.pause("too late"));
+    try testing.expectError(error.ActivityClosed, done.unpause(.{}));
+    try done.delete();
+    try testing.expectError(error.NotFound, done.describe(a));
+
+    var missing = try c.getActivityHandle(void, "no-such-activity", "");
+    defer missing.deinit();
+    try testing.expectError(error.NotFound, missing.pause("nothing"));
+    try testing.expectError(error.NotFound, missing.unpause(.{}));
+    try testing.expectError(error.NotFound, missing.delete());
+}
+
+const PauseThenCancelFixtures = struct {
+    /// Set when the running attempt has learned of the pause.
+    var learned: Io.Event = .unset;
+    /// Set by the test once it has canceled the activity.
+    var release: Io.Event = .unset;
+
+    /// Heartbeats until canceled, then holds the attempt open until `release`, and ends
+    /// it with the cancellation.
+    fn hold(ctx: *activity.Context) !void {
+        while (true) {
+            ctx.heartbeat({});
+            ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
+                learned.set(ctx.io());
+                release.waitUncancelable(ctx.io());
+                return err;
+            };
+        }
+    }
+    const Hold = activity.Def("PauseThenCancelHold", hold);
+};
+
+test "client: cancelling a standalone activity while its pause reaches the running attempt cancels it" {
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args });
+    defer env.deinit();
+    try env.registerActivity(PauseThenCancelFixtures.Hold);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var held = try c.executeActivity(PauseThenCancelFixtures.Hold, .{ .id = "pause-then-cancel", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(5) }, .{});
+    defer held.deinit();
+    try StandaloneFixtures.waitUntilStarted(&held, a);
+    // An operator pauses the activity, then cancels it before the running attempt it
+    // paused has ended: the caller asked for a cancellation, so the activity must end
+    // canceled, not as a failure of the attempt the pause ended.
+    try held.pause("hold on");
+    var tries: usize = 0;
+    while (!PauseThenCancelFixtures.learned.isSet()) : (tries += 1) {
+        if (tries == 300) {
+            PauseThenCancelFixtures.release.set(testing.io);
+            return error.TestUnexpectedResult;
+        }
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    held.cancel("no longer needed") catch |err| {
+        PauseThenCancelFixtures.release.set(testing.io);
+        return err;
+    };
+    PauseThenCancelFixtures.release.set(testing.io);
+    held.get(a) catch |err| {
+        if (err != error.ActivityCanceled) {
+            const message = if (held.failure()) |f| f.message else "";
+            std.debug.print("activity ended {t}: {s}\n", .{ err, message });
+        }
+        try testing.expectEqual(error.ActivityCanceled, err);
+        return;
+    };
+    return error.TestUnexpectedResult;
+}
+
 test "WorkflowEnvironment runs a child workflow on the same worker, or a test double in its place" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

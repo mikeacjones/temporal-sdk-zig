@@ -95,6 +95,33 @@ pub fn startWorkflows(client: *temporal.client.Client, arena: Allocator) ![]cons
     return greeting;
 }
 
+pub fn controlStandaloneActivity(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
+    // example: client-standalone-activity-control
+    var handle = try client.executeActivity(Greet, .{
+        .id = "greet-later",
+        .task_queue = "greetings",
+        .start_to_close_timeout = .fromSeconds(10),
+        .start_delay = .fromSeconds(1), // no worker gets it before then
+        .priority = .{ .priority_key = 1 },
+        .summary = "greet Grace once the delay passes",
+        .id_conflict_policy = .use_existing,
+    }, .{"Grace"});
+    defer handle.deinit();
+    std.log.info("started a new activity: {}", .{handle.started}); // false if it was running
+    try handle.pause("hold on");
+    try handle.unpause(.{ .reason = "go ahead" });
+    const greeting = try handle.get(arena);
+    const description = try handle.describe(arena);
+    std.log.info("{s}: {s}", .{ description.summary, @tagName(description.status) });
+    if (description.heartbeat_details.len() > 0) {
+        const progress = try description.heartbeat_details.get(u32, arena, 0);
+        std.log.info("last progress: {d}", .{progress});
+    }
+    try handle.delete(); // forget it: describe now returns error.NotFound
+    // end-example
+    return greeting;
+}
+
 /// Holds a greeting that updates change, until the `finish` signal ends it with
 /// "<greeting>, <name>!".
 const Greeter = struct {
@@ -468,6 +495,7 @@ test "client: examples against a dev server" {
     try std.testing.expectEqualStrings("Hi, Ada!", try reset.get(arena));
     try scheduleGreetings(&client, arena);
     try std.testing.expectEqualStrings("Hello, Ada!", try runStandaloneActivity(&client, arena));
+    try std.testing.expectEqualStrings("Hello, Grace!", try controlStandaloneActivity(&client, arena));
 
     var later = try client.executeWorkflow(GreetLaterWorkflow, .{ .task_queue = "greetings" }, .{"Lin"});
     defer later.deinit();

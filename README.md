@@ -555,6 +555,38 @@ Notes:
 - `start_to_close_timeout` or `schedule_to_close_timeout` is required: the client doesn't check and sends the request as given; the server validates it, and a start it refuses is `error.RpcFailed`, logged. `get` returns `error.ActivityFailed`, `ActivityCanceled`, `ActivityTerminated`, or `ActivityTimedOut`, with `failure()`.
 - `cancel` and `terminate` return `error.ActivityClosed` for a closed activity. `listActivities` and `countActivities` cover only standalone activities.
 
+`StartActivityOptions` also takes a `start_delay`, a `priority` (`workflow.Priority`) and a `summary`, and `describe` reads them back. `ActivityHandle` pauses, unpauses and deletes the activity.
+
+<!-- example: client-standalone-activity-control -->
+```zig
+var handle = try client.executeActivity(Greet, .{
+    .id = "greet-later",
+    .task_queue = "greetings",
+    .start_to_close_timeout = .fromSeconds(10),
+    .start_delay = .fromSeconds(1), // no worker gets it before then
+    .priority = .{ .priority_key = 1 },
+    .summary = "greet Grace once the delay passes",
+    .id_conflict_policy = .use_existing,
+}, .{"Grace"});
+defer handle.deinit();
+std.log.info("started a new activity: {}", .{handle.started}); // false if it was running
+try handle.pause("hold on");
+try handle.unpause(.{ .reason = "go ahead" });
+const greeting = try handle.get(arena);
+const description = try handle.describe(arena);
+std.log.info("{s}: {s}", .{ description.summary, @tagName(description.status) });
+if (description.heartbeat_details.len() > 0) {
+    const progress = try description.heartbeat_details.get(u32, arena, 0);
+    std.log.info("last progress: {d}", .{progress});
+}
+try handle.delete(); // forget it: describe now returns error.NotFound
+```
+Notes:
+- `handle.started` is false when `id_conflict_policy = .use_existing` returned the activity already running with the ID.
+- A running attempt learns of `pause` from its next heartbeat as `std.Io` cancellation with `ctx.cancelReason()` `.paused`; the worker ends it as a retryable `ActivityPause` failure, and `describe` reports `.paused`. That failure counts against the retry policy, so pausing a running attempt that is the last `maximum_attempts` allows fails the activity; a cancel requested before the paused attempt ends still ends it canceled. `unpause` schedules the next attempt, within `.jitter` if set.
+- `pause`, `unpause` and `delete` return `error.NotFound` for no such activity, and `pause` and `unpause` return `error.ActivityClosed` for a closed one. The server's other refusals, such as pausing a paused activity or unpausing a running one, are `error.RpcFailed`, logged.
+- `ActivityDescription.heartbeat_details` holds the latest heartbeat's details, decoded through the client's codecs; read each with `get(T, arena, index)`. `delete` terminates a running activity first.
+
 #### Completing activities asynchronously
 
 An activity that finishes elsewhere returns `ctx.completeAsync()` after handing off its task token. Any process that can reach the server then completes it through the client.

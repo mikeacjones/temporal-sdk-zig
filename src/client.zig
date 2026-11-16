@@ -1938,6 +1938,9 @@ pub const Client = struct {
         };
         if (options.retry_policy) |rp| request.retry_policy = try protoRetryPolicy(a, rp);
         if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
+        if (options.summary.len > 0) request.user_metadata = .{ .summary = try converter.toPayload(a, options.summary) };
+        if (options.priority) |p| request.priority = .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight };
+        request.start_delay = protoDuration(options.start_delay);
         var status: ?RpcStatus = null;
         var header = try c.outgoingHeader(a, options.context);
         const response = c.rpcCall(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status, &header, options.context) catch |err| switch (err) {
@@ -1949,7 +1952,9 @@ pub const Client = struct {
             },
             else => |e| return e,
         };
-        return c.getActivityHandle(Result, id, response.run_id);
+        var handle = try c.getActivityHandle(Result, id, response.run_id);
+        handle.started = response.started;
+        return handle;
     }
 
     /// A handle to an activity started with `executeActivity`, for example by another
@@ -2482,11 +2487,30 @@ pub const Client = struct {
     /// request and decode the response with `values` and the workflow or activity the request
     /// names.
     fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values) RpcError!Response {
-        var coded = request;
         var codec_context: converter.CodecContext = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
-        requestIdentity(@TypeOf(coded), &coded, &codec_context);
+        requestIdentity(@TypeOf(request), &request, &codec_context);
+        return c.sendInContext(Response, method, request, arena, status, &codec_context);
+    }
+
+    /// For `worker.Worker`: records a heartbeat of the activity attempt `task_token` with
+    /// `details`, which the codecs encode under the worker's `context` for the activity, as
+    /// its other heartbeats are, and returns the server's answer (whether the activity has
+    /// been canceled, paused or reset). Like the worker's other heartbeats, it bypasses the
+    /// client's interceptors. Memory comes from `arena`.
+    pub fn recordWorkerHeartbeat(c: *Client, arena: Allocator, task_token: []const u8, details: []const converter.Payload, context: *const converter.CodecContext) RpcError!wfs.RecordActivityTaskHeartbeatResponse {
+        var request: wfs.RecordActivityTaskHeartbeatRequest = .{ .namespace = c.namespace, .task_token = task_token, .identity = c.identity };
+        if (details.len > 0) {
+            var payloads: proto.temporal.api.common.v1.Payloads = .{};
+            try payloads.payloads.appendSlice(arena, details);
+            request.details = payloads;
+        }
+        return c.sendInContext(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", request, arena, null, context);
+    }
+
+    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.CodecContext) RpcError!Response {
+        var coded = request;
         if (c.encode_failure_attributes) try failure_mod.encodeAttributes(@TypeOf(coded), &coded, arena);
-        converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io, &codec_context) catch |err| {
+        converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io, codec_context) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: encoding its payloads with the client's codecs failed", .{method});
             return err;
         };
@@ -2524,7 +2548,7 @@ pub const Client = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidResponse,
         };
-        converter.decodeMessage(Response, &response, c.codecs, arena, c.io, &codec_context) catch |err| {
+        converter.decodeMessage(Response, &response, c.codecs, arena, c.io, codec_context) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: decoding the response's payloads with the client's codecs failed", .{method});
             return err;
         };
@@ -3028,6 +3052,16 @@ pub const StartActivityOptions = struct {
     /// Indexed values for `Client.listActivities` queries, built with
     /// `search_attributes.Key.set`; unsets are ignored. Only read while starting.
     search_attributes: []const search_attributes.Update = &.{},
+    /// How long the server waits before scheduling the first attempt. The activity counts
+    /// as running meanwhile, but no worker gets it before the delay has passed. Null
+    /// schedules it at once.
+    start_delay: ?Duration = null,
+    /// The activity's task priority and fairness. Null uses the server's defaults.
+    priority: ?workflow.Priority = null,
+    /// A single-line description of the activity for people reading it in the UI or CLI,
+    /// stored as a JSON string payload (through the codecs); empty sends none. Read it back
+    /// as `ActivityDescription.summary`.
+    summary: []const u8 = "",
     /// Values the client's propagators write into the activity's header; the activity reads
     /// them with `ctx.propagated()`. Only read during the call.
     context: ?*const propagation.Values = null,
@@ -3079,7 +3113,7 @@ pub const ActivityError = error{
     /// No such activity.
     NotFound,
     InvalidResponse,
-    /// `cancel` or `terminate` of an activity that has already closed.
+    /// `cancel`, `terminate`, `pause` or `unpause` of an activity that has already closed.
     ActivityClosed,
 };
 
@@ -3114,8 +3148,21 @@ pub const ActivityDescription = struct {
     close_time: ?Io.Timestamp,
     /// Read a value with `search_attributes.get(arena, key)`.
     search_attributes: search_attributes.View,
-    /// The server's record, with the last heartbeat's details and the last attempt's
-    /// failure, for anything not lifted into the fields above.
+    /// The details of the latest heartbeat, decoded through the client's codecs; read each
+    /// value with `heartbeat_details.get(T, arena, index)`. Empty before the first heartbeat
+    /// with details.
+    heartbeat_details: converter.EncodedValues,
+    /// When the latest heartbeat was recorded; null before the first.
+    last_heartbeat_time: ?Io.Timestamp,
+    /// `StartActivityOptions.start_delay`; null without one, or for a zero delay.
+    start_delay: ?Duration,
+    /// `StartActivityOptions.priority`; null when every field is at its default (the
+    /// server's defaults).
+    priority: ?workflow.Priority,
+    /// `StartActivityOptions.summary`; empty without one.
+    summary: []const u8,
+    /// The server's record, with the last attempt's failure, for anything not lifted into the
+    /// fields above.
     raw: proto.temporal.api.activity.v1.ActivityExecutionInfo,
 };
 
@@ -3151,6 +3198,10 @@ pub fn ActivityHandle(comptime T: type) type {
         id: []u8,
         /// Empty when the handle follows the latest run of `id`.
         run_id: []u8,
+        /// From `Client.executeActivity`: true when the call started a new activity, false
+        /// when `StartActivityOptions.id_conflict_policy = .use_existing` returned the one
+        /// already running with the ID. Always false from `Client.getActivityHandle`.
+        started: bool = false,
         failure_: ?failure_mod.Failure = null,
 
         pub fn deinit(h: *Self) void {
@@ -3238,6 +3289,18 @@ pub fn ActivityHandle(comptime T: type) type {
                 .last_started_time = timestamp(info.last_started_time),
                 .close_time = timestamp(info.close_time),
                 .search_attributes = try .fromProto(arena, info.search_attributes),
+                .heartbeat_details = .{ .payloads = if (info.heartbeat_details) |d| d.payloads.items else &.{} },
+                .last_heartbeat_time = timestamp(info.last_heartbeat_time),
+                .start_delay = if (duration(info.start_delay)) |d| if (d.nanoseconds == 0) null else d else null,
+                .priority = if (info.priority) |p| if (p.priority_key == 0 and p.fairness_key.len == 0 and p.fairness_weight == 0) null else .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight } else null,
+                .summary = summary: {
+                    const md = info.user_metadata orelse break :summary "";
+                    const p = md.summary orelse break :summary "";
+                    break :summary converter.fromPayload([]const u8, arena, p) catch |err| {
+                        log.err("DescribeActivityExecution for activity {s} returned a summary that doesn't decode as a string: {t}", .{ h.id, err });
+                        return error.InvalidResponse;
+                    };
+                },
                 .raw = info,
             };
         }
@@ -3277,6 +3340,24 @@ pub fn ActivityHandle(comptime T: type) type {
             }
         }
 
+        /// `controlError` for `pause` and `unpause`, whose FAILED_PRECONDITION means either a
+        /// closed activity or one in the wrong state (already pausing, or not paused): the
+        /// activity's status tells them apart.
+        fn pauseError(h: *const Self, err: Client.RpcError, status: ?Client.RpcStatus, comptime what: []const u8) ActivityError {
+            const s = status orelse return h.controlError(err, status, what);
+            if (err != error.RpcFailed or s.code != 9) return h.controlError(err, status, what);
+            var arena_state: std.heap.ArenaAllocator = .init(h.client.gpa);
+            defer arena_state.deinit();
+            const d = try h.describe(arena_state.allocator());
+            switch (d.status) {
+                .running, .paused, .unspecified, _ => {
+                    log.warn(what ++ " activity {s} failed: {s} (gRPC status {d})", .{ h.id, s.message, s.code });
+                    return error.RpcFailed;
+                },
+                .completed, .failed, .canceled, .terminated, .timed_out => return error.ActivityClosed,
+            }
+        }
+
         /// Terminates the activity: it closes at once, and a running attempt's result is
         /// discarded. Returns `error.ActivityClosed` if the activity has already closed.
         pub fn terminate(h: *const Self, reason: []const u8) ActivityError!void {
@@ -3294,8 +3375,84 @@ pub fn ActivityHandle(comptime T: type) type {
                 .reason = reason,
             }, a, &status) catch |err| return h.controlError(err, status, "terminating");
         }
+
+        /// Pauses the activity: no new attempt is scheduled until `unpause`, and a running
+        /// attempt learns of the pause from its next heartbeat as `std.Io` cancellation, with
+        /// `ctx.cancelReason()` `.paused`; once it returns `error.Canceled`, the worker ends
+        /// the attempt as a retryable `ActivityPause` failure. `describe` reports the status
+        /// `.paused`. That failure counts against the retry policy: pausing a running attempt
+        /// that is the last `maximum_attempts` allows fails the activity instead. A cancel
+        /// requested before the paused attempt ends still ends the activity canceled.
+        /// `reason` is recorded with the request.
+        /// Returns `error.NotFound` for no such activity, `error.ActivityClosed` if it has
+        /// already closed, and `error.RpcFailed` (logging the server's reason) for anything
+        /// else the server refuses, such as an activity that is already paused or pausing.
+        pub fn pause(h: *const Self, reason: []const u8) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.PauseActivityExecutionResponse, "PauseActivityExecution", wfs.PauseActivityExecutionRequest{
+                .namespace = c.namespace,
+                .activity_id = h.id,
+                .run_id = h.run_id,
+                .identity = c.identity,
+                .reason = reason,
+                .resource_id = try std.fmt.allocPrint(a, "activity:{s}", .{h.id}),
+                .request_id = try uuid(a, c.io),
+            }, a, &status) catch |err| return h.pauseError(err, status, "pausing");
+        }
+
+        /// Resumes a paused activity: its next attempt is scheduled at once, or at a random
+        /// time within `options.jitter`. Errors as for `pause`; unpausing an activity that
+        /// isn't paused returns `error.RpcFailed`.
+        pub fn unpause(h: *const Self, options: UnpauseActivityOptions) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.UnpauseActivityExecutionResponse, "UnpauseActivityExecution", wfs.UnpauseActivityExecutionRequest{
+                .namespace = c.namespace,
+                .activity_id = h.id,
+                .run_id = h.run_id,
+                .identity = c.identity,
+                .reason = options.reason,
+                .jitter = protoDuration(options.jitter),
+                .resource_id = try std.fmt.allocPrint(a, "activity:{s}", .{h.id}),
+                .request_id = try uuid(a, c.io),
+            }, a, &status) catch |err| return h.pauseError(err, status, "unpausing");
+        }
+
+        /// Deletes the activity and its record; a running activity is terminated first.
+        /// Afterwards `describe` and `get` return `error.NotFound`, and visibility queries
+        /// stop listing it once they catch up. Returns `error.NotFound` for no such activity
+        /// and `error.RpcFailed` (logging the server's reason) for anything else the server
+        /// refuses.
+        pub fn delete(h: *const Self) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.DeleteActivityExecutionResponse, "DeleteActivityExecution", wfs.DeleteActivityExecutionRequest{
+                .namespace = c.namespace,
+                .activity_id = h.id,
+                .run_id = h.run_id,
+            }, a, &status) catch |err| return h.controlError(err, status, "deleting");
+        }
     };
 }
+
+/// How `ActivityHandle.unpause` resumes an activity.
+pub const UnpauseActivityOptions = struct {
+    /// Recorded with the request.
+    reason: []const u8 = "",
+    /// Schedules the next attempt at a random time within this long, to spread out many
+    /// activities unpaused at once. Null schedules it at once.
+    jitter: ?Duration = null,
+};
 
 /// The standalone activities matching a visibility query, from `Client.listActivities`.
 /// Fetches a page from the server whenever `next` runs past the last one. Owns its memory
@@ -4458,6 +4615,11 @@ pub fn uuid(arena: Allocator, io: Io) error{OutOfMemory}![]const u8 {
 
 fn timestamp(t: ?proto.google.protobuf.Timestamp) ?Io.Timestamp {
     const v = t orelse return null;
+    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
+}
+
+fn duration(d: ?proto.google.protobuf.Duration) ?Duration {
+    const v = d orelse return null;
     return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
 }
 
