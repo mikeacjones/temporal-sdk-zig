@@ -20,7 +20,7 @@ test "the codecs encrypt with the propagated key and decode without a context" {
     const a = arena.allocator();
 
     const values = try testValues(a, "test");
-    const context: converter.CodecContext = .{ .values = &values };
+    const context: converter.Context = .{ .values = &values };
     const default_payload = try converter.toPayload(a, @as([]const u8, "Testing"));
     const encrypted = try converter.encodePayloadsWithContext(&codec.codecs, a, testing.io, &context, &.{default_payload});
     try testing.expectEqual(@as(usize, 1), encrypted.len);

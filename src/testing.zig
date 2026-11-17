@@ -323,13 +323,18 @@ pub const WorkflowEnvironment = struct {
         /// Encode the message and stack trace of failures the client and its worker send
         /// (`client.Options.encode_failure_attributes`).
         encode_failure_attributes: bool = false,
+        /// The client's failure converter (`client.Options.failure_converter`), which its
+        /// worker and the replay of each finished workflow use too. Borrowed: it must outlive
+        /// the environment.
+        failure_converter: ?converter.FailureConverter = null,
         /// Where the client's sdk-core logs and the worker's workflow and activity logs go
         /// (`client.Options.logger`). Borrowed: it must outlive the environment.
         logger: ?log_mod.Sink = null,
         /// The client's context propagators (`client.Options.propagators`), which its worker
         /// and replays use too. Borrowed: they must outlive the environment.
         propagators: []const propagation.ContextPropagator = &.{},
-        /// Interceptors of the worker's workflows and activities
+        /// Interceptors of the worker's workflows, activities and Nexus requests (the requests
+        /// the worker handles and the operations a workflow calls)
         /// (`client.Options.worker_interceptors`), which replays use too. Borrowed: they must
         /// outlive the environment.
         worker_interceptors: []const interceptor.Worker = &.{},
@@ -357,7 +362,7 @@ pub const WorkflowEnvironment = struct {
     }
 
     /// `startTimeSkipping` with the client's options: codecs, the failure attribute
-    /// encoding, a logger, propagators, worker and client interceptors, and metrics, as
+    /// encoding, the failure converter, a logger, propagators, worker and client interceptors, and metrics, as
     /// `startWithOptions` takes them. `dev_server_extra_args` is for the dev server only: a
     /// non-empty one returns `error.InvalidOptions` before any server starts.
     pub fn startTimeSkippingWithOptions(gpa: Allocator, io: Io, options: Options) !*WorkflowEnvironment {
@@ -417,6 +422,7 @@ pub const WorkflowEnvironment = struct {
         errdefer env.server.stop(io);
         client_options.codecs = options.codecs;
         client_options.encode_failure_attributes = options.encode_failure_attributes;
+        client_options.failure_converter = options.failure_converter;
         client_options.logger = options.logger;
         client_options.propagators = options.propagators;
         client_options.worker_interceptors = options.worker_interceptors;
@@ -826,9 +832,9 @@ pub const WorkflowEnvironment = struct {
             .workflow_execution_continued_as_new_event_attributes => |c| c,
             else => {
                 const outcome: client_mod.ResultError!Result = switch (attrs) {
-                    .workflow_execution_completed_event_attributes => |done| decodeResult(Result, arena, done.result),
+                    .workflow_execution_completed_event_attributes => |done| decodeResult(Result, arena, &env.resultContext(run.id), done.result),
                     .workflow_execution_failed_event_attributes => |failed| blk: {
-                        run.failure_ = failed.failure;
+                        run.failure_ = try env.readFailure(arena, run.id, failed.failure);
                         break :blk error.WorkflowFailed;
                     },
                     .workflow_execution_timed_out_event_attributes => error.WorkflowTimedOut,
@@ -863,7 +869,7 @@ pub const WorkflowEnvironment = struct {
             .continued_as_new => return error.WorkflowContinuedAsNew,
             .returned => |payload| {
                 if (Result == void) return;
-                return converter.fromPayload(Result, arena, payload);
+                return converter.fromPayloadWithContext(Result, arena, &env.resultContext(run.id), payload);
             },
             .failed, .unfinished => {
                 // The time-skipping server records a retried run's failure only on the run
@@ -871,7 +877,7 @@ pub const WorkflowEnvironment = struct {
                 var why = continued.failure;
                 if (why == null and continued.new_execution_run_id.len > 0)
                     why = (try env.startedEvent(arena, run.id, continued.new_execution_run_id)).continued_failure;
-                run.failure_ = why;
+                run.failure_ = try env.readFailure(arena, run.id, why);
                 if (why) |f| if (f.failure_info) |info| if (info == .timeout_failure_info) return error.WorkflowTimedOut;
                 // A run the workflow didn't finish and the server didn't fail.
                 if (outcome == .unfinished and why == null) return error.WorkflowContinuedAsNew;
@@ -908,11 +914,26 @@ pub const WorkflowEnvironment = struct {
         };
     };
 
-    fn decodeResult(comptime Result: type, arena: Allocator, payloads: ?proto.temporal.api.common.v1.Payloads) client_mod.ResultError!Result {
+    fn decodeResult(comptime Result: type, arena: Allocator, context: *const converter.Context, payloads: ?proto.temporal.api.common.v1.Payloads) client_mod.ResultError!Result {
         if (Result == void) return;
         const p = payloads orelse return error.InvalidPayload;
         if (p.payloads.items.len == 0) return error.InvalidPayload;
-        return converter.fromPayload(Result, arena, p.payloads.items[0]);
+        return converter.fromPayloadWithContext(Result, arena, context, p.payloads.items[0]);
+    }
+
+    /// The run's failure `f` as `WorkflowRun.get` reads it: through the client's failure
+    /// converter, with the context of the run's result. Memory from `arena`.
+    fn readFailure(env: *const WorkflowEnvironment, arena: Allocator, workflow_id: []const u8, f: ?failure_mod.Failure) error{OutOfMemory}!?failure_mod.Failure {
+        const v = f orelse return null;
+        const c = env.client.failure_converter orelse return v;
+        return try c.fromFailure(arena, &env.resultContext(workflow_id), v);
+    }
+
+    /// The converter context of the result of workflow `workflow_id`, as
+    /// `client.WorkflowRun.get` decodes it with: the namespace and the workflow ID. Borrows
+    /// `workflow_id`.
+    fn resultContext(env: *const WorkflowEnvironment, workflow_id: []const u8) converter.Context {
+        return .{ .namespace = env.client.namespace, .workflow_id = workflow_id };
     }
 
     /// The started event of run `run_id`, from `arena`.
@@ -1020,6 +1041,7 @@ pub const WorkflowEnvironment = struct {
                 .namespace = env.client.namespace,
                 .task_queue = env.task_queue,
                 .codecs = env.client.codecs,
+                .failure_converter = env.client.failure_converter,
                 .propagators = env.client.propagators,
                 .interceptors = interceptors.items,
             },
@@ -1124,7 +1146,15 @@ pub const ActivityEnvironment = struct {
             .heartbeat_sink = env.on_heartbeat,
             .client_ = env.client,
             .metrics_ = env.metrics,
+            .converter_context_ = .{
+                .namespace = info.workflow_namespace,
+                .workflow_id = info.workflow_id,
+                .workflow_type = info.workflow_type,
+                .activity_type = info.activity_type,
+                .activity_id = info.activity_id,
+            },
         };
+        ctx.converter_context_.values = &ctx.propagated_;
         var run: Running = .{ .ctx = &ctx };
         {
             env.mutex.lockUncancelable(env.io);
@@ -1203,6 +1233,10 @@ pub const WorkflowReplayer = struct {
         /// through a client with codecs is already decoded; codecs pass decoded payloads
         /// through.
         codecs: []const converter.PayloadCodec = &.{},
+        /// The failure converter of the original worker's client
+        /// (`client.Options.failure_converter`), which replayed workflows send and read
+        /// failures through. It must be the one the recording worker used.
+        failure_converter: ?converter.FailureConverter = null,
         /// Context propagators that extract the values workflows read with
         /// `ctx.propagated()`, as the original worker's client did
         /// (`client.Options.propagators`).
@@ -1481,6 +1515,7 @@ pub const WorkflowReplayer = struct {
                     .task_failure_errors = r.options.workflow_task_failure_errors,
                     .deadlock_timeout = r.options.deadlock_detection_timeout,
                     .codecs = r.options.codecs,
+                    .failure_converter = r.options.failure_converter,
                     .propagators = r.options.propagators,
                     .interceptors = r.options.interceptors,
                     .on_evict = Outcome.record,
@@ -7350,6 +7385,82 @@ const StandaloneFollowUpFixtures = struct {
     }
 };
 
+/// A standalone activity's value and failure, each stamped with the converter context it
+/// was decoded with as "namespace|workflow ID|workflow type|activity type|activity ID".
+const StandaloneContextFixtures = struct {
+    fn contextText(arena: Allocator, c: *const converter.Context) error{OutOfMemory}![]const u8 {
+        return std.fmt.allocPrint(arena, "{s}|{s}|{s}|{s}|{s}", .{ c.namespace, c.workflow_id, c.workflow_type, c.activity_type, c.activity_id });
+    }
+
+    /// Its encoding is plain text; decoding records the context it was decoded with.
+    const Stamped = struct {
+        text: []const u8,
+        decoded_with: []const u8 = "",
+
+        pub fn toPayloadWithContext(v: Stamped, arena: Allocator, _: *const converter.Context) error{OutOfMemory}!converter.Payload {
+            return converter.toPayload(arena, v.text);
+        }
+
+        pub fn fromPayloadWithContext(arena: Allocator, context: *const converter.Context, p: converter.Payload) converter.DecodeError!Stamped {
+            return .{ .text = try converter.fromPayload([]const u8, arena, p), .decoded_with = try contextText(arena, context) };
+        }
+    };
+
+    fn echo(_: *activity.Context, v: Stamped) !Stamped {
+        return .{ .text = v.text };
+    }
+    const Echo = activity.Def("StampedEcho", echo);
+
+    fn refuse(_: *activity.Context) !void {
+        return error.Refused;
+    }
+    const Refuse = activity.Def("StampedRefuse", refuse);
+
+    /// Prefixes a received failure's message with "<ctx>"; sends failures as built.
+    const converter_value: converter.FailureConverter = .{ .ptr = undefined, .vtable = &.{ .toFailure = toFailure, .fromFailure = fromFailure } };
+
+    fn toFailure(_: *anyopaque, _: Allocator, _: *const converter.Context, _: ?anyerror, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        return f;
+    }
+
+    fn fromFailure(_: *anyopaque, arena: Allocator, context: *const converter.Context, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        var out = f;
+        out.message = try std.fmt.allocPrint(arena, "<{s}> {s}", .{ try contextText(arena, context), f.message });
+        return out;
+    }
+};
+
+test "client: a standalone activity's handle decodes its result and failure with the activity type it was started with" {
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .dev_server_extra_args = &DevServer.standalone_activity_args,
+        .failure_converter = StandaloneContextFixtures.converter_value,
+    });
+    defer env.deinit();
+    try env.registerActivity(StandaloneContextFixtures.Echo);
+    try env.registerActivity(StandaloneContextFixtures.Refuse);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var echoed = try c.executeActivity(StandaloneContextFixtures.Echo, .{ .id = "stamped-echo", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{.{ .text = "solo" }});
+    defer echoed.deinit();
+    const result = try echoed.get(a);
+    try testing.expectEqualStrings("solo", result.text);
+    try testing.expectEqualStrings("default|||StampedEcho|stamped-echo", result.decoded_with);
+
+    // A handle from the ID alone doesn't know the type.
+    var by_id = try c.getActivityHandle(StandaloneContextFixtures.Stamped, "stamped-echo", "");
+    defer by_id.deinit();
+    try testing.expectEqualStrings("default||||stamped-echo", (try by_id.get(a)).decoded_with);
+
+    var refused = try c.executeActivityByName(void, "StampedRefuse", .{ .id = "stamped-refuse", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10), .retry_policy = .{ .maximum_attempts = 1 } }, .{});
+    defer refused.deinit();
+    try testing.expectError(error.ActivityFailed, refused.get(a));
+    try testing.expectEqualStrings("<default|||StampedRefuse|stamped-refuse> Refused", refused.failure().?.message);
+}
+
 test "client: a standalone activity starts with a delay, a priority and a summary, and reports whether it started" {
     StandaloneFixtures.reset();
     const zlib: converter.ZlibCodec = .{ .always_encode = true };
@@ -8622,7 +8733,7 @@ const KeyIdCodec = struct {
         return decodeWithContext(ptr, arena, io, &.{}, payloads);
     }
 
-    fn encodeWithContext(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+    fn encodeWithContext(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
         const k: *KeyIdCodec = @ptrCast(@alignCast(ptr));
         const id = context.values.get(key_id) orelse {
             _ = k.without_key.fetchAdd(1, .monotonic);
@@ -8638,7 +8749,7 @@ const KeyIdCodec = struct {
         return out;
     }
 
-    fn decodeWithContext(_: *anyopaque, arena: Allocator, _: Io, _: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+    fn decodeWithContext(_: *anyopaque, arena: Allocator, _: Io, _: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
         const out = try arena.dupe(converter.Payload, payloads);
         for (out) |*p| {
             const id = keyIdOf(p.*) orelse continue;

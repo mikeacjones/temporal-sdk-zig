@@ -53,6 +53,62 @@ test "converter: values round-trip through payloads" {
     try testing.expectEqualStrings("json/protobuf", converter.encodingOf(proto_json).?);
 }
 
+// example: converter-context-hooks
+/// Records the workflow it was sent for, and refuses to decode for another.
+const Ticket = struct {
+    seat: []const u8,
+
+    pub fn toPayloadWithContext(t: Ticket, arena: Allocator, context: *const converter.Context) error{OutOfMemory}!converter.Payload {
+        var p = try converter.payloadWithEncoding(arena, "text/ticket", t.seat);
+        try p.metadata.append(arena, .{ .key = "workflow-id", .value = context.workflow_id });
+        return p;
+    }
+
+    pub fn fromPayloadWithContext(arena: Allocator, context: *const converter.Context, p: converter.Payload) converter.DecodeError!Ticket {
+        const enc = converter.encodingOf(p) orelse return error.UnknownEncoding;
+        if (!std.mem.eql(u8, enc, "text/ticket")) return error.UnknownEncoding;
+        for (p.metadata.items) |m| {
+            if (std.mem.eql(u8, m.key, "workflow-id") and !std.mem.eql(u8, m.value, context.workflow_id)) return error.InvalidPayload;
+        }
+        return .{ .seat = try arena.dupe(u8, p.data) };
+    }
+};
+
+fn checkIn(ctx: *activity.Context, ticket: Ticket) ![]const u8 {
+    // The activity's context names its workflow, its type and its ID.
+    return std.fmt.allocPrint(ctx.allocator(), "{s} for {s}", .{ ticket.seat, ctx.converterContext().workflow_id });
+}
+
+fn board(ctx: *workflow.Context, ticket: Ticket) ![]const u8 {
+    // The client encoded `ticket` for this workflow's ID; the activity's argument is
+    // encoded and decoded with the activity's context, which names the same workflow.
+    return ctx.executeActivity(CheckIn, .{ .start_to_close_timeout = .fromSeconds(10) }, .{ticket}).get();
+}
+// end-example
+
+const CheckIn = activity.Def("check_in", checkIn);
+const Board = workflow.Def("board", board);
+
+test "converter: a type's context hooks see the workflow its value is sent for" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const for_one: converter.Context = .{ .namespace = "default", .workflow_id = "board-1" };
+    const p = try converter.toPayloadWithContext(arena, &for_one, Ticket{ .seat = "12A" });
+    try testing.expectEqualStrings("12A", (try converter.fromPayloadWithContext(Ticket, arena, &for_one, p)).seat);
+    try testing.expectError(error.InvalidPayload, converter.fromPayloadWithContext(Ticket, arena, &.{ .workflow_id = "board-2" }, p));
+    // Without a context the hooks get the empty one.
+    try testing.expectError(error.InvalidPayload, converter.fromPayload(Ticket, arena, p));
+
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Board);
+    try env.registerActivity(CheckIn);
+    const seat = try env.executeWorkflowWithOptions(Board, .{ .id = "board-1" }, .{.{ .seat = "12A" }}, arena, null);
+    try testing.expectEqualStrings("12A for board-1", seat);
+}
+
 test "converter: ProtoJSON of protobuf messages" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -270,4 +326,68 @@ test "converter: encoded failure attributes" {
     try temporal.failure.decodeAttributes(temporal.Failure, &f, arena);
     try testing.expectEqualStrings("card 4242 declined", f.message);
     // end-example
+}
+
+// example: converter-failure-converter
+/// Masks the digits in the messages of every failure user code sends, causes included, so
+/// card numbers never reach history. It keeps no state that changes, so it is deterministic
+/// and safe to call from any thread, as a failure converter must be.
+const Masking = struct {
+    mask: u8 = '*',
+
+    pub fn failureConverter(m: *const Masking) converter.FailureConverter {
+        return .{ .ptr = @constCast(m), .vtable = &.{ .toFailure = toFailure, .fromFailure = fromFailure } };
+    }
+
+    fn toFailure(ptr: *anyopaque, arena: Allocator, _: *const converter.Context, _: ?anyerror, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        const m: *const Masking = @ptrCast(@alignCast(ptr));
+        return m.masked(arena, f);
+    }
+
+    /// Failures are read as they arrive: they were masked when sent.
+    fn fromFailure(_: *anyopaque, _: Allocator, _: *const converter.Context, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        return f;
+    }
+
+    fn masked(m: *const Masking, arena: Allocator, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        var out = f;
+        const message = try arena.dupe(u8, f.message);
+        for (message) |*c| if (std.ascii.isDigit(c.*)) {
+            c.* = m.mask;
+        };
+        out.message = message;
+        if (f.cause) |cause| {
+            out.cause = try arena.create(converter.Failure);
+            out.cause.?.* = try m.masked(arena, cause.*);
+        }
+        return out;
+    }
+};
+
+fn chargeCardNumber(ctx: *activity.Context, card: []const u8) !void {
+    return ctx.fail(.{ .message = try std.fmt.allocPrint(ctx.allocator(), "card {s} declined", .{card}), .type = "Declined", .non_retryable = true });
+}
+
+fn payByCard(ctx: *workflow.Context, card: []const u8) !void {
+    return ctx.executeActivity(ChargeCardNumber, .{ .start_to_close_timeout = .fromSeconds(10) }, .{card}).get();
+}
+// end-example
+
+const ChargeCardNumber = activity.Def("charge_card_number", chargeCardNumber);
+const PayByCard = workflow.Def("pay_by_card", payByCard);
+
+test "converter: a failure converter masks what failures send" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const masking: Masking = .{};
+    const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        // client.Options.failure_converter: the client, its workers and replays use it.
+        .failure_converter = masking.failureConverter(),
+    });
+    defer env.deinit();
+    try env.registerWorkflow(PayByCard);
+    try env.registerActivity(ChargeCardNumber);
+    var failure: ?temporal.failure.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(PayByCard, .{"4242"}, arena.allocator(), &failure));
+    try testing.expectEqualStrings("card **** declined", temporal.failure.rootCause(&failure.?).message);
 }

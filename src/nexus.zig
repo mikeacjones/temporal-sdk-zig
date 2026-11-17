@@ -547,6 +547,10 @@ pub const Context = struct {
     /// Set by `fail`, `failCanceled`, and `handlerError`, and reported when the handler
     /// returns the error they gave back.
     pending: ?union(enum) { operation: OperationError, handler: HandlerError } = null,
+    /// The error the handler returned, set by the SDK when the request's failure is built
+    /// from it; the worker then passes that failure through the client's failure converter
+    /// (`client.Options.failure_converter`) with it.
+    returned_error_: ?anyerror = null,
     /// Written once by the worker when a cancel arrives, possibly from another thread.
     cancel_reason_: std.atomic.Value(u8) = .init(not_canceled),
 
@@ -670,6 +674,7 @@ pub const Context = struct {
 
     /// The result for `err`, returned by the handler of `operation` in `service`.
     fn errorResult(ctx: *Context, comptime service: []const u8, comptime operation: []const u8, err: anyerror) HandlerOutcome {
+        ctx.returned_error_ = err;
         if (ctx.pending) |p| switch (p) {
             .operation => |o| if (err == error.OperationFailed or err == error.OperationCanceled) return .{ .operation_error = o },
             .handler => |h| if (err == error.HandlerError) return .{ .handler_error = h },
@@ -850,7 +855,7 @@ fn Implementation(comptime service: []const u8, comptime Op: type, comptime func
 
         fn encodeOutput(ctx: *Context, value: shape.Value) StartResult {
             const a = ctx.arena;
-            const payload = converter.toPayload(a, value) catch return outOfMemory(what);
+            const payload = converter.toPayloadWithContext(a, &codecContext(ctx), value) catch return outOfMemory(what);
             if (ctx.codecs.len == 0) return .{ .succeeded = .{ .result = payload } };
             const encoded = converter.encodePayloadsWithContext(ctx.codecs, a, ctx.io_, &codecContext(ctx), &.{payload}) catch |err| return .{ .handler_error = .{
                 .type = .internal,
@@ -861,7 +866,9 @@ fn Implementation(comptime service: []const u8, comptime Op: type, comptime func
     };
 }
 
-fn codecContext(ctx: *const Context) converter.CodecContext {
+// What the codecs and the payload converter see for a request: the namespace and the
+// propagated values, since the caller is no workflow or activity of this worker.
+fn codecContext(ctx: *const Context) converter.Context {
     return .{ .namespace = ctx.info_.namespace, .values = &ctx.propagated_ };
 }
 
@@ -882,7 +889,7 @@ fn decodeInput(comptime T: type, comptime what: []const u8, ctx: *Context, input
         };
         payload = decoded[0];
     }
-    return converter.fromPayload(T, a, payload) catch |err| {
+    return converter.fromPayloadWithContext(T, a, &codecContext(ctx), payload) catch |err| {
         if (err == error.OutOfMemory) {
             failed.* = .{ .type = .internal, .message = what ++ ": out of memory decoding its input" };
             return error.Failed;

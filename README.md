@@ -1305,7 +1305,7 @@ Notes:
 - An update handler's listed error doesn't reject or fail the update: the retried task runs the handler again and answers it. An update delivered in the failed task was never accepted, so the server delivers it again and its validator runs again. An update handler's unlisted errors, `error.OutOfMemory` included, and errors from update validators reject the update as before.
 - Listing `error.Canceled` doesn't stop a cancellation: the workflow function or a signal handler that returns it cancels the workflow, listed or not. An update handler that returns a listed `error.Canceled` fails the task, where unlisted it rejects the update. Listing `error.ContinueAsNew` doesn't stop a continue-as-new the workflow function requested with `ctx.continueAsNew`; only returning it otherwise (without the request, or from a signal handler) then fails the task instead of the workflow.
 - Without `nondeterminism_fails_workflow`, a nondeterministic run fails its task and waits for code that matches. With it, the run fails with the nondeterminism failure. The definition's option needs a workflow type name, so a dynamic workflow takes only the worker's (`DynamicDefWithOptions` rejects it at compile time).
-- What happens to a failed workflow task: it is reported to the server only on its first attempt, which records it in history and retries it at once. A retry that fails again is not reported; the server retries it once the workflow task timeout (`StartWorkflowOptions.task_timeout`, 10 s by default) passes, so code that keeps failing retries about once per task timeout until it is fixed or the run is terminated. The worker logs each failure. [Deadlock detection](#deadlock-detection) and the [workflow memory limit](#workflow-memory-limit), under Workers, fail tasks the same way.
+- What happens to a failed workflow task: it is reported to the server only on its first attempt, which records it in history and retries it at once. A retry that fails again is not reported; the server retries it once the workflow task timeout (`StartWorkflowOptions.task_timeout`, 10 s by default) passes, so code that keeps failing retries about once per task timeout until it is fixed or the run is terminated. What is logged depends on why the task failed. For a listed error, sdk-core logs the warning "Failing workflow task" with the run ID and the failure through the client's logger when it reports the task's first attempt; a later attempt gets only a debug line from sdk-core, which the default `client.Options.core_log_level` (`.warn`) hides, so at the default levels a task that keeps failing on a listed error shows that one warning. Besides that, the worker logs the eviction that follows each such failed attempt at debug level through its logger (`worker.Options.logger`), with the run ID and the failure message; the default sink, `std.log`, shows it in Debug builds. A nondeterministic run, [deadlock detection](#deadlock-detection) and the [workflow memory limit](#workflow-memory-limit), under Workers, log at error level on every attempt; the last two fail tasks the same way as a listed error.
 - `@panic` in workflow code, and in Debug and ReleaseSafe builds safety-checked illegal behavior such as integer overflow or an out-of-bounds index, ends the worker process: Zig has no way to recover from a panic. The workflow task that was running gets no completion, so the server retries it once its workflow task timeout passes, on whichever worker polls the task queue then (the restarted one, or another). Every run cached on the process is replayed from history by its next task. Code that panics on every attempt ends every worker that takes its task, so return an error instead, and list it if it should fail the task.
 - `testing.WorkflowReplayer.Options.workflow_task_failure_errors` replays with the worker's list. Replay doesn't re-run a task that failed: a history in which a listed error failed a task replays with code that no longer returns it, and code that still does fails replay with `error.ReplayFailed`.
 
@@ -1795,10 +1795,59 @@ try testing.expectEqualStrings("greeting-1", (try later.get(Execution, arena)).w
 Notes:
 
 - A `converter.Payload` passes through as is. `void` and null encode as `binary/null`, `converter.Bytes` as `binary/plain`, protobuf messages as ProtoJSON (`converter.ProtoBinary` as `binary/protobuf`), and everything else, strings included, as JSON through `std.json`.
-- A type that declares `pub fn toPayload(self, arena)` and `pub fn fromPayload(arena, payload)` encodes itself, also as an optional.
+- A type that declares `pub fn toPayload(self, arena)` and `pub fn fromPayload(arena, payload)` encodes itself, also as an optional. It may declare the context hooks below instead.
 - Decoded strings and slices come from the arena passed in; an encoded payload may borrow the value's bytes.
 - `fromPayload` returns `error.UnknownEncoding` for a payload with no `encoding` or with one the converter doesn't handle, which for a protobuf message type is anything but `binary/null` and the two protobuf encodings.
 - It returns `error.InvalidPayload` for `binary/null` into a type that isn't `void` or optional, `binary/plain` into anything but `converter.Bytes` or a byte slice, and JSON or protobuf data that doesn't parse as the type.
+
+A type that needs to know what its value is for, such as one that picks its encoding by namespace or by workflow, declares `toPayloadWithContext` and `fromPayloadWithContext` instead. They receive a `converter.Context`: the namespace, the workflow ID and type, for an activity's values the activity type and ID, and the propagated values, which is also what payload codecs receive.
+
+<!-- example: converter-context-hooks -->
+```zig
+/// Records the workflow it was sent for, and refuses to decode for another.
+const Ticket = struct {
+    seat: []const u8,
+
+    pub fn toPayloadWithContext(t: Ticket, arena: Allocator, context: *const converter.Context) error{OutOfMemory}!converter.Payload {
+        var p = try converter.payloadWithEncoding(arena, "text/ticket", t.seat);
+        try p.metadata.append(arena, .{ .key = "workflow-id", .value = context.workflow_id });
+        return p;
+    }
+
+    pub fn fromPayloadWithContext(arena: Allocator, context: *const converter.Context, p: converter.Payload) converter.DecodeError!Ticket {
+        const enc = converter.encodingOf(p) orelse return error.UnknownEncoding;
+        if (!std.mem.eql(u8, enc, "text/ticket")) return error.UnknownEncoding;
+        for (p.metadata.items) |m| {
+            if (std.mem.eql(u8, m.key, "workflow-id") and !std.mem.eql(u8, m.value, context.workflow_id)) return error.InvalidPayload;
+        }
+        return .{ .seat = try arena.dupe(u8, p.data) };
+    }
+};
+
+fn checkIn(ctx: *activity.Context, ticket: Ticket) ![]const u8 {
+    // The activity's context names its workflow, its type and its ID.
+    return std.fmt.allocPrint(ctx.allocator(), "{s} for {s}", .{ ticket.seat, ctx.converterContext().workflow_id });
+}
+
+fn board(ctx: *workflow.Context, ticket: Ticket) ![]const u8 {
+    // The client encoded `ticket` for this workflow's ID; the activity's argument is
+    // encoded and decoded with the activity's context, which names the same workflow.
+    return ctx.executeActivity(CheckIn, .{ .start_to_close_timeout = .fromSeconds(10) }, .{ticket}).get();
+}
+```
+
+Notes:
+
+- The hooks are `pub fn toPayloadWithContext(self, arena, context)` and `pub fn fromPayloadWithContext(arena, context, payload)`. They take precedence over `toPayload` and `fromPayload`, for the type and for optionals of it, at the top level of a payload. Declaring only one of the two is a compile error. Types with only `toPayload` and `fromPayload`, and the built-in encodings, convert as before.
+- `converter.toPayloadWithContext`, `fromPayloadWithContext`, `toPayloadsWithContext` and `fromPayloadsWithContext` convert with a context. The functions without it pass the empty context: every string empty and no propagated values.
+- The SDK passes the context of the call a value belongs to:
+  - On a client: the namespace, workflow ID and workflow type for a workflow's start arguments (with signal-with-start and update-with-start), the namespace and workflow ID for signals, queries, updates and their results, terminate details and `WorkflowRun.get`, the namespace, activity ID and activity type for a standalone activity's arguments and result (the type is empty for a handle from `getActivityHandle`, which doesn't know it) and for `ActivityDescription.heartbeat_details`, and the namespace, workflow ID and activity ID for the `...ById` activity completion calls. The calls by task token carry the namespace only. The client call's `.context` values are the propagated values.
+  - In a workflow: the run's context (`ctx.converterContext()`) for its arguments, result, signals, queries, updates, side effects and `lastCompletionResult`, with the new type for continue-as-new arguments. An activity's or local activity's arguments and result carry its type and ID (`future.converterContext()`); a child's arguments, result and signals carry its ID and type; an external signal carries its target's workflow ID. A Nexus operation's input and result carry the namespace and propagated values only.
+  - On the activity worker: the activity's context (`ctx.converterContext()`) for its arguments, result and heartbeat details, with an empty workflow ID and type for a standalone activity. A Nexus handler's input and output carry the namespace and propagated values.
+- Failure details are encoded and decoded by your code, so pass the context yourself: `converter.toPayloadWithContext(arena, ctx.converterContext(), value)` to encode, and `details.withContext(future.converterContext()).get(T, arena, 0)` to decode. `EncodedValues.withContext` and `EncodedValue.withContext` return a copy that decodes with the context; the ones the SDK hands you already carry theirs.
+- These conversions have no context, and a context hook receives the empty one: your own calls to `toPayload`, `fromPayload`, `toPayloads`, `fromPayloads`, `toFields` and `fieldValue`; an `EncodedValues` or `EncodedValue` built without one, including those from `failure.kind`; memos; search attributes; headers and propagators; summaries and details in user metadata; schedule action arguments; and the codec server.
+- The context names what the caller knows, and the two sides of a value don't always agree. The workflow type and activity type are set only where the caller knows them. An activity's arguments are encoded before the outbound interceptors and before the activity is scheduled, so their activity ID is `ActivityOptions.activity_id` or the ID the SDK will assign; an interceptor that changes the ID or schedules another activity first makes it differ. A local activity retried after a backoff timer gets a new ID while its arguments stay as first encoded. A child's arguments carry an empty workflow ID when the SDK generates the ID. Set `activity_id` and `ChildWorkflowOptions.id` when a hook depends on them.
+- The hooks run inside workflow code when a workflow converts, so they must be deterministic and must not block or do I/O. They also run concurrently on workflow, activity and client threads, so they must not rely on unsynchronized shared state. The context is borrowed for the call: copy anything a hook keeps.
 
 `temporal.protojson.encode` and `temporal.protojson.decode` write and read any generated protobuf message as ProtoJSON, the form the Temporal CLI, the Web UI and codec servers use: history exports, codec server requests and answers, and `json/protobuf` payloads, which `converter` converts with them.
 
@@ -1850,7 +1899,7 @@ Notes:
 
 - Codecs run in order on the way out and in reverse on the way in. Search attributes are never encoded. The codecs are borrowed and must outlive the client.
 - A codec returns as many payloads as it was given and passes through payloads it didn't encode. It runs on many threads at once, never in workflow code.
-- `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.CodecContext`: namespace, workflow, activity, and propagated values.
+- `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.Context`: namespace, workflow, activity, and propagated values.
 - `converter.codecHandler(codecs, options)` serves `POST /encode` and `/decode` for the Temporal Web UI and CLI. It doesn't authenticate callers.
 
 #### Failures
@@ -1965,6 +2014,54 @@ try temporal.failure.decodeAttributes(temporal.Failure, &f, arena);
 try testing.expectEqualStrings("card 4242 declined", f.message);
 ```
 
+A failure converter (`converter.FailureConverter`) decides how failures look on the wire. The SDK still turns an error into a failure itself (from its name, or from `ctx.fail`); the converter's `toFailure` then gets that failure, the error, and the `converter.Context` it is for, and returns the failure to send, and its `fromFailure` gets each failure that arrives and returns the one user code reads. Set it with `client.Options.failure_converter`, beside `codecs` (or `testing.WorkflowEnvironment.Options.failure_converter`, here as `.failure_converter = masking.failureConverter()`); the client, every worker on it, and replays use it:
+
+<!-- example: converter-failure-converter -->
+```zig
+/// Masks the digits in the messages of every failure user code sends, causes included, so
+/// card numbers never reach history. It keeps no state that changes, so it is deterministic
+/// and safe to call from any thread, as a failure converter must be.
+const Masking = struct {
+    mask: u8 = '*',
+
+    pub fn failureConverter(m: *const Masking) converter.FailureConverter {
+        return .{ .ptr = @constCast(m), .vtable = &.{ .toFailure = toFailure, .fromFailure = fromFailure } };
+    }
+
+    fn toFailure(ptr: *anyopaque, arena: Allocator, _: *const converter.Context, _: ?anyerror, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        const m: *const Masking = @ptrCast(@alignCast(ptr));
+        return m.masked(arena, f);
+    }
+
+    /// Failures are read as they arrive: they were masked when sent.
+    fn fromFailure(_: *anyopaque, _: Allocator, _: *const converter.Context, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        return f;
+    }
+
+    fn masked(m: *const Masking, arena: Allocator, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        var out = f;
+        const message = try arena.dupe(u8, f.message);
+        for (message) |*c| if (std.ascii.isDigit(c.*)) {
+            c.* = m.mask;
+        };
+        out.message = message;
+        if (f.cause) |cause| {
+            out.cause = try arena.create(converter.Failure);
+            out.cause.?.* = try m.masked(arena, cause.*);
+        }
+        return out;
+    }
+};
+
+fn chargeCardNumber(ctx: *activity.Context, card: []const u8) !void {
+    return ctx.fail(.{ .message = try std.fmt.allocPrint(ctx.allocator(), "card {s} declined", .{card}), .type = "Declined", .non_retryable = true });
+}
+
+fn payByCard(ctx: *workflow.Context, card: []const u8) !void {
+    return ctx.executeActivity(ChargeCardNumber, .{ .start_to_close_timeout = .fromSeconds(10) }, .{card}).get();
+}
+```
+
 Notes:
 
 - `cause` is borrowed only until the call it is given to returns: `ctx.fail`, `Client.failActivity` and `failActivityById`, `interceptor.rejectActivity`, `rejectChildWorkflow` and `rejectNexusOperation`, and the cause of a Nexus `ctx.handlerError` copy the chain (and the `details` list), so it may point at the stack. A future's failure (`future.failure()`) works as is.
@@ -1973,6 +2070,12 @@ Notes:
 - Encoded attributes are a `json/plain` payload of `{"message": ..., "stack_trace": ...}` (`failure.EncodedAttributes`), the format other Temporal SDKs read and write; the failure travels with the message "Encoded failure" and an empty stack trace. Each cause in the chain is encoded the same way. Type, details and the rest stay where they are. A failure that already has encoded attributes (one passed on that this side couldn't decode) is sent as received, and a failed query's answer isn't encoded: it never reaches history, and the server returns its message in the clear.
 - Received failures are decoded back after the codecs whatever the option says, so a client or worker reads failures from senders that encode them. One whose `encoded_attributes` doesn't decode (a codec this side lacks, another format) is left as received: a client without the codec reads "Encoded failure".
 - `failure.encodeAttributes` and `failure.decodeAttributes` do the same to any protobuf message, for code that handles raw requests.
+- `toFailure` runs for the workflow's own failure (its function's or a signal handler's error, `ctx.fail`, `ctx.failWith`, or a future's failure it returns), update rejections from validators and handlers, query failures, the failures of activities and local activities, a Nexus handler's error, and `Client.failActivity` and `failActivityById` (where `err` is null). `fromFailure` runs for the failures a workflow reads of activities, local activities, children, Nexus operations, external signals and cancels, and `ctx.previousRunFailure()`, and for those `WorkflowRun.failure()`, `WorkflowUpdateHandle.failure()` and `ActivityHandle.failure()` return on a client. Each failure passes each way once per hop, so a failure a workflow passes on was read through `fromFailure` and is sent through `toFailure`.
+- The converter gets the head of the cause chain; visiting the causes is its own choice. The failure it returns may borrow from the one it was given; anything else it allocates comes from the `arena` it is passed.
+- It runs inside workflow code for the failures a workflow sends and receives, and replay runs it again, so it must be deterministic and must not block or do I/O: one that blocks there is reported as a deadlock. It is called concurrently from workflow, activity, Nexus and client threads. A `testing.WorkflowReplayer` must be given the converter the recording worker used (`Options.failure_converter`).
+- The context is the one the call's payloads get (see [Payloads](#payloads)): the run's for the workflow's own failures, the activity's or child's for theirs, the namespace and propagated values for Nexus.
+- Failures the SDK makes for its own reports (workflow task failures, unregistered activities, queries and updates, codec failures, cancel acknowledgements) and those it builds for user code without the server (an interceptor's refusal, a child that couldn't start, a canceled local activity) aren't converted, nor is a failed query's message on the client.
+- `encode_failure_attributes` applies after `toFailure` and is undone before `fromFailure`, so the converter always sees plain messages.
 
 #### External payload storage
 <!-- stub: temporal-sdk-zig-d51.4.9 -->

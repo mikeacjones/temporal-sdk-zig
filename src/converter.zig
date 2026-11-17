@@ -49,9 +49,68 @@
 //!         }
 //!     };
 //!
+//! A type that needs to know what its value is for declares both of
+//!
+//!     pub fn toPayloadWithContext(self: T, arena: Allocator, context: *const Context) error{OutOfMemory}!Payload
+//!     pub fn fromPayloadWithContext(arena: Allocator, context: *const Context, p: Payload) DecodeError!T
+//!
+//! instead, or as well: they take precedence over `toPayload` and `fromPayload`, with the same
+//! reach (the type and optionals of it, at the top level of a payload). Declaring only one of
+//! the two is a compile error. `Context` is what payload codecs receive too: the namespace,
+//! the workflow ID and type, for an activity's values the activity type and ID, and the
+//! propagated values. `toPayloadWithContext`, `fromPayloadWithContext`,
+//! `toPayloadsWithContext` and `fromPayloadsWithContext` convert with one; `toPayload`,
+//! `fromPayload`, `toPayloads` and `fromPayloads` pass the empty context (every string empty,
+//! no values). The SDK passes the context of the call a value belongs to:
+//!
+//! | Conversion                                                    | Context                                      |
+//! |---------------------------------------------------------------|----------------------------------------------|
+//! | client: workflow start, signal-with-start, update-with-start | namespace, workflow ID and type, `.context`  |
+//! | client: signal, query, update, terminate details, results    | namespace, workflow ID, `.context`           |
+//! | client: standalone activity arguments and result             | namespace, activity ID (and type when known) |
+//! | client: `...ById` activity calls                             | namespace, workflow ID, activity ID          |
+//! | client: activity calls by task token                         | namespace                                    |
+//! | workflow: arguments, result, signals, queries, updates,      | the run's (`workflow.Context.converterContext`) |
+//! |   side effects, `lastCompletionResult`                       |                                              |
+//! | workflow: continue-as-new arguments                          | the run's, with the new workflow type        |
+//! | workflow: activity and local activity arguments and results  | the run's, with the activity type and ID     |
+//! | workflow: child arguments, result and signals                | namespace, the child's workflow ID and type  |
+//! | workflow: external signal arguments                          | namespace, the target workflow ID            |
+//! | workflow and Nexus handler: Nexus input and result           | namespace and propagated values              |
+//! | activity: arguments, result, heartbeat details               | the activity's (`activity.Context.converterContext`) |
+//!
+//! These have no context, and a context hook receives the empty one: user code calling
+//! `toPayload`, `fromPayload`, `toPayloads`, `fromPayloads`, `toFields` or `fieldValue`; an
+//! `EncodedValues` or `EncodedValue` built without one, including those from `failure.kind`;
+//! memos; search attributes; headers and propagators (`HeaderWriter.set`, `Header.value`);
+//! summaries and details in user metadata; schedule action arguments; and the codec server.
+//! Failure details are user code's to convert: encode them with
+//! `toPayloadWithContext(arena, ctx.converterContext(), value)` and decode them with
+//! `details.withContext(future.converterContext())`.
+//!
+//! The two sides of a value don't always agree. The workflow and activity types are set only
+//! where the caller knows them. An activity's arguments are encoded before the outbound
+//! interceptors and before it is scheduled: their activity ID is `ActivityOptions.activity_id`,
+//! or the ID the SDK will assign, which differs if an interceptor changes the ID or schedules
+//! another activity first. A local activity retried after a backoff timer is scheduled under a
+//! new ID while its arguments stay as first encoded. A child's arguments carry an empty
+//! workflow ID when the SDK generates the ID. Completion by task token carries the namespace
+//! only, and a Nexus handler may be in another namespace. Set `activity_id` and
+//! `ChildWorkflowOptions.id` when a hook depends on them.
+//!
+//! Context hooks run inside workflow code when a workflow converts, so they must be
+//! deterministic and must not block or do I/O. They run concurrently on workflow, activity
+//! and client threads, so they must not rely on unsynchronized shared state. The context is
+//! borrowed for the call: copy anything a hook keeps.
+//!
 //! Conversion turns values into payloads; payload codecs (`PayloadCodec`) then transform
 //! the payloads themselves, for example to compress or encrypt them. `codecHandler` serves
 //! codecs over HTTP, so the Web UI and CLI can show payloads only the codecs can decode.
+//!
+//! Errors become failures (`Failure`) by a fixed step: an error's name, or the
+//! `failure.Application` given to `ctx.fail`. A `FailureConverter`, set with
+//! `client.Options.failure_converter`, then transforms each failure user code sends and each
+//! failure it receives, before user code reads it.
 
 const std = @import("std");
 const proto = @import("proto.zig");
@@ -64,7 +123,9 @@ pub const Payloads = proto.temporal.api.common.v1.Payloads;
 const codec = @import("converter/codec.zig");
 pub const CodecError = codec.CodecError;
 pub const PayloadCodec = codec.PayloadCodec;
-pub const CodecContext = codec.CodecContext;
+pub const Context = codec.Context;
+/// Deprecated: use `Context`.
+pub const CodecContext = Context;
 pub const ZlibCodec = codec.ZlibCodec;
 pub const encodePayloads = codec.encodePayloads;
 pub const decodePayloads = codec.decodePayloads;
@@ -77,6 +138,61 @@ const codec_handler = @import("converter/codec_handler.zig");
 pub const CodecHandler = codec_handler.CodecHandler;
 pub const CodecHandlerOptions = codec_handler.CodecHandlerOptions;
 pub const codecHandler = codec_handler.codecHandler;
+
+/// A Temporal failure, as `failure.Failure`.
+pub const Failure = proto.temporal.api.failure.v1.Failure;
+
+/// Transforms failures on their way between user code and the server, for example to
+/// rewrite their messages, move details into payloads, or redact them. Set it with
+/// `client.Options.failure_converter`; the client, every worker on it, and the replayer
+/// (`testing.WorkflowReplayer.Options.failure_converter`) use it. Without one, failures are
+/// sent and read as the SDK builds and receives them.
+///
+/// `toFailure` runs where an error of user code becomes a failure: the workflow's own
+/// failure (its function's or a signal handler's error, `ctx.fail`, `ctx.failWith`, or a
+/// future's failure it returns), update rejections from validators and handlers, query
+/// failures, the failures of activities and local activities, a Nexus handler's error, and
+/// `Client.failActivity` and `failActivityById`. `f` is the failure the SDK built, stack trace
+/// included, and `err` the error user code returned (null only for the two client calls). It
+/// returns the failure to send. `fromFailure` runs where a failure arrives, before user code
+/// reads it: in a workflow, the failures of activities, local activities, child workflows,
+/// Nexus operations, external signals and cancels, and `ctx.previousRunFailure`; on a
+/// client, the failures `WorkflowRun.failure`, `WorkflowUpdateHandle.failure` and
+/// `ActivityHandle.failure` return. Each is called once per failure with the head of its
+/// cause chain; the causes are the converter's to visit.
+///
+/// `context` names what the failure is for, as for payloads (see the table above), and is
+/// borrowed for the call. The failure returned may borrow from `f`; anything else comes from
+/// `arena`, which lives as long as the failure does.
+///
+/// Failures the SDK makes for its own reports (workflow task failures, unregistered
+/// activities, queries and updates, codec failures, cancel acknowledgements) and those it
+/// builds for user code without a server (an interceptor's refusal, a child that couldn't
+/// start, a canceled local activity) are not converted. `client.Options.encode_failure_attributes`
+/// applies after `toFailure` on the way out and is undone before `fromFailure` on the way in.
+///
+/// The converter runs inside workflow code when a workflow sends or receives a failure, so it
+/// must be deterministic and must not block or do I/O: a converter that blocks is reported as
+/// a deadlock. It is called concurrently from workflow, activity, Nexus and client threads,
+/// so it must be thread-safe. Borrowed: `ptr` and `vtable` must outlive the client, its
+/// workers, and any replayer given it.
+pub const FailureConverter = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        toFailure: *const fn (ptr: *anyopaque, arena: Allocator, context: *const Context, err: ?anyerror, f: Failure) error{OutOfMemory}!Failure,
+        fromFailure: *const fn (ptr: *anyopaque, arena: Allocator, context: *const Context, f: Failure) error{OutOfMemory}!Failure,
+    };
+
+    pub fn toFailure(c: FailureConverter, arena: Allocator, context: *const Context, err: ?anyerror, f: Failure) error{OutOfMemory}!Failure {
+        return c.vtable.toFailure(c.ptr, arena, context, err, f);
+    }
+
+    pub fn fromFailure(c: FailureConverter, arena: Allocator, context: *const Context, f: Failure) error{OutOfMemory}!Failure {
+        return c.vtable.fromFailure(c.ptr, arena, context, f);
+    }
+};
 
 /// Raw bytes, encoded as `binary/plain` instead of a JSON string.
 pub const Bytes = struct { data: []const u8 };
@@ -114,15 +230,24 @@ pub fn encodingOf(p: Payload) ?[]const u8 {
     return null;
 }
 
-/// Encodes one value. Memory comes from `arena`.
+/// Encodes one value. Memory comes from `arena`. A type's `toPayloadWithContext` hook
+/// receives the empty context.
 pub fn toPayload(arena: Allocator, value: anytype) error{OutOfMemory}!Payload {
+    return toPayloadWithContext(arena, &.{}, value);
+}
+
+/// Encodes one value for the call `context` describes, which a type's
+/// `toPayloadWithContext` hook receives; every other encoding ignores it. Memory comes from
+/// `arena`; `context` is borrowed for the call.
+pub fn toPayloadWithContext(arena: Allocator, context: *const Context, value: anytype) error{OutOfMemory}!Payload {
     const T = @TypeOf(value);
     if (T == Payload) return value;
     if (T == void or T == @TypeOf(null)) return payloadWith(arena, .null, "");
     if (@typeInfo(T) == .optional) {
-        if (value) |v| return toPayload(arena, v);
+        if (value) |v| return toPayloadWithContext(arena, context, v);
         return payloadWith(arena, .null, "");
     }
+    if (comptime hasContextHooks(T)) return value.toPayloadWithContext(arena, context);
     if (comptime hasPayloadHooks(T)) return value.toPayload(arena);
     if (T == Bytes) return payloadWith(arena, .binary, value.data);
     if (comptime isProtoMessage(T)) return Proto(T, .{}).encode(arena, value);
@@ -130,9 +255,18 @@ pub fn toPayload(arena: Allocator, value: anytype) error{OutOfMemory}!Payload {
     return payloadWith(arena, .json, json);
 }
 
-/// Decodes one value of type `T`. Memory comes from `arena`.
+/// Decodes one value of type `T`. Memory comes from `arena`. A type's
+/// `fromPayloadWithContext` hook receives the empty context.
 pub fn fromPayload(comptime T: type, arena: Allocator, p: Payload) DecodeError!T {
+    return fromPayloadWithContext(T, arena, &.{}, p);
+}
+
+/// Decodes one value of type `T` for the call `context` describes, which a type's
+/// `fromPayloadWithContext` hook receives; every other encoding ignores it. Memory comes
+/// from `arena`; `context` is borrowed for the call.
+pub fn fromPayloadWithContext(comptime T: type, arena: Allocator, context: *const Context, p: Payload) DecodeError!T {
     if (T == Payload) return try p.dupe(arena);
+    if (comptime hasContextHooks(T)) return T.fromPayloadWithContext(arena, context, p);
     if (comptime hasPayloadHooks(T)) return T.fromPayload(arena, p);
     const enc = encodingOf(p) orelse return error.UnknownEncoding;
     if (std.mem.eql(u8, enc, Encoding.null.text())) {
@@ -142,7 +276,8 @@ pub fn fromPayload(comptime T: type, arena: Allocator, p: Payload) DecodeError!T
     }
     if (@typeInfo(T) == .optional) {
         const Child = @typeInfo(T).optional.child;
-        if (comptime hasPayloadHooks(Child) or isProtoMessage(Child)) return try fromPayload(Child, arena, p);
+        if (comptime hasContextHooks(Child) or hasPayloadHooks(Child) or isProtoMessage(Child))
+            return try fromPayloadWithContext(Child, arena, context, p);
     }
     if (comptime isProtoMessage(T)) return Proto(T, .{}).decode(arena, p);
     if (std.mem.eql(u8, enc, Encoding.binary.text())) {
@@ -163,20 +298,31 @@ pub fn fromPayload(comptime T: type, arena: Allocator, p: Payload) DecodeError!T
     return error.UnknownEncoding;
 }
 
-/// Encodes each element of the tuple `args` (workflow and activity arguments).
+/// Encodes each element of the tuple `args` (workflow and activity arguments). Context
+/// hooks receive the empty context.
 pub fn toPayloads(arena: Allocator, args: anytype) error{OutOfMemory}!std.ArrayList(Payload) {
+    return toPayloadsWithContext(arena, &.{}, args);
+}
+
+/// `toPayloads` for the call `context` describes, as `toPayloadWithContext`.
+pub fn toPayloadsWithContext(arena: Allocator, context: *const Context, args: anytype) error{OutOfMemory}!std.ArrayList(Payload) {
     var out: std.ArrayList(Payload) = .empty;
-    inline for (args) |arg| try out.append(arena, try toPayload(arena, arg));
+    inline for (args) |arg| try out.append(arena, try toPayloadWithContext(arena, context, arg));
     return out;
 }
 
 /// Decodes payloads into a tuple of type `Args`. Missing trailing optional arguments decode
-/// as null; extra payloads are ignored.
+/// as null; extra payloads are ignored. Context hooks receive the empty context.
 pub fn fromPayloads(comptime Args: type, arena: Allocator, payloads: []const Payload) DecodeError!Args {
+    return fromPayloadsWithContext(Args, arena, &.{}, payloads);
+}
+
+/// `fromPayloads` for the call `context` describes, as `fromPayloadWithContext`.
+pub fn fromPayloadsWithContext(comptime Args: type, arena: Allocator, context: *const Context, payloads: []const Payload) DecodeError!Args {
     var out: Args = undefined;
     inline for (@typeInfo(Args).@"struct".field_types, 0..) |F, i| {
         if (i < payloads.len) {
-            out[i] = try fromPayload(F, arena, payloads[i]);
+            out[i] = try fromPayloadWithContext(F, arena, context, payloads[i]);
         } else if (@typeInfo(F) == .optional) {
             out[i] = null;
         } else {
@@ -194,7 +340,7 @@ pub const Direction = enum { encode, decode };
 /// reject a type with an error that names it instead of one deep inside `std.json`.
 pub fn unconvertibleType(comptime T: type, comptime direction: Direction) ?type {
     if (T == Payload or T == void or T == @TypeOf(null) or T == Bytes) return null;
-    if (comptime hasPayloadHooks(T) or isProtoMessage(T)) return null;
+    if (comptime hasContextHooks(T) or hasPayloadHooks(T) or isProtoMessage(T)) return null;
     if (@typeInfo(T) == .optional) return unconvertibleType(@typeInfo(T).optional.child, direction);
     return jsonUnconvertible(T, direction);
 }
@@ -263,9 +409,13 @@ fn jsonUnconvertible(comptime Root: type, comptime direction: Direction) ?type {
 /// Arguments not yet decoded, as a dynamic workflow, activity, or signal handler receives
 /// them: the handler reads each one as the type it expects. A view: the payloads are owned by
 /// the run or task that delivered them and live as long as its memory (`ctx.allocator()`);
-/// decoded values come from the arena passed in.
+/// decoded values come from the arena passed in. Values the SDK hands to user code carry the
+/// context of the call they belong to, which context hooks receive when they are decoded.
 pub const EncodedValues = struct {
     payloads: []const Payload,
+    /// The context decoding passes to context hooks; borrowed, and must stay valid as long
+    /// as the values are decoded.
+    context: *const Context = &.{},
 
     pub fn len(v: EncodedValues) usize {
         return v.payloads.len;
@@ -275,7 +425,7 @@ pub const EncodedValues = struct {
     /// decodes as null and anything else returns `error.WrongArgumentCount`, as in
     /// `decode`.
     pub fn get(v: EncodedValues, comptime T: type, arena: Allocator, index: usize) DecodeError!T {
-        if (index < v.payloads.len) return fromPayload(T, arena, v.payloads[index]);
+        if (index < v.payloads.len) return fromPayloadWithContext(T, arena, v.context, v.payloads[index]);
         if (@typeInfo(T) == .optional) return null;
         return error.WrongArgumentCount;
     }
@@ -283,7 +433,13 @@ pub const EncodedValues = struct {
     /// Decodes every argument into the tuple `Args`, by the rules for typed arguments:
     /// missing trailing optionals are null, extra arguments are ignored.
     pub fn decode(v: EncodedValues, comptime Args: type, arena: Allocator) DecodeError!Args {
-        return fromPayloads(Args, arena, v.payloads);
+        return fromPayloadsWithContext(Args, arena, v.context, v.payloads);
+    }
+
+    /// A copy that decodes with `context`, such as failure details read with
+    /// `details.withContext(future.converterContext())`. Copies nothing but the struct.
+    pub fn withContext(v: EncodedValues, context: *const Context) EncodedValues {
+        return .{ .payloads = v.payloads, .context = context };
     }
 };
 
@@ -292,6 +448,8 @@ pub const EncodedValues = struct {
 /// long as the memory it came from; decoded values come from the arena passed to `get`.
 pub const EncodedValue = struct {
     payload: ?Payload,
+    /// The context decoding passes to context hooks, as for `EncodedValues`.
+    context: *const Context = &.{},
 
     /// Whether there is a value to decode.
     pub fn hasValue(v: EncodedValue) bool {
@@ -302,9 +460,14 @@ pub const EncodedValue = struct {
     /// and anything else returns `error.WrongArgumentCount`, as `EncodedValues.get` does
     /// past the last argument.
     pub fn get(v: EncodedValue, comptime T: type, arena: Allocator) DecodeError!T {
-        if (v.payload) |p| return fromPayload(T, arena, p);
+        if (v.payload) |p| return fromPayloadWithContext(T, arena, v.context, p);
         if (@typeInfo(T) == .optional) return null;
         return error.WrongArgumentCount;
+    }
+
+    /// A copy that decodes with `context`. Copies nothing but the struct.
+    pub fn withContext(v: EncodedValue, context: *const Context) EncodedValue {
+        return .{ .payload = v.payload, .context = context };
     }
 };
 
@@ -448,6 +611,20 @@ pub fn payloadWithEncoding(arena: Allocator, encoding: []const u8, data: []const
     var p: Payload = .{ .data = data };
     try p.metadata.append(arena, .{ .key = encoding_key, .value = encoding });
     return p;
+}
+
+// Whether `T` declares the context hook pair. Half a pair is a compile error, so a hook
+// that would silently never run is caught where the type is converted.
+fn hasContextHooks(comptime T: type) bool {
+    switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => {},
+        else => return false,
+    }
+    const to = std.meta.hasFn(T, "toPayloadWithContext");
+    const from = std.meta.hasFn(T, "fromPayloadWithContext");
+    if (to and !from) @compileError(@typeName(T) ++ " declares toPayloadWithContext but not fromPayloadWithContext; a type's context hooks come in pairs");
+    if (from and !to) @compileError(@typeName(T) ++ " declares fromPayloadWithContext but not toPayloadWithContext; a type's context hooks come in pairs");
+    return to;
 }
 
 fn hasPayloadHooks(comptime T: type) bool {
@@ -687,7 +864,6 @@ test "unconvertibleType names the type the default converter can't handle" {
     const Node = struct { value: u32, next: ?*const @This() };
     const Shape = union(enum) { circle: f32, empty };
     const Untagged = union { a: u32, b: f32 };
-    const Failure = proto.temporal.api.failure.v1.Failure;
     inline for (.{ void, Payload, Bytes, Point, ?Point, Failure, []const u8, ?u32, Node, Shape, [3]u8, struct { a: []const []const u8 } }) |T| {
         try testing.expectEqual(null, unconvertibleType(T, .encode));
         try testing.expectEqual(null, unconvertibleType(T, .decode));
@@ -934,11 +1110,169 @@ test "a type's own toPayload and fromPayload take precedence" {
     try testing.expectEqual(@as(i32, 6), args[0].y);
 }
 
+/// Records the context its hooks were given: encoding writes the workflow and activity IDs
+/// into the payload's metadata, decoding keeps those and the ones it was given.
+const Stamped = struct {
+    text: []const u8,
+    encoded_for: []const u8 = "",
+    decoded_for: []const u8 = "",
+
+    fn describe(arena: Allocator, context: *const Context) error{OutOfMemory}![]const u8 {
+        return std.fmt.allocPrint(arena, "{s}/{s}/{s}/{s}/{s}/{d}", .{ context.namespace, context.workflow_id, context.workflow_type, context.activity_type, context.activity_id, context.values.count() });
+    }
+
+    pub fn toPayloadWithContext(v: Stamped, arena: Allocator, context: *const Context) error{OutOfMemory}!Payload {
+        var p = try payloadWithEncoding(arena, "binary/stamped", v.text);
+        try p.metadata.append(arena, .{ .key = "for", .value = try describe(arena, context) });
+        return p;
+    }
+
+    pub fn fromPayloadWithContext(arena: Allocator, context: *const Context, p: Payload) DecodeError!Stamped {
+        const enc = encodingOf(p) orelse return error.UnknownEncoding;
+        if (!std.mem.eql(u8, enc, "binary/stamped")) return error.UnknownEncoding;
+        var encoded_for: []const u8 = "";
+        for (p.metadata.items) |e| if (std.mem.eql(u8, e.key, "for")) {
+            encoded_for = e.value;
+        };
+        return .{ .text = try arena.dupe(u8, p.data), .encoded_for = encoded_for, .decoded_for = try describe(arena, context) };
+    }
+};
+
+/// Declares both pairs: the context pair wins.
+const BothPairs = struct {
+    n: u8,
+
+    pub fn toPayload(_: BothPairs, arena: Allocator) error{OutOfMemory}!Payload {
+        return payloadWithEncoding(arena, "binary/plain-hook", "");
+    }
+
+    pub fn fromPayload(_: Allocator, _: Payload) DecodeError!BothPairs {
+        return .{ .n = 1 };
+    }
+
+    pub fn toPayloadWithContext(_: BothPairs, arena: Allocator, _: *const Context) error{OutOfMemory}!Payload {
+        return payloadWithEncoding(arena, "binary/context-hook", "");
+    }
+
+    pub fn fromPayloadWithContext(_: Allocator, _: *const Context, _: Payload) DecodeError!BothPairs {
+        return .{ .n = 2 };
+    }
+};
+
+test "a type's context hooks receive the context, or the empty one through the plain functions" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const propagation = @import("propagation.zig");
+    var values: propagation.Values = .init(a);
+    try values.put(propagation.key([]const u8, "tenant"), "acme");
+    const context: Context = .{ .values = &values, .namespace = "ns", .workflow_id = "wf", .workflow_type = "Flow", .activity_type = "Act", .activity_id = "7" };
+    const other: Context = .{ .namespace = "ns", .workflow_id = "other" };
+
+    const p = try toPayloadWithContext(a, &context, Stamped{ .text = "hi" });
+    const back = try fromPayloadWithContext(Stamped, a, &other, p);
+    try testing.expectEqualStrings("hi", back.text);
+    try testing.expectEqualStrings("ns/wf/Flow/Act/7/1", back.encoded_for);
+    try testing.expectEqualStrings("ns/other////0", back.decoded_for);
+
+    // The plain functions pass the empty context.
+    const plain = try fromPayload(Stamped, a, try toPayload(a, Stamped{ .text = "x" }));
+    try testing.expectEqualStrings("/////0", plain.encoded_for);
+    try testing.expectEqualStrings("/////0", plain.decoded_for);
+
+    // Optionals and argument tuples reach the hooks with the context.
+    const some = try fromPayloadWithContext(?Stamped, a, &context, try toPayloadWithContext(a, &context, @as(?Stamped, .{ .text = "o" })));
+    try testing.expectEqualStrings("ns/wf/Flow/Act/7/1", some.?.decoded_for);
+    try testing.expectEqual(@as(?Stamped, null), try fromPayloadWithContext(?Stamped, a, &context, try toPayloadWithContext(a, &context, @as(?Stamped, null))));
+    const list = try toPayloadsWithContext(a, &context, .{ Stamped{ .text = "t" }, @as(u32, 3) });
+    const args = try fromPayloadsWithContext(struct { Stamped, u32 }, a, &other, list.items);
+    try testing.expectEqualStrings("ns/wf/Flow/Act/7/1", args[0].encoded_for);
+    try testing.expectEqualStrings("ns/other////0", args[0].decoded_for);
+    try testing.expectEqual(@as(u32, 3), args[1]);
+
+    // Encoded values decode with their context, the empty one unless given.
+    const values_list: EncodedValues = .{ .payloads = list.items };
+    try testing.expectEqualStrings("/////0", (try values_list.get(Stamped, a, 0)).decoded_for);
+    const with = values_list.withContext(&context);
+    try testing.expectEqualStrings("ns/wf/Flow/Act/7/1", (try with.get(Stamped, a, 0)).decoded_for);
+    try testing.expectEqualStrings("ns/wf/Flow/Act/7/1", (try with.decode(struct { Stamped }, a))[0].decoded_for);
+    const one: EncodedValue = .{ .payload = p };
+    try testing.expectEqualStrings("/////0", (try one.get(Stamped, a)).decoded_for);
+    try testing.expectEqualStrings("ns/other////0", (try one.withContext(&other).get(Stamped, a)).decoded_for);
+
+    // The context pair takes precedence over the plain pair.
+    const both = try toPayload(a, BothPairs{ .n = 0 });
+    try testing.expectEqualStrings("binary/context-hook", encodingOf(both).?);
+    try testing.expectEqual(@as(u8, 2), (try fromPayload(BothPairs, a, both)).n);
+    try testing.expectEqual(null, unconvertibleType(Stamped, .encode));
+    try testing.expectEqual(null, unconvertibleType(?Stamped, .decode));
+}
+
+test "the context changes nothing for built-in encodings and plain hooks" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const context: Context = .{ .namespace = "ns", .workflow_id = "wf", .activity_type = "Act", .activity_id = "1" };
+    const Order = struct { id: u32, items: []const []const u8 };
+    const order: Order = .{ .id = 4, .items = &.{ "a", "b" } };
+    inline for (.{ order, Point{ .x = 1, .y = -1 }, Bytes{ .data = "raw" }, @as(?u8, null), {}, Time{ .unix_ns = 5 } }) |v| {
+        const plain = try toPayload(a, v);
+        const with = try toPayloadWithContext(a, &context, v);
+        try testing.expectEqualSlices(u8, plain.data, with.data);
+        try testing.expectEqual(plain.metadata.items.len, with.metadata.items.len);
+        for (plain.metadata.items, with.metadata.items) |x, y| {
+            try testing.expectEqualStrings(x.key, y.key);
+            try testing.expectEqualStrings(x.value, y.value);
+        }
+    }
+    const decoded = try fromPayloadWithContext(Order, a, &context, try toPayload(a, order));
+    try testing.expectEqual(@as(u32, 4), decoded.id);
+    try testing.expectEqualStrings("b", decoded.items[1]);
+}
+
+test "FailureConverter calls its vtable with the context, the error and the failure" {
+    const Prefixing = struct {
+        last_err: ?anyerror = null,
+        last_workflow_id: []const u8 = "",
+
+        fn converter(p: *@This()) FailureConverter {
+            return .{ .ptr = p, .vtable = &.{ .toFailure = toFailure, .fromFailure = fromFailure } };
+        }
+        fn toFailure(ptr: *anyopaque, arena: Allocator, context: *const Context, err: ?anyerror, f: Failure) error{OutOfMemory}!Failure {
+            const p: *@This() = @ptrCast(@alignCast(ptr));
+            p.last_err = err;
+            p.last_workflow_id = context.workflow_id;
+            var out = f;
+            out.message = try std.fmt.allocPrint(arena, "sent: {s}", .{f.message});
+            return out;
+        }
+        fn fromFailure(ptr: *anyopaque, arena: Allocator, context: *const Context, f: Failure) error{OutOfMemory}!Failure {
+            const p: *@This() = @ptrCast(@alignCast(ptr));
+            p.last_workflow_id = context.workflow_id;
+            var out = f;
+            out.message = try std.fmt.allocPrint(arena, "read: {s}", .{f.message});
+            return out;
+        }
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var state: Prefixing = .{};
+    const c = state.converter();
+    const sent = try c.toFailure(a, &.{ .workflow_id = "wf-1" }, error.Boom, .{ .message = "boom", .stack_trace = "trace" });
+    try testing.expectEqualStrings("sent: boom", sent.message);
+    try testing.expectEqualStrings("trace", sent.stack_trace);
+    try testing.expectEqual(@as(?anyerror, error.Boom), state.last_err);
+    try testing.expectEqualStrings("wf-1", state.last_workflow_id);
+    const read = try c.fromFailure(a, &.{ .workflow_id = "wf-2" }, sent);
+    try testing.expectEqualStrings("read: sent: boom", read.message);
+    try testing.expectEqualStrings("wf-2", state.last_workflow_id);
+}
+
 test "protobuf messages round-trip as json/protobuf and binary/protobuf" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const Failure = proto.temporal.api.failure.v1.Failure;
 
     var cause: Failure = .{ .message = "root cause" };
     const f: Failure = .{

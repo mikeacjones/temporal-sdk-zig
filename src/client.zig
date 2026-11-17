@@ -50,7 +50,7 @@ pub const Options = struct {
     /// payload this client sends and in reverse to every payload it receives (results,
     /// failures, memos, history events), and by every worker on this client to its workflow
     /// and activity payloads. Search attributes are never encoded. A codec that sets
-    /// `encodeWithContext` and `decodeWithContext` sees each call's `converter.CodecContext`:
+    /// `encodeWithContext` and `decodeWithContext` sees each call's `converter.Context`:
     /// its propagated values and the workflow or activity it is for. Borrowed: the slice and
     /// the codecs must outlive the client and its workers. Called concurrently: workers run
     /// them from the threads that process workflow activations and run activities.
@@ -66,6 +66,17 @@ pub const Options = struct {
     /// message to the caller in the clear (`QueryOptions.failure_message`).
     /// Failures received are always decoded back, after the codecs, whatever this is set to.
     encode_failure_attributes: bool = false,
+    /// Transforms the failures this client and every worker on it send and receive (see
+    /// `converter.FailureConverter` for where it runs): `toFailure` runs before
+    /// `encode_failure_attributes` and the codecs, and `fromFailure` after they are undone.
+    /// Null sends and reads failures as the SDK builds and receives them. The converter also
+    /// runs inside workflow code, for the failures a workflow sends and receives, so it must
+    /// be deterministic and must not block or do I/O; it is called concurrently from worker
+    /// threads and the client's callers, so it must be thread-safe. A replayer of this
+    /// client's histories must be given the same one
+    /// (`testing.WorkflowReplayer.Options.failure_converter`). Borrowed: it must outlive the
+    /// client and its workers.
+    failure_converter: ?converter.FailureConverter = null,
     /// Where sdk-core's logs go, and the default for every worker on this client (see
     /// `worker.Options.logger`). Null uses `log.Sink.std_log`. Borrowed: it must outlive the
     /// client and its workers. Called concurrently from worker threads and sdk-core's threads.
@@ -75,12 +86,15 @@ pub const Options = struct {
     core_log_level: ?log_mod.Level = .warn,
     /// Context propagators, run in order: they write the `.context` values of each call that
     /// carries a header into that header, and every worker on this client reads them back out
-    /// for its workflows and activities (see `temporal.propagation`). Borrowed: the slice and
+    /// for its workflows, activities and the Nexus requests it handles. A workflow's values
+    /// travel with the Nexus operations it calls, in one Nexus header
+    /// (`propagation.nexus_header_name`); see `temporal.propagation`. Borrowed: the slice and
     /// the propagators must outlive the client and its workers.
     propagators: []const propagation.ContextPropagator = &.{},
-    /// Interceptors of the workflows and activities of every worker on this client, before
-    /// the worker's own (`worker.Options.interceptors`). Borrowed: the slice and the
-    /// interceptors must outlive the client and its workers.
+    /// Interceptors of the workflows, activities and Nexus requests of every worker on this
+    /// client (the requests a worker handles and the operations a workflow calls), before the
+    /// worker's own (`worker.Options.interceptors`). Borrowed: the slice and the interceptors
+    /// must outlive the client and its workers.
     worker_interceptors: []const interceptor.Worker = &.{},
     /// Interceptors of every WorkflowService request this client sends, in order (the first
     /// is the outermost); see `interceptor.Client`. `Client.checkHealth` bypasses them.
@@ -619,6 +633,8 @@ pub const Client = struct {
     codecs: []const converter.PayloadCodec,
     /// `Options.encode_failure_attributes`.
     encode_failure_attributes: bool = false,
+    /// `Options.failure_converter`, borrowed; workers on this client use it too.
+    failure_converter: ?converter.FailureConverter = null,
     /// `Options.logger` or the default sink; workers on this client inherit it.
     logger: log_mod.Sink,
     /// `Options.propagators`, borrowed; workers on this client use them too.
@@ -753,6 +769,7 @@ pub const Client = struct {
             .identity = identity,
             .codecs = options.codecs,
             .encode_failure_attributes = options.encode_failure_attributes,
+            .failure_converter = options.failure_converter,
             .logger = logger,
             .propagators = options.propagators,
             .worker_interceptors = options.worker_interceptors,
@@ -766,9 +783,9 @@ pub const Client = struct {
     /// program that works in several namespaces of one server connects once and makes a
     /// client for each of the others with this. Workers on the new client poll `namespace`.
     /// The new client has this one's identity, codecs, `encode_failure_attributes`,
-    /// logger, propagators, interceptors (client and worker), metrics (`metrics`) and
-    /// `Options.rpc_timeout`; they are borrowed from the same `Options` as this client's, so
-    /// those must outlive it too. `namespace` is copied.
+    /// failure converter, logger, propagators, interceptors (client and worker), metrics
+    /// (`metrics`) and `Options.rpc_timeout`; they are borrowed from the same `Options` as
+    /// this client's, so those must outlive it too. `namespace` is copied.
     ///
     /// The clients share the connection and the runtime, and own them together: closing
     /// one leaves both to the others, and the last of them to close frees them. The clients
@@ -1412,12 +1429,18 @@ pub const Client = struct {
             log.warn("starting workflow \"{s}\" of type \"{s}\": StartWorkflowOptions.task_queue is empty; set it to the task queue a worker polls (WorkflowEnvironment fills in its own)", .{ id, workflow_type });
             return error.InvalidOptions;
         }
+        const context: converter.Context = .{
+            .values = options.context orelse &.empty,
+            .namespace = c.namespace,
+            .workflow_id = id,
+            .workflow_type = workflow_type,
+        };
         var request: wfs.StartWorkflowExecutionRequest = .{
             .namespace = c.namespace,
             .workflow_id = id,
             .workflow_type = .{ .name = workflow_type },
             .task_queue = .{ .name = options.task_queue, .kind = .TASK_QUEUE_KIND_NORMAL },
-            .input = .{ .payloads = try converter.toPayloads(a, args) },
+            .input = .{ .payloads = try converter.toPayloadsWithContext(a, &context, args) },
             .workflow_execution_timeout = protoDuration(options.execution_timeout),
             .workflow_run_timeout = protoDuration(options.run_timeout),
             .workflow_task_timeout = protoDuration(options.task_timeout),
@@ -1492,11 +1515,12 @@ pub const Client = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
         var header = try c.outgoingHeader(a, options.context);
+        const context = c.workflowContext(workflow_id, options.context);
         _ = c.rpcCall(wfs.SignalWorkflowExecutionResponse, "SignalWorkflowExecution", wfs.SignalWorkflowExecutionRequest{
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .signal_name = signal_name,
-            .input = .{ .payloads = try converter.toPayloads(a, args) },
+            .input = .{ .payloads = try converter.toPayloadsWithContext(a, &context, args) },
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
         }, a, null, &header, options.context) catch |err| switch (err) {
@@ -1541,9 +1565,15 @@ pub const Client = struct {
         const id = if (options.id.len > 0) options.id else try uuid(a, c.io);
 
         const start = try c.startRequest(a, workflow_type, id, options, args);
+        const context: converter.Context = .{
+            .values = options.context orelse &.empty,
+            .namespace = c.namespace,
+            .workflow_id = id,
+            .workflow_type = workflow_type,
+        };
         var request: wfs.SignalWithStartWorkflowExecutionRequest = .{
             .signal_name = signal_name,
-            .signal_input = .{ .payloads = try converter.toPayloads(a, signal_args) },
+            .signal_input = .{ .payloads = try converter.toPayloadsWithContext(a, &context, signal_args) },
         };
         // Every start field the two requests share, so a start option mapped in
         // `startRequest` reaches signal-with-start too.
@@ -1584,7 +1614,7 @@ pub const Client = struct {
             .namespace = c.namespace,
             .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
             .reason = reason,
-            .details = try detailPayloads(a, details),
+            .details = try detailPayloads(a, &c.workflowContext(workflow_id, null), details),
             .identity = c.identity,
             .first_execution_run_id = options.first_execution_run_id,
         };
@@ -1767,7 +1797,7 @@ pub const Client = struct {
         _ = try c.activityRpc(wfs.RespondActivityTaskCompletedResponse, "RespondActivityTaskCompleted", wfs.RespondActivityTaskCompletedRequest{
             .namespace = c.namespace,
             .task_token = task_token,
-            .result = try resultPayloads(a, result),
+            .result = try resultPayloads(a, &.{ .namespace = c.namespace }, result),
             .identity = c.identity,
         }, a);
     }
@@ -1782,7 +1812,7 @@ pub const Client = struct {
             .workflow_id = id.workflow_id,
             .run_id = id.run_id,
             .activity_id = id.activity_id,
-            .result = try resultPayloads(a, result),
+            .result = try resultPayloads(a, &c.activityIdContext(id), result),
             .identity = c.identity,
         }, a);
     }
@@ -1798,7 +1828,7 @@ pub const Client = struct {
         _ = try c.activityRpc(wfs.RespondActivityTaskFailedResponse, "RespondActivityTaskFailed", wfs.RespondActivityTaskFailedRequest{
             .namespace = c.namespace,
             .task_token = task_token,
-            .failure = try failure_mod.application(a, f),
+            .failure = try c.sentFailure(a, &.{ .namespace = c.namespace }, try failure_mod.application(a, f)),
             .identity = c.identity,
         }, a);
     }
@@ -1813,7 +1843,7 @@ pub const Client = struct {
             .workflow_id = id.workflow_id,
             .run_id = id.run_id,
             .activity_id = id.activity_id,
-            .failure = try failure_mod.application(a, f),
+            .failure = try c.sentFailure(a, &c.activityIdContext(id), try failure_mod.application(a, f)),
             .identity = c.identity,
         }, a);
     }
@@ -1829,7 +1859,7 @@ pub const Client = struct {
         _ = try c.activityRpc(wfs.RespondActivityTaskCanceledResponse, "RespondActivityTaskCanceled", wfs.RespondActivityTaskCanceledRequest{
             .namespace = c.namespace,
             .task_token = task_token,
-            .details = try detailPayloads(a, details),
+            .details = try detailPayloads(a, &.{ .namespace = c.namespace }, details),
             .identity = c.identity,
         }, a);
     }
@@ -1844,7 +1874,7 @@ pub const Client = struct {
             .workflow_id = id.workflow_id,
             .run_id = id.run_id,
             .activity_id = id.activity_id,
-            .details = try detailPayloads(a, details),
+            .details = try detailPayloads(a, &c.activityIdContext(id), details),
             .identity = c.identity,
         }, a);
     }
@@ -1862,7 +1892,7 @@ pub const Client = struct {
         const response = try c.activityRpc(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", wfs.RecordActivityTaskHeartbeatRequest{
             .namespace = c.namespace,
             .task_token = task_token,
-            .details = try detailPayloads(a, details),
+            .details = try detailPayloads(a, &.{ .namespace = c.namespace }, details),
             .identity = c.identity,
         }, a);
         return response.cancel_requested;
@@ -1878,7 +1908,7 @@ pub const Client = struct {
             .workflow_id = id.workflow_id,
             .run_id = id.run_id,
             .activity_id = id.activity_id,
-            .details = try detailPayloads(a, details),
+            .details = try detailPayloads(a, &c.activityIdContext(id), details),
             .identity = c.identity,
         }, a);
         return response.cancel_requested;
@@ -1891,15 +1921,52 @@ pub const Client = struct {
         };
     }
 
-    fn resultPayloads(a: Allocator, result: anytype) error{OutOfMemory}!proto.temporal.api.common.v1.Payloads {
+    /// `f`, which user code gave the client to send, as the failure converter sends it.
+    fn sentFailure(c: *const Client, a: Allocator, context: *const converter.Context, f: failure_mod.Failure) error{OutOfMemory}!failure_mod.Failure {
+        const fc = c.failure_converter orelse return f;
+        return fc.toFailure(a, context, null, f);
+    }
+
+    /// `f`, a failure the server returned, as the failure converter gives it to user code.
+    fn receivedFailure(c: *const Client, a: Allocator, context: *const converter.Context, f: failure_mod.Failure) error{OutOfMemory}!failure_mod.Failure {
+        const fc = c.failure_converter orelse return f;
+        return fc.fromFailure(a, context, f);
+    }
+
+    fn resultPayloads(a: Allocator, context: *const converter.Context, result: anytype) error{OutOfMemory}!proto.temporal.api.common.v1.Payloads {
         var payloads: proto.temporal.api.common.v1.Payloads = .{};
-        try payloads.payloads.append(a, try converter.toPayload(a, result));
+        try payloads.payloads.append(a, try converter.toPayloadWithContext(a, context, result));
         return payloads;
     }
 
-    fn detailPayloads(a: Allocator, details: anytype) error{OutOfMemory}!?proto.temporal.api.common.v1.Payloads {
+    fn detailPayloads(a: Allocator, context: *const converter.Context, details: anytype) error{OutOfMemory}!?proto.temporal.api.common.v1.Payloads {
         if (@TypeOf(details) == void) return null;
-        return try resultPayloads(a, details);
+        return try resultPayloads(a, context, details);
+    }
+
+    /// The converter context of a call naming the workflow `workflow_id`. Borrows both.
+    fn workflowContext(c: *const Client, workflow_id: []const u8, values: ?*const propagation.Values) converter.Context {
+        return .{ .values = values orelse &.empty, .namespace = c.namespace, .workflow_id = workflow_id };
+    }
+
+    /// The converter context of a call naming an activity by its ID. Borrows `id`.
+    fn activityIdContext(c: *const Client, id: ActivityId) converter.Context {
+        return .{ .namespace = c.namespace, .workflow_id = id.workflow_id, .activity_id = id.activity_id };
+    }
+
+    /// A converter context like `context`, allocated in `arena` with its strings copied, for
+    /// values the caller decodes after the call returns. `values` stays borrowed.
+    fn dupeContext(arena: Allocator, context: converter.Context) error{OutOfMemory}!*const converter.Context {
+        const out = try arena.create(converter.Context);
+        out.* = .{
+            .values = context.values,
+            .namespace = try arena.dupe(u8, context.namespace),
+            .workflow_id = try arena.dupe(u8, context.workflow_id),
+            .workflow_type = try arena.dupe(u8, context.workflow_type),
+            .activity_type = try arena.dupe(u8, context.activity_type),
+            .activity_id = try arena.dupe(u8, context.activity_id),
+        };
+        return out;
     }
 
     /// Returns the full event history of a workflow run (all pages). An empty `run_id` reads
@@ -2017,7 +2084,12 @@ pub const Client = struct {
             .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
             .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
             .heartbeat_timeout = protoDuration(options.heartbeat_timeout),
-            .input = .{ .payloads = try converter.toPayloads(a, args) },
+            .input = .{ .payloads = try converter.toPayloadsWithContext(a, &.{
+                .values = options.context orelse &.empty,
+                .namespace = c.namespace,
+                .activity_type = activity_type,
+                .activity_id = id,
+            }, args) },
             .id_reuse_policy = switch (options.id_reuse_policy) {
                 .unspecified => .ACTIVITY_ID_REUSE_POLICY_UNSPECIFIED,
                 .allow_duplicate => .ACTIVITY_ID_REUSE_POLICY_ALLOW_DUPLICATE,
@@ -2047,6 +2119,8 @@ pub const Client = struct {
             else => |e| return e,
         };
         var handle = try c.getActivityHandle(Result, id, response.run_id);
+        errdefer handle.deinit();
+        handle.activity_type = try c.gpa.dupe(u8, activity_type);
         handle.started = response.started;
         return handle;
     }
@@ -2161,9 +2235,10 @@ pub const Client = struct {
     /// the workflow has no handler for the query type, and `error.QueryRejected` when
     /// `options.reject_condition` matches the workflow's state.
     pub fn queryWorkflowWithOptions(c: *Client, comptime Query: type, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: Query.Args, options: QueryOptions) QueryError!Query.Result {
-        const result = try c.sendQuery(Query.query_name, arena, workflow_id, run_id, try converter.toPayloads(arena, args), options);
+        const context = c.workflowContext(workflow_id, options.context);
+        const result = try c.sendQuery(Query.query_name, arena, workflow_id, run_id, try converter.toPayloadsWithContext(arena, &context, args), options);
         if (Query.Result == void) return;
-        return converter.fromPayload(Query.Result, arena, result orelse return error.InvalidPayload);
+        return converter.fromPayloadWithContext(Query.Result, arena, &context, result orelse return error.InvalidPayload);
     }
 
     /// Sends the query named `query_type` with the tuple `args` to a workflow, for a caller
@@ -2179,7 +2254,8 @@ pub const Client = struct {
     /// `error.QueryFailed` when the handler fails or the workflow has no handler named
     /// `query_type`, and `error.QueryRejected` when `options.reject_condition` matches.
     pub fn queryWorkflowByNameWithOptions(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: anytype, options: QueryOptions) QueryError!converter.EncodedValue {
-        return .{ .payload = try c.sendQuery(query_type, arena, workflow_id, run_id, try converter.toPayloads(arena, args), options) };
+        const context = try dupeContext(arena, c.workflowContext(workflow_id, options.context));
+        return .{ .payload = try c.sendQuery(query_type, arena, workflow_id, run_id, try converter.toPayloadsWithContext(arena, context, args), options), .context = context };
     }
 
     /// Sends a query and returns its first result payload, or null when there is none.
@@ -2388,7 +2464,7 @@ pub const Client = struct {
             .wait_policy = .{ .lifecycle_stage = options.wait_for_stage.toProto() },
             .request = .{
                 .meta = .{ .update_id = if (options.update_id.len > 0) options.update_id else try uuid(a, c.io), .identity = c.identity },
-                .input = .{ .name = name, .args = .{ .payloads = try converter.toPayloads(a, args) } },
+                .input = .{ .name = name, .args = .{ .payloads = try converter.toPayloadsWithContext(a, &c.workflowContext(workflow_id, options.context), args) } },
             },
         };
     }
@@ -2477,7 +2553,7 @@ pub const Client = struct {
     }
 
     /// Fills `context`'s workflow and activity fields from those `r` names, for the codecs.
-    fn requestIdentity(comptime Request: type, r: *const Request, context: *converter.CodecContext) void {
+    fn requestIdentity(comptime Request: type, r: *const Request, context: *converter.Context) void {
         const common = proto.temporal.api.common.v1;
         if (comptime Request == wfs.ExecuteMultiOperationRequest) {
             for (r.operations.items) |op| if (op.operation) |o| if (o == .start_workflow) return requestIdentity(wfs.StartWorkflowExecutionRequest, &o.start_workflow, context);
@@ -2581,7 +2657,7 @@ pub const Client = struct {
     /// request and decode the response with `values` and the workflow or activity the request
     /// names.
     fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values) RpcError!Response {
-        var codec_context: converter.CodecContext = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
+        var codec_context: converter.Context = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
         requestIdentity(@TypeOf(request), &request, &codec_context);
         return c.sendInContext(Response, method, request, arena, status, &codec_context);
     }
@@ -2591,7 +2667,7 @@ pub const Client = struct {
     /// its other heartbeats are, and returns the server's answer (whether the activity has
     /// been canceled, paused or reset). Like the worker's other heartbeats, it bypasses the
     /// client's interceptors. Memory comes from `arena`.
-    pub fn recordWorkerHeartbeat(c: *Client, arena: Allocator, task_token: []const u8, details: []const converter.Payload, context: *const converter.CodecContext) RpcError!wfs.RecordActivityTaskHeartbeatResponse {
+    pub fn recordWorkerHeartbeat(c: *Client, arena: Allocator, task_token: []const u8, details: []const converter.Payload, context: *const converter.Context) RpcError!wfs.RecordActivityTaskHeartbeatResponse {
         var request: wfs.RecordActivityTaskHeartbeatRequest = .{ .namespace = c.namespace, .task_token = task_token, .identity = c.identity };
         if (details.len > 0) {
             var payloads: proto.temporal.api.common.v1.Payloads = .{};
@@ -2601,7 +2677,7 @@ pub const Client = struct {
         return c.sendInContext(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", request, arena, null, context);
     }
 
-    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.CodecContext) RpcError!Response {
+    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.Context) RpcError!Response {
         var coded = request;
         if (c.encode_failure_attributes) try failure_mod.encodeAttributes(@TypeOf(coded), &coded, arena);
         converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io, codec_context) catch |err| {
@@ -3454,11 +3530,16 @@ pub fn ActivityHandle(comptime T: type) type {
         /// when `StartActivityOptions.id_conflict_policy = .use_existing` returned the one
         /// already running with the ID. Always false from `Client.getActivityHandle`.
         started: bool = false,
+        /// The activity's type, from `Client.executeActivity`; `get` decodes the result and
+        /// any failure with it in the converter context. Empty from
+        /// `Client.getActivityHandle`, which doesn't know it.
+        activity_type: []u8 = &.{},
         failure_: ?failure_mod.Failure = null,
 
         pub fn deinit(h: *Self) void {
             h.client.gpa.free(h.id);
             h.client.gpa.free(h.run_id);
+            h.client.gpa.free(h.activity_type);
             h.* = undefined;
         }
 
@@ -3486,13 +3567,15 @@ pub fn ActivityHandle(comptime T: type) type {
                 };
                 if (response.outcome) |o| break o;
             };
+            const context = h.converterContext();
             switch (outcome.value orelse return error.InvalidResponse) {
                 .result => |payloads| {
                     if (T == void) return;
                     if (payloads.payloads.items.len == 0) return error.InvalidPayload;
-                    return converter.fromPayload(T, arena, payloads.payloads.items[0]);
+                    return converter.fromPayloadWithContext(T, arena, &context, payloads.payloads.items[0]);
                 },
-                .failure => |f| {
+                .failure => |received| {
+                    const f = try c.receivedFailure(arena, &context, received);
                     h.failure_ = f;
                     const info = f.failure_info orelse return error.ActivityFailed;
                     return switch (info) {
@@ -3503,6 +3586,12 @@ pub fn ActivityHandle(comptime T: type) type {
                     };
                 },
             }
+        }
+
+        /// The converter context `get` decodes the result and any failure with. Borrows the
+        /// handle.
+        fn converterContext(h: *const Self) converter.Context {
+            return .{ .namespace = h.client.namespace, .activity_id = h.id, .activity_type = h.activity_type };
         }
 
         /// Why the activity didn't complete, after `get` returned `error.ActivityFailed`,
@@ -3541,7 +3630,10 @@ pub fn ActivityHandle(comptime T: type) type {
                 .last_started_time = timestamp(info.last_started_time),
                 .close_time = timestamp(info.close_time),
                 .search_attributes = try .fromProto(arena, info.search_attributes),
-                .heartbeat_details = .{ .payloads = if (info.heartbeat_details) |d| d.payloads.items else &.{} },
+                .heartbeat_details = .{
+                    .payloads = if (info.heartbeat_details) |d| d.payloads.items else &.{},
+                    .context = try Client.dupeContext(arena, .{ .namespace = c.namespace, .activity_id = info.activity_id, .activity_type = if (info.activity_type) |t| t.name else "" }),
+                },
                 .last_heartbeat_time = timestamp(info.last_heartbeat_time),
                 .start_delay = if (duration(info.start_delay)) |d| if (d.nanoseconds == 0) null else d else null,
                 .priority = if (info.priority) |p| if (p.priority_key == 0 and p.fairness_key.len == 0 and p.fairness_weight == 0) null else .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight } else null,
@@ -4520,10 +4612,10 @@ pub fn WorkflowRun(comptime T: type) type {
                         if (T == void) return;
                         const payloads = done.result orelse return error.InvalidPayload;
                         if (payloads.payloads.items.len == 0) return error.InvalidPayload;
-                        return converter.fromPayload(T, arena, payloads.payloads.items[0]);
+                        return converter.fromPayloadWithContext(T, arena, &c.workflowContext(run.id, null), payloads.payloads.items[0]);
                     },
                     .workflow_execution_failed_event_attributes => |failed| {
-                        run.failure_ = failed.failure;
+                        run.failure_ = if (failed.failure) |f| try c.receivedFailure(arena, &c.workflowContext(run.id, null), f) else null;
                         return error.WorkflowFailed;
                     },
                     .workflow_execution_canceled_event_attributes => return error.WorkflowCanceled,
@@ -4673,10 +4765,10 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
                 .success => |payloads| {
                     if (T == void) return;
                     if (payloads.payloads.items.len == 0) return error.InvalidPayload;
-                    return converter.fromPayload(T, arena, payloads.payloads.items[0]);
+                    return converter.fromPayloadWithContext(T, arena, &c.workflowContext(h.workflow_id, null), payloads.payloads.items[0]);
                 },
                 .failure => |f| {
-                    h.failure_ = f;
+                    h.failure_ = try c.receivedFailure(arena, &c.workflowContext(h.workflow_id, null), f);
                     return error.UpdateFailed;
                 },
             }
@@ -4947,7 +5039,7 @@ test "codec contexts name the workflow or activity a request names" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var context: converter.CodecContext = .{};
+    var context: converter.Context = .{};
     Client.requestIdentity(wfs.StartWorkflowExecutionRequest, &.{ .workflow_id = "wf", .workflow_type = .{ .name = "Order" } }, &context);
     try testing.expectEqualStrings("wf", context.workflow_id);
     try testing.expectEqualStrings("Order", context.workflow_type);

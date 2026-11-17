@@ -212,6 +212,15 @@ pub const Options = struct {
     /// the task. Only a task's first failed attempt is reported to the server; later ones
     /// send nothing and end in a workflow task timeout before the next retry.
     ///
+    /// For a listed error, sdk-core logs the warning "Failing workflow task" with the run ID
+    /// and the failure through the client's logger when it reports the task's first attempt.
+    /// A later attempt gets only a debug line from sdk-core, which the default
+    /// `client.Options.core_log_level` (`.warn`) hides, so at the default levels a task that
+    /// keeps failing on a listed error shows that one warning. The worker also logs the
+    /// eviction that follows each such failed attempt at debug level through `logger`, which
+    /// the default `std.log` sink shows in Debug builds. A nondeterministic run, deadlock
+    /// detection and `workflow_memory_limit` log at error level on every attempt.
+    ///
     /// A listed error from an update handler doesn't reject or fail the update: the retried
     /// task runs the handler again and answers it. An update delivered in the failed task
     /// was never accepted, so the server delivers it again and its validator runs again.
@@ -1112,6 +1121,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .task_failure_errors = w.options.workflow_task_failure_errors,
         .codecs = w.client.codecs,
         .encode_failure_attributes = w.client.encode_failure_attributes,
+        .failure_converter = w.client.failure_converter,
         .propagators = w.client.propagators,
         .interceptors = w.interceptors,
         .logger = w.logSink(),
@@ -1173,6 +1183,8 @@ pub const WorkflowRunner = struct {
     codecs: []const converter.PayloadCodec = &.{},
     /// See `client.Options.encode_failure_attributes`.
     encode_failure_attributes: bool = false,
+    /// Borrowed; see `client.Options.failure_converter`.
+    failure_converter: ?converter.FailureConverter = null,
     /// Borrowed; see `client.Options.propagators`.
     propagators: []const propagation.ContextPropagator = &.{},
     /// Borrowed; see `Options.interceptors`.
@@ -1398,7 +1410,7 @@ pub const WorkflowRunner = struct {
             if (job.variant) |v| if (v == .initialize_workflow) break i;
         } else return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &.{ .namespace = r.namespace });
         const init = &act.jobs.items[index].variant.?.initialize_workflow;
-        var context: converter.CodecContext = .{ .namespace = r.namespace, .workflow_id = init.workflow_id, .workflow_type = init.workflow_type };
+        var context: converter.Context = .{ .namespace = r.namespace, .workflow_id = init.workflow_id, .workflow_type = init.workflow_type };
         var headers = init.headers;
         try converter.decodeMessage(@TypeOf(headers), &headers, r.codecs, a, io, &context);
         const values = try a.create(propagation.Values);
@@ -1664,6 +1676,7 @@ pub const WorkflowRunner = struct {
             .memory_limit = r.memory_limit,
             .failure_stack_traces = r.failure_stack_traces,
             .task_failure_errors = r.task_failure_errors,
+            .failure_converter = r.failure_converter,
             .logger = r.logger,
             .log_during_replay = r.log_during_replay,
             .propagators = r.propagators,
@@ -1757,7 +1770,7 @@ fn readVarint(bytes: []const u8, i: *usize) ?u64 {
 }
 
 /// The codec context of a cached run: its identity and the values `ctx.propagated()` returns.
-fn runCodecContext(namespace: []const u8, inst: *const Instance) converter.CodecContext {
+fn runCodecContext(namespace: []const u8, inst: *const Instance) converter.Context {
     return .{ .values = &inst.propagated, .namespace = namespace, .workflow_id = inst.info.workflow_id, .workflow_type = inst.info.workflow_type };
 }
 
@@ -1841,7 +1854,7 @@ const RunningActivity = struct {
     ctx: activity.Context,
     /// What the codecs see for this activity's payloads: its identity, and once its header is
     /// decoded, `ctx.propagated_`.
-    codec_context: converter.CodecContext = .{},
+    codec_context: converter.Context = .{},
     /// Set when the activity returns or a cancel arrives; wakes the supervisor.
     wake: Io.Event = .unset,
 
@@ -2028,7 +2041,7 @@ const Heartbeats = struct {
     w: *Worker,
     core: bridge.Worker,
     task_token: []const u8,
-    codec_context: *const converter.CodecContext,
+    codec_context: *const converter.Context,
     /// The latest details, before the codecs: the attempt's last heartbeat's, or those it
     /// started with. `last_arena` owns them once the attempt has heartbeated.
     last: []const converter.Payload,
@@ -2110,6 +2123,8 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
             .type = "PayloadCodecFailed",
         }) } } },
     };
+    // The payload converter sees what the codecs see, propagated values included.
+    ctx.converter_context_ = run.codec_context;
     const side_effect = start.is_local and std.mem.eql(u8, start.activity_type, Instance.side_effect_activity_type);
     const session_entry = if (start.is_local) null else if (w.session_host) |h| h.registered(start.activity_type) else null;
     const internal = side_effect or session_entry != null;
@@ -2169,7 +2184,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     const payload = user: {
         const sdk = w.io.swapCancelProtection(.unblocked);
         defer _ = w.io.swapCancelProtection(sdk);
-        break :user next.execute(.{ .activity_type = start.activity_type, .args = .{ .payloads = start.input.items }, .header = ctx.header_ });
+        break :user next.execute(.{ .activity_type = start.activity_type, .args = .{ .payloads = start.input.items, .context = ctx.converterContext() }, .header = ctx.header_ });
     } catch |err| {
         if (err == error.CompleteAsync) {
             if (!start.is_local) return .{ .status = .{ .will_complete_async = .{} } };
@@ -2202,6 +2217,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
             ctx.logger_.debug("Activity failed", .{ .Error = f.message })
         else
             ctx.logger_.warn("Activity failed", .{ .Error = f.message });
+        if (w.client.failure_converter) |c| f = try c.toFailure(a, ctx.converterContext(), err, f);
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };
@@ -2654,19 +2670,20 @@ fn completeNexusRequest(w: *Worker, core: bridge.Worker, req: *NexusRequest, out
         .failed => |e| wire.failedCompletion(a, req.task_token, e),
     } catch return dropNexusTask(w, core, req.task_token, logger);
     encodeNexusFailure(w, a, &completion, ctx) catch |err| {
-        logger.warn("Encoding the Nexus request's failure with the client's codecs failed; sending it without its details", .{ .Error = @errorName(err) });
+        logger.warn("Preparing the Nexus request's failure (the client's failure converter, encoded attributes and codecs) failed; sending it without its details", .{ .Error = @errorName(err) });
         completion = wire.failedCompletion(a, req.task_token, .{
             .type = .internal,
-            .message = std.fmt.allocPrint(a, "encoding the failure of Nexus operation \"{s}\" of service \"{s}\" with the client's codecs failed: {t}", .{ ctx.info_.operation, ctx.info_.service, err }) catch "encoding the Nexus request's failure with the client's codecs failed",
+            .message = std.fmt.allocPrint(a, "preparing the failure of Nexus operation \"{s}\" of service \"{s}\" with the client's failure converter, encoded attributes and codecs failed: {t}", .{ ctx.info_.operation, ctx.info_.service, err }) catch "preparing the Nexus request's failure with the client's failure converter, encoded attributes and codecs failed",
         }) catch return dropNexusTask(w, core, req.task_token, logger);
     };
     sendNexusCompletion(w, core, a, completion, logger);
 }
 
-/// Encodes the payloads of the completion's failure, if it has one, with the client's codecs.
-/// A synchronous result is already encoded (by `nexus.Operation.start`).
+/// Passes the completion's failure, if it has one, through the client's failure converter
+/// (when the handler's own error built it), then encodes its attributes and payloads with the
+/// client's codecs. A synchronous result is already encoded (by `nexus.Operation.start`).
 fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, ctx: *const nexus.Context) converter.CodecError!void {
-    const context: converter.CodecContext = .{ .namespace = ctx.info_.namespace, .values = ctx.propagated() };
+    const context: converter.Context = .{ .namespace = ctx.info_.namespace, .values = ctx.propagated() };
     const status = if (completion.status) |*st| st else return;
     const f: *failure_mod.Failure = switch (status.*) {
         .failure => |*f| f,
@@ -2683,6 +2700,10 @@ fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, ct
             };
         },
         else => return,
+    };
+    // Only a handler's own error is user code's; the SDK's reports go as they are.
+    if (ctx.returned_error_) |err| if (w.client.failure_converter) |c| {
+        f.* = try c.toFailure(a, &context, err, f.*);
     };
     if (w.client.encode_failure_attributes) try failure_mod.encodeAttributes(failure_mod.Failure, f, a);
     try converter.encodeMessage(failure_mod.Failure, f, w.client.codecs, a, w.io, &context);
@@ -5061,17 +5082,17 @@ const ContextRecordingCodec = struct {
         return arena.dupe(converter.Payload, payloads);
     }
 
-    fn encode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+    fn encode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
         try record(ptr, "encode", context);
         return arena.dupe(converter.Payload, payloads);
     }
 
-    fn decode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+    fn decode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
         try record(ptr, "decode", context);
         return arena.dupe(converter.Payload, payloads);
     }
 
-    fn record(ptr: *anyopaque, what: []const u8, context: *const converter.CodecContext) !void {
+    fn record(ptr: *anyopaque, what: []const u8, context: *const converter.Context) !void {
         const r: *ContextRecordingCodec = @ptrCast(@alignCast(ptr));
         const call = try std.fmt.allocPrint(r.arena, "{s} tenant={s} {s}/{s}/{s}", .{ what, context.values.get(tenant) orelse "-", context.namespace, context.workflow_type, context.workflow_id });
         try r.calls.append(r.arena, call);

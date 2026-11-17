@@ -759,6 +759,15 @@ pub const Context = struct {
         return &ctx.instance.propagated;
     }
 
+    /// The run's converter context: the namespace, the workflow ID and type, and
+    /// `propagated()`, as the run's arguments, result, signals, queries, updates and side
+    /// effects are converted with. Encode failure details with it,
+    /// `converter.toPayloadWithContext(arena, ctx.converterContext(), value)`. Valid for the
+    /// run; workflow code only.
+    pub fn converterContext(ctx: *const Context) *const converter.Context {
+        return &ctx.instance.converter_context;
+    }
+
     /// Records metrics through the client's exporter (`client.Options.metrics`) with
     /// `namespace`, `task_queue`, and `workflow_type` attributes, or records nothing without
     /// one. Nothing is recorded while the workflow replays history, so each value is recorded
@@ -1054,7 +1063,7 @@ pub const Context = struct {
     /// For a value that changes over the run, keep it in workflow state and record each new
     /// reading with another `sideEffect`.
     pub fn sideEffect(ctx: *Context, comptime T: type, context: anytype, comptime func: fn (@TypeOf(context)) T) SideEffectError!T {
-        const value: ?converter.Payload = if (ctx.instance.replaying) null else try converter.toPayload(ctx.allocator(), func(context));
+        const value: ?converter.Payload = if (ctx.instance.replaying) null else try converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), func(context));
         const future: ActivityFuture(T) = .{ .ctx = ctx, .state = ctx.instance.sideEffect(value).state };
         return future.get() catch |err| switch (err) {
             error.ActivityFailed => error.SideEffectFailed,
@@ -1322,12 +1331,12 @@ pub const Context = struct {
         const C = @TypeOf(context);
         comptime checkHandler("query handler for \"" ++ Query.query_name ++ "\"", Query.Args, C, @TypeOf(handler), Query.Result);
         const Erased = struct {
-            fn call(p: *const anyopaque, out: Allocator, payloads: []const converter.Payload) anyerror!converter.Payload {
+            fn call(p: *const anyopaque, out: Allocator, conv: *const converter.Context, payloads: []const converter.Payload) anyerror!converter.Payload {
                 const c: *const C = @ptrCast(@alignCast(p));
-                const args = try converter.fromPayloads(Query.Args, out, payloads);
+                const args = try converter.fromPayloadsWithContext(Query.Args, out, conv, payloads);
                 const result = @call(.auto, handler, .{c.*} ++ args);
                 const value = if (@typeInfo(@TypeOf(result)) == .error_union) try result else result;
-                return converter.toPayload(out, value);
+                return converter.toPayloadWithContext(out, conv, value);
             }
         };
         const stored = try ctx.allocator().create(C);
@@ -1363,11 +1372,11 @@ pub const Context = struct {
         const Result = comptime dynamicResult("dynamic query handler", C, @TypeOf(handler));
         comptime checkHandler("dynamic query handler", Args, C, @TypeOf(handler), Result);
         const Erased = struct {
-            fn call(p: *const anyopaque, out: Allocator, name: []const u8, payloads: []const converter.Payload) anyerror!converter.Payload {
+            fn call(p: *const anyopaque, out: Allocator, conv: *const converter.Context, name: []const u8, payloads: []const converter.Payload) anyerror!converter.Payload {
                 const c: *const C = @ptrCast(@alignCast(p));
-                const result = handler(c.*, name, converter.EncodedValues{ .payloads = payloads });
+                const result = handler(c.*, name, converter.EncodedValues{ .payloads = payloads, .context = conv });
                 const value = if (@typeInfo(@TypeOf(result)) == .error_union) try result else result;
-                return converter.toPayload(out, value);
+                return converter.toPayloadWithContext(out, conv, value);
             }
         };
         const stored = try ctx.allocator().create(C);
@@ -1434,9 +1443,9 @@ pub const Context = struct {
     fn setSignalHandlerInner(ctx: *Context, name: []const u8, comptime Args: type, context: anytype, comptime handler: anytype, options: HandlerOptions) SetSignalHandlerError!void {
         const C = @TypeOf(context);
         const Erased = struct {
-            fn decode(out: Allocator, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
+            fn decode(out: Allocator, conv: *const converter.Context, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
                 const args = try out.create(Args);
-                args.* = try converter.fromPayloads(Args, out, payloads);
+                args.* = try converter.fromPayloadsWithContext(Args, out, conv, payloads);
                 return @ptrCast(args);
             }
             fn call(p: *const anyopaque, a: *const anyopaque) anyerror!void {
@@ -1477,9 +1486,9 @@ pub const Context = struct {
         const Args = struct { []const u8, converter.EncodedValues };
         comptime checkHandler("dynamic signal handler", Args, C, @TypeOf(handler), void);
         const Erased = struct {
-            fn decode(out: Allocator, name: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
+            fn decode(out: Allocator, conv: *const converter.Context, name: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
                 const args = try out.create(Args);
-                args.* = .{ name, .{ .payloads = payloads } };
+                args.* = .{ name, .{ .payloads = payloads, .context = conv } };
                 return @ptrCast(args);
             }
             fn call(p: *const anyopaque, a: *const anyopaque) anyerror!void {
@@ -1604,9 +1613,9 @@ pub const Context = struct {
         const has_validator = @TypeOf(validator) != @TypeOf(null);
         if (has_validator) comptime checkHandler("update validator for \"" ++ Update.update_name ++ "\"", Update.Args, C, @TypeOf(validator), void);
         const Erased = struct {
-            fn decode(out: Allocator, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
+            fn decode(out: Allocator, conv: *const converter.Context, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
                 const args = try out.create(Update.Args);
-                args.* = try converter.fromPayloads(Update.Args, out, payloads);
+                args.* = try converter.fromPayloadsWithContext(Update.Args, out, conv, payloads);
                 return @ptrCast(args);
             }
             fn validate(p: *const anyopaque, a: *const anyopaque) anyerror!void {
@@ -1615,12 +1624,12 @@ pub const Context = struct {
                 const result = @call(.auto, validator, .{c.*} ++ args.*);
                 if (@typeInfo(@TypeOf(result)) == .error_union) try result;
             }
-            fn call(p: *const anyopaque, out: Allocator, a: *const anyopaque) anyerror!converter.Payload {
+            fn call(p: *const anyopaque, out: Allocator, conv: *const converter.Context, a: *const anyopaque) anyerror!converter.Payload {
                 const c: *const C = @ptrCast(@alignCast(p));
                 const args: *const Update.Args = @ptrCast(@alignCast(a));
                 const result = @call(.auto, handler, .{c.*} ++ args.*);
                 const value = if (@typeInfo(@TypeOf(result)) == .error_union) try result else result;
-                return converter.toPayload(out, value);
+                return converter.toPayloadWithContext(out, conv, value);
             }
         };
         const stored = try ctx.allocator().create(C);
@@ -1675,9 +1684,9 @@ pub const Context = struct {
         const has_validator = @TypeOf(validator) != @TypeOf(null);
         if (has_validator) comptime checkHandler("dynamic update validator", Args, C, @TypeOf(validator), void);
         const Erased = struct {
-            fn decode(out: Allocator, name: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
+            fn decode(out: Allocator, conv: *const converter.Context, name: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
                 const args = try out.create(Args);
-                args.* = .{ name, .{ .payloads = payloads } };
+                args.* = .{ name, .{ .payloads = payloads, .context = conv } };
                 return @ptrCast(args);
             }
             fn validate(p: *const anyopaque, a: *const anyopaque) anyerror!void {
@@ -1686,12 +1695,12 @@ pub const Context = struct {
                 const result = @call(.auto, validator, .{c.*} ++ args.*);
                 if (@typeInfo(@TypeOf(result)) == .error_union) try result;
             }
-            fn call(p: *const anyopaque, out: Allocator, a: *const anyopaque) anyerror!converter.Payload {
+            fn call(p: *const anyopaque, out: Allocator, conv: *const converter.Context, a: *const anyopaque) anyerror!converter.Payload {
                 const c: *const C = @ptrCast(@alignCast(p));
                 const args: *const Args = @ptrCast(@alignCast(a));
                 const result = @call(.auto, handler, .{c.*} ++ args.*);
                 const value = if (@typeInfo(@TypeOf(result)) == .error_union) try result else result;
-                return converter.toPayload(out, value);
+                return converter.toPayloadWithContext(out, conv, value);
             }
         };
         const stored = try ctx.allocator().create(C);
@@ -1734,7 +1743,7 @@ pub const Context = struct {
     ///
     pub fn lastCompletionResult(ctx: *Context, comptime T: type) error{ NoLastCompletionResult, OutOfMemory, InvalidPayload, UnknownEncoding }!T {
         const p = ctx.instance.last_completion_result orelse return error.NoLastCompletionResult;
-        return converter.fromPayload(T, ctx.allocator(), p) catch |err| switch (err) {
+        return converter.fromPayloadWithContext(T, ctx.allocator(), ctx.converterContext(), p) catch |err| switch (err) {
             error.WrongArgumentCount => error.InvalidPayload,
             else => |e| e,
         };
@@ -1779,13 +1788,23 @@ pub fn ActivityFuture(comptime T: type) type {
                 .completed => |maybe| {
                     if (T == void) return;
                     const p = maybe orelse return error.InvalidPayload;
-                    return converter.fromPayload(T, f.ctx.allocator(), p);
+                    return converter.fromPayloadWithContext(T, f.ctx.allocator(), &state.context, p);
                 },
                 .failed, .cancelled => |fl| {
                     f.ctx.instance.setLastFailure(fl);
                     return error.ActivityFailed;
                 },
             }
+        }
+
+        /// The converter context of the activity's result and failure: the run's (see
+        /// `Context.converterContext`) with the activity type and the scheduled activity ID.
+        /// Decode failure details with it: `details.withContext(future.converterContext())`.
+        /// The run's own context when scheduling was refused, and for a side effect. Valid
+        /// for the run; workflow code only.
+        pub fn converterContext(f: Self) *const converter.Context {
+            const state = f.state catch return f.ctx.converterContext();
+            return &state.context;
         }
 
         /// The activity's failure, after `get` returned `error.ActivityFailed`.
@@ -1856,7 +1875,7 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
                 .completed => |maybe| {
                     if (T == void) return;
                     const p = maybe orelse return error.InvalidPayload;
-                    return converter.fromPayload(T, f.ctx.allocator(), p);
+                    return converter.fromPayloadWithContext(T, f.ctx.allocator(), &state.context, p);
                 },
                 .failed, .cancelled => return f.fail(state),
             }
@@ -1865,6 +1884,15 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         fn fail(f: Self, state: *const Instance.ChildState) ChildWorkflowError {
             f.ctx.instance.setLastFailure(f.failure());
             return if (state.already_started) error.ChildWorkflowAlreadyStarted else error.ChildWorkflowFailed;
+        }
+
+        /// The converter context of the child's result, failure and signals: the namespace,
+        /// the child's workflow ID and type, and the run's propagated values. Decode failure
+        /// details with it: `details.withContext(future.converterContext())`. The run's own
+        /// context when the start was refused. Valid for the run; workflow code only.
+        pub fn converterContext(f: Self) *const converter.Context {
+            const state = f.state catch return f.ctx.converterContext();
+            return &state.context;
         }
 
         /// The child's failure, after `get` or `started` returned `error.ChildWorkflowFailed` or
@@ -1897,8 +1925,8 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// returns); the signal then goes to the child's run, and only to a child of this
         /// workflow.
         pub fn signal(f: Self, comptime Signal: type, args: Signal.Args) ChildWorkflowError!SignalExternalFuture {
-            const exec = try f.started();
-            return f.ctx.instance.signalExternal(.{ .child = exec.workflow_id }, Signal.signal_name, args);
+            _ = try f.started();
+            return f.ctx.instance.signalChildWorkflow(try f.state, Signal.signal_name, args);
         }
     };
 }
@@ -1953,7 +1981,8 @@ pub fn NexusOperationFuture(comptime T: type) type {
             switch (state.outcome.?) {
                 .completed => |p| {
                     if (T == void) return;
-                    return converter.fromPayload(T, f.ctx.allocator(), p);
+                    const context = f.ctx.instance.nexusContext();
+                    return converter.fromPayloadWithContext(T, f.ctx.allocator(), &context, p);
                 },
                 .failed, .canceled, .timed_out => return f.fail(),
             }
@@ -2128,9 +2157,9 @@ pub fn SignalChannel(comptime Args: type) type {
             return if (field_types.len == 1) args[0] else args.*;
         }
 
-        fn decode(out: Allocator, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
+        fn decode(out: Allocator, conv: *const converter.Context, _: []const u8, payloads: []const converter.Payload) anyerror!*const anyopaque {
             const args = try out.create(Args);
-            args.* = try converter.fromPayloads(Args, out, payloads);
+            args.* = try converter.fromPayloadsWithContext(Args, out, conv, payloads);
             return @ptrCast(args);
         }
 
@@ -2279,9 +2308,9 @@ pub fn DefWithOptions(comptime name: []const u8, comptime definition: anytype, c
         };
 
         pub fn invoke(ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
-            const args = try converter.fromPayloads(Args, ctx.allocator(), payloads);
+            const args = try converter.fromPayloadsWithContext(Args, ctx.allocator(), ctx.converterContext(), payloads);
             const result = try @call(.auto, definition, .{ctx} ++ args);
-            return converter.toPayload(ctx.allocator(), result);
+            return converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), result);
         }
 
         pub const versioning_behavior = options.versioning_behavior;
@@ -2311,12 +2340,12 @@ fn StructDef(comptime name: []const u8, comptime W: type, comptime options: DefO
         };
 
         pub fn invoke(ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
-            const args = try converter.fromPayloads(Args, ctx.allocator(), payloads);
+            const args = try converter.fromPayloadsWithContext(Args, ctx.allocator(), ctx.converterContext(), payloads);
             const state = ctx.instance.run_state orelse return error.StructWorkflowNotInitialized;
             try ctx.instance.releaseHandlers();
             const w: *W = @ptrCast(@alignCast(state));
             const result = try @call(.auto, W.run, .{ w, ctx } ++ args);
-            return converter.toPayload(ctx.allocator(), result);
+            return converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), result);
         }
 
         fn initRun(ctx: *Context) anyerror!*anyopaque {
@@ -2553,8 +2582,8 @@ pub fn DynamicDefWithOptions(comptime func: anytype, comptime options: DefOption
         };
 
         pub fn invoke(ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
-            const result = try func(ctx, .{ .payloads = payloads });
-            return converter.toPayload(ctx.allocator(), result);
+            const result = try func(ctx, .{ .payloads = payloads, .context = ctx.converterContext() });
+            return converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), result);
         }
 
         /// The registration. Its name is empty: it answers to every unregistered type.
