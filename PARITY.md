@@ -152,7 +152,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Payload codecs for compression and encryption | all | GA | supported | [Payload codecs](README.md#payload-codecs), [encryption](samples/encryption), [snappycompress](samples/snappycompress) |
 | Codec server for the Web UI and CLI | Go, Java, Python, TypeScript, .NET | GA | supported | [Payload codecs](README.md#payload-codecs), [codec-server](samples/codec-server) |
 | Remote codec client: a payload codec that sends payloads to a codec server's `/encode` and `/decode` | Go, Java | GA, deferred | partial | `temporal-sdk-zig-d51.4.4`. Missing: a ready-made codec that calls a codec server; a `converter.PayloadCodec` can make those HTTP calls itself. |
-| Serialization context for converters and codecs | Java, Python, .NET, TypeScript | GA | partial | `temporal-sdk-zig-d51.4.8`. Missing: context for the payload converter; codecs get it. |
+| Serialization context for converters and codecs | Java, Python, .NET, TypeScript | GA | supported | [Payloads](README.md#payloads), [Payload codecs](README.md#payload-codecs) |
 | Failures with cause chains and kinds | all | GA | supported | [Failures](README.md#failures-1) |
 | Encoded failure attributes (message and stack trace through the codecs) | all | GA | supported | [Failures](README.md#failures-1) |
 | Custom failure converter (errors to failures and back) | Go, Java, Python, TypeScript, .NET, Ruby | GA | partial | `temporal-sdk-zig-d51.4.21`. Missing: a pluggable failure converter; the SDK's own conversion is fixed, and `client.Options.encode_failure_attributes` is its only setting. |

@@ -16,16 +16,17 @@ const log = std.log.scoped(.temporal);
 /// key); the codec logs why under the `temporal` scope.
 pub const CodecError = error{ OutOfMemory, Canceled, CodecFailed };
 
-/// What a codec knows about the call whose payloads it encodes or decodes, for codecs that
-/// behave differently per workflow or per tenant (an encryption codec picking its key, for
-/// example). Every field may be empty: a call that names no workflow leaves the workflow
+/// What a conversion is for: the call whose payloads a codec encodes or decodes, or whose
+/// value a type's `toPayloadWithContext` / `fromPayloadWithContext` hooks convert, for code
+/// that behaves differently per workflow or per tenant (an encryption codec picking its key,
+/// for example). Every field may be empty: a call that names no workflow leaves the workflow
 /// fields empty, and the codec server (`codecHandler`) and `encodePayloads` pass no context
 /// at all.
 ///
 /// Header payloads go through codecs like any other, so a codec can't read a propagated
 /// value from the header it is encoding; it reads it from `values` instead. Everything is
-/// borrowed for the duration of the codec call only.
-pub const CodecContext = struct {
+/// borrowed for the duration of the codec or hook call only.
+pub const Context = struct {
     /// The call's propagated values (`temporal.propagation`): a client call's `.context`, the
     /// values a workflow run extracted from its start header (`ctx.propagated()` in the
     /// workflow), or those an activity extracted from its header. Empty when there are none,
@@ -46,6 +47,9 @@ pub const CodecContext = struct {
     activity_id: []const u8 = "",
 };
 
+/// Deprecated: use `converter.Context`.
+pub const CodecContext = Context;
+
 /// A transform of whole payload lists, plugged in at run time: `ptr` is the codec's state
 /// and `vtable` its functions. Set codecs with `client.Options.codecs`; the client and every
 /// worker on it apply them.
@@ -59,7 +63,7 @@ pub const CodecContext = struct {
 ///
 /// A codec that needs to know whose payloads it transforms also sets `encodeWithContext`
 /// and `decodeWithContext`, which the client and workers call instead with a
-/// `CodecContext`. `encode` and `decode` remain required: they serve calls with no context,
+/// `Context`. `encode` and `decode` remain required: they serve calls with no context,
 /// such as the codec server's.
 pub const PayloadCodec = struct {
     ptr: *anyopaque,
@@ -70,10 +74,10 @@ pub const PayloadCodec = struct {
         decode: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, payloads: []const Payload) CodecError![]Payload,
         /// Used instead of `encode` when the caller has a context; `context` is borrowed for
         /// the call.
-        encodeWithContext: ?*const fn (ptr: *anyopaque, arena: Allocator, io: Io, context: *const CodecContext, payloads: []const Payload) CodecError![]Payload = null,
+        encodeWithContext: ?*const fn (ptr: *anyopaque, arena: Allocator, io: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload = null,
         /// Used instead of `decode` when the caller has a context; `context` is borrowed for
         /// the call.
-        decodeWithContext: ?*const fn (ptr: *anyopaque, arena: Allocator, io: Io, context: *const CodecContext, payloads: []const Payload) CodecError![]Payload = null,
+        decodeWithContext: ?*const fn (ptr: *anyopaque, arena: Allocator, io: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload = null,
     };
 
     pub fn encode(c: PayloadCodec, arena: Allocator, io: Io, payloads: []const Payload) CodecError![]Payload {
@@ -85,13 +89,13 @@ pub const PayloadCodec = struct {
     }
 
     /// `encodeWithContext` from the vtable, or `encode` for a codec without one.
-    pub fn encodeWithContext(c: PayloadCodec, arena: Allocator, io: Io, context: *const CodecContext, payloads: []const Payload) CodecError![]Payload {
+    pub fn encodeWithContext(c: PayloadCodec, arena: Allocator, io: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload {
         if (c.vtable.encodeWithContext) |f| return f(c.ptr, arena, io, context, payloads);
         return c.vtable.encode(c.ptr, arena, io, payloads);
     }
 
     /// `decodeWithContext` from the vtable, or `decode` for a codec without one.
-    pub fn decodeWithContext(c: PayloadCodec, arena: Allocator, io: Io, context: *const CodecContext, payloads: []const Payload) CodecError![]Payload {
+    pub fn decodeWithContext(c: PayloadCodec, arena: Allocator, io: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload {
         if (c.vtable.decodeWithContext) |f| return f(c.ptr, arena, io, context, payloads);
         return c.vtable.decode(c.ptr, arena, io, payloads);
     }
@@ -110,16 +114,16 @@ pub fn decodePayloads(codecs: []const PayloadCodec, arena: Allocator, io: Io, pa
 }
 
 /// `encodePayloads` with `context` passed to each codec (`PayloadCodec.encodeWithContext`).
-pub fn encodePayloadsWithContext(codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const CodecContext, payloads: []const Payload) CodecError![]Payload {
+pub fn encodePayloadsWithContext(codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload {
     return chainPayloads(codecs, arena, io, context, payloads, true);
 }
 
 /// `decodePayloads` with `context` passed to each codec (`PayloadCodec.decodeWithContext`).
-pub fn decodePayloadsWithContext(codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const CodecContext, payloads: []const Payload) CodecError![]Payload {
+pub fn decodePayloadsWithContext(codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload {
     return chainPayloads(codecs, arena, io, context, payloads, false);
 }
 
-fn chainPayloads(codecs: []const PayloadCodec, arena: Allocator, io: Io, context: ?*const CodecContext, payloads: []const Payload, encode: bool) CodecError![]Payload {
+fn chainPayloads(codecs: []const PayloadCodec, arena: Allocator, io: Io, context: ?*const Context, payloads: []const Payload, encode: bool) CodecError![]Payload {
     var current = try arena.dupe(Payload, payloads);
     if (encode) {
         for (codecs) |c| {
@@ -148,13 +152,13 @@ fn checkCount(want: usize, got: []Payload, comptime what: []const u8) CodecError
 /// for which ones), replacing them in place, passing `context` to each codec. Memory comes
 /// from `arena`; `msg` may borrow memory it doesn't own, which is left unchanged. No codecs
 /// leaves `msg` as it is.
-pub fn encodeMessage(comptime T: type, msg: *T, codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const CodecContext) CodecError!void {
+pub fn encodeMessage(comptime T: type, msg: *T, codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const Context) CodecError!void {
     if (codecs.len == 0) return;
     return visitPayloads(T, msg, arena, ChainVisitor{ .codecs = codecs, .arena = arena, .io = io, .context = context, .encode = true });
 }
 
 /// Decodes every payload in the protobuf message `msg` with `codecs`, as `encodeMessage`.
-pub fn decodeMessage(comptime T: type, msg: *T, codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const CodecContext) CodecError!void {
+pub fn decodeMessage(comptime T: type, msg: *T, codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const Context) CodecError!void {
     if (codecs.len == 0) return;
     return visitPayloads(T, msg, arena, ChainVisitor{ .codecs = codecs, .arena = arena, .io = io, .context = context, .encode = false });
 }
@@ -163,7 +167,7 @@ const ChainVisitor = struct {
     codecs: []const PayloadCodec,
     arena: Allocator,
     io: Io,
-    context: *const CodecContext,
+    context: *const Context,
     encode: bool,
 
     pub fn visit(v: ChainVisitor, payloads: []const Payload) CodecError![]Payload {
@@ -565,7 +569,7 @@ const TenantCodec = struct {
         return decodeWithContext(ptr, arena, io, &.{}, payloads);
     }
 
-    fn encodeWithContext(_: *anyopaque, arena: Allocator, _: Io, context: *const CodecContext, payloads: []const Payload) CodecError![]Payload {
+    fn encodeWithContext(_: *anyopaque, arena: Allocator, _: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload {
         const out = try arena.dupe(Payload, payloads);
         for (out) |*p| {
             var metadata = try p.metadata.clone(arena);
@@ -575,7 +579,7 @@ const TenantCodec = struct {
         return out;
     }
 
-    fn decodeWithContext(_: *anyopaque, arena: Allocator, _: Io, context: *const CodecContext, payloads: []const Payload) CodecError![]Payload {
+    fn decodeWithContext(_: *anyopaque, arena: Allocator, _: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload {
         const out = try arena.dupe(Payload, payloads);
         for (out) |*p| {
             var metadata: std.ArrayList(Payload.MetadataEntry) = .empty;
@@ -605,7 +609,7 @@ test "a context-aware codec sees the context; a codec without one still works in
 
     var values: propagation.Values = .init(a);
     try values.put(TenantCodec.tenant, "acme");
-    const context: CodecContext = .{ .values = &values, .namespace = "ns", .workflow_id = "wf" };
+    const context: Context = .{ .values = &values, .namespace = "ns", .workflow_id = "wf" };
     var request: proto.temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest = .{ .signal_name = "s", .input = .{} };
     try request.input.?.payloads.append(a, try converter.toPayload(a, @as([]const u8, "hi")));
     try encodeMessage(@TypeOf(request), &request, &chain, a, testing.io, &context);

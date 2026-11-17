@@ -126,6 +126,12 @@ propagators: []const propagation.ContextPropagator = &.{},
 /// What the propagators extracted from `header`, injected again into outgoing commands.
 /// Arena memory.
 propagated: propagation.Values = .empty,
+/// The run's converter context (`workflow.Context.converterContext`): the namespace, and from
+/// `initialize` the workflow ID and type, with `values` pointing at `propagated`.
+converter_context: converter.Context = .{},
+/// Activity and workflow type names the run's converter contexts name, each copied into the
+/// arena once (see `intern`). Arena memory.
+type_names: std.StringHashMapUnmanaged(void) = .empty,
 interceptors: []const interceptor.Worker = &.{},
 /// The run's interceptors, from `interceptors` at initialization. Arena memory.
 inbound: []const interceptor.WorkflowInbound = &.{},
@@ -230,25 +236,27 @@ send_versioning_behavior: bool = false,
 deployment_version: ?deployment.Version = null,
 
 /// A type-erased query handler: decodes `args` into `out`, calls the handler with `context`,
-/// and encodes its result into `out`. Runs on the worker thread, outside any coroutine.
+/// and encodes its result into `out`, converting with `conv` (the run's converter context).
+/// Runs on the worker thread, outside any coroutine.
 pub const QueryHandler = struct {
     context: *const anyopaque,
-    call: *const fn (context: *const anyopaque, out: Allocator, args: []const converter.Payload) anyerror!converter.Payload,
+    call: *const fn (context: *const anyopaque, out: Allocator, conv: *const converter.Context, args: []const converter.Payload) anyerror!converter.Payload,
 };
 
 /// A type-erased dynamic query handler: like `QueryHandler`, but `call` also gets the query
 /// type, and `args` stay encoded for the handler to decode.
 pub const DynamicQueryHandler = struct {
     context: *const anyopaque,
-    call: *const fn (context: *const anyopaque, out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!converter.Payload,
+    call: *const fn (context: *const anyopaque, out: Allocator, conv: *const converter.Context, name: []const u8, args: []const converter.Payload) anyerror!converter.Payload,
 };
 
 /// A type-erased signal handler. `decode` turns a signal's name and payloads (both arena
-/// memory of the run) into the handler's arguments, allocated in `out`; `call` runs the
-/// handler with `context` and those arguments, inside the signal's coroutine.
+/// memory of the run) into the handler's arguments, allocated in `out`, converting with
+/// `conv` (the run's converter context, valid for the run); `call` runs the handler with
+/// `context` and those arguments, inside the signal's coroutine.
 pub const SignalHandler = struct {
     context: *const anyopaque,
-    decode: *const fn (out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque,
+    decode: SignalDecode,
     call: *const fn (context: *const anyopaque, args: *const anyopaque) anyerror!void,
     unfinished_policy: workflow.HandlerUnfinishedPolicy = .warn_and_abandon,
 };
@@ -256,14 +264,18 @@ pub const SignalHandler = struct {
 /// A type-erased update handler. `decode` turns an update's name and payloads into the
 /// handler's argument tuple, allocated in `out`; `validate` (if set) runs the validator with
 /// `context` and those arguments, outside any coroutine; `call` runs the handler inside the
-/// update's coroutine and encodes its result into `out`.
+/// update's coroutine and encodes its result into `out`. Both convert with `conv`, the run's
+/// converter context.
 pub const UpdateHandler = struct {
     context: *const anyopaque,
-    decode: *const fn (out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque,
+    decode: SignalDecode,
     validate: ?*const fn (context: *const anyopaque, args: *const anyopaque) anyerror!void,
-    call: *const fn (context: *const anyopaque, out: Allocator, args: *const anyopaque) anyerror!converter.Payload,
+    call: *const fn (context: *const anyopaque, out: Allocator, conv: *const converter.Context, args: *const anyopaque) anyerror!converter.Payload,
     unfinished_policy: workflow.HandlerUnfinishedPolicy = .warn_and_abandon,
 };
+
+/// Decodes a signal's or update's payloads into the handler's arguments (see `SignalHandler`).
+pub const SignalDecode = *const fn (out: Allocator, conv: *const converter.Context, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque;
 
 /// A delivered signal, copied into the arena so it outlives its activation. `arrival` orders
 /// signals by delivery.
@@ -364,8 +376,8 @@ const Update = struct {
     header: converter.Header,
     run_validator: bool,
 
-    fn input(u: *const Update) interceptor.UpdateInput {
-        return .{ .update_name = u.name, .update_id = u.id, .args = .{ .payloads = u.args }, .header = u.header };
+    fn input(u: *const Update, context: *const converter.Context) interceptor.UpdateInput {
+        return .{ .update_name = u.name, .update_id = u.id, .args = .{ .payloads = u.args, .context = context }, .header = u.header };
     }
 };
 
@@ -430,6 +442,11 @@ pub const ActivityState = struct {
     scheduled_in: u64 = 0,
     /// Set for a local activity; null for a remote one.
     local: ?*Local = null,
+    /// The converter context of the activity's result and failure: the run's, with the
+    /// activity type and the scheduled activity ID (arena memory, updated when a local
+    /// activity is retried under a new ID). The run's own for a side effect and for an
+    /// activity an interceptor refused.
+    context: converter.Context = .{},
 
     pub const CancellationType = workflow.ActivityCancellationType;
 
@@ -473,6 +490,10 @@ pub const ChildState = struct {
     /// With `wait_cancellation_requested`: the RequestCancelExternalWorkflowExecution this
     /// workflow sent itself once the child started, whose resolution reports the cancellation.
     cancel_request: ?*ExternalState = null,
+    /// The converter context of the child's result, failure and signals: the namespace, the
+    /// child's workflow ID and type, and the run's propagated values. The run's own for a
+    /// child an interceptor refused.
+    context: converter.Context = .{},
 
     pub const Outcome = ActivityState.Outcome;
 
@@ -613,6 +634,7 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
     inst.interceptors = options.interceptors;
     inst.metrics = options.metrics;
     inst.propagated = .init(inst.arena());
+    inst.converter_context = .{ .values = &inst.propagated, .namespace = inst.namespace };
     return inst;
 }
 
@@ -892,7 +914,7 @@ fn answerQuery(inst: *Instance, q: *const act_pb.QueryWorkflow, out: Allocator) 
     inst.wio.beginReadOnly(&section.io);
     const result = inst.inboundNext().handleQuery(.{
         .query_type = q.query_type,
-        .args = .{ .payloads = q.arguments.items },
+        .args = .{ .payloads = q.arguments.items, .context = &inst.converter_context },
         .header = header,
         .arena = out,
     });
@@ -1115,7 +1137,7 @@ pub fn setDynamicSignalHandler(inst: *Instance, handler: SignalHandler, context_
 /// inbound interceptors and `decode` in a handler coroutine of its own, which appends the
 /// decoded arguments to the channel; buffered signals of that name start theirs here.
 /// `ch` is arena memory the caller allocated.
-pub fn createSignalChannel(inst: *Instance, name: []const u8, ch: *SignalChannel, decode: *const fn (out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque) error{OutOfMemory}!void {
+pub fn createSignalChannel(inst: *Instance, name: []const u8, ch: *SignalChannel, decode: SignalDecode) error{OutOfMemory}!void {
     ch.* = .{ .inst = inst, .name = name };
     if (inst.wio.refuse("signalChannel")) return;
     try inst.signal_channels.append(inst.arena(), ch);
@@ -1127,7 +1149,7 @@ pub fn createSignalChannel(inst: *Instance, name: []const u8, ch: *SignalChannel
 
 /// The channel registered for signals called `name` whose arguments `decode` decodes, or null
 /// if another handler (or a channel of other argument types) handles them, or none does.
-pub fn signalChannelFor(inst: *Instance, name: []const u8, decode: *const fn (out: Allocator, name: []const u8, args: []const converter.Payload) anyerror!*const anyopaque) ?*SignalChannel {
+pub fn signalChannelFor(inst: *Instance, name: []const u8, decode: SignalDecode) ?*SignalChannel {
     const handler = inst.signal_handlers.get(name) orelse return null;
     if (handler.call != SignalChannel.handlerCall or handler.decode != decode) return null;
     return @ptrCast(@alignCast(@constCast(handler.context)));
@@ -1300,7 +1322,7 @@ fn startUpdate(inst: *Instance, handler: UpdateHandler, update: *const Update) e
     if (update.run_validator) {
         var section: ReadOnlySection = .{ .update = update, .update_handler = handler };
         inst.wio.beginReadOnly(&section.io);
-        const result = inst.inboundNext().validateUpdate(update.input());
+        const result = inst.inboundNext().validateUpdate(update.input(&inst.converter_context));
         inst.wio.endReadOnly(&section.io);
         if (section.io.refused) |call| return inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try readOnlyFailure(a, "update validator", update.name, call) });
         result catch |err| switch (err) {
@@ -1361,7 +1383,7 @@ pub fn releaseHandlers(inst: *Instance) error{OutOfMemory}!void {
 fn handlerMain(inst: *Instance, run: *HandlerRun) void {
     switch (run.kind) {
         .signal => |s| {
-            const result = inst.inboundNext().handleSignal(.{ .signal_name = s.signal.name, .args = .{ .payloads = s.signal.args }, .header = s.signal.header });
+            const result = inst.inboundNext().handleSignal(.{ .signal_name = s.signal.name, .args = .{ .payloads = s.signal.args, .context = &inst.converter_context }, .header = s.signal.header });
             inst.removeHandler(run);
             result catch |err| {
                 if (inst.evicting) return;
@@ -1376,7 +1398,7 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
         },
         .update => |u| {
             const a = inst.arena();
-            const result = inst.inboundNext().executeUpdate(u.update.input());
+            const result = inst.inboundNext().executeUpdate(u.update.input(&inst.converter_context));
             inst.removeHandler(run);
             if (inst.evicting) return;
             const response: cmd_pb.UpdateResponse.response_union = if (result) |payload|
@@ -1629,6 +1651,8 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
     inst.args = args;
     inst.header = try .fromEntries(a, init.headers.items);
     try propagation.extractAll(inst.propagators, a, inst.header, &inst.propagated, "the workflow start");
+    inst.converter_context.workflow_id = inst.info.workflow_id;
+    inst.converter_context.workflow_type = inst.info.workflow_type;
     var inbound: std.ArrayList(interceptor.WorkflowInbound) = .empty;
     var outbound: std.ArrayList(interceptor.WorkflowOutbound) = .empty;
     for (inst.interceptors) |w| {
@@ -1651,7 +1675,7 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
 fn rootMain(inst: *Instance) void {
     const started = inst.inboundNext().executeWorkflow(.{
         .workflow_type = inst.info.workflow_type,
-        .args = .{ .payloads = inst.args },
+        .args = .{ .payloads = inst.args, .context = &inst.converter_context },
         .header = inst.header,
     });
     const outcome: RootOutcome = if (started) |result|
@@ -1791,7 +1815,8 @@ fn workflowFailure(inst: *Instance, out: Allocator, err: anyerror) !Failure {
 /// `recordContinueAsNew`.
 pub fn requestContinueAsNew(inst: *Instance, workflow_type: []const u8, options: workflow.ContinueAsNewOptions, args: anytype) sa.EncodeError!void {
     if (inst.wio.refuse("continueAsNew")) return;
-    const out = try inst.outgoing(args);
+    const context = try inst.contextWith(.{ .workflow_type = workflow_type });
+    const out = try inst.outgoing(context, args);
     return inst.outboundNext().continueAsNew(.{ .workflow_type = workflow_type, .options = options, .args = out.args, .header = out.header });
 }
 
@@ -1960,13 +1985,55 @@ fn versionOutOfMemory(inst: *Instance, version: i32) i32 {
 /// for `propagated`, for the outbound interceptors. Arena memory.
 const Outgoing = struct { args: converter.EncodedValues, header: *converter.HeaderWriter };
 
-fn outgoing(inst: *Instance, args: anytype) error{OutOfMemory}!Outgoing {
+/// `context` is what the arguments are encoded with and what `args` decodes with; it must
+/// live as long as the run (arena memory, or the run's own).
+fn outgoing(inst: *Instance, context: *const converter.Context, args: anytype) error{OutOfMemory}!Outgoing {
     const a = inst.arena();
-    const payloads = try converter.toPayloads(a, args);
+    const payloads = try converter.toPayloadsWithContext(a, context, args);
     const header = try a.create(converter.HeaderWriter);
     header.* = .init(a);
     try propagation.injectAll(inst.propagators, a, &inst.propagated, header);
-    return .{ .args = .{ .payloads = payloads.items }, .header = header };
+    return .{ .args = .{ .payloads = payloads.items, .context = context }, .header = header };
+}
+
+/// A copy of the run's converter context in the arena, with `workflow_type`, `workflow_id`,
+/// `activity_type` and `activity_id` replaced where given (copied into the arena too).
+fn contextWith(inst: *Instance, fields: struct {
+    workflow_id: ?[]const u8 = null,
+    workflow_type: ?[]const u8 = null,
+    activity_type: ?[]const u8 = null,
+    activity_id: ?[]const u8 = null,
+}) error{OutOfMemory}!*converter.Context {
+    const a = inst.arena();
+    const context = try a.create(converter.Context);
+    context.* = inst.converter_context;
+    if (fields.workflow_id) |id| context.workflow_id = try a.dupe(u8, id);
+    if (fields.workflow_type) |t| context.workflow_type = try inst.intern(t);
+    if (fields.activity_type) |t| context.activity_type = try inst.intern(t);
+    if (fields.activity_id) |id| context.activity_id = try a.dupe(u8, id);
+    return context;
+}
+
+/// `name` copied into the arena once per run: a run that schedules many activities of a few
+/// types holds each type name once, so its memory doesn't grow with the names' length.
+fn intern(inst: *Instance, name: []const u8) error{OutOfMemory}![]const u8 {
+    const a = inst.arena();
+    const entry = try inst.type_names.getOrPut(a, name);
+    if (!entry.found_existing) entry.key_ptr.* = a.dupe(u8, name) catch |err| {
+        inst.type_names.removeByPtr(entry.key_ptr);
+        return err;
+    };
+    return entry.key_ptr.*;
+}
+
+/// The converter context of an activity's arguments, which are encoded before the activity
+/// is scheduled: the run's, with the activity type and `activity_id`, or the ID the next
+/// activity gets when that is empty (an interceptor that schedules another activity first,
+/// or changes the ID, makes it differ from the scheduled one).
+fn activityArgsContext(inst: *Instance, activity_type: []const u8, activity_id: []const u8) error{OutOfMemory}!*converter.Context {
+    const context = try inst.contextWith(.{ .activity_type = activity_type, .activity_id = activity_id });
+    if (activity_id.len == 0) context.activity_id = try std.fmt.allocPrint(inst.arena(), "{d}", .{inst.next_activity_seq});
+    return context;
 }
 
 fn payloadList(a: Allocator, payloads: []const converter.Payload) error{OutOfMemory}!std.ArrayList(converter.Payload) {
@@ -1992,14 +2059,16 @@ pub fn currentLogger(inst: *Instance) log.Logger {
 /// Encodes `args` and schedules an activity through the outbound interceptors.
 pub fn executeActivity(inst: *Instance, activity_type: []const u8, options: workflow.ActivityOptions, args: anytype) workflow.ActivityFuture(converter.Payload) {
     if (inst.wio.refuse("executeActivity")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
-    const out = inst.outgoing(args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
+    const context = inst.activityArgsContext(activity_type, options.activity_id) catch |err| return .{ .ctx = &inst.ctx, .state = err };
+    const out = inst.outgoing(context, args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     return inst.outboundNext().executeActivity(.{ .activity_type = activity_type, .options = options, .args = out.args, .header = out.header });
 }
 
 /// Encodes `args` and schedules a local activity through the outbound interceptors.
 pub fn executeLocalActivity(inst: *Instance, activity_type: []const u8, options: workflow.LocalActivityOptions, args: anytype) workflow.ActivityFuture(converter.Payload) {
     if (inst.wio.refuse("executeLocalActivity")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
-    const out = inst.outgoing(args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
+    const context = inst.activityArgsContext(activity_type, options.activity_id) catch |err| return .{ .ctx = &inst.ctx, .state = err };
+    const out = inst.outgoing(context, args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     return inst.outboundNext().executeLocalActivity(.{ .activity_type = activity_type, .options = options, .args = out.args, .header = out.header });
 }
 
@@ -2012,18 +2081,32 @@ pub fn sideEffect(inst: *Instance, value: ?converter.Payload) workflow.ActivityF
 /// Encodes `args` and starts a child workflow through the outbound interceptors.
 pub fn executeChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workflow.ChildWorkflowOptions, args: anytype) workflow.ChildWorkflowFuture(converter.Payload) {
     if (inst.wio.refuse("executeChildWorkflow")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
-    const out = inst.outgoing(args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
+    // The ID is empty when the SDK will generate it: it is drawn when the child is started,
+    // not earlier, so the run's random values stay as they were.
+    const context = inst.contextWith(.{ .workflow_id = options.id, .workflow_type = workflow_type }) catch |err| return .{ .ctx = &inst.ctx, .state = err };
+    const out = inst.outgoing(context, args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     return inst.outboundNext().executeChildWorkflow(.{ .workflow_type = workflow_type, .options = options, .args = out.args, .header = out.header });
 }
 
 /// Encodes `args` and sends a signal through the outbound interceptors.
 pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []const u8, args: anytype) workflow.SignalExternalFuture {
+    return inst.signalWithContext(target, null, signal_name, args);
+}
+
+/// `signalExternal` to the child `state`, encoding `args` with the child's converter context.
+pub fn signalChildWorkflow(inst: *Instance, state: *const ChildState, signal_name: []const u8, args: anytype) workflow.SignalExternalFuture {
+    return inst.signalWithContext(.{ .child = state.workflow_id }, &state.context, signal_name, args);
+}
+
+/// `context` null encodes `args` with the run's context naming the target workflow ID.
+fn signalWithContext(inst: *Instance, target: SignalTarget, context: ?*const converter.Context, signal_name: []const u8, args: anytype) workflow.SignalExternalFuture {
     if (inst.wio.refuse("signalExternalWorkflow")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
-    const out = inst.outgoing(args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     const workflow_id, const run_id, const child = switch (target) {
         .execution => |e| .{ e.workflow_id, e.run_id, false },
         .child => |id| .{ id, "", true },
     };
+    const conv = context orelse inst.contextWith(.{ .workflow_id = workflow_id, .workflow_type = "" }) catch |err| return .{ .ctx = &inst.ctx, .state = err };
+    const out = inst.outgoing(conv, args) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     return inst.outboundNext().signalExternalWorkflow(.{
         .signal_name = signal_name,
         .workflow_id = workflow_id,
@@ -2039,10 +2122,17 @@ pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
 /// interceptors.
 pub fn executeNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, input: anytype) workflow.NexusOperationFuture(converter.Payload) {
     if (inst.wio.refuse("executeNexusOperation")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
-    const payload = converter.toPayload(inst.arena(), input) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
+    const context = inst.nexusContext();
+    const payload = converter.toPayloadWithContext(inst.arena(), &context, input) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
     var with_propagated = options;
     with_propagated.headers = inst.nexusHeadersWithPropagated(options.headers) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
     return inst.outboundNext().executeNexusOperation(.{ .service = service, .operation = operation, .options = with_propagated, .payload = payload });
+}
+
+/// The converter context of a Nexus operation's input and result: the namespace and the
+/// propagated values only, since the handler is no workflow or activity of this run.
+pub fn nexusContext(inst: *const Instance) converter.Context {
+    return .{ .values = &inst.propagated, .namespace = inst.namespace };
 }
 
 /// The caller's Nexus headers with the propagated values added: `headers` as given when the
@@ -2078,7 +2168,7 @@ pub fn rejectedActivity(inst: *Instance, activity_type: []const u8, f: failure_m
         .failure_info = .{ .activity_failure_info = .{ .activity_type = .{ .name = try a.dupe(u8, activity_type) } } },
     };
     const state = try a.create(ActivityState);
-    state.* = .{ .seq = 0, .outcome = .{ .failed = out } };
+    state.* = .{ .seq = 0, .outcome = .{ .failed = out }, .context = inst.converter_context };
     return state;
 }
 
@@ -2098,7 +2188,7 @@ pub fn rejectedChild(inst: *Instance, workflow_type: []const u8, f: failure_mod.
         } },
     };
     const state = try a.create(ChildState);
-    state.* = .{ .seq = 0, .workflow_id = "", .workflow_type = out.failure_info.?.child_workflow_execution_failure_info.workflow_type.?.name, .cancellation_type = .try_cancel, .outcome = .{ .failed = out } };
+    state.* = .{ .seq = 0, .workflow_id = "", .workflow_type = out.failure_info.?.child_workflow_execution_failure_info.workflow_type.?.name, .cancellation_type = .try_cancel, .outcome = .{ .failed = out }, .context = inst.converter_context };
     return state;
 }
 
@@ -2155,9 +2245,13 @@ fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflo
     const state = try inst.newActivity(activity_type, options.cancellation_type);
     const seq = state.seq;
 
+    const activity_id = if (options.activity_id.len > 0) try a.dupe(u8, options.activity_id) else try std.fmt.allocPrint(a, "{d}", .{seq});
+    state.context = inst.converter_context;
+    state.context.activity_type = try inst.intern(activity_type);
+    state.context.activity_id = activity_id;
     var cmd: cmd_pb.ScheduleActivity = .{
         .seq = seq,
-        .activity_id = if (options.activity_id.len > 0) options.activity_id else try std.fmt.allocPrint(a, "{d}", .{seq}),
+        .activity_id = activity_id,
         .activity_type = activity_type,
         .task_queue = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue,
         .arguments = try payloadList(a, args),
@@ -2200,11 +2294,15 @@ fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: wo
     }
     const a = inst.arena();
     const state = try inst.newActivity(activity_type, options.cancellation_type);
+    const activity_id = if (options.activity_id.len > 0) try a.dupe(u8, options.activity_id) else try std.fmt.allocPrint(a, "{d}", .{state.seq});
+    state.context = inst.converter_context;
+    state.context.activity_type = try inst.intern(activity_type);
+    state.context.activity_id = activity_id;
     const local = try a.create(ActivityState.Local);
     local.* = .{
         .cmd = .{
             .seq = state.seq,
-            .activity_id = if (options.activity_id.len > 0) options.activity_id else try std.fmt.allocPrint(a, "{d}", .{state.seq}),
+            .activity_id = activity_id,
             .activity_type = activity_type,
             .arguments = try payloadList(a, args),
             .headers = try header.toEntries(cmd_pb.ScheduleLocalActivity.HeadersEntry, a),
@@ -2253,7 +2351,10 @@ fn retryLocalActivity(inst: *Instance, state: *ActivityState) !void {
     try inst.activities.put(a, state.seq, state);
     inst.next_activity_seq += 1;
     local.cmd.seq = state.seq;
-    if (local.id_from_seq) local.cmd.activity_id = try std.fmt.allocPrint(a, "{d}", .{state.seq});
+    if (local.id_from_seq) {
+        local.cmd.activity_id = try std.fmt.allocPrint(a, "{d}", .{state.seq});
+        state.context.activity_id = local.cmd.activity_id;
+    }
     try inst.emit(.{ .user_metadata = local.user_metadata, .variant = .{ .schedule_local_activity = local.cmd } });
 }
 
@@ -2434,6 +2535,9 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
         .workflow_type = try a.dupe(u8, workflow_type),
         .cancellation_type = options.cancellation_type,
     };
+    state.context = inst.converter_context;
+    state.context.workflow_id = state.workflow_id;
+    state.context.workflow_type = state.workflow_type;
     var cmd: cmd_pb.StartChildWorkflowExecution = .{
         .seq = state.seq,
         .namespace = inst.namespace,
@@ -2981,7 +3085,7 @@ fn handlerOfCaller(inst: *Instance, comptime kind: std.meta.Tag(@FieldType(Handl
 fn rootHandleSignal(ptr: *anyopaque, input: interceptor.HandleSignalInput, _: interceptor.WorkflowInbound.Next) anyerror!void {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
     const handler = (try inst.handlerOfCaller(.signal)).handler;
-    const args = handler.decode(inst.arena(), input.signal_name, input.args.payloads) catch |err| switch (err) {
+    const args = handler.decode(inst.arena(), &inst.converter_context, input.signal_name, input.args.payloads) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             inst.logger.warn("dropping a signal whose arguments don't decode as its handler's parameters", .{ .SignalName = input.signal_name, .error_name = err });
@@ -2993,11 +3097,11 @@ fn rootHandleSignal(ptr: *anyopaque, input: interceptor.HandleSignalInput, _: in
 
 fn rootHandleQuery(ptr: *anyopaque, input: interceptor.HandleQueryInput, _: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    if (inst.queries.get(input.query_type)) |handler| return handler.call(handler.context, input.arena, input.args.payloads);
-    if (std.mem.eql(u8, input.query_type, stack_trace_query)) return converter.toPayload(input.arena, try inst.stackTrace(input.arena));
+    if (inst.queries.get(input.query_type)) |handler| return handler.call(handler.context, input.arena, &inst.converter_context, input.args.payloads);
+    if (std.mem.eql(u8, input.query_type, stack_trace_query)) return converter.toPayloadWithContext(input.arena, &inst.converter_context, try inst.stackTrace(input.arena));
     if (reservedQuery(input.query_type)) return error.QueryNotRegistered;
     const dynamic = inst.dynamic_query_handler orelse return error.QueryNotRegistered;
-    return dynamic.call(dynamic.context, input.arena, input.query_type, input.args.payloads);
+    return dynamic.call(dynamic.context, input.arena, &inst.converter_context, input.query_type, input.args.payloads);
 }
 
 /// Whether `query_type` names one of the queries Temporal's tools send for themselves (stack
@@ -3012,7 +3116,7 @@ fn rootValidateUpdate(ptr: *anyopaque, input: interceptor.UpdateInput, _: interc
     const inst: *Instance = @ptrCast(@alignCast(ptr));
     const section = inst.readOnly() orelse return error.HandlerNotFound;
     const handler = section.update_handler orelse return error.HandlerNotFound;
-    const args = try handler.decode(inst.arena(), input.update_name, input.args.payloads);
+    const args = try handler.decode(inst.arena(), &inst.converter_context, input.update_name, input.args.payloads);
     if (handler.validate) |validate| try validate(handler.context, args);
 }
 
@@ -3020,7 +3124,7 @@ fn rootExecuteUpdate(ptr: *anyopaque, input: interceptor.UpdateInput, _: interce
     const inst: *Instance = @ptrCast(@alignCast(ptr));
     const handler = (try inst.handlerOfCaller(.update)).handler;
     const a = inst.arena();
-    return handler.call(handler.context, a, try handler.decode(a, input.update_name, input.args.payloads));
+    return handler.call(handler.context, a, &inst.converter_context, try handler.decode(a, &inst.converter_context, input.update_name, input.args.payloads));
 }
 
 const outbound_root: interceptor.WorkflowOutbound.VTable = .{
@@ -3074,7 +3178,10 @@ fn rootSideEffect(ptr: *anyopaque, input: interceptor.SideEffectInput, _: interc
     const options: workflow.LocalActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
     const value: [1]converter.Payload = .{input.value orelse .{}};
     const args: []const converter.Payload = if (input.value != null) &value else &.{};
-    return .{ .ctx = &inst.ctx, .state = inst.scheduleLocalActivity(side_effect_activity_type, options, args, .{}) };
+    const state = inst.scheduleLocalActivity(side_effect_activity_type, options, args, .{}) catch |err| return .{ .ctx = &inst.ctx, .state = err };
+    // A side effect's value is the run's own, encoded in the workflow with its context.
+    state.context = inst.converter_context;
+    return .{ .ctx = &inst.ctx, .state = state };
 }
 
 fn rootExecuteChildWorkflow(ptr: *anyopaque, input: interceptor.ChildWorkflowInput, _: interceptor.WorkflowOutbound.Next) workflow.ChildWorkflowFuture(converter.Payload) {

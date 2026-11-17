@@ -62,7 +62,7 @@ pub const EncryptionCodec = struct {
     /// Each payload is serialized whole (data and metadata) and replaced by a payload of
     /// encoding `binary/encrypted` holding the nonce, the ciphertext, and the tag, encrypted
     /// with the key the call propagates, or else `key_id`.
-    fn encodeWithContext(ptr: *anyopaque, arena: Allocator, io: Io, context: *const converter.CodecContext, payloads: []const Payload) converter.CodecError![]Payload {
+    fn encodeWithContext(ptr: *anyopaque, arena: Allocator, io: Io, context: *const converter.Context, payloads: []const Payload) converter.CodecError![]Payload {
         const e: *const EncryptionCodec = @ptrCast(@alignCast(ptr));
         const id = if (context.values.get(encryption.propagate_key)) |c| c.key_id else e.key_id;
         if (id.len == 0) {
@@ -88,7 +88,7 @@ pub const EncryptionCodec = struct {
         return out;
     }
 
-    fn decodeWithContext(ptr: *anyopaque, arena: Allocator, io: Io, _: *const converter.CodecContext, payloads: []const Payload) converter.CodecError![]Payload {
+    fn decodeWithContext(ptr: *anyopaque, arena: Allocator, io: Io, _: *const converter.Context, payloads: []const Payload) converter.CodecError![]Payload {
         return decode(ptr, arena, io, payloads);
     }
 

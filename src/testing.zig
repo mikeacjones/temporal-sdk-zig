@@ -826,7 +826,7 @@ pub const WorkflowEnvironment = struct {
             .workflow_execution_continued_as_new_event_attributes => |c| c,
             else => {
                 const outcome: client_mod.ResultError!Result = switch (attrs) {
-                    .workflow_execution_completed_event_attributes => |done| decodeResult(Result, arena, done.result),
+                    .workflow_execution_completed_event_attributes => |done| decodeResult(Result, arena, &env.resultContext(run.id), done.result),
                     .workflow_execution_failed_event_attributes => |failed| blk: {
                         run.failure_ = failed.failure;
                         break :blk error.WorkflowFailed;
@@ -863,7 +863,7 @@ pub const WorkflowEnvironment = struct {
             .continued_as_new => return error.WorkflowContinuedAsNew,
             .returned => |payload| {
                 if (Result == void) return;
-                return converter.fromPayload(Result, arena, payload);
+                return converter.fromPayloadWithContext(Result, arena, &env.resultContext(run.id), payload);
             },
             .failed, .unfinished => {
                 // The time-skipping server records a retried run's failure only on the run
@@ -908,11 +908,18 @@ pub const WorkflowEnvironment = struct {
         };
     };
 
-    fn decodeResult(comptime Result: type, arena: Allocator, payloads: ?proto.temporal.api.common.v1.Payloads) client_mod.ResultError!Result {
+    fn decodeResult(comptime Result: type, arena: Allocator, context: *const converter.Context, payloads: ?proto.temporal.api.common.v1.Payloads) client_mod.ResultError!Result {
         if (Result == void) return;
         const p = payloads orelse return error.InvalidPayload;
         if (p.payloads.items.len == 0) return error.InvalidPayload;
-        return converter.fromPayload(Result, arena, p.payloads.items[0]);
+        return converter.fromPayloadWithContext(Result, arena, context, p.payloads.items[0]);
+    }
+
+    /// The converter context of the result of workflow `workflow_id`, as
+    /// `client.WorkflowRun.get` decodes it with: the namespace and the workflow ID. Borrows
+    /// `workflow_id`.
+    fn resultContext(env: *const WorkflowEnvironment, workflow_id: []const u8) converter.Context {
+        return .{ .namespace = env.client.namespace, .workflow_id = workflow_id };
     }
 
     /// The started event of run `run_id`, from `arena`.
@@ -1124,7 +1131,15 @@ pub const ActivityEnvironment = struct {
             .heartbeat_sink = env.on_heartbeat,
             .client_ = env.client,
             .metrics_ = env.metrics,
+            .converter_context_ = .{
+                .namespace = info.workflow_namespace,
+                .workflow_id = info.workflow_id,
+                .workflow_type = info.workflow_type,
+                .activity_type = info.activity_type,
+                .activity_id = info.activity_id,
+            },
         };
+        ctx.converter_context_.values = &ctx.propagated_;
         var run: Running = .{ .ctx = &ctx };
         {
             env.mutex.lockUncancelable(env.io);
@@ -8622,7 +8637,7 @@ const KeyIdCodec = struct {
         return decodeWithContext(ptr, arena, io, &.{}, payloads);
     }
 
-    fn encodeWithContext(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+    fn encodeWithContext(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
         const k: *KeyIdCodec = @ptrCast(@alignCast(ptr));
         const id = context.values.get(key_id) orelse {
             _ = k.without_key.fetchAdd(1, .monotonic);
@@ -8638,7 +8653,7 @@ const KeyIdCodec = struct {
         return out;
     }
 
-    fn decodeWithContext(_: *anyopaque, arena: Allocator, _: Io, _: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+    fn decodeWithContext(_: *anyopaque, arena: Allocator, _: Io, _: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
         const out = try arena.dupe(converter.Payload, payloads);
         for (out) |*p| {
             const id = keyIdOf(p.*) orelse continue;

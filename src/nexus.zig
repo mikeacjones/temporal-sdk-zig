@@ -850,7 +850,7 @@ fn Implementation(comptime service: []const u8, comptime Op: type, comptime func
 
         fn encodeOutput(ctx: *Context, value: shape.Value) StartResult {
             const a = ctx.arena;
-            const payload = converter.toPayload(a, value) catch return outOfMemory(what);
+            const payload = converter.toPayloadWithContext(a, &codecContext(ctx), value) catch return outOfMemory(what);
             if (ctx.codecs.len == 0) return .{ .succeeded = .{ .result = payload } };
             const encoded = converter.encodePayloadsWithContext(ctx.codecs, a, ctx.io_, &codecContext(ctx), &.{payload}) catch |err| return .{ .handler_error = .{
                 .type = .internal,
@@ -861,7 +861,9 @@ fn Implementation(comptime service: []const u8, comptime Op: type, comptime func
     };
 }
 
-fn codecContext(ctx: *const Context) converter.CodecContext {
+// What the codecs and the payload converter see for a request: the namespace and the
+// propagated values, since the caller is no workflow or activity of this worker.
+fn codecContext(ctx: *const Context) converter.Context {
     return .{ .namespace = ctx.info_.namespace, .values = &ctx.propagated_ };
 }
 
@@ -882,7 +884,7 @@ fn decodeInput(comptime T: type, comptime what: []const u8, ctx: *Context, input
         };
         payload = decoded[0];
     }
-    return converter.fromPayload(T, a, payload) catch |err| {
+    return converter.fromPayloadWithContext(T, a, &codecContext(ctx), payload) catch |err| {
         if (err == error.OutOfMemory) {
             failed.* = .{ .type = .internal, .message = what ++ ": out of memory decoding its input" };
             return error.Failed;

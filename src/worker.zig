@@ -1398,7 +1398,7 @@ pub const WorkflowRunner = struct {
             if (job.variant) |v| if (v == .initialize_workflow) break i;
         } else return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &.{ .namespace = r.namespace });
         const init = &act.jobs.items[index].variant.?.initialize_workflow;
-        var context: converter.CodecContext = .{ .namespace = r.namespace, .workflow_id = init.workflow_id, .workflow_type = init.workflow_type };
+        var context: converter.Context = .{ .namespace = r.namespace, .workflow_id = init.workflow_id, .workflow_type = init.workflow_type };
         var headers = init.headers;
         try converter.decodeMessage(@TypeOf(headers), &headers, r.codecs, a, io, &context);
         const values = try a.create(propagation.Values);
@@ -1757,7 +1757,7 @@ fn readVarint(bytes: []const u8, i: *usize) ?u64 {
 }
 
 /// The codec context of a cached run: its identity and the values `ctx.propagated()` returns.
-fn runCodecContext(namespace: []const u8, inst: *const Instance) converter.CodecContext {
+fn runCodecContext(namespace: []const u8, inst: *const Instance) converter.Context {
     return .{ .values = &inst.propagated, .namespace = namespace, .workflow_id = inst.info.workflow_id, .workflow_type = inst.info.workflow_type };
 }
 
@@ -1841,7 +1841,7 @@ const RunningActivity = struct {
     ctx: activity.Context,
     /// What the codecs see for this activity's payloads: its identity, and once its header is
     /// decoded, `ctx.propagated_`.
-    codec_context: converter.CodecContext = .{},
+    codec_context: converter.Context = .{},
     /// Set when the activity returns or a cancel arrives; wakes the supervisor.
     wake: Io.Event = .unset,
 
@@ -2028,7 +2028,7 @@ const Heartbeats = struct {
     w: *Worker,
     core: bridge.Worker,
     task_token: []const u8,
-    codec_context: *const converter.CodecContext,
+    codec_context: *const converter.Context,
     /// The latest details, before the codecs: the attempt's last heartbeat's, or those it
     /// started with. `last_arena` owns them once the attempt has heartbeated.
     last: []const converter.Payload,
@@ -2110,6 +2110,8 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
             .type = "PayloadCodecFailed",
         }) } } },
     };
+    // The payload converter sees what the codecs see, propagated values included.
+    ctx.converter_context_ = run.codec_context;
     const side_effect = start.is_local and std.mem.eql(u8, start.activity_type, Instance.side_effect_activity_type);
     const session_entry = if (start.is_local) null else if (w.session_host) |h| h.registered(start.activity_type) else null;
     const internal = side_effect or session_entry != null;
@@ -2169,7 +2171,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     const payload = user: {
         const sdk = w.io.swapCancelProtection(.unblocked);
         defer _ = w.io.swapCancelProtection(sdk);
-        break :user next.execute(.{ .activity_type = start.activity_type, .args = .{ .payloads = start.input.items }, .header = ctx.header_ });
+        break :user next.execute(.{ .activity_type = start.activity_type, .args = .{ .payloads = start.input.items, .context = ctx.converterContext() }, .header = ctx.header_ });
     } catch |err| {
         if (err == error.CompleteAsync) {
             if (!start.is_local) return .{ .status = .{ .will_complete_async = .{} } };
@@ -2666,7 +2668,7 @@ fn completeNexusRequest(w: *Worker, core: bridge.Worker, req: *NexusRequest, out
 /// Encodes the payloads of the completion's failure, if it has one, with the client's codecs.
 /// A synchronous result is already encoded (by `nexus.Operation.start`).
 fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, ctx: *const nexus.Context) converter.CodecError!void {
-    const context: converter.CodecContext = .{ .namespace = ctx.info_.namespace, .values = ctx.propagated() };
+    const context: converter.Context = .{ .namespace = ctx.info_.namespace, .values = ctx.propagated() };
     const status = if (completion.status) |*st| st else return;
     const f: *failure_mod.Failure = switch (status.*) {
         .failure => |*f| f,
@@ -5061,17 +5063,17 @@ const ContextRecordingCodec = struct {
         return arena.dupe(converter.Payload, payloads);
     }
 
-    fn encode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+    fn encode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
         try record(ptr, "encode", context);
         return arena.dupe(converter.Payload, payloads);
     }
 
-    fn decode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.CodecContext, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+    fn decode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
         try record(ptr, "decode", context);
         return arena.dupe(converter.Payload, payloads);
     }
 
-    fn record(ptr: *anyopaque, what: []const u8, context: *const converter.CodecContext) !void {
+    fn record(ptr: *anyopaque, what: []const u8, context: *const converter.Context) !void {
         const r: *ContextRecordingCodec = @ptrCast(@alignCast(ptr));
         const call = try std.fmt.allocPrint(r.arena, "{s} tenant={s} {s}/{s}/{s}", .{ what, context.values.get(tenant) orelse "-", context.namespace, context.workflow_type, context.workflow_id });
         try r.calls.append(r.arena, call);

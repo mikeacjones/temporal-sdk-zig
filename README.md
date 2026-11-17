@@ -1795,10 +1795,59 @@ try testing.expectEqualStrings("greeting-1", (try later.get(Execution, arena)).w
 Notes:
 
 - A `converter.Payload` passes through as is. `void` and null encode as `binary/null`, `converter.Bytes` as `binary/plain`, protobuf messages as ProtoJSON (`converter.ProtoBinary` as `binary/protobuf`), and everything else, strings included, as JSON through `std.json`.
-- A type that declares `pub fn toPayload(self, arena)` and `pub fn fromPayload(arena, payload)` encodes itself, also as an optional.
+- A type that declares `pub fn toPayload(self, arena)` and `pub fn fromPayload(arena, payload)` encodes itself, also as an optional. It may declare the context hooks below instead.
 - Decoded strings and slices come from the arena passed in; an encoded payload may borrow the value's bytes.
 - `fromPayload` returns `error.UnknownEncoding` for a payload with no `encoding` or with one the converter doesn't handle, which for a protobuf message type is anything but `binary/null` and the two protobuf encodings.
 - It returns `error.InvalidPayload` for `binary/null` into a type that isn't `void` or optional, `binary/plain` into anything but `converter.Bytes` or a byte slice, and JSON or protobuf data that doesn't parse as the type.
+
+A type that needs to know what its value is for, such as one that picks its encoding by namespace or by workflow, declares `toPayloadWithContext` and `fromPayloadWithContext` instead. They receive a `converter.Context`: the namespace, the workflow ID and type, for an activity's values the activity type and ID, and the propagated values, which is also what payload codecs receive.
+
+<!-- example: converter-context-hooks -->
+```zig
+/// Records the workflow it was sent for, and refuses to decode for another.
+const Ticket = struct {
+    seat: []const u8,
+
+    pub fn toPayloadWithContext(t: Ticket, arena: Allocator, context: *const converter.Context) error{OutOfMemory}!converter.Payload {
+        var p = try converter.payloadWithEncoding(arena, "text/ticket", t.seat);
+        try p.metadata.append(arena, .{ .key = "workflow-id", .value = context.workflow_id });
+        return p;
+    }
+
+    pub fn fromPayloadWithContext(arena: Allocator, context: *const converter.Context, p: converter.Payload) converter.DecodeError!Ticket {
+        const enc = converter.encodingOf(p) orelse return error.UnknownEncoding;
+        if (!std.mem.eql(u8, enc, "text/ticket")) return error.UnknownEncoding;
+        for (p.metadata.items) |m| {
+            if (std.mem.eql(u8, m.key, "workflow-id") and !std.mem.eql(u8, m.value, context.workflow_id)) return error.InvalidPayload;
+        }
+        return .{ .seat = try arena.dupe(u8, p.data) };
+    }
+};
+
+fn checkIn(ctx: *activity.Context, ticket: Ticket) ![]const u8 {
+    // The activity's context names its workflow, its type and its ID.
+    return std.fmt.allocPrint(ctx.allocator(), "{s} for {s}", .{ ticket.seat, ctx.converterContext().workflow_id });
+}
+
+fn board(ctx: *workflow.Context, ticket: Ticket) ![]const u8 {
+    // The client encoded `ticket` for this workflow's ID; the activity's argument is
+    // encoded and decoded with the activity's context, which names the same workflow.
+    return ctx.executeActivity(CheckIn, .{ .start_to_close_timeout = .fromSeconds(10) }, .{ticket}).get();
+}
+```
+
+Notes:
+
+- The hooks are `pub fn toPayloadWithContext(self, arena, context)` and `pub fn fromPayloadWithContext(arena, context, payload)`. They take precedence over `toPayload` and `fromPayload`, for the type and for optionals of it, at the top level of a payload. Declaring only one of the two is a compile error. Types with only `toPayload` and `fromPayload`, and the built-in encodings, convert as before.
+- `converter.toPayloadWithContext`, `fromPayloadWithContext`, `toPayloadsWithContext` and `fromPayloadsWithContext` convert with a context. The functions without it pass the empty context: every string empty and no propagated values.
+- The SDK passes the context of the call a value belongs to:
+  - On a client: the namespace, workflow ID and workflow type for a workflow's start arguments (with signal-with-start and update-with-start), the namespace and workflow ID for signals, queries, updates and their results, terminate details and `WorkflowRun.get`, the namespace and activity ID (and type, where the call names it) for a standalone activity's arguments and result and for `ActivityDescription.heartbeat_details`, and the namespace, workflow ID and activity ID for the `...ById` activity completion calls. The calls by task token carry the namespace only. The client call's `.context` values are the propagated values.
+  - In a workflow: the run's context (`ctx.converterContext()`) for its arguments, result, signals, queries, updates, side effects and `lastCompletionResult`, with the new type for continue-as-new arguments. An activity's or local activity's arguments and result carry its type and ID (`future.converterContext()`); a child's arguments, result and signals carry its ID and type; an external signal carries its target's workflow ID. A Nexus operation's input and result carry the namespace and propagated values only.
+  - On the activity worker: the activity's context (`ctx.converterContext()`) for its arguments, result and heartbeat details, with an empty workflow ID and type for a standalone activity. A Nexus handler's input and output carry the namespace and propagated values.
+- Failure details are encoded and decoded by your code, so pass the context yourself: `converter.toPayloadWithContext(arena, ctx.converterContext(), value)` to encode, and `details.withContext(future.converterContext()).get(T, arena, 0)` to decode. `EncodedValues.withContext` and `EncodedValue.withContext` return a copy that decodes with the context; the ones the SDK hands you already carry theirs.
+- These conversions have no context, and a context hook receives the empty one: your own calls to `toPayload`, `fromPayload`, `toPayloads`, `fromPayloads`, `toFields` and `fieldValue`; an `EncodedValues` or `EncodedValue` built without one, including those from `failure.kind`; memos; search attributes; headers and propagators; summaries and details in user metadata; schedule action arguments; and the codec server.
+- The context names what the caller knows, and the two sides of a value don't always agree. The workflow type and activity type are set only where the caller knows them. An activity's arguments are encoded before the outbound interceptors and before the activity is scheduled, so their activity ID is `ActivityOptions.activity_id` or the ID the SDK will assign; an interceptor that changes the ID or schedules another activity first makes it differ. A local activity retried after a backoff timer gets a new ID while its arguments stay as first encoded. A child's arguments carry an empty workflow ID when the SDK generates the ID. Set `activity_id` and `ChildWorkflowOptions.id` when a hook depends on them.
+- The hooks run inside workflow code when a workflow converts, so they must be deterministic and must not block or do I/O. They also run concurrently on workflow, activity and client threads, so they must not rely on unsynchronized shared state. The context is borrowed for the call: copy anything a hook keeps.
 
 `temporal.protojson.encode` and `temporal.protojson.decode` write and read any generated protobuf message as ProtoJSON, the form the Temporal CLI, the Web UI and codec servers use: history exports, codec server requests and answers, and `json/protobuf` payloads, which `converter` converts with them.
 
@@ -1850,7 +1899,7 @@ Notes:
 
 - Codecs run in order on the way out and in reverse on the way in. Search attributes are never encoded. The codecs are borrowed and must outlive the client.
 - A codec returns as many payloads as it was given and passes through payloads it didn't encode. It runs on many threads at once, never in workflow code.
-- `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.CodecContext`: namespace, workflow, activity, and propagated values.
+- `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.Context`: namespace, workflow, activity, and propagated values.
 - `converter.codecHandler(codecs, options)` serves `POST /encode` and `/decode` for the Temporal Web UI and CLI. It doesn't authenticate callers.
 
 #### Failures

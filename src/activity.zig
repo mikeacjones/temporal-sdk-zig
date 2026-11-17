@@ -162,6 +162,10 @@ pub const Context = struct {
     header_: converter.Header = .{},
     /// What the client's propagators extracted from `header_`.
     propagated_: propagation.Values = .empty,
+    /// The activity's converter context (`converterContext`), set by the SDK: the
+    /// namespace, the workflow ID and type (empty for a standalone activity), the activity
+    /// type and ID, and `values` pointing at `propagated_`.
+    converter_context_: converter.Context = .{},
     /// The attempt's outbound interceptors (`interceptor.ActivityOutbound`).
     outbound: []const interceptor.ActivityOutbound = &.{},
     /// Records with the activity's attributes; the worker frees it after the activity.
@@ -270,6 +274,15 @@ pub const Context = struct {
         return &ctx.propagated_;
     }
 
+    /// The activity's converter context, as its arguments, result and heartbeat details are
+    /// converted with: the namespace, the workflow ID and type (empty for a standalone
+    /// activity), the activity type and ID, and `propagated()`. Encode failure details with
+    /// it, `converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), value)`.
+    /// Valid for the attempt.
+    pub fn converterContext(ctx: *const Context) *const converter.Context {
+        return &ctx.converter_context_;
+    }
+
     /// Records metrics through the client's exporter (`client.Options.metrics`) with
     /// `namespace`, `task_queue`, `activity_type`, and `workflow_type` attributes, as
     /// sdk-core's activity metrics have them; records nothing without
@@ -350,7 +363,7 @@ pub const Context = struct {
         var scratch: std.heap.ArenaAllocator = .init(sink.gpa);
         defer scratch.deinit();
         if (@TypeOf(details) == void) return ctx.outboundNext().heartbeat(.{ .details = &.{} });
-        const payload = converter.toPayload(scratch.allocator(), details) catch {
+        const payload = converter.toPayloadWithContext(scratch.allocator(), ctx.converterContext(), details) catch {
             ctx.logger_.warn("dropping a heartbeat: its details could not be encoded", .{});
             return;
         };
@@ -369,7 +382,7 @@ pub const Context = struct {
         // Cancels blocked, as in `heartbeat`: the decode can't return the error.
         const prev = ctx.io_.swapCancelProtection(.blocked);
         defer _ = ctx.io_.swapCancelProtection(prev);
-        return converter.fromPayload(T, ctx.arena, ctx.heartbeat_details[0]) catch |err| switch (err) {
+        return converter.fromPayloadWithContext(T, ctx.arena, ctx.converterContext(), ctx.heartbeat_details[0]) catch |err| switch (err) {
             error.WrongArgumentCount => error.InvalidPayload,
             else => |e| e,
         };
@@ -381,7 +394,7 @@ pub const Context = struct {
     /// reads only the first. The payloads live as long as the activity's memory; decode each
     /// with `get(T, ctx.allocator(), index)`.
     pub fn encodedHeartbeatDetails(ctx: *const Context) converter.EncodedValues {
-        return .{ .payloads = ctx.heartbeat_details };
+        return .{ .payloads = ctx.heartbeat_details, .context = ctx.converterContext() };
     }
 };
 
@@ -436,9 +449,9 @@ pub fn Def(comptime name: []const u8, comptime func: anytype) type {
             const args = blk: {
                 const prev = ctx.io_.swapCancelProtection(.blocked);
                 defer _ = ctx.io_.swapCancelProtection(prev);
-                break :blk try converter.fromPayloads(Args, ctx.arena, payloads);
+                break :blk try converter.fromPayloadsWithContext(Args, ctx.arena, ctx.converterContext(), payloads);
             };
-            return converter.toPayload(ctx.arena, try call(receiver, ctx, args));
+            return converter.toPayloadWithContext(ctx.arena, ctx.converterContext(), try call(receiver, ctx, args));
         }
 
         /// Calls the function directly (receiver ignored for plain functions).
@@ -586,7 +599,7 @@ pub fn DynamicDef(comptime func: anytype) type {
         };
 
         pub fn invoke(receiver: ?*anyopaque, ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
-            return converter.toPayload(ctx.arena, try call(receiver, ctx, .{ .payloads = payloads }));
+            return converter.toPayloadWithContext(ctx.arena, ctx.converterContext(), try call(receiver, ctx, .{ .payloads = payloads, .context = ctx.converterContext() }));
         }
 
         /// Calls the function directly (receiver ignored for plain functions).
