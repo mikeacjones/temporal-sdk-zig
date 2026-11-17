@@ -2368,6 +2368,10 @@ fn handleNexusRequest(w: *Worker, req: *NexusRequest) NexusOutcome {
         }
         ctx.info_.links = links.items;
     }
+    // Read from the request as it arrived, before an inbound interceptor can change its headers.
+    ctx.propagated_ = .init(a);
+    if (w.client.propagators.len > 0) if (ctx.info_.header(propagation.nexus_header_name)) |value|
+        propagation.extractNexusHeader(w.client.propagators, a, value, &ctx.propagated_) catch return oom;
     var inbound: std.ArrayList(interceptor.NexusOperationInbound) = .empty;
     var outbound: std.ArrayList(interceptor.NexusOperationOutbound) = .empty;
     for (w.interceptors) |wi| {
@@ -2471,7 +2475,7 @@ fn completeNexusRequest(w: *Worker, core: bridge.Worker, req: *NexusRequest, out
         .cancel => |r| wire.cancelCompletion(a, req.task_token, r),
         .failed => |e| wire.failedCompletion(a, req.task_token, e),
     } catch return dropNexusTask(w, core, req.task_token, logger);
-    encodeNexusFailure(w, a, &completion, ctx.info_.namespace) catch |err| {
+    encodeNexusFailure(w, a, &completion, ctx) catch |err| {
         logger.warn("Encoding the Nexus request's failure with the client's codecs failed; sending it without its details", .{ .Error = @errorName(err) });
         completion = wire.failedCompletion(a, req.task_token, .{
             .type = .internal,
@@ -2483,8 +2487,8 @@ fn completeNexusRequest(w: *Worker, core: bridge.Worker, req: *NexusRequest, out
 
 /// Encodes the payloads of the completion's failure, if it has one, with the client's codecs.
 /// A synchronous result is already encoded (by `nexus.Operation.start`).
-fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, namespace: []const u8) converter.CodecError!void {
-    const context: converter.CodecContext = .{ .namespace = namespace };
+fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, ctx: *const nexus.Context) converter.CodecError!void {
+    const context: converter.CodecContext = .{ .namespace = ctx.info_.namespace, .values = ctx.propagated() };
     const status = if (completion.status) |*st| st else return;
     const f: *failure_mod.Failure = switch (status.*) {
         .failure => |*f| f,

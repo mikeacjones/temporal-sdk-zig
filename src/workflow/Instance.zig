@@ -2016,11 +2016,28 @@ pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
     });
 }
 
-/// Encodes `input` and schedules a Nexus operation through the outbound interceptors.
+/// Encodes `input`, adds the propagated values to the Nexus headers (see
+/// `nexusHeadersWithPropagated`), and schedules a Nexus operation through the outbound
+/// interceptors.
 pub fn executeNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, input: anytype) workflow.NexusOperationFuture(converter.Payload) {
     if (inst.wio.refuse("executeNexusOperation")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
     const payload = converter.toPayload(inst.arena(), input) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
-    return inst.outboundNext().executeNexusOperation(.{ .service = service, .operation = operation, .options = options, .payload = payload });
+    var with_propagated = options;
+    with_propagated.headers = inst.nexusHeadersWithPropagated(options.headers) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
+    return inst.outboundNext().executeNexusOperation(.{ .service = service, .operation = operation, .options = with_propagated, .payload = payload });
+}
+
+/// The caller's Nexus headers with the propagated values added: `headers` as given when the
+/// propagators write nothing, otherwise `headers` in order without any named
+/// `propagation.nexus_header_name` (ignoring case), followed by that header. `headers` is not
+/// modified; a new list is arena memory.
+fn nexusHeadersWithPropagated(inst: *Instance, headers: []const client.NexusHeader) error{OutOfMemory}![]const client.NexusHeader {
+    const a = inst.arena();
+    const value = (try propagation.injectNexusHeader(inst.propagators, a, &inst.propagated)) orelse return headers;
+    var out: std.ArrayList(client.NexusHeader) = try .initCapacity(a, headers.len + 1);
+    for (headers) |h| if (!std.ascii.eqlIgnoreCase(h.name, propagation.nexus_header_name)) out.appendAssumeCapacity(h);
+    out.appendAssumeCapacity(.{ .name = propagation.nexus_header_name, .value = value });
+    return out.items;
 }
 
 /// Requests another workflow's cancellation through the outbound interceptors.
@@ -8210,6 +8227,51 @@ test "nexus: the default options send no timeouts, headers or summary, and wait_
     try testing.expectEqual(@as(usize, 0), cmd.nexus_header.items.len);
     try testing.expect(cmd.cancellation_type == .WAIT_CANCELLATION_COMPLETED);
     try testing.expect(first[0].user_metadata == null);
+}
+
+test "nexus: propagated values replace a caller header of the reserved name, after the caller's headers" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const tenant = comptime propagation.key([]const u8, "tenant");
+    const propagators = [_]propagation.ContextPropagator{propagation.HeaderPropagator(tenant).propagator};
+    const W = struct {
+        fn run(ctx: *workflow.Context) ![]const u8 {
+            const caller = [_]client.NexusHeader{
+                .{ .name = "Temporal-Zig-Context", .value = "stale" },
+                .{ .name = "trace-id", .value = "abc" },
+            };
+            _ = ctx.executeNexusOperation(NexusWf.Service, NexusWf.Echo, .{ .endpoint = "hello-endpoint", .headers = &caller }, .{ .message = "hi" });
+            try testing.expectEqualStrings("stale", caller[0].value);
+            return "";
+        }
+        const Def = workflow.Def("PropagatingNexus", run);
+    };
+
+    // With a propagated value: the caller's other headers in order, then the propagated one.
+    {
+        const inst = try create(testing.allocator, W.Def.registered, .{ .propagators = &propagators });
+        defer inst.destroy();
+        var act = try initActivation(a, "PropagatingNexus", .{});
+        try act.jobs.items[0].variant.?.initialize_workflow.headers.append(a, .{ .key = "tenant", .value = try converter.toPayload(a, @as([]const u8, "acme")) });
+        const cmd = commandsOf(try inst.activate(&act, a))[0].variant.?.schedule_nexus_operation;
+        try testing.expectEqual(@as(usize, 2), cmd.nexus_header.items.len);
+        try testing.expectEqualStrings("trace-id", cmd.nexus_header.items[0].key);
+        try testing.expectEqualStrings(propagation.nexus_header_name, cmd.nexus_header.items[1].key);
+        var received: propagation.Values = .init(a);
+        try propagation.extractNexusHeader(&propagators, a, cmd.nexus_header.items[1].value, &received);
+        try testing.expectEqualStrings("acme", received.get(tenant).?);
+    }
+    // Nothing propagated: the caller's headers exactly as given.
+    {
+        const inst = try create(testing.allocator, W.Def.registered, .{ .propagators = &propagators });
+        defer inst.destroy();
+        const cmd = commandsOf(try inst.activate(&try initActivation(a, "PropagatingNexus", .{}), a))[0].variant.?.schedule_nexus_operation;
+        try testing.expectEqual(@as(usize, 2), cmd.nexus_header.items.len);
+        try testing.expectEqualStrings("Temporal-Zig-Context", cmd.nexus_header.items[0].key);
+        try testing.expectEqualStrings("stale", cmd.nexus_header.items[0].value);
+        try testing.expectEqualStrings("trace-id", cmd.nexus_header.items[1].key);
+    }
 }
 
 test "nexus: an asynchronous start returns its token, and the result follows in a later activation" {

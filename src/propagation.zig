@@ -19,9 +19,21 @@
 //!     const who = ctx.propagated().get(tenant) orelse "nobody";
 //!
 //! `HeaderPropagator(tenant).propagator` carries one key as a header field of the same name.
+//!
+//! Nexus operations carry the values too. When a workflow calls an operation, the propagators
+//! write their fields into one Nexus header, `nexus_header_name`, whose value is the fields
+//! as a protobuf `temporal.api.common.v1.Header`, base64url-encoded. The caller's own
+//! `NexusOperationOptions.headers` are sent in their order, without any header of that name
+//! (ignoring case), followed by the propagated one; with nothing to propagate the caller's
+//! headers are sent exactly as given. On the handling worker the client's propagators read
+//! the header back: `ctx.propagated()` in the handler holds the values, and a workflow a
+//! workflow-run operation starts carries them on. Like every Nexus header, the value skips
+//! the payload codecs, is recorded in the caller's history, and counts toward the server's
+//! limit on a call's Nexus headers, so don't propagate secrets or large values over Nexus.
 
 const std = @import("std");
 const converter = @import("converter.zig");
+const proto = @import("proto.zig");
 const Allocator = std.mem.Allocator;
 
 /// A key of a `Values` store: a name and the type of the value stored under it. Make one with
@@ -159,6 +171,55 @@ pub fn extractAll(propagators: []const ContextPropagator, arena: Allocator, head
     };
 }
 
+/// The Nexus header that carries propagated values across a Nexus call between workers of
+/// this SDK.
+pub const nexus_header_name = "temporal-zig-context";
+
+const ProtoHeader = proto.temporal.api.common.v1.Header;
+const nexus_encoding = std.base64.url_safe_no_pad;
+
+/// Runs every propagator's `inject` and returns the value of the `nexus_header_name` header
+/// that carries the fields, or null when the propagators wrote none. The fields are encoded
+/// in name order, so the same values give the same bytes. Memory comes from `arena`.
+pub fn injectNexusHeader(propagators: []const ContextPropagator, arena: Allocator, values: *const Values) error{OutOfMemory}!?[]const u8 {
+    if (propagators.len == 0) return null;
+    var w: converter.HeaderWriter = .init(arena);
+    try injectAll(propagators, arena, values, &w);
+    if (w.fields.items.len == 0) return null;
+    const message: ProtoHeader = .{ .fields = try w.header().toEntries(ProtoHeader.FieldsEntry, arena) };
+    var bytes: std.Io.Writer.Allocating = .init(arena);
+    message.encode(&bytes.writer, arena) catch return error.OutOfMemory;
+    const encoded = try arena.alloc(u8, nexus_encoding.Encoder.calcSize(bytes.written().len));
+    return nexus_encoding.Encoder.encode(encoded, bytes.written());
+}
+
+/// Decodes `value`, written by `injectNexusHeader`, and runs every propagator's `extract` on
+/// it into `values`. A value that isn't base64url or a header message is logged and skipped,
+/// as is a propagator whose fields don't decode; only running out of memory is an error.
+pub fn extractNexusHeader(propagators: []const ContextPropagator, arena: Allocator, value: []const u8, values: *Values) error{OutOfMemory}!void {
+    if (propagators.len == 0) return;
+    const log = std.log.scoped(.temporal);
+    const size = nexus_encoding.Decoder.calcSizeForSlice(value) catch {
+        log.warn("the Nexus header " ++ nexus_header_name ++ " is not base64url; its propagated values are skipped", .{});
+        return;
+    };
+    const bytes = try arena.alloc(u8, size);
+    nexus_encoding.Decoder.decode(bytes, value) catch {
+        log.warn("the Nexus header " ++ nexus_header_name ++ " is not base64url; its propagated values are skipped", .{});
+        return;
+    };
+    var reader: std.Io.Reader = .fixed(bytes);
+    const message = ProtoHeader.decode(&reader, arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            log.warn("the Nexus header " ++ nexus_header_name ++ " doesn't decode as a header message ({t}); its propagated values are skipped", .{err});
+            return;
+        },
+    };
+    const header = try converter.Header.fromEntries(arena, message.fields.items);
+    try extractAll(propagators, arena, header, values, "a Nexus request");
+}
+
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -210,4 +271,43 @@ test "a header propagator carries a key through a header" {
     var skipped: Values = .init(a);
     try extractAll(&propagators, a, bad.header(), &skipped, "a test call");
     try testing.expectEqual(@as(usize, 0), skipped.count());
+}
+
+test "values travel through the Nexus header and an undecodable one is skipped" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tenant = comptime key([]const u8, "tenant");
+    const user = comptime key([]const u8, "user");
+    const propagators = [_]ContextPropagator{ HeaderPropagator(user).propagator, HeaderPropagator(tenant).propagator };
+
+    var sent: Values = .init(a);
+    try sent.put(user, "ann");
+    try sent.put(tenant, "acme");
+    const value = (try injectNexusHeader(&propagators, a, &sent)).?;
+    for (value) |c| try testing.expect(std.ascii.isAlphanumeric(c) or c == '-' or c == '_');
+    // The same values in another order give the same bytes.
+    var reordered: Values = .init(a);
+    try reordered.put(tenant, "acme");
+    try reordered.put(user, "ann");
+    try testing.expectEqualStrings(value, (try injectNexusHeader(&propagators, a, &reordered)).?);
+
+    var received: Values = .init(a);
+    try extractNexusHeader(&propagators, a, value, &received);
+    try testing.expectEqualStrings("acme", received.get(tenant).?);
+    try testing.expectEqualStrings("ann", received.get(user).?);
+
+    // Nothing to propagate, no header.
+    try testing.expectEqual(@as(?[]const u8, null), try injectNexusHeader(&propagators, a, &Values.empty));
+    try testing.expectEqual(@as(?[]const u8, null), try injectNexusHeader(&.{}, a, &sent));
+
+    // Not base64url, or not a header message (a field cut short): skipped, nothing extracted.
+    const level = testing.log_level;
+    defer testing.log_level = level;
+    testing.log_level = .err;
+    for ([_][]const u8{ "not base64!", "_w", "CgU" }) |bad| {
+        var skipped: Values = .init(a);
+        try extractNexusHeader(&propagators, a, bad, &skipped);
+        try testing.expectEqual(@as(usize, 0), skipped.count());
+    }
 }

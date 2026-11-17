@@ -2238,8 +2238,11 @@ test "observability: a tenant travels from the client to the activity" {
 Notes:
 
 - Workers on the client use `client.Options.propagators` too.
-- A workflow's `ctx.propagated()` holds its start header's values and passes them on to every activity, child, signal, and continue-as-new it sends.
+- A workflow's `ctx.propagated()` holds its start header's values and passes them on to every activity, child, signal, continue-as-new, and Nexus operation it sends.
 - `Values.put` copies the value but borrows what it points to, such as a string's bytes.
+- Nexus operations a workflow calls carry its values too. The propagators write their fields into one Nexus header, `propagation.nexus_header_name` (`temporal-zig-context`), whose value is the fields as a protobuf `temporal.api.common.v1.Header`, base64url-encoded, in name order so a replay sends the same bytes. On the handling worker the client's propagators read it back: the handler's `ctx.propagated()` holds the values, and a workflow a workflow-run operation starts carries them on unless the handler sets `options.context` in its `nexus.WorkflowStart` itself.
+- How the header combines with `NexusOperationOptions.headers`: when the propagators write nothing, the caller's headers are sent exactly as given. Otherwise the caller's headers are sent in their order, without any named `temporal-zig-context` (ignoring case), followed by the propagated one. Outbound workflow interceptors see the combined list and may change it; the handler's `ctx.propagated()` reads the header as the request arrived, before inbound interceptors run.
+- Like every Nexus header, the propagated values skip the payload codecs, are recorded in the caller's history, and count toward the server's limit on a call's Nexus headers, so don't propagate secrets or large values over Nexus. A header value that doesn't decode is logged and skipped, and the request is still handled.
 
 #### Tracing
 <!-- stub: temporal-sdk-zig-d51.12.5 -->

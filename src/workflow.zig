@@ -658,8 +658,11 @@ pub const NexusOperationOptions = struct {
     cancellation_type: NexusOperationCancellationType = .wait_cancellation_completed,
     /// Nexus headers sent with the request to start the operation (names are
     /// case-insensitive). They are recorded in history and reach the handler as they are,
-    /// without the payload codecs, so don't put secrets in them. Propagators don't write
-    /// here.
+    /// without the payload codecs, so don't put secrets in them. When the context propagators
+    /// (`client.Options.propagators`) write values, the request carries these headers in
+    /// their order, without any named `propagation.nexus_header_name` (ignoring case),
+    /// followed by that header holding the values; otherwise exactly these. The slice
+    /// isn't modified.
     headers: []const nexus.Header = &.{},
     /// A short, single-line description of this operation, shown by the UI and CLI on its
     /// scheduled event. Sent as a JSON string payload, through the worker's payload codecs.

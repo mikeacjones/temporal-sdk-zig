@@ -38,6 +38,7 @@ const failure_mod = @import("failure.zig");
 const interceptor = @import("interceptor.zig");
 const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
+const propagation = @import("propagation.zig");
 const proto = @import("proto.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -152,6 +153,9 @@ fn isServiceDef(comptime T: type) bool {
 /// worker's task queue. With `options.id_conflict_policy = .use_existing`, a start that finds
 /// the workflow running attaches the operation to it instead of failing.
 /// `options.enable_eager_start` and `options.error_when_already_started` are ignored.
+/// A null `options.context` starts the workflow with the request's propagated values
+/// (`Context.propagated`), so it carries them on; a handler that sets `options.context` keeps
+/// its own.
 /// Strings in `options` and `args` must live until the handler's response has been sent, as
 /// `ctx.allocator()` memory does.
 pub fn WorkflowStart(comptime W: type) type {
@@ -534,6 +538,9 @@ pub const Context = struct {
     metrics_: metrics_mod.Handler = .noop,
     /// The request's outbound interceptors (`interceptor.NexusOperationOutbound`).
     outbound: []const interceptor.NexusOperationOutbound = &.{},
+    /// What the client's propagators extracted from the request; written by the worker
+    /// before the handler's task runs, and only read afterwards.
+    propagated_: propagation.Values = .empty,
     /// Applied to the input before decoding and to a synchronous result after encoding:
     /// the client's (`client.Options.codecs`). Borrowed.
     codecs: []const converter.PayloadCodec = &.{},
@@ -560,6 +567,13 @@ pub const Context = struct {
     /// The request being handled. Valid as long as `allocator()` memory.
     pub fn info(ctx: *const Context) *const Info {
         return &ctx.info_;
+    }
+
+    /// The values the client's propagators (`client.Options.propagators`) extracted from the
+    /// request's `propagation.nexus_header_name` header, as it arrived; empty when it carries
+    /// none. Valid as long as `allocator()` memory.
+    pub fn propagated(ctx: *const Context) *const propagation.Values {
+        return &ctx.propagated_;
     }
 
     /// Why the request was canceled, or null if it hasn't been. Set before the cancel reaches
@@ -848,7 +862,7 @@ fn Implementation(comptime service: []const u8, comptime Op: type, comptime func
 }
 
 fn codecContext(ctx: *const Context) converter.CodecContext {
-    return .{ .namespace = ctx.info_.namespace };
+    return .{ .namespace = ctx.info_.namespace, .values = &ctx.propagated_ };
 }
 
 /// Decodes `input` as `T`: through the context's codecs, then the payload converter. On
@@ -897,6 +911,7 @@ fn startWorkflow(comptime W: type, comptime what: []const u8, ctx: *Context, sta
     } };
     const i = &ctx.info_;
     var options = start.options;
+    if (options.context == null) options.context = &ctx.propagated_;
     var request_id = i.request_id;
     if (request_id.len == 0) request_id = client_mod.uuid(a, ctx.io_) catch return outOfMemory(what);
     if (options.id.len == 0) options.id = request_id;

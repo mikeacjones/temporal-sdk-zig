@@ -181,7 +181,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Client, workflow, and activity interceptors | all | GA | supported | [Interceptors](README.md#interceptors), [logger-interceptor](samples/logger-interceptor) |
 | Nexus interceptors | Go, Java, Python, TypeScript, .NET | GA | supported | [Interceptors](README.md#interceptors) |
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
-| Context propagation over Nexus calls | Go, Java | GA | partial | `temporal-sdk-zig-d51.12.10`. Missing: propagators applied to Nexus calls; a caller sets `NexusOperationOptions.headers` by hand and a handler reads them with `ctx.info().header`. |
+| Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation) |
 | OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA, deferred | partial | `temporal-sdk-zig-d51.12.5`. Missing: a tracing interceptor and span export; the client and worker interceptors and context propagation it would use exist. |
 
 ### Nexus
