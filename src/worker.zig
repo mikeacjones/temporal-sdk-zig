@@ -212,6 +212,15 @@ pub const Options = struct {
     /// the task. Only a task's first failed attempt is reported to the server; later ones
     /// send nothing and end in a workflow task timeout before the next retry.
     ///
+    /// For a listed error, sdk-core logs the warning "Failing workflow task" with the run ID
+    /// and the failure through the client's logger when it reports the task's first attempt.
+    /// A later attempt gets only a debug line from sdk-core, which the default
+    /// `client.Options.core_log_level` (`.warn`) hides, so at the default levels a task that
+    /// keeps failing on a listed error shows that one warning. The worker also logs the
+    /// eviction that follows each such failed attempt at debug level through `logger`, which
+    /// the default `std.log` sink shows in Debug builds. A nondeterministic run, deadlock
+    /// detection and `workflow_memory_limit` log at error level on every attempt.
+    ///
     /// A listed error from an update handler doesn't reject or fail the update: the retried
     /// task runs the handler again and answers it. An update delivered in the failed task
     /// was never accepted, so the server delivers it again and its validator runs again.
