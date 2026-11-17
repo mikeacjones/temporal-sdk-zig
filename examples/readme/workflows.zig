@@ -42,6 +42,32 @@ test "workflows: function and struct definitions run" {
     try testing.expectEqualStrings("Hello, Bo!", try env.executeWorkflow(GreeterWorkflow, .{"Bo"}, arena.allocator(), null));
 }
 
+// example: workflow-uuid
+fn greetChildById(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const id = try ctx.randomUuid(); // the same on replay
+    const child = ctx.executeChildWorkflow(Greeting, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{name});
+    return std.fmt.allocPrint(ctx.allocator(), "{s} ({s})", .{ try child.get(), id });
+}
+pub const GreetChildById = workflow.Def("greet_child_by_id", greetChildById);
+// end-example
+
+test "workflows: a UUID from the run's seeded randomness names a child" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(GreetChildById);
+    try env.registerWorkflow(Greeting);
+    try env.registerActivity(Greet);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try env.startWorkflow(GreetChildById, .{}, .{"Ann"});
+    defer run.deinit();
+    const result = try env.getResult(GreetChildById, &run, arena.allocator(), null);
+    try testing.expect(std.mem.startsWith(u8, result, "Hello, Ann! ("));
+    try testing.expectEqual(@as(usize, "Hello, Ann! ()".len + 36), result.len);
+    try env.replayRun(run.id, run.run_id);
+}
+
 // example: workflow-activities
 fn greetTwice(ctx: *workflow.Context, name: []const u8) ![]const u8 {
     // Both start now; `get` waits for each result.
@@ -410,7 +436,13 @@ fn greetFamily(ctx: *workflow.Context, names: []const []const u8) ![]const []con
     const children = try a.alloc(workflow.ChildWorkflowFuture([]const u8), names.len);
     for (names, children) |name, *child| {
         const id = try std.fmt.allocPrint(a, "{s}-{s}", .{ ctx.info().workflow_id, name });
-        child.* = ctx.executeChildWorkflow(Greeting, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{name});
+        child.* = ctx.executeChildWorkflow(Greeting, .{
+            .id = id,
+            .execution_timeout = .fromSeconds(60),
+            // Shares dispatch fairly among family members; the priority key is the parent's.
+            .priority = .{ .fairness_key = name },
+            .cancellation_type = .wait_cancellation_requested,
+        }, .{name});
     }
     const greetings = try a.alloc([]const u8, names.len);
     for (children, greetings) |child, *out| out.* = try child.get();
@@ -454,6 +486,27 @@ test "workflows: continue-as-new carries state to the next run" {
     defer arena.deinit();
     const total = try env.executeWorkflow(GreetInBatches, .{ &.{ "Ann", "Bo", "Cy", "Di", "Ed" }, 0 }, arena.allocator(), null);
     try testing.expectEqual(5, total);
+}
+
+// example: workflow-continue-as-new-by-name
+fn anyCountdown(ctx: *workflow.Context, args: temporal.converter.EncodedValues) ![]const u8 {
+    const left = try args.get(u32, ctx.allocator(), 0);
+    // Continues under whichever type this run was started as.
+    if (left > 0) return ctx.continueAsNewByName(ctx.info().workflow_type, .{}, .{left - 1});
+    return std.fmt.allocPrint(ctx.allocator(), "{s} done", .{ctx.info().workflow_type});
+}
+pub const AnyCountdown = workflow.DynamicDef(anyCountdown);
+// end-example
+
+test "workflows: a dynamic workflow continues as new under its own type" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerDynamicWorkflow(AnyCountdown);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflowByName([]const u8, "launch_countdown", .{}, .{@as(u32, 2)}, arena.allocator(), null);
+    try testing.expectEqualStrings("launch_countdown done", result);
 }
 
 // example: workflow-cancellation
@@ -640,4 +693,35 @@ test "workflows: a failure policy lists errors that fail the workflow task" {
     var run = try env.startWorkflow(ShipOrder, .{}, .{"courier"});
     defer run.deinit();
     try testing.expectEqualStrings("shipped by courier for 12", try env.getResult(ShipOrder, &run, arena.allocator(), null));
+}
+
+// example: workflow-stack-trace
+fn reminder(ctx: *workflow.Context, minutes: i64) ![]const u8 {
+    try ctx.io().sleep(.fromSeconds(minutes * 60), .awake);
+    return "reminded";
+}
+pub const Reminder = workflow.Def("reminder", reminder);
+
+// From any client: the worker answers for every workflow, with no handler to register.
+fn whereIsIt(client: *temporal.client.Client, arena: std.mem.Allocator, workflow_id: []const u8) ![]const u8 {
+    return client.queryWorkflow(workflow.StackTraceQuery, arena, workflow_id, "", .{});
+}
+// end-example
+
+test "workflows: the worker answers the stack trace query for every workflow" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(Reminder);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(Reminder, .{}, .{60});
+    defer run.deinit();
+    // The workflow's first task may not have run yet; ask until it waits.
+    const answer = for (0..200) |_| {
+        const text = try whereIsIt(&env.client, a, run.id);
+        if (std.mem.find(u8, text, "waits on") != null) break text;
+    } else return error.TestNeverWaited;
+    try testing.expect(std.mem.startsWith(u8, answer, "workflow \"reminder\": 1 coroutine\n\ncoroutine 1 \"workflow\", the workflow function, waits on a timer (1h)\n  at "));
 }

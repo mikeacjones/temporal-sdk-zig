@@ -39,4 +39,7 @@ test {
     _ = @import("client_rpc_options_test.zig");
     _ = @import("nexus_test.zig");
     _ = @import("failure_test.zig");
+    _ = @import("workflow_api_test.zig");
+    _ = @import("workflow/stack_trace_test.zig");
+    _ = @import("workflow/call_sites.zig");
 }

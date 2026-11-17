@@ -1,0 +1,2 @@
+`workflow.ChildWorkflowOptions.priority` gives a child workflow a priority key and fairness key and weight; null or zero fields inherit the parent's.
+`workflow.ChildWorkflowCancellationType.wait_cancellation_requested` reports a child's cancellation once the server has recorded the request, without waiting for the child to close. Canceling a workflow cancels only the children a coroutine is waiting on; the others are left to their `parent_close_policy`.

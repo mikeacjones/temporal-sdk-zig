@@ -231,7 +231,8 @@ pub const CancelExternalInput = struct {
     run_id: []const u8,
 };
 
-/// The next run the workflow continues as; as `ActivityInput`.
+/// The next run the workflow continues as, from `continueAsNew` or `continueAsNewByName`; as
+/// `ActivityInput`.
 pub const ContinueAsNewInput = struct {
     workflow_type: []const u8,
     options: workflow.ContinueAsNewOptions,

@@ -68,7 +68,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Workflow initialization that sees the start arguments before handlers run | Java, Python, .NET, PHP, Ruby | GA | supported | [Definition](README.md#definition) (a function workflow reads its arguments, then registers its handlers) |
 | Determinism enforcement at run time (sandbox, illegal-call checks) | Python, TypeScript, .NET, Ruby | GA | supported | [Determinism](README.md#determinism) |
 | Deterministic random numbers | Java, Python, TypeScript, .NET, Ruby, PHP | GA | supported | [Determinism](README.md#determinism) |
-| Deterministic UUIDs | Java, Python, TypeScript, .NET, PHP | GA | partial | `temporal-sdk-zig-d51.7.33`. Missing: a workflow API for it and README.md documentation; `temporal.client.uuid(ctx.allocator(), ctx.io())` already gives a UUID that is the same on replay, because the workflow `std.Io`'s randomness is seeded from the run. |
+| Deterministic UUIDs | Java, Python, TypeScript, .NET, PHP | GA | supported | [Determinism](README.md#determinism) |
 | Activities from workflows: timeouts, retry policy, cancellation types | all | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [retryactivity](samples/retryactivity) |
 | Local activities | all | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [greetingslocal](samples/greetingslocal) |
 | Activities by name, without a typed definition | all | GA | supported | [Dynamic activities](README.md#dynamic-activities), [dynamic](samples/dynamic) |
@@ -88,7 +88,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Child workflows: options, parent close policy, signals, cancellation | all | GA | supported | [Child workflows](README.md#child-workflows), [child-workflow](samples/child-workflow) |
 | Signal and cancel external workflows | all | GA | supported | [External workflows](README.md#external-workflows), [synchronous-proxy](samples/synchronous-proxy) |
 | Continue-as-new, with the server's suggestion and history size | all | GA | supported | [Continue-as-new](README.md#continue-as-new), [child-workflow-continue-as-new](samples/child-workflow-continue-as-new) |
-| Continue-as-new by workflow name | all | GA | partial | `temporal-sdk-zig-d51.7.36`. Missing: `continueAsNewByName`, continuing as a workflow type named at run time; `ctx.continueAsNew` takes any `Def`, so a run can continue as another type it has a definition for. |
+| Continue-as-new by workflow name | all | GA | supported | [Continue-as-new](README.md#continue-as-new) |
 | Upgrade on continue-as-new (Public Preview) | Go, Java, Python, TypeScript, .NET | pre-release | partial | `temporal-sdk-zig-d51.7.35`. Missing: a `ContinueAsNewOptions` field that chooses the new run's initial versioning behavior; continuing as a definition whose behavior is `auto_upgrade` moves the new run to the current version only after its first workflow task, which runs on the old version. |
 | Cancellation, with cleanup that runs after the cancel | all | GA | supported | [Cancellation](README.md#cancellation), [cancellation](samples/cancellation) |
 | Shielding work from cancellation (cancellation scopes, non-cancellable sections) | Java, TypeScript, Python, .NET | GA | supported | [Cancellation](README.md#cancellation) |
@@ -103,11 +103,11 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Dynamic workflows | all | GA | supported | [Dynamic workflows](README.md#dynamic-workflows), [dynamic-workflows](samples/dynamic-workflows) |
 | Choosing which errors fail the workflow and which fail the workflow task | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Failure policy](README.md#failure-policy) |
 | Deadlock detection | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Deadlock detection](README.md#deadlock-detection) |
-| Stack trace query | all | GA | partial | `temporal-sdk-zig-d51.6.15`. Missing: the SDK answering `__stack_trace` with where each coroutine is blocked; a workflow can register a query of that name (it isn't reserved) and answer it from its own bookkeeping. |
+| Stack trace query | all | GA | supported | [Stack trace query](README.md#stack-trace-query) |
 | Enhanced stack trace query | TypeScript, Python | GA, deferred | partial | `temporal-sdk-zig-d51.6.9`. Missing: the SDK answering `__enhanced_stack_trace` with each coroutine's location and the source around it; a workflow can register a query of that name (it isn't reserved) and answer it from its own bookkeeping. |
 | Workflow metadata query and handler descriptions | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | partial | `temporal-sdk-zig-d51.6.9`. Missing: the SDK answering `__temporal_workflow_metadata` from its registered handlers, and handler descriptions; a workflow can register that query itself. |
 | Event groups: tying a workflow's commands and their history events to a named group (experimental) | Go, TypeScript | pre-release | missing | `temporal-sdk-zig-d51.13.7`. Commands carry no event group markers, and workflow options have no field for them. |
-| Priority and fairness keys on workflows, activities, and children (Task Queue Priority and Fairness GA, Replay 2026) | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [Starting workflows](README.md#starting-workflows) |
+| Priority and fairness keys on workflows, activities, and children (Task Queue Priority and Fairness GA, Replay 2026) | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [Starting workflows](README.md#starting-workflows), [Child workflows](README.md#child-workflows) |
 
 ### Activities
 

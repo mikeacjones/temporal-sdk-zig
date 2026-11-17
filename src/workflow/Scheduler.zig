@@ -37,6 +37,9 @@ ready_tail: ?*Fiber = null,
 free_stacks: std.ArrayList(Stack) = .empty,
 /// Fibers spawned and not yet finished.
 live: usize = 0,
+/// The unfinished fibers in spawn order, linked through `Fiber.live_next`.
+live_head: ?*Fiber = null,
+live_tail: ?*Fiber = null,
 next_id: u32 = 1,
 /// How many times a fiber has returned control to `run`. The only field another thread may
 /// read (atomically), while `run` executes: the worker's deadlock detector watches it advance.
@@ -64,6 +67,9 @@ pub const Fiber = struct {
     name: []const u8,
     state: State,
     queue_next: ?*Fiber = null,
+    /// Links in the scheduler's list of unfinished fibers (`firstLive`).
+    live_prev: ?*Fiber = null,
+    live_next: ?*Fiber = null,
     /// Owned by the layer that spawned the fiber (the workflow `std.Io` keeps its task here).
     user: ?*anyopaque = null,
 
@@ -143,6 +149,9 @@ pub fn spawn(s: *Scheduler, name: []const u8, comptime func: anytype, args: std.
     };
     s.next_id += 1;
     s.live += 1;
+    f.live_prev = s.live_tail;
+    if (s.live_tail) |t| t.live_next = f else s.live_head = f;
+    s.live_tail = f;
     s.push(f);
     return f;
 }
@@ -174,6 +183,108 @@ pub fn onCurrentStack(s: *const Scheduler, addr: usize) bool {
     const f = s.current orelse return false;
     const start = @intFromPtr(f.stack.memory.ptr);
     return addr >= start and addr < start + f.stack.memory.len;
+}
+
+/// Counts SDK work done outside workflow code as a switch, so the worker's deadlock detector,
+/// which watches `switches`, doesn't take a long stretch of it (reading debug info to answer
+/// the stack trace query) for workflow code that never returns. Call it between steps.
+pub fn noteProgress(s: *Scheduler) void {
+    _ = s.switches.fetchAdd(1, .release);
+}
+
+/// Keeps `switches` advancing, from a thread of its own, while the scheduler's thread does SDK
+/// work that can't call `noteProgress` often enough itself: the first read of debug info to
+/// answer the stack trace query is one call into std that can take seconds on a slow machine,
+/// longer than the worker's deadlock detection allows. Notes progress every
+/// `heartbeat_interval` from `start` until `stop`. Where no thread can be started (a
+/// single-threaded build, or the spawn fails) it does nothing, and only the caller's own
+/// `noteProgress` calls count.
+pub const Heartbeat = struct {
+    sched: *Scheduler,
+    stopped: std.Io.Event = .unset,
+    thread: ?std.Thread = null,
+
+    pub fn start(hb: *Heartbeat) void {
+        hb.sched.noteProgress();
+        if (builtin.single_threaded) return;
+        // std's default stack size: a smaller one can fall below the platform's minimum (128
+        // KiB on aarch64 glibc), which std asserts against rather than returning an error.
+        hb.thread = std.Thread.spawn(.{}, beat, .{hb}) catch null;
+    }
+
+    pub fn stop(hb: *Heartbeat) void {
+        hb.sched.noteProgress();
+        const t = hb.thread orelse return;
+        hb.stopped.set(std.Options.debug_io);
+        t.join();
+        hb.thread = null;
+    }
+
+    fn beat(hb: *Heartbeat) void {
+        const io = std.Options.debug_io;
+        const interval: std.Io.Clock.Duration = .{ .raw = heartbeat_interval, .clock = .awake };
+        while (true) {
+            if (hb.stopped.waitTimeout(io, .{ .duration = interval })) |_| {
+                return;
+            } else |err| switch (err) {
+                error.Timeout => hb.sched.noteProgress(),
+                error.Canceled => return,
+            }
+        }
+    }
+};
+
+/// How often a `Heartbeat` notes progress.
+pub const heartbeat_interval: std.Io.Duration = .fromMilliseconds(10);
+
+/// The oldest unfinished fiber; `Fiber.live_next` gives the rest in spawn order.
+pub fn firstLive(s: *const Scheduler) ?*Fiber {
+    return s.live_head;
+}
+
+/// The return addresses of a blocked fiber's stack, innermost first, stored in `buf`: read
+/// from the registers the fiber saved when it switched away, by `std.debug`'s unwinder, so
+/// a fiber pays nothing for this until it is asked. Empty for a fiber that isn't blocked,
+/// and where the target can't unwind. The first address is in this file (where the fiber
+/// switched away). Takes the stack and debug info reads of a panic's trace: call it from a
+/// thread's own stack, not a fiber's.
+pub fn blockedTrace(f: *const Fiber, buf: []usize) []usize {
+    if (f.state != .blocked) return buf[0..0];
+    if (comptime !std.options.allow_stack_tracing or std.debug.cpu_context.Native == noreturn) return buf[0..0];
+    var ctx = suspendedContext(f);
+    return std.debug.captureCurrentStackTrace(.{ .context = &ctx }, buf).return_addresses;
+}
+
+/// The registers of a fiber that switched away, as they are just after its `switchStack`
+/// returns: the callee-saved ones from its frame, the stack pointer above that frame, and
+/// the program counter at the frame's return address. The rest are zero; nothing needs
+/// them, as the ABI lets a callee clobber them.
+fn suspendedContext(f: *const Fiber) std.debug.cpu_context.Native {
+    const Native = std.debug.cpu_context.Native;
+    var ctx: Native = std.mem.zeroes(Native);
+    switch (builtin.cpu.arch) {
+        .aarch64 => {
+            const regs: [*]const usize = @ptrFromInt(f.sp);
+            for (0..10) |i| ctx.x[19 + i] = regs[i];
+            ctx.x[29] = regs[10];
+            ctx.x[30] = regs[11];
+            ctx.sp = f.sp + aarch64_frame_size;
+            ctx.pc = regs[11];
+        },
+        .x86_64 => {
+            const regs: [*]const usize = @ptrFromInt(f.sp);
+            ctx.gprs.set(.r15, regs[0]);
+            ctx.gprs.set(.r14, regs[1]);
+            ctx.gprs.set(.r13, regs[2]);
+            ctx.gprs.set(.r12, regs[3]);
+            ctx.gprs.set(.rbx, regs[4]);
+            ctx.gprs.set(.rbp, regs[5]);
+            ctx.gprs.set(.rip, regs[6]);
+            ctx.gprs.set(.rsp, f.sp + x86_64_frame_words * @sizeOf(usize));
+        },
+        else => comptime unreachable,
+    }
+    return ctx;
 }
 
 /// Suspends the calling fiber until another party calls `wake` on it.
@@ -236,6 +347,8 @@ fn fiberMain(f: *Fiber) callconv(.c) noreturn {
     f.start(f.args);
     f.state = .done;
     s.live -= 1;
+    if (f.live_prev) |p| p.live_next = f.live_next else s.live_head = f.live_next;
+    if (f.live_next) |n| n.live_prev = f.live_prev else s.live_tail = f.live_prev;
     // `run` releases the stack once it is no longer executing on it.
     var dead_sp: usize = undefined;
     switchStack(&dead_sp, s.main_sp);
@@ -619,4 +732,39 @@ test "two fibers can yield to each other many times" {
     _ = try s.spawn("b", pingPong, .{ &s, &counter, n });
     s.run();
     try testing.expectEqual(@as(u64, 2 * n), counter);
+}
+
+noinline fn parkHere(s: *Scheduler, gate: *Gate) void {
+    gate.waiter = s.currentFiber();
+    s.block();
+    gate.log.add(2);
+}
+
+fn parkCaller(s: *Scheduler, gate: *Gate) void {
+    parkHere(s, gate);
+    std.mem.doNotOptimizeAway(gate);
+}
+
+test "blockedTrace unwinds a blocked fiber's stack through its callers" {
+    var s: Scheduler = .init(testing.allocator, .{ .stack_size = 256 * 1024 });
+    defer s.deinit();
+    var log: Log = .{};
+    var gate: Gate = .{ .log = &log };
+    const f = try s.spawn("parked", parkCaller, .{ &s, &gate });
+    var buf: [32]usize = undefined;
+    try testing.expectEqual(@as(usize, 0), blockedTrace(f, &buf).len); // ready, not blocked
+    s.run();
+    try testing.expectEqual(f, s.firstLive().?);
+    const trace = blockedTrace(f, &buf);
+    if (std.debug.SelfInfo != void and std.options.allow_stack_tracing and std.debug.cpu_context.Native != noreturn) {
+        try testing.expect(trace.len >= 2);
+        // One of the frames returns into parkCaller, which called parkHere.
+        const start = @intFromPtr(&parkCaller);
+        var found = false;
+        for (trace) |addr| found = found or (addr > start and addr < start + 4096);
+        try testing.expect(found);
+    }
+    s.wake(f);
+    s.run();
+    try testing.expectEqual(@as(?*Fiber, null), s.firstLive());
 }

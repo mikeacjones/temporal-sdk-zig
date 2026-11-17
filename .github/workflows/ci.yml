@@ -153,8 +153,9 @@ jobs:
           libs=$(grep -o 'native-static-libs: .*' "$RUNNER_TEMP/core.log" || true)
           if [ -n "$libs" ]; then echo "${{ matrix.platform.name }} $libs" >> "$GITHUB_STEP_SUMMARY"; fi
 
+      # A test that hangs fails by name instead of holding the job until GitHub's six-hour limit.
       - name: Unit tests
-        run: zig build test $TARGET_ARGS -Doptimize=${{ matrix.optimize }} --summary all
+        run: zig build test $TARGET_ARGS -Doptimize=${{ matrix.optimize }} --test-timeout 10m --summary all
 
       - name: Check that the test binary is statically linked
         if: matrix.platform.target && contains(matrix.platform.target, 'musl')

@@ -21,11 +21,13 @@
 const WorkflowIo = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
 const Scheduler = @import("Scheduler.zig");
+const call_sites = @import("call_sites.zig");
 const Fiber = Scheduler.Fiber;
 
 /// The run's allocator. Task blocks and group state come from it and go back to `free_blocks`
@@ -144,8 +146,9 @@ pub fn cancelTask(w: *WorkflowIo, task: *Task) void {
 
 /// A blocking point for SDK code built on this Io (activity futures, signals): create it on
 /// the waiting coroutine with `newWait`, block with `waitFor`, and resume it with `wake`.
-pub fn newWaitPoint(w: *WorkflowIo) Wait {
-    return w.newWait();
+/// `reason` says what it waits on, for `Task.waiting_on`.
+pub fn newWaitPoint(w: *WorkflowIo, reason: Wait.Reason) Wait {
+    return w.newWait(reason);
 }
 
 /// Blocks the current coroutine until `wait` is woken, or until the task is canceled when
@@ -239,6 +242,10 @@ pub const Task = struct {
     cancel_protection: Io.CancelProtection = .unblocked,
     /// The cancelable wait this task is blocked in, if any.
     blocked_in: ?*Wait = null,
+    /// The wait this task is blocked in, cancelable or not, if any: for describing where the
+    /// coroutine waits (the stack trace query). Set and cleared around each block, with no
+    /// allocation.
+    waiting_on: ?*const Wait = null,
     group: ?*GroupState = null,
     group_next: ?*Task = null,
     /// Allocation backing this Task, its context, and its result.
@@ -258,6 +265,26 @@ pub const Wait = struct {
     futex_ptr: ?*const u32 = null,
     next: ?*Wait = null,
     prev: ?*Wait = null,
+    reason: Reason,
+
+    /// What a wait waits on, as text: `what` ("a timer", "activity"), then `name` quoted
+    /// when set (an activity type, escaped with `call_sites.text`), then `seq` when set (an activity's, when its name isn't
+    /// known), then `duration` in parentheses when set (a timer's). The strings are borrowed
+    /// and must outlive the wait; they are static, belong to the run, or are on the waiting
+    /// coroutine's stack.
+    pub const Reason = struct {
+        what: []const u8,
+        name: []const u8 = "",
+        seq: ?u32 = null,
+        duration: ?Io.Duration = null,
+
+        pub fn format(r: Reason, writer: *Io.Writer) Io.Writer.Error!void {
+            try writer.writeAll(r.what);
+            if (r.name.len > 0) try writer.print(" \"{f}\"", .{call_sites.text(r.name)});
+            if (r.seq) |seq| try writer.print(" (seq {d})", .{seq});
+            if (r.duration) |d| try writer.print(" ({f})", .{d});
+        }
+    };
 };
 
 const GroupState = struct {
@@ -307,6 +334,7 @@ const block_classes = 11; // 64 bytes to 64 KiB
 const block_max = block_min << (block_classes - 1);
 const block_align: Alignment = .@"16";
 const FreeBlock = struct { next: ?*FreeBlock };
+const free_poison: u8 = 0xdf;
 const OversizeBlock = struct { next: ?*OversizeBlock, len: usize, alignment: Alignment };
 
 fn isOversize(size: usize, alignment: Alignment) bool {
@@ -348,6 +376,8 @@ fn freeBlock(w: *WorkflowIo, mem: []u8, alignment: Alignment) void {
     }
     const class = blockClass(mem.len);
     assert(mem.len == @as(usize, block_min) << class);
+    // Tests check that no freed block is written to before it is reused.
+    if (builtin.is_test) @memset(mem[@sizeOf(FreeBlock)..], free_poison);
     const b: *FreeBlock = @ptrCast(@alignCast(mem.ptr));
     b.next = w.free_blocks[class];
     w.free_blocks[class] = b;
@@ -451,13 +481,16 @@ fn block(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void {
             t.blocked_in = wait;
         };
         w.settleOwedWake();
+        const current = w.currentTask();
+        if (current) |t| t.waiting_on = wait;
         w.scheduler.block();
+        if (current) |t| t.waiting_on = null;
         if (task) |t| t.blocked_in = null;
     }
 }
 
-fn newWait(w: *WorkflowIo) Wait {
-    return .{ .fiber = w.scheduler.currentFiber() orelse
+fn newWait(w: *WorkflowIo, reason: Wait.Reason) Wait {
+    return .{ .reason = reason, .fiber = w.scheduler.currentFiber() orelse
         @panic("a workflow Io operation that blocks was called outside a workflow coroutine") };
 }
 
@@ -548,11 +581,27 @@ fn concurrent(
     return @ptrCast(task);
 }
 
-fn awaitTask(w: *WorkflowIo, task: *Task, result: []u8) void {
+/// Waits for `task` to finish and copies its result out. With `pass_cancel`, a cancellation
+/// of the waiting coroutine is passed on to `task`, as `std.Io.Threaded` does in `await`: the
+/// wait goes on until `task` finishes, and if `task` didn't consume the cancellation (it had
+/// already finished, or never reached a cancelable wait), the waiting coroutine's
+/// cancellation is re-armed for its next cancelable wait.
+fn awaitTask(w: *WorkflowIo, task: *Task, result: []u8, pass_cancel: bool) void {
     if (!task.done) {
-        var wait = w.newWait();
+        var wait = w.newWait(.{ .what = "the result of a coroutine started with io.async or io.concurrent (Future.await or Future.cancel)" });
         task.awaiter = &wait;
-        w.block(&wait, false) catch unreachable;
+        if (w.block(&wait, pass_cancel)) |_| {} else |_| {
+            const was_running = !task.done;
+            w.requestCancel(task);
+            // The cancel that ended the block woke `wait`; wait on a fresh one.
+            while (!task.done) {
+                wait = w.newWait(.{ .what = "the result of a coroutine started with io.async or io.concurrent (Future.await or Future.cancel)" });
+                w.block(&wait, false) catch unreachable;
+            }
+            if (!was_running or task.cancel_requested) {
+                if (w.ownCancelTask()) |t| t.cancel_requested = true;
+            }
+        }
         assert(task.done);
     }
     @memcpy(result, task.result);
@@ -561,14 +610,14 @@ fn awaitTask(w: *WorkflowIo, task: *Task, result: []u8) void {
 
 fn await(userdata: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, _: Alignment) void {
     const w = self(userdata);
-    w.awaitTask(@ptrCast(@alignCast(any_future)), result);
+    w.awaitTask(@ptrCast(@alignCast(any_future)), result, true);
 }
 
 fn cancel(userdata: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, _: Alignment) void {
     const w = self(userdata);
     const task: *Task = @ptrCast(@alignCast(any_future));
     w.requestCancel(task);
-    w.awaitTask(task, result);
+    w.awaitTask(task, result, false);
 }
 
 fn groupState(w: *WorkflowIo, group: *Io.Group) !*GroupState {
@@ -631,14 +680,27 @@ fn finishGroup(w: *WorkflowIo, group: *Io.Group, g: *GroupState) void {
 fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Cancelable!void {
     const w = self(userdata);
     const g: *GroupState = @ptrCast(@alignCast(token));
+    var result: Io.Cancelable!void = {};
     if (g.pending > 0) {
         if (w.refuse("Group.await")) return error.Canceled;
-        var wait = w.newWait();
+        var wait = w.newWait(.{ .what = "the coroutines of a std.Io.Group (Group.await)" });
         g.awaiter = &wait;
+        // Runs before finishGroup below frees `g`.
         defer g.awaiter = null;
-        try w.block(&wait, true);
+        w.block(&wait, true) catch |err| {
+            // As `std.Io.Group.await` says: the cancellation goes to every member, and the
+            // group finishes before the error is returned.
+            var it = g.head;
+            while (it) |t| : (it = t.group_next) w.requestCancel(t);
+            while (g.pending > 0) {
+                wait = w.newWait(.{ .what = "the coroutines of a std.Io.Group (Group.await)" });
+                w.block(&wait, false) catch unreachable;
+            }
+            result = err;
+        };
     }
     w.finishGroup(group, g);
+    return result;
 }
 
 fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
@@ -647,7 +709,7 @@ fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void 
     var it = g.head;
     while (it) |t| : (it = t.group_next) w.requestCancel(t);
     if (g.pending > 0) {
-        var wait = w.newWait();
+        var wait = w.newWait(.{ .what = "the coroutines of a std.Io.Group (Group.cancel)" });
         g.awaiter = &wait;
         defer g.awaiter = null;
         w.block(&wait, false) catch unreachable;
@@ -695,7 +757,10 @@ fn futexWaitInner(w: *WorkflowIo, ptr: *const u32, expected: u32, timeout: Io.Ti
     // Before this coroutine's own wait is queued, where a wake on the same address (a relock
     // of the same Mutex, a Condition at the same stack address) would land on it.
     w.settleOwedWake();
-    var wait = w.newWait();
+    var wait = w.newWait(.{
+        .what = if (duration == null) "a std.Io Mutex, Condition, Event, Semaphore or Queue" else "a std.Io Mutex, Condition, Event, Semaphore or Queue, with a timeout",
+        .duration = duration,
+    });
     wait.futex_ptr = ptr;
     w.futexEnqueue(&wait);
     defer w.futexRemove(&wait);
@@ -788,12 +853,12 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     } else if (w.currentReadOnly() != null) return;
     const duration = d orelse {
         // Sleeping forever: wait for cancellation.
-        var wait = w.newWait();
+        var wait = w.newWait(.{ .what = "a sleep with no timeout, until canceled" });
         return w.block(&wait, true);
     };
     try checkCancel(userdata);
     if (duration.nanoseconds <= 0) return;
-    var wait = w.newWait();
+    var wait = w.newWait(.{ .what = "a timer", .duration = duration });
     var timer: Timer = .{ .wait = &wait };
     w.host.vtable.startTimer(w.host.ctx, &timer, duration);
     w.block(&wait, true) catch |err| {
@@ -982,6 +1047,145 @@ test "canceling a sleeping future cancels its timer and delivers error.Canceled"
     try testing.expectEqual(@as(?anyerror, error.Canceled), result);
     try testing.expectEqual(@as(u32, 1), e.fake.canceled);
     try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+/// Awaits a future that sleeps for an hour (`sleepForever`, or `protectedSleep` when
+/// `protected`), then records how its own next cancelable wait ends in `after`.
+fn awaitSleeper(i: Io, inner: *?anyerror, protected: bool, after: *?anyerror) void {
+    if (protected) {
+        var f = i.async(protectedSleep, .{ i, inner });
+        f.await(i);
+    } else {
+        var f = i.async(sleepForever, .{ i, inner });
+        f.await(i);
+    }
+    i.sleep(.fromSeconds(1), .awake) catch |err| {
+        after.* = err;
+        return;
+    };
+    after.* = null;
+}
+
+test "canceling a coroutine waiting in Future.await cancels the awaited one, which consumes it" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var inner: ?anyerror = error.Unset;
+    var after: ?anyerror = error.Unset;
+    const task = try e.wio.spawn("wf", awaitSleeper, .{ e.wio.io(), &inner, false, &after });
+    e.wio.run();
+    e.wio.cancelTask(task);
+    e.fake.runAll(&e.wio);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), inner);
+    // The awaited coroutine took the cancellation; the awaiting one goes on uncanceled.
+    try testing.expectEqual(@as(?anyerror, null), after);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+test "a cancellation the awaited future doesn't consume stays with the coroutine waiting in Future.await" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var inner: ?anyerror = error.Unset;
+    var after: ?anyerror = error.Unset;
+    const task = try e.wio.spawn("wf", awaitSleeper, .{ e.wio.io(), &inner, true, &after });
+    e.wio.run();
+    e.wio.cancelTask(task);
+    e.fake.runAll(&e.wio);
+    // The protected sleep finished; its awaiter's next cancelable wait gets the cancellation.
+    try testing.expectEqual(@as(?anyerror, null), inner);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), after);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+/// Awaits a group of two hour-long sleepers and records how the await ended.
+fn awaitSleeperGroup(i: Io, inner: *[2]?anyerror, result: *?anyerror) void {
+    var g: Io.Group = .init;
+    for (inner) |*r| g.async(i, sleepForever, .{ i, r });
+    g.await(i) catch |err| {
+        result.* = err;
+        return;
+    };
+    result.* = null;
+}
+
+test "canceling a coroutine waiting in Group.await cancels every member and returns once they finished" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var inner: [2]?anyerror = .{ error.Unset, error.Unset };
+    var result: ?anyerror = error.Unset;
+    const task = try e.wio.spawn("wf", awaitSleeperGroup, .{ e.wio.io(), &inner, &result });
+    e.wio.run();
+    e.wio.cancelTask(task);
+    e.wio.run();
+    try testing.expectEqual(@as(?anyerror, error.Canceled), result);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), inner[0]);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), inner[1]);
+    try testing.expectEqual(@as(u32, 2), e.fake.canceled);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+/// Fails if anything wrote to a pooled block after freeBlock put it on the free list.
+fn expectFreeBlocksUntouched(w: *const WorkflowIo) !void {
+    var free: usize = 0;
+    for (w.free_blocks, 0..) |head, class| {
+        const len = @as(usize, block_min) << @intCast(class);
+        var it = head;
+        while (it) |b| : (it = b.next) {
+            const p: [*]const u8 = @ptrCast(b);
+            for (p[@sizeOf(FreeBlock)..len]) |byte| try testing.expectEqual(free_poison, byte);
+            free += 1;
+        }
+    }
+    try testing.expect(free > 0);
+}
+
+/// Cancels a group of two hour-long sleepers with Group.cancel after a second.
+fn cancelSleeperGroup(i: Io, inner: *[2]?anyerror) void {
+    var g: Io.Group = .init;
+    for (inner) |*r| g.async(i, sleepForever, .{ i, r });
+    i.sleep(.fromSeconds(1), .awake) catch unreachable;
+    g.cancel(i);
+}
+
+test "finishing a group with pending members leaves its freed state untouched" {
+    {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var inner: [2]?anyerror = .{ error.Unset, error.Unset };
+        var result: ?anyerror = error.Unset;
+        const task = try e.wio.spawn("wf", awaitSleeperGroup, .{ e.wio.io(), &inner, &result });
+        e.wio.run();
+        e.wio.cancelTask(task);
+        e.wio.run();
+        try testing.expectEqual(@as(?anyerror, error.Canceled), result);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+        try expectFreeBlocksUntouched(&e.wio);
+    }
+    {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var inner: [2]?anyerror = .{ error.Unset, error.Unset };
+        _ = try e.wio.spawn("wf", cancelSleeperGroup, .{ e.wio.io(), &inner });
+        e.fake.runAll(&e.wio);
+        try testing.expectEqual(@as(?anyerror, error.Canceled), inner[0]);
+        try testing.expectEqual(@as(?anyerror, error.Canceled), inner[1]);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+        try expectFreeBlocksUntouched(&e.wio);
+    }
+    {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var trace: Trace = .{};
+        _ = try e.wio.spawn("wf", sleepers, .{ e.wio.io(), &trace });
+        e.fake.runAll(&e.wio);
+        try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 99 }, trace.items());
+        try expectFreeBlocksUntouched(&e.wio);
+    }
 }
 
 fn protectedSleep(i: Io, result: *?anyerror) void {

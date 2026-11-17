@@ -6,6 +6,8 @@ const protos = @import("deps/protos.zig");
 const core_header_name = "temporal-sdk-core-c-bridge.h";
 const core_header = "deps/sdk-core/crates/sdk-core-c-bridge/include/" ++ core_header_name;
 const core_lib_name = "libtemporalio_sdk_core_c_bridge.a";
+/// The time-skipping test server release this repository's tests pass with.
+const verified_test_server_version = "v1.40.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -23,6 +25,17 @@ pub fn build(b: *std.Build) void {
     );
     const protoc_opt = b.option([]const u8, "protoc", "Path to protoc used by the cargo build (default: pinned download)");
     const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
+    // A checkout tests against the test server release its tests were last verified with: a
+    // new release reaches every machine without a cached copy at once, and one has broken
+    // updates (sdk-java 1.41.0's never delivers a workflow task that carries one). A project
+    // that depends on the SDK gets sdk-core's default unless it passes the option.
+    const test_server_version = b.option(
+        []const u8,
+        "test-server-version",
+        "Time-skipping test server release testing.TestServer downloads by default: \"default\" (sdk-core's choice) or a tag such as \"v1.40.0\" (default in a checkout: " ++ verified_test_server_version ++ ")",
+    ) orelse if (b.isRoot()) verified_test_server_version else "default";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "test_server_version", test_server_version);
 
     // A fetched package has neither the submodule nor samples/, so the steps that need them
     // exist only in a checkout.
@@ -64,6 +77,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).createModule();
     temporal.addImport("core_c", core_c);
+    temporal.addOptions("build_options", build_options);
     linkCoreLib(temporal, target, core.lib);
 
     // zig build core: build only the Rust core library
@@ -86,6 +100,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_c", .module = core_c },
         },
     });
+    test_module.addOptions("build_options", build_options);
     linkCoreLib(test_module, target, core.lib);
     const unit_tests = b.addTest(.{ .root_module = test_module, .filters = test_filters });
     const test_step = b.step("test", "Run unit tests");
