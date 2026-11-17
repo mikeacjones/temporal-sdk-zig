@@ -564,6 +564,36 @@ test "nexus: stopping the worker cancels a running handler with reason worker_sh
     try testing.expectEqual(nexus.CancelReason.worker_shutdown, handlers.cancelReason().?);
 }
 
+test "nexus: a worker with autoscaling Nexus pollers handles an operation" {
+    var handlers: Handlers = .{ .io = testing.io };
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(CallEcho);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const queue = try uniqueName(a, "zig-autoscaling-handlers");
+    var w = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, queue, .{
+        .nexus_task_poller_behavior = .{ .autoscaling = .{} },
+    });
+    defer w.deinit();
+    try w.registerNexusServiceWith(Handler, &handlers);
+    var running = try testing.io.concurrent(worker_mod.Worker.run, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    try w.waitUntilRunning();
+    const endpoint = try uniqueName(a, "zig-autoscaling-endpoint");
+    try env.createNexusEndpoint(endpoint, .{ .task_queue = queue });
+
+    var r = try env.startWorkflow(CallEcho, .{}, .{ endpoint, "scaled" });
+    defer r.deinit();
+    const result = try env.getResult(CallEcho, &r, a, null);
+    try expectContains(result, try std.fmt.allocPrint(a, "scaled op=zig-test-service/echo ns=default endpoint={s} queue={s}", .{ endpoint, queue }));
+}
+
 test "nexus: a handler still running at its request's deadline is canceled with reason timed_out" {
     var handlers: Handlers = .{ .io = testing.io };
     var s = try Setup.start(&handlers, .{});

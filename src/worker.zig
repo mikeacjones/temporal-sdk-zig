@@ -62,11 +62,39 @@ pub const Options = struct {
     /// How many Nexus requests (starts and cancels of operations) the worker handles at
     /// once, each on its own task. Only used with a registered Nexus service.
     max_concurrent_nexus_task_executions: usize = 100,
+    /// How many workflow task polls the worker keeps open at once, split between the task
+    /// queue and the worker's sticky queue by `nonsticky_to_sticky_poll_ratio`. Must be at
+    /// least 2 while the cache is on (`max_cached_workflows` above 0). Ignored when
+    /// `workflow_task_poller_behavior` is set.
     max_concurrent_workflow_task_pollers: usize = 2,
+    /// How many activity task polls the worker keeps open at once; must be positive. Ignored
+    /// when `activity_task_poller_behavior` is set.
     max_concurrent_activity_task_pollers: usize = 2,
     /// How many Nexus task polls the worker keeps open at once. Only used with a registered
-    /// Nexus service; must be positive.
+    /// Nexus service; must be positive. Ignored when `nexus_task_poller_behavior` is set.
     max_concurrent_nexus_task_pollers: usize = 2,
+    /// How the worker polls for workflow tasks: a fixed maximum, or autoscaling
+    /// (`PollerBehavior` says what it does and what it needs from the server). Null: a
+    /// simple maximum of `max_concurrent_workflow_task_pollers`. With the cache on, a simple
+    /// maximum must be at least 2, and an autoscaling behavior applies to the task queue and
+    /// to the worker's sticky queue each, so up to twice `maximum` polls can be open.
+    workflow_task_poller_behavior: ?PollerBehavior = null,
+    /// How the worker polls for activity tasks (`PollerBehavior`). Null: a simple maximum
+    /// of `max_concurrent_activity_task_pollers`. Session queues (`sessions`) poll with the
+    /// same behavior, so with autoscaling each of them scales on its own between the same
+    /// bounds.
+    activity_task_poller_behavior: ?PollerBehavior = null,
+    /// How the worker polls for Nexus tasks (`PollerBehavior`). Null: a simple maximum of
+    /// `max_concurrent_nexus_task_pollers`. Only used with a registered Nexus service.
+    nexus_task_poller_behavior: ?PollerBehavior = null,
+    /// The share of the workflow task pollers that poll the task queue itself rather than
+    /// this worker's sticky queue, which brings the tasks of runs this worker has cached.
+    /// Applies only when the workflow pollers are a simple maximum: the task queue gets the
+    /// maximum times this ratio, rounded down and at least 1, and with the cache on the
+    /// sticky queue gets the rest, at least 1. With the defaults, 2 pollers, that is one
+    /// each. The task queue's share is the same with the cache off, when there is no sticky
+    /// queue. Must be from 0 to 1; `run` returns `error.InvalidOptions` otherwise.
+    nonsticky_to_sticky_poll_ratio: f32 = 0.2,
     /// Empty uses the client's identity.
     identity: []const u8 = "",
     /// How long a workflow task may wait on this worker's sticky queue before the server
@@ -236,6 +264,37 @@ pub const Options = struct {
 /// The application failure type of a workflow task that deadlock detection failed
 /// (`Options.deadlock_detection_timeout`).
 pub const deadlock_failure_type = "WorkflowDeadlockDetected";
+
+/// How many polls of one kind (workflow, activity or Nexus tasks) a worker keeps open at
+/// once. Written as `.{ .simple_maximum = 4 }` or `.{ .autoscaling = .{} }`. A poll is
+/// opened only while a slot for its task is free, whichever the behavior.
+pub const PollerBehavior = union(enum) {
+    /// Up to this many polls at once; must be positive.
+    simple_maximum: usize,
+    /// The worker opens and closes polls between `minimum` and `maximum`, starting from
+    /// `initial`, following the server's feedback.
+    ///
+    /// The server's poll responses carry a suggestion to add or remove polls. The worker
+    /// always follows a suggestion to remove them, down to `minimum`, and follows one to
+    /// add them, up to `maximum`, only while the worker is taking in more tasks than it
+    /// did a moment before (more polls would not help a worker that can't keep up). Once
+    /// the server has sent a suggestion, or when the namespace reports that it supports
+    /// poller autoscaling, an empty poll also removes one poll, and a poll refused for
+    /// exhausted resources halves the count. Failed polls are retried with backoff.
+    ///
+    /// The feedback needs a server that sends it. Against one that sends no suggestions
+    /// and doesn't report the capability, the worker keeps `initial` polls open.
+    autoscaling: Autoscaling,
+
+    /// Bounds of an autoscaling poller: `minimum` must be positive, `maximum` at least
+    /// `minimum`, and `initial` from `minimum` to `maximum`; `run` returns
+    /// `error.InvalidOptions` otherwise.
+    pub const Autoscaling = struct {
+        minimum: usize = 1,
+        maximum: usize = 100,
+        initial: usize = 5,
+    };
+};
 
 /// How a worker hosts sessions (`Options.sessions`).
 ///
@@ -773,6 +832,37 @@ pub const Worker = struct {
             log.warn("worker for task queue {s}: default_heartbeat_throttle_interval ({f}) must not be above max_heartbeat_throttle_interval ({f})", .{ task_queue, o.default_heartbeat_throttle_interval, o.max_heartbeat_throttle_interval });
             return error.InvalidOptions;
         }
+        inline for (.{ "workflow_task_poller_behavior", "activity_task_poller_behavior", "nexus_task_poller_behavior" }) |name| {
+            if (@field(o, name)) |behavior| try checkPollerBehavior(behavior, name, task_queue);
+        }
+        const ratio = o.nonsticky_to_sticky_poll_ratio;
+        if (!(ratio >= 0 and ratio <= 1)) {
+            log.warn("worker for task queue {s}: nonsticky_to_sticky_poll_ratio is {d}; it must be from 0 to 1", .{ task_queue, ratio });
+            return error.InvalidOptions;
+        }
+    }
+
+    fn checkPollerBehavior(behavior: PollerBehavior, comptime name: []const u8, task_queue: []const u8) error{InvalidOptions}!void {
+        switch (behavior) {
+            .simple_maximum => |m| if (m == 0) {
+                log.warn("worker for task queue {s}: " ++ name ++ ".simple_maximum is 0; it must be positive", .{task_queue});
+                return error.InvalidOptions;
+            },
+            .autoscaling => |a| {
+                if (a.minimum == 0) {
+                    log.warn("worker for task queue {s}: " ++ name ++ ".autoscaling.minimum is 0; it must be positive", .{task_queue});
+                    return error.InvalidOptions;
+                }
+                if (a.maximum < a.minimum) {
+                    log.warn("worker for task queue {s}: " ++ name ++ ".autoscaling.maximum is {d}; it must be at least minimum ({d})", .{ task_queue, a.maximum, a.minimum });
+                    return error.InvalidOptions;
+                }
+                if (a.initial < a.minimum or a.initial > a.maximum) {
+                    log.warn("worker for task queue {s}: " ++ name ++ ".autoscaling.initial is {d}; it must be from minimum ({d}) to maximum ({d})", .{ task_queue, a.initial, a.minimum, a.maximum });
+                    return error.InvalidOptions;
+                }
+            },
+        }
     }
 
     /// The longest poll spacing, 1 / `max_activities_per_second`, that `checkOptions` accepts.
@@ -809,12 +899,21 @@ pub const Worker = struct {
             // Eagerly started activities skip the core's poll rate limiter, so a per-worker
             // limit turns eager execution off. The core does that itself for the task queue's.
             .max_eager_activity_reservations_per_workflow_task = if (o.max_activities_per_second == null) o.max_eager_activity_reservations_per_workflow_task else 0,
-            .workflow_task_pollers = .{ .simple_maximum = o.max_concurrent_workflow_task_pollers },
-            .activity_task_pollers = .{ .simple_maximum = o.max_concurrent_activity_task_pollers },
+            .workflow_task_pollers = corePollerBehavior(o.workflow_task_poller_behavior, o.max_concurrent_workflow_task_pollers),
+            .nonsticky_to_sticky_poll_ratio = o.nonsticky_to_sticky_poll_ratio,
+            .activity_task_pollers = corePollerBehavior(o.activity_task_poller_behavior, o.max_concurrent_activity_task_pollers),
             // The core checks this even on a worker that polls no Nexus tasks.
-            .nexus_task_pollers = .{ .simple_maximum = if (registered.nexus) o.max_concurrent_nexus_task_pollers else 1 },
+            .nexus_task_pollers = if (registered.nexus) corePollerBehavior(o.nexus_task_poller_behavior, o.max_concurrent_nexus_task_pollers) else .{ .simple_maximum = 1 },
             .graceful_shutdown_period_ms = millis(o.graceful_shutdown_period),
             .nondeterminism_as_workflow_fail = o.nondeterminism_fails_workflow,
+        };
+    }
+
+    /// `behavior` when set, else a simple maximum of the legacy `max_concurrent_*` field.
+    fn corePollerBehavior(behavior: ?PollerBehavior, legacy_maximum: usize) bridge.Worker.Options.PollerBehavior {
+        return switch (behavior orelse return .{ .simple_maximum = legacy_maximum }) {
+            .simple_maximum => |m| .{ .simple_maximum = m },
+            .autoscaling => |a| .{ .autoscaling = .{ .minimum = a.minimum, .maximum = a.maximum, .initial = a.initial } },
         };
     }
 
@@ -2842,6 +2941,35 @@ test "a worker runs a workflow and its activity started by a client" {
     try testing.expectEqualStrings("NotToday", failure_mod.applicationType(failed.failure().?.*).?);
 }
 
+test "a worker with autoscaling workflow and activity pollers runs a workflow and its activity" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, testing.io, &client, "autoscaling-pollers", .{
+        .workflow_task_poller_behavior = .{ .autoscaling = .{ .minimum = 1, .maximum = 10, .initial = 2 } },
+        .activity_task_poller_behavior = .{ .autoscaling = .{} },
+    });
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try client.executeWorkflow(HelloTest.Hello, .{ .id = "autoscaling_pollers", .task_queue = "autoscaling-pollers" }, .{"Temporal"});
+    defer run.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try run.get(arena.allocator()));
+}
+
 test "a worker on a client from init connects it and runs a workflow" {
     var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
     defer server.stop(testing.io);
@@ -3205,6 +3333,89 @@ test "default worker options give the core its own defaults" {
     try testing.expectEqual(bridge.Worker.Options.TaskTypes{ .workflows = true, .local_activities = true, .remote_activities = true, .nexus = false }, core.task_types);
 }
 
+test "poller behaviors and the poll ratio reach the core options of all three poller kinds" {
+    const autoscaling: PollerBehavior = .{ .autoscaling = .{ .minimum = 2, .maximum = 20, .initial = 4 } };
+    const options: Options = .{
+        .max_concurrent_workflow_task_pollers = 3,
+        .max_concurrent_activity_task_pollers = 4,
+        .max_concurrent_nexus_task_pollers = 5,
+        .workflow_task_poller_behavior = autoscaling,
+        .activity_task_poller_behavior = .{ .autoscaling = .{} },
+        .nexus_task_poller_behavior = .{ .autoscaling = .{ .minimum = 1, .maximum = 1, .initial = 1 } },
+        .nonsticky_to_sticky_poll_ratio = 0.5,
+    };
+    const all: Worker.Registered = .{ .workflows = true, .activities = true, .nexus = true };
+    try Worker.checkOptions(options, "q", all);
+    const core = Worker.coreOptions(options, "ns", "q", .{ .none = .{} }, all);
+    try testing.expectEqual(bridge.Worker.Options.PollerBehavior{ .autoscaling = .{ .minimum = 2, .maximum = 20, .initial = 4 } }, core.workflow_task_pollers);
+    try testing.expectEqual(bridge.Worker.Options.PollerBehavior{ .autoscaling = .{ .minimum = 1, .maximum = 100, .initial = 5 } }, core.activity_task_pollers);
+    try testing.expectEqual(bridge.Worker.Options.PollerBehavior{ .autoscaling = .{ .minimum = 1, .maximum = 1, .initial = 1 } }, core.nexus_task_pollers);
+    try testing.expectEqual(0.5, core.nonsticky_to_sticky_poll_ratio);
+
+    // Session queues poll the way the main queue polls activities.
+    const session = Worker.sessionCoreOptions(core, "q@host", 42);
+    try testing.expectEqual(core.activity_task_pollers, session.activity_task_pollers);
+
+    // A simple maximum overrides the legacy field too.
+    const simple: Options = .{
+        .max_concurrent_workflow_task_pollers = 3,
+        .max_concurrent_activity_task_pollers = 4,
+        .max_concurrent_nexus_task_pollers = 5,
+        .workflow_task_poller_behavior = .{ .simple_maximum = 7 },
+        .activity_task_poller_behavior = .{ .simple_maximum = 8 },
+        .nexus_task_poller_behavior = .{ .simple_maximum = 9 },
+    };
+    try Worker.checkOptions(simple, "q", all);
+    const simple_core = Worker.coreOptions(simple, "ns", "q", .{ .none = .{} }, all);
+    try testing.expectEqual(bridge.Worker.Options.PollerBehavior{ .simple_maximum = 7 }, simple_core.workflow_task_pollers);
+    try testing.expectEqual(bridge.Worker.Options.PollerBehavior{ .simple_maximum = 8 }, simple_core.activity_task_pollers);
+    try testing.expectEqual(bridge.Worker.Options.PollerBehavior{ .simple_maximum = 9 }, simple_core.nexus_task_pollers);
+    try testing.expectEqual(0.2, simple_core.nonsticky_to_sticky_poll_ratio);
+
+    // Without a Nexus service the core still gets its one Nexus poller, whatever is set.
+    const no_nexus: Worker.Registered = .{ .workflows = true, .activities = true, .nexus = false };
+    try Worker.checkOptions(options, "q", no_nexus);
+    const without = Worker.coreOptions(options, "ns", "q", .{ .none = .{} }, no_nexus);
+    try testing.expectEqual(bridge.Worker.Options.PollerBehavior{ .simple_maximum = 1 }, without.nexus_task_pollers);
+    try testing.expectEqual(core.workflow_task_pollers, without.workflow_task_pollers);
+    try testing.expectEqual(core.activity_task_pollers, without.activity_task_pollers);
+}
+
+test "invalid poller behaviors and poll ratios are rejected, whatever is registered" {
+    const registrations = [_]Worker.Registered{
+        .{ .workflows = true, .activities = true, .nexus = true },
+        .{ .workflows = false, .activities = false, .nexus = false },
+    };
+    const bad = [_]PollerBehavior{
+        .{ .simple_maximum = 0 },
+        .{ .autoscaling = .{ .minimum = 0, .maximum = 10, .initial = 1 } },
+        .{ .autoscaling = .{ .minimum = 0, .maximum = 0, .initial = 0 } },
+        .{ .autoscaling = .{ .minimum = 5, .maximum = 4, .initial = 4 } },
+        .{ .autoscaling = .{ .minimum = 2, .maximum = 10, .initial = 1 } },
+        .{ .autoscaling = .{ .minimum = 2, .maximum = 10, .initial = 11 } },
+    };
+    for (registrations) |registered| {
+        for (bad) |b| {
+            try testing.expectError(error.InvalidOptions, Worker.checkOptions(.{ .workflow_task_poller_behavior = b }, "q", registered));
+            try testing.expectError(error.InvalidOptions, Worker.checkOptions(.{ .activity_task_poller_behavior = b }, "q", registered));
+            try testing.expectError(error.InvalidOptions, Worker.checkOptions(.{ .nexus_task_poller_behavior = b }, "q", registered));
+        }
+        for ([_]f32{ -0.01, 1.01, std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |ratio| {
+            try testing.expectError(error.InvalidOptions, Worker.checkOptions(.{ .nonsticky_to_sticky_poll_ratio = ratio }, "q", registered));
+        }
+
+        const good = [_]PollerBehavior{
+            .{ .simple_maximum = 1 },
+            .{ .autoscaling = .{} },
+            .{ .autoscaling = .{ .minimum = 1, .maximum = 1, .initial = 1 } },
+            .{ .autoscaling = .{ .minimum = 2, .maximum = 10, .initial = 2 } },
+            .{ .autoscaling = .{ .minimum = 2, .maximum = 10, .initial = 10 } },
+        };
+        for (good) |g| try Worker.checkOptions(.{ .workflow_task_poller_behavior = g, .activity_task_poller_behavior = g, .nexus_task_poller_behavior = g }, "q", registered);
+        for ([_]f32{ 0, 1, 0.5 }) |ratio| try Worker.checkOptions(.{ .nonsticky_to_sticky_poll_ratio = ratio }, "q", registered);
+    }
+}
+
 test "session queues get the heartbeat throttling but not the per-second limits" {
     const options: Options = .{
         .identity = "id-1",
@@ -3291,6 +3502,10 @@ test "run returns InvalidOptions for an invalid option, before it uses the clien
         .{ .max_activities_per_second = std.math.nan(f64) },
         .{ .max_heartbeat_throttle_interval = .fromSeconds(-1) },
         .{ .poll_activity_tasks = false, .sessions = .{} },
+        .{ .workflow_task_poller_behavior = .{ .simple_maximum = 0 } },
+        .{ .activity_task_poller_behavior = .{ .autoscaling = .{ .minimum = 3, .maximum = 2, .initial = 2 } } },
+        .{ .nexus_task_poller_behavior = .{ .autoscaling = .{ .initial = 101 } } },
+        .{ .nonsticky_to_sticky_poll_ratio = std.math.nan(f32) },
     };
     for (invalid) |options| {
         var w = try Worker.init(testing.allocator, testing.io, &client, "invalid", options);

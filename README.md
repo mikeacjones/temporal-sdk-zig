@@ -62,6 +62,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Sessions](#sessions-1)
     - [Workflow memory limit](#workflow-memory-limit)
     - [Deadlock detection](#deadlock-detection)
+    - [Poller behavior](#poller-behavior)
     - [Tuners and poller behavior](#tuners-and-poller-behavior)
     - [Plugins](#plugins)
   - [Data conversion](#data-conversion)
@@ -1587,7 +1588,7 @@ Notes:
 - `max_concurrent_workflow_task_executions` (100): workflow activations processed at once. Activations of different runs run in parallel, each on its own thread; one run's activations run one at a time, possibly on different threads. Payload codecs, interceptors, and log sinks are therefore called concurrently.
 - `max_concurrent_activity_executions` (100): activities run at once, each on its own task. `max_concurrent_local_activity_executions` (100): local activities run at once, a separate pool; a local activity waits for a slot up to its `schedule_to_start_timeout`.
 - `max_concurrent_nexus_task_executions` (100): Nexus requests (starts and cancels of operations) handled at once, each on its own task. Used only with a registered Nexus service.
-- `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers`, `max_concurrent_nexus_task_pollers` (2 each): polls in flight at once. Each must be at least 1, and the workflow pollers at least 2 while `max_cached_workflows` isn't 0; sdk-core rejects other values and `run` returns `error.WorkerInitFailed`, logged. The Nexus pollers are checked only with a registered Nexus service.
+- `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers`, `max_concurrent_nexus_task_pollers` (2 each): polls in flight at once. Each must be at least 1, and the workflow pollers at least 2 while `max_cached_workflows` isn't 0; sdk-core rejects other values and `run` returns `error.WorkerInitFailed`, logged. The Nexus pollers are checked only with a registered Nexus service. The `*_task_poller_behavior` options replace them with a fixed maximum or autoscaling, and `nonsticky_to_sticky_poll_ratio` splits the workflow pollers; see [Poller behavior](#poller-behavior).
 - `max_cached_workflows` (1000): runs kept in memory between tasks. Over the limit the least recently used run is evicted and replayed from its history at its next task; 0 replays every task from the start. `workflow_stack_size` (256 KiB): each coroutine's stack.
 - `identity`: the worker's name to the server; empty uses the client's.
 - `sticky_schedule_to_start_timeout` (10 s): how long a workflow task waits on this worker's sticky queue, where the next task of a cached run goes, before the server hands it to any worker on the task queue, which replays the run.
@@ -1696,10 +1697,36 @@ Notes:
 - Turn detection off while a debugger may stop workflow code at a breakpoint, or the paused task fails.
 - Detection emits no command and changes none, so replay is unaffected. `testing.WorkflowReplayer.Options.deadlock_detection_timeout` (null by default) applies the same limit to replayed code.
 
+#### Poller behavior
+
+A worker long-polls the server for each kind of task it runs: workflow tasks, activity tasks, and Nexus tasks. `worker.Options.workflow_task_poller_behavior`, `activity_task_poller_behavior` and `nexus_task_poller_behavior` each take a `worker.PollerBehavior`: `.simple_maximum`, up to that many polls open at once, or `.autoscaling`, where the worker opens and closes polls between `minimum` and `maximum`, starting from `initial`, following the server's feedback.
+
+<!-- example: worker-poller-behavior -->
+```zig
+var w = try Worker.init(gpa, io, &client, "orders", .{
+    // Between 2 and 20 workflow task polls, starting from 4, as the server suggests.
+    .workflow_task_poller_behavior = .{ .autoscaling = .{ .minimum = 2, .maximum = 20, .initial = 4 } },
+    // The defaults: between 1 and 100, starting from 5.
+    .activity_task_poller_behavior = .{ .autoscaling = .{} },
+    // Up to 4 Nexus task polls at once.
+    .nexus_task_poller_behavior = .{ .simple_maximum = 4 },
+});
+defer w.deinit();
+```
+
+Notes:
+- Null (the default) for a behavior is a simple maximum of the matching `max_concurrent_*_task_pollers` (2 each); a set behavior wins over that field. The Nexus pollers are used only with a registered Nexus service.
+- With autoscaling, the server's poll responses carry suggestions to add or remove polls. The worker always follows a suggestion to remove polls, down to `minimum`, and follows one to add polls, up to `maximum`, only while it is taking in more tasks than a moment before. Once the server has sent a suggestion, or when the namespace reports that it supports poller autoscaling, an empty poll also closes one poll, and a poll refused for exhausted resources halves the count. Failed polls are retried with backoff.
+- Autoscaling needs a server that sends this feedback. Against one that sends no suggestions and doesn't report the capability, the worker keeps `initial` polls open.
+- A poll is opened only while a slot for its task is free, whatever the behavior.
+- With the cache on (`max_cached_workflows` above 0), a worker polls its task queue and its own sticky queue for workflow tasks. An autoscaling workflow behavior applies to each of the two, so up to twice `maximum` polls can be open. With a simple maximum, `nonsticky_to_sticky_poll_ratio` (0.2) is the task queue's share: the maximum times the ratio, rounded down and at least 1, and the sticky queue gets the rest, at least 1. A workflow simple maximum must be at least 2 while the cache is on; sdk-core rejects less with `error.WorkerInitFailed`.
+- Session queues (`sessions`) poll with the activity behavior, so with autoscaling each scales on its own between the same bounds.
+- `run` returns `error.InvalidOptions`, and logs the option and why, before it polls, for a set behavior with a `simple_maximum` of 0, or an `autoscaling` with `minimum` 0, `maximum` below `minimum`, or `initial` outside `minimum` to `maximum`, whatever the worker registers; and for a `nonsticky_to_sticky_poll_ratio` outside 0 to 1, NaN included.
+
 #### Tuners and poller behavior
-<!-- stub: temporal-sdk-zig-d51.9.3, temporal-sdk-zig-d51.9.4 -->
+<!-- stub: temporal-sdk-zig-d51.9.3 -->
 Not implemented yet.
-`worker.Options` is to take slot tuners (fixed, resource-based, composite, custom) and per-poller behavior (a simple maximum or autoscaling).
+`worker.Options` is to take slot tuners (fixed, resource-based, composite, custom).
 
 #### Plugins
 <!-- stub: temporal-sdk-zig-d51.9.7 -->
