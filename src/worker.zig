@@ -180,7 +180,11 @@ pub const Options = struct {
     /// evicted, the server retries the task, and the retry replays the history, so code that
     /// still returns the error fails again, and a worker whose code no longer does completes
     /// the task. Only a task's first failed attempt is reported to the server; later ones
-    /// send nothing and end in a workflow task timeout before the next retry.
+    /// send nothing and end in a workflow task timeout before the next retry. Only the first
+    /// failed attempt is logged, too: the SDK doesn't log the failure itself, and sdk-core
+    /// logs the warning "Failing workflow task" through the client's logger
+    /// (`client.Options.core_log_level`) when it reports that attempt, but only a debug line
+    /// for each later one, which the default level hides.
     ///
     /// A listed error from an update handler doesn't reject or fail the update: the retried
     /// task runs the handler again and answers it. An update delivered in the failed task
