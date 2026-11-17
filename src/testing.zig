@@ -7384,6 +7384,82 @@ const StandaloneFollowUpFixtures = struct {
     }
 };
 
+/// A standalone activity's value and failure, each stamped with the converter context it
+/// was decoded with as "namespace|workflow ID|workflow type|activity type|activity ID".
+const StandaloneContextFixtures = struct {
+    fn contextText(arena: Allocator, c: *const converter.Context) error{OutOfMemory}![]const u8 {
+        return std.fmt.allocPrint(arena, "{s}|{s}|{s}|{s}|{s}", .{ c.namespace, c.workflow_id, c.workflow_type, c.activity_type, c.activity_id });
+    }
+
+    /// Its encoding is plain text; decoding records the context it was decoded with.
+    const Stamped = struct {
+        text: []const u8,
+        decoded_with: []const u8 = "",
+
+        pub fn toPayloadWithContext(v: Stamped, arena: Allocator, _: *const converter.Context) error{OutOfMemory}!converter.Payload {
+            return converter.toPayload(arena, v.text);
+        }
+
+        pub fn fromPayloadWithContext(arena: Allocator, context: *const converter.Context, p: converter.Payload) converter.DecodeError!Stamped {
+            return .{ .text = try converter.fromPayload([]const u8, arena, p), .decoded_with = try contextText(arena, context) };
+        }
+    };
+
+    fn echo(_: *activity.Context, v: Stamped) !Stamped {
+        return .{ .text = v.text };
+    }
+    const Echo = activity.Def("StampedEcho", echo);
+
+    fn refuse(_: *activity.Context) !void {
+        return error.Refused;
+    }
+    const Refuse = activity.Def("StampedRefuse", refuse);
+
+    /// Prefixes a received failure's message with "<ctx>"; sends failures as built.
+    const converter_value: converter.FailureConverter = .{ .ptr = undefined, .vtable = &.{ .toFailure = toFailure, .fromFailure = fromFailure } };
+
+    fn toFailure(_: *anyopaque, _: Allocator, _: *const converter.Context, _: ?anyerror, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        return f;
+    }
+
+    fn fromFailure(_: *anyopaque, arena: Allocator, context: *const converter.Context, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        var out = f;
+        out.message = try std.fmt.allocPrint(arena, "<{s}> {s}", .{ try contextText(arena, context), f.message });
+        return out;
+    }
+};
+
+test "client: a standalone activity's handle decodes its result and failure with the activity type it was started with" {
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .dev_server_extra_args = &DevServer.standalone_activity_args,
+        .failure_converter = StandaloneContextFixtures.converter_value,
+    });
+    defer env.deinit();
+    try env.registerActivity(StandaloneContextFixtures.Echo);
+    try env.registerActivity(StandaloneContextFixtures.Refuse);
+    try env.ensureWorker();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    var echoed = try c.executeActivity(StandaloneContextFixtures.Echo, .{ .id = "stamped-echo", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{.{ .text = "solo" }});
+    defer echoed.deinit();
+    const result = try echoed.get(a);
+    try testing.expectEqualStrings("solo", result.text);
+    try testing.expectEqualStrings("default|||StampedEcho|stamped-echo", result.decoded_with);
+
+    // A handle from the ID alone doesn't know the type.
+    var by_id = try c.getActivityHandle(StandaloneContextFixtures.Stamped, "stamped-echo", "");
+    defer by_id.deinit();
+    try testing.expectEqualStrings("default||||stamped-echo", (try by_id.get(a)).decoded_with);
+
+    var refused = try c.executeActivityByName(void, "StampedRefuse", .{ .id = "stamped-refuse", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(10), .retry_policy = .{ .maximum_attempts = 1 } }, .{});
+    defer refused.deinit();
+    try testing.expectError(error.ActivityFailed, refused.get(a));
+    try testing.expectEqualStrings("<default|||StampedRefuse|stamped-refuse> Refused", refused.failure().?.message);
+}
+
 test "client: a standalone activity starts with a delay, a priority and a summary, and reports whether it started" {
     StandaloneFixtures.reset();
     const zlib: converter.ZlibCodec = .{ .always_encode = true };

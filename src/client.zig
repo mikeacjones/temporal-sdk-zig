@@ -2116,6 +2116,8 @@ pub const Client = struct {
             else => |e| return e,
         };
         var handle = try c.getActivityHandle(Result, id, response.run_id);
+        errdefer handle.deinit();
+        handle.activity_type = try c.gpa.dupe(u8, activity_type);
         handle.started = response.started;
         return handle;
     }
@@ -3525,11 +3527,16 @@ pub fn ActivityHandle(comptime T: type) type {
         /// when `StartActivityOptions.id_conflict_policy = .use_existing` returned the one
         /// already running with the ID. Always false from `Client.getActivityHandle`.
         started: bool = false,
+        /// The activity's type, from `Client.executeActivity`; `get` decodes the result and
+        /// any failure with it in the converter context. Empty from
+        /// `Client.getActivityHandle`, which doesn't know it.
+        activity_type: []u8 = &.{},
         failure_: ?failure_mod.Failure = null,
 
         pub fn deinit(h: *Self) void {
             h.client.gpa.free(h.id);
             h.client.gpa.free(h.run_id);
+            h.client.gpa.free(h.activity_type);
             h.* = undefined;
         }
 
@@ -3557,14 +3564,15 @@ pub fn ActivityHandle(comptime T: type) type {
                 };
                 if (response.outcome) |o| break o;
             };
+            const context = h.converterContext();
             switch (outcome.value orelse return error.InvalidResponse) {
                 .result => |payloads| {
                     if (T == void) return;
                     if (payloads.payloads.items.len == 0) return error.InvalidPayload;
-                    return converter.fromPayloadWithContext(T, arena, &.{ .namespace = c.namespace, .activity_id = h.id }, payloads.payloads.items[0]);
+                    return converter.fromPayloadWithContext(T, arena, &context, payloads.payloads.items[0]);
                 },
                 .failure => |received| {
-                    const f = try c.receivedFailure(arena, &.{ .namespace = c.namespace, .activity_id = h.id }, received);
+                    const f = try c.receivedFailure(arena, &context, received);
                     h.failure_ = f;
                     const info = f.failure_info orelse return error.ActivityFailed;
                     return switch (info) {
@@ -3575,6 +3583,12 @@ pub fn ActivityHandle(comptime T: type) type {
                     };
                 },
             }
+        }
+
+        /// The converter context `get` decodes the result and any failure with. Borrows the
+        /// handle.
+        fn converterContext(h: *const Self) converter.Context {
+            return .{ .namespace = h.client.namespace, .activity_id = h.id, .activity_type = h.activity_type };
         }
 
         /// Why the activity didn't complete, after `get` returned `error.ActivityFailed`,
