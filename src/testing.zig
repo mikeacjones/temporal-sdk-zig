@@ -323,6 +323,10 @@ pub const WorkflowEnvironment = struct {
         /// Encode the message and stack trace of failures the client and its worker send
         /// (`client.Options.encode_failure_attributes`).
         encode_failure_attributes: bool = false,
+        /// The client's failure converter (`client.Options.failure_converter`), which its
+        /// worker and the replay of each finished workflow use too. Borrowed: it must outlive
+        /// the environment.
+        failure_converter: ?converter.FailureConverter = null,
         /// Where the client's sdk-core logs and the worker's workflow and activity logs go
         /// (`client.Options.logger`). Borrowed: it must outlive the environment.
         logger: ?log_mod.Sink = null,
@@ -357,7 +361,7 @@ pub const WorkflowEnvironment = struct {
     }
 
     /// `startTimeSkipping` with the client's options: codecs, the failure attribute
-    /// encoding, a logger, propagators, worker and client interceptors, and metrics, as
+    /// encoding, the failure converter, a logger, propagators, worker and client interceptors, and metrics, as
     /// `startWithOptions` takes them. `dev_server_extra_args` is for the dev server only: a
     /// non-empty one returns `error.InvalidOptions` before any server starts.
     pub fn startTimeSkippingWithOptions(gpa: Allocator, io: Io, options: Options) !*WorkflowEnvironment {
@@ -417,6 +421,7 @@ pub const WorkflowEnvironment = struct {
         errdefer env.server.stop(io);
         client_options.codecs = options.codecs;
         client_options.encode_failure_attributes = options.encode_failure_attributes;
+        client_options.failure_converter = options.failure_converter;
         client_options.logger = options.logger;
         client_options.propagators = options.propagators;
         client_options.worker_interceptors = options.worker_interceptors;
@@ -828,7 +833,7 @@ pub const WorkflowEnvironment = struct {
                 const outcome: client_mod.ResultError!Result = switch (attrs) {
                     .workflow_execution_completed_event_attributes => |done| decodeResult(Result, arena, &env.resultContext(run.id), done.result),
                     .workflow_execution_failed_event_attributes => |failed| blk: {
-                        run.failure_ = failed.failure;
+                        run.failure_ = try env.readFailure(arena, run.id, failed.failure);
                         break :blk error.WorkflowFailed;
                     },
                     .workflow_execution_timed_out_event_attributes => error.WorkflowTimedOut,
@@ -871,7 +876,7 @@ pub const WorkflowEnvironment = struct {
                 var why = continued.failure;
                 if (why == null and continued.new_execution_run_id.len > 0)
                     why = (try env.startedEvent(arena, run.id, continued.new_execution_run_id)).continued_failure;
-                run.failure_ = why;
+                run.failure_ = try env.readFailure(arena, run.id, why);
                 if (why) |f| if (f.failure_info) |info| if (info == .timeout_failure_info) return error.WorkflowTimedOut;
                 // A run the workflow didn't finish and the server didn't fail.
                 if (outcome == .unfinished and why == null) return error.WorkflowContinuedAsNew;
@@ -913,6 +918,14 @@ pub const WorkflowEnvironment = struct {
         const p = payloads orelse return error.InvalidPayload;
         if (p.payloads.items.len == 0) return error.InvalidPayload;
         return converter.fromPayloadWithContext(Result, arena, context, p.payloads.items[0]);
+    }
+
+    /// The run's failure `f` as `WorkflowRun.get` reads it: through the client's failure
+    /// converter, with the context of the run's result. Memory from `arena`.
+    fn readFailure(env: *const WorkflowEnvironment, arena: Allocator, workflow_id: []const u8, f: ?failure_mod.Failure) error{OutOfMemory}!?failure_mod.Failure {
+        const v = f orelse return null;
+        const c = env.client.failure_converter orelse return v;
+        return try c.fromFailure(arena, &env.resultContext(workflow_id), v);
     }
 
     /// The converter context of the result of workflow `workflow_id`, as
@@ -1027,6 +1040,7 @@ pub const WorkflowEnvironment = struct {
                 .namespace = env.client.namespace,
                 .task_queue = env.task_queue,
                 .codecs = env.client.codecs,
+                .failure_converter = env.client.failure_converter,
                 .propagators = env.client.propagators,
                 .interceptors = interceptors.items,
             },
@@ -1218,6 +1232,10 @@ pub const WorkflowReplayer = struct {
         /// through a client with codecs is already decoded; codecs pass decoded payloads
         /// through.
         codecs: []const converter.PayloadCodec = &.{},
+        /// The failure converter of the original worker's client
+        /// (`client.Options.failure_converter`), which replayed workflows send and read
+        /// failures through. It must be the one the recording worker used.
+        failure_converter: ?converter.FailureConverter = null,
         /// Context propagators that extract the values workflows read with
         /// `ctx.propagated()`, as the original worker's client did
         /// (`client.Options.propagators`).
@@ -1496,6 +1514,7 @@ pub const WorkflowReplayer = struct {
                     .task_failure_errors = r.options.workflow_task_failure_errors,
                     .deadlock_timeout = r.options.deadlock_detection_timeout,
                     .codecs = r.options.codecs,
+                    .failure_converter = r.options.failure_converter,
                     .propagators = r.options.propagators,
                     .interceptors = r.options.interceptors,
                     .on_evict = Outcome.record,

@@ -66,6 +66,17 @@ pub const Options = struct {
     /// message to the caller in the clear (`QueryOptions.failure_message`).
     /// Failures received are always decoded back, after the codecs, whatever this is set to.
     encode_failure_attributes: bool = false,
+    /// Transforms the failures this client and every worker on it send and receive (see
+    /// `converter.FailureConverter` for where it runs): `toFailure` runs before
+    /// `encode_failure_attributes` and the codecs, and `fromFailure` after they are undone.
+    /// Null sends and reads failures as the SDK builds and receives them. The converter also
+    /// runs inside workflow code, for the failures a workflow sends and receives, so it must
+    /// be deterministic and must not block or do I/O; it is called concurrently from worker
+    /// threads and the client's callers, so it must be thread-safe. A replayer of this
+    /// client's histories must be given the same one
+    /// (`testing.WorkflowReplayer.Options.failure_converter`). Borrowed: it must outlive the
+    /// client and its workers.
+    failure_converter: ?converter.FailureConverter = null,
     /// Where sdk-core's logs go, and the default for every worker on this client (see
     /// `worker.Options.logger`). Null uses `log.Sink.std_log`. Borrowed: it must outlive the
     /// client and its workers. Called concurrently from worker threads and sdk-core's threads.
@@ -619,6 +630,8 @@ pub const Client = struct {
     codecs: []const converter.PayloadCodec,
     /// `Options.encode_failure_attributes`.
     encode_failure_attributes: bool = false,
+    /// `Options.failure_converter`, borrowed; workers on this client use it too.
+    failure_converter: ?converter.FailureConverter = null,
     /// `Options.logger` or the default sink; workers on this client inherit it.
     logger: log_mod.Sink,
     /// `Options.propagators`, borrowed; workers on this client use them too.
@@ -753,6 +766,7 @@ pub const Client = struct {
             .identity = identity,
             .codecs = options.codecs,
             .encode_failure_attributes = options.encode_failure_attributes,
+            .failure_converter = options.failure_converter,
             .logger = logger,
             .propagators = options.propagators,
             .worker_interceptors = options.worker_interceptors,
@@ -766,9 +780,9 @@ pub const Client = struct {
     /// program that works in several namespaces of one server connects once and makes a
     /// client for each of the others with this. Workers on the new client poll `namespace`.
     /// The new client has this one's identity, codecs, `encode_failure_attributes`,
-    /// logger, propagators, interceptors (client and worker), metrics (`metrics`) and
-    /// `Options.rpc_timeout`; they are borrowed from the same `Options` as this client's, so
-    /// those must outlive it too. `namespace` is copied.
+    /// failure converter, logger, propagators, interceptors (client and worker), metrics
+    /// (`metrics`) and `Options.rpc_timeout`; they are borrowed from the same `Options` as
+    /// this client's, so those must outlive it too. `namespace` is copied.
     ///
     /// The clients share the connection and the runtime, and own them together: closing
     /// one leaves both to the others, and the last of them to close frees them. The clients
@@ -1811,7 +1825,7 @@ pub const Client = struct {
         _ = try c.activityRpc(wfs.RespondActivityTaskFailedResponse, "RespondActivityTaskFailed", wfs.RespondActivityTaskFailedRequest{
             .namespace = c.namespace,
             .task_token = task_token,
-            .failure = try failure_mod.application(a, f),
+            .failure = try c.sentFailure(a, &.{ .namespace = c.namespace }, try failure_mod.application(a, f)),
             .identity = c.identity,
         }, a);
     }
@@ -1826,7 +1840,7 @@ pub const Client = struct {
             .workflow_id = id.workflow_id,
             .run_id = id.run_id,
             .activity_id = id.activity_id,
-            .failure = try failure_mod.application(a, f),
+            .failure = try c.sentFailure(a, &c.activityIdContext(id), try failure_mod.application(a, f)),
             .identity = c.identity,
         }, a);
     }
@@ -1902,6 +1916,18 @@ pub const Client = struct {
             error.AlreadyExists => error.InvalidResponse,
             else => |e| e,
         };
+    }
+
+    /// `f`, which user code gave the client to send, as the failure converter sends it.
+    fn sentFailure(c: *const Client, a: Allocator, context: *const converter.Context, f: failure_mod.Failure) error{OutOfMemory}!failure_mod.Failure {
+        const fc = c.failure_converter orelse return f;
+        return fc.toFailure(a, context, null, f);
+    }
+
+    /// `f`, a failure the server returned, as the failure converter gives it to user code.
+    fn receivedFailure(c: *const Client, a: Allocator, context: *const converter.Context, f: failure_mod.Failure) error{OutOfMemory}!failure_mod.Failure {
+        const fc = c.failure_converter orelse return f;
+        return fc.fromFailure(a, context, f);
     }
 
     fn resultPayloads(a: Allocator, context: *const converter.Context, result: anytype) error{OutOfMemory}!proto.temporal.api.common.v1.Payloads {
@@ -3537,7 +3563,8 @@ pub fn ActivityHandle(comptime T: type) type {
                     if (payloads.payloads.items.len == 0) return error.InvalidPayload;
                     return converter.fromPayloadWithContext(T, arena, &.{ .namespace = c.namespace, .activity_id = h.id }, payloads.payloads.items[0]);
                 },
-                .failure => |f| {
+                .failure => |received| {
+                    const f = try c.receivedFailure(arena, &.{ .namespace = c.namespace, .activity_id = h.id }, received);
                     h.failure_ = f;
                     const info = f.failure_info orelse return error.ActivityFailed;
                     return switch (info) {
@@ -4571,7 +4598,7 @@ pub fn WorkflowRun(comptime T: type) type {
                         return converter.fromPayloadWithContext(T, arena, &c.workflowContext(run.id, null), payloads.payloads.items[0]);
                     },
                     .workflow_execution_failed_event_attributes => |failed| {
-                        run.failure_ = failed.failure;
+                        run.failure_ = if (failed.failure) |f| try c.receivedFailure(arena, &c.workflowContext(run.id, null), f) else null;
                         return error.WorkflowFailed;
                     },
                     .workflow_execution_canceled_event_attributes => return error.WorkflowCanceled,
@@ -4724,7 +4751,7 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
                     return converter.fromPayloadWithContext(T, arena, &c.workflowContext(h.workflow_id, null), payloads.payloads.items[0]);
                 },
                 .failure => |f| {
-                    h.failure_ = f;
+                    h.failure_ = try c.receivedFailure(arena, &c.workflowContext(h.workflow_id, null), f);
                     return error.UpdateFailed;
                 },
             }

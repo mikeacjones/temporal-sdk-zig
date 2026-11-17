@@ -1112,6 +1112,7 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
         .task_failure_errors = w.options.workflow_task_failure_errors,
         .codecs = w.client.codecs,
         .encode_failure_attributes = w.client.encode_failure_attributes,
+        .failure_converter = w.client.failure_converter,
         .propagators = w.client.propagators,
         .interceptors = w.interceptors,
         .logger = w.logSink(),
@@ -1173,6 +1174,8 @@ pub const WorkflowRunner = struct {
     codecs: []const converter.PayloadCodec = &.{},
     /// See `client.Options.encode_failure_attributes`.
     encode_failure_attributes: bool = false,
+    /// Borrowed; see `client.Options.failure_converter`.
+    failure_converter: ?converter.FailureConverter = null,
     /// Borrowed; see `client.Options.propagators`.
     propagators: []const propagation.ContextPropagator = &.{},
     /// Borrowed; see `Options.interceptors`.
@@ -1664,6 +1667,7 @@ pub const WorkflowRunner = struct {
             .memory_limit = r.memory_limit,
             .failure_stack_traces = r.failure_stack_traces,
             .task_failure_errors = r.task_failure_errors,
+            .failure_converter = r.failure_converter,
             .logger = r.logger,
             .log_during_replay = r.log_during_replay,
             .propagators = r.propagators,
@@ -2204,6 +2208,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
             ctx.logger_.debug("Activity failed", .{ .Error = f.message })
         else
             ctx.logger_.warn("Activity failed", .{ .Error = f.message });
+        if (w.client.failure_converter) |c| f = try c.toFailure(a, ctx.converterContext(), err, f);
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };
@@ -2656,17 +2661,18 @@ fn completeNexusRequest(w: *Worker, core: bridge.Worker, req: *NexusRequest, out
         .failed => |e| wire.failedCompletion(a, req.task_token, e),
     } catch return dropNexusTask(w, core, req.task_token, logger);
     encodeNexusFailure(w, a, &completion, ctx) catch |err| {
-        logger.warn("Encoding the Nexus request's failure with the client's codecs failed; sending it without its details", .{ .Error = @errorName(err) });
+        logger.warn("Preparing the Nexus request's failure (the client's failure converter, encoded attributes and codecs) failed; sending it without its details", .{ .Error = @errorName(err) });
         completion = wire.failedCompletion(a, req.task_token, .{
             .type = .internal,
-            .message = std.fmt.allocPrint(a, "encoding the failure of Nexus operation \"{s}\" of service \"{s}\" with the client's codecs failed: {t}", .{ ctx.info_.operation, ctx.info_.service, err }) catch "encoding the Nexus request's failure with the client's codecs failed",
+            .message = std.fmt.allocPrint(a, "preparing the failure of Nexus operation \"{s}\" of service \"{s}\" with the client's failure converter, encoded attributes and codecs failed: {t}", .{ ctx.info_.operation, ctx.info_.service, err }) catch "preparing the Nexus request's failure with the client's failure converter, encoded attributes and codecs failed",
         }) catch return dropNexusTask(w, core, req.task_token, logger);
     };
     sendNexusCompletion(w, core, a, completion, logger);
 }
 
-/// Encodes the payloads of the completion's failure, if it has one, with the client's codecs.
-/// A synchronous result is already encoded (by `nexus.Operation.start`).
+/// Passes the completion's failure, if it has one, through the client's failure converter
+/// (when the handler's own error built it), then encodes its attributes and payloads with the
+/// client's codecs. A synchronous result is already encoded (by `nexus.Operation.start`).
 fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, ctx: *const nexus.Context) converter.CodecError!void {
     const context: converter.Context = .{ .namespace = ctx.info_.namespace, .values = ctx.propagated() };
     const status = if (completion.status) |*st| st else return;
@@ -2685,6 +2691,10 @@ fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, ct
             };
         },
         else => return,
+    };
+    // Only a handler's own error is user code's; the SDK's reports go as they are.
+    if (ctx.returned_error_) |err| if (w.client.failure_converter) |c| {
+        f.* = try c.toFailure(a, &context, err, f.*);
     };
     if (w.client.encode_failure_attributes) try failure_mod.encodeAttributes(failure_mod.Failure, f, a);
     try converter.encodeMessage(failure_mod.Failure, f, w.client.codecs, a, w.io, &context);

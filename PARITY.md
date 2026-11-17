@@ -155,7 +155,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Serialization context for converters and codecs | Java, Python, .NET, TypeScript | GA | supported | [Payloads](README.md#payloads), [Payload codecs](README.md#payload-codecs) |
 | Failures with cause chains and kinds | all | GA | supported | [Failures](README.md#failures-1) |
 | Encoded failure attributes (message and stack trace through the codecs) | all | GA | supported | [Failures](README.md#failures-1) |
-| Custom failure converter (errors to failures and back) | Go, Java, Python, TypeScript, .NET, Ruby | GA | partial | `temporal-sdk-zig-d51.4.21`. Missing: a pluggable failure converter; the SDK's own conversion is fixed, and `client.Options.encode_failure_attributes` is its only setting. |
+| Custom failure converter (errors to failures and back) | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Failures](README.md#failures-1) |
 | External payload storage (Public Preview) | Go, Java, Python, TypeScript, .NET | pre-release | partial | `temporal-sdk-zig-d51.4.9`. Missing: storage drivers and a payload size threshold; a `converter.PayloadCodec` can store payloads elsewhere and pass references instead. |
 
 ### Testing

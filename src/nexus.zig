@@ -547,6 +547,10 @@ pub const Context = struct {
     /// Set by `fail`, `failCanceled`, and `handlerError`, and reported when the handler
     /// returns the error they gave back.
     pending: ?union(enum) { operation: OperationError, handler: HandlerError } = null,
+    /// The error the handler returned, set by the SDK when the request's failure is built
+    /// from it; the worker then passes that failure through the client's failure converter
+    /// (`client.Options.failure_converter`) with it.
+    returned_error_: ?anyerror = null,
     /// Written once by the worker when a cancel arrives, possibly from another thread.
     cancel_reason_: std.atomic.Value(u8) = .init(not_canceled),
 
@@ -670,6 +674,7 @@ pub const Context = struct {
 
     /// The result for `err`, returned by the handler of `operation` in `service`.
     fn errorResult(ctx: *Context, comptime service: []const u8, comptime operation: []const u8, err: anyerror) HandlerOutcome {
+        ctx.returned_error_ = err;
         if (ctx.pending) |p| switch (p) {
             .operation => |o| if (err == error.OperationFailed or err == error.OperationCanceled) return .{ .operation_error = o },
             .handler => |h| if (err == error.HandlerError) return .{ .handler_error = h },

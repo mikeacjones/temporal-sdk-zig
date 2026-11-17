@@ -106,6 +106,11 @@
 //! Conversion turns values into payloads; payload codecs (`PayloadCodec`) then transform
 //! the payloads themselves, for example to compress or encrypt them. `codecHandler` serves
 //! codecs over HTTP, so the Web UI and CLI can show payloads only the codecs can decode.
+//!
+//! Errors become failures (`Failure`) by a fixed step: an error's name, or the
+//! `failure.Application` given to `ctx.fail`. A `FailureConverter`, set with
+//! `client.Options.failure_converter`, then transforms each failure user code sends and each
+//! failure it receives, before user code reads it.
 
 const std = @import("std");
 const proto = @import("proto.zig");
@@ -133,6 +138,61 @@ const codec_handler = @import("converter/codec_handler.zig");
 pub const CodecHandler = codec_handler.CodecHandler;
 pub const CodecHandlerOptions = codec_handler.CodecHandlerOptions;
 pub const codecHandler = codec_handler.codecHandler;
+
+/// A Temporal failure, as `failure.Failure`.
+pub const Failure = proto.temporal.api.failure.v1.Failure;
+
+/// Transforms failures on their way between user code and the server, for example to
+/// rewrite their messages, move details into payloads, or redact them. Set it with
+/// `client.Options.failure_converter`; the client, every worker on it, and the replayer
+/// (`testing.WorkflowReplayer.Options.failure_converter`) use it. Without one, failures are
+/// sent and read as the SDK builds and receives them.
+///
+/// `toFailure` runs where an error of user code becomes a failure: the workflow's own
+/// failure (its function's or a signal handler's error, `ctx.fail`, `ctx.failWith`, or a
+/// future's failure it returns), update rejections from validators and handlers, query
+/// failures, the failures of activities and local activities, a Nexus handler's error, and
+/// `Client.failActivity` and `failActivityById`. `f` is the failure the SDK built, stack trace
+/// included, and `err` the error user code returned (null only for the two client calls). It
+/// returns the failure to send. `fromFailure` runs where a failure arrives, before user code
+/// reads it: in a workflow, the failures of activities, local activities, child workflows,
+/// Nexus operations, external signals and cancels, and `ctx.previousRunFailure`; on a
+/// client, the failures `WorkflowRun.failure`, `WorkflowUpdateHandle.failure` and
+/// `ActivityHandle.failure` return. Each is called once per failure with the head of its
+/// cause chain; the causes are the converter's to visit.
+///
+/// `context` names what the failure is for, as for payloads (see the table above), and is
+/// borrowed for the call. The failure returned may borrow from `f`; anything else comes from
+/// `arena`, which lives as long as the failure does.
+///
+/// Failures the SDK makes for its own reports (workflow task failures, unregistered
+/// activities, queries and updates, codec failures, cancel acknowledgements) and those it
+/// builds for user code without a server (an interceptor's refusal, a child that couldn't
+/// start, a canceled local activity) are not converted. `client.Options.encode_failure_attributes`
+/// applies after `toFailure` on the way out and is undone before `fromFailure` on the way in.
+///
+/// The converter runs inside workflow code when a workflow sends or receives a failure, so it
+/// must be deterministic and must not block or do I/O: a converter that blocks is reported as
+/// a deadlock. It is called concurrently from workflow, activity, Nexus and client threads,
+/// so it must be thread-safe. Borrowed: `ptr` and `vtable` must outlive the client, its
+/// workers, and any replayer given it.
+pub const FailureConverter = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        toFailure: *const fn (ptr: *anyopaque, arena: Allocator, context: *const Context, err: ?anyerror, f: Failure) error{OutOfMemory}!Failure,
+        fromFailure: *const fn (ptr: *anyopaque, arena: Allocator, context: *const Context, f: Failure) error{OutOfMemory}!Failure,
+    };
+
+    pub fn toFailure(c: FailureConverter, arena: Allocator, context: *const Context, err: ?anyerror, f: Failure) error{OutOfMemory}!Failure {
+        return c.vtable.toFailure(c.ptr, arena, context, err, f);
+    }
+
+    pub fn fromFailure(c: FailureConverter, arena: Allocator, context: *const Context, f: Failure) error{OutOfMemory}!Failure {
+        return c.vtable.fromFailure(c.ptr, arena, context, f);
+    }
+};
 
 /// Raw bytes, encoded as `binary/plain` instead of a JSON string.
 pub const Bytes = struct { data: []const u8 };
@@ -804,7 +864,6 @@ test "unconvertibleType names the type the default converter can't handle" {
     const Node = struct { value: u32, next: ?*const @This() };
     const Shape = union(enum) { circle: f32, empty };
     const Untagged = union { a: u32, b: f32 };
-    const Failure = proto.temporal.api.failure.v1.Failure;
     inline for (.{ void, Payload, Bytes, Point, ?Point, Failure, []const u8, ?u32, Node, Shape, [3]u8, struct { a: []const []const u8 } }) |T| {
         try testing.expectEqual(null, unconvertibleType(T, .encode));
         try testing.expectEqual(null, unconvertibleType(T, .decode));
@@ -1171,11 +1230,49 @@ test "the context changes nothing for built-in encodings and plain hooks" {
     try testing.expectEqualStrings("b", decoded.items[1]);
 }
 
+test "FailureConverter calls its vtable with the context, the error and the failure" {
+    const Prefixing = struct {
+        last_err: ?anyerror = null,
+        last_workflow_id: []const u8 = "",
+
+        fn converter(p: *@This()) FailureConverter {
+            return .{ .ptr = p, .vtable = &.{ .toFailure = toFailure, .fromFailure = fromFailure } };
+        }
+        fn toFailure(ptr: *anyopaque, arena: Allocator, context: *const Context, err: ?anyerror, f: Failure) error{OutOfMemory}!Failure {
+            const p: *@This() = @ptrCast(@alignCast(ptr));
+            p.last_err = err;
+            p.last_workflow_id = context.workflow_id;
+            var out = f;
+            out.message = try std.fmt.allocPrint(arena, "sent: {s}", .{f.message});
+            return out;
+        }
+        fn fromFailure(ptr: *anyopaque, arena: Allocator, context: *const Context, f: Failure) error{OutOfMemory}!Failure {
+            const p: *@This() = @ptrCast(@alignCast(ptr));
+            p.last_workflow_id = context.workflow_id;
+            var out = f;
+            out.message = try std.fmt.allocPrint(arena, "read: {s}", .{f.message});
+            return out;
+        }
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var state: Prefixing = .{};
+    const c = state.converter();
+    const sent = try c.toFailure(a, &.{ .workflow_id = "wf-1" }, error.Boom, .{ .message = "boom", .stack_trace = "trace" });
+    try testing.expectEqualStrings("sent: boom", sent.message);
+    try testing.expectEqualStrings("trace", sent.stack_trace);
+    try testing.expectEqual(@as(?anyerror, error.Boom), state.last_err);
+    try testing.expectEqualStrings("wf-1", state.last_workflow_id);
+    const read = try c.fromFailure(a, &.{ .workflow_id = "wf-2" }, sent);
+    try testing.expectEqualStrings("read: sent: boom", read.message);
+    try testing.expectEqualStrings("wf-2", state.last_workflow_id);
+}
+
 test "protobuf messages round-trip as json/protobuf and binary/protobuf" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const Failure = proto.temporal.api.failure.v1.Failure;
 
     var cause: Failure = .{ .message = "root cause" };
     const f: Failure = .{

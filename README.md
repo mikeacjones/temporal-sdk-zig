@@ -2014,6 +2014,54 @@ try temporal.failure.decodeAttributes(temporal.Failure, &f, arena);
 try testing.expectEqualStrings("card 4242 declined", f.message);
 ```
 
+A failure converter (`converter.FailureConverter`) decides how failures look on the wire. The SDK still turns an error into a failure itself (from its name, or from `ctx.fail`); the converter's `toFailure` then gets that failure, the error, and the `converter.Context` it is for, and returns the failure to send, and its `fromFailure` gets each failure that arrives and returns the one user code reads. Set it with `client.Options.failure_converter`, beside `codecs` (or `testing.WorkflowEnvironment.Options.failure_converter`, here as `.failure_converter = masking.failureConverter()`); the client, every worker on it, and replays use it:
+
+<!-- example: converter-failure-converter -->
+```zig
+/// Masks the digits in the messages of every failure user code sends, causes included, so
+/// card numbers never reach history. It keeps no state that changes, so it is deterministic
+/// and safe to call from any thread, as a failure converter must be.
+const Masking = struct {
+    mask: u8 = '*',
+
+    pub fn failureConverter(m: *const Masking) converter.FailureConverter {
+        return .{ .ptr = @constCast(m), .vtable = &.{ .toFailure = toFailure, .fromFailure = fromFailure } };
+    }
+
+    fn toFailure(ptr: *anyopaque, arena: Allocator, _: *const converter.Context, _: ?anyerror, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        const m: *const Masking = @ptrCast(@alignCast(ptr));
+        return m.masked(arena, f);
+    }
+
+    /// Failures are read as they arrive: they were masked when sent.
+    fn fromFailure(_: *anyopaque, _: Allocator, _: *const converter.Context, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        return f;
+    }
+
+    fn masked(m: *const Masking, arena: Allocator, f: converter.Failure) error{OutOfMemory}!converter.Failure {
+        var out = f;
+        const message = try arena.dupe(u8, f.message);
+        for (message) |*c| if (std.ascii.isDigit(c.*)) {
+            c.* = m.mask;
+        };
+        out.message = message;
+        if (f.cause) |cause| {
+            out.cause = try arena.create(converter.Failure);
+            out.cause.?.* = try m.masked(arena, cause.*);
+        }
+        return out;
+    }
+};
+
+fn chargeCardNumber(ctx: *activity.Context, card: []const u8) !void {
+    return ctx.fail(.{ .message = try std.fmt.allocPrint(ctx.allocator(), "card {s} declined", .{card}), .type = "Declined", .non_retryable = true });
+}
+
+fn payByCard(ctx: *workflow.Context, card: []const u8) !void {
+    return ctx.executeActivity(ChargeCardNumber, .{ .start_to_close_timeout = .fromSeconds(10) }, .{card}).get();
+}
+```
+
 Notes:
 
 - `cause` is borrowed only until the call it is given to returns: `ctx.fail`, `Client.failActivity` and `failActivityById`, `interceptor.rejectActivity`, `rejectChildWorkflow` and `rejectNexusOperation`, and the cause of a Nexus `ctx.handlerError` copy the chain (and the `details` list), so it may point at the stack. A future's failure (`future.failure()`) works as is.
@@ -2022,6 +2070,12 @@ Notes:
 - Encoded attributes are a `json/plain` payload of `{"message": ..., "stack_trace": ...}` (`failure.EncodedAttributes`), the format other Temporal SDKs read and write; the failure travels with the message "Encoded failure" and an empty stack trace. Each cause in the chain is encoded the same way. Type, details and the rest stay where they are. A failure that already has encoded attributes (one passed on that this side couldn't decode) is sent as received, and a failed query's answer isn't encoded: it never reaches history, and the server returns its message in the clear.
 - Received failures are decoded back after the codecs whatever the option says, so a client or worker reads failures from senders that encode them. One whose `encoded_attributes` doesn't decode (a codec this side lacks, another format) is left as received: a client without the codec reads "Encoded failure".
 - `failure.encodeAttributes` and `failure.decodeAttributes` do the same to any protobuf message, for code that handles raw requests.
+- `toFailure` runs for the workflow's own failure (its function's or a signal handler's error, `ctx.fail`, `ctx.failWith`, or a future's failure it returns), update rejections from validators and handlers, query failures, the failures of activities and local activities, a Nexus handler's error, and `Client.failActivity` and `failActivityById` (where `err` is null). `fromFailure` runs for the failures a workflow reads of activities, local activities, children, Nexus operations, external signals and cancels, and `ctx.previousRunFailure()`, and for those `WorkflowRun.failure()`, `WorkflowUpdateHandle.failure()` and `ActivityHandle.failure()` return on a client. Each failure passes each way once per hop, so a failure a workflow passes on was read through `fromFailure` and is sent through `toFailure`.
+- The converter gets the head of the cause chain; visiting the causes is its own choice. The failure it returns may borrow from the one it was given; anything else it allocates comes from the `arena` it is passed.
+- It runs inside workflow code for the failures a workflow sends and receives, and replay runs it again, so it must be deterministic and must not block or do I/O: one that blocks there is reported as a deadlock. It is called concurrently from workflow, activity, Nexus and client threads. A `testing.WorkflowReplayer` must be given the converter the recording worker used (`Options.failure_converter`).
+- The context is the one the call's payloads get (see [Payloads](#payloads)): the run's for the workflow's own failures, the activity's or child's for theirs, the namespace and propagated values for Nexus.
+- Failures the SDK makes for its own reports (workflow task failures, unregistered activities, queries and updates, codec failures, cancel acknowledgements) and those it builds for user code without the server (an interceptor's refusal, a child that couldn't start, a canceled local activity) aren't converted, nor is a failed query's message on the client.
+- `encode_failure_attributes` applies after `toFailure` and is undone before `fromFailure`, so the converter always sees plain messages.
 
 #### External payload storage
 <!-- stub: temporal-sdk-zig-d51.4.9 -->
