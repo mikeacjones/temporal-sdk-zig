@@ -41,10 +41,15 @@ live: usize = 0,
 live_head: ?*Fiber = null,
 live_tail: ?*Fiber = null,
 next_id: u32 = 1,
-/// How many times a fiber has returned control to `run`. The only field another thread may
-/// read (atomically), while `run` executes: the worker's deadlock detector watches it advance.
-/// Workflow code never sees it, so it doesn't affect determinism.
+/// How many times a fiber has returned control to `run`. With `sdk_work`, one of the only two
+/// fields another thread may read (atomically) while the scheduler's thread works: the
+/// worker's deadlock detector watches `switches` advance, and doesn't count time while
+/// `sdk_work` is set. Workflow code never sees either, so they don't affect determinism.
 switches: std.atomic.Value(u64) = .init(0),
+/// Set by the scheduler's thread, outside any fiber, while it does SDK work that can take
+/// longer than the deadlock limit and isn't workflow code: reading debug info to answer the
+/// stack trace query. Never set while a fiber runs. Only the scheduler's thread writes it.
+sdk_work: std.atomic.Value(bool) = .init(false),
 
 pub const Options = struct {
     /// Usable stack bytes per fiber. Memory is reserved virtually and only touched pages
@@ -184,58 +189,6 @@ pub fn onCurrentStack(s: *const Scheduler, addr: usize) bool {
     const start = @intFromPtr(f.stack.memory.ptr);
     return addr >= start and addr < start + f.stack.memory.len;
 }
-
-/// Counts SDK work done outside workflow code as a switch, so the worker's deadlock detector,
-/// which watches `switches`, doesn't take a long stretch of it (reading debug info to answer
-/// the stack trace query) for workflow code that never returns. Call it between steps.
-pub fn noteProgress(s: *Scheduler) void {
-    _ = s.switches.fetchAdd(1, .release);
-}
-
-/// Keeps `switches` advancing, from a thread of its own, while the scheduler's thread does SDK
-/// work that can't call `noteProgress` often enough itself: the first read of debug info to
-/// answer the stack trace query is one call into std that can take seconds on a slow machine,
-/// longer than the worker's deadlock detection allows. Notes progress every
-/// `heartbeat_interval` from `start` until `stop`. Where no thread can be started (a
-/// single-threaded build, or the spawn fails) it does nothing, and only the caller's own
-/// `noteProgress` calls count.
-pub const Heartbeat = struct {
-    sched: *Scheduler,
-    stopped: std.Io.Event = .unset,
-    thread: ?std.Thread = null,
-
-    pub fn start(hb: *Heartbeat) void {
-        hb.sched.noteProgress();
-        if (builtin.single_threaded) return;
-        // std's default stack size: a smaller one can fall below the platform's minimum (128
-        // KiB on aarch64 glibc), which std asserts against rather than returning an error.
-        hb.thread = std.Thread.spawn(.{}, beat, .{hb}) catch null;
-    }
-
-    pub fn stop(hb: *Heartbeat) void {
-        hb.sched.noteProgress();
-        const t = hb.thread orelse return;
-        hb.stopped.set(std.Options.debug_io);
-        t.join();
-        hb.thread = null;
-    }
-
-    fn beat(hb: *Heartbeat) void {
-        const io = std.Options.debug_io;
-        const interval: std.Io.Clock.Duration = .{ .raw = heartbeat_interval, .clock = .awake };
-        while (true) {
-            if (hb.stopped.waitTimeout(io, .{ .duration = interval })) |_| {
-                return;
-            } else |err| switch (err) {
-                error.Timeout => hb.sched.noteProgress(),
-                error.Canceled => return,
-            }
-        }
-    }
-};
-
-/// How often a `Heartbeat` notes progress.
-pub const heartbeat_interval: std.Io.Duration = .fromMilliseconds(10);
 
 /// The oldest unfinished fiber; `Fiber.live_next` gives the rest in spawn order.
 pub fn firstLive(s: *const Scheduler) ?*Fiber {

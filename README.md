@@ -62,6 +62,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Sessions](#sessions-1)
     - [Workflow memory limit](#workflow-memory-limit)
     - [Deadlock detection](#deadlock-detection)
+    - [Poller behavior](#poller-behavior)
     - [Tuners and poller behavior](#tuners-and-poller-behavior)
     - [Plugins](#plugins)
   - [Data conversion](#data-conversion)
@@ -1587,7 +1588,7 @@ Notes:
 - `max_concurrent_workflow_task_executions` (100): workflow activations processed at once. Activations of different runs run in parallel, each on its own thread; one run's activations run one at a time, possibly on different threads. Payload codecs, interceptors, and log sinks are therefore called concurrently.
 - `max_concurrent_activity_executions` (100): activities run at once, each on its own task. `max_concurrent_local_activity_executions` (100): local activities run at once, a separate pool; a local activity waits for a slot up to its `schedule_to_start_timeout`.
 - `max_concurrent_nexus_task_executions` (100): Nexus requests (starts and cancels of operations) handled at once, each on its own task. Used only with a registered Nexus service.
-- `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers`, `max_concurrent_nexus_task_pollers` (2 each): polls in flight at once. Each must be at least 1, and the workflow pollers at least 2 while `max_cached_workflows` isn't 0; sdk-core rejects other values and `run` returns `error.WorkerInitFailed`, logged. The Nexus pollers are checked only with a registered Nexus service.
+- `max_concurrent_workflow_task_pollers`, `max_concurrent_activity_task_pollers`, `max_concurrent_nexus_task_pollers` (2 each): polls in flight at once. Each must be at least 1, and the workflow pollers at least 2 while `max_cached_workflows` isn't 0; sdk-core rejects other values and `run` returns `error.WorkerInitFailed`, logged. The Nexus pollers are checked only with a registered Nexus service. The `*_task_poller_behavior` options replace them with a fixed maximum or autoscaling, and `nonsticky_to_sticky_poll_ratio` splits the workflow pollers; see [Poller behavior](#poller-behavior).
 - `max_cached_workflows` (1000): runs kept in memory between tasks. Over the limit the least recently used run is evicted and replayed from its history at its next task; 0 replays every task from the start. `workflow_stack_size` (256 KiB): each coroutine's stack.
 - `identity`: the worker's name to the server; empty uses the client's.
 - `sticky_schedule_to_start_timeout` (10 s): how long a workflow task waits on this worker's sticky queue, where the next task of a cached run goes, before the server hands it to any worker on the task queue, which replays the run.
@@ -1696,10 +1697,36 @@ Notes:
 - Turn detection off while a debugger may stop workflow code at a breakpoint, or the paused task fails.
 - Detection emits no command and changes none, so replay is unaffected. `testing.WorkflowReplayer.Options.deadlock_detection_timeout` (null by default) applies the same limit to replayed code.
 
+#### Poller behavior
+
+A worker long-polls the server for each kind of task it runs: workflow tasks, activity tasks, and Nexus tasks. `worker.Options.workflow_task_poller_behavior`, `activity_task_poller_behavior` and `nexus_task_poller_behavior` each take a `worker.PollerBehavior`: `.simple_maximum`, up to that many polls open at once, or `.autoscaling`, where the worker opens and closes polls between `minimum` and `maximum`, starting from `initial`, following the server's feedback.
+
+<!-- example: worker-poller-behavior -->
+```zig
+var w = try Worker.init(gpa, io, &client, "orders", .{
+    // Between 2 and 20 workflow task polls, starting from 4, as the server suggests.
+    .workflow_task_poller_behavior = .{ .autoscaling = .{ .minimum = 2, .maximum = 20, .initial = 4 } },
+    // The defaults: between 1 and 100, starting from 5.
+    .activity_task_poller_behavior = .{ .autoscaling = .{} },
+    // Up to 4 Nexus task polls at once.
+    .nexus_task_poller_behavior = .{ .simple_maximum = 4 },
+});
+defer w.deinit();
+```
+
+Notes:
+- Null (the default) for a behavior is a simple maximum of the matching `max_concurrent_*_task_pollers` (2 each); a set behavior wins over that field. The Nexus pollers are used only with a registered Nexus service.
+- With autoscaling, the server's poll responses carry suggestions to add or remove polls. The worker always follows a suggestion to remove polls, down to `minimum`, and follows one to add polls, up to `maximum`, only while it is taking in more tasks than a moment before. Once the server has sent a suggestion, or when the namespace reports that it supports poller autoscaling, an empty poll also closes one poll, and a poll refused for exhausted resources halves the count. Failed polls are retried with backoff.
+- Autoscaling needs a server that sends this feedback. Against one that sends no suggestions and doesn't report the capability, the worker keeps `initial` polls open.
+- A poll is opened only while a slot for its task is free, whatever the behavior.
+- With the cache on (`max_cached_workflows` above 0), a worker polls its task queue and its own sticky queue for workflow tasks. An autoscaling workflow behavior applies to each of the two, so up to twice `maximum` polls can be open. With a simple maximum, `nonsticky_to_sticky_poll_ratio` (0.2) is the task queue's share: the maximum times the ratio, rounded down and at least 1, and the sticky queue gets the rest, at least 1. A workflow simple maximum must be at least 2 while the cache is on; sdk-core rejects less with `error.WorkerInitFailed`.
+- Session queues (`sessions`) poll with the activity behavior, so with autoscaling each scales on its own between the same bounds.
+- `run` returns `error.InvalidOptions`, and logs the option and why, before it polls, for a set behavior with a `simple_maximum` of 0, or an `autoscaling` with `minimum` 0, `maximum` below `minimum`, or `initial` outside `minimum` to `maximum`, whatever the worker registers; and for a `nonsticky_to_sticky_poll_ratio` outside 0 to 1, NaN included.
+
 #### Tuners and poller behavior
-<!-- stub: temporal-sdk-zig-d51.9.3, temporal-sdk-zig-d51.9.4 -->
+<!-- stub: temporal-sdk-zig-d51.9.3 -->
 Not implemented yet.
-`worker.Options` is to take slot tuners (fixed, resource-based, composite, custom) and per-poller behavior (a simple maximum or autoscaling).
+`worker.Options` is to take slot tuners (fixed, resource-based, composite, custom).
 
 #### Plugins
 <!-- stub: temporal-sdk-zig-d51.9.7 -->
@@ -1882,7 +1909,7 @@ try testing.expectEqualStrings("card 4242 declined", f.message);
 
 Notes:
 
-- `cause` is borrowed only until the call it is given to returns: `ctx.fail`, `Client.failActivity` and `failActivityById`, `interceptor.rejectActivity` and `rejectChildWorkflow`, and the cause of a Nexus `ctx.handlerError` copy the chain (and the `details` list), so it may point at the stack. A future's failure (`future.failure()`) works as is.
+- `cause` is borrowed only until the call it is given to returns: `ctx.fail`, `Client.failActivity` and `failActivityById`, `interceptor.rejectActivity`, `rejectChildWorkflow` and `rejectNexusOperation`, and the cause of a Nexus `ctx.handlerError` copy the chain (and the `details` list), so it may point at the stack. A future's failure (`future.failure()`) works as is.
 - `failure.kind` borrows the failure it reads. Details and last heartbeat details are `converter.EncodedValues` (decode one with `get(T, arena, index)`), `next_retry_delay` is a `std.Io.Duration`, and timeout types, retry states and Nexus retry behaviors are Zig enums with an `unknown` case for values this SDK doesn't know. A failure with no info, or of a kind newer than the SDK, is `unknown`.
 - Stack traces exist only in builds with error return tracing whose debug info the worker can read; otherwise, and with `worker.Options.failure_stack_traces = false`, `stack_trace` is empty. Zig traces errors in Debug by default. For traces in ReleaseSafe, set `.error_tracing = true` on your executable's root module (the one with `main`) and on the module with your workflows and activities; the SDK's module leaves the setting to you, because a dependency that turns tracing on while the root module doesn't breaks the program. It never holds bare addresses. A failure passed on unchanged (a future's failure returned through `error.ActivityFailed`, or `ctx.failWith`) keeps its own stack trace. Each workflow coroutine and each activity attempt starts with an empty trace, so frames of other failures never mix in. Traces name source paths of the build machine. The trace holds a bounded number of frames, keeping those nearest where the error started, and an error that comes from another coroutine or thread (awaited from `io.async` or a `Group`) has only the frames after it reached this one.
 - Encoded attributes are a `json/plain` payload of `{"message": ..., "stack_trace": ...}` (`failure.EncodedAttributes`), the format other Temporal SDKs read and write; the failure travels with the message "Encoded failure" and an empty stack trace. Each cause in the chain is encoded the same way. Type, details and the rest stay where they are. A failure that already has encoded attributes (one passed on that this side couldn't decode) is sent as received, and a failed query's answer isn't encoded: it never reaches history, and the server returns its message in the clear.
@@ -2276,7 +2303,7 @@ Notes:
 
 #### Interceptors
 
-An `interceptor.Worker` hands out each workflow run's `WorkflowInbound` and `WorkflowOutbound` interceptors and each activity attempt's `ActivityInbound` and `ActivityOutbound`. An `interceptor.Client` wraps every request a client sends, except `Client.checkHealth`. Install them with `worker.Options.interceptors`, `client.Options.worker_interceptors`, and `client.Options.interceptors`.
+An `interceptor.Worker` hands out each workflow run's `WorkflowInbound` and `WorkflowOutbound` interceptors, each activity attempt's `ActivityInbound` and `ActivityOutbound`, and each Nexus request's `NexusOperationInbound` and `NexusOperationOutbound`. An `interceptor.Client` wraps every request a client sends, except `Client.checkHealth`. Install them with `worker.Options.interceptors`, `client.Options.worker_interceptors`, and `client.Options.interceptors`.
 
 <!-- example: observability-interceptors -->
 ```zig
@@ -2303,6 +2330,61 @@ Notes:
 - Workflow interceptors run as part of the workflow, again on replay, and follow the workflow rules. Query and update-validation interceptors run outside any coroutine, like their handlers, and must not block or change state.
 - Workflow and activity interceptor inputs are type-erased (`converter.EncodedValues`, a header, options), and results are encoded payloads. A client interceptor reads each request and response as its generated protobuf type.
 - Client interceptors run on any calling thread and must be thread-safe.
+
+Nexus operations are intercepted on both sides. In the calling workflow, `WorkflowOutbound.executeNexusOperation` sees each `ctx.executeNexusOperation` and `executeNexusOperationByName` call as an `interceptor.NexusOperationInput`: the service, the operation, the input encoded by the payload converter, and the options, whose `endpoint` and `headers` it may change. On the handling worker, an `interceptor.Worker` that declares `interceptNexusOperation` hands out each request's `NexusOperationInbound`, around the start and the cancel of an operation, and `NexusOperationOutbound`, around the logger the handler's `ctx.logger()` returns.
+
+<!-- example: observability-nexus-interceptors -->
+```zig
+const nexus = temporal.nexus;
+
+/// Sends a tenant header with every Nexus call a workflow makes, and refuses every Nexus
+/// request this worker handles that doesn't carry one.
+const TenantGate = struct {
+    tenant: []const u8,
+
+    pub fn interceptWorkflow(g: *TenantGate, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+        const run = try ctx.allocator().create(Calls);
+        run.* = .{ .gate = g, .ctx = ctx };
+        return .{ .outbound = interceptor.WorkflowOutbound.from(Calls, run) };
+    }
+
+    pub fn interceptNexusOperation(_: *TenantGate, _: *nexus.Context) error{OutOfMemory}!interceptor.NexusOperation {
+        return .{ .inbound = interceptor.NexusOperationInbound.from(Requests, &requests) };
+    }
+
+    const Calls = struct {
+        gate: *TenantGate,
+        ctx: *workflow.Context,
+        pub fn executeNexusOperation(c: *Calls, input: interceptor.NexusOperationInput, next: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(Payload) {
+            var with_tenant = input;
+            with_tenant.options.headers = std.mem.concat(c.ctx.allocator(), nexus.Header, &.{
+                input.options.headers, &.{.{ .name = "tenant", .value = c.gate.tenant }},
+            }) catch return interceptor.rejectNexusOperation(c.ctx, input, .{ .message = "out of memory adding the tenant" });
+            return next.executeNexusOperation(with_tenant);
+        }
+    };
+
+    // Stateless, so one is shared by every request.
+    const Requests = struct {
+        pub fn startOperation(_: *Requests, input: interceptor.StartNexusOperationInput, next: interceptor.NexusOperationInbound.Next) nexus.StartResult {
+            for (input.headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "tenant")) return next.startOperation(input);
+            }
+            return .{ .handler_error = .{ .type = .unauthorized, .message = "the request names no tenant", .retry = .non_retryable } };
+        }
+    };
+    var requests: Requests = .{};
+};
+```
+
+Notes:
+
+- `startOperation` sees the service, the operation, the input still encoded by the caller's codecs, and the request's Nexus headers; `cancelOperation` sees the service, the operation and the operation token. Both cover every kind of operation handler, synchronous and workflow-run.
+- An inbound interceptor may change its input before calling `next`, change what `next` returns, or refuse the request by returning `.{ .handler_error = ... }`; a refused start fails the caller's operation with that handler error. The handler is looked up after the interceptors, by the service and operation they pass on, and `ctx.info()` reports what they passed.
+- Slices an inbound interceptor puts in an input or a result must live until the response is sent: allocate them with `ctx.allocator()`. A payload it substitutes must be in wire form, encoded by the client's codecs.
+- Nexus interceptors on the handling worker run on the request's task on the worker's `std.Io`, concurrently for different requests, and may do I/O; a cancel of the request reaches them as `std.Io` cancellation. Requests the worker fails before it starts a task for them don't reach them.
+- To refuse a Nexus call in the workflow, return `interceptor.rejectNexusOperation`: nothing is scheduled, and the future's `get` returns `error.NexusOperationFailed` with a Nexus operation failure caused by the failure given. Canceling the operation's future doesn't pass through an interceptor.
+- Outbound Nexus calls are intercepted again on replay. Adding or changing headers keeps histories replayable; changing the endpoint, service or operation does not.
 
 #### Context propagation
 
@@ -2334,8 +2416,11 @@ test "observability: a tenant travels from the client to the activity" {
 Notes:
 
 - Workers on the client use `client.Options.propagators` too.
-- A workflow's `ctx.propagated()` holds its start header's values and passes them on to every activity, child, signal, and continue-as-new it sends.
+- A workflow's `ctx.propagated()` holds its start header's values and passes them on to every activity, child, signal, continue-as-new, and Nexus operation it sends.
 - `Values.put` copies the value but borrows what it points to, such as a string's bytes.
+- Nexus operations a workflow calls carry its values too. The propagators write their fields into one Nexus header, `propagation.nexus_header_name` (`temporal-zig-context`), whose value is the fields as a protobuf `temporal.api.common.v1.Header`, base64url-encoded, in name order so a replay sends the same bytes. On the handling worker the client's propagators read it back: the handler's `ctx.propagated()` holds the values, and a workflow a workflow-run operation starts carries them on unless the handler sets `options.context` in its `nexus.WorkflowStart` itself.
+- How the header combines with `NexusOperationOptions.headers`: when the propagators write nothing, the caller's headers are sent exactly as given. Otherwise the caller's headers are sent in their order, without any named `temporal-zig-context` (ignoring case), followed by the propagated one. Outbound workflow interceptors see the combined list and may change it; the handler's `ctx.propagated()` reads the header as the request arrived, before inbound interceptors run.
+- Like every Nexus header, the propagated values skip the payload codecs, are recorded in the caller's history, and count toward the server's limit on a call's Nexus headers, so don't propagate secrets or large values over Nexus. A header value that doesn't decode is logged and skipped, and the request is still handled.
 
 #### Tracing
 <!-- stub: temporal-sdk-zig-d51.12.5 -->
@@ -2421,7 +2506,6 @@ Notes:
 - With `try_cancel`, a workflow that closes right after canceling may close before the server has sent the cancel to the handler, which then never receives it; use `wait_cancellation_requested` when the handler must see the cancel.
 - With sdk-core v1.2.0, a workflow that is still running when an operation it abandoned ends fails its workflow tasks from then on: use `abandon` only when the workflow closes first, or use `try_cancel`.
 - A service that lacks the operation, or an operation whose types differ from the service's, is a compile error naming the service and the operation. `executeNexusOperationByName` calls a service this program has no contract for, by service and operation name.
-- Workflow interceptors don't see Nexus calls.
 
 #### Serving operations
 
@@ -2469,7 +2553,6 @@ Notes:
 - The client's payload codecs apply to an operation's input, its result, and the details of its failure.
 - The caller's links arrive in `ctx.info().links`, and a workflow-run operation's start returns a link to its workflow, which the caller's history records. Only workflow-event links are converted; a link of another kind, or one that doesn't parse, is logged and dropped.
 - `max_concurrent_nexus_task_executions` and `max_concurrent_nexus_task_pollers` bound the requests handled and the polls open at once (see [Options](#options)).
-- Worker interceptors don't see Nexus requests.
 
 #### Standalone operations
 <!-- stub: temporal-sdk-zig-d51.5.12 -->

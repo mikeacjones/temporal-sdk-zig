@@ -995,9 +995,12 @@ pub const stack_trace_query = "__stack_trace";
 /// each wait a few stores (`WorkflowIo.Wait.Reason` and `Task.waiting_on`), and an activity's
 /// wait a copy of up to `max_wait_name` bytes of its type to the waiting coroutine's stack; it
 /// allocates nothing, so a long run grows no more for it. Stacks are unwound and debug info is
-/// read only when the query arrives. While answering, a thread of its own notes progress
-/// (`Scheduler.Heartbeat`), since the first read of debug info can outlast
-/// `worker.Options.deadlock_detection_timeout` and isn't workflow code.
+/// read only when the query arrives. From the read of debug info to the end of the answer,
+/// `Scheduler.sdk_work` marks the time as SDK work, which the worker's deadlock detection
+/// doesn't count: the first read of debug info in a process can outlast
+/// `worker.Options.deadlock_detection_timeout`, and isn't workflow code. When workflow code
+/// asks for the answer from its own coroutine (an interceptor calling
+/// `WorkflowInbound.Next.handleQuery`), the flag stays clear and the time counts as its own.
 fn stackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}![]const u8 {
     var text: std.Io.Writer.Allocating = .init(out);
     errdefer text.deinit();
@@ -1006,10 +1009,6 @@ fn stackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}![]const u8 {
     };
     return text.toOwnedSlice() catch return error.OutOfMemory;
 }
-
-/// Test builds only: how long `writeStackTrace` stalls after reading debug info, standing in
-/// for a slow first read.
-pub var stack_trace_test_stall: ?std.Io.Duration = null;
 
 fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{OutOfMemory} || std.Io.Writer.Error)!void {
     if (inst.finished) {
@@ -1026,13 +1025,14 @@ fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{Ou
     try w.print("workflow \"{f}\": {d} coroutine{s}\n", .{ call_sites.text(inst.info.workflow_type), count, if (count == 1) "" else "s" });
 
     // Reading debug info the first time can take seconds, in one call into std; it isn't
-    // workflow code, so the heartbeat keeps the deadlock detector from taking it for some.
-    var heartbeat: Scheduler.Heartbeat = .{ .sched = &inst.sched };
-    heartbeat.start();
-    defer heartbeat.stop();
+    // workflow code, so the deadlock detector doesn't count it. Workflow code can ask for the
+    // answer itself (an interceptor calling `WorkflowInbound.Next.handleQuery`); then the
+    // time is the workflow code's, and the flag stays clear, as it must while a fiber runs.
+    const sdk_work = inst.sched.currentFiber() == null;
+    if (sdk_work) inst.sched.sdk_work.store(true, .release);
+    defer if (sdk_work) inst.sched.sdk_work.store(false, .release);
     var reader = try call_sites.Reader.init(out);
     defer if (reader) |*r| r.deinit();
-    if (builtin.is_test) if (stack_trace_test_stall) |d| std.Io.sleep(std.Options.debug_io, d, .awake) catch {};
     it = inst.sched.firstLive();
     while (it) |f| : (it = f.live_next) {
         try w.print("\ncoroutine {d} \"{f}\", ", .{ f.id, call_sites.text(f.name) });
@@ -1046,7 +1046,7 @@ fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{Ou
         } else {
             try w.writeAll(", waits\n");
         }
-        try call_sites.write(if (reader) |*r| r else null, &inst.sched, w, f, "  ");
+        try call_sites.write(if (reader) |*r| r else null, w, f, "  ");
     }
 }
 
@@ -2016,6 +2016,30 @@ pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
     });
 }
 
+/// Encodes `input`, adds the propagated values to the Nexus headers (see
+/// `nexusHeadersWithPropagated`), and schedules a Nexus operation through the outbound
+/// interceptors.
+pub fn executeNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, input: anytype) workflow.NexusOperationFuture(converter.Payload) {
+    if (inst.wio.refuse("executeNexusOperation")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
+    const payload = converter.toPayload(inst.arena(), input) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
+    var with_propagated = options;
+    with_propagated.headers = inst.nexusHeadersWithPropagated(options.headers) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
+    return inst.outboundNext().executeNexusOperation(.{ .service = service, .operation = operation, .options = with_propagated, .payload = payload });
+}
+
+/// The caller's Nexus headers with the propagated values added: `headers` as given when the
+/// propagators write nothing, otherwise `headers` in order without any named
+/// `propagation.nexus_header_name` (ignoring case), followed by that header. `headers` is not
+/// modified; a new list is arena memory.
+fn nexusHeadersWithPropagated(inst: *Instance, headers: []const client.NexusHeader) error{OutOfMemory}![]const client.NexusHeader {
+    const a = inst.arena();
+    const value = (try propagation.injectNexusHeader(inst.propagators, a, &inst.propagated)) orelse return headers;
+    var out: std.ArrayList(client.NexusHeader) = try .initCapacity(a, headers.len + 1);
+    for (headers) |h| if (!std.ascii.eqlIgnoreCase(h.name, propagation.nexus_header_name)) out.appendAssumeCapacity(h);
+    out.appendAssumeCapacity(.{ .name = propagation.nexus_header_name, .value = value });
+    return out.items;
+}
+
 /// Requests another workflow's cancellation through the outbound interceptors.
 pub fn cancelExternalWorkflow(inst: *Instance, workflow_id: []const u8, run_id: []const u8) workflow.CancelExternalFuture {
     if (inst.wio.refuse("cancelExternalWorkflow")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
@@ -2057,6 +2081,38 @@ pub fn rejectedChild(inst: *Instance, workflow_type: []const u8, f: failure_mod.
     };
     const state = try a.create(ChildState);
     state.* = .{ .seq = 0, .workflow_id = "", .workflow_type = out.failure_info.?.child_workflow_execution_failure_info.workflow_type.?.name, .cancellation_type = .try_cancel, .outcome = .{ .failed = out } };
+    return state;
+}
+
+/// The state of a Nexus operation an interceptor refused, as `rejectedActivity`: a Nexus
+/// operation failure naming the endpoint, service and operation, caused by `f`.
+pub fn rejectedNexusOperation(inst: *Instance, endpoint: []const u8, service: []const u8, operation: []const u8, f: failure_mod.Application) ScheduleError!*NexusOperationState {
+    const a = inst.arena();
+    const cause = try a.create(Failure);
+    cause.* = try failure_mod.application(a, f);
+    const endpoint_copy = try a.dupe(u8, endpoint);
+    const service_copy = try a.dupe(u8, service);
+    const operation_copy = try a.dupe(u8, operation);
+    const out = try a.create(Failure);
+    out.* = .{
+        .message = try std.fmt.allocPrint(a, "nexus operation \"{s}\" of service \"{s}\" was refused by a workflow interceptor", .{ operation, service }),
+        .source = failure_mod.source,
+        .cause = cause,
+        .failure_info = .{ .nexus_operation_execution_failure_info = .{
+            .endpoint = endpoint_copy,
+            .service = service_copy,
+            .operation = operation_copy,
+        } },
+    };
+    const state = try a.create(NexusOperationState);
+    state.* = .{
+        .seq = 0,
+        .endpoint = endpoint_copy,
+        .service = service_copy,
+        .operation = operation_copy,
+        .cancellation_type = .abandon,
+        .outcome = .{ .failed = out },
+    };
     return state;
 }
 
@@ -2567,11 +2623,11 @@ fn resolveChild(inst: *Instance, r: *const act_pb.ResolveChildWorkflowExecution)
 
 // ---------------------------------------------------------------- Nexus operations
 
-/// Validates the options, encodes `input`, and emits ScheduleNexusOperation. Nexus calls
-/// don't go through the outbound interceptors. The names, endpoint and headers are copied
-/// into the arena.
-pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, input: anytype) ScheduleError!*NexusOperationState {
-    if (inst.wio.refuse("executeNexusOperation")) return error.InvalidOptions;
+/// Validates the options and emits ScheduleNexusOperation with the encoded `payload`: the
+/// root of the outbound interceptors' `executeNexusOperation`, so validation sees what they
+/// pass on. The names, endpoint and headers are copied into the arena; `payload` must be
+/// arena memory or outlive the activation.
+pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, payload: converter.Payload) ScheduleError!*NexusOperationState {
     const fields = .{ .NexusEndpoint = options.endpoint, .NexusService = service, .NexusOperation = operation };
     if (options.endpoint.len == 0) {
         inst.logger.warn("executeNexusOperation: NexusOperationOptions.endpoint is empty; name the Nexus endpoint to call through", fields);
@@ -2601,7 +2657,7 @@ pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: [
         .endpoint = state.endpoint,
         .service = state.service,
         .operation = state.operation,
-        .input = try converter.toPayload(a, input),
+        .input = payload,
         .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
         .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
         .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
@@ -2957,6 +3013,7 @@ const outbound_root: interceptor.WorkflowOutbound.VTable = .{
     .cancelExternalWorkflow = rootCancelExternalWorkflow,
     .continueAsNew = rootContinueAsNew,
     .sideEffect = rootSideEffect,
+    .executeNexusOperation = rootExecuteNexusOperation,
     .logger = rootLogger,
 };
 
@@ -3005,6 +3062,11 @@ fn rootSideEffect(ptr: *anyopaque, input: interceptor.SideEffectInput, _: interc
 fn rootExecuteChildWorkflow(ptr: *anyopaque, input: interceptor.ChildWorkflowInput, _: interceptor.WorkflowOutbound.Next) workflow.ChildWorkflowFuture(converter.Payload) {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
     return .{ .ctx = &inst.ctx, .state = inst.startChildWorkflow(input.workflow_type, input.options, input.args.payloads, input.header.header()) };
+}
+
+fn rootExecuteNexusOperation(ptr: *anyopaque, input: interceptor.NexusOperationInput, _: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(converter.Payload) {
+    const inst: *Instance = @ptrCast(@alignCast(ptr));
+    return .{ .ctx = &inst.ctx, .state = inst.scheduleNexusOperation(input.service, input.operation, input.options, input.payload) };
 }
 
 fn rootSignalExternalWorkflow(ptr: *anyopaque, input: interceptor.SignalExternalInput, _: interceptor.WorkflowOutbound.Next) workflow.SignalExternalFuture {
@@ -8165,6 +8227,51 @@ test "nexus: the default options send no timeouts, headers or summary, and wait_
     try testing.expectEqual(@as(usize, 0), cmd.nexus_header.items.len);
     try testing.expect(cmd.cancellation_type == .WAIT_CANCELLATION_COMPLETED);
     try testing.expect(first[0].user_metadata == null);
+}
+
+test "nexus: propagated values replace a caller header of the reserved name, after the caller's headers" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const tenant = comptime propagation.key([]const u8, "tenant");
+    const propagators = [_]propagation.ContextPropagator{propagation.HeaderPropagator(tenant).propagator};
+    const W = struct {
+        fn run(ctx: *workflow.Context) ![]const u8 {
+            const caller = [_]client.NexusHeader{
+                .{ .name = "Temporal-Zig-Context", .value = "stale" },
+                .{ .name = "trace-id", .value = "abc" },
+            };
+            _ = ctx.executeNexusOperation(NexusWf.Service, NexusWf.Echo, .{ .endpoint = "hello-endpoint", .headers = &caller }, .{ .message = "hi" });
+            try testing.expectEqualStrings("stale", caller[0].value);
+            return "";
+        }
+        const Def = workflow.Def("PropagatingNexus", run);
+    };
+
+    // With a propagated value: the caller's other headers in order, then the propagated one.
+    {
+        const inst = try create(testing.allocator, W.Def.registered, .{ .propagators = &propagators });
+        defer inst.destroy();
+        var act = try initActivation(a, "PropagatingNexus", .{});
+        try act.jobs.items[0].variant.?.initialize_workflow.headers.append(a, .{ .key = "tenant", .value = try converter.toPayload(a, @as([]const u8, "acme")) });
+        const cmd = commandsOf(try inst.activate(&act, a))[0].variant.?.schedule_nexus_operation;
+        try testing.expectEqual(@as(usize, 2), cmd.nexus_header.items.len);
+        try testing.expectEqualStrings("trace-id", cmd.nexus_header.items[0].key);
+        try testing.expectEqualStrings(propagation.nexus_header_name, cmd.nexus_header.items[1].key);
+        var received: propagation.Values = .init(a);
+        try propagation.extractNexusHeader(&propagators, a, cmd.nexus_header.items[1].value, &received);
+        try testing.expectEqualStrings("acme", received.get(tenant).?);
+    }
+    // Nothing propagated: the caller's headers exactly as given.
+    {
+        const inst = try create(testing.allocator, W.Def.registered, .{ .propagators = &propagators });
+        defer inst.destroy();
+        const cmd = commandsOf(try inst.activate(&try initActivation(a, "PropagatingNexus", .{}), a))[0].variant.?.schedule_nexus_operation;
+        try testing.expectEqual(@as(usize, 2), cmd.nexus_header.items.len);
+        try testing.expectEqualStrings("Temporal-Zig-Context", cmd.nexus_header.items[0].key);
+        try testing.expectEqualStrings("stale", cmd.nexus_header.items[0].value);
+        try testing.expectEqualStrings("trace-id", cmd.nexus_header.items[1].key);
+    }
 }
 
 test "nexus: an asynchronous start returns its token, and the result follows in a later activation" {

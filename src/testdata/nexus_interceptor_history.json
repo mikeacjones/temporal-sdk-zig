@@ -1,0 +1,191 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-17T01:30:57.096436Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048587",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "NexusInterceptorReplay"
+        },
+        "taskQueue": {
+          "name": "test-bde55f79d286d93f",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "InppZy1pbnRlcmNlcHRvci1yZXBsYXktZW5kcG9pbnQi"
+            },
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImhpIg=="
+            }
+          ]
+        },
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a1e720-ecc8-76a7-a0b7-d7cc24141e4e",
+        "identity": "46028@Michaels-Mac-mini.local",
+        "firstExecutionRunId": "01a1e720-ecc8-76a7-a0b7-d7cc24141e4e",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "nexus-interceptor-replay"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-17T01:30:57.096487Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048588",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "test-bde55f79d286d93f",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-17T01:30:57.100376Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048593",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "46028@Michaels-Mac-mini.local",
+        "requestId": "68c27d82-31ca-458c-85bf-a44effae82d9",
+        "historySizeBytes": "378"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-17T01:30:57.105020Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048597",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "46028@Michaels-Mac-mini.local",
+        "workerVersion": {},
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            2,
+            3,
+            4,
+            1
+          ],
+          "sdkName": "temporal-zig",
+          "sdkVersion": "0.0.0"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-11-17T01:30:57.105333Z",
+      "eventType": "EVENT_TYPE_NEXUS_OPERATION_SCHEDULED",
+      "taskId": "1048598",
+      "nexusOperationScheduledEventAttributes": {
+        "endpoint": "zig-interceptor-replay-endpoint",
+        "service": "zig-interceptor-replay-service",
+        "operation": "shout",
+        "input": {
+          "metadata": {
+            "encoding": "anNvbi9wbGFpbg=="
+          },
+          "data": "ImhpIg=="
+        },
+        "scheduleToCloseTimeout": "60s",
+        "nexusHeader": {
+          "x-tag": "outbound"
+        },
+        "workflowTaskCompletedEventId": "4",
+        "requestId": "9a3b1462-cc28-4163-8c80-3a9e7d7eac6c",
+        "endpointId": "b55e1969-7905-4aac-ae7b-15c271d056b1"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-11-17T01:30:57.110307Z",
+      "eventType": "EVENT_TYPE_NEXUS_OPERATION_COMPLETED",
+      "taskId": "1048603",
+      "nexusOperationCompletedEventAttributes": {
+        "scheduledEventId": "5",
+        "result": {
+          "metadata": {
+            "encoding": "anNvbi9wbGFpbg=="
+          },
+          "data": "ImhpISB4LXRhZz1vdXRib3VuZCI="
+        },
+        "requestId": "9a3b1462-cc28-4163-8c80-3a9e7d7eac6c"
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-11-17T01:30:57.110327Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048604",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "46028@Michaels-Mac-mini.local-904ec233803145ac945e626d635b2a69",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "test-bde55f79d286d93f"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-11-17T01:30:57.111044Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048608",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "7",
+        "identity": "46028@Michaels-Mac-mini.local",
+        "requestId": "db5ec6bf-86ea-4875-a7a8-3f3f55654850",
+        "historySizeBytes": "1039"
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-11-17T01:30:57.113057Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048612",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "7",
+        "startedEventId": "8",
+        "identity": "46028@Michaels-Mac-mini.local",
+        "workerVersion": {},
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "10",
+      "eventTime": "2026-11-17T01:30:57.113099Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048613",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImhpISB4LXRhZz1vdXRib3VuZCI="
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "9"
+      }
+    }
+  ]
+}

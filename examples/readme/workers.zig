@@ -132,6 +132,26 @@ test "workers: deadlock detection takes a limit, or null to turn it off" {
     try testing.expect(debugging.options.deadlock_detection_timeout == null);
 }
 
+test "workers: poller behavior is a simple maximum or autoscaling, per kind of task" {
+    var client: temporal.client.Client = undefined; // never used: the worker doesn't run
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    // example: worker-poller-behavior
+    var w = try Worker.init(gpa, io, &client, "orders", .{
+        // Between 2 and 20 workflow task polls, starting from 4, as the server suggests.
+        .workflow_task_poller_behavior = .{ .autoscaling = .{ .minimum = 2, .maximum = 20, .initial = 4 } },
+        // The defaults: between 1 and 100, starting from 5.
+        .activity_task_poller_behavior = .{ .autoscaling = .{} },
+        // Up to 4 Nexus task polls at once.
+        .nexus_task_poller_behavior = .{ .simple_maximum = 4 },
+    });
+    defer w.deinit();
+    // end-example
+    try testing.expectEqual(20, w.options.workflow_task_poller_behavior.?.autoscaling.maximum);
+    try testing.expectEqual(4, w.options.nexus_task_poller_behavior.?.simple_maximum);
+}
+
 test "workers: a versioned worker compiles" {
     _ = &runVersionedWorker;
 }

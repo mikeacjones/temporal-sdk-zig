@@ -541,3 +541,309 @@ test "a client interceptor sees signals and updates sent by name as it sees type
     }
     for (want, got) |w, g| try testing.expectEqualStrings(w, g);
 }
+
+// ---------------------------------------------------------------- Nexus, unit
+
+const nexus = @import("nexus.zig");
+
+/// Appends its tag to `order` on the way in and out of each Nexus method it declares.
+const NexusTrace = struct {
+    tag: u8,
+    order: *std.ArrayList(u8),
+
+    fn mark(t: *NexusTrace) void {
+        t.order.appendAssumeCapacity(t.tag);
+    }
+
+    pub fn startOperation(t: *NexusTrace, input: interceptor.StartNexusOperationInput, next: interceptor.NexusOperationInbound.Next) nexus.StartResult {
+        t.mark();
+        defer t.mark();
+        var changed = input;
+        changed.operation = if (t.tag == 'a') "renamed" else input.operation;
+        return next.startOperation(changed);
+    }
+};
+
+const NexusRoot = struct {
+    starts: usize = 0,
+    cancels: usize = 0,
+    operation: []const u8 = "",
+    token: []const u8 = "",
+
+    const vtable: interceptor.NexusOperationInbound.VTable = .{ .startOperation = start, .cancelOperation = cancel };
+
+    fn start(ptr: *anyopaque, input: interceptor.StartNexusOperationInput, _: interceptor.NexusOperationInbound.Next) nexus.StartResult {
+        const r: *NexusRoot = @ptrCast(@alignCast(ptr));
+        r.starts += 1;
+        r.operation = input.operation;
+        return .{ .succeeded = .{ .result = .{ .data = "ok" } } };
+    }
+
+    fn cancel(ptr: *anyopaque, input: interceptor.CancelNexusOperationInput, _: interceptor.NexusOperationInbound.Next) nexus.CancelResult {
+        const r: *NexusRoot = @ptrCast(@alignCast(ptr));
+        r.cancels += 1;
+        r.token = input.token;
+        return .requested;
+    }
+
+    fn inbound(r: *NexusRoot) interceptor.NexusOperationInbound {
+        return .{ .ptr = r, .vtable = &vtable };
+    }
+};
+
+test "Nexus inbound interceptors run first to last around the handler, and pass through what they don't declare" {
+    var buffer: [8]u8 = undefined;
+    var order: std.ArrayList(u8) = .initBuffer(&buffer);
+    var a: NexusTrace = .{ .tag = 'a', .order = &order };
+    var b: NexusTrace = .{ .tag = 'b', .order = &order };
+    const first = interceptor.NexusOperationInbound.from(NexusTrace, &a);
+    try testing.expect(first.vtable.startOperation != null);
+    try testing.expect(first.vtable.cancelOperation == null);
+
+    var root: NexusRoot = .{};
+    const chain = [_]interceptor.NexusOperationInbound{ first, interceptor.NexusOperationInbound.from(NexusTrace, &b) };
+    const next: interceptor.NexusOperationInbound.Next = .{ .chain = &chain, .root = root.inbound() };
+
+    const started = next.startOperation(.{ .service = "s", .operation = "op", .payload = null, .headers = &.{} });
+    try testing.expectEqualStrings("ok", started.succeeded.result.data);
+    try testing.expectEqualStrings("abba", order.items);
+    try testing.expectEqualStrings("renamed", root.operation);
+
+    const canceled = next.cancelOperation(.{ .service = "s", .operation = "op", .token = "tok" });
+    try testing.expect(canceled == .requested);
+    try testing.expectEqual(@as(usize, 1), root.cancels);
+    try testing.expectEqualStrings("tok", root.token);
+    try testing.expectEqualStrings("abba", order.items);
+}
+
+test "a Nexus inbound interceptor refuses a request without calling next" {
+    const Refusing = struct {
+        pub fn cancelOperation(_: *@This(), _: interceptor.CancelNexusOperationInput, _: interceptor.NexusOperationInbound.Next) nexus.CancelResult {
+            return .{ .handler_error = .{ .type = .unauthorized, .message = "no" } };
+        }
+    };
+    var refusing: Refusing = .{};
+    var root: NexusRoot = .{};
+    const chain = [_]interceptor.NexusOperationInbound{interceptor.NexusOperationInbound.from(Refusing, &refusing)};
+    const next: interceptor.NexusOperationInbound.Next = .{ .chain = &chain, .root = root.inbound() };
+    const result = next.cancelOperation(.{ .service = "s", .operation = "op", .token = "tok" });
+    try testing.expectEqualStrings("no", result.handler_error.message);
+    try testing.expectEqual(@as(usize, 0), root.cancels);
+    // Starts pass through to the root.
+    _ = next.startOperation(.{ .service = "s", .operation = "op", .payload = null, .headers = &.{} });
+    try testing.expectEqual(@as(usize, 1), root.starts);
+}
+
+/// Adds the field `key=x` to the logger.
+const NexusLogTag = struct {
+    key: []const u8,
+    arena: std.mem.Allocator,
+    pub fn logger(t: *NexusLogTag, input: interceptor.LoggerInput, next: interceptor.NexusOperationOutbound.Next) log.Logger {
+        var l = next.logger(input);
+        const context = std.mem.concat(t.arena, log.Field, &.{ l.context, &.{.{ .key = t.key, .value = "x" }} }) catch return l;
+        l.context = context;
+        return l;
+    }
+};
+
+test "Nexus outbound interceptors wrap the handler's logger, the first outermost" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var records: Records = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer records.arena.deinit();
+    var outer: NexusLogTag = .{ .key = "OuterTagged", .arena = arena.allocator() };
+    var inner: NexusLogTag = .{ .key = "InnerTagged", .arena = arena.allocator() };
+    const Empty = struct {};
+    var empty: Empty = .{};
+    const pass = interceptor.NexusOperationOutbound.from(Empty, &empty);
+    try testing.expect(pass.vtable.logger == null);
+    const chain = [_]interceptor.NexusOperationOutbound{ interceptor.NexusOperationOutbound.from(NexusLogTag, &outer), pass, interceptor.NexusOperationOutbound.from(NexusLogTag, &inner) };
+
+    var ctx: nexus.Context = .{
+        .arena = arena.allocator(),
+        .io_ = testing.io,
+        .info_ = .{ .service = "s", .operation = "op" },
+        .logger_ = .{ .sink = records.sink() },
+    };
+    ctx.logger().info("without", .{ .NoneTagged = "y" });
+    ctx.outbound = &chain;
+    ctx.logger().info("with", .{});
+    try testing.expect(records.has("without NoneTagged=y"));
+    try testing.expect(records.has("with InnerTagged=x"));
+    try testing.expect(records.has("with OuterTagged=x"));
+    // The innermost interceptor's field comes first: it wrapped the root logger first.
+    const lines = records.lines.items;
+    try testing.expectEqualStrings("with InnerTagged=x", lines[lines.len - 2]);
+}
+
+test "Worker.from hands out a Nexus request's interceptors when the type declares interceptNexusOperation" {
+    const W = struct {
+        calls: usize = 0,
+        pub fn interceptNexusOperation(w: *@This(), _: *nexus.Context) error{OutOfMemory}!interceptor.NexusOperation {
+            w.calls += 1;
+            return .{};
+        }
+    };
+    var w: W = .{};
+    const with = interceptor.Worker.from(W, &w);
+    try testing.expect(with.vtable.interceptWorkflow == null);
+    try testing.expect(with.vtable.interceptActivity == null);
+    try testing.expect(with.vtable.interceptNexusOperation != null);
+    var ctx: nexus.Context = .{ .arena = testing.allocator, .io_ = testing.io, .info_ = .{ .service = "s", .operation = "op" } };
+    const got = try with.interceptNexusOperation(&ctx);
+    try testing.expect(got.inbound == null and got.outbound == null);
+    try testing.expectEqual(@as(usize, 1), w.calls);
+
+    const None = struct {};
+    var none: None = .{};
+    const without = interceptor.Worker.from(None, &none);
+    try testing.expect(without.vtable.interceptNexusOperation == null);
+    const passed = try without.interceptNexusOperation(&ctx);
+    try testing.expect(passed.inbound == null and passed.outbound == null);
+}
+
+test "workflow outbound interceptors see a Nexus call first to last, and pass through what they don't declare" {
+    const Trace = struct {
+        tag: u8,
+        order: *std.ArrayList(u8),
+        pub fn executeNexusOperation(t: *@This(), input: interceptor.NexusOperationInput, next: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(Payload) {
+            t.order.appendAssumeCapacity(t.tag);
+            var changed = input;
+            changed.options.endpoint = if (t.tag == 'a') "changed" else input.options.endpoint;
+            return next.executeNexusOperation(changed);
+        }
+    };
+    const Root = struct {
+        endpoint: []const u8 = "",
+        const vtable: interceptor.WorkflowOutbound.VTable = .{ .executeNexusOperation = call };
+        fn call(ptr: *anyopaque, input: interceptor.NexusOperationInput, _: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(Payload) {
+            const r: *@This() = @ptrCast(@alignCast(ptr));
+            r.endpoint = input.options.endpoint;
+            return .{ .ctx = undefined, .state = error.InvalidOptions };
+        }
+    };
+    const LogsOnly = struct {
+        pub fn logger(_: *@This(), input: interceptor.LoggerInput, next: interceptor.WorkflowOutbound.Next) log.Logger {
+            return next.logger(input);
+        }
+    };
+    var buffer: [4]u8 = undefined;
+    var order: std.ArrayList(u8) = .initBuffer(&buffer);
+    var a: Trace = .{ .tag = 'a', .order = &order };
+    var b: Trace = .{ .tag = 'b', .order = &order };
+    var logs: LogsOnly = .{};
+    const pass = interceptor.WorkflowOutbound.from(LogsOnly, &logs);
+    try testing.expect(pass.vtable.executeNexusOperation == null);
+    var root: Root = .{};
+    const chain = [_]interceptor.WorkflowOutbound{ interceptor.WorkflowOutbound.from(Trace, &a), pass, interceptor.WorkflowOutbound.from(Trace, &b) };
+    const next: interceptor.WorkflowOutbound.Next = .{ .chain = &chain, .root = .{ .ptr = &root, .vtable = &Root.vtable } };
+    const future = next.executeNexusOperation(.{ .service = "s", .operation = "op", .options = .{ .endpoint = "e" }, .payload = .{} });
+    try testing.expectError(error.InvalidOptions, future.state);
+    try testing.expectEqualStrings("ab", order.items);
+    try testing.expectEqualStrings("changed", root.endpoint);
+}
+
+// ---------------------------------------------------------------- Nexus, replay
+
+const NexusReplay = struct {
+    const Shout = nexus.OperationDef("shout", []const u8, []const u8);
+    const Service = nexus.ServiceDef("zig-interceptor-replay-service", .{Shout});
+
+    fn shout(ctx: *nexus.Context, input: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "{s}! x-tag={s}", .{ input, ctx.info().header("x-tag") orelse "none" });
+    }
+    const Handler = nexus.ServiceHandler(Service, .{nexus.OperationHandler(Shout, shout)});
+
+    /// Calls `shout` through `endpoint`.
+    fn call(ctx: *workflow.Context, endpoint: []const u8, input: []const u8) ![]const u8 {
+        return ctx.executeNexusOperation(Service, Shout, .{ .endpoint = endpoint, .schedule_to_close_timeout = .fromSeconds(60) }, input).get();
+    }
+    const Call = workflow.Def("NexusInterceptorReplay", call);
+
+    /// Adds the header `x-tag: outbound` to every Nexus call.
+    const Tag = struct {
+        pub fn interceptWorkflow(_: *Tag, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+            const run = try ctx.allocator().create(Run);
+            run.* = .{ .ctx = ctx };
+            return .{ .outbound = interceptor.WorkflowOutbound.from(Run, run) };
+        }
+
+        const Run = struct {
+            ctx: *workflow.Context,
+            pub fn executeNexusOperation(r: *Run, input: interceptor.NexusOperationInput, next: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(Payload) {
+                var changed = input;
+                changed.options.headers = std.mem.concat(r.ctx.allocator(), nexus.Header, &.{ input.options.headers, &.{.{ .name = "x-tag", .value = "outbound" }} }) catch
+                    return interceptor.rejectNexusOperation(r.ctx, input, .{ .message = "out of memory" });
+                return next.executeNexusOperation(changed);
+            }
+        };
+    };
+};
+
+/// A dev-server run of `NexusReplay.Call` with `NexusReplay.Tag` installed, whose Nexus call
+/// carries the header the interceptor added; fetched with `Client.fetchHistory` and encoded
+/// as ProtoJSON (`History.jsonEncode`).
+const nexus_interceptor_history = @embedFile("testdata/nexus_interceptor_history.json");
+
+test "WorkflowReplayer replays a Nexus call shaped by a workflow outbound interceptor" {
+    var tag: NexusReplay.Tag = .{};
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(NexusReplay.Tag, &tag)};
+    var replayer: testing_mod.WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer replayer.deinit();
+    try replayer.registerWorkflow(NexusReplay.Call);
+    try replayer.replayHistoryJson(nexus_interceptor_history);
+}
+
+/// Refuses every Nexus call with a failure whose cause it builds on its own stack, then reuses
+/// that memory, as `RefusingWithCause` does for activities.
+const RefusingNexus = struct {
+    pub fn interceptWorkflow(_: *RefusingNexus, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+        const run = try ctx.allocator().create(Run);
+        run.* = .{ .ctx = ctx };
+        return .{ .outbound = interceptor.WorkflowOutbound.from(Run, run) };
+    }
+
+    const Run = struct {
+        ctx: *workflow.Context,
+
+        pub fn executeNexusOperation(r: *Run, input: interceptor.NexusOperationInput, _: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(Payload) {
+            var why: failure_mod.Failure = .{ .message = "over budget" };
+            const future = interceptor.rejectNexusOperation(r.ctx, input, .{ .message = "refused", .type = "Refused", .cause = &why });
+            why = .{ .message = "reused stack" };
+            return future;
+        }
+    };
+
+    /// Calls `shout` through an endpoint that doesn't exist: nothing is scheduled, so it is
+    /// never looked up.
+    fn refused(ctx: *workflow.Context) ![]const u8 {
+        const f = ctx.executeNexusOperation(NexusReplay.Service, NexusReplay.Shout, .{ .endpoint = "no-such-endpoint" }, "hi");
+        if (!f.isReady()) return error.TestExpectedReady;
+        f.cancel();
+        if (f.started()) |_| return error.TestExpectedRefusal else |err| if (err != error.NexusOperationFailed) return err;
+        if (f.get()) |_| return error.TestExpectedRefusal else |err| if (err != error.NexusOperationFailed) return err;
+        const top = f.failure().?;
+        const info = top.failure_info.?.nexus_operation_execution_failure_info;
+        return std.fmt.allocPrint(ctx.allocator(), "{s}|{s}/{s}/{s}|{s}|{s}", .{ top.message, info.endpoint, info.service, info.operation, top.cause.?.message, failure_mod.rootCause(top).message });
+    }
+    const Refused = workflow.Def("RefusedNexus", refused);
+};
+
+test "rejectNexusOperation fails the call without scheduling it, naming the operation, and copies the refusal's cause" {
+    var refusing: RefusingNexus = .{};
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RefusingNexus, &refusing)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(RefusingNexus.Refused);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(RefusingNexus.Refused, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings(
+        "nexus operation \"shout\" of service \"zig-interceptor-replay-service\" was refused by a workflow interceptor|no-such-endpoint/zig-interceptor-replay-service/shout|refused|over budget",
+        try env.getResult(RefusingNexus.Refused, &run, a, null),
+    );
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    for (history.events.items) |event| try testing.expect(event.event_type != .EVENT_TYPE_NEXUS_OPERATION_SCHEDULED);
+}

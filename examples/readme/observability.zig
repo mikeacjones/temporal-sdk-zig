@@ -168,6 +168,89 @@ test "observability: a worker interceptor sees the activities a workflow schedul
     try testing.expect(hasLine(&lines, "info scheduling activity activity=greet", "WorkflowType=greeting"));
 }
 
+const Shout = temporal.nexus.OperationDef("shout", []const u8, []const u8);
+const ShoutService = temporal.nexus.ServiceDef("shout-service", .{Shout});
+
+fn shout(ctx: *temporal.nexus.Context, text: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(ctx.allocator(), "{s}! for {s}", .{ text, ctx.info().header("tenant").? });
+}
+const ShoutHandler = temporal.nexus.ServiceHandler(ShoutService, .{temporal.nexus.OperationHandler(Shout, shout)});
+
+fn shoutThroughNexus(ctx: *workflow.Context, endpoint: []const u8, text: []const u8) ![]const u8 {
+    return ctx.executeNexusOperation(ShoutService, Shout, .{ .endpoint = endpoint, .schedule_to_close_timeout = .fromSeconds(60) }, text).get();
+}
+const ShoutThroughNexus = workflow.Def("shout_through_nexus", shoutThroughNexus);
+
+// example: observability-nexus-interceptors
+const nexus = temporal.nexus;
+
+/// Sends a tenant header with every Nexus call a workflow makes, and refuses every Nexus
+/// request this worker handles that doesn't carry one.
+const TenantGate = struct {
+    tenant: []const u8,
+
+    pub fn interceptWorkflow(g: *TenantGate, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+        const run = try ctx.allocator().create(Calls);
+        run.* = .{ .gate = g, .ctx = ctx };
+        return .{ .outbound = interceptor.WorkflowOutbound.from(Calls, run) };
+    }
+
+    pub fn interceptNexusOperation(_: *TenantGate, _: *nexus.Context) error{OutOfMemory}!interceptor.NexusOperation {
+        return .{ .inbound = interceptor.NexusOperationInbound.from(Requests, &requests) };
+    }
+
+    const Calls = struct {
+        gate: *TenantGate,
+        ctx: *workflow.Context,
+        pub fn executeNexusOperation(c: *Calls, input: interceptor.NexusOperationInput, next: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(Payload) {
+            var with_tenant = input;
+            with_tenant.options.headers = std.mem.concat(c.ctx.allocator(), nexus.Header, &.{
+                input.options.headers, &.{.{ .name = "tenant", .value = c.gate.tenant }},
+            }) catch return interceptor.rejectNexusOperation(c.ctx, input, .{ .message = "out of memory adding the tenant" });
+            return next.executeNexusOperation(with_tenant);
+        }
+    };
+
+    // Stateless, so one is shared by every request.
+    const Requests = struct {
+        pub fn startOperation(_: *Requests, input: interceptor.StartNexusOperationInput, next: interceptor.NexusOperationInbound.Next) nexus.StartResult {
+            for (input.headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "tenant")) return next.startOperation(input);
+            }
+            return .{ .handler_error = .{ .type = .unauthorized, .message = "the request names no tenant", .retry = .non_retryable } };
+        }
+    };
+    var requests: Requests = .{};
+};
+// end-example
+
+test "observability: Nexus interceptors carry a header from the calling workflow to the handling worker" {
+    var gate: TenantGate = .{ .tenant = "acme" };
+    const interceptors = [_]interceptor.Worker{.from(TenantGate, &gate)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(ShoutThroughNexus);
+    try env.registerNexusService(ShoutHandler);
+    try env.createNexusEndpoint("readme-shout-endpoint", .{});
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("hi! for acme", try env.executeWorkflow(ShoutThroughNexus, .{ "readme-shout-endpoint", "hi" }, arena.allocator(), null));
+
+    // A request without the header is refused before the handler runs.
+    var requests: TenantGate.Requests = .{};
+    const Root = struct {
+        fn start(_: *anyopaque, _: interceptor.StartNexusOperationInput, _: interceptor.NexusOperationInbound.Next) nexus.StartResult {
+            return .{ .succeeded = .{ .result = .{} } };
+        }
+    };
+    const next: interceptor.NexusOperationInbound.Next = .{
+        .chain = &.{interceptor.NexusOperationInbound.from(TenantGate.Requests, &requests)},
+        .root = .{ .ptr = &requests, .vtable = &.{ .startOperation = Root.start } },
+    };
+    const refused = next.startOperation(.{ .service = "shout-service", .operation = "shout", .payload = null, .headers = &.{} });
+    try testing.expectEqualStrings("the request names no tenant", refused.handler_error.message);
+}
+
 fn tenantGreeting(ctx: *workflow.Context, name: []const u8) ![]const u8 {
     return ctx.executeActivity(TenantGreet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get();
 }
