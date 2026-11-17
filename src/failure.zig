@@ -873,7 +873,14 @@ test "traceText names the source of each frame of an error return trace, or is e
         } else {
             try testing.expect(std.mem.indexOf(u8, text, "failure.zig:") != null);
             try testing.expect(std.mem.indexOf(u8, text, "traceLeaf") != null);
-            try testing.expect(std.mem.indexOf(u8, text, "0x") == null);
+            // Each frame is a source location, not a raw address. Checked line by line
+            // rather than for "0x" anywhere, which the checkout's path may contain.
+            var lines = std.mem.tokenizeScalar(u8, text, '\n');
+            while (lines.next()) |line| {
+                try testing.expect(std.mem.indexOf(u8, line, ": in ") != null);
+                try testing.expect(std.mem.indexOf(u8, line, ": 0x") == null);
+                try testing.expect(!std.mem.startsWith(u8, line, "0x"));
+            }
         }
     };
     try testing.expectEqualStrings("", try traceText(testing.allocator, null));
