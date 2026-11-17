@@ -181,8 +181,8 @@ test "History ProtoJSON uses flat oneofs and parses back" {
     try testing.expectEqual(enums.EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, evs[0].event_type);
     const st = evs[0].attributes.?.workflow_execution_started_event_attributes;
     try testing.expectEqualStrings("\"bob\"", st.input.?.payloads.items[0].data);
-    // Payload.metadata (map<string, bytes>) is not checked: the pinned zig-protobuf does not
-    // base64-decode bytes map values from JSON yet (beads temporal-sdk-zig-d51.2.6).
+    // Payload.metadata (map<string, bytes>) is not checked: the pinned zig-protobuf's
+    // jsonDecode does not base64-decode bytes map values; `protojson.decode` does.
 }
 
 test "decode and deinit without an arena does not leak" {

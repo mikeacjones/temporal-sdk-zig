@@ -1,18 +1,15 @@
 //! Workflow histories: the types, and parsing them from JSON as `temporal workflow show
 //! --output json` and the Temporal UI export them.
 //!
-//! Those exports are ProtoJSON with two differences the protobuf parser can't take directly,
-//! so `fromJson` rewrites the JSON first, guided by the generated message types:
-//!
-//! - Enums may use short names: `"eventType": "WorkflowExecutionStarted"` for
-//!   `EVENT_TYPE_WORKFLOW_EXECUTION_STARTED`. A short name becomes the enum's prefix (taken from
-//!   its `*_UNSPECIFIED` value) plus the name in SCREAMING_SNAKE_CASE.
-//! - `Payload.metadata` values are base64 (they are bytes). They are decoded here because the
-//!   protobuf library doesn't base64-decode bytes values inside maps yet (beads d51.2.6). This
-//!   assumes metadata values are text, which encodings and other standard keys are.
+//! Those exports are ProtoJSON, except that enums may use short names: `"eventType":
+//! "WorkflowExecutionStarted"` for `EVENT_TYPE_WORKFLOW_EXECUTION_STARTED`. `fromJson` rewrites
+//! a short name, guided by the generated message types, to the enum's prefix (taken from its
+//! `*_UNSPECIFIED` value) plus the name in SCREAMING_SNAKE_CASE, then decodes the result with
+//! `protojson.decode`, which also base64-decodes `Payload.metadata` values.
 
 const std = @import("std");
 const proto = @import("proto.zig");
+const protojson = @import("protojson.zig");
 const Allocator = std.mem.Allocator;
 
 pub const History = proto.temporal.api.history.v1.History;
@@ -24,7 +21,6 @@ pub const WorkflowHistory = struct {
     workflow_id: []const u8,
     history: History,
 };
-const Payload = proto.temporal.api.common.v1.Payload;
 
 pub const Error = error{ OutOfMemory, InvalidHistoryJson };
 
@@ -36,11 +32,10 @@ pub fn fromJson(arena: Allocator, json: []const u8) Error!History {
     };
     try fix(History, arena, &root);
     const normalized = std.json.Stringify.valueAlloc(arena, root, .{}) catch return error.OutOfMemory;
-    const parsed = History.jsonDecode(normalized, .{ .ignore_unknown_fields = true }, arena) catch |err| switch (err) {
+    return protojson.decode(History, arena, normalized) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidHistoryJson,
+        error.InvalidProtoJson => return error.InvalidHistoryJson,
     };
-    return parsed.value;
 }
 
 fn fix(comptime T: type, arena: Allocator, v: *std.json.Value) Error!void {
@@ -65,7 +60,6 @@ fn fix(comptime T: type, arena: Allocator, v: *std.json.Value) Error!void {
             }
             if (!@hasDecl(T, "_desc_table")) return;
             if (v.* != .object) return;
-            if (T == Payload) try decodeMetadata(arena, v);
             inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, F| {
                 if (comptime std.mem.eql(u8, name, "_unknown_fields")) continue;
                 if (comptime unionOf(F)) |U| {
@@ -113,22 +107,6 @@ fn enumPrefix(comptime E: type) []const u8 {
     const suffix = "UNSPECIFIED";
     if (std.mem.endsWith(u8, first, suffix)) return first[0 .. first.len - suffix.len];
     return "";
-}
-
-fn decodeMetadata(arena: Allocator, payload: *std.json.Value) Error!void {
-    const md = payload.object.getPtr("metadata") orelse return;
-    if (md.* != .object) return;
-    var it = md.object.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.* != .string) continue;
-        const encoded = kv.value_ptr.string;
-        const decoder = std.base64.standard.Decoder;
-        const len = decoder.calcSizeForSlice(encoded) catch continue;
-        const buf = try arena.alloc(u8, len);
-        decoder.decode(buf, encoded) catch continue;
-        if (!std.unicode.utf8ValidateSlice(buf)) continue;
-        kv.value_ptr.* = .{ .string = buf };
-    }
 }
 
 fn camel(comptime name: []const u8) []const u8 {
@@ -206,4 +184,16 @@ test "canonical enum names pass through unchanged" {
         \\{"events":[{"eventId":"1","eventType":"EVENT_TYPE_WORKFLOW_EXECUTION_STARTED","workflowExecutionStartedEventAttributes":{"workflowType":{"name":"W"}}}]}
     );
     try testing.expectEqual(proto.temporal.api.enums.v1.EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, h.events.items[0].event_type);
+}
+
+test "metadata values that are not UTF-8 decode" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const h = try fromJson(arena.allocator(),
+        \\{"events":[{"eventId":"1","eventType":"WorkflowExecutionStarted",
+        \\ "workflowExecutionStartedEventAttributes":{"input":{"payloads":[{"metadata":{"encoding":"YmluYXJ5L3BsYWlu","key":"//79"}}]}}}]}
+    );
+    const md = h.events.items[0].attributes.?.workflow_execution_started_event_attributes.input.?.payloads.items[0].metadata.items;
+    try testing.expectEqualStrings("binary/plain", md[0].value);
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xfe, 0xfd }, md[1].value);
 }
