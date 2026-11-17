@@ -1401,6 +1401,7 @@ pub const WorkflowRunner = struct {
             .limit = limit,
             .run_id = act.run_id,
             .switches = &inst.sched.switches,
+            .sdk_work = &inst.sched.sdk_work,
             .sender = sender orelse return .{ .returned = inst.activate(act, a) },
         };
         var watchdog = io.concurrent(Watch.run, .{&watch}) catch {
@@ -1428,6 +1429,9 @@ pub const WorkflowRunner = struct {
         /// The run's `Scheduler.switches`, which advances each time workflow code returns to
         /// the scheduler.
         switches: *const std.atomic.Value(u64),
+        /// The run's `Scheduler.sdk_work`, set while the scheduler's thread does SDK work
+        /// that isn't workflow code (reading debug info for the stack trace query).
+        sdk_work: *const std.atomic.Value(bool),
         sender: Sender,
         /// Set by the activation thread once workflow code has returned.
         returned: Io.Event = .unset,
@@ -1439,7 +1443,9 @@ pub const WorkflowRunner = struct {
 
         /// Samples `switches` every quarter of the limit on the worker's real clock. A count
         /// unchanged since it was first seen at least `limit` ago means the code hasn't
-        /// returned to the scheduler for at least that long.
+        /// returned to the scheduler for at least that long. A sample that finds `sdk_work`
+        /// set starts the clock again, so that time isn't counted; SDK work begun and ended
+        /// between two samples is counted.
         fn run(w: *Watch) void {
             const io = w.io;
             const tick: Io.Clock.Duration = .{ .raw = .fromNanoseconds(@max(@divTrunc(w.limit.nanoseconds, 4), 1)), .clock = .awake };
@@ -1454,7 +1460,7 @@ pub const WorkflowRunner = struct {
                 }
                 const now = Io.Clock.awake.now(io);
                 const switches = w.switches.load(.acquire);
-                if (switches != seen) {
+                if (switches != seen or w.sdk_work.load(.acquire)) {
                     seen = switches;
                     since = now;
                     continue;
@@ -5417,6 +5423,46 @@ test "workflow code stuck past the deadlock limit fails its task once, and its r
     try testing.expectEqual(1, sent.count());
     // The replayed copy of A is untouched by the stuck code's teardown.
     _ = try ParallelTest.timerSeq((try runner.handle(try ParallelTest.fireTimer(a, "A", 1), a, testing.io)).completion);
+}
+
+test "time with Scheduler.sdk_work set doesn't count toward the deadlock limit, and time in workflow code still does" {
+    var workflows = try ParallelTest.registry(testing.allocator);
+    defer workflows.deinit(testing.allocator);
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var runner = ParallelTest.runner(&workflows, sink.sink());
+    defer runner.deinit();
+    const limit: Io.Duration = .fromMilliseconds(40);
+    var switches: std.atomic.Value(u64) = .init(0);
+    var sdk_work: std.atomic.Value(bool) = .init(false);
+
+    // SDK work for five limits, with no switch: the watch keeps waiting.
+    {
+        var sent: DeadlockTest.Sent = .{};
+        defer sent.deinit();
+        var watch: WorkflowRunner.Watch = .{ .r = &runner, .io = testing.io, .limit = limit, .run_id = "run-1", .switches = &switches, .sdk_work = &sdk_work, .sender = sent.sender() };
+        sdk_work.store(true, .release);
+        const thread = try std.Thread.spawn(.{}, WorkflowRunner.Watch.run, .{&watch});
+        try testing.io.sleep(.fromMilliseconds(5 * 40), .awake);
+        sdk_work.store(false, .release);
+        watch.returned.set(testing.io);
+        thread.join();
+        try testing.expect(!watch.abandoned);
+        try testing.expectEqual(0, sent.count());
+    }
+
+    // The same stretch with the flag clear is workflow code that never returned.
+    {
+        var sent: DeadlockTest.Sent = .{};
+        defer sent.deinit();
+        var watch: WorkflowRunner.Watch = .{ .r = &runner, .io = testing.io, .limit = limit, .run_id = "run-1", .switches = &switches, .sdk_work = &sdk_work, .sender = sent.sender() };
+        const thread = try std.Thread.spawn(.{}, WorkflowRunner.Watch.run, .{&watch});
+        try sent.received.wait(testing.io);
+        watch.returned.set(testing.io);
+        thread.join();
+        try testing.expect(watch.abandoned);
+        try testing.expectEqual(1, sent.count());
+    }
 }
 
 test "workflow code that returns to the scheduler between steps runs past the deadlock limit in total" {

@@ -119,14 +119,12 @@ noinline fn anchor() void {
 /// Writes the workflow frames of blocked `fiber`, one line each ("at path/to/file.zig:12:5 in
 /// function", the path and name through `text`), each starting with `indent`, or one
 /// `unknown_location` line. Past `max_lines` call sites, a last line says the deeper ones
-/// were left out. Notes progress on `sched` (`Scheduler.noteProgress`) after each frame it
-/// reads.
-pub fn write(reader: ?*Reader, sched: *Scheduler, w: *std.Io.Writer, fiber: *const Scheduler.Fiber, indent: []const u8) (error{OutOfMemory} || std.Io.Writer.Error)!void {
+/// were left out.
+pub fn write(reader: ?*Reader, w: *std.Io.Writer, fiber: *const Scheduler.Fiber, indent: []const u8) (error{OutOfMemory} || std.Io.Writer.Error)!void {
     var lines: usize = 0;
     if (reader) |r| frames: {
         var buf: [max_frames]usize = undefined;
         for (Scheduler.blockedTrace(fiber, &buf)) |addr| {
-            defer sched.noteProgress();
             for (try r.symbols(addr)) |sym| {
                 const loc = sym.source_location orelse continue;
                 if (loc.file_name.len == 0 or !r.isWorkflowCode(loc.file_name)) continue;

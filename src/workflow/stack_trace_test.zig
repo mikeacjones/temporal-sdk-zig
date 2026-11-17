@@ -8,6 +8,7 @@ const converter = @import("../converter.zig");
 const workflow = @import("../workflow.zig");
 const Instance = @import("Instance.zig");
 const call_sites = @import("call_sites.zig");
+const interceptor = @import("../interceptor.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -434,52 +435,116 @@ test "__stack_trace: names that aren't valid UTF-8 or hold newlines are escaped,
     _ = try entry(text, "coroutine 1 \"main\\n\\ncoroutine 9 \\\"fake\\\", the workflow function, waits on nothing\u{fffd}\", the workflow function, waits on activity \"bad\u{fffd}\u{fffd}\\\"type\\n\"");
 }
 
-/// Watches a scheduler's `switches` as the worker's deadlock detector does, and keeps the
-/// longest stretch it saw the count unchanged.
-const ProgressWatch = struct {
-    switches: *const std.atomic.Value(u64),
-    done: std.atomic.Value(bool) = .init(false),
-    longest: std.Io.Duration = .zero,
+/// Passes allocations to `backing`, noting whether `sdk_work` was set at each one; with
+/// `fail_during_sdk_work`, refuses those made while it is set.
+const SdkWorkSampler = struct {
+    backing: Allocator,
+    sdk_work: *const std.atomic.Value(bool),
+    fail_during_sdk_work: bool = false,
+    during: usize = 0,
+    outside: usize = 0,
 
-    fn run(w: *ProgressWatch) void {
-        const io = std.Options.debug_io;
-        var seen = w.switches.load(.acquire);
-        var since = std.Io.Clock.awake.now(io);
-        while (!w.done.load(.acquire)) {
-            std.Io.sleep(io, .fromMilliseconds(2), .awake) catch return;
-            const now = std.Io.Clock.awake.now(io);
-            const gap = since.durationTo(now);
-            if (gap.nanoseconds > w.longest.nanoseconds) w.longest = gap;
-            const switches = w.switches.load(.acquire);
-            if (switches != seen) {
-                seen = switches;
-                since = now;
-            }
+    fn allocator(s: *SdkWorkSampler) Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    /// Whether the allocation may go ahead.
+    fn sample(s: *SdkWorkSampler) bool {
+        if (!s.sdk_work.load(.acquire)) {
+            s.outside += 1;
+            return true;
         }
+        s.during += 1;
+        return !s.fail_during_sdk_work;
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const s: *SdkWorkSampler = @ptrCast(@alignCast(ptr));
+        if (!s.sample()) return null;
+        return s.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const s: *SdkWorkSampler = @ptrCast(@alignCast(ptr));
+        if (!s.sample()) return false;
+        return s.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const s: *SdkWorkSampler = @ptrCast(@alignCast(ptr));
+        if (!s.sample()) return null;
+        return s.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const s: *SdkWorkSampler = @ptrCast(@alignCast(ptr));
+        s.backing.rawFree(memory, alignment, ret_addr);
     }
 };
 
-test "__stack_trace keeps noting progress while a slow read of debug info runs, so deadlock detection doesn't fire" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+test "__stack_trace marks its read of debug info as SDK work for deadlock detection, and clears the mark on every way out" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
     const a = scratch.allocator();
     const inst = try Instance.create(testing.allocator, WaitsWf.registered, .{});
     defer inst.destroy();
     try startWaits(inst, a, false);
+    try testing.expect(!inst.sched.sdk_work.load(.acquire));
 
-    // Stands in for a first read of debug info that is slower than the deadlock limit.
-    const stall: std.Io.Duration = .fromMilliseconds(500);
-    Instance.stack_trace_test_stall = stall;
-    defer Instance.stack_trace_test_stall = null;
-    var watch: ProgressWatch = .{ .switches = &inst.sched.switches };
-    const thread = try std.Thread.spawn(.{}, ProgressWatch.run, .{&watch});
-    const text = stackTrace(inst, a);
-    watch.done.store(true, .release);
-    thread.join();
-    _ = try entry(try text, "coroutine 1 \"workflow\", the workflow function, waits on activity \"slow\"");
-    if (watch.longest.nanoseconds >= @divTrunc(stall.nanoseconds, 2)) {
-        std.debug.print("the progress count stood still for {f} while the answer stalled for {f}\n", .{ watch.longest, stall });
-        return error.TestUnexpectedResult;
+    var sampler: SdkWorkSampler = .{ .backing = a, .sdk_work = &inst.sched.sdk_work };
+    const text = try stackTrace(inst, sampler.allocator());
+    _ = try entry(text, "coroutine 1 \"workflow\", the workflow function, waits on activity \"slow\"");
+    // The answer is written, and the debug info's roots copied, with the flag set.
+    try testing.expect(sampler.during > 0);
+    try testing.expect(sampler.outside > 0);
+    try testing.expect(!inst.sched.sdk_work.load(.acquire));
+
+    // Running out of memory while the flag is set fails the answer and clears the flag.
+    var failing: SdkWorkSampler = .{ .backing = a, .sdk_work = &inst.sched.sdk_work, .fail_during_sdk_work = true };
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_999 } };
+    try act.jobs.append(a, .{ .variant = .{ .query_workflow = .{ .query_id = "q1", .query_type = "__stack_trace" } } });
+    const answered = inst.activate(&act, failing.allocator());
+    try testing.expect(failing.during > 0);
+    try testing.expect(!inst.sched.sdk_work.load(.acquire));
+    if (answered) |completion| {
+        const cmds = commandsOf(completion);
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expect(cmds[0].variant.?.respond_to_query.variant.? == .failed);
+    } else |err| try testing.expectEqual(error.OutOfMemory, err);
+
+    // The run goes on: the next answer succeeds.
+    _ = try entry(try stackTrace(inst, a), "coroutine 1 \"workflow\", the workflow function, waits on activity \"slow\"");
+}
+
+/// Asks for the `__stack_trace` answer through `next.handleQuery` from inside workflow code,
+/// before the workflow function runs: a call `interceptor.WorkflowInbound.Next` allows.
+const SelfTrace = struct {
+    arena: Allocator,
+    answered: ?anyerror!converter.Payload = null,
+
+    pub fn interceptWorkflow(s: *SelfTrace, _: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+        return .{ .inbound = interceptor.WorkflowInbound.from(SelfTrace, s) };
     }
+
+    pub fn executeWorkflow(s: *SelfTrace, input: interceptor.ExecuteWorkflowInput, next: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
+        s.answered = next.handleQuery(.{ .query_type = "__stack_trace", .args = .{ .payloads = &.{} }, .header = .{}, .arena = s.arena });
+        return next.executeWorkflow(input);
+    }
+};
+
+test "__stack_trace asked for from inside workflow code by an interceptor doesn't crash the worker, and leaves sdk_work clear" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var self_trace: SelfTrace = .{ .arena = a };
+    const interceptors = [_]interceptor.Worker{.from(SelfTrace, &self_trace)};
+    const inst = try Instance.create(testing.allocator, WaitsWf.registered, .{ .interceptors = &interceptors });
+    defer inst.destroy();
+    var init = try initActivation(a, "Waits");
+    const started = commandsOf(try inst.activate(&init, a));
+    // The workflow function still runs after the interceptor's call, whatever it answered.
+    try testing.expect(self_trace.answered != null);
+    try testing.expectEqual(@as(usize, 2), started.len);
+    try testing.expectEqualStrings("slow", started[0].variant.?.schedule_activity.activity_type);
+    try testing.expect(!inst.sched.sdk_work.load(.acquire));
 }

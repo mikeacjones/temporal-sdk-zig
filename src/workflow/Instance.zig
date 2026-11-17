@@ -995,9 +995,12 @@ pub const stack_trace_query = "__stack_trace";
 /// each wait a few stores (`WorkflowIo.Wait.Reason` and `Task.waiting_on`), and an activity's
 /// wait a copy of up to `max_wait_name` bytes of its type to the waiting coroutine's stack; it
 /// allocates nothing, so a long run grows no more for it. Stacks are unwound and debug info is
-/// read only when the query arrives. While answering, a thread of its own notes progress
-/// (`Scheduler.Heartbeat`), since the first read of debug info can outlast
-/// `worker.Options.deadlock_detection_timeout` and isn't workflow code.
+/// read only when the query arrives. From the read of debug info to the end of the answer,
+/// `Scheduler.sdk_work` marks the time as SDK work, which the worker's deadlock detection
+/// doesn't count: the first read of debug info in a process can outlast
+/// `worker.Options.deadlock_detection_timeout`, and isn't workflow code. When workflow code
+/// asks for the answer from its own coroutine (an interceptor calling
+/// `WorkflowInbound.Next.handleQuery`), the flag stays clear and the time counts as its own.
 fn stackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}![]const u8 {
     var text: std.Io.Writer.Allocating = .init(out);
     errdefer text.deinit();
@@ -1006,10 +1009,6 @@ fn stackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}![]const u8 {
     };
     return text.toOwnedSlice() catch return error.OutOfMemory;
 }
-
-/// Test builds only: how long `writeStackTrace` stalls after reading debug info, standing in
-/// for a slow first read.
-pub var stack_trace_test_stall: ?std.Io.Duration = null;
 
 fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{OutOfMemory} || std.Io.Writer.Error)!void {
     if (inst.finished) {
@@ -1026,13 +1025,14 @@ fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{Ou
     try w.print("workflow \"{f}\": {d} coroutine{s}\n", .{ call_sites.text(inst.info.workflow_type), count, if (count == 1) "" else "s" });
 
     // Reading debug info the first time can take seconds, in one call into std; it isn't
-    // workflow code, so the heartbeat keeps the deadlock detector from taking it for some.
-    var heartbeat: Scheduler.Heartbeat = .{ .sched = &inst.sched };
-    heartbeat.start();
-    defer heartbeat.stop();
+    // workflow code, so the deadlock detector doesn't count it. Workflow code can ask for the
+    // answer itself (an interceptor calling `WorkflowInbound.Next.handleQuery`); then the
+    // time is the workflow code's, and the flag stays clear, as it must while a fiber runs.
+    const sdk_work = inst.sched.currentFiber() == null;
+    if (sdk_work) inst.sched.sdk_work.store(true, .release);
+    defer if (sdk_work) inst.sched.sdk_work.store(false, .release);
     var reader = try call_sites.Reader.init(out);
     defer if (reader) |*r| r.deinit();
-    if (builtin.is_test) if (stack_trace_test_stall) |d| std.Io.sleep(std.Options.debug_io, d, .awake) catch {};
     it = inst.sched.firstLive();
     while (it) |f| : (it = f.live_next) {
         try w.print("\ncoroutine {d} \"{f}\", ", .{ f.id, call_sites.text(f.name) });
@@ -1046,7 +1046,7 @@ fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{Ou
         } else {
             try w.writeAll(", waits\n");
         }
-        try call_sites.write(if (reader) |*r| r else null, &inst.sched, w, f, "  ");
+        try call_sites.write(if (reader) |*r| r else null, w, f, "  ");
     }
 }
 
