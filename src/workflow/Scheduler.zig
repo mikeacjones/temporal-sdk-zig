@@ -207,7 +207,9 @@ pub const Heartbeat = struct {
     pub fn start(hb: *Heartbeat) void {
         hb.sched.noteProgress();
         if (builtin.single_threaded) return;
-        hb.thread = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, beat, .{hb}) catch null;
+        // std's default stack size: a smaller one can fall below the platform's minimum (128
+        // KiB on aarch64 glibc), which std asserts against rather than returning an error.
+        hb.thread = std.Thread.spawn(.{}, beat, .{hb}) catch null;
     }
 
     pub fn stop(hb: *Heartbeat) void {
