@@ -45,6 +45,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Dynamic workflows](#dynamic-workflows)
     - [Workflow info](#workflow-info)
     - [Failure policy](#failure-policy)
+    - [Stack trace query](#stack-trace-query)
     - [Stack trace and metadata queries](#stack-trace-and-metadata-queries)
   - [Activities](#activities)
     - [Definition](#definition-1)
@@ -709,6 +710,18 @@ Workflow code runs again on replay and must make the same calls in the same orde
 - File, network, and process calls and secure randomness fail on it.
 - Don't use threads, the wall clock, other randomness, unordered hash map iteration, or other I/O; use an activity or `ctx.sideEffect`.
 
+`workflow.Context.randomUuid` returns a random (version 4) UUID as text, drawn from the run's seeded randomness: a replay gets the same values in the same order, so it can name a child workflow or go in an activity's arguments.
+
+<!-- example: workflow-uuid -->
+```zig
+fn greetChildById(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const id = try ctx.randomUuid(); // the same on replay
+    const child = ctx.executeChildWorkflow(Greeting, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{name});
+    return std.fmt.allocPrint(ctx.allocator(), "{s} ({s})", .{ try child.get(), id });
+}
+pub const GreetChildById = workflow.Def("greet_child_by_id", greetChildById);
+```
+
 #### Activities and local activities
 `workflow.Context.executeActivity` schedules an activity and returns a `workflow.ActivityFuture`; `executeLocalActivity` runs a short one on the workflow's own worker.
 
@@ -922,7 +935,7 @@ Notes:
 - An error from the handler, or an argument that doesn't decode, fails the query with the error's name. Registering again replaces the dynamic handler; its context must outlive the run, and one on the calling coroutine's stack returns `error.QueryContextOnStack`.
 - Query handlers and update validators must not change workflow state: history doesn't record queries or rejected updates, so a change would make the run differ from its replay. A call from one that would start an activity, timer, child workflow or any other command (`executeActivity`, `sleep`, `executeChildWorkflow`, `signalExternalWorkflow`, `upsertMemo`, `completeSession`, ...), register or remove a handler (`setSignalHandler`, `signalChannel`, `setUpdateHandler`, ...), take a signal from a channel (`receive`, `tryReceive`), change the run's settings (`setVersioningBehavior`), start a coroutine (`io.concurrent`), or block (`ctx.await`, a pending future's `get`) is refused: it returns `error.InvalidOptions` or `error.Canceled` (or does nothing, where it can't fail), the query fails or the update is rejected with a `ReadOnlyViolation` failure whose message names the call, whatever the handler returns, no command is sent, and the workflow task doesn't fail. A zero `sleep` returns at once, `io.async` runs its function inline, and `io.random` draws without moving the workflow's random sequence. `ctx.fail` and `ctx.failWith` describe the query's failure or the update's rejection, not the workflow's.
 - `setCoroutineName` does nothing in a query handler or a validator run on delivery, which run outside any coroutine, so the query or update goes on. It is refused like the calls above in a validator that runs in a coroutine, which happens when the workflow function or a handler registers the handler of an update that is waiting for one: it would otherwise rename that coroutine.
-- Query types Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, and those starting with `__temporal`) don't go to the dynamic handler.
+- Query types Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, and those starting with `__temporal`) don't go to the dynamic handler. The worker answers `__stack_trace` itself (see [Stack trace query](#stack-trace-query)); the others fail with `QueryNotRegistered`.
 - In a query handler, `ctx.allocator()` is the query's memory, freed once the answer is sent, so decoding arguments there doesn't grow the run.
 - Waits that can't fail can't be refused: an uncancelable wait that would block (such as `std.Io.Mutex.lockUncancelable` on a mutex the workflow holds), or awaiting or canceling a pending `std.Io.Future`, panics the worker in a query handler or a validator run on delivery. A validator run in a handler's coroutine (when the handler registers the update's handler) blocks only that coroutine, and its update is rejected with `ReadOnlyViolation` once the wait ends. Don't wait in them.
 - A handler or validator that wakes a workflow coroutine through `std.Io` (`Event.set`, `Condition.signal`, `Queue.put`, `Mutex.unlock` on something a coroutine waits for) also fails the query or has the update rejected with `ReadOnlyViolation`. The wake itself still happens, since `std.Io` has already changed the primitive: the woken coroutine runs in the next workflow task that runs workflow code.
@@ -1027,7 +1040,13 @@ fn greetFamily(ctx: *workflow.Context, names: []const []const u8) ![]const []con
     const children = try a.alloc(workflow.ChildWorkflowFuture([]const u8), names.len);
     for (names, children) |name, *child| {
         const id = try std.fmt.allocPrint(a, "{s}-{s}", .{ ctx.info().workflow_id, name });
-        child.* = ctx.executeChildWorkflow(Greeting, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{name});
+        child.* = ctx.executeChildWorkflow(Greeting, .{
+            .id = id,
+            .execution_timeout = .fromSeconds(60),
+            // Shares dispatch fairly among family members; the priority key is the parent's.
+            .priority = .{ .fairness_key = name },
+            .cancellation_type = .wait_cancellation_requested,
+        }, .{name});
     }
     const greetings = try a.alloc([]const u8, names.len);
     for (children, greetings) |child, *out| out.* = try child.get();
@@ -1040,6 +1059,14 @@ Notes:
 - `started` returns the child's execution; `error.ChildWorkflowAlreadyStarted` means its ID is taken.
 - `get` returns `error.ChildWorkflowFailed` for a failed, timed-out, canceled, or terminated child, `future.failure()` saying which, and `error.ChildWorkflowAlreadyStarted` when the child's ID is taken.
 - `parent_close_policy` defaults to `.terminate`; `future.signal` signals the child and `future.cancel()` cancels it.
+- `priority` sets the child's priority key and fairness key and weight. Null uses the parent's priority; inside a set priority, each zero field inherits the parent's value. The child reads the result in `ctx.info().priority`.
+- `cancellation_type` says what canceling the child does, through `future.cancel()` or by canceling the coroutine waiting in its `get` (which then returns `error.Canceled`):
+  - `.try_cancel` (the default) requests the child's cancellation and reports it at once.
+  - `.wait_cancellation_requested` requests it and reports it once the server has recorded the request, while the child may still be cleaning up.
+  - `.wait_cancellation_completed` requests it and waits for the child to close; a child that completes or fails instead reports that.
+  - `.abandon` reports it at once and sends no request, leaving the child running.
+  - With any type, a child canceled before its start was sent is never started.
+- Canceling the parent cancels only the children a canceled coroutine is waiting on in `get` or `started`. The cancellation reaches the workflow function, and from it every coroutine it waits on in `Future.await`, `Group.await` or a `Select`. A child nobody waits on that way keeps running, and its `parent_close_policy` applies when the parent closes: by default the server terminates it. Call `future.cancel()` to cancel it with the parent.
 - `static_summary` (a short single line) and `static_details` (longer text) describe the child; the UI and CLI show them on its started event. Each is sent as a JSON string payload through the worker's payload codecs, and empty sends none. They don't take part in replay.
 
 #### External workflows
@@ -1067,6 +1094,24 @@ Notes:
 - `ctx.continueAsNewSuggested()` says when the server suggests it; `historyLength` and `historySizeBytes` give the size.
 - `ContinueAsNewOptions` fields left null keep this run's values; a client waiting on the result follows the chain.
 
+`workflow.Context.continueAsNewByName` continues as a workflow type named at run time, with the arguments as a tuple. A dynamic workflow uses it to continue under the type it runs as:
+
+<!-- example: workflow-continue-as-new-by-name -->
+```zig
+fn anyCountdown(ctx: *workflow.Context, args: temporal.converter.EncodedValues) ![]const u8 {
+    const left = try args.get(u32, ctx.allocator(), 0);
+    // Continues under whichever type this run was started as.
+    if (left > 0) return ctx.continueAsNewByName(ctx.info().workflow_type, .{}, .{left - 1});
+    return std.fmt.allocPrint(ctx.allocator(), "{s} done", .{ctx.info().workflow_type});
+}
+pub const AnyCountdown = workflow.DynamicDef(anyCountdown);
+```
+
+Notes:
+- It takes the same `ContinueAsNewOptions` and behaves as `continueAsNew` otherwise, workflow outbound interceptors included.
+- The name is copied; an empty name continues as this run's own type.
+- The new run's type needs a `Def` or a dynamic workflow on the worker that polls its task queue.
+
 #### Cancellation
 A cancellation request reaches the workflow function as `error.Canceled` at its next cancelable wait.
 
@@ -1088,6 +1133,7 @@ Notes:
 - Delivering the cancellation consumes it, so cleanup can still run activities and timers.
 - Returning `error.Canceled` ends the workflow canceled; a result or another error completes or fails it.
 - `ctx.io().swapCancelProtection(.blocked)` protects a section; `std.Io.recancel` re-arms a consumed cancellation.
+- A coroutine waiting in `Future.await` or `Group.await` passes the cancellation on to the coroutines it awaits, as `std.Io` specifies; if an awaited future finishes without consuming it, the awaiting coroutine's next cancelable wait gets it.
 
 #### Versioning and patching
 `workflow.Context.patched` keeps old and new code paths until runs on the old one are gone; `getVersion` does the same with version numbers.
@@ -1182,6 +1228,7 @@ Notes:
 - `workflow.DynamicDefWithOptions` takes `task_failure_errors` for it; see [Failure policy](#failure-policy).
 - A worker has at most one dynamic workflow, and a registered `Def` wins for its own type.
 - Clients start it by type name with `executeWorkflowByName`; it reads that name from `ctx.info().workflow_type`.
+- It continues as new under its own type with `ctx.continueAsNewByName(ctx.info().workflow_type, ...)`; see [Continue-as-new](#continue-as-new).
 - It registers handlers with the `Context` setters, as a function workflow does.
 
 #### Workflow info
@@ -1229,10 +1276,53 @@ Notes:
 - `@panic` in workflow code, and in Debug and ReleaseSafe builds safety-checked illegal behavior such as integer overflow or an out-of-bounds index, ends the worker process: Zig has no way to recover from a panic. The workflow task that was running gets no completion, so the server retries it once its workflow task timeout passes, on whichever worker polls the task queue then (the restarted one, or another). Every run cached on the process is replayed from history by its next task. Code that panics on every attempt ends every worker that takes its task, so return an error instead, and list it if it should fail the task.
 - `testing.WorkflowReplayer.Options.workflow_task_failure_errors` replays with the worker's list. Replay doesn't re-run a task that failed: a history in which a listed error failed a task replays with code that no longer returns it, and code that still does fails replay with `error.ReplayFailed`.
 
+#### Stack trace query
+
+Temporal's UI and CLI send a running workflow the `__stack_trace` query to show where it waits. A worker answers it for every workflow it runs, function, struct, and dynamic, with no handler to register. The answer is text: a line naming the workflow and how many coroutines it has, then one entry per live coroutine of the run, in the order they started: the workflow function, each running signal and update handler, and each coroutine the workflow started with `io.async`, `io.concurrent`, or a `std.Io.Group`. Each entry says what the coroutine waits on (an activity, a timer, a child workflow, a condition, a signal channel, a `std.Io` primitive, ...) and where, as the call sites in workflow code, innermost first. `workflow.StackTraceQuery` sends it from a client:
+
+<!-- example: workflow-stack-trace -->
+```zig
+fn reminder(ctx: *workflow.Context, minutes: i64) ![]const u8 {
+    try ctx.io().sleep(.fromSeconds(minutes * 60), .awake);
+    return "reminded";
+}
+pub const Reminder = workflow.Def("reminder", reminder);
+
+// From any client: the worker answers for every workflow, with no handler to register.
+fn whereIsIt(client: *temporal.client.Client, arena: std.mem.Allocator, workflow_id: []const u8) ![]const u8 {
+    return client.queryWorkflow(workflow.StackTraceQuery, arena, workflow_id, "", .{});
+}
+```
+
+A workflow waiting on an activity, with a coroutine it started on a timer and an update handler waiting on a condition, answers like this in a Debug build:
+
+```text
+workflow "order": 3 coroutines
+
+coroutine 1 "workflow", the workflow function, waits on activity "charge"
+  at /src/order.zig:41:83 in run
+
+coroutine 2 "async", started with io.async or io.concurrent, waits on a timer (1m)
+  at /src/order.zig:27:18 in remind
+
+coroutine 3 "update", update handler "approve" (update ID 7f3e), waits on a condition (Context.await)
+  at /src/order.zig:19:24 in approve
+```
+
+Notes:
+- A call site is a frame in workflow code: frames in the SDK's own source files and in the standard library are left out. Locations come from the executable's debug info. Where there is none (a stripped build, or a target the worker can't unwind a stack on), or where optimization inlined every workflow frame into SDK or standard library code, the entry says `at an unknown location: ...` instead; what the coroutine waits on is always given. In ReleaseSafe and ReleaseFast builds on Linux, debug info records inlined calls and the entry lists them; on macOS it doesn't, so an inlined workflow call site is left out and the entry starts at the nearest caller that wasn't inlined, or says `unknown location` when none is left.
+- Answering is read-only: it emits no command and changes no workflow state, so it works at any point of a run, and a run restored from history (after eviction, or on another worker) answers as the run that first got there did.
+- Once the workflow has closed by returning (completed, failed, canceled, or continued as new), the answer is one line saying how: `workflow "order" has completed and closed: no coroutine is waiting`. A workflow closed from outside its code (terminated, or timed out) answers with the coroutines that were waiting when it closed.
+- An activity's type is named when the wait began in the workflow task that scheduled it, and cut to 64 bytes; a future awaited in a later task names the activity by its sequence number instead (`waits on activity (seq 2)`), since the type name the workflow passed is only borrowed for the task that scheduled it. An entry lists at most 16 call sites, innermost first, and says so when it leaves deeper ones out.
+- A handler the workflow registers for `__stack_trace` with `ctx.setQueryHandler` (or in a struct workflow's `queries`) answers instead of the worker. A dynamic query handler never gets `__stack_trace`.
+- When no query comes, the cost is a few stores at each wait, recording what it waits on, plus copying up to 64 bytes of an activity's type name to the waiting coroutine's stack; nothing is allocated, so a long run grows no more than it would without the query. Stacks are unwound and debug info is read only to answer, on the worker's thread; the first answer in a process reads the executable's debug info from disk.
+- Paths are those of the build machine, as in failure stack traces.
+- The answer is always valid UTF-8, so clients receive it as a JSON string. Names in it (workflow and activity types, coroutine names, update IDs, paths) are written as they are when they are valid UTF-8, with bytes that aren't replaced by U+FFFD and control characters, `"` and `\` escaped as in Zig string literals (`\n`, `\"`), so a name can't add lines or entries of its own. A cut activity type is cut between characters.
+
 #### Stack trace and metadata queries
 <!-- stub: temporal-sdk-zig-d51.6.9 -->
 Not implemented yet.
-The built-in `__stack_trace`, `__enhanced_stack_trace`, and `__temporal_workflow_metadata` queries will report where each coroutine is blocked and which handlers are registered.
+The built-in `__enhanced_stack_trace` and `__temporal_workflow_metadata` queries will report each coroutine's location with the source around it, and which handlers are registered with their descriptions. The plain `__stack_trace` query is answered already: see [Stack trace query](#stack-trace-query).
 
 ### Activities
 

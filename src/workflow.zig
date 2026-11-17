@@ -531,15 +531,42 @@ pub const LocalActivityOptions = struct {
     summary: []const u8 = "",
 };
 
-/// What canceling a child workflow's future does: `try_cancel` requests the child's
-/// cancellation and reports it at once, `wait_cancellation_completed` requests it and waits for
-/// the child to end, and `abandon` reports it at once and leaves the child running.
-pub const ChildWorkflowCancellationType = enum { try_cancel, wait_cancellation_completed, abandon };
+/// What canceling a child workflow does: `ChildWorkflowFuture.cancel`, or canceling the
+/// coroutine waiting in its `get` or `started`. A canceled coroutine's wait returns
+/// `error.Canceled` when the type says; after `ChildWorkflowFuture.cancel`, `get` returns
+/// `error.ChildWorkflowFailed` then, with a canceled failure as the root cause.
+///
+/// - `try_cancel`, the default: requests the child's cancellation and reports it at once (in
+///   the same activation), without waiting for the server. The request may not reach the
+///   server if this workflow closes first.
+/// - `wait_cancellation_requested`: requests the cancellation and reports it once the server
+///   has recorded the request (the parent's history has the child's cancel-requested event),
+///   while the child may still be running its cleanup. If the child closes first, it reports
+///   how the child closed instead, as `wait_cancellation_completed` does.
+/// - `wait_cancellation_completed`: requests the cancellation and waits for the child to close.
+///   If it completes or fails instead of being canceled, that result is reported.
+/// - `abandon`: sends no request; reports the cancellation at once and leaves the child
+///   running. Its `parent_close_policy` still applies when this workflow closes.
+///
+/// A child canceled before its start was sent to the server is never started, with any type:
+/// it reports a canceled start ("cancelled before scheduled") in the next activation. One whose
+/// start was already sent is canceled as its type says; `wait_cancellation_requested` then
+/// waits for the child to start before it can confirm the request.
+pub const ChildWorkflowCancellationType = enum { try_cancel, wait_cancellation_requested, wait_cancellation_completed, abandon };
 
 /// What the server does to a child workflow still running when its parent closes.
 pub const ParentClosePolicy = enum { terminate, abandon, request_cancel };
 
 /// How a child workflow is started.
+///
+/// Canceling the parent workflow cancels only the children it is waiting on. The cancellation
+/// reaches the workflow function's coroutine, and from it every coroutine it waits on in
+/// `Future.await`, `Group.await` or `Select` (and so on down); a coroutine canceled while it
+/// waits in a child's `get` or `started` cancels that child as its `cancellation_type` says.
+/// A child whose future no canceled coroutine is waiting on (one started and left, or awaited
+/// by a coroutine started with `io.async` that nothing awaits) is left running; call its
+/// future's `cancel` to cancel it, or rely on its `parent_close_policy`, which the server
+/// applies when the parent closes (by default it terminates the child).
 pub const ChildWorkflowOptions = struct {
     /// Empty generates a UUID from the workflow's seeded randomness, the same on replay.
     id: []const u8 = "",
@@ -571,6 +598,11 @@ pub const ChildWorkflowOptions = struct {
     /// A longer description of the child, shown in the UI and CLI. Sent as a JSON string
     /// payload (through the codecs); empty sends none.
     static_details: []const u8 = "",
+    /// The priority of the child's tasks. Null uses the parent workflow's priority; inside a
+    /// set priority, each zero field inherits the parent's value. The child reads the result
+    /// in `Info.priority`. The server checks the values: one it rejects fails the workflow
+    /// task.
+    priority: ?Priority = null,
 };
 
 /// What canceling a Nexus operation does: `NexusOperationFuture.cancel`, or canceling the
@@ -745,6 +777,17 @@ pub const Context = struct {
         return .{ .nanoseconds = ctx.instance.now_ns };
     }
 
+    /// A random (version 4) UUID as lowercase text (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`),
+    /// drawn from the run's seeded randomness (`ctx.io().random`), so a replay gets the same
+    /// values in the same order and each call returns a new one. Use it for IDs workflow code
+    /// sends in commands, such as child workflow IDs or activity arguments. Not secure
+    /// randomness. The text lives in `allocator()`; in a query handler or update validator it
+    /// draws from the handler's own copy of the generator and leaves the run's sequence as it
+    /// was.
+    pub fn randomUuid(ctx: *Context) error{OutOfMemory}![]const u8 {
+        return @import("client.zig").uuid(ctx.allocator(), ctx.io());
+    }
+
     /// Blocks the calling coroutine on a durable timer, as `ctx.io().sleep` does, with
     /// `options` on the timer. To race or cancel it, run it as a coroutine (`io.async`, or a
     /// `std.Io.Select` case): canceling the coroutine cancels the timer and returns
@@ -842,6 +885,21 @@ pub const Context = struct {
     /// server can't index; the run doesn't continue as new.
     pub fn continueAsNew(ctx: *Context, comptime Workflow: type, options: ContinueAsNewOptions, args: Workflow.Args) error{ ContinueAsNew, OutOfMemory, InvalidSearchAttribute } {
         try ctx.instance.requestContinueAsNew(Workflow.workflow_name, options, args);
+        return error.ContinueAsNew;
+    }
+
+    /// Ends this run and starts a new run of the workflow type `workflow_type`, named at run
+    /// time, with the same workflow ID and `args` (a tuple of argument values, encoded here),
+    /// like `continueAsNew`. A dynamic workflow continues as the type it runs as by passing
+    /// `ctx.info().workflow_type`; an empty name does the same. The name is copied.
+    ///
+    ///     return ctx.continueAsNewByName(ctx.info().workflow_type, .{}, .{ count + 1 });
+    ///
+    /// Return the error this gives back from the workflow function; everything else is as for
+    /// `continueAsNew`, and workflow outbound interceptors see both alike.
+    pub fn continueAsNewByName(ctx: *Context, workflow_type: []const u8, options: ContinueAsNewOptions, args: anytype) error{ ContinueAsNew, OutOfMemory, InvalidSearchAttribute } {
+        const name = if (workflow_type.len == 0) ctx.info().workflow_type else workflow_type;
+        try ctx.instance.requestContinueAsNew(name, options, args);
         return error.ContinueAsNew;
     }
 
@@ -1230,7 +1288,8 @@ pub const Context = struct {
 
     /// Answers queries of type `Query` (a `QueryDef`) with `handler(context, args...)`, which
     /// returns `Query.Result` or an error union of it; an error fails the query with the
-    /// error's name. Registering the same query type again replaces its handler.
+    /// error's name. Registering the same query type again replaces its handler. A handler
+    /// for `__stack_trace` (`StackTraceQuery`) replaces the worker's own answer to it.
     ///
     /// Handlers run synchronously on the worker thread, outside any coroutine, possibly after
     /// the workflow function has returned. They must only read workflow state. A handler that
@@ -1280,8 +1339,10 @@ pub const Context = struct {
     /// encodes) or an error union of it; an error fails the query with the error's name.
     /// Registering again replaces the dynamic handler. A handler registered for a query type
     /// with `setQueryHandler` still answers that type. Without a dynamic handler, a query of
-    /// an unregistered type fails with `QueryNotRegistered`, and so do the query types
-    /// Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, `__temporal...`).
+    /// an unregistered type fails with `QueryNotRegistered`. The query types Temporal's tools
+    /// send never reach the dynamic handler: the worker answers `__stack_trace` itself
+    /// (`StackTraceQuery`), and `__enhanced_stack_trace` and `__temporal...` fail with
+    /// `QueryNotRegistered`.
     ///
     /// The handler is read-only and its `context` must outlive the run, as in
     /// `setQueryHandler`; a pointer into the calling coroutine's stack returns
@@ -1779,9 +1840,11 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// the failure with `failure`. If the calling coroutine is canceled while waiting (the
         /// workflow is canceled, or an enclosing future, `Select`, or `Group` is), the child's
         /// cancellation is requested and this returns `error.Canceled`: at once for
-        /// `try_cancel` and `abandon`, and once the child has closed for
-        /// `wait_cancellation_completed`. If that child completes or fails instead, this
-        /// returns its result or error, and the next cancelable wait returns `error.Canceled`.
+        /// `try_cancel` and `abandon`, once the server has recorded the request for
+        /// `wait_cancellation_requested`, and once the child has closed for
+        /// `wait_cancellation_completed` (see `ChildWorkflowCancellationType`). If the child
+        /// completes or fails first, this returns its result or error, and the next
+        /// cancelable wait returns `error.Canceled`.
         pub fn get(f: Self) ChildWorkflowError!T {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .result);
@@ -1817,7 +1880,10 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
             return state.outcome != null;
         }
 
-        /// Requests cancellation of the child, as its `cancellation_type` says.
+        /// Requests cancellation of the child, as its `cancellation_type` says; `get` then
+        /// returns `error.ChildWorkflowFailed` with a canceled failure once the type reports
+        /// the cancellation. Nothing else cancels a child no coroutine is waiting on (see
+        /// `ChildWorkflowOptions`).
         pub fn cancel(f: Self) void {
             if (f.state) |s| f.ctx.instance.cancelChild(s) else |_| {}
         }
@@ -2491,6 +2557,25 @@ pub fn DynamicDefWithOptions(comptime func: anytype, comptime options: DefOption
         pub const registered: Registered = .{ .name = "", .invoke = invoke, .task_failure_errors = options.task_failure_errors };
     };
 }
+
+/// The query Temporal's UI and CLI send to see where a running workflow waits, which a worker
+/// answers for every workflow it runs without any registration: text with an entry per live
+/// coroutine of the run (the workflow function, running signal and update handlers, and the
+/// coroutines the workflow started), saying what it waits on and its call sites in workflow
+/// code. Clients send it like any query:
+///
+///     const where = try client.queryWorkflow(temporal.workflow.StackTraceQuery, arena, id, "", .{});
+///
+/// A handler the workflow registers for `__stack_trace` with `Context.setQueryHandler`
+/// answers it instead; a dynamic query handler never gets it. README.md's "Stack trace query"
+/// section shows the answer.
+///
+/// Answering is read-only: it emits no command and changes no workflow state, so a run
+/// restored from history answers as the run that first got there did. When no query comes,
+/// the cost is a few stores at each wait, recording what it waits on (an activity's type is
+/// copied, cut to 64 bytes, to the waiting coroutine's stack), and no allocation; the
+/// coroutines' stacks are unwound and debug info is read only to answer.
+pub const StackTraceQuery = QueryDef(Instance.stack_trace_query, fn () []const u8);
 
 /// Names a query and its signature: `F` is a function type whose parameters are the query's
 /// arguments and whose return type is its result. Workflows answer it with
