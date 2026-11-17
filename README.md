@@ -1741,6 +1741,32 @@ Notes:
 - `fromPayload` returns `error.UnknownEncoding` for a payload with no `encoding` or with one the converter doesn't handle, which for a protobuf message type is anything but `binary/null` and the two protobuf encodings.
 - It returns `error.InvalidPayload` for `binary/null` into a type that isn't `void` or optional, `binary/plain` into anything but `converter.Bytes` or a byte slice, and JSON or protobuf data that doesn't parse as the type.
 
+`temporal.protojson.encode` and `temporal.protojson.decode` write and read any generated protobuf message as ProtoJSON, the form the Temporal CLI, the Web UI and codec servers use: history exports, codec server requests and answers, and `json/protobuf` payloads, which `converter` converts with them.
+
+<!-- example: converter-protojson -->
+```zig
+const common = temporal.proto.temporal.api.common.v1;
+var payload: common.Payload = .{ .data = &.{ 0x00, 0xff } };
+try payload.metadata.append(arena, .{ .key = "encoding", .value = "binary/plain" });
+const json = try temporal.protojson.encode(arena, common.Payloads{ .payloads = .fromOwnedSlice(try arena.dupe(common.Payload, &.{payload})) });
+// {"payloads":[{"metadata":{"encoding":"YmluYXJ5L3BsYWlu"},"data":"AP8="}]}
+const list = try temporal.protojson.decode(common.Payloads, arena, json);
+try testing.expectEqualSlices(u8, &.{ 0x00, 0xff }, list.payloads.items[0].data);
+
+// Older CLI and Web UI exports write enums by short name.
+const TaskQueue = temporal.proto.temporal.api.taskqueue.v1.TaskQueue;
+const queue = try temporal.protojson.decode(TaskQueue, arena,
+    \\{"name":"orders","kind":"Normal"}
+);
+try testing.expectEqual(.TASK_QUEUE_KIND_NORMAL, queue.kind);
+```
+
+Notes:
+
+- `encode` writes a oneof's fields flat, bytes fields and the values of `map<string, bytes>` fields such as `Payload.metadata` as base64, and enums by full name (`TASK_QUEUE_KIND_NORMAL`), which every Temporal tool reads.
+- `decode` accepts an enum by full name, by number, or by the short name older exports write (`Normal`, `WorkflowExecutionStarted`). Fields the type doesn't know are skipped, and an enum name that matches no value decodes as zero. Anything else that doesn't parse is `error.InvalidProtoJson`.
+- The result lives in the arena passed in and borrows nothing from the text. Messages inside a `google.protobuf.Any` keep their bytes-map values as base64 text and their short enum names unresolved.
+
 #### Payload codecs
 
 A `converter.PayloadCodec` transforms payloads after encoding and before decoding, to compress or encrypt them. Set codecs with `client.Options.codecs`; the client and every worker on it apply them. `converter.ZlibCodec` compresses each payload that compression makes smaller and leaves the others as they were, unless `always_encode` is set.

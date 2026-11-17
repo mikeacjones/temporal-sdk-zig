@@ -106,4 +106,4 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 ## Notes
 
 - `zig fetch` doesn't fetch git submodules, so a project that depends on this SDK by git URL gets no sdk-core and can't build the core. Users fetch a release tarball instead, whose build links the core bundle `build.zig.zon` pins; building from source takes a recursive clone and a path dependency.
-- The generated protobuf code uses zig-protobuf with unknown-field preservation on. Encode ProtoJSON with `.emit_oneof_field_name = false` to get standard ProtoJSON.
+- The generated protobuf code uses zig-protobuf with unknown-field preservation on. Write and read ProtoJSON with `temporal.protojson` (`src/protojson.zig`), not the generated `jsonEncode` and `jsonDecode`: it writes standard ProtoJSON, accepts short enum names, and base64-decodes the values of bytes maps.

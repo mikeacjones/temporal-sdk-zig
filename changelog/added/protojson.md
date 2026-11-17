@@ -1,0 +1,1 @@
+`temporal.protojson.encode` and `temporal.protojson.decode` write and read any generated protobuf message as ProtoJSON, as the Temporal CLI, Web UI and codec servers do: oneof fields flat, bytes and `map<string, bytes>` values as base64, and enums accepted by full name, short name (`WorkflowExecutionStarted`) or number.

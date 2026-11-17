@@ -3,9 +3,9 @@
 //! by `converter`.
 
 const std = @import("std");
-const protobuf = @import("protobuf");
 const proto = @import("../proto.zig");
 const codec = @import("codec.zig");
+const protojson = @import("../protojson.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const http = std.http;
@@ -67,10 +67,10 @@ pub const CodecHandler = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.ReadFailed => return error.ReadFailed,
         };
-        const payloads = parsePayloads(arena, body) catch |err| switch (err) {
+        const payloads = (protojson.decode(Payloads, arena, body) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return respondText(request, .bad_request, try std.fmt.allocPrint(arena, "the body is not a JSON payload list ({{\"payloads\":[...]}}): {t}", .{err}), headers.items),
-        };
+            error.InvalidProtoJson => return respondText(request, .bad_request, "the body is not ProtoJSON of a payload list ({\"payloads\":[...]})", headers.items),
+        }).payloads.items;
 
         const result = (if (encode)
             codec.encodePayloads(h.codecs, arena, io, payloads)
@@ -82,7 +82,7 @@ pub const CodecHandler = struct {
         const json = if (result.len == 0)
             "{\"payloads\":[]}"
         else
-            (Payloads{ .payloads = .fromOwnedSlice(result) }).jsonEncode(.{}, .{ .emit_oneof_field_name = false }, arena) catch return error.OutOfMemory;
+            try protojson.encode(arena, Payloads{ .payloads = .fromOwnedSlice(result) });
         headers.appendAssumeCapacity(.{ .name = "content-type", .value = "application/json" });
         return request.respond(json, .{ .status = .ok, .extra_headers = headers.items });
     }
@@ -96,29 +96,6 @@ pub const CodecHandler = struct {
         return request.respond(text, .{ .status = status, .extra_headers = headers.items });
     }
 };
-
-/// Parses ProtoJSON of a `Payloads` by hand: the protobuf library doesn't base64-decode the
-/// bytes values of maps such as `metadata` yet (beads d51.2.6), and metadata values may be
-/// any bytes. External payload references are dropped.
-fn parsePayloads(arena: Allocator, json: []const u8) ![]Payload {
-    const Json = struct {
-        payloads: []const struct {
-            metadata: std.json.ArrayHashMap([]const u8) = .{},
-            data: []const u8 = "",
-        } = &.{},
-    };
-    const parsed = try std.json.parseFromSliceLeaky(Json, arena, json, .{ .ignore_unknown_fields = true });
-    const out = try arena.alloc(Payload, parsed.payloads.len);
-    for (parsed.payloads, out) |in, *p| {
-        p.* = .{ .data = try protobuf.json.decodeBase64Lenient(arena, in.data) };
-        var it = in.metadata.map.iterator();
-        while (it.next()) |entry| try p.metadata.append(arena, .{
-            .key = entry.key_ptr.*,
-            .value = try protobuf.json.decodeBase64Lenient(arena, entry.value_ptr.*),
-        });
-    }
-    return out;
-}
 
 /// A handler that serves `codecs` (borrowed) over HTTP; see `CodecHandler`.
 pub fn codecHandler(codecs: []const codec.PayloadCodec, options: CodecHandlerOptions) CodecHandler {
@@ -158,19 +135,19 @@ test "the codec handler encodes and decodes payload lists over HTTP" {
 
     var original: Payloads = .{};
     try original.payloads.appendSlice(a, (try converter.toPayloads(a, .{ @as([]const u8, "hello"), @as(i64, 42) })).items);
-    const request_json = try original.jsonEncode(.{}, .{ .emit_oneof_field_name = false }, a);
+    const request_json = try protojson.encode(a, original);
 
     const encoded = try exchange(h, a, try post(a, "/codec/encode", request_json));
     try testing.expect(std.mem.startsWith(u8, encoded, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.indexOf(u8, encoded, "access-control-allow-origin: http://localhost:8233\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, encoded, "content-type: application/json\r\n") != null);
-    const encoded_list = try parsePayloads(a, bodyOf(encoded));
+    const encoded_list = (try protojson.decode(Payloads, a, bodyOf(encoded))).payloads.items;
     try testing.expectEqual(@as(usize, 2), encoded_list.len);
     try testing.expectEqualStrings("binary/zlib", converter.encodingOf(encoded_list[0]).?);
 
     const decoded = try exchange(h, a, try post(a, "/codec/decode?ignored=1", bodyOf(encoded)));
     try testing.expect(std.mem.startsWith(u8, decoded, "HTTP/1.1 200 OK\r\n"));
-    const decoded_list = try parsePayloads(a, bodyOf(decoded));
+    const decoded_list = (try protojson.decode(Payloads, a, bodyOf(decoded))).payloads.items;
     const values = try converter.fromPayloads(struct { []const u8, i64 }, a, decoded_list);
     try testing.expectEqualStrings("hello", values[0]);
     try testing.expectEqual(@as(i64, 42), values[1]);

@@ -12,6 +12,9 @@ pub const search_attributes = @import("search_attributes.zig");
 pub const failure = @import("failure.zig");
 pub const log = @import("log.zig");
 pub const history = @import("history.zig");
+/// ProtoJSON of generated protobuf messages, as Temporal's CLI, Web UI and codec servers
+/// write and read it.
+pub const protojson = @import("protojson.zig");
 pub const metrics = @import("metrics.zig");
 pub const schedule = @import("schedule.zig");
 pub const deployment = @import("deployment.zig");
@@ -31,7 +34,6 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = bridge;
     _ = @import("proto_test.zig");
-    _ = @import("protojson.zig");
     _ = @import("propagation_test.zig");
     _ = @import("interceptor_test.zig");
     _ = @import("metrics_test.zig");
