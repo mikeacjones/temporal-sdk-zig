@@ -376,7 +376,23 @@ test "operator, health and cloud service calls, deadlines and cancellation again
         }
     };
     var task = try testing.io.concurrent(Poll.run, .{ &c, poll });
-    try testing.io.sleep(.fromMilliseconds(200), .awake);
+    // Cancel only once the server lists the poll, so the call is known to be in flight.
+    var tries: usize = 0;
+    polling: while (true) : (tries += 1) {
+        const described = try c.callService(.workflow, "DescribeTaskQueue", arena, .{
+            .namespace = "default",
+            .task_queue = poll.task_queue,
+            .task_queue_type = .TASK_QUEUE_TYPE_WORKFLOW,
+        }, null);
+        for (described.pollers.items) |poller| {
+            if (std.mem.eql(u8, poller.identity, poll.identity)) break :polling;
+        }
+        if (tries == 200) {
+            _ = task.cancel(testing.io) catch {};
+            return error.TestUnexpectedResult;
+        }
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
     const start = std.Io.Timestamp.now(testing.io, .awake);
     try testing.expectError(error.Canceled, task.cancel(testing.io));
     try testing.expect(start.durationTo(std.Io.Timestamp.now(testing.io, .awake)).nanoseconds < 5 * std.time.ns_per_s);

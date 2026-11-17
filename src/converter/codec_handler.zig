@@ -9,7 +9,6 @@ const protojson = @import("../protojson.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const http = std.http;
-const Payload = proto.temporal.api.common.v1.Payload;
 const Payloads = proto.temporal.api.common.v1.Payloads;
 
 const log = std.log.scoped(.temporal);
