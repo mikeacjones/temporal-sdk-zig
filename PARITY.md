@@ -166,7 +166,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Time-skipping test environment | Java, Python, TypeScript, .NET | GA | supported | [Time skipping](README.md#time-skipping) |
 | Activity test doubles in workflow tests | all | GA | supported | [Workflow environment](README.md#workflow-environment) |
 | Activity test environment | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Activity environment](README.md#activity-environment) |
-| Test environment on an existing server or client | Java, Python, TypeScript, .NET, Ruby | GA | partial | `temporal-sdk-zig-d51.11.18`. Missing: a `testing.WorkflowEnvironment` built on a server or client the test already has (`WorkflowEnvironment.Server` is only `dev` or `time_skipping`); a test can connect a `client.Client` to any server and run a `worker.Worker` on it itself. |
+| Test environment on an existing server or client | Java, Python, TypeScript, .NET, Ruby | GA | supported | [Workflow environment](README.md#workflow-environment) |
 | Heartbeats and cancellation in activity tests | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Activity environment](README.md#activity-environment) |
 | Stand-in Nexus handlers in workflow tests | Go, Java | GA | supported | [Serving operations](README.md#serving-operations) |
 | Workflow replayer | all | GA | supported | [Replaying histories](README.md#replaying-histories), [multi-history-replay](samples/multi-history-replay) |
