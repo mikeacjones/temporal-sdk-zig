@@ -67,6 +67,33 @@ fn rpcOptionsExample(client: *temporal.client.Client, request_id: []const u8) !u
     return running;
 }
 
+fn serviceCallsExample(client: *temporal.client.Client, arena: Allocator) ![]const u8 {
+    // example: client-service-calls
+    const errordetails = temporal.proto.temporal.api.errordetails.v1;
+    // Any method of the workflow, operator, cloud, test or health service, with its
+    // generated request and response types.
+    _ = try client.callService(.workflow, "RegisterNamespace", arena, .{
+        .namespace = "orders",
+        .description = "Order processing",
+        .workflow_execution_retention_period = .{ .seconds = 7 * 24 * 60 * 60 },
+    }, null);
+    const described = try client.callService(.workflow, "DescribeNamespace", arena, .{ .namespace = "orders" }, null);
+    const description = described.namespace_info.?.description; // "Order processing"
+
+    // A refused call returns the error of its gRPC status; `failure` holds the status.
+    var failure: ?temporal.client.RpcFailure = null;
+    _ = client.callService(.workflow, "DescribeNamespace", arena, .{ .namespace = "returns" }, &failure) catch |err| switch (err) {
+        error.NotFound => if (try failure.?.detail(errordetails.NamespaceNotFoundFailure, arena)) |missing|
+            std.log.info("no namespace {s}", .{missing.namespace}),
+        else => return err,
+    };
+    // Per-call deadline, retries and metadata come from a view.
+    var patient = try client.withRpcOptions(.{ .timeout = .fromSeconds(10), .retry = true });
+    _ = try patient.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "orders" }, null);
+    // end-example
+    return description;
+}
+
 fn transportExample(gpa: Allocator, io: Io, proxy_password: []const u8) !void {
     // example: client-transport
     var client = try temporal.client.Client.connect(gpa, io, .{
@@ -414,6 +441,11 @@ test "client: examples against a dev server" {
     var client = try temporal.client.Client.connect(gpa, io, server.clientOptions());
     defer client.close();
     try std.testing.expectEqual(0, try rpcOptionsExample(&client, "req-1"));
+    {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        try std.testing.expectEqualStrings("Order processing", try serviceCallsExample(&client, arena_state.allocator()));
+    }
 
     var outbox: Outbox = .{ .gpa = gpa };
     defer gpa.free(outbox.task_token);

@@ -294,7 +294,7 @@ Notes:
 - `reconnect`, `updateApiKey`, and `updateHeaders` on any of them change the connection of all of them, and `reconnect` moves the workers running on any of them. A client from `init` shares its first connection the same way: whichever client needs the server first connects for all.
 - Each `Client.connect` and `Client.init` still creates its own runtime: clients of different servers don't share one.
 
-`Client.withRpcOptions` gives a single call, or a group of calls, its own deadline and gRPC metadata without changing `client.Options`: it returns a view of the client whose calls send `client.RpcOptions`.
+`Client.withRpcOptions` gives a single call, or a group of calls, its own deadline, retries, and gRPC metadata without changing `client.Options`: it returns a view of the client whose calls send `client.RpcOptions`.
 
 <!-- example: client-rpc-options -->
 ```zig
@@ -308,9 +308,10 @@ var quick = try client.withRpcOptions(.{
 const running = try quick.countWorkflows("ExecutionStatus = 'Running'");
 ```
 Notes:
-- Every call made through the view sends its options: workflow start, signal, query, update, describe, list and count, cancel, terminate and reset, history, schedules, worker deployments, standalone activities, asynchronous activity completion and heartbeats, `checkHealth`, and the calls of the handles and iterators the view returns.
+- Every call made through the view sends its options: workflow start, signal, query, update, describe, list and count, cancel, terminate and reset, history, schedules, worker deployments, standalone activities, asynchronous activity completion and heartbeats, `checkHealth`, `callService`, and the calls of the handles and iterators the view returns.
 - A view is for single calls: build workers on the client, not on a view. A worker built on a view keeps the view, so `ctx.client()` in its activities and Nexus handlers returns the view and their calls send its timeout and metadata; on a client from `Client.init` that hasn't connected yet, the worker's first connection waits only as long as the view's timeout.
 - `RpcOptions.timeout` replaces `Options.rpc_timeout` for each call (null keeps it). A call that runs out fails with `error.RpcFailed`, logged with gRPC status 1 ("Timeout expired") or 4 (DEADLINE_EXCEEDED). As with `rpc_timeout`, calls that long-poll aren't limited by it: waiting for a workflow's or an activity's result with `get`, for an update to reach its stage or its outcome, and following history with `wait_new_event`. Cancel the calling task to stop those.
+- `RpcOptions.retry`, when set, decides for every call through the view whether sdk-core retries it with the connection's retry policy (`Options.retry`). Null keeps each call's own choice: the client's operations retry, a workflow reset and `callService` don't. `retry = true` makes a reset retry too, which can reset the workflow twice.
 - `metadata` (ASCII) and `binary_metadata` (names ending in `-bin`, any bytes) are sent along with `Options.headers` and the API key, the long-polls included; for a name in both, the view's value is sent, and an `authorization` entry replaces the API key's. `withRpcOptions` returns `error.InvalidOptions`, logged, for a timeout that isn't positive or a name or value gRPC can't send.
 - The view borrows the client and the options' slices, which must outlive it and the handles it returns. It owns nothing: `close` on it does nothing. `forNamespace` on a view returns a full client without the view's options; a view of a client from `forNamespace` works in that client's namespace.
 
@@ -661,16 +662,47 @@ Notes:
 - The reset point is the event ID of a workflow task's completed, failed, or timed-out event, or its started event, found with `Client.fetchHistory`; a non-positive one is `error.InvalidOptions`, and one the server refuses is `error.RpcFailed`. An unknown workflow or run is `error.NotFound`.
 - A running base run ends terminated, as does the workflow's current run; a closed base run stays as it was. A handle that names the base run's ID, such as one `executeWorkflow` returned, doesn't follow the reset: its `get` returns `error.WorkflowTerminated` (or the run's own result if it had closed). A handle made with an empty run ID reads the latest run when `get` runs, so it gets the new run's result.
 - Signals, updates, and Nexus events recorded after the reset point are reapplied to the new run unless `ResetOptions.reapply_exclude` excludes them. Don't rely on `request_id` to deduplicate: a repeated request may reset again.
-- A reset is sent once, without the automatic retries other calls get. A transport failure is `error.RpcFailed` too, and after it the reset may or may not have happened: before resetting again, describe the base run, whose `raw.workflow_extended_info.reset_run_id` names the new run once it has been reset.
+- A reset is sent once, without the automatic retries other calls get, unless it is made through a view whose `RpcOptions.retry` is `true`, which retries it and can reset twice. A transport failure is `error.RpcFailed` too, and after it the reset may or may not have happened: before resetting again, describe the base run, whose `raw.workflow_extended_info.reset_run_id` names the new run once it has been reset.
 - In `WorkflowExecutionOptionsChanges`, `null` leaves an option as it is, `.remove` clears the override, and `.set` replaces it; changing nothing is `error.InvalidOptions`. A pin (`.set = .{ .pinned = version }`) needs a worker of that version to have polled the workflow's task queue, or it is `error.RpcFailed`; auto-upgrade needs none. A closed workflow is `error.NotFound`.
 - The server's refusals are logged as warnings with its reason.
 <!-- stub: temporal-sdk-zig-d51.5.30 -->
 - Not implemented yet: operations applied after a reset, helpers that pick a reset point, and changing a workflow's priority or time-skipping configuration.
 
 #### Namespaces and raw service access
-<!-- stub: temporal-sdk-zig-d51.5.11 -->
-Not implemented yet.
-The client will register, describe, and update namespaces, and make typed calls to service methods it has no wrapper for.
+
+`Client.callService` calls any method of the workflow, operator, cloud, test, and health services, with the method's generated protobuf request and response types from `temporal.proto`. Namespaces are managed this way, through the workflow service's `RegisterNamespace`, `DescribeNamespace`, `UpdateNamespace`, `ListNamespaces`, and the operator service's `DeleteNamespace`.
+
+<!-- example: client-service-calls -->
+```zig
+const errordetails = temporal.proto.temporal.api.errordetails.v1;
+// Any method of the workflow, operator, cloud, test or health service, with its
+// generated request and response types.
+_ = try client.callService(.workflow, "RegisterNamespace", arena, .{
+    .namespace = "orders",
+    .description = "Order processing",
+    .workflow_execution_retention_period = .{ .seconds = 7 * 24 * 60 * 60 },
+}, null);
+const described = try client.callService(.workflow, "DescribeNamespace", arena, .{ .namespace = "orders" }, null);
+const description = described.namespace_info.?.description; // "Order processing"
+
+// A refused call returns the error of its gRPC status; `failure` holds the status.
+var failure: ?temporal.client.RpcFailure = null;
+_ = client.callService(.workflow, "DescribeNamespace", arena, .{ .namespace = "returns" }, &failure) catch |err| switch (err) {
+    error.NotFound => if (try failure.?.detail(errordetails.NamespaceNotFoundFailure, arena)) |missing|
+        std.log.info("no namespace {s}", .{missing.namespace}),
+    else => return err,
+};
+// Per-call deadline, retries and metadata come from a view.
+var patient = try client.withRpcOptions(.{ .timeout = .fromSeconds(10), .retry = true });
+_ = try patient.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "orders" }, null);
+```
+Notes:
+- The service is a `client.Service` (`.workflow`, `.operator`, `.cloud`, `.test_service` for the time-skipping test server, `.health`) and the method is its name in the service's .proto file. `client.ServiceRequest(service, method)` and `client.ServiceResponse(service, method)` are its types, read at compile time from the generated service declarations, so regenerating the protobuf code adds new methods. A method the service doesn't have, or a streaming one (`Health.Watch`), is a compile error. The response is allocated from the arena passed to the call.
+- The request is sent exactly as given: the payload codecs (`Options.codecs`) and `encode_failure_attributes` aren't applied to the request or the response, the client's namespace and identity aren't filled in, and the call doesn't pass through `Options.interceptors`.
+- A refused call returns the `client.CallServiceError` of its gRPC status: CANCELLED is `error.RpcCanceled`, UNKNOWN (and any code outside 1 to 16) `error.Unknown`, INVALID_ARGUMENT `error.InvalidArgument`, DEADLINE_EXCEEDED `error.DeadlineExceeded`, NOT_FOUND `error.NotFound`, ALREADY_EXISTS `error.AlreadyExists`, PERMISSION_DENIED `error.PermissionDenied`, RESOURCE_EXHAUSTED `error.ResourceExhausted`, FAILED_PRECONDITION `error.FailedPrecondition`, ABORTED `error.Aborted`, OUT_OF_RANGE `error.OutOfRange`, UNIMPLEMENTED `error.Unimplemented`, INTERNAL `error.Internal`, UNAVAILABLE `error.Unavailable`, DATA_LOSS `error.DataLoss`, and UNAUTHENTICATED `error.Unauthenticated`. A call that runs out of its deadline is `error.DeadlineExceeded`, though sdk-core reports it as CANCELLED. `error.RpcFailed` is a failure without a gRPC status, such as a transport error or a first connection that failed; `error.Canceled` means the calling task was canceled, which cancels the call; `error.InvalidResponse` means the answer didn't decode as the response type.
+- The last argument, a `?*?client.RpcFailure`, receives the status of a failed call: `code` (a `client.RpcCode`, null for `error.RpcFailed`), `message`, and the serialized `details`, allocated from the call's arena. `detail(T, arena)` returns the first detail that is a `T`, a generated message type such as those in `temporal.proto.temporal.api.errordetails.v1`, or null. It stays null after a success. With a failure to fill, nothing is logged; without one, a failure other than `error.NotFound` and `error.AlreadyExists` is logged as a warning.
+- A call makes one attempt, within `Options.rpc_timeout` (sdk-core's default without one), long-polls included. A view from `withRpcOptions` gives it its own `timeout`, `retry = true` for retries with the connection's retry policy, and `metadata` and `binary_metadata`.
+- The cloud service is Temporal Cloud's operations API, reached with a client connected to its address with an API key: `.host_port = "saas-api.tmprl.cloud:443"`, `.api_key = api_key`, `.tls = .{}`. A server without it, such as the dev server, answers a cloud call with `error.Unimplemented`.
 
 ### Workflows
 #### Definition
@@ -1767,6 +1799,32 @@ Notes:
 - Decoded strings and slices come from the arena passed in; an encoded payload may borrow the value's bytes.
 - `fromPayload` returns `error.UnknownEncoding` for a payload with no `encoding` or with one the converter doesn't handle, which for a protobuf message type is anything but `binary/null` and the two protobuf encodings.
 - It returns `error.InvalidPayload` for `binary/null` into a type that isn't `void` or optional, `binary/plain` into anything but `converter.Bytes` or a byte slice, and JSON or protobuf data that doesn't parse as the type.
+
+`temporal.protojson.encode` and `temporal.protojson.decode` write and read any generated protobuf message as ProtoJSON, the form the Temporal CLI, the Web UI and codec servers use: history exports, codec server requests and answers, and `json/protobuf` payloads, which `converter` converts with them.
+
+<!-- example: converter-protojson -->
+```zig
+const common = temporal.proto.temporal.api.common.v1;
+var payload: common.Payload = .{ .data = &.{ 0x00, 0xff } };
+try payload.metadata.append(arena, .{ .key = "encoding", .value = "binary/plain" });
+const json = try temporal.protojson.encode(arena, common.Payloads{ .payloads = .fromOwnedSlice(try arena.dupe(common.Payload, &.{payload})) });
+// {"payloads":[{"metadata":{"encoding":"YmluYXJ5L3BsYWlu"},"data":"AP8="}]}
+const list = try temporal.protojson.decode(common.Payloads, arena, json);
+try testing.expectEqualSlices(u8, &.{ 0x00, 0xff }, list.payloads.items[0].data);
+
+// Older CLI and Web UI exports write enums by short name.
+const TaskQueue = temporal.proto.temporal.api.taskqueue.v1.TaskQueue;
+const queue = try temporal.protojson.decode(TaskQueue, arena,
+    \\{"name":"orders","kind":"Normal"}
+);
+try testing.expectEqual(.TASK_QUEUE_KIND_NORMAL, queue.kind);
+```
+
+Notes:
+
+- `encode` writes a oneof's fields flat, bytes fields and the values of `map<string, bytes>` fields such as `Payload.metadata` as base64, and enums by full name (`TASK_QUEUE_KIND_NORMAL`), which every Temporal tool reads.
+- `decode` accepts an enum by full name, by number, or by the short name older exports write (`Normal`, `WorkflowExecutionStarted`). Fields the type doesn't know are skipped, and an enum name that matches no value decodes as zero. Anything else that doesn't parse is `error.InvalidProtoJson`.
+- The result lives in the arena passed in and borrows nothing from the text. Messages inside a `google.protobuf.Any` keep their bytes-map values as base64 text and their short enum names unresolved.
 
 #### Payload codecs
 

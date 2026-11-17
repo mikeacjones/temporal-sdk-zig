@@ -20,6 +20,11 @@ pub const google = struct {
     pub const rpc = @import("proto/google/rpc.pb.zig");
 };
 pub const grpc = struct {
+    pub const gateway = struct {
+        pub const protoc_gen_openapiv2 = struct {
+            pub const options = @import("proto/grpc/gateway/protoc_gen_openapiv2/options.pb.zig");
+        };
+    };
     pub const health = struct {
         pub const v1 = @import("proto/grpc/health/v1.pb.zig");
     };
@@ -37,6 +42,47 @@ pub const temporal = struct {
         };
         pub const callback = struct {
             pub const v1 = @import("proto/temporal/api/callback/v1.pb.zig");
+        };
+        pub const cloud = struct {
+            pub const account = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/account/v1.pb.zig");
+            };
+            pub const auditlog = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/auditlog/v1.pb.zig");
+            };
+            pub const billing = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/billing/v1.pb.zig");
+            };
+            pub const cloudservice = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/cloudservice/v1.pb.zig");
+            };
+            pub const connectivityrule = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/connectivityrule/v1.pb.zig");
+            };
+            pub const identity = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/identity/v1.pb.zig");
+            };
+            pub const namespace = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/namespace/v1.pb.zig");
+            };
+            pub const nexus = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/nexus/v1.pb.zig");
+            };
+            pub const operation = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/operation/v1.pb.zig");
+            };
+            pub const region = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/region/v1.pb.zig");
+            };
+            pub const resource = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/resource/v1.pb.zig");
+            };
+            pub const sink = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/sink/v1.pb.zig");
+            };
+            pub const usage = struct {
+                pub const v1 = @import("proto/temporal/api/cloud/usage/v1.pb.zig");
+            };
         };
         pub const command = struct {
             pub const v1 = @import("proto/temporal/api/command/v1.pb.zig");

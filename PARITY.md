@@ -56,9 +56,9 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Worker deployment management: current and ramping versions | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Worker deployments](README.md#worker-deployments), [worker-versioning](samples/worker-versioning) |
 | Update workflow execution options (versioning override) | Go, Java, Python, TypeScript, .NET | GA | supported | [Workflow reset and execution options](README.md#workflow-reset-and-execution-options) |
 | Reset a workflow | Go, Java | GA, deferred | partial | `temporal-sdk-zig-d51.5.30`. Missing: operations applied after a reset, and helpers that pick a reset point. |
-| Namespace management | Go, Java, TypeScript | GA | partial | `temporal-sdk-zig-d51.2.5`. Missing: typed calls to register, describe, list, and update namespaces, and their README.md section; today a namespace is managed only through raw WorkflowService calls (`(try client.currentConnection()).call`). |
-| Raw gRPC service calls (workflow, operator, and test services) | all | GA | partial | `temporal-sdk-zig-d51.2.5`. Missing: typed calls that take and return the generated protobuf types, and a README.md section; `(try client.currentConnection()).call` already sends encoded requests to the workflow, operator, test, cloud, and health services. |
-| Cloud Operations API client | Go, Java, Python, TypeScript, .NET | pre-release | partial | `temporal-sdk-zig-d51.2.5`. Missing: a typed Cloud Operations client and its README.md section; raw `.cloud` service calls go through `(try client.currentConnection()).call`. |
+| Namespace management | Go, Java, TypeScript | GA | supported | [Namespaces and raw service access](README.md#namespaces-and-raw-service-access) |
+| Raw gRPC service calls (workflow, operator, and test services) | all | GA | supported | [Namespaces and raw service access](README.md#namespaces-and-raw-service-access) |
+| Cloud Operations API client | Go, Java, Python, TypeScript, .NET | pre-release | partial | `unfiled`. Typed calls to every CloudService method go through `Client.callService(.cloud, ...)` on a client connected to the Cloud Operations API with an API key ([Namespaces and raw service access](README.md#namespaces-and-raw-service-access)). Missing: a run against Temporal Cloud. |
 
 ### Workflows
 
