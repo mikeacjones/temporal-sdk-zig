@@ -792,12 +792,12 @@ pub const Client = struct {
         return other;
     }
 
-    /// Returns a view of this client whose calls send `options`: their own deadline and extra
-    /// gRPC metadata, without changing `Options` or any other call. Every call made through
-    /// the view uses them: workflow start, signal, query, update, describe, list and count,
-    /// cancel, terminate and reset, history, schedules, worker deployments, standalone
-    /// activities, asynchronous activity completion and heartbeats, `checkHealth`, and the
-    /// calls of the handles and iterators the view returns.
+    /// Returns a view of this client whose calls send `options`: their own deadline, retries
+    /// and extra gRPC metadata, without changing `Options` or any other call. Every call made
+    /// through the view uses them: workflow start, signal, query, update, describe, list and
+    /// count, cancel, terminate and reset, history, schedules, worker deployments, standalone
+    /// activities, asynchronous activity completion and heartbeats, `checkHealth`,
+    /// `callService`, and the calls of the handles and iterators the view returns.
     ///
     /// A view is for single calls: build workers on this client, not on a view. A worker
     /// built on a view keeps the view, so `ctx.client()` in its activities and Nexus
@@ -813,6 +813,10 @@ pub const Client = struct {
     /// workflow's or an activity's result (`get` on the handles), for an update to reach its
     /// wait stage or its outcome, and following history with `wait_new_event`. Cancel the
     /// calling task to stop those. Null keeps `Options.rpc_timeout`.
+    ///
+    /// `options.retry`, when set, decides for each call whether sdk-core retries it with
+    /// `Options.retry`'s policy. `true` makes a workflow reset retry too, which can reset the
+    /// workflow twice when the transport fails after the server applied the first attempt.
     ///
     /// `options.metadata` and `options.binary_metadata` are sent with each call, the
     /// long-polls included, along with `Options.headers` (as `updateHeaders` last set them)
@@ -904,6 +908,96 @@ pub const Client = struct {
         if (response.status == .SERVING) return;
         log.warn("checking the health of " ++ health_service ++ " failed: the server reports {s}, not SERVING", .{std.enums.tagName(health.HealthCheckResponse.ServingStatus, response.status) orelse "an unknown status"});
         return error.NotServing;
+    }
+
+    /// Calls `method` of `service` (the method's name as the service's .proto file spells
+    /// it, such as "DescribeNamespace") with the generated request type of that method, and
+    /// returns its generated response type, allocated from `arena`. For example
+    /// `client.callService(.workflow, "DescribeNamespace", arena, .{ .namespace = "billing" }, &failure)`.
+    /// The methods are those of the generated service declarations under `temporal.proto`:
+    /// `temporal.api.workflowservice.v1.WorkflowService`, `operatorservice.v1.OperatorService`,
+    /// `cloud.cloudservice.v1.CloudService`, `testservice.v1.TestService` and
+    /// `grpc.health.v1.Health`. A method the service doesn't have is a compile error naming
+    /// both, and so is a streaming method (`Health.Watch`): calls are unary.
+    ///
+    /// The request is sent exactly as given: the payload codecs (`Options.codecs`) and
+    /// `Options.encode_failure_attributes` are applied to neither the request nor the
+    /// response, the client's namespace and identity are not filled in, and the call does not
+    /// pass through `Options.interceptors`.
+    ///
+    /// The call's deadline is `RpcOptions.timeout` on a view from `withRpcOptions`, else
+    /// `Options.rpc_timeout`, else sdk-core's default for the method; it applies to every
+    /// method alike, long-polls included. The call makes one attempt unless a view sets
+    /// `RpcOptions.retry`, and sends a view's metadata with the client's headers and API key.
+    /// Canceling the calling task cancels the call and returns `error.Canceled`.
+    ///
+    /// A call the server refuses returns the error of its gRPC status (see
+    /// `CallServiceError`); `error.RpcFailed` means a failure without one. When `failure` is
+    /// given, it is set to null first, then to the failure for `error.RpcFailed` (with a null
+    /// `code`) and for every status error, its slices allocated from `arena`; nothing is
+    /// logged. Without it, a failure other than `error.NotFound` and `error.AlreadyExists` is
+    /// logged as a warning. Thread-safe.
+    pub fn callService(
+        c: *Client,
+        comptime service: Service,
+        comptime method: []const u8,
+        arena: Allocator,
+        request: ServiceRequest(service, method),
+        failure: ?*?RpcFailure,
+    ) CallServiceError!ServiceResponse(service, method) {
+        const Response = ServiceResponse(service, method);
+        const what = @tagName(service) ++ " service call " ++ method;
+        if (failure) |out| out.* = null;
+        var encoded: Io.Writer.Allocating = .init(arena);
+        request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
+        const connection = c.currentConnection() catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => |e| return e,
+            // Logged by `currentConnection`.
+            else => {
+                if (failure) |out| out.* = .{ .code = null, .message = "connecting to the server failed", .details = "" };
+                return error.RpcFailed;
+            },
+        };
+        var bridge_failure: ?bridge.Connection.RpcFailure = null;
+        defer if (bridge_failure) |f| f.deinit(c.gpa);
+        const deadline_ms = c.callDeadlineMs();
+        const started = Io.Timestamp.now(c.io, .awake);
+        const bytes = connection.call(c.gpa, c.io, service, method, encoded.written(), c.callOptions(false, deadline_ms), &bridge_failure) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => |e| return e,
+            error.InvalidOptions => {
+                const message = "sdk-core rejected the call's metadata";
+                if (failure) |out| out.* = .{ .code = null, .message = message, .details = "" } else log.warn(what ++ " failed: " ++ message, .{});
+                return error.RpcFailed;
+            },
+            error.RpcFailed => {
+                const f = bridge_failure.?;
+                const code: ?RpcCode = if (f.status_code == 0) null else @fromBackingInt(@intCast(f.status_code));
+                var result = statusError(f.status_code, f.message);
+                // The server ends the call at the same deadline (sent as grpc-timeout) by
+                // resetting the stream, which sdk-core reports as CANCELLED without "Timeout
+                // expired" when the reset arrives first.
+                if (result == error.RpcCanceled and deadline_ms > 0 and
+                    started.durationTo(Io.Timestamp.now(c.io, .awake)).toMilliseconds() >= deadline_ms) result = error.DeadlineExceeded;
+                if (failure) |out| {
+                    out.* = .{ .code = code, .message = try arena.dupe(u8, f.message), .details = try arena.dupe(u8, f.details) };
+                } else if (result != error.NotFound and result != error.AlreadyExists) {
+                    if (code) |s| {
+                        log.warn(what ++ " failed: {s} (gRPC status {d})", .{ f.message, @backingInt(s) });
+                    } else log.warn(what ++ " failed: {s}", .{f.message});
+                }
+                return result;
+            },
+        };
+        defer c.gpa.free(bytes);
+        const owned = try arena.dupe(u8, bytes);
+        var reader: Io.Reader = .fixed(owned);
+        return Response.decode(&reader, arena) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => {
+                if (failure == null) log.warn(what ++ " failed: the response doesn't decode as a {s} ({t})", .{ comptime converter.protoMessageType(Response), err });
+                return error.InvalidResponse;
+            },
+        };
     }
 
     /// Frees the client, connected or not, once no call on it is running and the workers on
@@ -2467,10 +2561,10 @@ pub const Client = struct {
 
     /// The bridge's options for one call: `timeout_ms`, and the metadata of a view from
     /// `withRpcOptions`, which sdk-core sends in place of the connection's headers for the
-    /// same key.
+    /// same key. The view's `retry`, when set, replaces `retry`.
     fn callOptions(c: *const Client, retry: bool, timeout_ms: u32) bridge.Connection.CallOptions {
         const o = c.rpc_options orelse return .{ .retry = retry, .timeout_ms = timeout_ms };
-        return .{ .retry = retry, .timeout_ms = timeout_ms, .metadata = o.metadata, .binary_metadata = o.binary_metadata };
+        return .{ .retry = o.retry orelse retry, .timeout_ms = timeout_ms, .metadata = o.metadata, .binary_metadata = o.binary_metadata };
     }
 
     /// Whether the core retries a failed call. Not a reset: an attempt the server applied
@@ -2618,7 +2712,158 @@ pub const StartWorkflowOptions = struct {
     context: ?*const propagation.Values = null,
 };
 
-/// A call's own deadline and gRPC metadata, which replace or add to the client's
+/// The gRPC services of a connection, for `Client.callService`. `.test_service` is the
+/// time-skipping test server's.
+pub const Service = bridge.Connection.Service;
+
+/// The generated declaration of `service` (such as
+/// `temporal.api.workflowservice.v1.WorkflowService`), whose fields are its methods.
+fn ServiceDecl(comptime service: Service) type {
+    return switch (service) {
+        .workflow => proto.temporal.api.workflowservice.v1.WorkflowService(anyopaque, error{}),
+        .operator => proto.temporal.api.operatorservice.v1.OperatorService(anyopaque, error{}),
+        .cloud => proto.temporal.api.cloud.cloudservice.v1.CloudService(anyopaque, error{}),
+        .test_service => proto.temporal.api.testservice.v1.TestService(anyopaque, error{}),
+        .health => proto.grpc.health.v1.Health(anyopaque, error{}),
+    };
+}
+
+/// The signature of `method` on `service` as the generated declaration gives it: the
+/// userdata, the request, and the response in an error union.
+fn serviceMethod(comptime service: Service, comptime method: []const u8) std.builtin.Type.Fn {
+    comptime {
+        const Decl = ServiceDecl(service);
+        const what = "the " ++ @tagName(service) ++ " service (" ++ Decl.package ++ "." ++ Decl.service_name ++ ")";
+        if (!@hasField(Decl, method)) @compileError(what ++ " has no method \"" ++ method ++ "\"");
+        const field = @typeInfo(@FieldType(Decl, method));
+        if (field != .pointer or @typeInfo(field.pointer.child) != .@"fn")
+            @compileError(what ++ " has no method \"" ++ method ++ "\"");
+        const f = @typeInfo(field.pointer.child).@"fn";
+        if (f.param_types.len != 2 or f.param_types[1] == null or f.return_type == null or @typeInfo(f.return_type.?) != .error_union)
+            @compileError(what ++ " method \"" ++ method ++ "\" streams; Client.callService makes unary calls only");
+        return f;
+    }
+}
+
+/// The generated request type of `method` on `service`, such as
+/// `ServiceRequest(.workflow, "DescribeNamespace")`, which is
+/// `temporal.api.workflowservice.v1.DescribeNamespaceRequest`. A method `service` doesn't
+/// have is a compile error naming both.
+pub fn ServiceRequest(comptime service: Service, comptime method: []const u8) type {
+    return serviceMethod(service, method).param_types[1].?;
+}
+
+/// The generated response type of `method` on `service`; see `ServiceRequest`.
+pub fn ServiceResponse(comptime service: Service, comptime method: []const u8) type {
+    return @typeInfo(serviceMethod(service, method).return_type.?).error_union.payload;
+}
+
+/// How `Client.callService` fails. A call the server refuses returns the error of its gRPC
+/// status:
+///
+/// - CANCELLED (1): `RpcCanceled`, except the call's deadline (`RpcOptions.timeout` or
+///   `Options.rpc_timeout`), which arrives as CANCELLED, with the message "Timeout expired"
+///   when sdk-core ends the call and another when the server's reset of the stream comes
+///   first, and returns `DeadlineExceeded`: CANCELLED is the deadline when its message is
+///   "Timeout expired" or the call ran for its whole deadline;
+/// - UNKNOWN (2): `Unknown`, as is any code outside 1 to 16;
+/// - INVALID_ARGUMENT (3): `InvalidArgument`;
+/// - DEADLINE_EXCEEDED (4): `DeadlineExceeded`;
+/// - NOT_FOUND (5): `NotFound`;
+/// - ALREADY_EXISTS (6): `AlreadyExists`;
+/// - PERMISSION_DENIED (7): `PermissionDenied`;
+/// - RESOURCE_EXHAUSTED (8): `ResourceExhausted`;
+/// - FAILED_PRECONDITION (9): `FailedPrecondition`;
+/// - ABORTED (10): `Aborted`;
+/// - OUT_OF_RANGE (11): `OutOfRange`;
+/// - UNIMPLEMENTED (12): `Unimplemented`;
+/// - INTERNAL (13): `Internal`;
+/// - UNAVAILABLE (14): `Unavailable`;
+/// - DATA_LOSS (15): `DataLoss`;
+/// - UNAUTHENTICATED (16): `Unauthenticated`.
+pub const CallServiceError = error{
+    OutOfMemory,
+    /// The calling task was canceled; the call was canceled in sdk-core.
+    Canceled,
+    /// The call failed without a gRPC status: the client's first connection failed (see
+    /// `Client.init`), the transport failed, or sdk-core doesn't dispatch the method.
+    RpcFailed,
+    /// The server's answer didn't decode as the method's response type.
+    InvalidResponse,
+    RpcCanceled,
+    Unknown,
+    InvalidArgument,
+    DeadlineExceeded,
+    NotFound,
+    AlreadyExists,
+    PermissionDenied,
+    ResourceExhausted,
+    FailedPrecondition,
+    Aborted,
+    OutOfRange,
+    Unimplemented,
+    Internal,
+    Unavailable,
+    DataLoss,
+    Unauthenticated,
+};
+
+/// The `CallServiceError` of gRPC status `code`, whose message is `message`: see there.
+fn statusError(code: u32, message: []const u8) CallServiceError {
+    return switch (code) {
+        0 => error.RpcFailed,
+        1 => if (std.mem.indexOf(u8, message, "Timeout expired") != null) error.DeadlineExceeded else error.RpcCanceled,
+        3 => error.InvalidArgument,
+        4 => error.DeadlineExceeded,
+        5 => error.NotFound,
+        6 => error.AlreadyExists,
+        7 => error.PermissionDenied,
+        8 => error.ResourceExhausted,
+        9 => error.FailedPrecondition,
+        10 => error.Aborted,
+        11 => error.OutOfRange,
+        12 => error.Unimplemented,
+        13 => error.Internal,
+        14 => error.Unavailable,
+        15 => error.DataLoss,
+        16 => error.Unauthenticated,
+        else => error.Unknown,
+    };
+}
+
+/// Why a `Client.callService` call failed. The slices borrow the arena passed to the call.
+pub const RpcFailure = struct {
+    /// The gRPC status code, or null when the call failed without a gRPC status
+    /// (`error.RpcFailed`).
+    code: ?RpcCode,
+    /// The server's message, or sdk-core's for a failure without a status.
+    message: []const u8,
+    /// Serialized google.rpc.Status, possibly empty.
+    details: []const u8,
+
+    /// The first detail of the status that is a `T`, a generated protobuf message type such
+    /// as `temporal.proto.temporal.api.errordetails.v1.NamespaceNotFoundFailure`, decoded
+    /// from `arena`; null when there is none or it doesn't decode. A detail is a `T` when its
+    /// type URL ends in "/" and `converter.protoMessageType(T)`.
+    pub fn detail(f: RpcFailure, comptime T: type, arena: Allocator) error{OutOfMemory}!?T {
+        var reader: Io.Reader = .fixed(f.details);
+        const status = proto.google.rpc.Status.decode(&reader, arena) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        for (status.details.items) |any| {
+            if (!std.mem.endsWith(u8, any.type_url, comptime "/" ++ converter.protoMessageType(T))) continue;
+            var detail_reader: Io.Reader = .fixed(any.value);
+            return T.decode(&detail_reader, arena) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => null,
+            };
+        }
+        return null;
+    }
+};
+
+/// A call's own deadline, retries and gRPC metadata, which replace or add to the client's
 /// (`Options.rpc_timeout` and `Options.headers`) for the calls made with them; see
 /// `Client.withRpcOptions`. The slices are borrowed.
 pub const RpcOptions = struct {
@@ -2633,6 +2878,13 @@ pub const RpcOptions = struct {
     /// gRPC binary headers sent with each call: names end in "-bin", and values are any
     /// bytes (gRPC sends them base64-encoded).
     binary_metadata: []const bridge.bytes.MetadataEntry = &.{},
+    /// Whether sdk-core retries a call that fails with a retryable status, with the
+    /// connection's retry policy (`Options.retry`). Null keeps each call's own choice: the
+    /// client's operations retry (a workflow reset does not), and `Client.callService` makes
+    /// one attempt. Set, it replaces that choice for every call made with these options:
+    /// `true` makes a workflow reset retry too, which can reset the workflow twice when the
+    /// transport fails after the server applied the first attempt.
+    retry: ?bool = null,
 
     fn check(o: RpcOptions, rejection: *Rejection) error{InvalidOptions}!void {
         if (o.timeout) |t| if (t.nanoseconds <= 0)

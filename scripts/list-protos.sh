@@ -13,11 +13,11 @@ list() {
   echo "pub const root = \"$protos\";"
   echo ""
   echo "/// Directories passed to protoc with -I, relative to \`root\`."
-  echo "pub const include_dirs = [_][]const u8{ \"api_upstream\", \"local\", \"testsrv_upstream\", \"\" };"
+  echo "pub const include_dirs = [_][]const u8{ \"api_upstream\", \"api_cloud_upstream\", \"local\", \"testsrv_upstream\", \"\" };"
   echo ""
   echo "/// Files compiled, relative to \`root\`."
   echo "pub const files = [_][]const u8{"
-  (cd "$root/$protos" && find api_upstream/temporal local testsrv_upstream google/rpc grpc -name '*.proto' | LC_ALL=C sort) |
+  (cd "$root/$protos" && find api_upstream/temporal api_cloud_upstream/temporal local testsrv_upstream google/rpc grpc -name '*.proto' | LC_ALL=C sort) |
     sed 's|.*|    "&",|'
   echo "};"
 }

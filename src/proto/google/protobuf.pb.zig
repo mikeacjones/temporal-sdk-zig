@@ -6,33 +6,21 @@ const protobuf = @import("protobuf");
 const fd = protobuf.fd;
 const fdf = protobuf.fdf;
 
-pub const Duration = protobuf.wkt.Duration;
-
 pub const Timestamp = protobuf.wkt.Timestamp;
 
-pub const Empty = protobuf.wkt.Empty;
+pub const NullValue = protobuf.wkt.NullValue;
 
-pub const FieldMask = protobuf.wkt.FieldMask;
+pub const Struct = protobuf.wkt.Struct;
 
-pub const DoubleValue = protobuf.wkt.DoubleValue;
+pub const Value = protobuf.wkt.Value;
 
-pub const FloatValue = protobuf.wkt.FloatValue;
+pub const ListValue = protobuf.wkt.ListValue;
 
-pub const Int64Value = protobuf.wkt.Int64Value;
-
-pub const UInt64Value = protobuf.wkt.UInt64Value;
-
-pub const Int32Value = protobuf.wkt.Int32Value;
-
-pub const UInt32Value = protobuf.wkt.UInt32Value;
-
-pub const BoolValue = protobuf.wkt.BoolValue;
-
-pub const StringValue = protobuf.wkt.StringValue;
-
-pub const BytesValue = protobuf.wkt.BytesValue;
+pub const Duration = protobuf.wkt.Duration;
 
 pub const Any = protobuf.wkt.Any;
+
+pub const Empty = protobuf.wkt.Empty;
 
 /// The full set of known editions.
 pub const Edition = enum(i32) {
@@ -2909,3 +2897,23 @@ pub const GeneratedCodeInfo = struct {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
 };
+
+pub const FieldMask = protobuf.wkt.FieldMask;
+
+pub const DoubleValue = protobuf.wkt.DoubleValue;
+
+pub const FloatValue = protobuf.wkt.FloatValue;
+
+pub const Int64Value = protobuf.wkt.Int64Value;
+
+pub const UInt64Value = protobuf.wkt.UInt64Value;
+
+pub const Int32Value = protobuf.wkt.Int32Value;
+
+pub const UInt32Value = protobuf.wkt.UInt32Value;
+
+pub const BoolValue = protobuf.wkt.BoolValue;
+
+pub const StringValue = protobuf.wkt.StringValue;
+
+pub const BytesValue = protobuf.wkt.BytesValue;
