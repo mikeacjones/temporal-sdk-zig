@@ -1,0 +1,2 @@
+`testing.WorkflowEnvironment.startTimeSkippingWithOptions` starts the time-skipping environment with the client options `startWithOptions` takes (codecs, a logger, propagators, interceptors, metrics); `dev_server_extra_args` there returns `error.InvalidOptions`.
+`testing.WorkflowEnvironment.getResultWithOptions` and `getResultByNameWithOptions` take `client.WorkflowRun.GetOptions`, so a test can stop at one run of a continue-as-new chain (`.follow_runs = false` returns `error.WorkflowContinuedAsNew`) and still have time skipped and the run replayed.

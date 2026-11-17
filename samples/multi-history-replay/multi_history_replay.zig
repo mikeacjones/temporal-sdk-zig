@@ -1,7 +1,8 @@
-//! Multi-history replay: list the runs of a workflow ID through a visibility query, fetch
-//! each run's history, and replay them all against the current workflow code through one
-//! replay worker. A run that no longer replays shows that a code change isn't backward
-//! compatible with workflows already on the server.
+//! Multi-history replay: replay every run of a workflow ID that a visibility query lists
+//! against the current workflow code through one replay worker
+//! (`WorkflowReplayer.replayListedWorkflows` lists the runs and fetches their histories).
+//! A run that no longer replays shows that a code change isn't backward compatible with
+//! workflows already on the server.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -14,37 +15,6 @@ pub const task_queue = "multiple-history-replay";
 pub const workflow_id = "multiple_history_replay_workflowID";
 pub const query = "WorkflowId='" ++ workflow_id ++ "'";
 
-/// Feeds `WorkflowReplayer.replayHistories` the histories of the runs a visibility query
-/// lists, fetching each one as replay reaches it.
-const ListedHistories = struct {
-    client: *temporal.client.Client,
-    executions: temporal.client.WorkflowExecutionIterator,
-    count: usize = 0,
-
-    pub fn next(h: *ListedHistories, arena: Allocator) !?temporal.history.WorkflowHistory {
-        const info = try h.executions.next(arena) orelse return null;
-        h.count += 1;
-        return .{
-            .workflow_id = info.workflow_id,
-            .history = try h.client.fetchHistory(arena, info.workflow_id, info.run_id),
-        };
-    }
-};
-
-/// Replays the history of every run matching `visibility_query` with `replayer`'s workflows
-/// and returns one result per run, in listing order. A run that fails to replay doesn't stop
-/// the rest; listing or fetching errors are returned. Results are allocated from `arena`.
-pub fn replayListed(
-    replayer: *WorkflowReplayer,
-    arena: Allocator,
-    client: *temporal.client.Client,
-    visibility_query: []const u8,
-) ![]WorkflowReplayer.ReplayResult {
-    var histories: ListedHistories = .{ .client = client, .executions = try client.listWorkflows(visibility_query, .{}) };
-    defer histories.executions.deinit();
-    return replayer.replayHistories(arena, &histories);
-}
-
 /// Replays every run of `workflow_id` against the hello world workflow and logs each result.
 /// Returns whether all of them replayed cleanly; failures to list, fetch, or replay are logged.
 pub fn replayAll(gpa: Allocator, io: std.Io, arena: Allocator, client: *temporal.client.Client) bool {
@@ -56,7 +26,7 @@ pub fn replayAll(gpa: Allocator, io: std.Io, arena: Allocator, client: *temporal
     };
 
     std.log.info("Listing workflows Query={s}", .{query});
-    const results = replayListed(&replayer, arena, client, query) catch |err| {
+    const results = replayer.replayListedWorkflows(arena, client, query) catch |err| {
         std.log.err("Error listing or fetching workflow histories for \"{s}\": {t}", .{ query, err });
         return false;
     };

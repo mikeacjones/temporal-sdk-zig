@@ -1,0 +1,1 @@
+`testing.WorkflowEnvironment.fromClient` makes a workflow environment on a server the test already runs, through a `client.Client` it has: it starts and stops no server and leaves the client open. See [Workflow environment](https://github.com/mikeacjones/temporal-sdk-zig#workflow-environment).

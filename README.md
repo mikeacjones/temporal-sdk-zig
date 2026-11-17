@@ -1956,7 +1956,59 @@ Notes:
 - `registerActivityAs` runs a double under the activity's name; registering the activity as well returns `error.AlreadyRegistered`.
 - `startWorkflow` returns the run without waiting, for tests that signal, query, or update it before `getResult`.
 - `createNexusEndpoint` creates a Nexus endpoint on the dev server that routes to a namespace and task queue (the environment's by default), for workflows that call [Nexus operations](#calling-operations-from-workflows); a name that exists returns `error.AlreadyExists`. `testing.createNexusEndpoint(client, name, target)` does the same through any client, for a server without an environment such as a `testing.DevServer`; its target names both the namespace, which must exist on the server, and the task queue.
-- `startWithOptions` takes extra dev server arguments, codecs, a logger, propagators, worker and client interceptors, and metrics, borrowed for the environment's life. `startTimeSkipping` takes no options.
+- `startWithOptions` takes extra dev server arguments, codecs, a logger, propagators, worker and client interceptors, and metrics, borrowed for the environment's life. `startTimeSkippingWithOptions` takes the same options for the [time-skipping test server](#time-skipping), except the dev server arguments.
+
+`getResult` and `getResultByName` follow a run's continue-as-new, cron, and retry runs to the last one and replay that run. `getResultWithOptions` and `getResultByNameWithOptions` take `client.WorkflowRun.GetOptions`: with `.follow_runs = false` they wait for the run the handle names alone (for a handle without a run ID, the run that is latest when the call starts) and replay that run, so a run that continued as new is replayed and then returns `error.WorkflowContinuedAsNew`, while a run that failed and was retried, or a cron run that finished, returns its own failure or result: what the workflow code did in that run decides, whatever its retry policy or cron schedule. On the time-skipping test server they unlock time skipping for the wait and lock it again, as `getResult` does.
+
+<!-- example: testing-get-result-options -->
+```zig
+fn chainStep(ctx: *workflow.Context, step: u32) !u32 {
+    if (step < 2) return ctx.continueAsNew(ChainStep, .{}, .{step + 1});
+    return step;
+}
+
+test "testing: stop at the first run of a continue-as-new chain" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChainStep);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try env.startWorkflow(ChainStep, .{}, .{0});
+    defer run.deinit();
+    // Waits for the first run alone, and replays it.
+    try testing.expectError(error.WorkflowContinuedAsNew, env.getResultWithOptions(ChainStep, &run, .{ .follow_runs = false }, arena.allocator(), null));
+    // Follows the chain to the last run's result, and replays the last run.
+    try testing.expectEqual(2, try env.getResult(ChainStep, &run, arena.allocator(), null));
+}
+```
+
+`WorkflowEnvironment.fromClient` makes an environment on a server the test already runs, such as a shared dev server, one started with special settings, or a staging namespace, through a `client.Client` the test has:
+
+<!-- example: testing-existing-client -->
+```zig
+test "testing: a workflow environment on the test's own server" {
+    var server = try temporal.testing.DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var client = try temporal.client.Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer client.close();
+
+    const env = try WorkflowEnvironment.fromClient(testing.allocator, testing.io, &client);
+    defer env.deinit(); // stops the environment's worker; the client and the server stay up
+    try env.registerWorkflow(Greeting);
+    try env.registerActivityAs(Greet, greetDouble);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(Greeting, .{"Ziggy"}, arena.allocator(), null);
+    try testing.expectEqualStrings("Hi, Ziggy!", result);
+}
+```
+
+Notes:
+
+- It starts no server and `deinit` stops none: it stops the environment's worker and leaves the server and the client as they were. The environment works through its own client for the same namespace on the client's connection (`Client.forNamespace`), so the two may be closed in either order, and it uses the client's codecs, logger, propagators, interceptors, and metrics.
+- Workers, activity test doubles, and workflows behave as on the environment's own dev server, in the client's namespace and on a fresh task queue.
+- The environment never skips time, even on a time-skipping test server: `env.sleep` is a real sleep and `env.now()` the wall clock, as on the dev server. Use `startTimeSkipping` for time skipping.
+- `env.server` is `.existing`. Whatever the test relies on that `start` sets up on its own dev server, such as `testing.custom_search_attributes` or extra dev server arguments, the test's server must have.
 
 #### Time skipping
 
@@ -1989,6 +2041,46 @@ Notes:
 - `env.now()` is the server's time, skipped time included.
 - The test server is downloaded once and cached; by default it's the release sdk-core picks, usually the newest. Pin one with `.test_server_version = "v1.40.0"` in the SDK's `b.dependency` arguments, or for a single server with `testing.TestServer.Options.version`. The 1.41.0 release never delivers a workflow task that carries an update, so a test that sends one waits forever.
 
+`WorkflowEnvironment.startTimeSkippingWithOptions` takes the options `startWithOptions` takes: codecs, the failure attribute encoding, a logger, propagators, worker and client interceptors, and metrics, which the worker and the replay of each finished run use too:
+
+<!-- example: testing-time-skipping-options -->
+```zig
+/// Counts the workflow runs it sees start, on the worker and in replays.
+const CountRuns = struct {
+    runs: std.atomic.Value(u32) = .init(0),
+
+    pub fn interceptWorkflow(c: *CountRuns, _: *workflow.Context) error{OutOfMemory}!temporal.interceptor.Workflow {
+        _ = c.runs.fetchAdd(1, .monotonic);
+        return .{};
+    }
+};
+
+test "testing: time skipping with a codec and a worker interceptor" {
+    const zlib: temporal.converter.ZlibCodec = .{};
+    const codecs = [_]temporal.converter.PayloadCodec{zlib.codec()};
+    var counter: CountRuns = .{};
+    const interceptors = [_]temporal.interceptor.Worker{.from(CountRuns, &counter)};
+    const env = try WorkflowEnvironment.startTimeSkippingWithOptions(testing.allocator, testing.io, .{
+        .codecs = &codecs,
+        .worker_interceptors = &interceptors,
+    });
+    defer env.deinit();
+    try env.registerWorkflow(Reminder);
+    try env.registerActivity(Greet);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(Reminder, .{"Ziggy"}, arena.allocator(), null);
+    try testing.expectEqualStrings("Hello, Ziggy!", result);
+    // Once on the worker, once in the replay that checks the run's history.
+    try testing.expectEqual(2, counter.runs.load(.monotonic));
+}
+```
+
+Notes:
+
+- `dev_server_extra_args` applies only to the dev server: a non-empty one returns `error.InvalidOptions` before any server starts.
+- The options are borrowed for the environment's life.
+
 #### Activity environment
 
 `testing.ActivityEnvironment` calls an activity function directly with a test context, without a server.
@@ -2010,7 +2102,7 @@ test "testing: an activity on its own" {
 Notes:
 
 - The result comes from the arena passed in; the failure a `ctx.fail` call describes isn't exposed.
-- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, and `metrics` to control what the activity sees; `info.activity_type` is always the activity's name. Its timeouts and `retry_policy` start out null and its `priority` zero.
+- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, `metrics`, and `logger` to control what the activity sees; `info.activity_type` is always the activity's name. Its timeouts and `retry_policy` start out null and its `priority` zero.
 - `executeActivity` takes the environment by pointer (`var env`) and runs the activity on a task of its own while it waits; canceling the calling task cancels the activity, without a `cancelReason`.
 
 `cancel(reason)` cancels the running activity as a worker does, and `stopWorker()` fires the worker-stop signal:
@@ -2059,6 +2151,64 @@ Notes:
 - `cancel` reaches the activities running at the time, from any thread; with none running it does nothing. An activity already canceled keeps its first reason.
 - After `stopWorker`, every activity the environment runs, now or later, sees `isWorkerStopping()` true.
 
+Set `logger` to a `log.Sink` to read or silence what the activity logs through `ctx.logger()`:
+
+<!-- example: testing-activity-logger -->
+```zig
+/// Keeps the levels and `ActivityID` fields of the records it gets. The activity logs from a
+/// task of its own, so the sink takes a lock.
+const Captured = struct {
+    mutex: std.Io.Mutex = .init,
+    levels: [4]temporal.log.Level = undefined,
+    ids: [4][16]u8 = undefined,
+    count: usize = 0,
+
+    fn sink(c: *Captured) temporal.log.Sink {
+        return .{ .ptr = c, .vtable = &.{ .log = record } };
+    }
+
+    fn record(ptr: ?*anyopaque, level: temporal.log.Level, _: []const u8, fields: []const temporal.log.Field) void {
+        const c: *Captured = @ptrCast(@alignCast(ptr.?));
+        c.mutex.lockUncancelable(testing.io);
+        defer c.mutex.unlock(testing.io);
+        if (c.count == c.levels.len) return;
+        c.levels[c.count] = level;
+        for (fields) |f| if (std.mem.eql(u8, f.key, "ActivityID")) {
+            // The fields are only valid during the call: copy what the test reads.
+            const n = @min(f.value.len, c.ids[0].len);
+            @memcpy(c.ids[c.count][0..n], f.value[0..n]);
+        };
+        c.count += 1;
+    }
+};
+
+fn charge(ctx: *activity.Context, amount: u32) !void {
+    ctx.logger().info("charging", .{ .amount = amount });
+    ctx.logger().err("card declined", .{ .amount = amount }); // through std.log, this fails the test
+}
+
+test "testing: read what an activity logs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var captured: Captured = .{};
+    var env: ActivityEnvironment = .init(testing.io);
+    env.logger = captured.sink();
+    env.info.activity_id = "charge-1";
+
+    try env.executeActivity(activity.Def("charge", charge), .{@as(u32, 10)}, arena.allocator());
+    try testing.expectEqual(2, captured.count);
+    try testing.expectEqual(.info, captured.levels[0]);
+    try testing.expectEqual(.err, captured.levels[1]);
+    try testing.expectEqualStrings("charge-1", captured.ids[1][0.."charge-1".len]);
+}
+```
+
+Notes:
+
+- Each record carries the context fields a worker adds: `ActivityID`, `ActivityType`, and `Attempt`, then `WorkflowType`, `WorkflowID`, and `RunID` when `info.workflow_id` isn't empty, all taken from `info`.
+- Without `logger`, the activity logs to `std.log` with no context fields, where an error-level message fails the Zig test that runs it.
+- The sink is borrowed and must outlive the activities it receives records from. It is called from the activity's task, so it must be thread-safe, and the message and fields are only valid during the call.
+
 #### Replaying histories
 
 `testing.WorkflowReplayer` replays recorded histories against current workflow code to catch changes that would break running workflows.
@@ -2082,6 +2232,7 @@ Notes:
 
 - `replayHistoryJson` and `replayHistoryFromJsonFile` read histories exported by the Temporal CLI or Web UI.
 - `replayHistories` replays many histories and returns a result for each instead of stopping at the first failure.
+- `replayListedWorkflows(arena, client, query)` replays every run a visibility query lists, such as `WorkflowType='greeting' AND ExecutionStatus='Completed'`, through one replay worker. It pages through the listing and fetches each run's history itself, and returns a result per run with its workflow ID, run ID, and any error and message; a listing or fetch failure ends the batch with an error. Only the results are allocated from `arena`; the histories are fetched one at a time into memory the call reuses and frees, so a batch holds the results, one listing page, and about twice the largest single history. A run with no workflow task yet, such as a cron run waiting for its next fire, gets a clean result.
 - Set `workflow_id` and `initWithOptions` to the original values when the workflow's commands depend on them.
 
 #### Metrics recorder

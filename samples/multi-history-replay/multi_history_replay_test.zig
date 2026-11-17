@@ -47,7 +47,7 @@ test "replays every listed run of the workflow ID and catches a change that brea
     var replayer: WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .task_queue = env.task_queue });
     defer replayer.deinit();
     try replayer.registerWorkflow(helloworld.HelloWorld);
-    const results = try multi_history_replay.replayListed(&replayer, a, &env.client, multi_history_replay.query);
+    const results = try replayer.replayListedWorkflows(a, &env.client, multi_history_replay.query);
     try testing.expectEqual(@as(usize, runs), results.len);
     for (results) |result| {
         try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), result.err);
@@ -60,7 +60,7 @@ test "replays every listed run of the workflow ID and catches a change that brea
     var changed: WorkflowReplayer = .init(testing.allocator, testing.io);
     defer changed.deinit();
     try changed.registerWorkflow(ChangedHelloWorld);
-    const changed_results = try multi_history_replay.replayListed(&changed, a, &env.client, multi_history_replay.query);
+    const changed_results = try changed.replayListedWorkflows(a, &env.client, multi_history_replay.query);
     try testing.expectEqual(@as(usize, runs), changed_results.len);
     for (changed_results) |result| {
         try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, error.Nondeterminism), result.err);

@@ -1,0 +1,1 @@
+`testing.ActivityEnvironment.logger` takes a `log.Sink` that receives what the activity logs through `ctx.logger()`, with the context fields a worker adds, so a test can read or silence the activity's logs. See [Activity environment](https://github.com/mikeacjones/temporal-sdk-zig#activity-environment).
