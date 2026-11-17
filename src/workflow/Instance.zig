@@ -807,7 +807,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         if (ran) inst.runUntilQuiet();
         try inst.fillUpdateTraces(out);
         try inst.rejectUnhandledUpdates();
-        try inst.finishIfDone();
+        try inst.finishIfDone(out);
         if (ran and !inst.finished and inst.task_failure == null) try inst.checkMemoryLimit(out);
     }
 
@@ -998,9 +998,11 @@ pub const stack_trace_query = "__stack_trace";
 /// read only when the query arrives. From the read of debug info to the end of the answer,
 /// `Scheduler.sdk_work` marks the time as SDK work, which the worker's deadlock detection
 /// doesn't count: the first read of debug info in a process can outlast
-/// `worker.Options.deadlock_detection_timeout`, and isn't workflow code. When workflow code
-/// asks for the answer from its own coroutine (an interceptor calling
-/// `WorkflowInbound.Next.handleQuery`), the flag stays clear and the time counts as its own.
+/// `worker.Options.deadlock_detection_timeout`, and isn't workflow code. The stack trace text
+/// of a failed workflow or update is built under the same mark (`failureTraceText`), so a
+/// failure's stack trace doesn't count either. When workflow code asks for the answer from
+/// its own coroutine (an interceptor calling `WorkflowInbound.Next.handleQuery`), the flag
+/// stays clear and the time counts as its own.
 fn stackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}![]const u8 {
     var text: std.Io.Writer.Allocating = .init(out);
     errdefer text.deinit();
@@ -1443,9 +1445,22 @@ fn fillUpdateTraces(inst: *Instance, out: Allocator) error{OutOfMemory}!void {
             else => continue,
         } else continue;
         for (inst.update_traces.items) |t| if (std.mem.eql(u8, t.protocol_instance_id, response.protocol_instance_id)) {
-            rejected.stack_trace = try failure_mod.addressesText(out, t.addresses);
+            rejected.stack_trace = try inst.failureTraceText(out, t.addresses);
         };
     }
+}
+
+/// The text of a failure's stack trace (`failure.addressesText`), built as SDK work: as for
+/// the stack trace query (`writeStackTrace`), the first read of debug info in a process can
+/// outlast `worker.Options.deadlock_detection_timeout` and isn't workflow code, so
+/// `Scheduler.sdk_work` marks the time and the worker's deadlock detection doesn't count it.
+/// Called from inside a coroutine, the time stays the workflow code's and the flag clear, as
+/// it must while a fiber runs. Memory comes from `out`.
+fn failureTraceText(inst: *Instance, out: Allocator, addresses: []const usize) error{OutOfMemory}![]const u8 {
+    const sdk_work = inst.sched.currentFiber() == null;
+    if (sdk_work) inst.sched.sdk_work.store(true, .release);
+    defer if (sdk_work) inst.sched.sdk_work.store(false, .release);
+    return failure_mod.addressesText(out, addresses);
 }
 
 /// The handler run executing now, or null in the workflow function, the coroutines it
@@ -1672,7 +1687,7 @@ fn failTaskWith(inst: *Instance, comptime what: []const u8, args: anytype, err: 
     inst.task_failure = std.fmt.allocPrint(inst.arena(), what ++ " of workflow \"{s}\" returned error.{t}, which task_failure_errors lists (worker.Options.workflow_task_failure_errors or the workflow's DefOptions), so the workflow task fails and is retried; the workflow keeps running", args ++ .{ inst.info.workflow_type, err }) catch "workflow code returned an error that task_failure_errors lists; the workflow task fails and is retried";
 }
 
-fn finishIfDone(inst: *Instance) !void {
+fn finishIfDone(inst: *Instance, out: Allocator) !void {
     if (inst.finished) return;
     const outcome = inst.root_outcome orelse return;
     inst.finished = true;
@@ -1712,7 +1727,7 @@ fn finishIfDone(inst: *Instance) !void {
         .failed => |err| switch (err) {
             error.Canceled => try inst.emit(.{ .variant = .{ .cancel_workflow_execution = .{} } }),
             else => try inst.emit(.{ .variant = .{
-                .fail_workflow_execution = .{ .failure = try inst.workflowFailure(err) },
+                .fail_workflow_execution = .{ .failure = try inst.workflowFailure(out, err) },
             } }),
         },
     }
@@ -1743,13 +1758,16 @@ fn warnUnfinishedHandlers(inst: *Instance) error{OutOfMemory}!void {
     });
 }
 
-fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
+/// The failure that fails the workflow with `err`. Its stack trace text goes to `out`, the
+/// activation's memory, like an update rejection's (`fillUpdateTraces`); the rest to the
+/// run's arena.
+fn workflowFailure(inst: *Instance, out: Allocator, err: anyerror) !Failure {
     const a = inst.arena();
     const pending, const last, const addresses = if (inst.failed_handler) |run|
         .{ run.pending_failure, run.last_failure, run.trace }
     else
         .{ inst.ctx.pending_failure, inst.ctx.last_failure, inst.root_trace };
-    if (pending) |p| return p.resolve(a, try failure_mod.addressesText(a, addresses));
+    if (pending) |p| return p.resolve(a, try inst.failureTraceText(out, addresses));
     switch (err) {
         error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (last) |f| return f.*,
         // Only the workflow function's return of ctx.continueAsNew's error continues as new.
@@ -1763,7 +1781,7 @@ fn workflowFailure(inst: *Instance, err: anyerror) !Failure {
         else => {},
     }
     var f = try failure_mod.fromError(a, err);
-    f.stack_trace = try failure_mod.addressesText(a, addresses);
+    f.stack_trace = try inst.failureTraceText(out, addresses);
     return f;
 }
 

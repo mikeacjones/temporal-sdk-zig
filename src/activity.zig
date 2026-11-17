@@ -341,6 +341,12 @@ pub const Context = struct {
     /// cheap. To report several values, pass a struct.
     pub fn heartbeat(ctx: *Context, details: anytype) void {
         const sink = ctx.heartbeat_sink orelse return;
+        // The worker cancels an activity's task once, and a heartbeat returns nothing: a wait
+        // in here that took the cancel would lose it, leaving the activity running for good.
+        // Even an allocation can wait (in Debug, std's stack capture locks its debug info).
+        // Blocked, the cancel reaches the activity's next wait instead.
+        const prev = ctx.io_.swapCancelProtection(.blocked);
+        defer _ = ctx.io_.swapCancelProtection(prev);
         var scratch: std.heap.ArenaAllocator = .init(sink.gpa);
         defer scratch.deinit();
         if (@TypeOf(details) == void) return ctx.outboundNext().heartbeat(.{ .details = &.{} });
@@ -360,6 +366,9 @@ pub const Context = struct {
     /// memory.
     pub fn heartbeatDetails(ctx: *Context, comptime T: type) error{ NoHeartbeatDetails, OutOfMemory, InvalidPayload, UnknownEncoding }!T {
         if (ctx.heartbeat_details.len == 0) return error.NoHeartbeatDetails;
+        // Cancels blocked, as in `heartbeat`: the decode can't return the error.
+        const prev = ctx.io_.swapCancelProtection(.blocked);
+        defer _ = ctx.io_.swapCancelProtection(prev);
         return converter.fromPayload(T, ctx.arena, ctx.heartbeat_details[0]) catch |err| switch (err) {
             error.WrongArgumentCount => error.InvalidPayload,
             else => |e| e,
@@ -423,7 +432,12 @@ pub fn Def(comptime name: []const u8, comptime func: anytype) type {
         };
 
         pub fn invoke(receiver: ?*anyopaque, ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
-            const args = try converter.fromPayloads(Args, ctx.arena, payloads);
+            // Cancels blocked, as in `Context.heartbeat`: the decode can't return the error.
+            const args = blk: {
+                const prev = ctx.io_.swapCancelProtection(.blocked);
+                defer _ = ctx.io_.swapCancelProtection(prev);
+                break :blk try converter.fromPayloads(Args, ctx.arena, payloads);
+            };
             return converter.toPayload(ctx.arena, try call(receiver, ctx, args));
         }
 

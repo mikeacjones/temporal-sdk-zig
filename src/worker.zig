@@ -44,6 +44,7 @@ const act_pb = proto.coresdk.workflow_activation;
 const done_pb = proto.coresdk.workflow_completion;
 const task_pb = proto.coresdk.activity_task;
 const result_pb = proto.coresdk.activity_result;
+const builtin = @import("builtin");
 const log = std.log.scoped(.temporal);
 
 pub const Options = struct {
@@ -167,11 +168,12 @@ pub const Options = struct {
     /// A watchdog on the worker's own `Io` and its real clock (`.awake`), never the
     /// workflow's deterministic `std.Io`, times each stretch of an activation's workflow code
     /// between returns to the scheduler. Work outside workflow code, such as payload codecs
-    /// decoding the activation and encoding its completion, isn't counted. Workflow code
-    /// that runs longer (a loop that never waits, or a call that blocks outside the
-    /// workflow's `std.Io`) fails that workflow task with an application failure of type
-    /// `deadlock_failure_type`, whose message names the workflow type and this limit, within
-    /// about 1.25 times the limit. The worker logs one error with the workflow and run IDs,
+    /// decoding the activation and encoding its completion, isn't counted. Nor is the SDK's
+    /// reading of debug info for the stack trace query or for a failure's stack trace
+    /// (`failure_stack_traces`). Workflow code that runs longer (a loop that never waits, or
+    /// a call that blocks outside the workflow's `std.Io`) fails that workflow task with an
+    /// application failure of type `deadlock_failure_type`, whose message names the workflow
+    /// type and this limit, within about 1.25 times the limit. The worker logs one error with the workflow and run IDs,
     /// and the run is evicted, so its next workflow task replays it from history. The
     /// workflow itself does not fail: the server retries the task. Only the first attempt's
     /// failure is reported to the server; code that gets stuck on later attempts sends no
@@ -1529,7 +1531,8 @@ pub const WorkflowRunner = struct {
         /// the scheduler.
         switches: *const std.atomic.Value(u64),
         /// The run's `Scheduler.sdk_work`, set while the scheduler's thread does SDK work
-        /// that isn't workflow code (reading debug info for the stack trace query).
+        /// that isn't workflow code (reading debug info for the stack trace query or a
+        /// failure's stack trace).
         sdk_work: *const std.atomic.Value(bool),
         sender: Sender,
         /// Set by the activation thread once workflow code has returned.
@@ -1849,6 +1852,48 @@ const RunningActivity = struct {
     }
 };
 
+/// `w.gpa` with cancels blocked around each call: the memory behind an activity's or a Nexus
+/// request's arena (`activity.Context.allocator`, and the SDK's decoding into it). The worker
+/// cancels such a task once, and an allocation can wait on the task's `std.Io` without
+/// returning the error (in Debug, std's stack capture waits for its debug info lock and drops
+/// a cancel), which would leave the task running for good. Blocked, the cancel reaches the
+/// task's next wait. Valid while `w` is: arenas made with it are freed before `run` returns.
+fn taskAllocator(w: *Worker) Allocator {
+    return .{ .ptr = w, .vtable = &TaskAllocator.vtable };
+}
+
+const TaskAllocator = struct {
+    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const w: *Worker = @ptrCast(@alignCast(ptr));
+        const prev = w.io.swapCancelProtection(.blocked);
+        defer _ = w.io.swapCancelProtection(prev);
+        return w.gpa.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const w: *Worker = @ptrCast(@alignCast(ptr));
+        const prev = w.io.swapCancelProtection(.blocked);
+        defer _ = w.io.swapCancelProtection(prev);
+        return w.gpa.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const w: *Worker = @ptrCast(@alignCast(ptr));
+        const prev = w.io.swapCancelProtection(.blocked);
+        defer _ = w.io.swapCancelProtection(prev);
+        return w.gpa.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const w: *Worker = @ptrCast(@alignCast(ptr));
+        const prev = w.io.swapCancelProtection(.blocked);
+        defer _ = w.io.swapCancelProtection(prev);
+        w.gpa.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 /// Decodes a polled activity task. Returns a new run for a Start task; delivers a Cancel
 /// task to its run and returns null.
 fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.Worker.Polled, task_queue: []const u8) ?*RunningActivity {
@@ -1858,7 +1903,7 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
         return null;
     };
     run.* = .{
-        .arena = .init(w.gpa),
+        .arena = .init(taskAllocator(w)),
         .polled = polled,
         .task_queue = task_queue,
         .task_token = &.{},
@@ -1888,9 +1933,16 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
         .cancel => |c| {
             running.mutex.lockUncancelable(w.io);
             defer running.mutex.unlock(w.io);
+            const reason = cancelReason(c.reason);
             // A run that already finished has nothing to cancel.
-            const target = running.map.get(task.task_token) orelse return null;
-            if (target.ctx.setCancelReason(cancelReason(c.reason))) target.wake.set(w.io);
+            const target = running.map.get(task.task_token) orelse {
+                log.debug("a cancel task ({t}) arrived for an activity this worker is not running; ignoring it", .{reason});
+                return null;
+            };
+            if (target.ctx.setCancelReason(reason)) {
+                log.debug("activity {s}: cancel task received ({t}); waking its supervisor", .{ target.start.activity_id, reason });
+                target.wake.set(w.io);
+            } else log.debug("activity {s}: cancel task received ({t}) after an earlier cancel ({t}); nothing to do", .{ target.start.activity_id, reason, target.ctx.cancelReason().? });
             return null;
         },
     }
@@ -1924,7 +1976,11 @@ fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivitie
             break :blk callActivity(w, core, run);
         };
         run.wake.waitUncancelable(w.io);
-        break :blk if (run.ctx.cancelReason() != null) task.cancel(w.io) else task.await(w.io);
+        const reason = run.ctx.cancelReason() orelse break :blk task.await(w.io);
+        log.debug("activity {s}: canceling its task ({t})", .{ run.start.activity_id, reason });
+        const outcome = task.cancel(w.io);
+        log.debug("activity {s}: its task returned after the cancel", .{run.start.activity_id});
+        break :blk outcome;
     };
     const a = run.arena.allocator();
     var result = outcome catch return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
@@ -1947,8 +2003,19 @@ fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivitie
     };
 }
 
+// `std.Io.Threaded` futures overrun their allocation for results aligned above 8; see `runNexusRequest`.
+comptime {
+    std.debug.assert(@alignOf(error{OutOfMemory}!result_pb.ActivityExecutionResult) <= @alignOf(usize));
+}
+
 fn callActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) error{OutOfMemory}!result_pb.ActivityExecutionResult {
     defer run.wake.set(w.io);
+    // The worker cancels an activity's task once. SDK code here can wait without returning
+    // the error to the activity (in Debug even an allocation can: std's stack capture locks
+    // its debug info and drops a cancel), so it runs with cancels blocked, and only the
+    // activity's interceptors and function (`executeActivity`) see them.
+    const prev = w.io.swapCancelProtection(.blocked);
+    defer _ = w.io.swapCancelProtection(prev);
     const a = run.arena.allocator();
     return executeActivity(w, core, run) catch |err| .{
         .status = .{ .failed = .{ .failure = try failure_mod.fromError(a, err) } },
@@ -1980,6 +2047,8 @@ const Heartbeats = struct {
         const a = scratch.allocator();
         var heartbeat: proto.coresdk.self.ActivityHeartbeat = .{ .task_token = h.task_token };
         heartbeat.details.appendSlice(a, details) catch return;
+        // Runs with cancels blocked (`activity.Context.heartbeat`): a codec waiting here can't
+        // take the activity's cancel.
         converter.encodeMessage(proto.coresdk.self.ActivityHeartbeat, &heartbeat, h.w.client.codecs, a, h.w.io, h.codec_context) catch |err| {
             log.warn("recording an activity heartbeat failed: encoding its details with the client's codecs failed: {t}", .{err});
             return;
@@ -2097,7 +2166,11 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     // pooled thread it runs on.
     const trace_scope: failure_mod.TraceScope = .begin(@errorReturnTrace());
     defer trace_scope.end();
-    const payload = next.execute(.{ .activity_type = start.activity_type, .args = .{ .payloads = start.input.items }, .header = ctx.header_ }) catch |err| {
+    const payload = user: {
+        const sdk = w.io.swapCancelProtection(.unblocked);
+        defer _ = w.io.swapCancelProtection(sdk);
+        break :user next.execute(.{ .activity_type = start.activity_type, .args = .{ .payloads = start.input.items }, .header = ctx.header_ });
+    } catch |err| {
         if (err == error.CompleteAsync) {
             if (!start.is_local) return .{ .status = .{ .will_complete_async = .{} } };
             return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
@@ -2313,7 +2386,7 @@ fn receiveNexusTask(w: *Worker, core: bridge.Worker, running: *RunningNexusReque
         return null;
     };
     req.* = .{
-        .arena = .init(w.gpa),
+        .arena = .init(taskAllocator(w)),
         .polled = polled,
         .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = .{ .service = "", .operation = "" }, .logger_ = sink_logger, .client_ = w.client, .codecs = w.client.codecs },
     };
@@ -3909,6 +3982,13 @@ const CancelTest = struct {
     const Env = @import("testing.zig").WorkflowEnvironment;
     const EventType = proto.temporal.api.enums.v1.EventType;
 
+    /// Bounds one named wait of a test.
+    const wait_limit: Io.Duration = .fromSeconds(30);
+    /// Set by `stop`: the looping fixtures return, whatever happened to their cancel.
+    var abandon: std.atomic.Value(bool) = .init(false);
+    /// The server ends a run whose activity never ends, so `getResult` can't wait for good.
+    const run_options: client_mod.StartWorkflowOptions = .{ .task_queue = "", .execution_timeout = .fromSeconds(45) };
+
     var started: Io.Event = .unset;
     /// Set once `beat` has seen a cancel; `seen_reason` is written before.
     var observed: Io.Event = .unset;
@@ -3917,7 +3997,7 @@ const CancelTest = struct {
     /// Heartbeats until canceled. With `ignore`, swallows the cancel and returns a value.
     fn beat(ctx: *activity.Context, ignore: bool) ![]const u8 {
         started.set(ctx.io());
-        while (true) {
+        while (!abandon.load(.acquire)) {
             ctx.heartbeat({});
             ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
                 seen_reason = ctx.cancelReason();
@@ -3926,6 +4006,7 @@ const CancelTest = struct {
                 return err;
             };
         }
+        return error.TestAbandoned;
     }
     const Beat = activity.Def("Beat", beat);
 
@@ -3978,11 +4059,134 @@ const CancelTest = struct {
     }
     const RunFinish = workflow.Def("RunFinish", runFinish);
 
+    /// Set when `BeatThroughCodec`'s heartbeat has reached `HoldingCodec`.
+    var in_codec: Io.Event = .unset;
+    /// The thread `BeatThroughCodec` runs on, whose encodes `HoldingCodec` holds; 0 for none.
+    var holding_thread: std.atomic.Value(std.Thread.Id) = .init(0);
+    /// `BeatThroughCodec`'s context, written before `holding_thread`.
+    var beat_ctx: ?*activity.Context = null;
+
+    /// Passes payloads through. On `holding_thread` it waits on its `io` until the activity
+    /// is canceled and a while after, so the worker's cancel lands while it waits.
+    const HoldingCodec = struct {
+        var unused: u8 = 0;
+
+        fn codec() converter.PayloadCodec {
+            return .{ .ptr = &unused, .vtable = &.{ .encode = encode, .decode = decode } };
+        }
+
+        fn encode(_: *anyopaque, arena: Allocator, io: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+            if (holding_thread.load(.acquire) == std.Thread.getCurrentId()) {
+                in_codec.set(io);
+                while (beat_ctx.?.cancelReason() == null and !abandon.load(.acquire)) try io.sleep(.fromMilliseconds(5), .awake);
+                try io.sleep(.fromMilliseconds(500), .awake);
+                holding_thread.store(0, .release);
+            }
+            return arena.dupe(converter.Payload, payloads);
+        }
+
+        fn decode(_: *anyopaque, arena: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+            return arena.dupe(converter.Payload, payloads);
+        }
+    };
+
+    /// Like `beat`, with heartbeat details for `HoldingCodec` to encode.
+    fn beatThroughCodec(ctx: *activity.Context) ![]const u8 {
+        beat_ctx = ctx;
+        holding_thread.store(std.Thread.getCurrentId(), .release);
+        while (!abandon.load(.acquire)) {
+            ctx.heartbeat(@as(u32, 1));
+            ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
+                seen_reason = ctx.cancelReason();
+                observed.set(ctx.io());
+                return err;
+            };
+        }
+        return error.TestAbandoned;
+    }
+    const BeatThroughCodec = activity.Def("BeatThroughCodec", beatThroughCodec);
+
+    fn runBeatThroughCodec(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(BeatThroughCodec, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const RunBeatThroughCodec = workflow.Def("RunBeatThroughCodec", runBeatThroughCodec);
+
+    /// Set by the test once the activity's cancel is pending and std's debug info lock is
+    /// held; `BeatWhenTold` heartbeats then.
+    var go: Io.Event = .unset;
+
+    /// Waits for `go` without taking a cancel, so the worker's cancel stays pending on its
+    /// task, then heartbeats like `beat`.
+    fn beatWhenTold(ctx: *activity.Context) ![]const u8 {
+        beat_ctx = ctx;
+        started.set(ctx.io());
+        go.waitUncancelable(ctx.io());
+        while (!abandon.load(.acquire)) {
+            ctx.heartbeat(@as(u32, 1));
+            ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
+                seen_reason = ctx.cancelReason();
+                observed.set(ctx.io());
+                return err;
+            };
+        }
+        return error.TestAbandoned;
+    }
+    const BeatWhenTold = activity.Def("BeatWhenTold", beatWhenTold);
+
+    fn runBeatWhenTold(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(BeatWhenTold, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const RunBeatWhenTold = workflow.Def("RunBeatWhenTold", runBeatWhenTold);
+
+    /// Like `beatWhenTold`, but allocates from `ctx.allocator()` once told, before it sleeps.
+    fn allocWhenTold(ctx: *activity.Context) ![]const u8 {
+        beat_ctx = ctx;
+        started.set(ctx.io());
+        go.waitUncancelable(ctx.io());
+        const block = try ctx.allocator().alloc(u8, 1 << 20);
+        @memset(block, 0);
+        while (!abandon.load(.acquire)) {
+            ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
+                seen_reason = ctx.cancelReason();
+                observed.set(ctx.io());
+                return err;
+            };
+        }
+        return error.TestAbandoned;
+    }
+    const AllocWhenTold = activity.Def("AllocWhenTold", allocWhenTold);
+
+    fn runAllocWhenTold(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(AllocWhenTold, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const RunAllocWhenTold = workflow.Def("RunAllocWhenTold", runAllocWhenTold);
+
+    /// Sets `go` while holding std's debug info lock, and holds it until a thread waits for
+    /// it and a while after, so the fixture's next allocation waits with its cancel pending.
+    /// Nothing here may allocate: with the lock held that would wait for this thread.
+    fn goWithDebugInfoLockHeld(si: anytype) !void {
+        si.mutex.lockUncancelable(testing.io);
+        defer si.mutex.unlock(testing.io);
+        go.set(testing.io);
+        const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = wait_limit, .clock = .awake });
+        while (si.mutex.state.load(.monotonic) != .contended) {
+            if (deadline.durationFromNow(testing.io).raw.nanoseconds <= 0) break;
+            try testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        // Long enough for the supervisor's cancel of the task to land while the lock is held.
+        try testing.io.sleep(.fromMilliseconds(200), .awake);
+    }
+
     fn reset() void {
+        go = .unset;
         started = .unset;
         observed = .unset;
         release = .unset;
         seen_reason = null;
+        abandon.store(false, .release);
+        in_codec = .unset;
+        holding_thread.store(0, .release);
+        beat_ctx = null;
     }
 
     fn countEvents(env: *Env, run: anytype, event_type: EventType) !usize {
@@ -3995,8 +4199,14 @@ const CancelTest = struct {
     }
 
     fn start() !*Env {
+        return startWithOptions(.{});
+    }
+
+    fn startWithOptions(options: Env.Options) !*Env {
         reset();
-        const env = try Env.start(testing.allocator, testing.io);
+        testing.log_level = .debug;
+        errdefer testing.log_level = .warn;
+        const env = try Env.startWithOptions(testing.allocator, testing.io, options);
         errdefer env.deinit();
         try env.registerWorkflow(CancelBeat);
         try env.registerWorkflow(RunBeat);
@@ -4004,18 +4214,67 @@ const CancelTest = struct {
         try env.registerActivity(WaitStarted);
         try env.registerWorkflow(RunFinish);
         try env.registerActivity(Finish);
+        try env.registerWorkflow(RunBeatThroughCodec);
+        try env.registerActivity(BeatThroughCodec);
+        try env.registerWorkflow(RunBeatWhenTold);
+        try env.registerActivity(BeatWhenTold);
+        try env.registerWorkflow(RunAllocWhenTold);
+        try env.registerActivity(AllocWhenTold);
         return env;
+    }
+
+    /// Waits up to `wait_limit` for `event`, logging `what` when it doesn't come.
+    fn waitFor(event: *Io.Event, comptime what: []const u8) error{ Timeout, Canceled }!void {
+        event.waitTimeout(testing.io, .{ .duration = .{ .raw = wait_limit, .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => {
+                log.err("CancelTest: timed out after {d} s waiting for " ++ what, .{wait_limit.toSeconds()});
+                return error.Timeout;
+            },
+            error.Canceled => |e| return e,
+        };
+    }
+
+    /// Waits up to `wait_limit` for `beat_ctx`'s activity to have a cancel reason.
+    fn waitForCancelReason(comptime what: []const u8) error{ Timeout, Canceled }!void {
+        const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = wait_limit, .clock = .awake });
+        while (beat_ctx.?.cancelReason() == null) {
+            if (deadline.durationFromNow(testing.io).raw.nanoseconds <= 0) {
+                log.err("CancelTest: timed out after {d} s waiting for " ++ what, .{wait_limit.toSeconds()});
+                return error.Timeout;
+            }
+            try testing.io.sleep(.fromMilliseconds(5), .awake);
+        }
+    }
+
+    /// Awaits the worker's run and returns its error.
+    fn awaitWorker(env: *Env) !void {
+        defer env.running = null;
+        return env.running.?.await(testing.io);
+    }
+
+    /// What every test of the group defers: tells the fixtures to end, so the worker can
+    /// stop whatever happened to their cancel, then tears the environment down.
+    fn stop(env: *Env) void {
+        // Every event a fixture waits on, so they all return whatever the test did.
+        abandon.store(true, .release);
+        release.set(testing.io);
+        go.set(testing.io);
+        started.set(testing.io);
+        env.deinit();
+        testing.log_level = .warn;
     }
 };
 
 test "a heartbeating activity canceled by its workflow sees the cancel and reports canceled" {
     const env = try CancelTest.start();
-    defer env.deinit();
+    defer CancelTest.stop(env);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    var run = try env.startWorkflow(CancelTest.CancelBeat, .{ .task_queue = "" }, .{false});
+    var run = try env.startWorkflow(CancelTest.CancelBeat, CancelTest.run_options, .{false});
     defer run.deinit();
+    errdefer env.client.terminateWorkflow(run.id, run.run_id, "test failed") catch {};
+    try CancelTest.waitFor(&CancelTest.observed, "Beat to see the cancel its workflow requested");
     try testing.expectEqualStrings("canceled", try env.getResult(CancelTest.CancelBeat, &run, arena.allocator(), null));
     try testing.expectEqual(@as(?activity.CancelReason, .canceled), CancelTest.seen_reason);
     try testing.expectEqual(1, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_CANCELED));
@@ -4023,12 +4282,14 @@ test "a heartbeating activity canceled by its workflow sees the cancel and repor
 
 test "an activity that ignores a cancel and returns a value completes normally" {
     const env = try CancelTest.start();
-    defer env.deinit();
+    defer CancelTest.stop(env);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    var run = try env.startWorkflow(CancelTest.CancelBeat, .{ .task_queue = "" }, .{true});
+    var run = try env.startWorkflow(CancelTest.CancelBeat, CancelTest.run_options, .{true});
     defer run.deinit();
+    errdefer env.client.terminateWorkflow(run.id, run.run_id, "test failed") catch {};
+    try CancelTest.waitFor(&CancelTest.observed, "Beat to see the cancel its workflow requested");
     try testing.expectEqualStrings("finished anyway", try env.getResult(CancelTest.CancelBeat, &run, arena.allocator(), null));
     try testing.expectEqual(@as(?activity.CancelReason, .canceled), CancelTest.seen_reason);
     try testing.expectEqual(0, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_CANCELED));
@@ -4037,14 +4298,16 @@ test "an activity that ignores a cancel and returns a value completes normally" 
 
 test "canceling a workflow cancels its heartbeating activity" {
     const env = try CancelTest.start();
-    defer env.deinit();
+    defer CancelTest.stop(env);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    var run = try env.startWorkflow(CancelTest.RunBeat, .{ .task_queue = "" }, .{});
+    var run = try env.startWorkflow(CancelTest.RunBeat, CancelTest.run_options, .{});
     defer run.deinit();
-    try CancelTest.started.wait(testing.io);
+    errdefer env.client.terminateWorkflow(run.id, run.run_id, "test failed") catch {};
+    try CancelTest.waitFor(&CancelTest.started, "Beat to start");
     try env.client.cancelWorkflow(run.id, run.run_id, "testing activity cancellation");
+    try CancelTest.waitFor(&CancelTest.observed, "Beat to see the cancel of its canceled workflow");
     try testing.expectError(error.WorkflowCanceled, env.getResult(CancelTest.RunBeat, &run, arena.allocator(), null));
     try testing.expectEqual(@as(?activity.CancelReason, .canceled), CancelTest.seen_reason);
     try testing.expectEqual(1, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_CANCELED));
@@ -4052,36 +4315,226 @@ test "canceling a workflow cancels its heartbeating activity" {
 
 test "stopping the worker cancels running activities with reason worker_shutdown" {
     const env = try CancelTest.start();
-    defer env.deinit();
+    defer CancelTest.stop(env);
 
-    var run = try env.startWorkflow(CancelTest.RunBeat, .{ .task_queue = "" }, .{});
+    var run = try env.startWorkflow(CancelTest.RunBeat, CancelTest.run_options, .{});
     defer run.deinit();
-    try CancelTest.started.wait(testing.io);
+    errdefer env.client.terminateWorkflow(run.id, run.run_id, "test failed") catch {};
+    try CancelTest.waitFor(&CancelTest.started, "Beat to start");
     env.worker.stop();
-    try env.running.?.await(testing.io);
-    env.running = null;
+    try CancelTest.waitFor(&CancelTest.observed, "Beat to see the worker-stop cancel");
+    try CancelTest.awaitWorker(env);
     try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
 }
 
 test "a graceful shutdown period lets a running activity finish" {
     const env = try CancelTest.start();
-    defer env.deinit();
+    defer CancelTest.stop(env);
     const period: Io.Duration = .fromSeconds(30);
     env.worker.options.graceful_shutdown_period = period;
 
-    var run = try env.startWorkflow(CancelTest.RunFinish, .{ .task_queue = "" }, .{});
+    var run = try env.startWorkflow(CancelTest.RunFinish, CancelTest.run_options, .{});
     defer run.deinit();
-    try CancelTest.started.wait(testing.io);
+    errdefer env.client.terminateWorkflow(run.id, run.run_id, "test failed") catch {};
+    try CancelTest.waitFor(&CancelTest.started, "Finish to start");
     const stopped_at = Io.Timestamp.now(testing.io, .awake);
     env.worker.stop();
     CancelTest.release.set(testing.io);
-    try env.running.?.await(testing.io);
-    env.running = null;
+    try CancelTest.awaitWorker(env);
     const elapsed = stopped_at.durationTo(Io.Timestamp.now(testing.io, .awake));
 
     try testing.expectEqual(@as(?activity.CancelReason, null), CancelTest.seen_reason);
     try testing.expectEqual(1, try CancelTest.countEvents(env, &run, .EVENT_TYPE_ACTIVITY_TASK_COMPLETED));
     try testing.expect(elapsed.nanoseconds < period.nanoseconds);
+}
+
+test "a cancel that arrives while a heartbeat's codec waits still reaches the activity" {
+    const codecs = [_]converter.PayloadCodec{CancelTest.HoldingCodec.codec()};
+    const env = try CancelTest.startWithOptions(.{ .codecs = &codecs });
+    defer CancelTest.stop(env);
+
+    var run = try env.startWorkflow(CancelTest.RunBeatThroughCodec, CancelTest.run_options, .{});
+    defer run.deinit();
+    errdefer env.client.terminateWorkflow(run.id, run.run_id, "test failed") catch {};
+    try CancelTest.waitFor(&CancelTest.in_codec, "BeatThroughCodec's heartbeat to reach the codec");
+    // Worker stop is the cancel source: it needs no heartbeat to reach the worker.
+    env.worker.stop();
+    try CancelTest.waitFor(&CancelTest.observed, "BeatThroughCodec to see error.Canceled after its heartbeat's codec returned");
+    try CancelTest.awaitWorker(env);
+    try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
+}
+
+// In a Debug build `testing.allocator` captures a stack trace on every allocation, and on macOS
+// std's unwinder takes the debug info lock with a wait that can be canceled and drops the
+// error. A heartbeat that allocates while another thread holds that lock must not take the
+// activity's one cancel.
+test "a cancel pending while a heartbeat waits for std's debug info lock still reaches the activity" {
+    const SelfInfo = std.debug.SelfInfo;
+    if (comptime builtin.mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+        return error.SkipZigTest;
+    const env = try CancelTest.start();
+    defer CancelTest.stop(env);
+
+    var run = try env.startWorkflow(CancelTest.RunBeatWhenTold, CancelTest.run_options, .{});
+    defer run.deinit();
+    errdefer env.client.terminateWorkflow(run.id, run.run_id, "test failed") catch {};
+    try CancelTest.waitFor(&CancelTest.started, "BeatWhenTold to start");
+    const si = try std.debug.getSelfDebugInfo();
+    env.worker.stop();
+    try CancelTest.waitForCancelReason("BeatWhenTold's worker-stop cancel to reach its run");
+    {
+        // Nothing here may allocate: with the lock held that would wait for this thread.
+        si.mutex.lockUncancelable(testing.io);
+        defer si.mutex.unlock(testing.io);
+        CancelTest.go.set(testing.io);
+        const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = CancelTest.wait_limit, .clock = .awake });
+        while (si.mutex.state.load(.monotonic) != .contended) {
+            if (deadline.durationFromNow(testing.io).raw.nanoseconds <= 0) break;
+            try testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        // Long enough for the supervisor's cancel of the task to land while the lock is held.
+        try testing.io.sleep(.fromMilliseconds(200), .awake);
+    }
+    try CancelTest.waitFor(&CancelTest.observed, "BeatWhenTold to see error.Canceled after its heartbeat waited for the debug info lock");
+    try CancelTest.awaitWorker(env);
+    try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
+}
+
+/// Holds an activity attempt in `interceptActivity`, before the SDK decodes the activity's
+/// arguments, so the worker's cancel is pending while that decoding allocates.
+const PreambleCancelTest = struct {
+    const Hold = struct {
+        pub fn interceptActivity(_: *Hold, ctx: *activity.Context) error{OutOfMemory}!interceptor.Activity {
+            if (!std.mem.eql(u8, ctx.info().activity_type, "BeatWithInput")) return .{};
+            CancelTest.beat_ctx = ctx;
+            CancelTest.started.set(ctx.io());
+            CancelTest.go.waitUncancelable(ctx.io());
+            return .{};
+        }
+    };
+
+    /// Like `CancelTest.beat`, with an input large enough that decoding it grows the
+    /// activity's arena.
+    fn beatWithInput(ctx: *activity.Context, input: []const u64) ![]const u8 {
+        std.debug.assert(input.len == input_len);
+        while (!CancelTest.abandon.load(.acquire)) {
+            ctx.heartbeat({});
+            ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
+                CancelTest.seen_reason = ctx.cancelReason();
+                CancelTest.observed.set(ctx.io());
+                return err;
+            };
+        }
+        return error.TestAbandoned;
+    }
+    const BeatWithInput = activity.Def("BeatWithInput", beatWithInput);
+
+    const input_len = 100_000;
+
+    fn runBeatWithInput(ctx: *workflow.Context) ![]const u8 {
+        const input = try ctx.allocator().alloc(u64, input_len);
+        @memset(input, 0);
+        return ctx.executeActivity(BeatWithInput, .{ .start_to_close_timeout = .fromSeconds(60) }, .{input}).get();
+    }
+    const RunBeatWithInput = workflow.Def("RunBeatWithInput", runBeatWithInput);
+};
+
+// The SDK decodes an activity's arguments on the activity's task, after its interceptors and
+// before its function. In a Debug build on macOS, `testing.allocator` captures a stack trace on
+// each allocation and waits for std's debug info lock with a wait that can be canceled and
+// drops the error. A cancel pending then must still reach the activity's function.
+test "a cancel pending while the SDK decodes an activity's arguments and std's debug info lock is held still reaches the activity" {
+    const SelfInfo = std.debug.SelfInfo;
+    if (comptime builtin.mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+        return error.SkipZigTest;
+    const env = try CancelTest.start();
+    defer CancelTest.stop(env);
+    var hold: PreambleCancelTest.Hold = .{};
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(PreambleCancelTest.Hold, &hold)};
+    env.worker.options.interceptors = &interceptors;
+    try env.registerWorkflow(PreambleCancelTest.RunBeatWithInput);
+    try env.registerActivity(PreambleCancelTest.BeatWithInput);
+
+    var run = try env.startWorkflow(PreambleCancelTest.RunBeatWithInput, CancelTest.run_options, .{});
+    defer run.deinit();
+    errdefer env.client.terminateWorkflow(run.id, run.run_id, "test failed") catch {};
+    try CancelTest.waitFor(&CancelTest.started, "BeatWithInput's interceptor to run");
+    const si = try std.debug.getSelfDebugInfo();
+    env.worker.stop();
+    try CancelTest.waitForCancelReason("BeatWithInput's worker-stop cancel to reach its run");
+    {
+        // Nothing here may allocate: with the lock held that would wait for this thread.
+        si.mutex.lockUncancelable(testing.io);
+        defer si.mutex.unlock(testing.io);
+        CancelTest.go.set(testing.io);
+        const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = CancelTest.wait_limit, .clock = .awake });
+        while (si.mutex.state.load(.monotonic) != .contended) {
+            if (deadline.durationFromNow(testing.io).raw.nanoseconds <= 0) break;
+            try testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try testing.io.sleep(.fromMilliseconds(200), .awake);
+    }
+    try CancelTest.waitFor(&CancelTest.observed, "BeatWithInput to see error.Canceled after its arguments were decoded");
+    try CancelTest.awaitWorker(env);
+    try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
+}
+
+// The debug-info-lock tests hold `BeatWhenTold` (or `BeatWithInput`'s interceptor) on
+// `CancelTest.go` until the cancel has reached the run. When that wait fails, as it does when
+// the cancel is lost, the test returns before setting `go`, and `CancelTest.stop` must still
+// end the fixture so the test fails with its message instead of waiting without bound.
+test "CancelTest.stop ends a fixture still held on go, as when a test fails before setting it" {
+    const env = try CancelTest.start();
+    var stop_task: ?Io.Future(void) = null;
+    var stopped: Io.Event = .unset;
+    // On a hang, release the fixture so the test fails rather than waits for good.
+    defer if (stop_task) |*t| {
+        CancelTest.go.set(testing.io);
+        t.await(testing.io);
+    } else CancelTest.stop(env);
+
+    {
+        var run = try env.startWorkflow(CancelTest.RunBeatWhenTold, CancelTest.run_options, .{});
+        defer run.deinit();
+        try CancelTest.waitFor(&CancelTest.started, "BeatWhenTold to start");
+    }
+    // What a test of the group does when a wait fails before `go.set`: its deferred stop.
+    const S = struct {
+        fn stopAndSignal(e: *CancelTest.Env, done: *Io.Event) void {
+            CancelTest.stop(e);
+            done.set(testing.io);
+        }
+    };
+    stop_task = try testing.io.concurrent(S.stopAndSignal, .{ env, &stopped });
+    stopped.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(20), .clock = .awake } }) catch |err| switch (err) {
+        error.Timeout => {
+            log.err("CancelTest.stop did not end within 20 s: BeatWhenTold is still waiting on CancelTest.go", .{});
+            return error.TestUnexpectedResult;
+        },
+        error.Canceled => |e| return e,
+    };
+}
+
+// As above, for memory the activity itself allocates from `ctx.allocator()`, the arena the SDK
+// gives it (and a dynamic activity decodes its arguments into).
+test "a cancel pending while an activity allocates from its context and std's debug info lock is held still reaches the activity" {
+    const SelfInfo = std.debug.SelfInfo;
+    if (comptime builtin.mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+        return error.SkipZigTest;
+    const env = try CancelTest.start();
+    defer CancelTest.stop(env);
+
+    var run = try env.startWorkflow(CancelTest.RunAllocWhenTold, CancelTest.run_options, .{});
+    defer run.deinit();
+    errdefer env.client.terminateWorkflow(run.id, run.run_id, "test failed") catch {};
+    try CancelTest.waitFor(&CancelTest.started, "AllocWhenTold to start");
+    const si = try std.debug.getSelfDebugInfo();
+    env.worker.stop();
+    try CancelTest.waitForCancelReason("AllocWhenTold's worker-stop cancel to reach its run");
+    try CancelTest.goWithDebugInfoLockHeld(si);
+    try CancelTest.waitFor(&CancelTest.observed, "AllocWhenTold to see error.Canceled after allocating from ctx.allocator()");
+    try CancelTest.awaitWorker(env);
+    try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
 }
 
 /// An activity that reports the timeouts, retry policy, priority and deadline in its info.
