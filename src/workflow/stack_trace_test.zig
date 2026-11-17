@@ -548,3 +548,108 @@ test "__stack_trace asked for from inside workflow code by an interceptor doesn'
     try testing.expectEqualStrings("slow", started[0].variant.?.schedule_activity.activity_type);
     try testing.expect(!inst.sched.sdk_work.load(.acquire));
 }
+
+const FailsWf = workflow.Def("Fails", struct {
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        _ = ctx;
+        return error.Broken;
+    }
+}.run);
+
+const Reject = workflow.UpdateDef("reject", fn () []const u8);
+
+/// Waits on a timer, with a `reject` update handler that fails.
+const Rejects = struct {
+    fn reject(_: *Rejects) ![]const u8 {
+        return error.Refused;
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(Rejects);
+        try ctx.setUpdateHandler(Reject, s, reject);
+        try ctx.sleep(.fromSeconds(60), .{});
+        return "done";
+    }
+};
+const RejectsWf = workflow.Def("Rejects", Rejects.run);
+
+const FailCase = enum { workflow, update };
+
+/// What one failing activation of `case` did with `options` and `sampler` as its memory.
+const FailedRun = struct {
+    /// The failure's stack trace text, or null when the activation ran out of memory or
+    /// failed its task.
+    stack_trace: ?[]const u8,
+};
+
+/// Runs the activation of `case` that fails: the workflow function's return of an error, or
+/// an update whose handler returns one. The flag must be clear before and after.
+fn runFailing(case: FailCase, options: Instance.Options, sampler: *SdkWorkSampler) !FailedRun {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try Instance.create(testing.allocator, switch (case) {
+        .workflow => FailsWf.registered,
+        .update => RejectsWf.registered,
+    }, options);
+    defer inst.destroy();
+    sampler.sdk_work = &inst.sched.sdk_work;
+    var act = switch (case) {
+        .workflow => try initActivation(a, "Fails"),
+        .update => act: {
+            var init = try initActivation(a, "Rejects");
+            const started = commandsOf(try inst.activate(&init, a));
+            try testing.expectEqual(@as(usize, 1), started.len);
+            _ = started[0].variant.?.start_timer;
+            break :act try oneJob(a, updateJob("u1", "reject"));
+        },
+    };
+    try testing.expect(!inst.sched.sdk_work.load(.acquire));
+    const done = inst.activate(&act, sampler.allocator());
+    try testing.expect(!inst.sched.sdk_work.load(.acquire));
+    const completion = done catch |err| {
+        try testing.expectEqual(error.OutOfMemory, err);
+        return .{ .stack_trace = null };
+    };
+    const status = completion.status orelse return error.TestUnexpectedResult;
+    if (status == .failed) return .{ .stack_trace = null };
+    for (status.successful.commands.items) |cmd| switch (cmd.variant.?) {
+        .fail_workflow_execution => |f| if (case == .workflow) return .{ .stack_trace = try a.dupe(u8, f.failure.?.stack_trace) },
+        .update_response => |r| if (case == .update) switch (r.response.?) {
+            .rejected => |f| return .{ .stack_trace = try a.dupe(u8, f.stack_trace) },
+            else => {},
+        },
+        else => {},
+    };
+    std.debug.print("no failure for the {t} case among {d} commands\n", .{ case, status.successful.commands.items.len });
+    return error.TestExpectedFailure;
+}
+
+test "a failed workflow's and a failed update's stack trace text is built as SDK work for deadlock detection, and the mark is cleared on every way out" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_]FailCase{ .workflow, .update }) |case| {
+        var with: SdkWorkSampler = .{ .backing = a, .sdk_work = undefined };
+        const traced = try runFailing(case, .{}, &with);
+        const text = traced.stack_trace orelse return error.TestExpectedFailure;
+        if (builtin.mode == .debug) try testing.expect(text.len > 0);
+        // Each allocation for the text happens with the flag set...
+        if (text.len > 0) try testing.expect(with.during > 0);
+
+        // ...and only those: without stack traces, none does, and the others are the same.
+        var without: SdkWorkSampler = .{ .backing = a, .sdk_work = undefined };
+        const untraced = try runFailing(case, .{ .failure_stack_traces = false }, &without);
+        try testing.expectEqualStrings("", untraced.stack_trace orelse return error.TestExpectedFailure);
+        try testing.expectEqual(@as(usize, 0), without.during);
+        try testing.expectEqual(without.outside, with.outside);
+
+        // Running out of memory while the flag is set fails the activation and clears the flag.
+        if (text.len > 0) {
+            var failing: SdkWorkSampler = .{ .backing = a, .sdk_work = undefined, .fail_during_sdk_work = true };
+            const refused = try runFailing(case, .{}, &failing);
+            try testing.expect(failing.during > 0);
+            try testing.expect(refused.stack_trace == null);
+        }
+    }
+}

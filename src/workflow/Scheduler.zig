@@ -48,7 +48,7 @@ next_id: u32 = 1,
 switches: std.atomic.Value(u64) = .init(0),
 /// Set by the scheduler's thread, outside any fiber, while it does SDK work that can take
 /// longer than the deadlock limit and isn't workflow code: reading debug info to answer the
-/// stack trace query. Never set while a fiber runs. Only the scheduler's thread writes it.
+/// stack trace query or to write a failure's stack trace. Never set while a fiber runs. Only the scheduler's thread writes it.
 sdk_work: std.atomic.Value(bool) = .init(false),
 
 pub const Options = struct {

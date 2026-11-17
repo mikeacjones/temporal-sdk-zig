@@ -167,11 +167,12 @@ pub const Options = struct {
     /// A watchdog on the worker's own `Io` and its real clock (`.awake`), never the
     /// workflow's deterministic `std.Io`, times each stretch of an activation's workflow code
     /// between returns to the scheduler. Work outside workflow code, such as payload codecs
-    /// decoding the activation and encoding its completion, isn't counted. Workflow code
-    /// that runs longer (a loop that never waits, or a call that blocks outside the
-    /// workflow's `std.Io`) fails that workflow task with an application failure of type
-    /// `deadlock_failure_type`, whose message names the workflow type and this limit, within
-    /// about 1.25 times the limit. The worker logs one error with the workflow and run IDs,
+    /// decoding the activation and encoding its completion, isn't counted. Nor is the SDK's
+    /// reading of debug info for the stack trace query or for a failure's stack trace
+    /// (`failure_stack_traces`). Workflow code that runs longer (a loop that never waits, or
+    /// a call that blocks outside the workflow's `std.Io`) fails that workflow task with an
+    /// application failure of type `deadlock_failure_type`, whose message names the workflow
+    /// type and this limit, within about 1.25 times the limit. The worker logs one error with the workflow and run IDs,
     /// and the run is evicted, so its next workflow task replays it from history. The
     /// workflow itself does not fail: the server retries the task. Only the first attempt's
     /// failure is reported to the server; code that gets stuck on later attempts sends no
@@ -1529,7 +1530,8 @@ pub const WorkflowRunner = struct {
         /// the scheduler.
         switches: *const std.atomic.Value(u64),
         /// The run's `Scheduler.sdk_work`, set while the scheduler's thread does SDK work
-        /// that isn't workflow code (reading debug info for the stack trace query).
+        /// that isn't workflow code (reading debug info for the stack trace query or a
+        /// failure's stack trace).
         sdk_work: *const std.atomic.Value(bool),
         sender: Sender,
         /// Set by the activation thread once workflow code has returned.
