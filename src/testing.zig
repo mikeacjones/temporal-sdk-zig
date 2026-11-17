@@ -333,7 +333,8 @@ pub const WorkflowEnvironment = struct {
         /// The client's context propagators (`client.Options.propagators`), which its worker
         /// and replays use too. Borrowed: they must outlive the environment.
         propagators: []const propagation.ContextPropagator = &.{},
-        /// Interceptors of the worker's workflows and activities
+        /// Interceptors of the worker's workflows, activities and Nexus requests (the requests
+        /// the worker handles and the operations a workflow calls)
         /// (`client.Options.worker_interceptors`), which replays use too. Borrowed: they must
         /// outlive the environment.
         worker_interceptors: []const interceptor.Worker = &.{},

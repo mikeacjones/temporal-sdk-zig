@@ -86,12 +86,15 @@ pub const Options = struct {
     core_log_level: ?log_mod.Level = .warn,
     /// Context propagators, run in order: they write the `.context` values of each call that
     /// carries a header into that header, and every worker on this client reads them back out
-    /// for its workflows and activities (see `temporal.propagation`). Borrowed: the slice and
+    /// for its workflows, activities and the Nexus requests it handles. A workflow's values
+    /// travel with the Nexus operations it calls, in one Nexus header
+    /// (`propagation.nexus_header_name`); see `temporal.propagation`. Borrowed: the slice and
     /// the propagators must outlive the client and its workers.
     propagators: []const propagation.ContextPropagator = &.{},
-    /// Interceptors of the workflows and activities of every worker on this client, before
-    /// the worker's own (`worker.Options.interceptors`). Borrowed: the slice and the
-    /// interceptors must outlive the client and its workers.
+    /// Interceptors of the workflows, activities and Nexus requests of every worker on this
+    /// client (the requests a worker handles and the operations a workflow calls), before the
+    /// worker's own (`worker.Options.interceptors`). Borrowed: the slice and the interceptors
+    /// must outlive the client and its workers.
     worker_interceptors: []const interceptor.Worker = &.{},
     /// Interceptors of every WorkflowService request this client sends, in order (the first
     /// is the outermost); see `interceptor.Client`. `Client.checkHealth` bypasses them.
