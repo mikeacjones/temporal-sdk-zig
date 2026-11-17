@@ -1,0 +1,1 @@
+`history.fromJson` base64-decodes every `Payload.metadata` value, including values that are not text, which it used to leave as base64; a metadata value that is not valid base64 now fails with `error.InvalidHistoryJson` instead of being kept as text.

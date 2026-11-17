@@ -53,6 +53,32 @@ test "converter: values round-trip through payloads" {
     try testing.expectEqualStrings("json/protobuf", converter.encodingOf(proto_json).?);
 }
 
+test "converter: ProtoJSON of protobuf messages" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // example: converter-protojson
+    const common = temporal.proto.temporal.api.common.v1;
+    var payload: common.Payload = .{ .data = &.{ 0x00, 0xff } };
+    try payload.metadata.append(arena, .{ .key = "encoding", .value = "binary/plain" });
+    const json = try temporal.protojson.encode(arena, common.Payloads{ .payloads = .fromOwnedSlice(try arena.dupe(common.Payload, &.{payload})) });
+    // {"payloads":[{"metadata":{"encoding":"YmluYXJ5L3BsYWlu"},"data":"AP8="}]}
+    const list = try temporal.protojson.decode(common.Payloads, arena, json);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0xff }, list.payloads.items[0].data);
+
+    // Older CLI and Web UI exports write enums by short name.
+    const TaskQueue = temporal.proto.temporal.api.taskqueue.v1.TaskQueue;
+    const queue = try temporal.protojson.decode(TaskQueue, arena,
+        \\{"name":"orders","kind":"Normal"}
+    );
+    try testing.expectEqual(.TASK_QUEUE_KIND_NORMAL, queue.kind);
+    // end-example
+    try testing.expectEqualStrings(
+        \\{"payloads":[{"metadata":{"encoding":"YmluYXJ5L3BsYWlu"},"data":"AP8="}]}
+    , json);
+}
+
 test "converter: compress payloads with the zlib codec" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();

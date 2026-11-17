@@ -109,7 +109,7 @@ pub const CodecServer = struct {
 /// if not empty, is sent as the X-Namespace header.
 pub fn postPayloads(client: *http.Client, arena: Allocator, url: []const u8, namespace: []const u8, payloads: []const converter.Payload) ![]converter.Payload {
     const list: converter.Payloads = .{ .payloads = .fromOwnedSlice(try arena.dupe(converter.Payload, payloads)) };
-    const body = if (payloads.len == 0) "{\"payloads\":[]}" else try list.jsonEncode(.{}, .{ .emit_oneof_field_name = false }, arena);
+    const body = if (payloads.len == 0) "{\"payloads\":[]}" else try temporal.protojson.encode(arena, list);
     var namespace_header = [_]http.Header{.{ .name = "x-namespace", .value = namespace }};
     var response_body: Io.Writer.Allocating = .init(arena);
     const response = try client.fetch(.{
@@ -125,28 +125,8 @@ pub fn postPayloads(client: *http.Client, arena: Allocator, url: []const u8, nam
         return error.CodecServerFailed;
     }
 
-    // ProtoJSON of a Payloads message: bytes, including metadata values, are base64.
-    const Json = struct {
-        payloads: []const struct {
-            metadata: std.json.ArrayHashMap([]const u8) = .{},
-            data: []const u8 = "",
-        } = &.{},
-    };
-    const parsed = try std.json.parseFromSliceLeaky(Json, arena, response_body.written(), .{ .ignore_unknown_fields = true });
-    const out = try arena.alloc(converter.Payload, parsed.payloads.len);
-    for (parsed.payloads, out) |in, *p| {
-        p.* = .{ .data = try decodeBase64(arena, in.data) };
-        var it = in.metadata.map.iterator();
-        while (it.next()) |entry| try p.metadata.append(arena, .{ .key = entry.key_ptr.*, .value = try decodeBase64(arena, entry.value_ptr.*) });
-    }
-    return out;
-}
-
-fn decodeBase64(arena: Allocator, text: []const u8) ![]u8 {
-    const decoder = std.base64.standard.Decoder;
-    const out = try arena.alloc(u8, try decoder.calcSizeForSlice(text));
-    try decoder.decode(out, text);
-    return out;
+    const answer = try temporal.protojson.decode(converter.Payloads, arena, response_body.written());
+    return answer.payloads.items;
 }
 
 pub fn main(init: std.process.Init) !void {

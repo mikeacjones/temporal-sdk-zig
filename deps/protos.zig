@@ -4,10 +4,24 @@
 pub const root = "deps/sdk-core/crates/protos/protos";
 
 /// Directories passed to protoc with -I, relative to `root`.
-pub const include_dirs = [_][]const u8{ "api_upstream", "local", "testsrv_upstream", "" };
+pub const include_dirs = [_][]const u8{ "api_upstream", "api_cloud_upstream", "local", "testsrv_upstream", "" };
 
 /// Files compiled, relative to `root`.
 pub const files = [_][]const u8{
+    "api_cloud_upstream/temporal/api/cloud/account/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/auditlog/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/billing/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/cloudservice/v1/request_response.proto",
+    "api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto",
+    "api_cloud_upstream/temporal/api/cloud/connectivityrule/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/identity/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/namespace/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/nexus/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/operation/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/region/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/resource/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/sink/v1/message.proto",
+    "api_cloud_upstream/temporal/api/cloud/usage/v1/message.proto",
     "api_upstream/temporal/api/activity/v1/message.proto",
     "api_upstream/temporal/api/batch/v1/message.proto",
     "api_upstream/temporal/api/callback/v1/message.proto",
