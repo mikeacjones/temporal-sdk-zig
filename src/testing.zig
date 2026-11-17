@@ -7159,22 +7159,61 @@ const StandaloneFixtures = struct {
     }
     const Charge = activity.Def("Charge", charge);
 
+    /// Bounds one named wait of a test.
+    const wait_limit: Io.Duration = .fromSeconds(30);
+    /// Set by `stop`: the looping fixtures return, whatever happened to their cancel.
+    var abandon: std.atomic.Value(bool) = .init(false);
+
+    /// A named wait that gives up `wait_limit` after it began.
+    const Wait = struct {
+        deadline: Io.Clock.Timestamp,
+        what: []const u8,
+
+        fn begin(what: []const u8) Wait {
+            return .{ .deadline = .fromNow(testing.io, .{ .raw = wait_limit, .clock = .awake }), .what = what };
+        }
+
+        /// Sleeps before the next try; once the limit has passed, logs `what` and returns
+        /// `error.Timeout` instead.
+        fn again(w: Wait) error{ Timeout, Canceled }!void {
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+            if (w.deadline.durationFromNow(testing.io).raw.nanoseconds > 0) return;
+            log.err("timed out after {d} s waiting for {s}", .{ wait_limit.toSeconds(), w.what });
+            return error.Timeout;
+        }
+    };
+
     /// Heartbeats until it is canceled.
     fn hold(ctx: *activity.Context) !void {
-        while (true) {
+        while (!abandon.load(.acquire)) {
             ctx.heartbeat({});
             try ctx.io().sleep(.fromMilliseconds(50), .awake);
         }
+        return error.TestAbandoned;
     }
     const Hold = activity.Def("Hold", hold);
 
-    /// Waits until a worker has started the activity, for at most 30 s.
+    /// Waits until a worker has started the activity, for at most `wait_limit`.
     fn waitUntilStarted(handle: anytype, arena: Allocator) !void {
-        var tries: usize = 0;
-        while ((try handle.describe(arena)).last_started_time == null) : (tries += 1) {
-            if (tries == 300) return error.TestUnexpectedResult;
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
-        }
+        const wait: Wait = .begin("the activity to start");
+        while ((try handle.describe(arena)).last_started_time == null) try wait.again();
+    }
+
+    /// The first line of a test that runs a looping heartbeating fixture.
+    fn reset() void {
+        abandon.store(false, .release);
+        PauseThenCancelFixtures.learned = .unset;
+        PauseThenCancelFixtures.release = .unset;
+        testing.log_level = .debug;
+    }
+
+    /// What such a test defers: tells the fixtures to end, so the worker can stop whatever
+    /// happened to their cancel, then tears the environment down.
+    fn stop(env: *WorkflowEnvironment) void {
+        abandon.store(true, .release);
+        PauseThenCancelFixtures.release.set(testing.io);
+        env.deinit();
+        testing.log_level = .warn;
     }
 
     fn waitForCount(c: *client_mod.Client, query: []const u8, want: u64) !void {
@@ -7190,8 +7229,9 @@ const StandaloneFixtures = struct {
 };
 
 test "client: standalone activities run without a workflow; get, describe, cancel, terminate, list and count them" {
+    StandaloneFixtures.reset();
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args });
-    defer env.deinit();
+    defer StandaloneFixtures.stop(env);
     try env.registerActivity(StandaloneFixtures.Charge);
     try env.registerActivity(StandaloneFixtures.Hold);
     try env.ensureWorker();
@@ -7230,8 +7270,10 @@ test "client: standalone activities run without a workflow; get, describe, cance
         break :blk o;
     }, .{});
     defer canceled.deinit();
+    errdefer canceled.terminate("test failed") catch {};
     try StandaloneFixtures.waitUntilStarted(&canceled, a);
     try canceled.cancel("no longer needed");
+    _ = try StandaloneFollowUpFixtures.waitForStatus(&canceled, a, .canceled, "hold-cancel to end canceled");
     try testing.expectError(error.ActivityCanceled, canceled.get(a));
     try testing.expectEqual(client_mod.ActivityExecutionStatus.canceled, (try canceled.describe(a)).status);
 
@@ -7241,6 +7283,7 @@ test "client: standalone activities run without a workflow; get, describe, cance
         break :blk o;
     }, .{});
     defer terminated.deinit();
+    errdefer terminated.terminate("test failed") catch {};
     try testing.expectError(error.ActivityExecutionAlreadyStarted, c.executeActivity(StandaloneFixtures.Hold, blk: {
         var o = hold;
         o.id = "hold-terminate";
@@ -7284,32 +7327,35 @@ const StandaloneFollowUpFixtures = struct {
 
     /// Heartbeats its progress until it is canceled or paused.
     fn beat(ctx: *activity.Context) ![]const u8 {
-        while (true) {
+        while (!StandaloneFixtures.abandon.load(.acquire)) {
             ctx.heartbeat(Progress{ .step = 3, .note = "halfway" });
             try ctx.io().sleep(.fromMilliseconds(50), .awake);
         }
+        return error.TestAbandoned;
     }
     const Beat = activity.Def("Beat", beat);
 
-    fn waitForStatus(handle: anytype, arena: Allocator, want: client_mod.ActivityExecutionStatus) !client_mod.ActivityDescription {
-        var tries: usize = 0;
-        while (true) : (tries += 1) {
+    /// Waits up to `StandaloneFixtures.wait_limit` for the activity's status to be `want`;
+    /// `what` names the wait in the log when it isn't.
+    fn waitForStatus(handle: anytype, arena: Allocator, want: client_mod.ActivityExecutionStatus, what: []const u8) !client_mod.ActivityDescription {
+        const wait: StandaloneFixtures.Wait = .begin(what);
+        while (true) {
             const d = try handle.describe(arena);
             if (d.status == want) return d;
-            if (tries == 300) {
-                log.err("activity {s} stayed {t}, never {t}", .{ d.activity_id, d.status, want });
-                return error.TestUnexpectedResult;
-            }
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
+            wait.again() catch |err| {
+                log.err("{s}: activity {s} stayed {t}, never {t}", .{ what, d.activity_id, d.status, want });
+                return err;
+            };
         }
     }
 };
 
 test "client: a standalone activity starts with a delay, a priority and a summary, and reports whether it started" {
+    StandaloneFixtures.reset();
     const zlib: converter.ZlibCodec = .{ .always_encode = true };
     const codecs = [_]converter.PayloadCodec{zlib.codec()};
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args, .codecs = &codecs });
-    defer env.deinit();
+    defer StandaloneFixtures.stop(env);
     try env.registerActivity(StandaloneFixtures.Charge);
     try env.registerActivity(StandaloneFixtures.Hold);
     try env.ensureWorker();
@@ -7360,6 +7406,7 @@ test "client: a standalone activity starts with a delay, a priority and a summar
     const hold: client_mod.StartActivityOptions = .{ .id = "attach", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(2), .id_conflict_policy = .use_existing };
     var first = try c.executeActivity(StandaloneFixtures.Hold, hold, .{});
     defer first.deinit();
+    errdefer first.terminate("test failed") catch {};
     try testing.expect(first.started);
     var again = try c.executeActivity(StandaloneFixtures.Hold, hold, .{});
     defer again.deinit();
@@ -7372,10 +7419,11 @@ test "client: a standalone activity starts with a delay, a priority and a summar
 }
 
 test "client: a standalone activity can be paused, unpaused and deleted, and reports its heartbeat details" {
+    StandaloneFixtures.reset();
     const zlib: converter.ZlibCodec = .{ .always_encode = true };
     const codecs = [_]converter.PayloadCodec{zlib.codec()};
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args, .codecs = &codecs });
-    defer env.deinit();
+    defer StandaloneFixtures.stop(env);
     try env.registerActivity(StandaloneFollowUpFixtures.Beat);
     try env.registerActivity(StandaloneFixtures.Charge);
     try env.ensureWorker();
@@ -7387,13 +7435,13 @@ test "client: a standalone activity can be paused, unpaused and deleted, and rep
 
     var beat = try c.executeActivity(StandaloneFollowUpFixtures.Beat, .{ .id = "beat", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(2) }, .{});
     defer beat.deinit();
+    errdefer beat.terminate("test failed") catch {};
     const beating = blk: {
-        var tries: usize = 0;
-        while (true) : (tries += 1) {
+        const wait: StandaloneFixtures.Wait = .begin("beat's first heartbeat details to show in describe");
+        while (true) {
             const d = try beat.describe(a);
             if (d.heartbeat_details.len() > 0) break :blk d;
-            if (tries == 300) return error.TestUnexpectedResult;
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
+            try wait.again();
         }
     };
     const progress = try beating.heartbeat_details.get(Progress, a, 0);
@@ -7403,38 +7451,42 @@ test "client: a standalone activity can be paused, unpaused and deleted, and rep
     try testing.expectEqual(@as(?Progress, null), try beating.heartbeat_details.get(?Progress, a, 1));
 
     try beat.pause("maintenance");
-    const paused = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .paused);
+    const paused = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .paused, "beat to be paused after the first pause");
     // The worker ended the running attempt as a pause, not a cancellation.
     const ended = blk: {
-        var tries: usize = 0;
-        while (true) : (tries += 1) {
+        const wait: StandaloneFixtures.Wait = .begin("the paused attempt's failure to show in describe");
+        while (true) {
             const d = try beat.describe(a);
             if (d.raw.last_failure) |f| break :blk f;
-            if (tries == 300) return error.TestUnexpectedResult;
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
+            try wait.again();
         }
     };
-    try testing.expectEqualStrings("ActivityPause", failure_mod.applicationType(ended).?);
+    const ended_type = failure_mod.applicationType(ended) orelse {
+        log.err("the paused attempt ended with a {t} failure, not an application failure: {s}", .{ ended.failure_info orelse return error.TestUnexpectedResult, ended.message });
+        return error.TestUnexpectedResult;
+    };
+    try testing.expectEqualStrings("ActivityPause", ended_type);
     // Ending the paused attempt kept its last heartbeat's details for the next one.
     try testing.expectEqualStrings("halfway", (try (try beat.describe(a)).heartbeat_details.get(Progress, a, 0)).note);
     try testing.expectEqual(client_mod.ActivityExecutionStatus.paused, (try beat.describe(a)).status);
     try beat.unpause(.{ .reason = "maintenance over" });
-    var tries: usize = 0;
-    while (true) : (tries += 1) {
-        const d = try beat.describe(a);
-        if (d.status == .running and d.attempt > 1 and d.last_started_time != null and
-            d.last_started_time.?.nanoseconds > paused.last_started_time.?.nanoseconds) break;
-        if (tries == 300) return error.TestUnexpectedResult;
-        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    {
+        const wait: StandaloneFixtures.Wait = .begin("beat to run a second attempt after the first unpause");
+        while (true) {
+            const d = try beat.describe(a);
+            if (d.status == .running and d.attempt > 1 and d.last_started_time != null and
+                d.last_started_time.?.nanoseconds > paused.last_started_time.?.nanoseconds) break;
+            try wait.again();
+        }
     }
     // Unpausing an activity that isn't paused does nothing.
     // The server refuses to unpause a running activity, or to pause one twice.
     try testing.expectError(error.RpcFailed, beat.unpause(.{ .jitter = .fromSeconds(1) }));
     try beat.pause("again");
     try testing.expectError(error.RpcFailed, beat.pause("again"));
-    _ = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .paused);
+    _ = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .paused, "beat to be paused after the second pause");
     try beat.unpause(.{ .reason = "jittered", .jitter = .fromMilliseconds(500) });
-    _ = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .running);
+    _ = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .running, "beat to run again after the second unpause");
 
     try beat.delete();
     try testing.expectError(error.NotFound, beat.describe(a));
@@ -7463,7 +7515,7 @@ const PauseThenCancelFixtures = struct {
     /// Heartbeats until canceled, then holds the attempt open until `release`, and ends
     /// it with the cancellation.
     fn hold(ctx: *activity.Context) !void {
-        while (true) {
+        while (!StandaloneFixtures.abandon.load(.acquire)) {
             ctx.heartbeat({});
             ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
                 learned.set(ctx.io());
@@ -7471,13 +7523,15 @@ const PauseThenCancelFixtures = struct {
                 return err;
             };
         }
+        return error.TestAbandoned;
     }
     const Hold = activity.Def("PauseThenCancelHold", hold);
 };
 
 test "client: cancelling a standalone activity while its pause reaches the running attempt cancels it" {
+    StandaloneFixtures.reset();
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args });
-    defer env.deinit();
+    defer StandaloneFixtures.stop(env);
     try env.registerActivity(PauseThenCancelFixtures.Hold);
     try env.ensureWorker();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -7487,24 +7541,18 @@ test "client: cancelling a standalone activity while its pause reaches the runni
 
     var held = try c.executeActivity(PauseThenCancelFixtures.Hold, .{ .id = "pause-then-cancel", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60), .heartbeat_timeout = .fromSeconds(5) }, .{});
     defer held.deinit();
+    errdefer held.terminate("test failed") catch {};
     try StandaloneFixtures.waitUntilStarted(&held, a);
     // An operator pauses the activity, then cancels it before the running attempt it
     // paused has ended: the caller asked for a cancellation, so the activity must end
     // canceled, not as a failure of the attempt the pause ended.
     try held.pause("hold on");
-    var tries: usize = 0;
-    while (!PauseThenCancelFixtures.learned.isSet()) : (tries += 1) {
-        if (tries == 300) {
-            PauseThenCancelFixtures.release.set(testing.io);
-            return error.TestUnexpectedResult;
-        }
-        try testing.io.sleep(.fromMilliseconds(100), .awake);
-    }
-    held.cancel("no longer needed") catch |err| {
-        PauseThenCancelFixtures.release.set(testing.io);
-        return err;
-    };
+    const learning: StandaloneFixtures.Wait = .begin("the running attempt to learn of the pause");
+    while (!PauseThenCancelFixtures.learned.isSet()) try learning.again();
+    // A failure from here on releases the attempt in `StandaloneFixtures.stop`.
+    try held.cancel("no longer needed");
     PauseThenCancelFixtures.release.set(testing.io);
+    _ = try StandaloneFollowUpFixtures.waitForStatus(&held, a, .canceled, "pause-then-cancel to end canceled");
     held.get(a) catch |err| {
         if (err != error.ActivityCanceled) {
             const message = if (held.failure()) |f| f.message else "";
