@@ -35,6 +35,7 @@ const std = @import("std");
 const converter = @import("converter.zig");
 const client_mod = @import("client.zig");
 const failure_mod = @import("failure.zig");
+const interceptor = @import("interceptor.zig");
 const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
 const proto = @import("proto.zig");
@@ -531,6 +532,8 @@ pub const Context = struct {
     client_: ?*client_mod.Client = null,
     /// Records with the operation's attributes; the worker frees it after the request.
     metrics_: metrics_mod.Handler = .noop,
+    /// The request's outbound interceptors (`interceptor.NexusOperationOutbound`).
+    outbound: []const interceptor.NexusOperationOutbound = &.{},
     /// Applied to the input before decoding and to a synchronous result after encoding:
     /// the client's (`client.Options.codecs`). Borrowed.
     codecs: []const converter.PayloadCodec = &.{},
@@ -583,9 +586,22 @@ pub const Context = struct {
     }
 
     /// The logger the worker set up for the request, carrying its service and operation as
-    /// fields and writing to the worker's sink (`worker.Options.logger`); the std log for a
-    /// context built without one.
+    /// fields and writing to the worker's sink (`worker.Options.logger`), as the request's
+    /// outbound interceptors (`interceptor.NexusOperationOutbound.logger`) return it; the std
+    /// log for a context built without one.
     pub fn logger(ctx: *const Context) log.Logger {
+        if (ctx.outbound.len == 0) return ctx.logger_;
+        return ctx.outboundNext().logger(.{});
+    }
+
+    fn outboundNext(ctx: *const Context) interceptor.NexusOperationOutbound.Next {
+        return .{ .chain = ctx.outbound, .root = .{ .ptr = @constCast(ctx), .vtable = &outbound_root } };
+    }
+
+    const outbound_root: interceptor.NexusOperationOutbound.VTable = .{ .logger = rootLogger };
+
+    fn rootLogger(ptr: *anyopaque, _: interceptor.LoggerInput, _: interceptor.NexusOperationOutbound.Next) log.Logger {
+        const ctx: *const Context = @ptrCast(@alignCast(ptr));
         return ctx.logger_;
     }
 

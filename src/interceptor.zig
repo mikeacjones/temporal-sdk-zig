@@ -23,7 +23,10 @@
 //! `Worker` interceptor hands out the run's interceptors: `WorkflowInbound` around what
 //! reaches the workflow (its start, signals, queries, updates), `WorkflowOutbound` around what
 //! the workflow sends (activities, children, signals, continue-as-new, its logger), and
-//! `ActivityInbound` and `ActivityOutbound` likewise for an activity. The first interceptor in
+//! `ActivityInbound` and `ActivityOutbound` likewise for an activity. For each Nexus request
+//! the worker handles, it hands out `NexusOperationInbound`, around the start and the cancel
+//! of the operation, and `NexusOperationOutbound`, around the handler's logger. A workflow's
+//! Nexus calls pass through `WorkflowOutbound.executeNexusOperation`. The first interceptor in
 //! a list is the outermost.
 //!
 //! Clients take `Client` interceptors (`client.Options.interceptors`), which wrap every request
@@ -33,6 +36,9 @@
 //! Inputs are type-erased, since workflows, activities, and their handlers are typed at
 //! compile time: names, `converter.EncodedValues` arguments, a `converter.Header`, and
 //! options. Results are encoded payloads.
+//!
+//! Activity and Nexus interceptors run on the worker's threads, concurrently for different
+//! attempts and requests, so a `Worker` interceptor must be thread-safe.
 //!
 //! Workflow interceptors run inside the workflow: they must follow the workflow rules (no
 //! threads, clocks, randomness, or I/O outside `ctx.io()`), and they run again on replay, where
@@ -45,6 +51,7 @@ const failure_mod = @import("failure.zig");
 const log = @import("log.zig");
 const workflow = @import("workflow.zig");
 const activity = @import("activity.zig");
+const nexus = @import("nexus.zig");
 const Allocator = std.mem.Allocator;
 const Payload = converter.Payload;
 const EncodedValues = converter.EncodedValues;
@@ -53,7 +60,8 @@ const HeaderWriter = converter.HeaderWriter;
 
 // ---------------------------------------------------------------- worker
 
-/// Supplies the interceptors of each workflow run and activity attempt on a worker. Set with
+/// Supplies the interceptors of each workflow run, activity attempt and Nexus request on a
+/// worker. Set with
 /// `worker.Options.interceptors` or, for every worker on a client,
 /// `client.Options.worker_interceptors`. Borrowed: it must outlive the workers.
 pub const Worker = struct {
@@ -68,6 +76,12 @@ pub const Worker = struct {
         /// Called once per activity attempt, before the activity runs, on the activity's
         /// thread. Allocate per-attempt state with `ctx.allocator()`.
         interceptActivity: ?*const fn (ptr: *anyopaque, ctx: *activity.Context) error{OutOfMemory}!Activity = null,
+        /// Called once per Nexus request the worker handles (the start or the cancel of an
+        /// operation), before the handler runs, on the request's own task on the worker's
+        /// `std.Io`, concurrently for different requests. `ctx.info()` is complete. Allocate
+        /// per-request state with `ctx.allocator()`. `error.OutOfMemory` fails the request
+        /// with a retryable `internal` handler error.
+        interceptNexusOperation: ?*const fn (ptr: *anyopaque, ctx: *nexus.Context) error{OutOfMemory}!NexusOperation = null,
     };
 
     pub fn interceptWorkflow(w: Worker, ctx: *workflow.Context) error{OutOfMemory}!Workflow {
@@ -80,8 +94,13 @@ pub const Worker = struct {
         return f(w.ptr, ctx);
     }
 
-    /// The `Worker` interceptor of `impl`, from whichever of `interceptWorkflow` and
-    /// `interceptActivity` `T` declares, each taking `*T` first.
+    pub fn interceptNexusOperation(w: Worker, ctx: *nexus.Context) error{OutOfMemory}!NexusOperation {
+        const f = w.vtable.interceptNexusOperation orelse return .{};
+        return f(w.ptr, ctx);
+    }
+
+    /// The `Worker` interceptor of `impl`, from whichever of `interceptWorkflow`,
+    /// `interceptActivity` and `interceptNexusOperation` `T` declares, each taking `*T` first.
     pub fn from(comptime T: type, impl: *T) Worker {
         const Erased = struct {
             fn wf(ptr: *anyopaque, ctx: *workflow.Context) error{OutOfMemory}!Workflow {
@@ -90,9 +109,13 @@ pub const Worker = struct {
             fn act(ptr: *anyopaque, ctx: *activity.Context) error{OutOfMemory}!Activity {
                 return T.interceptActivity(@as(*T, @ptrCast(@alignCast(ptr))), ctx);
             }
+            fn nx(ptr: *anyopaque, ctx: *nexus.Context) error{OutOfMemory}!NexusOperation {
+                return T.interceptNexusOperation(@as(*T, @ptrCast(@alignCast(ptr))), ctx);
+            }
             const vtable: VTable = .{
                 .interceptWorkflow = if (@hasDecl(T, "interceptWorkflow")) wf else null,
                 .interceptActivity = if (@hasDecl(T, "interceptActivity")) act else null,
+                .interceptNexusOperation = if (@hasDecl(T, "interceptNexusOperation")) nx else null,
             };
         };
         return .{ .ptr = impl, .vtable = &Erased.vtable };
@@ -109,6 +132,12 @@ pub const Workflow = struct {
 pub const Activity = struct {
     inbound: ?ActivityInbound = null,
     outbound: ?ActivityOutbound = null,
+};
+
+/// A Nexus request's interceptors; either may be null.
+pub const NexusOperation = struct {
+    inbound: ?NexusOperationInbound = null,
+    outbound: ?NexusOperationOutbound = null,
 };
 
 // ---------------------------------------------------------------- workflow inbound
@@ -245,14 +274,27 @@ pub const SideEffectInput = struct {
     value: ?Payload,
 };
 
-/// A request for the logger workflow or activity code uses.
+/// A Nexus operation the workflow calls, from `ctx.executeNexusOperation` or
+/// `executeNexusOperationByName`. The endpoint is `options.endpoint` and the call's Nexus
+/// headers are `options.headers`. `payload` is the input encoded by the payload converter;
+/// the payload codecs run later, as for activity arguments. Options are validated after the
+/// interceptors, and the endpoint, names and headers are copied then, so a changed slice need
+/// only live for the call; a changed `payload` must be `ctx.allocator()` memory.
+pub const NexusOperationInput = struct {
+    service: []const u8,
+    operation: []const u8,
+    options: workflow.NexusOperationOptions,
+    payload: Payload,
+};
+
+/// A request for the logger workflow, activity or Nexus handler code uses.
 pub const LoggerInput = struct {};
 
 /// Wraps what a workflow run sends. See the namespace documentation.
 ///
-/// To refuse an activity or child workflow, return `rejectActivity` or
-/// `rejectChildWorkflow`: the workflow's future fails with the failure given, and nothing is
-/// scheduled.
+/// To refuse an activity, child workflow or Nexus operation, return `rejectActivity`,
+/// `rejectChildWorkflow` or `rejectNexusOperation`: the workflow's future fails with the
+/// failure given, and nothing is scheduled.
 pub const WorkflowOutbound = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -269,6 +311,13 @@ pub const WorkflowOutbound = struct {
         /// sends.
         continueAsNew: ?*const fn (ptr: *anyopaque, input: ContinueAsNewInput, next: Next) ContinueAsNewError!void = null,
         sideEffect: ?*const fn (ptr: *anyopaque, input: SideEffectInput, next: Next) workflow.ActivityFuture(Payload) = null,
+        /// Schedules a Nexus operation, for `ctx.executeNexusOperation` and
+        /// `executeNexusOperationByName`. Cancelling the operation's future
+        /// (`NexusOperationFuture.cancel`, or cancelling the coroutine that waits on it) does
+        /// not pass through an interceptor, as for activities and child workflows. Changing
+        /// the endpoint, service or operation is a nondeterministic change for histories
+        /// recorded without it; changing headers is not.
+        executeNexusOperation: ?*const fn (ptr: *anyopaque, input: NexusOperationInput, next: Next) workflow.NexusOperationFuture(Payload) = null,
         /// The logger `ctx.logger()` returns, called on every `ctx.logger()`. Add fields with
         /// `with` (cache the result: the run's arena grows with each call).
         logger: ?*const fn (ptr: *anyopaque, input: LoggerInput, next: Next) log.Logger = null,
@@ -300,6 +349,9 @@ pub const WorkflowOutbound = struct {
         pub fn sideEffect(n: Next, input: SideEffectInput) workflow.ActivityFuture(Payload) {
             return dispatch(WorkflowOutbound, "sideEffect", n, input);
         }
+        pub fn executeNexusOperation(n: Next, input: NexusOperationInput) workflow.NexusOperationFuture(Payload) {
+            return dispatch(WorkflowOutbound, "executeNexusOperation", n, input);
+        }
         pub fn logger(n: Next, input: LoggerInput) log.Logger {
             return dispatch(WorkflowOutbound, "logger", n, input);
         }
@@ -323,6 +375,14 @@ pub fn rejectActivity(ctx: *workflow.Context, activity_type: []const u8, f: fail
 /// refusing `workflow_type`.
 pub fn rejectChildWorkflow(ctx: *workflow.Context, workflow_type: []const u8, f: failure_mod.Application) workflow.ChildWorkflowFuture(Payload) {
     return .{ .ctx = ctx, .state = ctx.instance.rejectedChild(workflow_type, f) };
+}
+
+/// A future for a Nexus operation that is never scheduled, for an outbound interceptor
+/// refusing `input`: `started` and `get` return `error.NexusOperationFailed`, and `failure`
+/// is a Nexus operation failure naming `input`'s endpoint, service and operation whose cause
+/// is `f`. `f` is copied, so it may point at the stack. `cancel` on it does nothing.
+pub fn rejectNexusOperation(ctx: *workflow.Context, input: NexusOperationInput, f: failure_mod.Application) workflow.NexusOperationFuture(Payload) {
+    return .{ .ctx = ctx, .state = ctx.instance.rejectedNexusOperation(input.options.endpoint, input.service, input.operation, f) };
 }
 
 // ---------------------------------------------------------------- activities
@@ -388,6 +448,93 @@ pub const ActivityOutbound = struct {
 
     pub fn from(comptime T: type, impl: *T) ActivityOutbound {
         return build(ActivityOutbound, T, impl);
+    }
+};
+
+// ---------------------------------------------------------------- Nexus operations
+
+/// The start of a Nexus operation on the handling worker. `payload` is the request's input,
+/// still encoded by the caller's codecs, null when the request carries none; `headers` are
+/// the request's Nexus headers.
+pub const StartNexusOperationInput = struct {
+    service: []const u8,
+    operation: []const u8,
+    payload: ?Payload,
+    headers: []const nexus.Header,
+};
+
+/// The cancel of a Nexus operation on the handling worker; `token` is the operation token
+/// its start returned.
+pub const CancelNexusOperationInput = struct {
+    service: []const u8,
+    operation: []const u8,
+    token: []const u8,
+};
+
+/// Wraps a Nexus request a worker handles: the start or the cancel of an operation, of every
+/// kind of handler. The chain ends in looking up the registered operation by the input's
+/// service and operation (a `not_found` handler error when there is none) and running it, so
+/// a change to the input is what the handler runs with and what `ctx.info()` reports.
+///
+/// An interceptor may change the input before calling `next`, change what `next` returns,
+/// or refuse the request by returning `.{ .handler_error = ... }` without calling `next`.
+/// It runs on the request's task on the worker's `std.Io`, concurrently with other requests,
+/// may do I/O, and sees a cancel of the request as `std.Io` cancellation, like the handler.
+/// Every slice in an input it changes or a result it builds must live until the response has
+/// been sent, as `ctx.allocator()` memory does; a payload it substitutes (input or
+/// `StartResult.succeeded.result`) must be in wire form, through the client's codecs.
+/// Requests the worker fails before a handler task exists don't reach it.
+pub const NexusOperationInbound = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        startOperation: ?*const fn (ptr: *anyopaque, input: StartNexusOperationInput, next: Next) nexus.StartResult = null,
+        cancelOperation: ?*const fn (ptr: *anyopaque, input: CancelNexusOperationInput, next: Next) nexus.CancelResult = null,
+    };
+
+    /// The interceptors after this one, ending in the registered operation handler.
+    pub const Next = struct {
+        chain: []const NexusOperationInbound,
+        root: NexusOperationInbound,
+
+        pub fn startOperation(n: Next, input: StartNexusOperationInput) nexus.StartResult {
+            return dispatch(NexusOperationInbound, "startOperation", n, input);
+        }
+        pub fn cancelOperation(n: Next, input: CancelNexusOperationInput) nexus.CancelResult {
+            return dispatch(NexusOperationInbound, "cancelOperation", n, input);
+        }
+    };
+
+    /// The interceptor of `impl`, from the methods of `VTable` that `T` declares, each as
+    /// `fn (*T, Input, Next) Result`.
+    pub fn from(comptime T: type, impl: *T) NexusOperationInbound {
+        return build(NexusOperationInbound, T, impl);
+    }
+};
+
+/// Wraps what a Nexus handler uses from its context: the logger.
+pub const NexusOperationOutbound = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// The logger the handler's `ctx.logger()` returns, called on every `ctx.logger()`.
+        /// The worker's own logging of the request's outcome doesn't pass through it.
+        logger: ?*const fn (ptr: *anyopaque, input: LoggerInput, next: Next) log.Logger = null,
+    };
+
+    pub const Next = struct {
+        chain: []const NexusOperationOutbound,
+        root: NexusOperationOutbound,
+
+        pub fn logger(n: Next, input: LoggerInput) log.Logger {
+            return dispatch(NexusOperationOutbound, "logger", n, input);
+        }
+    };
+
+    pub fn from(comptime T: type, impl: *T) NexusOperationOutbound {
+        return build(NexusOperationOutbound, T, impl);
     }
 };
 

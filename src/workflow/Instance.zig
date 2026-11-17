@@ -2016,6 +2016,13 @@ pub fn signalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
     });
 }
 
+/// Encodes `input` and schedules a Nexus operation through the outbound interceptors.
+pub fn executeNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, input: anytype) workflow.NexusOperationFuture(converter.Payload) {
+    if (inst.wio.refuse("executeNexusOperation")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
+    const payload = converter.toPayload(inst.arena(), input) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
+    return inst.outboundNext().executeNexusOperation(.{ .service = service, .operation = operation, .options = options, .payload = payload });
+}
+
 /// Requests another workflow's cancellation through the outbound interceptors.
 pub fn cancelExternalWorkflow(inst: *Instance, workflow_id: []const u8, run_id: []const u8) workflow.CancelExternalFuture {
     if (inst.wio.refuse("cancelExternalWorkflow")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
@@ -2057,6 +2064,38 @@ pub fn rejectedChild(inst: *Instance, workflow_type: []const u8, f: failure_mod.
     };
     const state = try a.create(ChildState);
     state.* = .{ .seq = 0, .workflow_id = "", .workflow_type = out.failure_info.?.child_workflow_execution_failure_info.workflow_type.?.name, .cancellation_type = .try_cancel, .outcome = .{ .failed = out } };
+    return state;
+}
+
+/// The state of a Nexus operation an interceptor refused, as `rejectedActivity`: a Nexus
+/// operation failure naming the endpoint, service and operation, caused by `f`.
+pub fn rejectedNexusOperation(inst: *Instance, endpoint: []const u8, service: []const u8, operation: []const u8, f: failure_mod.Application) ScheduleError!*NexusOperationState {
+    const a = inst.arena();
+    const cause = try a.create(Failure);
+    cause.* = try failure_mod.application(a, f);
+    const endpoint_copy = try a.dupe(u8, endpoint);
+    const service_copy = try a.dupe(u8, service);
+    const operation_copy = try a.dupe(u8, operation);
+    const out = try a.create(Failure);
+    out.* = .{
+        .message = try std.fmt.allocPrint(a, "nexus operation \"{s}\" of service \"{s}\" was refused by a workflow interceptor", .{ operation, service }),
+        .source = failure_mod.source,
+        .cause = cause,
+        .failure_info = .{ .nexus_operation_execution_failure_info = .{
+            .endpoint = endpoint_copy,
+            .service = service_copy,
+            .operation = operation_copy,
+        } },
+    };
+    const state = try a.create(NexusOperationState);
+    state.* = .{
+        .seq = 0,
+        .endpoint = endpoint_copy,
+        .service = service_copy,
+        .operation = operation_copy,
+        .cancellation_type = .abandon,
+        .outcome = .{ .failed = out },
+    };
     return state;
 }
 
@@ -2567,11 +2606,11 @@ fn resolveChild(inst: *Instance, r: *const act_pb.ResolveChildWorkflowExecution)
 
 // ---------------------------------------------------------------- Nexus operations
 
-/// Validates the options, encodes `input`, and emits ScheduleNexusOperation. Nexus calls
-/// don't go through the outbound interceptors. The names, endpoint and headers are copied
-/// into the arena.
-pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, input: anytype) ScheduleError!*NexusOperationState {
-    if (inst.wio.refuse("executeNexusOperation")) return error.InvalidOptions;
+/// Validates the options and emits ScheduleNexusOperation with the encoded `payload`: the
+/// root of the outbound interceptors' `executeNexusOperation`, so validation sees what they
+/// pass on. The names, endpoint and headers are copied into the arena; `payload` must be
+/// arena memory or outlive the activation.
+pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, payload: converter.Payload) ScheduleError!*NexusOperationState {
     const fields = .{ .NexusEndpoint = options.endpoint, .NexusService = service, .NexusOperation = operation };
     if (options.endpoint.len == 0) {
         inst.logger.warn("executeNexusOperation: NexusOperationOptions.endpoint is empty; name the Nexus endpoint to call through", fields);
@@ -2601,7 +2640,7 @@ pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: [
         .endpoint = state.endpoint,
         .service = state.service,
         .operation = state.operation,
-        .input = try converter.toPayload(a, input),
+        .input = payload,
         .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
         .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
         .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
@@ -2957,6 +2996,7 @@ const outbound_root: interceptor.WorkflowOutbound.VTable = .{
     .cancelExternalWorkflow = rootCancelExternalWorkflow,
     .continueAsNew = rootContinueAsNew,
     .sideEffect = rootSideEffect,
+    .executeNexusOperation = rootExecuteNexusOperation,
     .logger = rootLogger,
 };
 
@@ -3005,6 +3045,11 @@ fn rootSideEffect(ptr: *anyopaque, input: interceptor.SideEffectInput, _: interc
 fn rootExecuteChildWorkflow(ptr: *anyopaque, input: interceptor.ChildWorkflowInput, _: interceptor.WorkflowOutbound.Next) workflow.ChildWorkflowFuture(converter.Payload) {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
     return .{ .ctx = &inst.ctx, .state = inst.startChildWorkflow(input.workflow_type, input.options, input.args.payloads, input.header.header()) };
+}
+
+fn rootExecuteNexusOperation(ptr: *anyopaque, input: interceptor.NexusOperationInput, _: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(converter.Payload) {
+    const inst: *Instance = @ptrCast(@alignCast(ptr));
+    return .{ .ctx = &inst.ctx, .state = inst.scheduleNexusOperation(input.service, input.operation, input.options, input.payload) };
 }
 
 fn rootSignalExternalWorkflow(ptr: *anyopaque, input: interceptor.SignalExternalInput, _: interceptor.WorkflowOutbound.Next) workflow.SignalExternalFuture {

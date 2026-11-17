@@ -1196,10 +1196,11 @@ pub const Context = struct {
     ///
     /// `Service` must have `Operation`, with the same input and output types: otherwise this
     /// is a compile error naming the service and the operation. An input of the wrong type is
-    /// a compile error at the call. Workflow interceptors don't see Nexus calls.
+    /// a compile error at the call. The call passes through the workflow's outbound interceptors
+    /// (`interceptor.WorkflowOutbound.executeNexusOperation`).
     pub fn executeNexusOperation(ctx: *Context, comptime Service: type, comptime Operation: type, options: NexusOperationOptions, input: Operation.Input) NexusOperationFuture(Operation.Output) {
         if (comptime nexusCallError(Service, Operation)) |message| @compileError(message);
-        return .{ .ctx = ctx, .state = ctx.instance.scheduleNexusOperation(Service.service_name, Operation.operation_name, options, input) };
+        return .{ .ctx = ctx, .state = ctx.instance.executeNexusOperation(Service.service_name, Operation.operation_name, options, input).state };
     }
 
     /// Schedules a Nexus operation by its service and operation names, for a service this
@@ -1208,7 +1209,7 @@ pub const Context = struct {
     /// copied. An empty service or operation name makes the future return
     /// `error.InvalidOptions` (logged).
     pub fn executeNexusOperationByName(ctx: *Context, comptime Output: type, service: []const u8, operation: []const u8, options: NexusOperationOptions, input: anytype) NexusOperationFuture(Output) {
-        return .{ .ctx = ctx, .state = ctx.instance.scheduleNexusOperation(service, operation, options, input) };
+        return .{ .ctx = ctx, .state = ctx.instance.executeNexusOperation(service, operation, options, input).state };
     }
 
     /// Sends `Signal` (a `SignalDef`) with `args` to the workflow `workflow_id` and returns a

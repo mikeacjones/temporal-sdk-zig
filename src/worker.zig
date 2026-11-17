@@ -211,9 +211,10 @@ pub const Options = struct {
     /// Keep workflow loggers on while workflows replay history. By default they are silent
     /// during replay, so each message is logged once.
     log_during_replay: bool = false,
-    /// Interceptors of this worker's workflows and activities, after the client's
-    /// (`client.Options.worker_interceptors`); the first is the outermost. Borrowed: they
-    /// must outlive the worker. Called concurrently from workflow and activity threads.
+    /// Interceptors of this worker's workflows, activities and Nexus requests, after the
+    /// client's (`client.Options.worker_interceptors`); the first is the outermost. Borrowed:
+    /// they must outlive the worker. Called concurrently from workflow and activity threads
+    /// and Nexus handler tasks.
     interceptors: []const interceptor.Worker = &.{},
     /// Makes this worker a version of a Worker Deployment (see `temporal.deployment`). Null
     /// leaves it unversioned.
@@ -2310,7 +2311,8 @@ fn runNexusRequest(w: *Worker, req: *NexusRequest) void {
     req.outcome = handleNexusRequest(w, req);
 }
 
-/// Builds the request's context and calls its operation's handler.
+/// Builds the request's context, asks the worker's interceptors for the request's own, and
+/// calls the operation's handler through them.
 fn handleNexusRequest(w: *Worker, req: *NexusRequest) NexusOutcome {
     const a = req.arena.allocator();
     const ctx = &req.ctx;
@@ -2347,40 +2349,95 @@ fn handleNexusRequest(w: *Worker, req: *NexusRequest) NexusOutcome {
         ctx.metrics_.deinit();
         ctx.metrics_ = .noop;
     }
-    const bound = w.nexusOperation(service, operation) catch |err| return .{ .failed = .{
-        .type = .not_found,
-        .message = switch (err) {
-            error.ServiceNotFound => std.fmt.allocPrint(a, "Nexus service \"{s}\" is not registered on the worker for task queue {s} (looking for its operation \"{s}\")", .{ service, w.task_queue, operation }),
-            error.OperationNotFound => std.fmt.allocPrint(a, "Nexus service \"{s}\" has no operation \"{s}\" on the worker for task queue {s}", .{ service, operation, w.task_queue }),
-        } catch "the Nexus service or operation is not registered on this worker",
-        .retry = .non_retryable,
-    } };
+    if (variant == .start_operation) {
+        const s = &variant.start_operation;
+        ctx.info_.request_id = s.request_id;
+        ctx.info_.callback_url = s.callback;
+        ctx.info_.callback_headers = nexusHeaders(a, s.callback_header.items) catch return oom;
+        var links: std.ArrayList(nexus.Link) = .empty;
+        for (s.links.items) |link| {
+            var why: []const u8 = "";
+            const converted = wire.fromNexusLink(a, link, &why) catch |err| switch (err) {
+                error.OutOfMemory => return oom,
+                error.InvalidLink => {
+                    ctx.logger_.warn("Dropping a link of the Nexus request that doesn't parse", .{ .Url = link.url, .Type = link.type, .Reason = why });
+                    continue;
+                },
+            };
+            links.append(a, converted) catch return oom;
+        }
+        ctx.info_.links = links.items;
+    }
+    var inbound: std.ArrayList(interceptor.NexusOperationInbound) = .empty;
+    var outbound: std.ArrayList(interceptor.NexusOperationOutbound) = .empty;
+    for (w.interceptors) |wi| {
+        const request = wi.interceptNexusOperation(ctx) catch return oom;
+        if (request.inbound) |i| inbound.append(a, i) catch return oom;
+        if (request.outbound) |o| outbound.append(a, o) catch return oom;
+    }
+    ctx.outbound = outbound.items;
+    var call: NexusCall = .{ .w = w, .ctx = ctx };
+    const next: interceptor.NexusOperationInbound.Next = .{ .chain = inbound.items, .root = .{ .ptr = &call, .vtable = &NexusCall.vtable } };
     switch (variant) {
-        .start_operation => |s| {
-            ctx.info_.request_id = s.request_id;
-            ctx.info_.callback_url = s.callback;
-            ctx.info_.callback_headers = nexusHeaders(a, s.callback_header.items) catch return oom;
-            var links: std.ArrayList(nexus.Link) = .empty;
-            for (s.links.items) |link| {
-                var why: []const u8 = "";
-                const converted = wire.fromNexusLink(a, link, &why) catch |err| switch (err) {
-                    error.OutOfMemory => return oom,
-                    error.InvalidLink => {
-                        ctx.logger_.warn("Dropping a link of the Nexus request that doesn't parse", .{ .Url = link.url, .Type = link.type, .Reason = why });
-                        continue;
-                    },
-                };
-                links.append(a, converted) catch return oom;
-            }
-            ctx.info_.links = links.items;
-            return .{ .start = bound.start(ctx, s.payload) };
-        },
-        .cancel_operation => |c| {
-            const token = if (c.operation_token.len > 0) c.operation_token else c.operation_id;
-            return .{ .cancel = bound.cancel(ctx, token) };
-        },
+        .start_operation => |s| return .{ .start = next.startOperation(.{
+            .service = service,
+            .operation = operation,
+            .payload = s.payload,
+            .headers = ctx.info_.headers,
+        }) },
+        .cancel_operation => |c| return .{ .cancel = next.cancelOperation(.{
+            .service = service,
+            .operation = operation,
+            .token = if (c.operation_token.len > 0) c.operation_token else c.operation_id,
+        }) },
     }
 }
+
+/// The end of a Nexus request's inbound interceptor chain: looks up the registered operation
+/// by the names the interceptors pass on and runs its handler, with `ctx.info()` reporting
+/// them.
+const NexusCall = struct {
+    w: *Worker,
+    ctx: *nexus.Context,
+
+    const vtable: interceptor.NexusOperationInbound.VTable = .{ .startOperation = start, .cancelOperation = cancel };
+
+    fn start(ptr: *anyopaque, input: interceptor.StartNexusOperationInput, _: interceptor.NexusOperationInbound.Next) nexus.StartResult {
+        const call: *NexusCall = @ptrCast(@alignCast(ptr));
+        var missing: nexus.HandlerError = undefined;
+        const bound = call.lookup(input.service, input.operation, &missing) orelse return .{ .handler_error = missing };
+        call.ctx.info_.headers = input.headers;
+        return bound.start(call.ctx, input.payload);
+    }
+
+    fn cancel(ptr: *anyopaque, input: interceptor.CancelNexusOperationInput, _: interceptor.NexusOperationInbound.Next) nexus.CancelResult {
+        const call: *NexusCall = @ptrCast(@alignCast(ptr));
+        var missing: nexus.HandlerError = undefined;
+        const bound = call.lookup(input.service, input.operation, &missing) orelse return .{ .handler_error = missing };
+        return bound.cancel(call.ctx, input.token);
+    }
+
+    /// The operation, with the context's service and operation set to its names; null with
+    /// a `not_found` handler error in `missing` when it isn't registered.
+    fn lookup(call: *NexusCall, service: []const u8, operation: []const u8, missing: *nexus.HandlerError) ?nexus.BoundOperation {
+        const w = call.w;
+        const a = call.ctx.arena;
+        const bound = w.nexusOperation(service, operation) catch |err| {
+            missing.* = .{
+                .type = .not_found,
+                .message = switch (err) {
+                    error.ServiceNotFound => std.fmt.allocPrint(a, "Nexus service \"{s}\" is not registered on the worker for task queue {s} (looking for its operation \"{s}\")", .{ service, w.task_queue, operation }),
+                    error.OperationNotFound => std.fmt.allocPrint(a, "Nexus service \"{s}\" has no operation \"{s}\" on the worker for task queue {s}", .{ service, operation, w.task_queue }),
+                } catch "the Nexus service or operation is not registered on this worker",
+                .retry = .non_retryable,
+            };
+            return null;
+        };
+        call.ctx.info_.service = service;
+        call.ctx.info_.operation = operation;
+        return bound;
+    }
+};
 
 fn nexusHeaders(a: Allocator, entries: anytype) error{OutOfMemory}![]const nexus.Header {
     const out = try a.alloc(nexus.Header, entries.len);

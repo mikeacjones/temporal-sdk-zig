@@ -5,6 +5,8 @@ const std = @import("std");
 const client_mod = @import("client.zig");
 const converter = @import("converter.zig");
 const failure_mod = @import("failure.zig");
+const interceptor = @import("interceptor.zig");
+const log = @import("log.zig");
 const nexus = @import("nexus.zig");
 const proto = @import("proto.zig");
 const testing_mod = @import("testing.zig");
@@ -77,6 +79,7 @@ const Handlers = struct {
 
     /// Returns the input with what the handler knows about its request.
     fn echo(_: *Handlers, ctx: *nexus.Context, input: []const u8) ![]const u8 {
+        ctx.logger().info("echo handled", .{});
         const i = ctx.info();
         const link_workflow = if (i.links.len > 0) i.links[0].variant.?.workflow_event.workflow_id else "none";
         return std.fmt.allocPrint(ctx.allocator(), "{s} op={s}/{s} ns={s} endpoint={s} queue={s} trace={s} request_id={} link={s} deadline={}", .{
@@ -598,4 +601,222 @@ test "nexus: a workflow that abandons a started operation resolves it as cancele
     defer held.deinit();
     try testing.expectEqualStrings(try std.fmt.allocPrint(a, "released {s}", .{hold_id}), try held.get(a));
     try testing.expectEqual(client_mod.WorkflowExecutionStatus.completed, (try c.describeWorkflow(a, r.id, r.run_id)).status);
+}
+
+// ---------------------------------------------------------------- interceptors
+
+/// What the Nexus interceptors saw, in order, from the handlers' tasks.
+const Seen = struct {
+    mutex: Io.Mutex = .init,
+    arena: std.heap.ArenaAllocator = .init(testing.allocator),
+    events: std.ArrayList([]const u8) = .empty,
+
+    fn add(s: *Seen, comptime fmt: []const u8, args: anytype) void {
+        s.mutex.lockUncancelable(testing.io);
+        defer s.mutex.unlock(testing.io);
+        const event = std.fmt.allocPrint(s.arena.allocator(), fmt, args) catch return;
+        s.events.append(s.arena.allocator(), event) catch {};
+    }
+
+    fn expect(s: *Seen, event: []const u8) !void {
+        s.mutex.lockUncancelable(testing.io);
+        defer s.mutex.unlock(testing.io);
+        for (s.events.items) |e| if (std.mem.eql(u8, e, event)) return;
+        std.debug.print("the Nexus interceptors never saw \"{s}\"; they saw {any}\n", .{ event, s.events.items });
+        return error.TestExpectedEvent;
+    }
+};
+
+/// Keeps the message and the `NexusTagged` field of each log record that has one.
+const TaggedRecords = struct {
+    mutex: Io.Mutex = .init,
+    arena: std.heap.ArenaAllocator = .init(testing.allocator),
+    lines: std.ArrayList([]const u8) = .empty,
+
+    fn sink(r: *TaggedRecords) log.Sink {
+        return .{ .ptr = r, .vtable = &.{ .log = record } };
+    }
+
+    fn record(ptr: ?*anyopaque, _: log.Level, message: []const u8, fields: []const log.Field) void {
+        const r: *TaggedRecords = @ptrCast(@alignCast(ptr.?));
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        for (fields) |f| if (std.mem.eql(u8, f.key, "NexusTagged")) {
+            const line = std.fmt.allocPrint(r.arena.allocator(), "{s} {s}", .{ message, f.value }) catch return;
+            r.lines.append(r.arena.allocator(), line) catch {};
+        };
+    }
+
+    fn has(r: *TaggedRecords, line: []const u8) bool {
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        for (r.lines.items) |l| if (std.mem.eql(u8, l, line)) return true;
+        return false;
+    }
+};
+
+fn headerValue(headers: []const nexus.Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    return null;
+}
+
+/// On the calling side, adds the header `x-tag: <tag>` to every Nexus call. On the handling
+/// side, records each start and cancel with the `x-tag` header it carries, appends "+<tag>"
+/// to the `trace-id` header the handler sees, refuses every start of `fail`, and adds the
+/// field `NexusTagged=<tag>` to the handler's logger.
+const NexusTagging = struct {
+    tag: []const u8,
+    seen: *Seen,
+
+    pub fn interceptWorkflow(t: *NexusTagging, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+        const run = try ctx.allocator().create(Caller);
+        run.* = .{ .t = t, .ctx = ctx };
+        return .{ .outbound = interceptor.WorkflowOutbound.from(Caller, run) };
+    }
+
+    pub fn interceptNexusOperation(t: *NexusTagging, ctx: *nexus.Context) error{OutOfMemory}!interceptor.NexusOperation {
+        const request = try ctx.allocator().create(Request);
+        request.* = .{ .t = t, .ctx = ctx };
+        return .{ .inbound = interceptor.NexusOperationInbound.from(Request, request), .outbound = interceptor.NexusOperationOutbound.from(Request, request) };
+    }
+
+    const Caller = struct {
+        t: *NexusTagging,
+        ctx: *workflow.Context,
+
+        pub fn executeNexusOperation(c: *Caller, input: interceptor.NexusOperationInput, next: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(converter.Payload) {
+            var changed = input;
+            changed.options.headers = std.mem.concat(c.ctx.allocator(), nexus.Header, &.{ input.options.headers, &.{.{ .name = "x-tag", .value = c.t.tag }} }) catch
+                return interceptor.rejectNexusOperation(c.ctx, input, .{ .message = "out of memory adding the tag" });
+            return next.executeNexusOperation(changed);
+        }
+    };
+
+    const Request = struct {
+        t: *NexusTagging,
+        ctx: *nexus.Context,
+
+        pub fn startOperation(r: *Request, input: interceptor.StartNexusOperationInput, next: interceptor.NexusOperationInbound.Next) nexus.StartResult {
+            const tag = headerValue(input.headers, "x-tag") orelse "none";
+            r.t.seen.add("{s} saw start {s} x-tag={s}", .{ r.t.tag, input.operation, tag });
+            if (std.mem.eql(u8, input.operation, "fail"))
+                return .{ .handler_error = .{ .type = .unauthorized, .message = "refused by the tagging interceptor", .retry = .non_retryable } };
+            const a = r.ctx.allocator();
+            const headers = a.dupe(nexus.Header, input.headers) catch return .{ .handler_error = .{ .type = .internal, .message = "out of memory" } };
+            for (headers) |*h| if (std.ascii.eqlIgnoreCase(h.name, "trace-id")) {
+                h.value = std.fmt.allocPrint(a, "{s}+{s}", .{ h.value, r.t.tag }) catch return .{ .handler_error = .{ .type = .internal, .message = "out of memory" } };
+            };
+            var changed = input;
+            changed.headers = headers;
+            return next.startOperation(changed);
+        }
+
+        pub fn cancelOperation(r: *Request, input: interceptor.CancelNexusOperationInput, next: interceptor.NexusOperationInbound.Next) nexus.CancelResult {
+            r.t.seen.add("{s} saw cancel {s} token={}", .{ r.t.tag, input.operation, input.token.len > 0 });
+            return next.cancelOperation(input);
+        }
+
+        pub fn logger(r: *Request, input: interceptor.LoggerInput, next: interceptor.NexusOperationOutbound.Next) log.Logger {
+            const base = next.logger(input);
+            return base.with(r.ctx.allocator(), .{ .NexusTagged = r.t.tag }) catch base;
+        }
+    };
+};
+
+test "nexus: a workflow interceptor's header reaches the handling worker's interceptor, for a synchronous and a workflow-run operation" {
+    var handlers: Handlers = .{ .io = testing.io };
+    var seen: Seen = .{};
+    defer seen.arena.deinit();
+    var records: TaggedRecords = .{};
+    defer records.arena.deinit();
+    var tagging: NexusTagging = .{ .tag = "env", .seen = &seen };
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(NexusTagging, &tagging)};
+    var s = try Setup.start(&handlers, .{ .worker_interceptors = &interceptors, .logger = records.sink() });
+    defer s.deinit();
+
+    // The handler sees the header as the interceptor changed it, and logs through its logger.
+    try expectContains(try s.run(CallEcho, .{ s.endpoint, "hi" }), "hi op=zig-test-service/echo ns=default");
+    try expectContains(try s.run(CallEcho, .{ s.endpoint, "hi" }), "trace=abc+env ");
+    try seen.expect("env saw start echo x-tag=env");
+    try testing.expect(records.has("echo handled env"));
+
+    try expectContains(try s.run(CallGreet, .{ s.endpoint, "Tagged" }), "Hello, Tagged (token of ");
+    try seen.expect("env saw start greet x-tag=env");
+}
+
+test "nexus: a start an interceptor refuses fails the caller's operation with its handler error, and the handler never runs" {
+    var handlers: Handlers = .{ .io = testing.io };
+    var seen: Seen = .{};
+    defer seen.arena.deinit();
+    var tagging: NexusTagging = .{ .tag = "env", .seen = &seen };
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(NexusTagging, &tagging)};
+    var s = try Setup.start(&handlers, .{ .worker_interceptors = &interceptors });
+    defer s.deinit();
+    const result = try s.run(CallByName, .{ s.endpoint, "fail", "socks" });
+    try testing.expect(std.mem.startsWith(u8, result, "failed: "));
+    try expectContains(result, "refused by the tagging interceptor [handler UNAUTHORIZED]");
+    try testing.expectEqual(0, handlers.fail_calls.load(.monotonic));
+    try seen.expect("env saw start fail x-tag=env");
+}
+
+test "nexus: the handling worker's interceptor sees the cancel of a workflow-run operation" {
+    var handlers: Handlers = .{ .io = testing.io };
+    var seen: Seen = .{};
+    defer seen.arena.deinit();
+    var tagging: NexusTagging = .{ .tag = "env", .seen = &seen };
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(NexusTagging, &tagging)};
+    var s = try Setup.start(&handlers, .{ .worker_interceptors = &interceptors });
+    defer s.deinit();
+    const a = s.arena.allocator();
+    const hold_id = try uniqueName(a, "hold-intercepted");
+    // wait_cancellation_requested resolves only after the handler's cancel returned.
+    const result = try s.run(CancelHold, .{ s.endpoint, hold_id, "wait_cancellation_requested" });
+    try expectContains(result, "[canceled_failure_info]");
+    try seen.expect("env saw start hold x-tag=env");
+    try seen.expect("env saw cancel hold token=true");
+    try s.env.client.signalWorkflow(Release, hold_id, "", .{});
+    var held = try s.env.client.getWorkflow([]const u8, hold_id, "");
+    defer held.deinit();
+    try testing.expectError(error.WorkflowCanceled, held.get(a));
+}
+
+test "nexus: the client's worker interceptors run outside the worker's own on a Nexus request" {
+    var handlers: Handlers = .{ .io = testing.io };
+    var seen: Seen = .{};
+    defer seen.arena.deinit();
+    var records: TaggedRecords = .{};
+    defer records.arena.deinit();
+    var client_tagging: NexusTagging = .{ .tag = "client", .seen = &seen };
+    const client_interceptors = [_]interceptor.Worker{interceptor.Worker.from(NexusTagging, &client_tagging)};
+    var worker_tagging: NexusTagging = .{ .tag = "worker", .seen = &seen };
+    const worker_interceptors = [_]interceptor.Worker{interceptor.Worker.from(NexusTagging, &worker_tagging)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &client_interceptors, .logger = records.sink() });
+    defer env.deinit();
+    try env.registerWorkflow(CallEcho);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const queue = try uniqueName(a, "zig-intercepted");
+    var w = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, queue, .{ .interceptors = &worker_interceptors });
+    defer w.deinit();
+    try w.registerNexusServiceWith(Handler, &handlers);
+    var running = try testing.io.concurrent(worker_mod.Worker.run, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    try w.waitUntilRunning();
+    const endpoint = try uniqueName(a, "zig-endpoint");
+    try env.createNexusEndpoint(endpoint, .{ .task_queue = queue });
+
+    var r = try env.startWorkflow(CallEcho, .{}, .{ endpoint, "ordered" });
+    defer r.deinit();
+    // The client's interceptor changed the header first, then the worker's.
+    try expectContains(try env.getResult(CallEcho, &r, a, null), "trace=abc+client+worker ");
+    try seen.expect("client saw start echo x-tag=client");
+    try seen.expect("worker saw start echo x-tag=client");
+    // The innermost logger interceptor adds its field first, and each record lists both.
+    try testing.expect(records.has("echo handled worker"));
+    try testing.expect(records.has("echo handled client"));
 }
