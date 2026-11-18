@@ -6,6 +6,7 @@ const std = @import("std");
 const temporal = @import("temporal");
 const harness = @import("harness");
 const features = @import("features");
+const dynamic_config = @import("dynamic_config.zig");
 const inventory = @import("inventory.zig");
 const report = @import("report.zig");
 
@@ -123,6 +124,20 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
         return error.InvalidInventory;
     }
 
+    const config_path = "dockerfiles/dynamicconfig/docker.yaml";
+    const yaml = suite_dir.readFileAlloc(io, config_path, arena, .limited(1024 * 1024)) catch |err| {
+        std.log.warn("cannot read {s}/{s}: {t}", .{ suite_path, config_path, err });
+        return switch (err) {
+            error.FileNotFound, error.StreamTooLong => error.InvalidDynamicConfig,
+            else => err,
+        };
+    };
+    const entries = dynamic_config.parse(arena, yaml) catch |err| {
+        std.log.warn("cannot parse {s}/{s}: {t}", .{ suite_path, config_path, err });
+        return err;
+    };
+    const server_args = try dynamic_config.serverArgs(arena, entries);
+
     var output = cwd.createFileAtomic(io, report_path, .{ .make_path = true, .replace = true }) catch |err| {
         std.log.err("cannot create report {s}: {t}", .{ report_path, err });
         return err;
@@ -132,7 +147,7 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
     @memset(outcomes, null);
     for (written) |path| {
         if (inventory.selected(patterns.items, path)) {
-            try runSelected(gpa, arena, io, work_path, written, patterns.items, outcomes);
+            try runSelected(gpa, arena, io, work_path, written, patterns.items, outcomes, server_args);
             break;
         }
     }
@@ -153,6 +168,7 @@ fn runSelected(
     written: []const []const u8,
     patterns: []const []const u8,
     outcomes: []?report.Outcome,
+    server_args: []const []const u8,
 ) !void {
     const exe = try std.process.executablePathAlloc(io, arena);
     // The build's cache directory can be shared by simultaneous invocations.
@@ -165,7 +181,7 @@ fn runSelected(
         return err;
     };
 
-    var server = try temporal.testing.DevServer.start(gpa, io, .{ .namespace = namespace, .port = 0 });
+    var server = try temporal.testing.DevServer.start(gpa, io, .{ .namespace = namespace, .port = 0, .extra_args = server_args });
     defer server.stop(io);
     std.log.info("conformance dev server at {s}, child logs in {s}", .{ server.address(), run_path });
     for (written, outcomes, 0..) |path, *outcome, i| {
@@ -392,6 +408,7 @@ fn failure(arena: Allocator, comptime fmt: []const u8, args: anytype) report.Out
 }
 
 test {
+    _ = dynamic_config;
     _ = inventory;
     _ = report;
 }
@@ -407,6 +424,35 @@ test "conformance parent removes a stale report before validating options" {
     const dir = try tmp.dir.realPathFileAlloc(io, ".", arena.allocator());
     const path = try std.fmt.allocPrintSentinel(arena.allocator(), "{s}/report.json", .{dir}, 0);
     try std.testing.expectError(error.InvalidArguments, runParent(gpa, arena.allocator(), io, &.{ "--bad-option", "value", "--report", path }, &.{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "report.json", .{}));
+}
+
+test "conformance requires the suite dynamic config even with no features to run" {
+    const level = std.testing.log_level;
+    defer std.testing.log_level = level;
+    std.testing.log_level = .err;
+
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var state: std.heap.ArenaAllocator = .init(gpa);
+    defer state.deinit();
+    const arena = state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "features", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "not-applicable.zon", .data = ".{}" });
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const suite_path = try arena.dupeSentinel(u8, dir, 0);
+    const na_path = try std.fmt.allocPrintSentinel(arena, "{s}/not-applicable.zon", .{dir}, 0);
+    const report_path = try std.fmt.allocPrintSentinel(arena, "{s}/report.json", .{dir}, 0);
+    const args: []const [:0]const u8 = &.{ "--suite", suite_path, "--suite-commit", "test", "--not-applicable", na_path, "--report", report_path, "--work-dir", suite_path };
+
+    try std.testing.expectError(error.InvalidDynamicConfig, runParent(gpa, arena, io, args, &.{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "report.json", .{}));
+
+    try tmp.dir.createDirPath(io, "dockerfiles/dynamicconfig");
+    try tmp.dir.writeFile(io, .{ .sub_path = "dockerfiles/dynamicconfig/docker.yaml", .data = "example.setting: []" });
+    try std.testing.expectError(error.InvalidDynamicConfig, runParent(gpa, arena, io, args, &.{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "report.json", .{}));
 }
 
