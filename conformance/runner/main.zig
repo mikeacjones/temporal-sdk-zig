@@ -1,6 +1,7 @@
 //! conformance-runner map --suite <dir> --not-applicable <file> --parity-map <file>
+//! conformance-runner check --report <file> --parity-map <file> --parity <PARITY.md>
 //! conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file>
-//!                        --report <file> --work-dir <dir> [--feature <pattern>]...
+//!                        --report <file> --work-dir <dir> [--feature <pattern>]... [--stdout-to stderr]
 //! conformance-runner feature <area>/<name> --address <host:port> --namespace <ns>
 //!                            --task-queue <queue> --result <file> [--variant <name>]
 //!                            [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
@@ -11,6 +12,7 @@ const features = @import("features");
 const dynamic_config = @import("dynamic_config.zig");
 const feature_config = @import("feature_config.zig");
 const inventory = @import("inventory.zig");
+const parity_check = @import("parity_check.zig");
 const parity_map = @import("parity_map.zig");
 const parity_table = @import("parity_table.zig");
 const report = @import("report.zig");
@@ -21,7 +23,8 @@ const timeout_seconds = 240;
 const namespace = "default";
 
 const MapOption = enum { suite, @"not-applicable", @"parity-map" };
-const ParentOption = enum { suite, @"suite-commit", @"not-applicable", report, @"work-dir" };
+const CheckOption = enum { report, @"parity-map", parity };
+const ParentOption = enum { suite, @"suite-commit", @"not-applicable", report, @"work-dir", @"stdout-to" };
 const ChildOption = enum { address, namespace, @"task-queue", result, variant, @"nexus-endpoint" };
 const ChildResult = struct {
     status: enum { pass, fail },
@@ -36,6 +39,12 @@ pub fn main(init: std.process.Init) !void {
         runMap(init.gpa, arena, init.io, args[2..]) catch |err| {
             if (err == error.InvalidArguments) return usage();
             std.log.err("cannot validate the parity map: {t}", .{err});
+            std.process.exit(1);
+        };
+    } else if (std.mem.eql(u8, args[1], "check")) {
+        runCheck(init.gpa, arena, init.io, args[2..]) catch |err| {
+            if (err == error.InvalidArguments) return usage();
+            std.log.err("cannot check conformance: {t}", .{err});
             std.process.exit(1);
         };
     } else if (std.mem.eql(u8, args[1], "run")) {
@@ -56,7 +65,9 @@ fn usage() error{InvalidArguments} {
     std.log.err(
         \\usage:
         \\  conformance-runner map --suite <dir> --not-applicable <file> --parity-map <file>
-        \\  conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file> --report <file> --work-dir <dir> [--feature <pattern>]...
+        \\  conformance-runner check --report <file> --parity-map <file> --parity <PARITY.md>
+        \\  conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file> --report <file> --work-dir <dir>
+        \\                         [--feature <pattern>]... [--stdout-to stderr]
         \\  conformance-runner feature <area>/<name> --address <host:port> --namespace <ns> --task-queue <queue> --result <file>
         \\                             [--variant <name>] [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
     , .{});
@@ -141,9 +152,53 @@ fn runMap(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u8) 
     try stderr.interface.flush();
 }
 
+fn runCheck(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u8) !void {
+    const options = try parseOptions(CheckOption, args, arena, null, &.{});
+    const report_path = options.get(.report).?;
+    const map_path = options.get(.@"parity-map").?;
+    const verdict = try parity_check.checkSources(gpa, arena, .{
+        .report_path = report_path,
+        .report_json = readCheckInput(arena, io, report_path),
+        .map_path = map_path,
+        .map_source = readCheckInput(arena, io, map_path),
+        .parity_source = readCheckInput(arena, io, options.get(.parity).?),
+    });
+    switch (verdict) {
+        .refused => |messages| for (messages) |message| std.log.err("{s}", .{message}),
+        .findings => |findings| {
+            var buffer: [4096]u8 = undefined;
+            var stdout = Io.File.stdout().writerStreaming(io, &buffer);
+            try parity_check.write(findings, &stdout.interface);
+            try stdout.interface.flush();
+        },
+    }
+    const code = parity_check.exitCode(verdict);
+    if (code != 0) std.process.exit(code);
+}
+
+fn readCheckInput(arena: Allocator, io: Io, path: []const u8) [:0]const u8 {
+    return Io.Dir.cwd().readFileAllocOptions(io, path, arena, .unlimited, .of(u8), 0) catch |err| {
+        std.log.err("cannot read {s}: {t}", .{ path, err });
+        std.process.exit(1);
+    };
+}
+
 fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u8, registry: []const features.Entry) !void {
     const cwd = Io.Dir.cwd();
-    // Clear the previous report even if another option is invalid.
+    var patterns: std.ArrayList([]const u8) = .empty;
+    const parsed = parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{.@"stdout-to"});
+    if (parsed) |options| {
+        if (options.get(.@"stdout-to")) |destination| {
+            if (!std.mem.eql(u8, destination, "stderr")) return error.InvalidArguments;
+            const fd = std.c.dup2(2, 1);
+            if (fd < 0) {
+                std.log.err("cannot redirect conformance stdout to stderr: {t}", .{std.posix.errno(fd)});
+                return error.StdoutRedirectFailed;
+            }
+        }
+    } else |_| {}
+
+    // Clear the previous report even when option parsing fails.
     var i: usize = 0;
     while (i + 1 < args.len) : (i += 2) {
         if (!std.mem.eql(u8, args[i], "--report")) continue;
@@ -156,8 +211,7 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
         };
     }
 
-    var patterns: std.ArrayList([]const u8) = .empty;
-    const options = try parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{});
+    const options = try parsed;
     const suite_path = options.get(.suite).?;
     const na_path = options.get(.@"not-applicable").?;
     const report_path = options.get(.report).?;
@@ -711,6 +765,7 @@ test {
     _ = inventory;
     _ = parity_table;
     _ = parity_map;
+    _ = parity_check;
     _ = report;
 }
 

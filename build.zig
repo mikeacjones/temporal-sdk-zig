@@ -565,6 +565,10 @@ fn addConformanceSteps(
     const with_suite = b.option(bool, "conformance-suite", "Internal option set by the conformance step on its nested build") orelse false;
     const step = b.step("conformance", "Run the Temporal features suite and write conformance/report.json");
     const map_step = b.step("conformance-map", "Check conformance/parity_map.zon against the features suite");
+    const check_step = b.step("conformance-check", "Run the features suite and fail when a supported PARITY.md row's feature is not passing");
+    if (patterns.len != 0) {
+        check_step.dependOn(&b.addFail("zig build conformance-check takes no -Dfeature: it compares the whole suite with PARITY.md (use zig build conformance -Dfeature=... to run part of the suite)").step);
+    }
     const report_path = b.graph.path(.install_prefix, "conformance/report.json");
 
     const harness = b.createModule(.{
@@ -623,6 +627,11 @@ fn addConformanceSteps(
         nested.step.dependOn(&clear.step);
         step.dependOn(&nested.step);
         map_step.dependOn(&nestedConformanceBuild(b, "conformance-map", optimize, forwarded).step);
+        if (patterns.len == 0) {
+            const nested_check = nestedConformanceBuild(b, "conformance-check", optimize, forwarded);
+            nested_check.step.dependOn(&clear.step);
+            check_step.dependOn(&nested_check.step);
+        }
         return;
     }
 
@@ -641,19 +650,42 @@ fn addConformanceSteps(
 
     const suite_url = @import("build.zig.zon").dependencies.temporal_features.url;
     const suite_commit = suite_url[std.mem.lastIndexOfScalar(u8, suite_url, '#').? + 1 ..];
-    const run = b.addRunArtifact(executable);
-    run.addArgs(&.{ "run", "--suite" });
-    run.addDirectoryArg(suite.path(""));
-    run.addArgs(&.{ "--suite-commit", suite_commit, "--not-applicable" });
-    run.addFileArg(b.path("conformance/not_applicable.zon"));
-    run.addArg("--report");
-    run.addFileArg2(report_path, .{ .make_absolute = true });
-    run.addArg("--work-dir");
-    run.addDirectoryArg(b.addWriteFiles().getDirectory());
-    for (patterns) |pattern| run.addArgs(&.{ "--feature", pattern });
-    run.stdio = .inherit;
-    run.has_side_effects = true;
-    step.dependOn(&run.step);
+    const work_dir = b.addWriteFiles().getDirectory();
+    for ([_]*std.Build.Step{ step, check_step }) |suite_step| {
+        const checking = suite_step == check_step;
+        if (checking and patterns.len != 0) continue;
+
+        const run = b.addRunArtifact(executable);
+        run.addArgs(&.{ "run", "--suite" });
+        run.addDirectoryArg(suite.path(""));
+        run.addArgs(&.{ "--suite-commit", suite_commit, "--not-applicable" });
+        run.addFileArg(b.path("conformance/not_applicable.zon"));
+        run.addArg("--report");
+        run.addFileArg2(report_path, .{ .make_absolute = true });
+        run.addArg("--work-dir");
+        run.addDirectoryArg(work_dir);
+        run.stdio = .inherit;
+        run.has_side_effects = true;
+        if (!checking) {
+            for (patterns) |pattern| run.addArgs(&.{ "--feature", pattern });
+            suite_step.dependOn(&run.step);
+            continue;
+        }
+
+        run.addArgs(&.{ "--stdout-to", "stderr" });
+        run.step.dependOn(&map.step);
+        const check = b.addRunArtifact(executable);
+        check.addArgs(&.{ "check", "--report" });
+        check.addFileArg2(report_path, .{ .make_absolute = true });
+        check.addArg("--parity-map");
+        check.addFileArg(b.path("conformance/parity_map.zon"));
+        check.addArg("--parity");
+        check.addFileArg(b.path("PARITY.md"));
+        check.stdio = .inherit;
+        check.has_side_effects = true;
+        check.step.dependOn(&run.step);
+        suite_step.dependOn(&check.step);
+    }
 }
 
 fn nestedConformanceBuild(b: *std.Build, step_name: []const u8, optimize: std.builtin.OptimizeMode, forwarded: ConformanceForwarded) *std.Build.Step.Run {
