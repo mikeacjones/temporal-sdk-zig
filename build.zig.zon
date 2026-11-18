@@ -31,6 +31,39 @@
             .hash = "N-V-__8AABekzACgnTDmenHY7N0E55oHnTfOliLw8ReYHEDH",
             .lazy = true,
         },
+        // The prebuilt sdk-core C bridge per tier-1 target, published by core-bundles.yml as
+        // core-v1.2.0-r1. A build without the deps/sdk-core submodule links the one for its
+        // target instead of running cargo (docs/releasing.md).
+        .@"core-v1.2.0-aarch64-linux-gnu" = .{
+            .url = "https://github.com/mikeacjones/temporal-sdk-zig/releases/download/core-v1.2.0-r1/temporal-core-v1.2.0-aarch64-linux-gnu.tar.xz",
+            .hash = "N-V-__8AAL9BSgkb9pREL4Oi2NVpEl2yJo4ZeFsgR4aciwAa",
+            .lazy = true,
+        },
+        .@"core-v1.2.0-aarch64-linux-musl" = .{
+            .url = "https://github.com/mikeacjones/temporal-sdk-zig/releases/download/core-v1.2.0-r1/temporal-core-v1.2.0-aarch64-linux-musl.tar.xz",
+            .hash = "N-V-__8AACyTRgmHzXIPa7cGoVGDuq6ujFuzf9NG9utqpIBp",
+            .lazy = true,
+        },
+        .@"core-v1.2.0-aarch64-macos" = .{
+            .url = "https://github.com/mikeacjones/temporal-sdk-zig/releases/download/core-v1.2.0-r1/temporal-core-v1.2.0-aarch64-macos.tar.xz",
+            .hash = "N-V-__8AAGRCSwYB9SfyXkR3FOPDp8ZPa7bUIb3Myl-DGT5G",
+            .lazy = true,
+        },
+        .@"core-v1.2.0-x86_64-linux-gnu" = .{
+            .url = "https://github.com/mikeacjones/temporal-sdk-zig/releases/download/core-v1.2.0-r1/temporal-core-v1.2.0-x86_64-linux-gnu.tar.xz",
+            .hash = "N-V-__8AADc_TglSH_UNHpT2Z3t4ENbcVA-d9zErP69VzkTL",
+            .lazy = true,
+        },
+        .@"core-v1.2.0-x86_64-linux-musl" = .{
+            .url = "https://github.com/mikeacjones/temporal-sdk-zig/releases/download/core-v1.2.0-r1/temporal-core-v1.2.0-x86_64-linux-musl.tar.xz",
+            .hash = "N-V-__8AAOpRSQmiMqc7pgowEvt07NUnogwAn7lSNLh7eYH5",
+            .lazy = true,
+        },
+        .@"core-v1.2.0-x86_64-macos" = .{
+            .url = "https://github.com/mikeacjones/temporal-sdk-zig/releases/download/core-v1.2.0-r1/temporal-core-v1.2.0-x86_64-macos.tar.xz",
+            .hash = "N-V-__8AAAy1OwZ0QhVRbxR53Pr-N1wTu1AFQQroIdCDwdgf",
+            .lazy = true,
+        },
         .protobuf = .{
             .url = "git+https://github.com/Arwalk/zig-protobuf#38ec95e38e136bfc93685b6549018285f5e722b2",
             .hash = "protobuf-7.0.0-0e82aujcOwCmSdUIDrerIiWx8LAAxIYj20-i3tRkjOPz",
