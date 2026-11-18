@@ -71,6 +71,15 @@ Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, `sam
 - When to run: When reviewing new code for copies of existing code.
 - Run time: about 0.8 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.3 s).
 
+### `zig build fuzz`
+
+Runs the `history_json` target with Zig's fuzzer. A panic or failed safety check, a leak, an error outside the declared set, or a failed round trip counts as a crash. The default box is 30 seconds per target. Set `-Dfuzz-seconds=<n>` to change it. Each target runs in two nested builds. The first builds the target and replays the corpus, and the second fuzzes until its deadline. A second run in the same checkout waits on `.zig-cache/fuzz.lock`. Interrupting the command or killing its wrapper stops the nested build and fuzzer. Zig keeps the inputs it learns under `.zig-cache/f/`.
+
+Crash inputs are saved under `zig-out/fuzz/<target>/crash-<8 hex digits>`. Copy the saved input into `src/fuzz/<target>/` and run `zig build test` to replay it. `tools/checks/fuzz.zon` lists the open bugs with their targets and the reason for each guard. `zig build test` fails for an entry without a guard.
+
+- When to run: When changing code a target calls, or adding a target.
+- Run time: about 38 s for the one target at the default 30 s (30 s of fuzzing plus builds and start-up) on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 2.6 min, with an empty local cache).
+
 ### `zig build lint`
 
 Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance`, excluding generated code and check fixtures. The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init`, even if you pass `-Dcore-bundle` or `-Dcore-lib`. zlinter configures the build a second time with `zig build --print-configuration-path` and omits the outer command's `-D` options. Without the submodule or a default bundle pin for the host, that configuration stops with `no prebuilt core`. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.
