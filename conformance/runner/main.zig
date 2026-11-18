@@ -1,5 +1,5 @@
 //! conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file>
-//!                        --report <file> --work-dir <dir> [--feature <pattern>]...
+//!                        --report <file> --work-dir <dir> [--feature <pattern>]... [--histories <dir>]
 //! conformance-runner feature <area>/<name> --address <host:port> --namespace <ns>
 //!                            --task-queue <queue> --result <file> [--variant <name>]
 //!                            [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
@@ -10,6 +10,7 @@ const features = @import("features");
 const dynamic_config = @import("dynamic_config.zig");
 const feature_config = @import("feature_config.zig");
 const inventory = @import("inventory.zig");
+const record = @import("record.zig");
 const report = @import("report.zig");
 
 const Allocator = std.mem.Allocator;
@@ -17,7 +18,7 @@ const Io = std.Io;
 const timeout_seconds = 240;
 const namespace = "default";
 
-const ParentOption = enum { suite, @"suite-commit", @"not-applicable", report, @"work-dir" };
+const ParentOption = enum { suite, @"suite-commit", @"not-applicable", report, @"work-dir", histories };
 const ChildOption = enum { address, namespace, @"task-queue", result, variant, @"nexus-endpoint" };
 const ChildResult = struct {
     status: enum { pass, fail },
@@ -45,7 +46,8 @@ pub fn main(init: std.process.Init) !void {
 fn usage() error{InvalidArguments} {
     std.log.err(
         \\usage:
-        \\  conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file> --report <file> --work-dir <dir> [--feature <pattern>]...
+        \\  conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file> --report <file> --work-dir <dir>
+        \\                         [--feature <pattern>]... [--histories <dir>]
         \\  conformance-runner feature <area>/<name> --address <host:port> --namespace <ns> --task-queue <queue> --result <file>
         \\                             [--variant <name>] [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
     , .{});
@@ -97,7 +99,7 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
     }
 
     var patterns: std.ArrayList([]const u8) = .empty;
-    const options = try parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{});
+    const options = try parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{.histories});
     const suite_path = options.get(.suite).?;
     const na_path = options.get(.@"not-applicable").?;
     const report_path = options.get(.report).?;
@@ -153,7 +155,7 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
     const selected = try selectConfigs(arena, io, features_dir, written, patterns.items, outcomes);
     for (selected) |config| {
         if (config != null) {
-            try runSelected(gpa, arena, io, work_path, written, selected, outcomes, entries);
+            try runSelected(gpa, arena, io, work_path, options.get(.histories), registry, selected, outcomes, entries);
             break;
         }
     }
@@ -204,7 +206,8 @@ fn runSelected(
     arena: Allocator,
     io: Io,
     work_path: []const u8,
-    written: []const []const u8,
+    histories: ?[]const u8,
+    registry: []const features.Entry,
     selected: []const ?feature_config.Config,
     outcomes: []?report.Outcome,
     defaults: []const dynamic_config.Entry,
@@ -233,28 +236,39 @@ fn runSelected(
         std.log.info("conformance dev server at {s}, child logs in {s}", .{ shared.?.address(), run_path });
     }
 
-    const runner: Runner = .{ .gpa = gpa, .arena = arena, .io = io, .exe = exe, .work_dir = run_path };
-    for (written, selected, outcomes, 0..) |path, maybe_config, *outcome, i| {
+    const runner: Runner = .{ .gpa = gpa, .arena = arena, .io = io, .exe = exe, .work_dir = run_path, .histories = histories };
+    for (registry, selected, outcomes, 0..) |entry, maybe_config, *outcome, i| {
         const config = maybe_config orelse continue;
+        const path = entry.path;
         const needs_endpoint = config.needs_nexus_endpoint or std.mem.startsWith(u8, path, "nexus/");
+        var sets: std.ArrayList(record.Set) = .empty;
         if (config.run_variants.len == 0) {
-            outcome.* = try runner.runFeature(shared.?.address(), path, i, null, needs_endpoint, null);
+            const result = try runner.runFeature(shared.?.address(), entry, i, null, needs_endpoint, null);
+            outcome.* = result.outcome;
+            if (result.set) |set| try sets.append(arena, set);
             if (last_shared == i) {
                 shared.?.stop(io);
                 shared = null;
             }
-            continue;
+        } else {
+            const variants = try arena.alloc(report.VariantOutcome, config.run_variants.len);
+            for (config.run_variants, variants, 0..) |variant, *variant_outcome, j| {
+                const result = try runner.runVariant(defaults, entry, i, j, needs_endpoint, variant);
+                variant_outcome.* = .{ .name = variant.name, .outcome = result.outcome };
+                if (result.set) |set| try sets.append(arena, set);
+            }
+            outcome.* = try report.combineVariants(arena, path, variants);
         }
-        const variants = try arena.alloc(report.VariantOutcome, config.run_variants.len);
-        for (config.run_variants, variants, 0..) |variant, *variant_outcome, j| {
-            variant_outcome.* = .{
-                .name = variant.name,
-                .outcome = try runner.runVariant(defaults, path, i, j, needs_endpoint, variant),
-            };
+        if (try record.store(arena, io, runner.histories, path, temporal.version, outcome.*.?, sets.items)) |message| {
+            outcome.* = recordingFailure(arena, message);
         }
-        outcome.* = try report.combineVariants(arena, path, variants);
     }
 }
+
+const FeatureResult = struct {
+    outcome: report.Outcome,
+    set: ?record.Set = null,
+};
 
 const Runner = struct {
     gpa: Allocator,
@@ -262,35 +276,38 @@ const Runner = struct {
     io: Io,
     exe: []const u8,
     work_dir: []const u8,
+    histories: ?[]const u8,
 
     fn runVariant(
         runner: Runner,
         defaults: []const dynamic_config.Entry,
-        path: []const u8,
+        entry: features.Entry,
         index: usize,
         variant_index: usize,
         needs_endpoint: bool,
         variant: feature_config.Variant,
-    ) !report.Outcome {
+    ) !FeatureResult {
         const merged = try dynamic_config.merge(runner.arena, defaults, variant.dynamic_config);
         const args = try dynamic_config.serverArgs(runner.arena, merged);
         var server = temporal.testing.DevServer.start(runner.gpa, runner.io, .{ .namespace = namespace, .port = 0, .extra_args = args }) catch |err|
-            return failure(runner.arena, "cannot start variant dev server: {t}", .{err});
+            return .{ .outcome = failure(runner.arena, "cannot start variant dev server: {t}", .{err}) };
         defer server.stop(runner.io);
-        std.log.info("conformance variant {s}#{s} dev server at {s}", .{ path, variant.name, server.address() });
-        return runner.runFeature(server.address(), path, index, variant_index, needs_endpoint, variant);
+        std.log.info("conformance variant {s}#{s} dev server at {s}", .{ entry.path, variant.name, server.address() });
+        return runner.runFeature(server.address(), entry, index, variant_index, needs_endpoint, variant);
     }
 
     fn runFeature(
         runner: Runner,
         address: []const u8,
-        path: []const u8,
+        entry: features.Entry,
         index: usize,
         variant_index: ?usize,
         needs_endpoint: bool,
         variant: ?feature_config.Variant,
-    ) !report.Outcome {
+    ) !FeatureResult {
         const arena = runner.arena;
+        const path = entry.path;
+        const recording = runner.histories != null and entry.feature.workflow_types.len != 0;
         const variant_name = if (variant) |v| v.name else null;
         const capabilities = if (variant) |v| v.expect_namespace_capabilities else &.{};
         const task_queue = if (variant_name) |name|
@@ -306,19 +323,19 @@ const Runner = struct {
 
         var client: ?temporal.client.Client = null;
         defer if (client) |*c| c.close();
-        if (needs_endpoint or capabilities.len != 0) {
+        if (needs_endpoint or capabilities.len != 0 or recording) {
             client = temporal.client.Client.connect(runner.gpa, runner.io, .{
                 .host_port = address,
                 .namespace = namespace,
                 .rpc_timeout = .fromSeconds(10),
-            }) catch |err| return failure(arena, "cannot connect to {s} for feature setup: {t}", .{ address, err });
+            }) catch |err| return .{ .outcome = failure(arena, "cannot connect to {s} for feature setup: {t}", .{ address, err }) };
         }
         var rpc_failure: ?temporal.client.RpcFailure = null;
         if (capabilities.len != 0) {
             const response = client.?.callService(.workflow, "DescribeNamespace", arena, .{ .namespace = namespace }, &rpc_failure) catch |err|
-                return serviceFailure(arena, "DescribeNamespace", namespace, err, rpc_failure);
+                return .{ .outcome = serviceFailure(arena, "DescribeNamespace", namespace, err, rpc_failure) };
             const actual: NamespaceCapabilities = if (response.namespace_info) |info| info.capabilities orelse .{} else .{};
-            if (try checkCapabilities(arena, actual, capabilities)) |message| return .{ .fail = message };
+            if (try checkCapabilities(arena, actual, capabilities)) |message| return .{ .outcome = .{ .fail = message } };
         }
 
         const NexusEndpoint = temporal.proto.temporal.api.nexus.v1.Endpoint;
@@ -342,8 +359,8 @@ const Runner = struct {
             const response = client.?.callService(.operator, "CreateNexusEndpoint", arena, .{ .spec = .{
                 .name = name,
                 .target = .{ .variant = .{ .worker = .{ .namespace = namespace, .task_queue = task_queue } } },
-            } }, &rpc_failure) catch |err| return serviceFailure(arena, "CreateNexusEndpoint", name, err, rpc_failure);
-            endpoint = response.endpoint orelse return failure(arena, "CreateNexusEndpoint {s} returned no endpoint", .{name});
+            } }, &rpc_failure) catch |err| return .{ .outcome = serviceFailure(arena, "CreateNexusEndpoint", name, err, rpc_failure) };
+            endpoint = response.endpoint orelse return .{ .outcome = failure(arena, "CreateNexusEndpoint {s} returned no endpoint", .{name}) };
             endpoint_name = name;
             std.log.debug("created Nexus endpoint {s} for task queue {s}", .{ name, task_queue });
         }
@@ -357,8 +374,13 @@ const Runner = struct {
             try argv.appendSlice(arena, &.{ "--capability", arg });
         }
         std.log.info("running {s} (log {s})", .{ label, log_path });
-        return runOne(arena, runner.io, argv.items, result_path, log_path) catch |err|
+        const outcome = runOne(arena, runner.io, argv.items, result_path, log_path) catch |err|
             failure(arena, "cannot run child (log {s}, result {s}): {t}", .{ log_path, result_path, err });
+        if (outcome != .pass or !recording) return .{ .outcome = outcome };
+        return switch (try record.collect(&client.?, arena, runner.io, namespace, task_queue, variant_name, .{})) {
+            .set => |set| .{ .outcome = .pass, .set = set },
+            .failed => |message| .{ .outcome = recordingFailure(arena, message) },
+        };
     }
 };
 
@@ -579,6 +601,7 @@ fn parseCapabilities(arena: Allocator, args: []const []const u8) ![]const harnes
 fn executeFeature(feature: *const harness.Feature, ctx: *harness.Context, address: []const u8) report.Outcome {
     var client_options: temporal.client.Options = .{};
     if (feature.configureClient) |configure| configure(&client_options);
+    client_options.identity = "conformance";
     client_options.host_port = address;
     client_options.namespace = ctx.namespace;
     var client = temporal.client.Client.connect(ctx.gpa, ctx.io, client_options) catch |err|
@@ -593,7 +616,10 @@ fn executeFeature(feature: *const harness.Feature, ctx: *harness.Context, addres
 fn executeWithWorker(feature: *const harness.Feature, ctx: *harness.Context) report.Outcome {
     const io = ctx.io;
     const arena = ctx.arena;
-    var worker = temporal.worker.Worker.init(ctx.gpa, io, ctx.client, ctx.task_queue, feature.worker_options) catch |err|
+    var worker_options = feature.worker_options;
+    // Error return traces include absolute source paths in server histories.
+    worker_options.failure_stack_traces = false;
+    var worker = temporal.worker.Worker.init(ctx.gpa, io, ctx.client, ctx.task_queue, worker_options) catch |err|
         return failure(arena, "worker init returned error.{t}", .{err});
     defer worker.deinit();
     feature.register(&worker) catch |err| return failure(arena, "registering feature definitions returned error.{t}", .{err});
@@ -645,10 +671,15 @@ fn failure(arena: Allocator, comptime fmt: []const u8, args: anytype) report.Out
     return .{ .fail = std.fmt.allocPrint(arena, fmt, args) catch "out of memory formatting feature failure" };
 }
 
+fn recordingFailure(arena: Allocator, reason: []const u8) report.Outcome {
+    return failure(arena, "feature passed, but recording its histories failed: {s}", .{reason});
+}
+
 test {
     _ = dynamic_config;
     _ = feature_config;
     _ = inventory;
+    _ = record;
     _ = report;
 }
 

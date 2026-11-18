@@ -550,6 +550,8 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     }
 }
 
+const conformance_histories = "conformance/histories";
+
 fn addConformanceSteps(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -560,6 +562,7 @@ fn addConformanceSteps(
     forwarded: struct { core_lib: ?[]const u8, core_bundle: ?[]const u8, protoc: ?[]const u8 },
 ) void {
     const patterns = b.option([]const []const u8, "feature", "Run conformance features matching this path pattern (repeatable)") orelse &.{};
+    const record = b.option(bool, "record-histories", "Store the workflow histories of passing conformance features under conformance/histories") orelse false;
     const with_suite = b.option(bool, "conformance-suite", "Internal option set by the conformance step on its nested build") orelse false;
     const step = b.step("conformance", "Run the Temporal features suite and write conformance/report.json");
     const report_path = b.graph.path(.install_prefix, "conformance/report.json");
@@ -607,6 +610,23 @@ fn addConformanceSteps(
     registry.root_source_file = b.addWriteFiles().add("features.zig", source.written());
     runner.addImport("features", registry);
 
+    const stored_histories = b.createModule(.{ .imports = &.{.{ .name = "harness", .module = harness }} });
+    var stored_source: std.Io.Writer.Allocating = .init(b.allocator);
+    const stored_writer = &stored_source.writer;
+    stored_writer.writeAll(
+        \\const harness = @import("harness");
+        \\pub const files = [_]harness.stored.File{
+        \\
+    ) catch @panic("OOM");
+    for (findStoredHistories(b), 0..) |path, i| {
+        const name = b.fmt("stored-{d}", .{i});
+        stored_histories.addAnonymousImport(name, .{ .root_source_file = b.path(b.fmt("{s}/{s}", .{ conformance_histories, path })) });
+        stored_writer.print("    .{{ .path = \"{f}\", .bytes = @embedFile(\"{s}\") }},\n", .{ std.zig.fmtString(path), name }) catch @panic("OOM");
+    }
+    stored_writer.writeAll("};\n") catch @panic("OOM");
+    stored_histories.root_source_file = b.addWriteFiles().add("stored_histories.zig", stored_source.written());
+    runner.addImport("stored_histories", stored_histories);
+
     if (!with_suite) {
         // Only the nested build requests the lazy dependency. Clear the report even if
         // fetching the suite or compiling the runner fails before the parent can clear it.
@@ -623,6 +643,7 @@ fn addConformanceSteps(
         if (forwarded.core_lib) |path| nested.addArg(b.fmt("-Dcore-lib={s}", .{path}));
         if (forwarded.core_bundle) |path| nested.addArg(b.fmt("-Dcore-bundle={s}", .{path}));
         if (forwarded.protoc) |path| nested.addArg(b.fmt("-Dprotoc={s}", .{path}));
+        if (record) nested.addArg("-Drecord-histories=true");
         for (patterns) |pattern| nested.addArg(b.fmt("-Dfeature={s}", .{pattern}));
         nested.step.dependOn(&clear.step);
         step.dependOn(&nested.step);
@@ -641,10 +662,48 @@ fn addConformanceSteps(
     run.addFileArg2(report_path, .{ .make_absolute = true });
     run.addArg("--work-dir");
     run.addDirectoryArg(b.addWriteFiles().getDirectory());
+    if (record) {
+        const package_root = b.root.root_dir.handle.realPathFileAlloc(b.graph.io, b.root.subPathOrDot(), b.allocator) catch |err|
+            std.process.fatal("cannot resolve the conformance package root: {t}", .{err});
+        run.addArgs(&.{ "--histories", b.pathJoin(&.{ package_root, conformance_histories }) });
+    }
     for (patterns) |pattern| run.addArgs(&.{ "--feature", pattern });
     run.stdio = .inherit;
     run.has_side_effects = true;
     step.dependOn(&run.step);
+}
+
+fn findStoredHistories(b: *std.Build) []const []const u8 {
+    const io = b.graph.io;
+    const dir = b.root.openDir(io, conformance_histories, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            b.dependOnDirectoryContents(b.path("conformance"));
+            return &.{};
+        },
+        else => std.process.fatal("cannot open {s}: {t}", .{ conformance_histories, err }),
+    };
+    defer dir.close(io);
+    b.dependOnDirectoryContents(b.path(conformance_histories));
+    var walker = dir.walkSelectively(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    while (walker.next(io) catch |err| std.process.fatal("cannot scan {s}: {t}", .{ conformance_histories, err })) |entry| {
+        if (entry.basename[0] == '.') continue;
+        switch (entry.kind) {
+            .directory => {
+                b.dependOnDirectoryContents(b.path(b.fmt("{s}/{s}", .{ conformance_histories, entry.path })));
+                walker.enter(io, entry) catch |err| std.process.fatal("cannot open {s}/{s}: {t}", .{ conformance_histories, entry.path, err });
+            },
+            .file => paths.append(b.allocator, b.dupe(entry.path)) catch @panic("OOM"),
+            else => {},
+        }
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lessThan);
+    return paths.items;
 }
 
 fn findConformanceFeatures(b: *std.Build) []const []const u8 {

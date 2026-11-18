@@ -4,10 +4,13 @@ const temporal = @import("temporal");
 
 pub const Context = @import("Context.zig");
 pub const history = @import("history.zig");
+pub const stored = @import("stored.zig");
 
 pub const Feature = struct {
     has_worker: bool,
     worker_options: temporal.worker.Options,
+    /// Workflow type names in declaration order.
+    workflow_types: []const []const u8,
     register: *const fn (*temporal.worker.Worker) anyerror!void,
     execute: *const fn (*Context) anyerror!void,
     /// Options may borrow slices from file-scope constants for the client and its worker.
@@ -45,6 +48,12 @@ pub fn define(comptime spec: anytype) Feature {
     return .{
         .has_worker = workflows.len != 0 or activities.len != 0 or nexus_services.len != 0,
         .worker_options = worker_options,
+        .workflow_types = comptime blk: {
+            var names: [workflows.len][]const u8 = undefined;
+            for (workflows, &names) |Workflow, *name| name.* = Workflow.workflow_name;
+            const result = names;
+            break :blk &result;
+        },
         .register = struct {
             fn register(worker: *temporal.worker.Worker) anyerror!void {
                 inline for (workflows) |Workflow| try worker.registerWorkflow(Workflow);
@@ -60,6 +69,7 @@ pub fn define(comptime spec: anytype) Feature {
 test {
     _ = Context;
     _ = history;
+    _ = stored;
 }
 
 test "conformance define defaults to a client-only feature" {
@@ -69,9 +79,22 @@ test "conformance define defaults to a client-only feature" {
         }
     }.execute });
     try std.testing.expect(!feature.has_worker);
+    try std.testing.expectEqual(0, feature.workflow_types.len);
     try std.testing.expectEqual(null, feature.configureClient);
     var ctx: Context = undefined;
     try std.testing.expectError(error.Example, feature.execute(&ctx));
+}
+
+test "conformance define lists workflow types in declaration order" {
+    const Example = struct {
+        fn run(_: *temporal.workflow.Context) !void {}
+        fn execute(_: *Context) !void {}
+    };
+    const feature = define(.{
+        .workflows = .{ temporal.workflow.Def("Parent", Example.run), temporal.workflow.Def("Child", Example.run) },
+        .execute = Example.execute,
+    });
+    try std.testing.expectEqualDeep(&[_][]const u8{ "Parent", "Child" }, feature.workflow_types);
 }
 
 test "conformance define retains the client configuration callback" {
