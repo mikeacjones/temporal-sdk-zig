@@ -1,0 +1,5 @@
+.{
+    .{ .feature = "bugs/go/activity_start_race", .reason = "Regression for the Go worker's activity start race." },
+    .{ .feature = "bugs/go/child_workflow_cancel_panic", .reason = "Regression for a panic in the Go workflow runtime's child cancellation." },
+    .{ .feature = "deployment_versioning/aa_clean_old_deployments", .reason = "Go suite maintenance that deletes old deployments before its versioning scenarios." },
+}

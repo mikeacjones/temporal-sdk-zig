@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
     // exist only in a checkout.
     const have_submodule = pathExists(b, core_header);
     const have_samples = pathExists(b, "samples");
+    const have_conformance = pathExists(b, "conformance");
 
     const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
 
@@ -106,8 +107,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
-    if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters);
+    if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance);
     if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters);
+    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, .{
+        .core_lib = core_lib_opt,
+        .core_bundle = core_bundle_opt,
+        .protoc = protoc_opt,
+    });
 }
 
 /// The files under examples/readme whose regions README.md copies, in a fixed order.
@@ -179,18 +185,22 @@ fn addReadmeSteps(
     }
 }
 
-fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8) void {
+fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8, have_conformance: bool) void {
     // zig build fmt
-    const fmt_paths: []const std.Build.LazyPath = &.{
+    const fmt_paths = [_]std.Build.LazyPath{
         b.path("build.zig"),
         b.path("build.zig.zon"),
         b.path("src"),
         b.path("samples"),
         b.path("tools"),
         b.path("examples"),
+        b.path("conformance"),
     };
     const fmt_step = b.step("fmt", "Check formatting");
-    fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_paths, .check = true }).step);
+    fmt_step.dependOn(&b.addFmt(.{
+        .paths = if (have_conformance) &fmt_paths else fmt_paths[0 .. fmt_paths.len - 1],
+        .check = true,
+    }).step);
 
     // zig build samples / zig build samples-test
     //
@@ -285,6 +295,134 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             samples_test_step.dependOn(&b.addRunArtifact(t).step);
         }
     }
+}
+
+fn addConformanceSteps(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    temporal: *std.Build.Module,
+    test_step: *std.Build.Step,
+    test_filters: []const []const u8,
+    forwarded: struct { core_lib: ?[]const u8, core_bundle: ?[]const u8, protoc: ?[]const u8 },
+) void {
+    const patterns = b.option([]const []const u8, "feature", "Run conformance features matching this path pattern (repeatable)") orelse &.{};
+    const with_suite = b.option(bool, "conformance-suite", "Internal option set by the conformance step on its nested build") orelse false;
+    const step = b.step("conformance", "Run the Temporal features suite and write conformance/report.json");
+    const report_path = b.graph.path(.install_prefix, "conformance/report.json");
+
+    const harness = b.createModule(.{
+        .root_source_file = b.path("conformance/harness/harness.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "temporal", .module = temporal }},
+    });
+    const runner = b.createModule(.{
+        .root_source_file = b.path("conformance/runner/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "temporal", .module = temporal }, .{ .name = "harness", .module = harness } },
+    });
+    inline for (.{ .{ "conformance-harness", harness }, .{ "conformance-runner", runner } }) |artifact| {
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+            .name = artifact[0],
+            .root_module = artifact[1],
+            .filters = test_filters,
+        })).step);
+    }
+
+    var source: std.Io.Writer.Allocating = .init(b.allocator);
+    const writer = &source.writer;
+    writer.writeAll(
+        \\const harness = @import("harness");
+        \\pub const Entry = struct { path: []const u8, feature: *const harness.Feature };
+        \\pub const all = [_]Entry{
+        \\
+    ) catch @panic("OOM");
+    const registry = b.createModule(.{ .imports = &.{.{ .name = "harness", .module = harness }} });
+    for (findConformanceFeatures(b)) |path| {
+        const feature = b.createModule(.{
+            .root_source_file = b.path(b.fmt("conformance/features/{s}/feature.zig", .{path})),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "temporal", .module = temporal }, .{ .name = "harness", .module = harness } },
+        });
+        registry.addImport(path, feature);
+        writer.print("    .{{ .path = \"{f}\", .feature = &@import(\"{f}\").feature }},\n", .{ std.zig.fmtString(path), std.zig.fmtString(path) }) catch @panic("OOM");
+    }
+    writer.writeAll("};\n") catch @panic("OOM");
+    registry.root_source_file = b.addWriteFiles().add("features.zig", source.written());
+    runner.addImport("features", registry);
+
+    if (!with_suite) {
+        // Only the nested build requests the lazy dependency. Clear the report even if
+        // fetching the suite or compiling the runner fails before the parent can clear it.
+        const clear = b.addSystemCommand(&.{ "rm", "-f", "--" });
+        clear.addFileArg2(report_path, .{ .make_absolute = true });
+        clear.has_side_effects = true;
+        const nested = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "conformance", "-Dconformance-suite=true", "--prefix" });
+        nested.addFileArg2(b.graph.path(.install_prefix, ""), .{ .make_absolute = true });
+        nested.removeEnvironmentVariable("DESTDIR");
+        nested.setCwd(b.path(""));
+        nested.stdio = .inherit;
+        nested.has_side_effects = true;
+        nested.addArg(b.fmt("-Doptimize={t}", .{optimize}));
+        if (forwarded.core_lib) |path| nested.addArg(b.fmt("-Dcore-lib={s}", .{path}));
+        if (forwarded.core_bundle) |path| nested.addArg(b.fmt("-Dcore-bundle={s}", .{path}));
+        if (forwarded.protoc) |path| nested.addArg(b.fmt("-Dprotoc={s}", .{path}));
+        for (patterns) |pattern| nested.addArg(b.fmt("-Dfeature={s}", .{pattern}));
+        nested.step.dependOn(&clear.step);
+        step.dependOn(&nested.step);
+        return;
+    }
+
+    const suite = b.lazyDependency("temporal_features", .{}) orelse return;
+    const suite_url = @import("build.zig.zon").dependencies.temporal_features.url;
+    const suite_commit = suite_url[std.mem.lastIndexOfScalar(u8, suite_url, '#').? + 1 ..];
+    const run = b.addRunArtifact(b.addExecutable(.{ .name = "conformance-runner", .root_module = runner }));
+    run.addArgs(&.{ "run", "--suite" });
+    run.addDirectoryArg(suite.path(""));
+    run.addArgs(&.{ "--suite-commit", suite_commit, "--not-applicable" });
+    run.addFileArg(b.path("conformance/not_applicable.zon"));
+    run.addArg("--report");
+    run.addFileArg2(report_path, .{ .make_absolute = true });
+    run.addArg("--work-dir");
+    run.addDirectoryArg(b.addWriteFiles().getDirectory());
+    for (patterns) |pattern| run.addArgs(&.{ "--feature", pattern });
+    run.stdio = .inherit;
+    run.has_side_effects = true;
+    step.dependOn(&run.step);
+}
+
+fn findConformanceFeatures(b: *std.Build) []const []const u8 {
+    const root = "conformance/features";
+    const io = b.graph.io;
+    const dir = b.root.openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            b.dependOnDirectoryContents(b.path("conformance"));
+            return &.{};
+        },
+        else => std.process.fatal("cannot open {s}: {t}", .{ root, err }),
+    };
+    defer dir.close(io);
+    b.dependOnDirectoryContents(b.path(root));
+    var walker = dir.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    while (walker.next(io) catch |err| std.process.fatal("cannot scan {s}: {t}", .{ root, err })) |entry| {
+        if (entry.kind == .directory) {
+            b.dependOnDirectoryContents(b.path(b.fmt("{s}/{s}", .{ root, entry.path })));
+        } else if (entry.kind == .file and std.mem.eql(u8, entry.basename, "feature.zig")) {
+            const path = std.fs.path.dirname(entry.path) orelse std.process.fatal("{s}/feature.zig needs a feature directory", .{root});
+            paths.append(b.allocator, b.dupe(path)) catch @panic("OOM");
+        }
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lessThan);
+    return paths.items;
 }
 
 /// A sample in samples/<name>: worker.zig, starter.zig, and sample.zon, whose `tests` are its
