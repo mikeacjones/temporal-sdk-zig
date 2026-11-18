@@ -103,8 +103,8 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - Workflow code must stay deterministic. Anything reachable from workflow execution must not use threads, wall-clock time, randomness, unordered hash map iteration, or I/O outside the workflow `std.Io`.
 - For workflow runtime, command, patch, update, local activity, or Nexus workflow changes, add replay coverage with the workflow replayer to protect existing histories.
 - Behavior that crosses the core boundary follows sdk-core's rules (activation job ordering, patch semantics, local activity backoff). When in doubt, compare against the official SDKs that drive the same core, which PARITY.md names.
-- Prefer idiomatic Zig over literal ports: explicit allocators and `std.Io`, struct-literal options, comptime-typed definitions, error sets with failure details read from the future or handle.
-- Document ownership, lifetime, and thread-safety at every interface boundary. Every `TemporalCoreByteArray` the core returns must be freed with `temporal_core_byte_array_free`. Core callbacks run on the core's threads, not the caller's.
+- Prefer idiomatic Zig over literal ports: explicit allocators and `std.Io`, struct-literal options, comptime-typed definitions, error sets with failure details read from the future or handle. See [allocator passing](docs/standards.md#allocator-passing).
+- Document ownership, lifetime, and thread-safety at every interface boundary. Every `TemporalCoreByteArray` the core returns must be freed with `temporal_core_byte_array_free`. Core callbacks run on the core's threads, not the caller's. See the [ownership standards](docs/standards.md#ownership).
 - When the C header changes, the ABI snapshot test fails. Update every wrapper that builds or reads a changed struct before refreshing the snapshot.
 - Zig panics can't be caught. SDK code returns errors instead of panicking on bad input from users, the server, or the core.
 - Workflow fibers support aarch64 and System V x86_64 only. Windows x64 is a compile error until its register set is implemented.
