@@ -57,6 +57,13 @@ Lists the public names reachable from `@import("temporal")` in byte order, with 
 - When to run: When reviewing a change to public declarations or re-exports.
 - Run time: about 0.2 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 2.0 s).
 
+### `zig build api-diff`
+
+Compares the public names from `-Dbase=<ref>` with the working tree, including uncommitted changes. Pass `-Dhead=<ref>` to compare with a second commit. It prints `+ name` for additions and `- name` for removals, sorted by name, and exits successfully even when the lists differ. It requires a local Git repository. The same limits as `zig build api` apply, including names only and reflection for the host regardless of `-Dtarget`. Committed sources are compiled with the checkout's dependencies and core header, so a ref across an sdk-core bump may fail to compile.
+
+- When to run: When reviewing which public names a branch adds or removes.
+- Run time: about 0.3 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 6.7 s).
+
 ### `zig build test-allocators`
 
 Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, and `samples` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check.

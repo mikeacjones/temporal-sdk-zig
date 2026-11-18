@@ -198,7 +198,7 @@ const CheckInputs = struct {
 /// Correctness commands (see AGENTS.md). A fetched package has no tools/checks.
 fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
     // zig build api
-    {
+    const api_lister, const api_options = api: {
         const source = "tools/checks/api_list.zig";
         const lister = checkTool(b, "api-list", source);
         lister.root_module.addImport("api_root", checkSdkModule(b, in, b.path("src/temporal.zig")));
@@ -242,6 +242,56 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         large.root_module.addOptions("api_options", large_options);
         const large_list = addCheckCase(b, in.test_step, large, "api large root", 0);
         large_list.expectStdOutMatch("large.c.S99.f29\n");
+
+        break :api .{ lister, options };
+    };
+
+    // zig build api-diff
+    {
+        const base = b.option([]const u8, "base", "api-diff: the commit to compare from (required)");
+        const head = b.option([]const u8, "head", "api-diff: the commit to compare to (default: the working tree)");
+        const step = b.step("api-diff", "List the public names added and removed between -Dbase and -Dhead");
+        const tool = checkTool(b, "api-diff", "tools/checks/api_diff.zig");
+
+        if (base) |base_ref| {
+            const compare = b.addRunArtifact(tool);
+            compare.addArg("compare");
+            for ([_][]const u8{ "base", "head" }, [_]?[]const u8{ base_ref, head }) |option, maybe_ref| {
+                const lister = if (maybe_ref) |ref| lister: {
+                    const export_tree = b.addRunArtifact(tool);
+                    export_tree.setName(b.fmt("export -D{s}={s}", .{ option, ref }));
+                    export_tree.has_side_effects = true;
+                    export_tree.addArg("export");
+                    export_tree.addDirectoryArg(b.path("."));
+                    export_tree.addArgs(&.{ option, ref });
+                    const tree = export_tree.addOutputDirectoryArg2("tree", .{});
+
+                    const lister = checkTool(b, b.fmt("api-list-{s}", .{option}), "tools/checks/api_list.zig");
+                    lister.step.name = b.fmt("compile the public names of -D{s}={s}", .{ option, ref });
+                    lister.root_module.addImport("api_root", checkSdkModule(b, in, tree.path(b, "src/temporal.zig")));
+                    lister.root_module.addOptions("api_options", api_options);
+                    break :lister lister;
+                } else api_lister;
+                const list = b.addRunArtifact(lister);
+                compare.addFileArg(list.captureStdOut(.{}));
+            }
+            step.dependOn(&compare.step);
+        } else {
+            step.dependOn(&b.addFail("api-diff: pass -Dbase=<ref>, the commit to compare from (-Dhead=<ref> is optional; the default is the working tree)").step);
+        }
+
+        const compare = addCheckCase(b, in.test_step, tool, "api-diff compare", 0);
+        compare.addArg("compare");
+        compare.addFileArg(b.path("tools/checks/fixtures/api_diff/base.txt"));
+        compare.addFileArg(b.path("tools/checks/fixtures/api_diff/head.txt"));
+        compare.addCheck(.{ .expect_stdout_snapshot = b.path("tools/checks/fixtures/api_diff/compare.expected.txt") });
+
+        const unknown_ref = addCheckCase(b, in.test_step, tool, "api-diff unknown ref", 1);
+        unknown_ref.addArg("export");
+        unknown_ref.addDirectoryArg(b.path("."));
+        unknown_ref.addArgs(&.{ "base", "refs/heads/api-diff-test-no-such-ref" });
+        _ = unknown_ref.addOutputDirectoryArg2("tree", .{});
+        unknown_ref.expectStdErrMatch("-Dbase=refs/heads/api-diff-test-no-such-ref");
     }
 
     // zig build test-allocators
