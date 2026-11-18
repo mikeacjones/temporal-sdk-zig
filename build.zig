@@ -550,11 +550,9 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     }
 }
 
-<<<<<<< HEAD
 const ConformanceForwarded = struct { core_lib: ?[]const u8, core_bundle: ?[]const u8, protoc: ?[]const u8 };
-=======
+
 const conformance_histories = "conformance/histories";
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
 
 fn addConformanceSteps(
     b: *std.Build,
@@ -660,21 +658,8 @@ fn addConformanceSteps(
         const clear = b.addSystemCommand(&.{ "rm", "-f", "--" });
         clear.addFileArg2(report_path, .{ .make_absolute = true });
         clear.has_side_effects = true;
-<<<<<<< HEAD
         const nested = nestedConformanceBuild(b, "conformance", optimize, forwarded);
-=======
-        const nested = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "conformance", "-Dconformance-suite=true", "--prefix" });
-        nested.addFileArg2(b.graph.path(.install_prefix, ""), .{ .make_absolute = true });
-        nested.removeEnvironmentVariable("DESTDIR");
-        nested.setCwd(b.path(""));
-        nested.stdio = .inherit;
-        nested.has_side_effects = true;
-        nested.addArg(b.fmt("-Doptimize={t}", .{optimize}));
-        if (forwarded.core_lib) |path| nested.addArg(b.fmt("-Dcore-lib={s}", .{path}));
-        if (forwarded.core_bundle) |path| nested.addArg(b.fmt("-Dcore-bundle={s}", .{path}));
-        if (forwarded.protoc) |path| nested.addArg(b.fmt("-Dprotoc={s}", .{path}));
         if (record) nested.addArg("-Drecord-histories=true");
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
         for (patterns) |pattern| nested.addArg(b.fmt("-Dfeature={s}", .{pattern}));
         nested.step.dependOn(&clear.step);
         step.dependOn(&nested.step);
@@ -702,7 +687,6 @@ fn addConformanceSteps(
 
     const suite_url = @import("build.zig.zon").dependencies.temporal_features.url;
     const suite_commit = suite_url[std.mem.lastIndexOfScalar(u8, suite_url, '#').? + 1 ..];
-<<<<<<< HEAD
     const work_dir = b.addWriteFiles().getDirectory();
     for ([_]*std.Build.Step{ step, check_step }) |suite_step| {
         const checking = suite_step == check_step;
@@ -720,6 +704,11 @@ fn addConformanceSteps(
         run.stdio = .inherit;
         run.has_side_effects = true;
         if (!checking) {
+            if (record) {
+                const package_root = b.root.root_dir.handle.realPathFileAlloc(b.graph.io, b.root.subPathOrDot(), b.allocator) catch |err|
+                    std.process.fatal("cannot resolve the conformance package root: {t}", .{err});
+                run.addArgs(&.{ "--histories", b.pathJoin(&.{ package_root, conformance_histories }) });
+            }
             for (patterns) |pattern| run.addArgs(&.{ "--feature", pattern });
             suite_step.dependOn(&run.step);
             continue;
@@ -753,26 +742,6 @@ fn nestedConformanceBuild(b: *std.Build, step_name: []const u8, optimize: std.bu
     if (forwarded.core_bundle) |path| nested.addArg(b.fmt("-Dcore-bundle={s}", .{path}));
     if (forwarded.protoc) |path| nested.addArg(b.fmt("-Dprotoc={s}", .{path}));
     return nested;
-=======
-    const run = b.addRunArtifact(b.addExecutable(.{ .name = "conformance-runner", .root_module = runner }));
-    run.addArgs(&.{ "run", "--suite" });
-    run.addDirectoryArg(suite.path(""));
-    run.addArgs(&.{ "--suite-commit", suite_commit, "--not-applicable" });
-    run.addFileArg(b.path("conformance/not_applicable.zon"));
-    run.addArg("--report");
-    run.addFileArg2(report_path, .{ .make_absolute = true });
-    run.addArg("--work-dir");
-    run.addDirectoryArg(b.addWriteFiles().getDirectory());
-    if (record) {
-        const package_root = b.root.root_dir.handle.realPathFileAlloc(b.graph.io, b.root.subPathOrDot(), b.allocator) catch |err|
-            std.process.fatal("cannot resolve the conformance package root: {t}", .{err});
-        run.addArgs(&.{ "--histories", b.pathJoin(&.{ package_root, conformance_histories }) });
-    }
-    for (patterns) |pattern| run.addArgs(&.{ "--feature", pattern });
-    run.stdio = .inherit;
-    run.has_side_effects = true;
-    step.dependOn(&run.step);
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
 }
 
 fn findStoredHistories(b: *std.Build) []const []const u8 {

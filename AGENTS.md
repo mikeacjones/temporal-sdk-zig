@@ -87,7 +87,6 @@ Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, and `sam
 
 ## Conformance
 
-<<<<<<< HEAD
 `addConformanceSteps` in build.zig adds three commands that run Temporal's cross-SDK features suite against this SDK. The suite is `temporalio/features` at the commit build.zig.zon pins as the lazy dependency `temporal_features`. Each command runs a nested `zig build <step> -Dconformance-suite=true`, and only the nested build fetches the suite. The first run needs network, for that fetch and for the dev server's download. The suite's own Go, TypeScript, and other harnesses are not used: the Zig versions of its features live in `conformance/features/`, and no Go toolchain is needed. The harness is `conformance/harness/` and the runner `conformance/runner/`. Run times are measurements, not limits: they were measured on 2026-11-18 on the factory's Mac (Apple M4 Pro, 14 cores, 64 GB, macOS 27.2.1), each command in its own fresh `git clone --recursive` with no `.zig-cache`, while other builds ran on the machine. The first runs include building the Rust core with cargo (about 70 s). Machine-wide caches were already warm: Zig's global package cache held the suite and the other dependencies, so nothing was downloaded; the dev server's Temporal CLI binary was already in `$TMPDIR`; and cargo's registry and the Rust toolchain were installed.
 
 ### `zig build conformance`
@@ -145,13 +144,13 @@ Checks `conformance/parity_map.zon` against the suite's features and `conformanc
 2. Write `conformance/features/<area>/<name>/feature.zig`, where `<area>/<name>` is the suite path, with `pub const feature = harness.define(.{ .workflows = ..., .activities = ..., .execute = execute });`. `.execute` is required; `.workflows`, `.activities`, `.nexus_services`, `.worker_options`, and `.configureClient` are optional. build.zig finds the file by its path, and the runner rejects a feature the suite doesn't have.
 3. Check that its entry in `conformance/parity_map.zon` names the right row, or change it from `.none` to `.row` when the feature now covers one.
 4. Run `zig build conformance -Dfeature=<area>/<name>`, then `zig build conformance-check`.
+5. When it passes and declares workflows, record its histories with `zig build conformance -Dfeature=<area>/<name> -Drecord-histories` and commit them (see Stored histories below), or `zig build test` fails for the missing history.
 
-When the feature fails because the SDK lacks something, keep the feature as written and file a bead for the gap. Don't add it to not_applicable.zon or work around the gap in the feature: the report keeps it as `fail` with its message, and `zig build conformance-check` lists it as `failing` while its row is supported.
-=======
+When the feature fails because the SDK lacks something, keep the feature as written and file a bead for the gap. Don't add it to not_applicable.zon or work around the gap in the feature: the report keeps it as `fail` with its message, and `zig build conformance-check` lists it as `failing` while its row is supported. With no history to record, it also gets an entry in `conformance/replay/exclusions.zon` with that bead ID, as Stored histories below says.
+
 ### Stored histories
 
 The workflow histories of the written conformance features live in `conformance/histories/<feature path>/<temporal.version>/[<variant>/]`, one `<n>-<workflow type>.json` per closed run in start order, with a `runs.json` that gives the namespace, task queue and each run's workflow ID. `zig build conformance -Drecord-histories` records them for every passing feature, and `-Dfeature=<pattern>` limits that to the matching features. Re-record a history only on purpose, and say why in the commit message. While the version is 0.0.0 the one set is replaced in place; once a version is released its directory is frozen and each release gets a new set beside it. `zig build test` replays every stored file, of every version, against its feature's workflows (`conformance/replay/replay.zig`), and fails for a written feature that declares workflows and has no history for the current version. A replay failure on a frozen file is an SDK bug, not a reason to re-record: file it, and list the feature in `conformance/replay/exclusions.zon` with that bead ID and the reason. A written feature that fails because of an SDK gap, and so has no history to record, is listed there the same way. An entry exempts its feature from replay and from the missing-history rule, and the test prints it on every run; the commit that fixes the defect, or makes the feature pass and records its history, removes the entry.
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
 
 ## README.md is the API documentation
 
@@ -204,7 +203,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `samples/` holds the samples, and `tools/samples_runner.zig` validates them. PARITY.md lists them, explains how parity is measured, and has the feature table; `scripts/parity-check.sh` checks the table.
 - `examples/readme/` holds the compiled examples that README.md's code blocks copy, and `tools/readme_examples.zig` checks or rewrites the copies.
 - `tools/checks/` holds the correctness commands and their fixtures.
-- `conformance/` holds the features-suite conformance run: `features/<area>/<name>/feature.zig` are the Zig features, `harness/` and `runner/` run them, `parity_map.zon` maps each suite feature to a PARITY.md row, and `not_applicable.zon` lists the features with no Zig equivalent.
+- `conformance/` holds the features-suite conformance run: `features/<area>/<name>/feature.zig` are the Zig features, `harness/` and `runner/` run them, `parity_map.zon` maps each suite feature to a PARITY.md row, `not_applicable.zon` lists the features with no Zig equivalent, `histories/` holds the stored workflow histories, and `replay/` replays them in `zig build test`.
 - `scripts/` holds maintenance scripts, each with usage in its header.
 - `.review/` holds the review tooling: `reports.sh` runs the checks and the scanners (gitleaks, osv-scanner, cargo-deny, shellcheck, actionlint, typos, zlint) on a change, `install.sh` installs them, and the `.toml` files are their settings. It isn't part of the SDK and isn't in the release tarball.
 - `docs/` holds maintainer documentation.

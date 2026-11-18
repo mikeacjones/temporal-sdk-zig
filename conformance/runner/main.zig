@@ -1,11 +1,8 @@
 //! conformance-runner map --suite <dir> --not-applicable <file> --parity-map <file>
 //! conformance-runner check --report <file> --parity-map <file> --parity <PARITY.md>
 //! conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file>
-<<<<<<< HEAD
-//!                        --report <file> --work-dir <dir> [--feature <pattern>]... [--stdout-to stderr]
-=======
 //!                        --report <file> --work-dir <dir> [--feature <pattern>]... [--histories <dir>]
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
+//!                        [--stdout-to stderr]
 //! conformance-runner feature <area>/<name> --address <host:port> --namespace <ns>
 //!                            --task-queue <queue> --result <file> [--variant <name>]
 //!                            [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
@@ -16,13 +13,10 @@ const features = @import("features");
 const dynamic_config = @import("dynamic_config.zig");
 const feature_config = @import("feature_config.zig");
 const inventory = @import("inventory.zig");
-<<<<<<< HEAD
 const parity_check = @import("parity_check.zig");
 const parity_map = @import("parity_map.zig");
 const parity_table = @import("parity_table.zig");
-=======
 const record = @import("record.zig");
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
 const report = @import("report.zig");
 
 const Allocator = std.mem.Allocator;
@@ -30,13 +24,9 @@ const Io = std.Io;
 const timeout_seconds = 240;
 const namespace = "default";
 
-<<<<<<< HEAD
 const MapOption = enum { suite, @"not-applicable", @"parity-map" };
 const CheckOption = enum { report, @"parity-map", parity };
-const ParentOption = enum { suite, @"suite-commit", @"not-applicable", report, @"work-dir", @"stdout-to" };
-=======
-const ParentOption = enum { suite, @"suite-commit", @"not-applicable", report, @"work-dir", histories };
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
+const ParentOption = enum { suite, @"suite-commit", @"not-applicable", report, @"work-dir", histories, @"stdout-to" };
 const ChildOption = enum { address, namespace, @"task-queue", result, variant, @"nexus-endpoint" };
 const ChildResult = struct {
     status: enum { pass, fail },
@@ -76,15 +66,10 @@ pub fn main(init: std.process.Init) !void {
 fn usage() error{InvalidArguments} {
     std.log.err(
         \\usage:
-<<<<<<< HEAD
         \\  conformance-runner map --suite <dir> --not-applicable <file> --parity-map <file>
         \\  conformance-runner check --report <file> --parity-map <file> --parity <PARITY.md>
         \\  conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file> --report <file> --work-dir <dir>
-        \\                         [--feature <pattern>]... [--stdout-to stderr]
-=======
-        \\  conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file> --report <file> --work-dir <dir>
-        \\                         [--feature <pattern>]... [--histories <dir>]
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
+        \\                         [--feature <pattern>]... [--histories <dir>] [--stdout-to stderr]
         \\  conformance-runner feature <area>/<name> --address <host:port> --namespace <ns> --task-queue <queue> --result <file>
         \\                             [--variant <name>] [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
     , .{});
@@ -203,7 +188,7 @@ fn readCheckInput(arena: Allocator, io: Io, path: []const u8) [:0]const u8 {
 fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u8, registry: []const features.Entry) !void {
     const cwd = Io.Dir.cwd();
     var patterns: std.ArrayList([]const u8) = .empty;
-    var parsed = parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{.@"stdout-to"});
+    var parsed = parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{ .histories, .@"stdout-to" });
     // An invalid --stdout-to value fails like any other invalid option: only
     // after the previous report is cleared below, and without redirecting.
     if (parsed) |options| {
@@ -233,12 +218,7 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
         };
     }
 
-<<<<<<< HEAD
     const options = try parsed;
-=======
-    var patterns: std.ArrayList([]const u8) = .empty;
-    const options = try parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{.histories});
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
     const suite_path = options.get(.suite).?;
     const na_path = options.get(.@"not-applicable").?;
     const report_path = options.get(.report).?;
@@ -818,13 +798,10 @@ test {
     _ = dynamic_config;
     _ = feature_config;
     _ = inventory;
-<<<<<<< HEAD
     _ = parity_table;
     _ = parity_map;
     _ = parity_check;
-=======
     _ = record;
->>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
     _ = report;
 }
 
