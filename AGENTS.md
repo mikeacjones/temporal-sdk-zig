@@ -64,6 +64,13 @@ Compares the public names from `-Dbase=<ref>` with the working tree, including u
 - When to run: When reviewing which public names a branch adds or removes.
 - Run time: about 0.3 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 6.7 s).
 
+### `zig build dupes`
+
+Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, and `samples` as `file:start-end` line ranges, longest first. It compares both token kind and exact text, including identifiers and literals, and ignores comments and whitespace between tokens. It leaves out `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, and `tools/checks/fixtures/`. Directory walks also skip hidden directories, `zig-out`, and `zig-pkg`. The default minimum is 100 tokens. Set it with `-Ddupes-min-tokens=<n>`, or pass relative file and directory paths after `--` to limit the scan. Finding duplicates does not fail the command.
+
+- When to run: When reviewing new code for copies of existing code.
+- Run time: about 0.7 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.0 s).
+
 ### `zig build lint`
 
 Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, and `samples`, excluding generated code and check fixtures. The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init` so zlinter can evaluate the default build configuration. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.

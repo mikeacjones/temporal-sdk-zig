@@ -294,6 +294,39 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         unknown_ref.expectStdErrMatch("-Dbase=refs/heads/api-diff-test-no-such-ref");
     }
 
+    // zig build dupes
+    {
+        const min_tokens = b.option(u32, "dupes-min-tokens", "dupes: smallest duplicated run in tokens (default: 100)") orelse 100;
+        const tool = checkTool(b, "dupes", "tools/checks/dupes.zig");
+        const run = b.addRunArtifact(tool);
+        run.addDirectoryArg(b.path("."));
+        run.addArgs(&.{ "--min-tokens", b.fmt("{d}", .{min_tokens}) });
+        run.addPassthruArgs();
+        run.has_side_effects = true;
+        b.step("dupes", "Report duplicated code in hand-written Zig").dependOn(&run.step);
+        const tests = b.addTest(.{ .name = "dupes-tool", .root_module = tool.root_module, .filters = in.test_filters });
+        in.test_step.dependOn(&b.addRunArtifact(tests).step);
+
+        const fixtures = b.path("tools/checks/fixtures/dupes");
+        const report = addCheckCase(b, in.test_step, tool, "dupes report", 0);
+        report.addDirectoryArg(fixtures);
+        report.addArgs(&.{ "--min-tokens", "14", "c.zig", "b.zig", "a.zig" });
+        report.addCheck(.{ .expect_stdout_snapshot = fixtures.path(b, "report.expected.txt") });
+        report.expectStdErrEqual("");
+
+        const missing = addCheckCase(b, in.test_step, tool, "dupes missing path", 1);
+        missing.addDirectoryArg(fixtures);
+        missing.addArg("dupes-test-no-such-path");
+        missing.expectStdErrMatch("dupes: cannot read dupes-test-no-such-path: FileNotFound");
+        missing.expectStdOutEqual("");
+
+        const invalid = addCheckCase(b, in.test_step, tool, "dupes invalid minimum", 2);
+        invalid.addDirectoryArg(fixtures);
+        invalid.addArgs(&.{ "--min-tokens", "0" });
+        invalid.expectStdErrMatch("dupes: --min-tokens must be a positive integer");
+        invalid.expectStdOutEqual("");
+    }
+
     // zig build lint
     if (b.isRoot()) if (b.lazyImport(@This(), "zlinter")) |zlinter| {
         var linter = zlinter.builder(b, .{});

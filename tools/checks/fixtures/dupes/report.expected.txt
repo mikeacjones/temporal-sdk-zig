@@ -1,0 +1,18 @@
+27 tokens, 2 copies
+a.zig:1-6
+b.zig:3-10
+
+24 tokens, 2 copies
+a.zig:6-11
+a.zig:11-16
+
+16 tokens, 3 copies
+a.zig:6-8
+a.zig:11-13
+b.zig:10-12
+
+16 tokens, 2 copies
+c.zig:2-5
+c.zig:6-9
+
+4 groups of 14 or more tokens in 3 files
