@@ -4,14 +4,33 @@ const temporal = @import("temporal");
 
 pub const Context = @import("Context.zig");
 pub const history = @import("history.zig");
+pub const stored = @import("stored.zig");
 
 pub const Feature = struct {
     has_worker: bool,
     worker_options: temporal.worker.Options,
+    /// Workflow type names in declaration order.
+    workflow_types: []const []const u8,
     register: *const fn (*temporal.worker.Worker) anyerror!void,
+    /// Registers the workflows of `.workflows` with a replayer.
+    registerReplayer: *const fn (*temporal.testing.WorkflowReplayer) anyerror!void,
     execute: *const fn (*Context) anyerror!void,
     /// Options may borrow slices from file-scope constants for the client and its worker.
     configureClient: ?*const fn (*temporal.client.Options) void = null,
+
+    /// Replayer options for a stored run of this feature: the given namespace and task queue,
+    /// and the codecs and failure converter `.configureClient` sets on a default
+    /// `temporal.client.Options`. The slices borrow what `configureClient` borrowed.
+    pub fn replayerOptions(feature: *const Feature, namespace: []const u8, task_queue: []const u8) temporal.testing.WorkflowReplayer.Options {
+        var client_options: temporal.client.Options = .{};
+        if (feature.configureClient) |configure| configure(&client_options);
+        return .{
+            .namespace = namespace,
+            .task_queue = task_queue,
+            .codecs = client_options.codecs,
+            .failure_converter = client_options.failure_converter,
+        };
+    }
 };
 
 pub fn define(comptime spec: anytype) Feature {
@@ -45,6 +64,12 @@ pub fn define(comptime spec: anytype) Feature {
     return .{
         .has_worker = workflows.len != 0 or activities.len != 0 or nexus_services.len != 0,
         .worker_options = worker_options,
+        .workflow_types = comptime blk: {
+            var names: [workflows.len][]const u8 = undefined;
+            for (workflows, &names) |Workflow, *name| name.* = Workflow.workflow_name;
+            const result = names;
+            break :blk &result;
+        },
         .register = struct {
             fn register(worker: *temporal.worker.Worker) anyerror!void {
                 inline for (workflows) |Workflow| try worker.registerWorkflow(Workflow);
@@ -52,6 +77,11 @@ pub fn define(comptime spec: anytype) Feature {
                 inline for (nexus_services) |Service| try worker.registerNexusService(Service);
             }
         }.register,
+        .registerReplayer = struct {
+            fn registerReplayer(replayer: *temporal.testing.WorkflowReplayer) anyerror!void {
+                inline for (workflows) |Workflow| try replayer.registerWorkflow(Workflow);
+            }
+        }.registerReplayer,
         .execute = spec.execute,
         .configureClient = if (@hasField(@TypeOf(spec), "configureClient")) spec.configureClient else null,
     };
@@ -60,6 +90,7 @@ pub fn define(comptime spec: anytype) Feature {
 test {
     _ = Context;
     _ = history;
+    _ = stored;
 }
 
 test "conformance define defaults to a client-only feature" {
@@ -69,9 +100,22 @@ test "conformance define defaults to a client-only feature" {
         }
     }.execute });
     try std.testing.expect(!feature.has_worker);
+    try std.testing.expectEqual(0, feature.workflow_types.len);
     try std.testing.expectEqual(null, feature.configureClient);
     var ctx: Context = undefined;
     try std.testing.expectError(error.Example, feature.execute(&ctx));
+}
+
+test "conformance define lists workflow types in declaration order" {
+    const Example = struct {
+        fn run(_: *temporal.workflow.Context) !void {}
+        fn execute(_: *Context) !void {}
+    };
+    const feature = define(.{
+        .workflows = .{ temporal.workflow.Def("Parent", Example.run), temporal.workflow.Def("Child", Example.run) },
+        .execute = Example.execute,
+    });
+    try std.testing.expectEqualDeep(&[_][]const u8{ "Parent", "Child" }, feature.workflow_types);
 }
 
 test "conformance define retains the client configuration callback" {
@@ -85,6 +129,52 @@ test "conformance define retains the client configuration callback" {
     var options: temporal.client.Options = .{};
     feature.configureClient.?(&options);
     try std.testing.expect(options.encode_failure_attributes);
+}
+
+test "conformance replayer options carry the codecs set by configureClient" {
+    const Example = struct {
+        var context: u8 = 0;
+        const codecs = [_]temporal.converter.PayloadCodec{.{ .ptr = &context, .vtable = &.{ .encode = passThrough, .decode = passThrough } }};
+        fn passThrough(_: *anyopaque, _: std.mem.Allocator, _: std.Io, payloads: []const temporal.converter.Payload) temporal.converter.CodecError![]temporal.converter.Payload {
+            return @constCast(payloads);
+        }
+        fn execute(_: *Context) !void {}
+        fn configure(options: *temporal.client.Options) void {
+            options.codecs = &codecs;
+        }
+    };
+    const feature = define(.{ .execute = Example.execute, .configureClient = Example.configure });
+    const options = feature.replayerOptions("ns", "queue");
+    try std.testing.expectEqualStrings("ns", options.namespace);
+    try std.testing.expectEqualStrings("queue", options.task_queue);
+    try std.testing.expectEqual(1, options.codecs.len);
+    try std.testing.expectEqual(&Example.codecs[0], &options.codecs[0]);
+    try std.testing.expectEqual(null, options.failure_converter);
+}
+
+test "conformance replayer options default without configureClient" {
+    const feature = define(.{ .execute = struct {
+        fn execute(_: *Context) !void {}
+    }.execute });
+    const options = feature.replayerOptions("default", "conformance-a/b");
+    try std.testing.expectEqualDeep(temporal.testing.WorkflowReplayer.Options{ .namespace = "default", .task_queue = "conformance-a/b" }, options);
+}
+
+test "conformance registerReplayer registers each declared workflow type" {
+    const Example = struct {
+        fn run(_: *temporal.workflow.Context) !void {}
+        fn execute(_: *Context) !void {}
+    };
+    const feature = define(.{
+        .workflows = .{ temporal.workflow.Def("Parent", Example.run), temporal.workflow.Def("Child", Example.run) },
+        .execute = Example.execute,
+    });
+    var replayer: temporal.testing.WorkflowReplayer = .init(std.testing.allocator, std.testing.io);
+    defer replayer.deinit();
+    try feature.registerReplayer(&replayer);
+    try std.testing.expectEqual(2, replayer.workflows.count());
+    try std.testing.expect(replayer.workflows.contains("Parent"));
+    try std.testing.expect(replayer.workflows.contains("Child"));
 }
 
 test "conformance define accepts worker options written as a struct literal" {

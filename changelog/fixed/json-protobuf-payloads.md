@@ -1,1 +1,0 @@
-`json/protobuf` payloads now decode enums written by short name, and base64-decode the values of `map<string, bytes>` fields such as `Payload.metadata` in the messages they hold, instead of leaving them as base64 text.

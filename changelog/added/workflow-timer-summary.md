@@ -1,1 +1,0 @@
-`workflow.Context.sleep` blocks on a durable timer like `ctx.io().sleep`, with `workflow.SleepOptions.summary` shown by the UI and CLI on the timer's started event; run it as a coroutine to race or cancel it. See [Timers and conditions](https://github.com/mikeacjones/temporal-sdk-zig#timers-and-conditions).

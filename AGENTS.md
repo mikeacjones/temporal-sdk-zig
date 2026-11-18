@@ -87,6 +87,7 @@ Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, and `sam
 
 ## Conformance
 
+<<<<<<< HEAD
 `addConformanceSteps` in build.zig adds three commands that run Temporal's cross-SDK features suite against this SDK. The suite is `temporalio/features` at the commit build.zig.zon pins as the lazy dependency `temporal_features`. Each command runs a nested `zig build <step> -Dconformance-suite=true`, and only the nested build fetches the suite. The first run needs network, for that fetch and for the dev server's download. The suite's own Go, TypeScript, and other harnesses are not used: the Zig versions of its features live in `conformance/features/`, and no Go toolchain is needed. The harness is `conformance/harness/` and the runner `conformance/runner/`. Run times are measurements, not limits: they were measured on 2026-11-18 on the factory's Mac (Apple M4 Pro, 14 cores, 64 GB, macOS 27.2.1), each command in its own fresh `git clone --recursive` with no `.zig-cache`, while other builds ran on the machine. The first runs include building the Rust core with cargo (about 70 s). Machine-wide caches were already warm: Zig's global package cache held the suite and the other dependencies, so nothing was downloaded; the dev server's Temporal CLI binary was already in `$TMPDIR`; and cargo's registry and the Rust toolchain were installed.
 
 ### `zig build conformance`
@@ -146,6 +147,11 @@ Checks `conformance/parity_map.zon` against the suite's features and `conformanc
 4. Run `zig build conformance -Dfeature=<area>/<name>`, then `zig build conformance-check`.
 
 When the feature fails because the SDK lacks something, keep the feature as written and file a bead for the gap. Don't add it to not_applicable.zon or work around the gap in the feature: the report keeps it as `fail` with its message, and `zig build conformance-check` lists it as `failing` while its row is supported.
+=======
+### Stored histories
+
+The workflow histories of the written conformance features live in `conformance/histories/<feature path>/<temporal.version>/[<variant>/]`, one `<n>-<workflow type>.json` per closed run in start order, with a `runs.json` that gives the namespace, task queue and each run's workflow ID. `zig build conformance -Drecord-histories` records them for every passing feature, and `-Dfeature=<pattern>` limits that to the matching features. Re-record a history only on purpose, and say why in the commit message. While the version is 0.0.0 the one set is replaced in place; once a version is released its directory is frozen and each release gets a new set beside it. `zig build test` replays every stored file, of every version, against its feature's workflows (`conformance/replay/replay.zig`), and fails for a written feature that declares workflows and has no history for the current version. A replay failure on a frozen file is an SDK bug, not a reason to re-record: file it, and list the feature in `conformance/replay/exclusions.zon` with that bead ID and the reason. A written feature that fails because of an SDK gap, and so has no history to record, is listed there the same way. An entry exempts its feature from replay and from the missing-history rule, and the test prints it on every run; the commit that fixes the defect, or makes the feature pass and records its history, removes the entry.
+>>>>>>> 1bbe49fefa1f46b3256758903cc2321dd5b0a308
 
 ## README.md is the API documentation
 

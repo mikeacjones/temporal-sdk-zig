@@ -1,1 +1,0 @@
-A workflow coroutine waiting to lock a `std.Io.Mutex` no longer blocks forever when the waiter ahead of it is woken by the unlock and canceled before it runs: that waiter still gets `error.Canceled`, and the wake passes on to the next waiter. The same holds for any single-waiter futex wake in workflow code.

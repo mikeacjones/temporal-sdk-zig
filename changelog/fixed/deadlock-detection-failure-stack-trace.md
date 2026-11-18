@@ -1,1 +1,0 @@
-A workflow or update that fails is no longer reported as a potential deadlock when reading debug info for its failure's stack trace takes longer than `worker.Options.deadlock_detection_timeout`: that time is SDK work and is not counted, like the stack trace query's.

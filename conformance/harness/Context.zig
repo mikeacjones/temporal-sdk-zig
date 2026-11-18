@@ -121,7 +121,8 @@ pub fn fetchRawHistory(ctx: *Context, workflow_id: []const u8, run_id: []const u
     return readRawHistory(ctx.client, ctx.arena, ctx.namespace, workflow_id, run_id);
 }
 
-fn readRawHistory(client: anytype, arena: std.mem.Allocator, namespace: []const u8, workflow_id: []const u8, run_id: []const u8) temporal.client.CallServiceError!temporal.history.History {
+/// Reads every page with its stored payloads into the caller's arena.
+pub fn readRawHistory(client: anytype, arena: std.mem.Allocator, namespace: []const u8, workflow_id: []const u8, run_id: []const u8) temporal.client.CallServiceError!temporal.history.History {
     var recorded: temporal.history.History = .{};
     var token: []const u8 = "";
     while (true) {
