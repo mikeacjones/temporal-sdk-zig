@@ -13,6 +13,16 @@ pub const Report = struct {
     readme_only_directories: usize,
     features: []const Entry,
 };
+pub const Parsed = union(enum) { report: Report, problem: []const u8 };
+
+/// Reads a report written by `write`, copying its strings into the arena.
+pub fn parse(arena: Allocator, json: []const u8) error{OutOfMemory}!Parsed {
+    const result = std.json.parseFromSliceLeaky(Report, arena, json, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .problem = @errorName(err) },
+    };
+    return .{ .report = result };
+}
 
 /// Outcomes are indexed by written path. Unselected features have no outcome.
 pub fn assemble(
@@ -78,6 +88,29 @@ pub fn combineVariants(arena: Allocator, path: []const u8, variants: []const Var
         }
     }
     return if (message.written().len == 0) .pass else .{ .fail = message.written() };
+}
+
+test "conformance report parsing copies strings from the JSON input" {
+    const gpa = std.testing.allocator;
+    var state: std.heap.ArenaAllocator = .init(gpa);
+    defer state.deinit();
+    var json: std.Io.Writer.Allocating = .init(gpa);
+    defer json.deinit();
+    const expected: Report = .{
+        .suite_commit = "commit",
+        .sdk_version = "0.0.0",
+        .filter = &.{"area/*"},
+        .readme_only_directories = 2,
+        .features = &.{
+            .{ .path = "area/pass", .status = .pass },
+            .{ .path = "area/fail", .status = .fail, .message = "failure" },
+        },
+    };
+    try write(expected, &json.writer);
+    const parsed = try parse(state.allocator(), json.written());
+    @memset(json.written(), 0);
+    try std.testing.expect(parsed == .report);
+    try std.testing.expectEqualDeep(expected, parsed.report);
 }
 
 test "conformance report combines failed variants in run order" {
