@@ -3,6 +3,7 @@ const std = @import("std");
 const temporal = @import("temporal");
 
 pub const Context = @import("Context.zig");
+pub const history = @import("history.zig");
 
 pub const Feature = struct {
     has_worker: bool,
@@ -51,6 +52,7 @@ pub fn define(comptime spec: anytype) Feature {
 
 test {
     _ = Context;
+    _ = history;
 }
 
 test "conformance define defaults to a client-only feature" {
