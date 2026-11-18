@@ -550,6 +550,8 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     }
 }
 
+const ConformanceForwarded = struct { core_lib: ?[]const u8, core_bundle: ?[]const u8, protoc: ?[]const u8 };
+
 fn addConformanceSteps(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -557,11 +559,12 @@ fn addConformanceSteps(
     temporal: *std.Build.Module,
     test_step: *std.Build.Step,
     test_filters: []const []const u8,
-    forwarded: struct { core_lib: ?[]const u8, core_bundle: ?[]const u8, protoc: ?[]const u8 },
+    forwarded: ConformanceForwarded,
 ) void {
     const patterns = b.option([]const []const u8, "feature", "Run conformance features matching this path pattern (repeatable)") orelse &.{};
     const with_suite = b.option(bool, "conformance-suite", "Internal option set by the conformance step on its nested build") orelse false;
     const step = b.step("conformance", "Run the Temporal features suite and write conformance/report.json");
+    const map_step = b.step("conformance-map", "Check conformance/parity_map.zon against the features suite");
     const report_path = b.graph.path(.install_prefix, "conformance/report.json");
 
     const harness = b.createModule(.{
@@ -576,6 +579,8 @@ fn addConformanceSteps(
         .optimize = optimize,
         .imports = &.{ .{ .name = "temporal", .module = temporal }, .{ .name = "harness", .module = harness } },
     });
+    runner.addAnonymousImport("PARITY.md", .{ .root_source_file = b.path("PARITY.md") });
+    runner.addAnonymousImport("parity_map.zon", .{ .root_source_file = b.path("conformance/parity_map.zon") });
     inline for (.{ .{ "conformance-harness", harness }, .{ "conformance-runner", runner } }) |artifact| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{
             .name = artifact[0],
@@ -613,26 +618,30 @@ fn addConformanceSteps(
         const clear = b.addSystemCommand(&.{ "rm", "-f", "--" });
         clear.addFileArg2(report_path, .{ .make_absolute = true });
         clear.has_side_effects = true;
-        const nested = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "conformance", "-Dconformance-suite=true", "--prefix" });
-        nested.addFileArg2(b.graph.path(.install_prefix, ""), .{ .make_absolute = true });
-        nested.removeEnvironmentVariable("DESTDIR");
-        nested.setCwd(b.path(""));
-        nested.stdio = .inherit;
-        nested.has_side_effects = true;
-        nested.addArg(b.fmt("-Doptimize={t}", .{optimize}));
-        if (forwarded.core_lib) |path| nested.addArg(b.fmt("-Dcore-lib={s}", .{path}));
-        if (forwarded.core_bundle) |path| nested.addArg(b.fmt("-Dcore-bundle={s}", .{path}));
-        if (forwarded.protoc) |path| nested.addArg(b.fmt("-Dprotoc={s}", .{path}));
+        const nested = nestedConformanceBuild(b, "conformance", optimize, forwarded);
         for (patterns) |pattern| nested.addArg(b.fmt("-Dfeature={s}", .{pattern}));
         nested.step.dependOn(&clear.step);
         step.dependOn(&nested.step);
+        map_step.dependOn(&nestedConformanceBuild(b, "conformance-map", optimize, forwarded).step);
         return;
     }
 
     const suite = b.lazyDependency("temporal_features", .{}) orelse return;
+    const executable = b.addExecutable(.{ .name = "conformance-runner", .root_module = runner });
+    const map = b.addRunArtifact(executable);
+    map.addArgs(&.{ "map", "--suite" });
+    map.addDirectoryArg(suite.path(""));
+    map.addArg("--not-applicable");
+    map.addFileArg(b.path("conformance/not_applicable.zon"));
+    map.addArg("--parity-map");
+    map.addFileArg(b.path("conformance/parity_map.zon"));
+    map.stdio = .inherit;
+    map.has_side_effects = true;
+    map_step.dependOn(&map.step);
+
     const suite_url = @import("build.zig.zon").dependencies.temporal_features.url;
     const suite_commit = suite_url[std.mem.lastIndexOfScalar(u8, suite_url, '#').? + 1 ..];
-    const run = b.addRunArtifact(b.addExecutable(.{ .name = "conformance-runner", .root_module = runner }));
+    const run = b.addRunArtifact(executable);
     run.addArgs(&.{ "run", "--suite" });
     run.addDirectoryArg(suite.path(""));
     run.addArgs(&.{ "--suite-commit", suite_commit, "--not-applicable" });
@@ -645,6 +654,20 @@ fn addConformanceSteps(
     run.stdio = .inherit;
     run.has_side_effects = true;
     step.dependOn(&run.step);
+}
+
+fn nestedConformanceBuild(b: *std.Build, step_name: []const u8, optimize: std.builtin.OptimizeMode, forwarded: ConformanceForwarded) *std.Build.Step.Run {
+    const nested = b.addSystemCommand(&.{ b.graph.zig_exe, "build", step_name, "-Dconformance-suite=true", "--prefix" });
+    nested.addFileArg2(b.graph.path(.install_prefix, ""), .{ .make_absolute = true });
+    nested.removeEnvironmentVariable("DESTDIR");
+    nested.setCwd(b.path(""));
+    nested.stdio = .inherit;
+    nested.has_side_effects = true;
+    nested.addArg(b.fmt("-Doptimize={t}", .{optimize}));
+    if (forwarded.core_lib) |path| nested.addArg(b.fmt("-Dcore-lib={s}", .{path}));
+    if (forwarded.core_bundle) |path| nested.addArg(b.fmt("-Dcore-bundle={s}", .{path}));
+    if (forwarded.protoc) |path| nested.addArg(b.fmt("-Dprotoc={s}", .{path}));
+    return nested;
 }
 
 fn findConformanceFeatures(b: *std.Build) []const []const u8 {
