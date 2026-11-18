@@ -35,6 +35,11 @@
             .url = "git+https://github.com/Arwalk/zig-protobuf#38ec95e38e136bfc93685b6549018285f5e722b2",
             .hash = "protobuf-7.0.0-0e82aujcOwCmSdUIDrerIiWx8LAAxIYj20-i3tRkjOPz",
         },
+        .zlinter = .{
+            .url = "git+https://github.com/KurtWagner/zlinter#e1f92a1159a36fa301730596f742d0f66e60908d",
+            .hash = "zlinter-0.0.1-OjQ08aZsFgB3c_awcIosz3PylM-2Xui24XuPsEONY3n1",
+            .lazy = true,
+        },
         .temporal_features = .{
             .url = "git+https://github.com/temporalio/features#a132d35815137c2e8fdc7767c52907c724f48c68",
             .hash = "N-V-__8AAAjTHwBqUsiPnovBfdL6f5C0iLALKgsMwLuJtn5U",

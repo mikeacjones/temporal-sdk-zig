@@ -16,8 +16,9 @@ This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust 
   - `.review/reports.sh [--base <ref>] [--quick] [--all]` writes the review reports for a change into `.review/out/`: the diff, the checks above, and the scanners' output. Reviewers read `INDEX.txt` there before the code. `.review/install.sh` installs the scanners.
   - `scripts/parity-check.sh` checks PARITY.md's feature table: known statuses and stages, README.md anchors and sample directories that exist for supported rows, a bead ID or `unfiled` for partial and missing rows, and the `GA, deferred` stage (a GA feature the owner deferred past the first release) only on a partial or missing row with a bead ID. README.md anchors come from `scripts/github-anchors.awk`, which reads only plain top-level `#` headings and fails the check on any README.md construct that could create or hide a heading in a way it doesn't model (keep README.md's headings, fences, and comments plain and at column 0). It prints the GA features still partial or missing that the first release needs, and the deferred ones under their own heading. `zig build readme-check` runs it and its tests (`scripts/parity-check-test.sh`), and CI's check job runs `zig build readme-check`; run it locally after changing PARITY.md or README.md's headings (or run `sh scripts/parity-check-test.sh` and `sh scripts/parity-check.sh` directly).
   - `scripts/changelog-check.sh [<base>]` checks the changelog fragments, and the commits since `<base>` for a fragment or trailer; `scripts/changelog-test.sh` tests the changelog scripts.
+  - See [Correctness commands](#correctness-commands) for the checks and reports available in a checkout.
 - For focused tests, use `-Dtest-filter` (repeatable): `zig build test -Dtest-filter="fibers interleave"`.
-- Use `std.testing.allocator` in tests so leaks fail them. Avoid fixed sleeps in tests: wait on the condition itself.
+- Use `std.testing.allocator` in tests so leaks fail them. Run `zig build test-allocators` to check for other allocators. Avoid fixed sleeps in tests: wait on the condition itself.
 - Keep comments sparse. Comments explain non-obvious reasons, invariants, and ownership, not what the code already says.
 - Error messages must be actionable: include the operation, option, input, or state that helps the caller diagnose the problem.
 - Don't add abstractions for one-off helpers. Follow the style of the file you are changing.
@@ -45,6 +46,45 @@ A clean build of the Rust core takes a minute or two; later builds reuse `.zig-c
 
 Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md), and releases follow [docs/releasing.md](docs/releasing.md).
 
+## Correctness commands
+
+`addCheckSteps` in build.zig adds these commands in a checkout. Programs, fixtures, and allow-lists live under `tools/checks/`. Exit code 0 means the tool ran successfully, 1 means a check found a problem or the tool could not run, and 2 means the arguments were invalid. Run times are measurements, not limits.
+
+### `zig build api`
+
+Lists the public names reachable from `@import("temporal")` in byte order, with aliases under each path. The command takes no arguments. It lists names only, so signature changes do not show up. It includes the members of public error sets and omits the errors a function can return. It lists `temporal.proto` without expanding it. The list is for the machine running the build, regardless of `-Dtarget`. A public declaration that evaluates to `@compileError` prevents the lister from compiling.
+
+- When to run: When reviewing a change to public declarations or re-exports.
+- Run time: about 0.2 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 2.0 s).
+
+### `zig build api-diff`
+
+Compares the public names from `-Dbase=<ref>` with the working tree, including uncommitted changes. Pass `-Dhead=<ref>` to compare with a second commit. It prints `+ name` for additions and `- name` for removals, sorted by name, and exits successfully even when the lists differ. It requires a local Git repository. The same limits as `zig build api` apply, including names only and reflection for the host regardless of `-Dtarget`. Committed sources are compiled with the checkout's dependencies and core header, so a ref across an sdk-core bump may fail to compile.
+
+- When to run: When reviewing which public names a branch adds or removes.
+- Run time: about 0.3 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 6.7 s).
+
+### `zig build dupes`
+
+Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, and `samples` as `file:start-end` line ranges, longest first. It compares both token kind and exact text, including identifiers and literals, and ignores comments and whitespace between tokens. It leaves out `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, and `tools/checks/fixtures/`. Directory walks also skip hidden directories, `zig-out`, and `zig-pkg`. The default minimum is 100 tokens. Set it with `-Ddupes-min-tokens=<n>`, or pass relative file and directory paths after `--` to limit the scan. Finding duplicates does not fail the command.
+
+- When to run: When reviewing new code for copies of existing code.
+- Run time: about 0.7 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.0 s).
+
+### `zig build lint`
+
+Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, and `samples`, excluding generated code and check fixtures. The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init` so zlinter can evaluate the default build configuration. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.
+
+- When to run: When changing hand-written Zig code or the lint rules.
+- Run time: about 2.5 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 31 s with packages already fetched).
+
+### `zig build test-allocators`
+
+Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, and `samples` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check.
+
+- When to run: When adding or changing tests or reviewing an allow-list entry.
+- Run time: about 0.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 8.6 s).
+
 ## README.md is the API documentation
 
 - README.md documents the public API area by area. A commit that changes the shape of the public API (a public function, type, option, error, or default in `src/`'s public namespaces) or adds a capability updates the matching README.md section in the same commit.
@@ -70,8 +110,8 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - Workflow code must stay deterministic. Anything reachable from workflow execution must not use threads, wall-clock time, randomness, unordered hash map iteration, or I/O outside the workflow `std.Io`.
 - For workflow runtime, command, patch, update, local activity, or Nexus workflow changes, add replay coverage with the workflow replayer to protect existing histories.
 - Behavior that crosses the core boundary follows sdk-core's rules (activation job ordering, patch semantics, local activity backoff). When in doubt, compare against the official SDKs that drive the same core, which PARITY.md names.
-- Prefer idiomatic Zig over literal ports: explicit allocators and `std.Io`, struct-literal options, comptime-typed definitions, error sets with failure details read from the future or handle.
-- Document ownership, lifetime, and thread-safety at every interface boundary. Every `TemporalCoreByteArray` the core returns must be freed with `temporal_core_byte_array_free`. Core callbacks run on the core's threads, not the caller's.
+- Prefer idiomatic Zig over literal ports: explicit allocators and `std.Io`, struct-literal options, comptime-typed definitions, error sets with failure details read from the future or handle. See [allocator passing](docs/standards.md#allocator-passing).
+- Document ownership, lifetime, and thread-safety at every interface boundary. Every `TemporalCoreByteArray` the core returns must be freed with `temporal_core_byte_array_free`. Core callbacks run on the core's threads, not the caller's. See the [ownership standards](docs/standards.md#ownership).
 - When the C header changes, the ABI snapshot test fails. Update every wrapper that builds or reads a changed struct before refreshing the snapshot.
 - Zig panics can't be caught. SDK code returns errors instead of panicking on bad input from users, the server, or the core.
 - Workflow fibers support aarch64 and System V x86_64 only. Windows x64 is a compile error until its register set is implemented.
@@ -95,6 +135,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `deps/sdk-core/` is the pinned sdk-core submodule. `deps/Cargo.toml` and `deps/Cargo.lock` build its C bridge.
 - `samples/` holds the samples, and `tools/samples_runner.zig` validates them. PARITY.md lists them, explains how parity is measured, and has the feature table; `scripts/parity-check.sh` checks the table.
 - `examples/readme/` holds the compiled examples that README.md's code blocks copy, and `tools/readme_examples.zig` checks or rewrites the copies.
+- `tools/checks/` holds the correctness commands and their fixtures.
 - `scripts/` holds maintenance scripts, each with usage in its header.
 - `.review/` holds the review tooling: `reports.sh` runs the checks and the scanners (gitleaks, osv-scanner, cargo-deny, shellcheck, actionlint, typos, zlint) on a change, `install.sh` installs them, and the `.toml` files are their settings. It isn't part of the SDK and isn't in the release tarball.
 - `docs/` holds maintainer documentation.

@@ -109,6 +109,7 @@ pub fn build(b: *std.Build) void {
 
     if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance);
     if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters);
+    if (pathExists(b, "tools/checks")) addCheckSteps(b, .{ .target = target, .optimize = optimize, .temporal = temporal, .protobuf = protobuf_dep.module("protobuf"), .core_c = core_c, .build_options = build_options, .core = core, .test_step = test_step, .test_filters = test_filters });
     if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, .{
         .core_lib = core_lib_opt,
         .core_bundle = core_bundle_opt,
@@ -183,6 +184,258 @@ fn addReadmeSteps(
             }
         }
     }
+}
+
+const CheckInputs = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    /// The module users import, with the core linked.
+    temporal: *std.Build.Module,
+    /// The protobuf module built for target.
+    protobuf: *std.Build.Module,
+    /// The core header translated for target.
+    core_c: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
+    core: Core,
+    test_step: *std.Build.Step,
+    test_filters: []const []const u8,
+};
+
+/// Correctness commands (see AGENTS.md). A fetched package has no tools/checks.
+fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
+    // zig build api
+    const api_lister, const api_options = api: {
+        const source = "tools/checks/api_list.zig";
+        const lister = checkTool(b, "api-list", source);
+        lister.root_module.addImport("api_root", checkSdkModule(b, in, b.path("src/temporal.zig")));
+        const options = b.addOptions();
+        options.addOption([]const u8, "root_name", "temporal");
+        options.addOption([]const []const u8, "skip", &.{"proto"});
+        lister.root_module.addOptions("api_options", options);
+        const run = b.addRunArtifact(lister);
+        run.addPassthruArgs();
+        b.step("api", "List the public names reachable from the package root").dependOn(&run.step);
+
+        const fixture = checkTool(b, "api-list-fixture", source);
+        fixture.root_module.addImport("api_root", b.createModule(.{
+            .root_source_file = b.path("tools/checks/fixtures/api/root.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }));
+        const fixture_options = b.addOptions();
+        fixture_options.addOption([]const u8, "root_name", "fixture");
+        fixture_options.addOption([]const []const u8, "skip", &.{"generated"});
+        fixture.root_module.addOptions("api_options", fixture_options);
+
+        const list = addCheckCase(b, in.test_step, fixture, "api list", 0);
+        list.addCheck(.{ .expect_stdout_snapshot = b.path("tools/checks/fixtures/api/list.expected.txt") });
+        const bad_arg = addCheckCase(b, in.test_step, fixture, "api unexpected argument", 2);
+        bad_arg.addArg("unexpected");
+        bad_arg.expectStdErrMatch("api: takes no arguments");
+        bad_arg.expectStdOutEqual("");
+
+        // The "check api large root" case exercises four paths to a wide namespace,
+        // producing a list about three times the size of the SDK's.
+        const large = checkTool(b, "api-list-large-fixture", source);
+        large.root_module.addImport("api_root", b.createModule(.{
+            .root_source_file = b.path("tools/checks/fixtures/api/large.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }));
+        const large_options = b.addOptions();
+        large_options.addOption([]const u8, "root_name", "large");
+        large_options.addOption([]const []const u8, "skip", &.{});
+        large.root_module.addOptions("api_options", large_options);
+        const large_list = addCheckCase(b, in.test_step, large, "api large root", 0);
+        large_list.expectStdOutMatch("large.c.S99.f29\n");
+
+        break :api .{ lister, options };
+    };
+
+    // zig build api-diff
+    {
+        const base = b.option([]const u8, "base", "api-diff: the commit to compare from (required)");
+        const head = b.option([]const u8, "head", "api-diff: the commit to compare to (default: the working tree)");
+        const step = b.step("api-diff", "List the public names added and removed between -Dbase and -Dhead");
+        const tool = checkTool(b, "api-diff", "tools/checks/api_diff.zig");
+
+        if (base) |base_ref| {
+            const compare = b.addRunArtifact(tool);
+            compare.addArg("compare");
+            for ([_][]const u8{ "base", "head" }, [_]?[]const u8{ base_ref, head }) |option, maybe_ref| {
+                const lister = if (maybe_ref) |ref| lister: {
+                    const export_tree = b.addRunArtifact(tool);
+                    export_tree.setName(b.fmt("export -D{s}={s}", .{ option, ref }));
+                    export_tree.has_side_effects = true;
+                    export_tree.addArg("export");
+                    export_tree.addDirectoryArg(b.path("."));
+                    export_tree.addArgs(&.{ option, ref });
+                    const tree = export_tree.addOutputDirectoryArg2("tree", .{});
+
+                    const lister = checkTool(b, b.fmt("api-list-{s}", .{option}), "tools/checks/api_list.zig");
+                    lister.step.name = b.fmt("compile the public names of -D{s}={s}", .{ option, ref });
+                    lister.root_module.addImport("api_root", checkSdkModule(b, in, tree.path(b, "src/temporal.zig")));
+                    lister.root_module.addOptions("api_options", api_options);
+                    break :lister lister;
+                } else api_lister;
+                const list = b.addRunArtifact(lister);
+                compare.addFileArg(list.captureStdOut(.{}));
+            }
+            step.dependOn(&compare.step);
+        } else {
+            step.dependOn(&b.addFail("api-diff: pass -Dbase=<ref>, the commit to compare from (-Dhead=<ref> is optional; the default is the working tree)").step);
+        }
+
+        const compare = addCheckCase(b, in.test_step, tool, "api-diff compare", 0);
+        compare.addArg("compare");
+        compare.addFileArg(b.path("tools/checks/fixtures/api_diff/base.txt"));
+        compare.addFileArg(b.path("tools/checks/fixtures/api_diff/head.txt"));
+        compare.addCheck(.{ .expect_stdout_snapshot = b.path("tools/checks/fixtures/api_diff/compare.expected.txt") });
+
+        const unknown_ref = addCheckCase(b, in.test_step, tool, "api-diff unknown ref", 1);
+        unknown_ref.addArg("export");
+        unknown_ref.addDirectoryArg(b.path("."));
+        unknown_ref.addArgs(&.{ "base", "refs/heads/api-diff-test-no-such-ref" });
+        _ = unknown_ref.addOutputDirectoryArg2("tree", .{});
+        unknown_ref.expectStdErrMatch("-Dbase=refs/heads/api-diff-test-no-such-ref");
+    }
+
+    // zig build dupes
+    {
+        const min_tokens = b.option(u32, "dupes-min-tokens", "dupes: smallest duplicated run in tokens (default: 100)") orelse 100;
+        const tool = checkTool(b, "dupes", "tools/checks/dupes.zig");
+        const run = b.addRunArtifact(tool);
+        run.addDirectoryArg(b.path("."));
+        run.addArgs(&.{ "--min-tokens", b.fmt("{d}", .{min_tokens}) });
+        run.addPassthruArgs();
+        run.has_side_effects = true;
+        b.step("dupes", "Report duplicated code in hand-written Zig").dependOn(&run.step);
+        const tests = b.addTest(.{ .name = "dupes-tool", .root_module = tool.root_module, .filters = in.test_filters });
+        in.test_step.dependOn(&b.addRunArtifact(tests).step);
+
+        const fixtures = b.path("tools/checks/fixtures/dupes");
+        const report = addCheckCase(b, in.test_step, tool, "dupes report", 0);
+        report.addDirectoryArg(fixtures);
+        report.addArgs(&.{ "--min-tokens", "14", "c.zig", "b.zig", "a.zig" });
+        report.addCheck(.{ .expect_stdout_snapshot = fixtures.path(b, "report.expected.txt") });
+        report.expectStdErrEqual("");
+
+        const missing = addCheckCase(b, in.test_step, tool, "dupes missing path", 1);
+        missing.addDirectoryArg(fixtures);
+        missing.addArg("dupes-test-no-such-path");
+        missing.expectStdErrMatch("dupes: cannot read dupes-test-no-such-path: FileNotFound");
+        missing.expectStdOutEqual("");
+
+        const invalid = addCheckCase(b, in.test_step, tool, "dupes invalid minimum", 2);
+        invalid.addDirectoryArg(fixtures);
+        invalid.addArgs(&.{ "--min-tokens", "0" });
+        invalid.expectStdErrMatch("dupes: --min-tokens must be a positive integer");
+        invalid.expectStdOutEqual("");
+    }
+
+    // zig build lint
+    if (b.isRoot()) if (b.lazyImport(@This(), "zlinter")) |zlinter| {
+        var linter = zlinter.builder(b, .{});
+        linter.addRule(.{ .builtin = .file_naming }, .{});
+        linter.addRule(.{ .builtin = .no_comment_out_code }, .{ .severity = .@"error" });
+        linter.addRule(.{ .builtin = .no_hidden_allocations }, .{ .severity = .@"error" });
+        linter.addRule(.{ .builtin = .no_literal_only_bool_expression }, .{});
+        linter.addRule(.{ .builtin = .no_todo }, .{ .severity = .@"error" });
+        linter.addRule(.{ .builtin = .switch_case_ordering }, .{ .else_is_last = .@"error" });
+        linter.addPaths(.{
+            .include_dirs = &.{ b.path("src"), b.path("tools"), b.path("examples"), b.path("samples") },
+            .exclude_dirs = &.{ b.path("src/proto"), b.path("tools/checks/fixtures") },
+            .exclude_files = &.{ b.path("src/proto.zig"), b.path("samples/dispatch.zig") },
+        });
+        const scan = linter.build().cast(std.Build.Step.Run).?;
+        // zlinter resolves the build configuration relative to its working directory.
+        scan.setCwd(b.path("."));
+        const lint = b.step("lint", "Lint hand-written Zig with zlinter");
+        lint.dependOn(&scan.step);
+
+        const fixture = b.addRunArtifact(scan.producer.?);
+        fixture.setCwd(b.path("."));
+        fixture.setName("check zlinter rejects a literal-only condition");
+        fixture.addArg("--zig_exe");
+        fixture.addFileArg(.zig_exe);
+        fixture.addArg("--zig_lib_directory");
+        fixture.addDirectoryArg(.zig_lib);
+        fixture.addArg("--include");
+        fixture.addFileArg(b.path("tools/checks/fixtures/lint/bad.zig"));
+        fixture.expectExitCode(2);
+        fixture.expectStdOutMatch("no_literal_only_bool_expression");
+        lint.dependOn(&fixture.step);
+    };
+
+    // zig build test-allocators
+    {
+        const tool = checkTool(b, "test-allocators", "tools/checks/test_allocators.zig");
+        const run = b.addRunArtifact(tool);
+        run.addDirectoryArg(b.path("."));
+        run.addArg("tools/checks/test_allocators.zon");
+        run.has_side_effects = true;
+        b.step("test-allocators", "Check that tests allocate through std.testing.allocator").dependOn(&run.step);
+
+        const fixtures = b.path("tools/checks/fixtures/test_allocators");
+        const page = addCheckCase(b, in.test_step, tool, "test-allocators page allocator", 1);
+        page.addDirectoryArg(fixtures);
+        page.addArgs(&.{ "empty.zon", "./page.zig", "page.zig" });
+        page.addCheck(.{ .expect_stdout_snapshot = fixtures.path(b, "page.expected.txt") });
+        page.expectStdErrEqual("");
+
+        const stale = addCheckCase(b, in.test_step, tool, "test-allocators stale entry", 1);
+        stale.addDirectoryArg(fixtures);
+        stale.addArgs(&.{ "stale.zon", "page.zig" });
+        stale.addCheck(.{ .expect_stdout_snapshot = fixtures.path(b, "stale.expected.txt") });
+        stale.expectStdErrEqual("");
+
+        const clean = addCheckCase(b, in.test_step, tool, "test-allocators clean file", 0);
+        clean.addDirectoryArg(fixtures);
+        clean.addArgs(&.{ "empty.zon", "clean.zig" });
+        clean.expectStdOutEqual("");
+        clean.expectStdErrEqual("");
+    }
+}
+
+/// Builds a check tool for the machine running the build.
+fn checkTool(b: *std.Build, name: []const u8, source: []const u8) *std.Build.Step.Compile {
+    return b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
+        .root_source_file = b.path(source),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+}
+
+/// Adds a tool run to test. Tools can read files by path, so their runs are never cached.
+fn addCheckCase(b: *std.Build, test_step: *std.Build.Step, tool: *std.Build.Step.Compile, name: []const u8, exit_code: u8) *std.Build.Step.Run {
+    const run = b.addRunArtifact(tool);
+    run.setName(b.fmt("check {s}", .{name}));
+    run.has_side_effects = true;
+    run.expectExitCode(exit_code);
+    test_step.dependOn(&run.step);
+    return run;
+}
+
+/// Gives the lister an SDK module and imports for the host. Reflection needs no core library.
+fn checkSdkModule(b: *std.Build, in: CheckInputs, root: std.Build.LazyPath) *std.Build.Module {
+    const host_protobuf = b.dependency("protobuf", .{ .target = b.graph.host, .optimize = .Debug }).module("protobuf");
+    const host_core_c = b.addTranslateC(.{
+        .root_source_file = in.core.header,
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }).createModule();
+    const module = b.createModule(.{
+        .root_source_file = root,
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "protobuf", .module = host_protobuf },
+            .{ .name = "core_c", .module = host_core_c },
+        },
+    });
+    module.addOptions("build_options", in.build_options);
+    return module;
 }
 
 fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8, have_conformance: bool) void {

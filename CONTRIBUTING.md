@@ -41,6 +41,8 @@ Small bug fixes, documentation fixes, and narrowly scoped maintenance changes ca
 
 ## Development
 
+For ownership, error sets, allocator passing, and test layout, see the [coding standards](docs/standards.md).
+
 README.md's [Development](README.md#development) section lists the prerequisites (Zig 0.17.1, rustup, and the sdk-core submodule) and how to build and test. Before opening a pull request, run the checks AGENTS.md asks for:
 
 ```bash
