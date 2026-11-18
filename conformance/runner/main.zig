@@ -186,10 +186,15 @@ fn readCheckInput(arena: Allocator, io: Io, path: []const u8) [:0]const u8 {
 fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u8, registry: []const features.Entry) !void {
     const cwd = Io.Dir.cwd();
     var patterns: std.ArrayList([]const u8) = .empty;
-    const parsed = parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{.@"stdout-to"});
+    var parsed = parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{.@"stdout-to"});
+    // An invalid --stdout-to value fails like any other invalid option: only
+    // after the previous report is cleared below, and without redirecting.
     if (parsed) |options| {
-        if (options.get(.@"stdout-to")) |destination| {
-            if (!std.mem.eql(u8, destination, "stderr")) return error.InvalidArguments;
+        if (options.get(.@"stdout-to")) |destination| redirect: {
+            if (!std.mem.eql(u8, destination, "stderr")) {
+                parsed = error.InvalidArguments;
+                break :redirect;
+            }
             const fd = std.c.dup2(2, 1);
             if (fd < 0) {
                 std.log.err("cannot redirect conformance stdout to stderr: {t}", .{std.posix.errno(fd)});
@@ -861,6 +866,23 @@ test "conformance parent removes a stale report before validating options" {
     const path = try std.fmt.allocPrintSentinel(arena.allocator(), "{s}/report.json", .{dir}, 0);
     try std.testing.expectError(error.InvalidArguments, runParent(gpa, arena.allocator(), io, &.{ "--bad-option", "value", "--report", path }, &.{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "report.json", .{}));
+}
+
+test "conformance parent removes a stale report before rejecting a --stdout-to value other than stderr" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena.allocator());
+    const path = try std.fmt.allocPrintSentinel(arena.allocator(), "{s}/report.json", .{dir}, 0);
+    for ([_][:0]const u8{ "stdout", "STDERR", "stderr2" }) |destination| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "report.json", .data = "stale" });
+        const args: []const [:0]const u8 = &.{ "--suite", dir, "--suite-commit", "test", "--not-applicable", path, "--report", path, "--work-dir", dir, "--stdout-to", destination };
+        try std.testing.expectError(error.InvalidArguments, runParent(gpa, arena.allocator(), io, args, &.{}));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "report.json", .{}));
+    }
 }
 
 test "conformance requires the suite dynamic config even with no features to run" {

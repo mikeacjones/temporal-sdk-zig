@@ -112,6 +112,7 @@ fn find(arena: Allocator, result: report.Report, entries: []const parity_map.Ent
     return .{ .findings = .{ .lines = lines.items, .counts = counts } };
 }
 
+/// Writes the finding lines (failing, uncovered, unknown-row) and the counts line.
 pub fn write(findings: Findings, out: *std.Io.Writer) std.Io.Writer.Error!void {
     for (findings.lines) |line| switch (line) {
         .failing => |item| try out.print("failing\t{s}\t{s}\t{t}\n", .{ item.row, item.feature, item.status }),
@@ -122,6 +123,7 @@ pub fn write(findings: Findings, out: *std.Io.Writer) std.Io.Writer.Error!void {
     try out.print("counts\tfailing={d}\tuncovered={d}\tunknown-row={d}\n", .{ counts.failing, counts.uncovered, counts.unknown_row });
 }
 
+/// 0 when there are findings with no failing and no unknown-row line; 1 otherwise, including refused.
 pub fn exitCode(verdict: Verdict) u8 {
     return switch (verdict) {
         .refused => 1,
