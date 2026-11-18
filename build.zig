@@ -109,15 +109,12 @@ pub fn build(b: *std.Build) void {
 
     if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance);
     if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters);
-<<<<<<< HEAD
     if (pathExists(b, "tools/checks")) addCheckSteps(b, .{ .target = target, .optimize = optimize, .temporal = temporal, .protobuf = protobuf_dep.module("protobuf"), .core_c = core_c, .build_options = build_options, .core = core, .test_step = test_step, .test_filters = test_filters });
-=======
     if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, .{
         .core_lib = core_lib_opt,
         .core_bundle = core_bundle_opt,
         .protoc = protoc_opt,
     });
->>>>>>> 7d58fb081c95976724fa118ffc7e778530a47657
 }
 
 /// The files under examples/readme whose regions README.md copies, in a fixed order.
@@ -189,7 +186,6 @@ fn addReadmeSteps(
     }
 }
 
-<<<<<<< HEAD
 const CheckInputs = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -442,10 +438,7 @@ fn checkSdkModule(b: *std.Build, in: CheckInputs, root: std.Build.LazyPath) *std
     return module;
 }
 
-fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8) void {
-=======
 fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8, have_conformance: bool) void {
->>>>>>> 7d58fb081c95976724fa118ffc7e778530a47657
     // zig build fmt
     const fmt_paths = [_]std.Build.LazyPath{
         b.path("build.zig"),
