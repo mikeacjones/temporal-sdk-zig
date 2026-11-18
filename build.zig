@@ -326,6 +326,11 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         missing.expectStdErrMatch("dupes: cannot read dupes-test-no-such-path: FileNotFound");
         missing.expectStdOutEqual("");
 
+        const absent = addCheckCase(b, in.test_step, tool, "dupes default roots absent", 0);
+        absent.addDirectoryArg(fixtures);
+        absent.expectStdOutEqual("0 groups of 100 or more tokens in 0 files\n");
+        absent.expectStdErrEqual("");
+
         const invalid = addCheckCase(b, in.test_step, tool, "dupes invalid minimum", 2);
         invalid.addDirectoryArg(fixtures);
         invalid.addArgs(&.{ "--min-tokens", "0" });
@@ -342,8 +347,15 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         linter.addRule(.{ .builtin = .no_literal_only_bool_expression }, .{});
         linter.addRule(.{ .builtin = .no_todo }, .{ .severity = .@"error" });
         linter.addRule(.{ .builtin = .switch_case_ordering }, .{ .else_is_last = .@"error" });
+        const include_dirs = [_]std.Build.LazyPath{
+            b.path("src"),
+            b.path("tools"),
+            b.path("examples"),
+            b.path("samples"),
+            b.path("conformance"),
+        };
         linter.addPaths(.{
-            .include_dirs = &.{ b.path("src"), b.path("tools"), b.path("examples"), b.path("samples") },
+            .include_dirs = if (pathExists(b, "conformance")) &include_dirs else include_dirs[0 .. include_dirs.len - 1],
             .exclude_dirs = &.{ b.path("src/proto"), b.path("tools/checks/fixtures") },
             .exclude_files = &.{ b.path("src/proto.zig"), b.path("samples/dispatch.zig") },
         });

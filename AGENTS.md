@@ -66,24 +66,24 @@ Compares the public names from `-Dbase=<ref>` with the working tree, including u
 
 ### `zig build dupes`
 
-Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, and `samples` as `file:start-end` line ranges, longest first. It compares both token kind and exact text, including identifiers and literals, and ignores comments and whitespace between tokens. It leaves out `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, and `tools/checks/fixtures/`. Directory walks also skip hidden directories, `zig-out`, and `zig-pkg`. The default minimum is 100 tokens. Set it with `-Ddupes-min-tokens=<n>`, or pass relative file and directory paths after `--` to limit the scan. Finding duplicates does not fail the command.
+Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` as `file:start-end` line ranges, longest first. It compares both token kind and exact text, including identifiers and literals, and ignores comments and whitespace between tokens. It leaves out `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, and `tools/checks/fixtures/`. Directory walks also skip hidden directories, `zig-out`, and `zig-pkg`. The default minimum is 100 tokens. Set it with `-Ddupes-min-tokens=<n>`, or pass relative file and directory paths after `--` to limit the scan. Finding duplicates does not fail the command.
 
 - When to run: When reviewing new code for copies of existing code.
-- Run time: about 0.7 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.0 s).
+- Run time: about 0.8 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.3 s).
 
 ### `zig build lint`
 
-Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, and `samples`, excluding generated code and check fixtures. The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init` so zlinter can evaluate the default build configuration. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.
+Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance`, excluding generated code and check fixtures. The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init`, even if you pass `-Dcore-bundle` or `-Dcore-lib`. zlinter configures the build a second time with `zig build --print-configuration-path` and omits the outer command's `-D` options. Without the submodule or a default bundle pin for the host, that configuration stops with `no prebuilt core`. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.
 
 - When to run: When changing hand-written Zig code or the lint rules.
-- Run time: about 2.5 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 31 s with packages already fetched).
+- Run time: about 2.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 24 s with packages already fetched).
 
 ### `zig build test-allocators`
 
-Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, and `samples` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check.
+Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check.
 
 - When to run: When adding or changing tests or reviewing an allow-list entry.
-- Run time: about 0.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 8.6 s).
+- Run time: about 0.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.8 s).
 
 ## README.md is the API documentation
 
