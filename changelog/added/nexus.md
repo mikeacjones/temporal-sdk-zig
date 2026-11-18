@@ -1,1 +1,0 @@
-`nexus.OperationDef` and `nexus.ServiceDef` define a Nexus service contract, `nexus.ServiceHandler` binds each operation to a synchronous handler or to a workflow-run handler that returns a `nexus.WorkflowStart`, and `Worker.registerNexusService` registers it; handlers get a `nexus.Context` and fail with `ctx.fail`, `ctx.failCanceled` or `ctx.handlerError`.

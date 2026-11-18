@@ -1,3 +1,0 @@
-`activity.Info` carries the activity's `schedule_to_close_timeout`, `start_to_close_timeout`, `heartbeat_timeout`, `retry_policy` and `priority`, and `Info.deadline()` says when the current attempt times out.
-`activity.Context.isWorkerStopping` and `waitForWorkerStop` tell an activity its worker has begun stopping, so it can finish or save progress within `worker.Options.graceful_shutdown_period`.
-`testing.ActivityEnvironment.cancel` cancels the running activity with a reason, and `stopWorker` fires the worker-stop signal; `executeActivity` now takes the environment by pointer, so declare it with `var`.
