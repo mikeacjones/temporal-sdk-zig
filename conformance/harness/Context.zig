@@ -42,16 +42,59 @@ pub fn fetchHistory(ctx: *Context, workflow_id: []const u8, run_id: []const u8) 
     return ctx.client.fetchHistory(ctx.arena, workflow_id, run_id);
 }
 
+/// Reads all recorded events with their stored payloads. The result lives in the feature
+/// arena. An empty run ID selects the latest run.
+pub fn fetchRawHistory(ctx: *Context, workflow_id: []const u8, run_id: []const u8) (temporal.client.CallServiceError || error{OutOfMemory})!temporal.history.History {
+    return readRawHistory(ctx.client, ctx.arena, ctx.namespace, workflow_id, run_id);
+}
+
+fn readRawHistory(client: anytype, arena: std.mem.Allocator, namespace: []const u8, workflow_id: []const u8, run_id: []const u8) temporal.client.CallServiceError!temporal.history.History {
+    var recorded: temporal.history.History = .{};
+    var token: []const u8 = "";
+    while (true) {
+        const page = try client.callService(.workflow, "GetWorkflowExecutionHistory", arena, .{
+            .namespace = namespace,
+            .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .next_page_token = token,
+            .history_event_filter_type = .HISTORY_EVENT_FILTER_TYPE_ALL_EVENT,
+            .skip_archival = true,
+        }, null);
+        if (page.history) |h| try recorded.events.appendSlice(arena, h.events.items);
+        token = page.next_page_token;
+        if (token.len == 0) return recorded;
+    }
+}
+
 pub fn expectEvent(ctx: *Context, recorded: temporal.history.History, event_type: history.EventType) error{FeatureFailed}!void {
-    try ctx.expect(history.contains(recorded, event_type), "history is missing event {any}", .{event_type});
+    try ctx.expect(history.contains(recorded, event_type), "history is missing event {f}", .{EventName{ .data = event_type }});
 }
 
 pub fn expectNoEvent(ctx: *Context, recorded: temporal.history.History, event_type: history.EventType) error{FeatureFailed}!void {
-    try ctx.expect(!history.contains(recorded, event_type), "history contains unexpected event {any}", .{event_type});
+    try ctx.expect(!history.contains(recorded, event_type), "history contains unexpected event {f}", .{EventName{ .data = event_type }});
 }
 
 pub fn expectEventsInOrder(ctx: *Context, recorded: temporal.history.History, event_types: []const history.EventType) error{FeatureFailed}!void {
-    try ctx.expect(history.containsInOrder(recorded, event_types), "history does not contain events in order {any}", .{event_types});
+    const EventNames = std.fmt.Alt([]const history.EventType, formatEventTypes);
+    try ctx.expect(history.containsInOrder(recorded, event_types), "history does not contain events in order {f}", .{EventNames{ .data = event_types }});
+}
+
+const EventName = std.fmt.Alt(history.EventType, formatEventType);
+
+fn formatEventType(event_type: history.EventType, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (std.enums.tagName(history.EventType, event_type)) |name| {
+        try writer.writeAll(name);
+    } else {
+        try writer.print("unknown ({d})", .{@backingInt(event_type)});
+    }
+}
+
+fn formatEventTypes(event_types: []const history.EventType, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeAll("{ ");
+    for (event_types, 0..) |event_type, i| {
+        if (i != 0) try writer.writeAll(", ");
+        try formatEventType(event_type, writer);
+    }
+    try writer.writeAll(" }");
 }
 
 test "conformance context defaults and assertions" {
@@ -105,10 +148,61 @@ test "conformance history assertions report the expected event types" {
     try std.testing.expectEqual(null, ctx.failure_message_);
 
     try std.testing.expectError(error.FeatureFailed, ctx.expectEvent(recorded, rejected));
-    try std.testing.expectEqualStrings("history is missing event ." ++ @tagName(rejected), ctx.failure_message_.?);
+    try std.testing.expectEqualStrings("history is missing event " ++ @tagName(rejected), ctx.failure_message_.?);
     try std.testing.expectError(error.FeatureFailed, ctx.expectNoEvent(recorded, accepted));
-    try std.testing.expectEqualStrings("history contains unexpected event ." ++ @tagName(accepted), ctx.failure_message_.?);
+    try std.testing.expectEqualStrings("history contains unexpected event " ++ @tagName(accepted), ctx.failure_message_.?);
     try std.testing.expectError(error.FeatureFailed, ctx.expectEventsInOrder(recorded, &.{ completed, accepted }));
-    try std.testing.expect(std.mem.indexOf(u8, ctx.failure_message_.?, @tagName(completed)) != null);
-    try std.testing.expect(std.mem.indexOf(u8, ctx.failure_message_.?, @tagName(accepted)) != null);
+    try std.testing.expectEqualStrings(
+        "history does not contain events in order { " ++ @tagName(completed) ++ ", " ++ @tagName(accepted) ++ " }",
+        ctx.failure_message_.?,
+    );
+    try std.testing.expectError(error.FeatureFailed, ctx.expectEvent(recorded, @fromBackingInt(1234)));
+    try std.testing.expectEqualStrings("history is missing event unknown (1234)", ctx.failure_message_.?);
+}
+
+test "conformance raw history preserves stored payloads across pages" {
+    const Pager = struct {
+        fn callService(
+            _: @This(),
+            comptime service: temporal.client.Service,
+            comptime method: []const u8,
+            arena: std.mem.Allocator,
+            request: temporal.client.ServiceRequest(service, method),
+            _: ?*?temporal.client.RpcFailure,
+        ) temporal.client.CallServiceError!temporal.client.ServiceResponse(service, method) {
+            const execution = request.execution orelse return error.InvalidArgument;
+            if (!std.mem.eql(u8, request.namespace, "feature-namespace") or
+                !std.mem.eql(u8, execution.workflow_id, "workflow") or
+                !std.mem.eql(u8, execution.run_id, "run") or request.wait_new_event or
+                request.history_event_filter_type != .HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+                return error.InvalidArgument;
+
+            var page: temporal.history.History = .{};
+            if (request.next_page_token.len == 0) {
+                const payload = try temporal.converter.payloadWithEncoding(arena, "my-encoding", "opaque bytes");
+                var input: temporal.converter.Payloads = .{};
+                try input.payloads.append(arena, payload);
+                try page.events.append(arena, .{
+                    .event_id = 1,
+                    .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+                    .attributes = .{ .workflow_execution_started_event_attributes = .{ .input = input } },
+                });
+                return .{ .history = page, .next_page_token = "empty" };
+            }
+            if (std.mem.eql(u8, request.next_page_token, "empty")) return .{ .next_page_token = "last" };
+            if (!std.mem.eql(u8, request.next_page_token, "last")) return error.InvalidArgument;
+            try page.events.append(arena, .{ .event_id = 2, .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED });
+            return .{ .history = page };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const recorded = try readRawHistory(Pager{}, arena.allocator(), "feature-namespace", "workflow", "run");
+    try std.testing.expectEqual(2, recorded.events.items.len);
+    try std.testing.expectEqual(1, recorded.events.items[0].event_id);
+    try std.testing.expectEqual(2, recorded.events.items[1].event_id);
+    const payloads = history.inputPayloads(recorded);
+    try std.testing.expectEqual(1, payloads.len);
+    try std.testing.expectEqualStrings("my-encoding", temporal.converter.encodingOf(payloads[0]).?);
+    try std.testing.expectEqualStrings("opaque bytes", payloads[0].data);
 }

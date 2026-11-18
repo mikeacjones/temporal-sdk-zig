@@ -27,6 +27,28 @@ pub fn containsInOrder(history: History, event_types: []const EventType) bool {
     return remaining.len == 0;
 }
 
+pub fn inputPayloads(history: History) []const temporal.converter.Payload {
+    for (history.events.items) |event| {
+        if (event.event_type != .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED) continue;
+        const attrs = event.attributes orelse return &.{};
+        if (attrs != .workflow_execution_started_event_attributes) return &.{};
+        const input = attrs.workflow_execution_started_event_attributes.input orelse return &.{};
+        return input.payloads.items;
+    }
+    return &.{};
+}
+
+pub fn resultPayloads(history: History) []const temporal.converter.Payload {
+    for (history.events.items) |event| {
+        if (event.event_type != .EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED) continue;
+        const attrs = event.attributes orelse return &.{};
+        if (attrs != .workflow_execution_completed_event_attributes) return &.{};
+        const result = attrs.workflow_execution_completed_event_attributes.result orelse return &.{};
+        return result.payloads.items;
+    }
+    return &.{};
+}
+
 test "conformance history counts present and absent event types" {
     const started: EventType = .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED;
     const signaled: EventType = .EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED;
@@ -65,4 +87,36 @@ test "conformance history matches ordered subsequences with gaps and duplicates"
     try std.testing.expect(containsInOrder(recorded, &.{}));
     try std.testing.expect(containsInOrder(.{}, &.{}));
     try std.testing.expect(!containsInOrder(.{}, &.{started}));
+}
+
+test "conformance history reads start and completion payloads unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var input: temporal.converter.Payloads = .{};
+    try input.payloads.append(a, try temporal.converter.payloadWithEncoding(a, "my-encoding", "raw input"));
+    try input.payloads.append(a, try temporal.converter.payloadWithEncoding(a, "my-encoding", "second argument"));
+    var result: temporal.converter.Payloads = .{};
+    try result.payloads.append(a, try temporal.converter.payloadWithEncoding(a, "my-encoding", "raw result"));
+    var events = [_]temporal.history.HistoryEvent{
+        .{
+            .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+            .attributes = .{ .workflow_execution_started_event_attributes = .{ .input = input } },
+        },
+        .{ .event_type = .EVENT_TYPE_WORKFLOW_TASK_COMPLETED },
+        .{
+            .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED,
+            .attributes = .{ .workflow_execution_completed_event_attributes = .{ .result = result } },
+        },
+    };
+    var recorded: History = .{ .events = .fromOwnedSlice(&events) };
+    try std.testing.expectEqualSlices(temporal.converter.Payload, input.payloads.items, inputPayloads(recorded));
+    try std.testing.expectEqualSlices(temporal.converter.Payload, result.payloads.items, resultPayloads(recorded));
+    try std.testing.expectEqual(0, inputPayloads(.{}).len);
+    try std.testing.expectEqual(0, resultPayloads(.{}).len);
+
+    recorded.events.items[0].attributes = null;
+    recorded.events.items[2].attributes.?.workflow_execution_completed_event_attributes.result = null;
+    try std.testing.expectEqual(0, inputPayloads(recorded).len);
+    try std.testing.expectEqual(0, resultPayloads(recorded).len);
 }

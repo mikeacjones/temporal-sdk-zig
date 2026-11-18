@@ -10,6 +10,8 @@ pub const Feature = struct {
     worker_options: temporal.worker.Options,
     register: *const fn (*temporal.worker.Worker) anyerror!void,
     execute: *const fn (*Context) anyerror!void,
+    /// Options may borrow slices from file-scope constants for the client and its worker.
+    configureClient: ?*const fn (*temporal.client.Options) void = null,
 };
 
 pub fn define(comptime spec: anytype) Feature {
@@ -17,9 +19,10 @@ pub fn define(comptime spec: anytype) Feature {
         if (comptime !std.mem.eql(u8, name, "execute") and
             !std.mem.eql(u8, name, "workflows") and
             !std.mem.eql(u8, name, "activities") and
-            !std.mem.eql(u8, name, "worker_options"))
+            !std.mem.eql(u8, name, "worker_options") and
+            !std.mem.eql(u8, name, "configureClient"))
         {
-            @compileError("unknown feature field ." ++ name ++ "; expected .execute, .workflows, .activities or .worker_options");
+            @compileError("unknown feature field ." ++ name ++ "; expected .execute, .workflows, .activities, .worker_options or .configureClient");
         }
     }
     if (!@hasField(@TypeOf(spec), "execute")) @compileError("a feature requires .execute");
@@ -47,6 +50,7 @@ pub fn define(comptime spec: anytype) Feature {
             }
         }.register,
         .execute = spec.execute,
+        .configureClient = if (@hasField(@TypeOf(spec), "configureClient")) spec.configureClient else null,
     };
 }
 
@@ -62,8 +66,22 @@ test "conformance define defaults to a client-only feature" {
         }
     }.execute });
     try std.testing.expect(!feature.has_worker);
+    try std.testing.expectEqual(null, feature.configureClient);
     var ctx: Context = undefined;
     try std.testing.expectError(error.Example, feature.execute(&ctx));
+}
+
+test "conformance define retains the client configuration callback" {
+    const Example = struct {
+        fn execute(_: *Context) !void {}
+        fn configure(options: *temporal.client.Options) void {
+            options.encode_failure_attributes = true;
+        }
+    };
+    const feature = define(.{ .execute = Example.execute, .configureClient = Example.configure });
+    var options: temporal.client.Options = .{};
+    feature.configureClient.?(&options);
+    try std.testing.expect(options.encode_failure_attributes);
 }
 
 test "conformance define accepts worker options written as a struct literal" {

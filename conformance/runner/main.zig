@@ -345,7 +345,11 @@ fn executeFeature(
     ns: []const u8,
     task_queue: []const u8,
 ) report.Outcome {
-    var client = temporal.client.Client.connect(gpa, io, .{ .host_port = address, .namespace = ns }) catch |err|
+    var client_options: temporal.client.Options = .{};
+    if (feature.configureClient) |configure| configure(&client_options);
+    client_options.host_port = address;
+    client_options.namespace = ns;
+    var client = temporal.client.Client.connect(gpa, io, client_options) catch |err|
         return failure(arena, "connect to {s} returned error.{t}", .{ address, err });
     defer client.close();
     var ctx: harness.Context = .{ .gpa = gpa, .io = io, .arena = arena, .client = &client, .feature = path, .namespace = ns, .task_queue = task_queue };
