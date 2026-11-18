@@ -627,6 +627,22 @@ fn addConformanceSteps(
     stored_histories.root_source_file = b.addWriteFiles().add("stored_histories.zig", stored_source.written());
     runner.addImport("stored_histories", stored_histories);
 
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .name = "conformance-replay",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("conformance/replay/replay.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "temporal", .module = temporal },
+                .{ .name = "harness", .module = harness },
+                .{ .name = "features", .module = registry },
+                .{ .name = "stored_histories", .module = stored_histories },
+            },
+        }),
+        .filters = test_filters,
+    })).step);
+
     if (!with_suite) {
         // Only the nested build requests the lazy dependency. Clear the report even if
         // fetching the suite or compiling the runner fails before the parent can clear it.
