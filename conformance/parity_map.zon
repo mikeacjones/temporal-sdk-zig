@@ -47,7 +47,7 @@
     .{ .feature = "query/unexpected_arguments", .parity = .{ .row = "Query handlers" } },
     .{ .feature = "query/unexpected_query_type_name", .parity = .{ .row = "Query handlers" } },
     .{ .feature = "query/unexpected_return_type", .parity = .{ .row = "Signal, query, and update a workflow" } },
-    .{ .feature = "reset/reset_and_delete", .parity = .{ .none = "Checks that the server can delete the new run created by resetting a workflow." } },
+    .{ .feature = "reset/reset_and_delete", .parity = .{ .row = "Reset a workflow" } },
     .{ .feature = "schedule/backfill", .parity = .{ .row = "Schedules: create, describe, update, pause, trigger, backfill, list, delete" } },
     .{ .feature = "schedule/basic", .parity = .{ .row = "Schedules: create, describe, update, pause, trigger, backfill, list, delete" } },
     .{ .feature = "schedule/cron", .parity = .{ .row = "Cron workflows" } },
