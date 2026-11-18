@@ -64,6 +64,13 @@ Compares the public names from `-Dbase=<ref>` with the working tree, including u
 - When to run: When reviewing which public names a branch adds or removes.
 - Run time: about 0.3 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 6.7 s).
 
+### `zig build lint`
+
+Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, and `samples`, excluding generated code and check fixtures. The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init` so zlinter can evaluate the default build configuration. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.
+
+- When to run: When changing hand-written Zig code or the lint rules.
+- Run time: about 2.5 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 31 s with packages already fetched).
+
 ### `zig build test-allocators`
 
 Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, and `samples` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check.

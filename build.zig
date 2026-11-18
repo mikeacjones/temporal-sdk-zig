@@ -294,6 +294,40 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         unknown_ref.expectStdErrMatch("-Dbase=refs/heads/api-diff-test-no-such-ref");
     }
 
+    // zig build lint
+    if (b.isRoot()) if (b.lazyImport(@This(), "zlinter")) |zlinter| {
+        var linter = zlinter.builder(b, .{});
+        linter.addRule(.{ .builtin = .file_naming }, .{});
+        linter.addRule(.{ .builtin = .no_comment_out_code }, .{ .severity = .@"error" });
+        linter.addRule(.{ .builtin = .no_hidden_allocations }, .{ .severity = .@"error" });
+        linter.addRule(.{ .builtin = .no_literal_only_bool_expression }, .{});
+        linter.addRule(.{ .builtin = .no_todo }, .{ .severity = .@"error" });
+        linter.addRule(.{ .builtin = .switch_case_ordering }, .{ .else_is_last = .@"error" });
+        linter.addPaths(.{
+            .include_dirs = &.{ b.path("src"), b.path("tools"), b.path("examples"), b.path("samples") },
+            .exclude_dirs = &.{ b.path("src/proto"), b.path("tools/checks/fixtures") },
+            .exclude_files = &.{ b.path("src/proto.zig"), b.path("samples/dispatch.zig") },
+        });
+        const scan = linter.build().cast(std.Build.Step.Run).?;
+        // zlinter resolves the build configuration relative to its working directory.
+        scan.setCwd(b.path("."));
+        const lint = b.step("lint", "Lint hand-written Zig with zlinter");
+        lint.dependOn(&scan.step);
+
+        const fixture = b.addRunArtifact(scan.producer.?);
+        fixture.setCwd(b.path("."));
+        fixture.setName("check zlinter rejects a literal-only condition");
+        fixture.addArg("--zig_exe");
+        fixture.addFileArg(.zig_exe);
+        fixture.addArg("--zig_lib_directory");
+        fixture.addDirectoryArg(.zig_lib);
+        fixture.addArg("--include");
+        fixture.addFileArg(b.path("tools/checks/fixtures/lint/bad.zig"));
+        fixture.expectExitCode(2);
+        fixture.expectStdOutMatch("no_literal_only_bool_expression");
+        lint.dependOn(&fixture.step);
+    };
+
     // zig build test-allocators
     {
         const tool = checkTool(b, "test-allocators", "tools/checks/test_allocators.zig");
