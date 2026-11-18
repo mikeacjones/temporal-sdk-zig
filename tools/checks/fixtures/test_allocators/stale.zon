@@ -1,0 +1,27 @@
+.{
+    .{
+        .file = "page.zig",
+        .test_name = "page-backed arena",
+        .reason = "Exercise a live allow-list entry.",
+    },
+    .{
+        .file = "page.zig",
+        .test_name = "nested \"page\" test",
+        .reason = "Exercise a live entry with a quoted test name.",
+    },
+    .{
+        .file = "page.zig",
+        .test_name = "named",
+        .reason = "Exercise a live entry for a declaration test.",
+    },
+    .{
+        .file = "page.zig",
+        .test_name = "",
+        .reason = "Exercise a live entry for an unnamed test.",
+    },
+    .{
+        .file = "page.zig",
+        .test_name = "removed test",
+        .reason = "This deliberately stale entry must be reported.",
+    },
+}

@@ -1,0 +1,12 @@
+.{
+    .{
+        .file = "src/client.zig",
+        .test_name = "core log fields split into keys, with strings unquoted and other values as JSON",
+        .reason = "Uses a fixed scratch buffer to parse log fields and an eight-byte buffer to force the raw-fields fallback when space runs out.",
+    },
+    .{
+        .file = "src/workflow/Instance.zig",
+        .test_name = "query: ctx.fail in a query handler leaves the run no failure in the query's freed memory",
+        .reason = "Zeros the query's backing buffer after activation to simulate released query memory and check that the later workflow failure is intact.",
+    },
+}

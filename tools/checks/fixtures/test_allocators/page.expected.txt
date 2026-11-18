@@ -1,0 +1,4 @@
+page.zig:6: test "page-backed arena" uses page_allocator
+page.zig:11: test "nested \"page\" test" uses page_allocator
+page.zig:20: test "named" uses FixedBufferAllocator
+page.zig:25: test "" uses smp_allocator

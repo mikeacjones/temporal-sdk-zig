@@ -243,6 +243,35 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         const large_list = addCheckCase(b, in.test_step, large, "api large root", 0);
         large_list.expectStdOutMatch("large.c.S99.f29\n");
     }
+
+    // zig build test-allocators
+    {
+        const tool = checkTool(b, "test-allocators", "tools/checks/test_allocators.zig");
+        const run = b.addRunArtifact(tool);
+        run.addDirectoryArg(b.path("."));
+        run.addArg("tools/checks/test_allocators.zon");
+        run.has_side_effects = true;
+        b.step("test-allocators", "Check that tests allocate through std.testing.allocator").dependOn(&run.step);
+
+        const fixtures = b.path("tools/checks/fixtures/test_allocators");
+        const page = addCheckCase(b, in.test_step, tool, "test-allocators page allocator", 1);
+        page.addDirectoryArg(fixtures);
+        page.addArgs(&.{ "empty.zon", "./page.zig", "page.zig" });
+        page.addCheck(.{ .expect_stdout_snapshot = fixtures.path(b, "page.expected.txt") });
+        page.expectStdErrEqual("");
+
+        const stale = addCheckCase(b, in.test_step, tool, "test-allocators stale entry", 1);
+        stale.addDirectoryArg(fixtures);
+        stale.addArgs(&.{ "stale.zon", "page.zig" });
+        stale.addCheck(.{ .expect_stdout_snapshot = fixtures.path(b, "stale.expected.txt") });
+        stale.expectStdErrEqual("");
+
+        const clean = addCheckCase(b, in.test_step, tool, "test-allocators clean file", 0);
+        clean.addDirectoryArg(fixtures);
+        clean.addArgs(&.{ "empty.zon", "clean.zig" });
+        clean.expectStdOutEqual("");
+        clean.expectStdErrEqual("");
+    }
 }
 
 /// Builds a check tool for the machine running the build.
