@@ -55,7 +55,7 @@ The `gate` job refuses the run, naming each failed check:
 | `changelog` | `CHANGELOG.md` has a `## [<version>]` section with at least one entry |
 | `fragments` | no changelog fragments remain under `changelog/` |
 | `ci.yml`, `samples.yml` | the newest CI and Samples runs on the commit succeeded |
-| `core-pins` | `build.zig.zon` pins a core bundle at `CORE_VERSION` for every tier 1 target |
+| `core-pins` | `build.zig.zon` pins a core bundle at `CORE_VERSION` for every tier 1 target: an entry under `.dependencies` named `core-<CORE_VERSION>-<target>`, with a `.url` ending in that target's bundle and a `.hash` (`scripts/core-pins.sh`, which reads the manifest's structure, so a pin in a comment or under another key doesn't count). It can't tell whether a hash matches the published bundle; a build that fetches the pin checks that, and the smoke test does so for two targets |
 
 `scripts/release-preflight.sh <version>` runs the checks that need only the checkout (`semver`, `zon`, `changelog`, `fragments` and `core-pins`), so run it before dispatching.
 
