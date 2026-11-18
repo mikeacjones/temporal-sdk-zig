@@ -85,6 +85,12 @@ Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, and `sam
 - When to run: When adding or changing tests or reviewing an allow-list entry.
 - Run time: about 0.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 8.6 s).
 
+## Conformance
+
+### Stored histories
+
+The workflow histories of the written conformance features live in `conformance/histories/<feature path>/<temporal.version>/[<variant>/]`, one `<n>-<workflow type>.json` per closed run in start order, with a `runs.json` that gives the namespace, task queue and each run's workflow ID. `zig build conformance -Drecord-histories` records them for every passing feature, and `-Dfeature=<pattern>` limits that to the matching features. Re-record a history only on purpose, and say why in the commit message. While the version is 0.0.0 the one set is replaced in place; once a version is released its directory is frozen and each release gets a new set beside it. `zig build test` replays every stored file, of every version, against its feature's workflows (`conformance/replay/replay.zig`), and fails for a written feature that declares workflows and has no history for the current version. A replay failure on a frozen file is an SDK bug, not a reason to re-record: file it, and list the feature in `conformance/replay/exclusions.zon` with that bead ID and the reason. A written feature that fails because of an SDK gap, and so has no history to record, is listed there the same way. An entry exempts its feature from replay and from the missing-history rule, and the test prints it on every run; the commit that fixes the defect, or makes the feature pass and records its history, removes the entry.
+
 ## README.md is the API documentation
 
 - README.md documents the public API area by area. A commit that changes the shape of the public API (a public function, type, option, error, or default in `src/`'s public namespaces) or adds a capability updates the matching README.md section in the same commit.
