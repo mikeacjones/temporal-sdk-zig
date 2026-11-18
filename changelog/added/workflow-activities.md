@@ -1,1 +1,0 @@
-`workflow.Context.executeActivity` and `executeLocalActivity` schedule activities with `workflow.ActivityOptions` and `workflow.LocalActivityOptions` (timeouts, retry policy, cancellation type, summary, priority, versioning intent) and return a `workflow.ActivityFuture`; `executeActivityByName` calls an activity by its type name.

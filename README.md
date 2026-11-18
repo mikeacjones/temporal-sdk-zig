@@ -105,10 +105,10 @@ This section builds a workflow that calls one activity, a worker that runs both,
 
 ### Installation
 
-You need Zig 0.17.1. Add a release to your project's `build.zig.zon`:
+You need Zig 0.17.1. Add the latest release, `v0.1.0-alpha.1`, to your project's `build.zig.zon`:
 
 ```bash
-zig fetch --save=temporal https://github.com/mikeacjones/temporal-sdk-zig/releases/download/v<version>/temporal-sdk-zig-<version>.tar.gz
+zig fetch --save=temporal https://github.com/mikeacjones/temporal-sdk-zig/releases/download/v0.1.0-alpha.1/temporal-sdk-zig-0.1.0-alpha.1.tar.gz
 ```
 
 and import the module in `build.zig`:
@@ -119,7 +119,7 @@ const temporal = b.dependency("temporal", .{ .target = target, .optimize = optim
 exe.root_module.addImport("temporal", temporal.module("temporal"));
 ```
 
-A release needs no Rust toolchain: its build links a prebuilt core library for your target, which Zig fetches on first use. Prebuilt libraries exist for `aarch64-macos`, `x86_64-macos`, `aarch64-linux-gnu`, `x86_64-linux-gnu`, `aarch64-linux-musl`, and `x86_64-linux-musl`; for any other target, the build stops and says so. [docs/releasing.md](docs/releasing.md) has the support policy, including the glibc the gnu libraries need. No release has been published yet; the [releases page](https://github.com/mikeacjones/temporal-sdk-zig/releases) lists them once there are.
+A release needs no Rust toolchain: its build links a prebuilt core library for your target, which Zig fetches on first use. Prebuilt libraries exist for `aarch64-macos`, `x86_64-macos`, `aarch64-linux-gnu`, `x86_64-linux-gnu`, `aarch64-linux-musl`, and `x86_64-linux-musl`; for any other target, the build stops and says so. [docs/releasing.md](docs/releasing.md) has the support policy, including the glibc the gnu libraries need. `v0.1.0-alpha.1` is an alpha: until the SDK reaches parity, a minor release may break the API. Fetch the release tarball, not the repository: `zig fetch` of a git URL leaves out the sdk-core submodule, so its build can't link the core. The [releases page](https://github.com/mikeacjones/temporal-sdk-zig/releases) lists every release with its notes and the `zig fetch` command for it.
 
 To build from source instead, for another target or for unreleased changes, clone the SDK with its submodule next to your project and depend on it by path. The build then compiles the Rust core with cargo, so it needs a Rust toolchain installed through [rustup](https://rustup.rs), which installs the pinned Rust version on first use. You don't need `protoc`.
 
