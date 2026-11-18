@@ -1,0 +1,48 @@
+fixture.@"odd.name"
+fixture.Any
+fixture.Choice
+fixture.Choice.mode
+fixture.Choice.number
+fixture.Cycle
+fixture.Cycle.Child
+fixture.Cycle.Child.Parent
+fixture.Cycle.Self
+fixture.Cycle.next
+fixture.Empty
+fixture.Errors
+fixture.Errors.@"bad state"
+fixture.Errors.BadInput
+fixture.Handle
+fixture.Handle.Id
+fixture.Merged
+fixture.Merged.@"bad state"
+fixture.Merged.BadInput
+fixture.Merged.Other
+fixture.MergedAlias
+fixture.MergedAlias.@"bad state"
+fixture.MergedAlias.BadInput
+fixture.MergedAlias.Other
+fixture.Mode
+fixture.Mode.@"not ready"
+fixture.Mode.ready
+fixture.Options
+fixture.Options.@"odd field"
+fixture.Options.default
+fixture.Options.mode
+fixture.Tuple
+fixture.Tuple.@"0"
+fixture.counter
+fixture.error_value
+fixture.fallible
+fixture.generated
+fixture.generated_alias
+fixture.instance
+fixture.nested
+fixture.nested.Errors
+fixture.nested.Errors.@"bad state"
+fixture.nested.Errors.BadInput
+fixture.nested.Options
+fixture.nested.Options.@"odd field"
+fixture.nested.Options.default
+fixture.nested.Options.mode
+fixture.typeFactory

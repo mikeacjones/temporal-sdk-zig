@@ -108,6 +108,7 @@ pub fn build(b: *std.Build) void {
 
     if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters);
     if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters);
+    if (pathExists(b, "tools/checks")) addCheckSteps(b, .{ .target = target, .optimize = optimize, .temporal = temporal, .protobuf = protobuf_dep.module("protobuf"), .core_c = core_c, .build_options = build_options, .core = core, .test_step = test_step, .test_filters = test_filters });
 }
 
 /// The files under examples/readme whose regions README.md copies, in a fixed order.
@@ -177,6 +178,112 @@ fn addReadmeSteps(
             }
         }
     }
+}
+
+const CheckInputs = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    /// The module users import, with the core linked.
+    temporal: *std.Build.Module,
+    /// The protobuf module built for target.
+    protobuf: *std.Build.Module,
+    /// The core header translated for target.
+    core_c: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
+    core: Core,
+    test_step: *std.Build.Step,
+    test_filters: []const []const u8,
+};
+
+/// Correctness commands (see AGENTS.md). A fetched package has no tools/checks.
+fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
+    // zig build api
+    {
+        const source = "tools/checks/api_list.zig";
+        const lister = checkTool(b, "api-list", source);
+        lister.root_module.addImport("api_root", checkSdkModule(b, in, b.path("src/temporal.zig")));
+        const options = b.addOptions();
+        options.addOption([]const u8, "root_name", "temporal");
+        options.addOption([]const []const u8, "skip", &.{"proto"});
+        lister.root_module.addOptions("api_options", options);
+        const run = b.addRunArtifact(lister);
+        run.addPassthruArgs();
+        b.step("api", "List the public names reachable from the package root").dependOn(&run.step);
+
+        const fixture = checkTool(b, "api-list-fixture", source);
+        fixture.root_module.addImport("api_root", b.createModule(.{
+            .root_source_file = b.path("tools/checks/fixtures/api/root.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }));
+        const fixture_options = b.addOptions();
+        fixture_options.addOption([]const u8, "root_name", "fixture");
+        fixture_options.addOption([]const []const u8, "skip", &.{"generated"});
+        fixture.root_module.addOptions("api_options", fixture_options);
+
+        const list = addCheckCase(b, in.test_step, fixture, "api list", 0);
+        list.addCheck(.{ .expect_stdout_snapshot = b.path("tools/checks/fixtures/api/list.expected.txt") });
+        const bad_arg = addCheckCase(b, in.test_step, fixture, "api unexpected argument", 2);
+        bad_arg.addArg("unexpected");
+        bad_arg.expectStdErrMatch("api: takes no arguments");
+        bad_arg.expectStdOutEqual("");
+
+        // The "check api large root" case exercises four paths to a wide namespace,
+        // producing a list about three times the size of the SDK's.
+        const large = checkTool(b, "api-list-large-fixture", source);
+        large.root_module.addImport("api_root", b.createModule(.{
+            .root_source_file = b.path("tools/checks/fixtures/api/large.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }));
+        const large_options = b.addOptions();
+        large_options.addOption([]const u8, "root_name", "large");
+        large_options.addOption([]const []const u8, "skip", &.{});
+        large.root_module.addOptions("api_options", large_options);
+        const large_list = addCheckCase(b, in.test_step, large, "api large root", 0);
+        large_list.expectStdOutMatch("large.c.S99.f29\n");
+    }
+}
+
+/// Builds a check tool for the machine running the build.
+fn checkTool(b: *std.Build, name: []const u8, source: []const u8) *std.Build.Step.Compile {
+    return b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
+        .root_source_file = b.path(source),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+}
+
+/// Adds a tool run to test. Tools can read files by path, so their runs are never cached.
+fn addCheckCase(b: *std.Build, test_step: *std.Build.Step, tool: *std.Build.Step.Compile, name: []const u8, exit_code: u8) *std.Build.Step.Run {
+    const run = b.addRunArtifact(tool);
+    run.setName(b.fmt("check {s}", .{name}));
+    run.has_side_effects = true;
+    run.expectExitCode(exit_code);
+    test_step.dependOn(&run.step);
+    return run;
+}
+
+/// Gives the lister an SDK module and imports for the host. Reflection needs no core library.
+fn checkSdkModule(b: *std.Build, in: CheckInputs, root: std.Build.LazyPath) *std.Build.Module {
+    const host_protobuf = b.dependency("protobuf", .{ .target = b.graph.host, .optimize = .Debug }).module("protobuf");
+    const host_core_c = b.addTranslateC(.{
+        .root_source_file = in.core.header,
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }).createModule();
+    const module = b.createModule(.{
+        .root_source_file = root,
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "protobuf", .module = host_protobuf },
+            .{ .name = "core_c", .module = host_core_c },
+        },
+    });
+    module.addOptions("build_options", in.build_options);
+    return module;
 }
 
 fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8) void {

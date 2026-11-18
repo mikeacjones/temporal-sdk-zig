@@ -16,6 +16,7 @@ This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust 
   - `.review/reports.sh [--base <ref>] [--quick] [--all]` writes the review reports for a change into `.review/out/`: the diff, the checks above, and the scanners' output. Reviewers read `INDEX.txt` there before the code. `.review/install.sh` installs the scanners.
   - `scripts/parity-check.sh` checks PARITY.md's feature table: known statuses and stages, README.md anchors and sample directories that exist for supported rows, a bead ID or `unfiled` for partial and missing rows, and the `GA, deferred` stage (a GA feature the owner deferred past the first release) only on a partial or missing row with a bead ID. README.md anchors come from `scripts/github-anchors.awk`, which reads only plain top-level `#` headings and fails the check on any README.md construct that could create or hide a heading in a way it doesn't model (keep README.md's headings, fences, and comments plain and at column 0). It prints the GA features still partial or missing that the first release needs, and the deferred ones under their own heading. `zig build readme-check` runs it and its tests (`scripts/parity-check-test.sh`), and CI's check job runs `zig build readme-check`; run it locally after changing PARITY.md or README.md's headings (or run `sh scripts/parity-check-test.sh` and `sh scripts/parity-check.sh` directly).
   - `scripts/changelog-check.sh [<base>]` checks the changelog fragments, and the commits since `<base>` for a fragment or trailer; `scripts/changelog-test.sh` tests the changelog scripts.
+  - See [Correctness commands](#correctness-commands) for the checks and reports available in a checkout.
 - For focused tests, use `-Dtest-filter` (repeatable): `zig build test -Dtest-filter="fibers interleave"`.
 - Use `std.testing.allocator` in tests so leaks fail them. Avoid fixed sleeps in tests: wait on the condition itself.
 - Keep comments sparse. Comments explain non-obvious reasons, invariants, and ownership, not what the code already says.
@@ -44,6 +45,17 @@ scripts/changelog-check.sh origin/main
 A clean build of the Rust core takes a minute or two; later builds reuse `.zig-cache/cargo-target`. Pass `-Dcore-lib=<path>` to link a prebuilt core library instead (the header still comes from the submodule), `-Dcore-bundle=<dir>` to link an extracted core bundle from `scripts/package-core-bundle.sh` (library and header), and `-Dprotoc=<path>` to override the pinned `protoc` that cargo uses. Without the submodule and either option, build.zig links the bundle that build.zig.zon pins as `core-<CORE_VERSION>-<target>`, and fails naming the target if there is none. `.github/workflows/core-bundles.yml` builds and publishes the bundles.
 
 Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md), and releases follow [docs/releasing.md](docs/releasing.md).
+
+## Correctness commands
+
+`addCheckSteps` in build.zig adds these commands in a checkout. Programs, fixtures, and allow-lists live under `tools/checks/`. Exit code 0 means the tool ran successfully, 1 means a check found a problem or the tool could not run, and 2 means the arguments were invalid. Run times are measurements, not limits.
+
+### `zig build api`
+
+Lists the public names reachable from `@import("temporal")` in byte order, with aliases under each path. The command takes no arguments. It lists names only, so signature changes do not show up. It includes the members of public error sets and omits the errors a function can return. It lists `temporal.proto` without expanding it. The list is for the machine running the build, regardless of `-Dtarget`. A public declaration that evaluates to `@compileError` prevents the lister from compiling.
+
+- When to run: When reviewing a change to public declarations or re-exports.
+- Run time: about 0.2 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 2.0 s).
 
 ## README.md is the API documentation
 
@@ -95,6 +107,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `deps/sdk-core/` is the pinned sdk-core submodule. `deps/Cargo.toml` and `deps/Cargo.lock` build its C bridge.
 - `samples/` holds the samples, and `tools/samples_runner.zig` validates them. PARITY.md lists them, explains how parity is measured, and has the feature table; `scripts/parity-check.sh` checks the table.
 - `examples/readme/` holds the compiled examples that README.md's code blocks copy, and `tools/readme_examples.zig` checks or rewrites the copies.
+- `tools/checks/` holds the correctness commands and their fixtures.
 - `scripts/` holds maintenance scripts, each with usage in its header.
 - `.review/` holds the review tooling: `reports.sh` runs the checks and the scanners (gitleaks, osv-scanner, cargo-deny, shellcheck, actionlint, typos, zlint) on a change, `install.sh` installs them, and the `.toml` files are their settings. It isn't part of the SDK and isn't in the release tarball.
 - `docs/` holds maintainer documentation.
