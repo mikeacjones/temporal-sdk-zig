@@ -1,1 +1,0 @@
-`client.Options.encode_failure_attributes` moves the message and stack trace of each failure the client and its workers send into `encoded_attributes`, before the payload codecs run, in the format other Temporal SDKs use; received failures are always decoded back.
