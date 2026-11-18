@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Status = enum { pass, fail, unwritten, not_applicable, not_run };
 pub const Outcome = union(enum) { pass, fail: []const u8 };
+pub const VariantOutcome = struct { name: []const u8, outcome: Outcome };
 pub const Entry = struct { path: []const u8, status: Status, message: ?[]const u8 = null };
 pub const Report = struct {
     suite_commit: []const u8,
@@ -61,6 +62,37 @@ pub fn assemble(
 pub fn write(report: Report, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try std.json.Stringify.value(report, .{ .whitespace = .indent_2, .emit_null_optional_fields = false }, writer);
     try writer.writeByte('\n');
+}
+
+pub fn combineVariants(arena: Allocator, path: []const u8, variants: []const VariantOutcome) error{OutOfMemory}!Outcome {
+    var message: std.Io.Writer.Allocating = .init(arena);
+    for (variants) |variant| {
+        switch (variant.outcome) {
+            .pass => {},
+            .fail => |why| message.writer.print("{s}{s}#{s}: {s}", .{
+                if (message.written().len == 0) "" else "; ",
+                path,
+                variant.name,
+                why,
+            }) catch return error.OutOfMemory,
+        }
+    }
+    return if (message.written().len == 0) .pass else .{ .fail = message.written() };
+}
+
+test "conformance report combines failed variants in run order" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const path = "area/feature";
+    const passed: VariantOutcome = .{ .name = "passed", .outcome = .pass };
+    try std.testing.expectEqual(Outcome.pass, try combineVariants(arena, path, &.{passed}));
+    const outcome = try combineVariants(arena, path, &.{
+        .{ .name = "z", .outcome = .{ .fail = "wrong capability" } },
+        passed,
+        .{ .name = "a", .outcome = .{ .fail = "timed out" } },
+    });
+    try std.testing.expectEqualStrings("area/feature#z: wrong capability; area/feature#a: timed out", outcome.fail);
 }
 
 test "conformance report preserves inventory order and writes optional messages only where required" {

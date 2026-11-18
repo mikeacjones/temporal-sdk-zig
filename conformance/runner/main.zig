@@ -1,12 +1,14 @@
 //! conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file>
 //!                        --report <file> --work-dir <dir> [--feature <pattern>]...
 //! conformance-runner feature <area>/<name> --address <host:port> --namespace <ns>
-//!                            --task-queue <queue> --result <file>
+//!                            --task-queue <queue> --result <file> [--variant <name>]
+//!                            [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
 const std = @import("std");
 const temporal = @import("temporal");
 const harness = @import("harness");
 const features = @import("features");
 const dynamic_config = @import("dynamic_config.zig");
+const feature_config = @import("feature_config.zig");
 const inventory = @import("inventory.zig");
 const report = @import("report.zig");
 
@@ -16,7 +18,7 @@ const timeout_seconds = 240;
 const namespace = "default";
 
 const ParentOption = enum { suite, @"suite-commit", @"not-applicable", report, @"work-dir" };
-const ChildOption = enum { address, namespace, @"task-queue", result };
+const ChildOption = enum { address, namespace, @"task-queue", result, variant, @"nexus-endpoint" };
 const ChildResult = struct {
     status: enum { pass, fail },
     message: ?[]const u8 = null,
@@ -45,6 +47,7 @@ fn usage() error{InvalidArguments} {
         \\usage:
         \\  conformance-runner run --suite <dir> --suite-commit <sha> --not-applicable <file> --report <file> --work-dir <dir> [--feature <pattern>]...
         \\  conformance-runner feature <area>/<name> --address <host:port> --namespace <ns> --task-queue <queue> --result <file>
+        \\                             [--variant <name>] [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
     , .{});
     return error.InvalidArguments;
 }
@@ -53,17 +56,16 @@ fn parseOptions(
     comptime Option: type,
     args: []const [:0]const u8,
     arena: Allocator,
-    patterns: ?*std.ArrayList([]const u8),
+    repeated: struct { flag: []const u8, values: *std.ArrayList([]const u8) },
+    optional: []const Option,
 ) !std.EnumArray(Option, ?[]const u8) {
     var values: std.EnumArray(Option, ?[]const u8) = .initFill(null);
     var i: usize = 0;
     while (i + 1 < args.len) : (i += 2) {
         const arg = args[i];
-        if (patterns) |filters| {
-            if (std.mem.eql(u8, arg, "--feature")) {
-                try filters.append(arena, args[i + 1]);
-                continue;
-            }
+        if (std.mem.eql(u8, arg, repeated.flag)) {
+            try repeated.values.append(arena, args[i + 1]);
+            continue;
         }
         if (!std.mem.startsWith(u8, arg, "--")) return error.InvalidArguments;
         const key = std.meta.stringToEnum(Option, arg[2..]) orelse return error.InvalidArguments;
@@ -71,7 +73,11 @@ fn parseOptions(
         values.set(key, args[i + 1]);
     }
     if (i != args.len) return error.InvalidArguments;
-    for (values.values) |value| if (value == null) return error.InvalidArguments;
+    var keys = values.iterator();
+    while (keys.next()) |entry| {
+        if (entry.value.* == null and std.mem.indexOfScalar(Option, optional, entry.key) == null)
+            return error.InvalidArguments;
+    }
     return values;
 }
 
@@ -91,7 +97,7 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
     }
 
     var patterns: std.ArrayList([]const u8) = .empty;
-    const options = try parseOptions(ParentOption, args, arena, &patterns);
+    const options = try parseOptions(ParentOption, args, arena, .{ .flag = "--feature", .values = &patterns }, &.{});
     const suite_path = options.get(.suite).?;
     const na_path = options.get(.@"not-applicable").?;
     const report_path = options.get(.report).?;
@@ -136,7 +142,6 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
         std.log.warn("cannot parse {s}/{s}: {t}", .{ suite_path, config_path, err });
         return err;
     };
-    const server_args = try dynamic_config.serverArgs(arena, entries);
 
     var output = cwd.createFileAtomic(io, report_path, .{ .make_path = true, .replace = true }) catch |err| {
         std.log.err("cannot create report {s}: {t}", .{ report_path, err });
@@ -145,9 +150,10 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
     defer output.deinit(io);
     const outcomes = try arena.alloc(?report.Outcome, written.len);
     @memset(outcomes, null);
-    for (written) |path| {
-        if (inventory.selected(patterns.items, path)) {
-            try runSelected(gpa, arena, io, work_path, written, patterns.items, outcomes, server_args);
+    const selected = try selectConfigs(arena, io, features_dir, written, patterns.items, outcomes);
+    for (selected) |config| {
+        if (config != null) {
+            try runSelected(gpa, arena, io, work_path, written, selected, outcomes, entries);
             break;
         }
     }
@@ -160,15 +166,48 @@ fn runParent(gpa: Allocator, arena: Allocator, io: Io, args: []const [:0]const u
     showReport(io, result, report_path) catch {};
 }
 
+fn selectConfigs(
+    arena: Allocator,
+    io: Io,
+    features_dir: Io.Dir,
+    written: []const []const u8,
+    patterns: []const []const u8,
+    outcomes: []?report.Outcome,
+) error{OutOfMemory}![]const ?feature_config.Config {
+    const selected = try arena.alloc(?feature_config.Config, written.len);
+    for (written, selected, outcomes) |path, *config, *outcome| {
+        config.* = null;
+        if (!inventory.selected(patterns, path)) continue;
+        switch (try readFeatureConfig(arena, io, features_dir, path)) {
+            .config => |value| config.* = value,
+            .unsupported => |message| outcome.* = .{ .fail = message },
+        }
+    }
+    return selected;
+}
+
+fn readFeatureConfig(arena: Allocator, io: Io, features_dir: Io.Dir, path: []const u8) error{OutOfMemory}!feature_config.Parsed {
+    const config_path = try std.fmt.allocPrint(arena, "{s}/config.json", .{path});
+    const source = features_dir.readFileAlloc(io, config_path, arena, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return .{ .config = .{} },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .unsupported = try std.fmt.allocPrint(arena, "cannot read {s}: {t}", .{ config_path, err }) },
+    };
+    return switch (try feature_config.parse(arena, source)) {
+        .config => |config| .{ .config = config },
+        .unsupported => |message| .{ .unsupported = try std.fmt.allocPrint(arena, "{s}: {s}", .{ config_path, message }) },
+    };
+}
+
 fn runSelected(
     gpa: Allocator,
     arena: Allocator,
     io: Io,
     work_path: []const u8,
     written: []const []const u8,
-    patterns: []const []const u8,
+    selected: []const ?feature_config.Config,
     outcomes: []?report.Outcome,
-    server_args: []const []const u8,
+    defaults: []const dynamic_config.Entry,
 ) !void {
     const exe = try std.process.executablePathAlloc(io, arena);
     // The build's cache directory can be shared by simultaneous invocations.
@@ -181,29 +220,197 @@ fn runSelected(
         return err;
     };
 
-    var server = try temporal.testing.DevServer.start(gpa, io, .{ .namespace = namespace, .port = 0, .extra_args = server_args });
-    defer server.stop(io);
-    std.log.info("conformance dev server at {s}, child logs in {s}", .{ server.address(), run_path });
-    for (written, outcomes, 0..) |path, *outcome, i| {
-        if (!inventory.selected(patterns, path)) continue;
-        const task_queue = try std.fmt.allocPrint(arena, "conformance-{s}", .{path});
-        const result_path = try std.fmt.allocPrint(arena, "{s}/{d}.result.json", .{ run_path, i });
-        const log_path = try std.fmt.allocPrint(arena, "{s}/{d}.log", .{ run_path, i });
-        std.log.info("running {s} (log {s})", .{ path, log_path });
-        outcome.* = runOne(arena, io, exe, path, server.address(), task_queue, result_path, log_path) catch |err| {
-            std.log.err("cannot run {s} (log {s}, result {s}): {t}", .{ path, log_path, result_path, err });
-            return err;
+    const last_shared = for (0..selected.len) |offset| {
+        const i = selected.len - 1 - offset;
+        const config = selected[i] orelse continue;
+        if (config.run_variants.len == 0) break i;
+    } else null;
+    var shared: ?temporal.testing.DevServer = null;
+    defer if (shared) |*server| server.stop(io);
+    if (last_shared != null) {
+        const server_args = try dynamic_config.serverArgs(arena, defaults);
+        shared = try temporal.testing.DevServer.start(gpa, io, .{ .namespace = namespace, .port = 0, .extra_args = server_args });
+        std.log.info("conformance dev server at {s}, child logs in {s}", .{ shared.?.address(), run_path });
+    }
+
+    const runner: Runner = .{ .gpa = gpa, .arena = arena, .io = io, .exe = exe, .work_dir = run_path };
+    for (written, selected, outcomes, 0..) |path, maybe_config, *outcome, i| {
+        const config = maybe_config orelse continue;
+        const needs_endpoint = config.needs_nexus_endpoint or std.mem.startsWith(u8, path, "nexus/");
+        if (config.run_variants.len == 0) {
+            outcome.* = try runner.runFeature(shared.?.address(), path, i, null, needs_endpoint, null);
+            if (last_shared == i) {
+                shared.?.stop(io);
+                shared = null;
+            }
+            continue;
+        }
+        const variants = try arena.alloc(report.VariantOutcome, config.run_variants.len);
+        for (config.run_variants, variants, 0..) |variant, *variant_outcome, j| {
+            variant_outcome.* = .{
+                .name = variant.name,
+                .outcome = try runner.runVariant(defaults, path, i, j, needs_endpoint, variant),
+            };
+        }
+        outcome.* = try report.combineVariants(arena, path, variants);
+    }
+}
+
+const Runner = struct {
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    exe: []const u8,
+    work_dir: []const u8,
+
+    fn runVariant(
+        runner: Runner,
+        defaults: []const dynamic_config.Entry,
+        path: []const u8,
+        index: usize,
+        variant_index: usize,
+        needs_endpoint: bool,
+        variant: feature_config.Variant,
+    ) !report.Outcome {
+        const merged = try dynamic_config.merge(runner.arena, defaults, variant.dynamic_config);
+        const args = try dynamic_config.serverArgs(runner.arena, merged);
+        var server = temporal.testing.DevServer.start(runner.gpa, runner.io, .{ .namespace = namespace, .port = 0, .extra_args = args }) catch |err|
+            return failure(runner.arena, "cannot start variant dev server: {t}", .{err});
+        defer server.stop(runner.io);
+        std.log.info("conformance variant {s}#{s} dev server at {s}", .{ path, variant.name, server.address() });
+        return runner.runFeature(server.address(), path, index, variant_index, needs_endpoint, variant);
+    }
+
+    fn runFeature(
+        runner: Runner,
+        address: []const u8,
+        path: []const u8,
+        index: usize,
+        variant_index: ?usize,
+        needs_endpoint: bool,
+        variant: ?feature_config.Variant,
+    ) !report.Outcome {
+        const arena = runner.arena;
+        const variant_name = if (variant) |v| v.name else null;
+        const capabilities = if (variant) |v| v.expect_namespace_capabilities else &.{};
+        const task_queue = if (variant_name) |name|
+            try std.fmt.allocPrint(arena, "conformance-{s}-{s}", .{ path, name })
+        else
+            try std.fmt.allocPrint(arena, "conformance-{s}", .{path});
+        const stem = if (variant_index) |j|
+            try std.fmt.allocPrint(arena, "{s}/{d}-{d}", .{ runner.work_dir, index, j })
+        else
+            try std.fmt.allocPrint(arena, "{s}/{d}", .{ runner.work_dir, index });
+        const log_path = try std.fmt.allocPrint(arena, "{s}.log", .{stem});
+        const label = if (variant_name) |name| try std.fmt.allocPrint(arena, "{s}#{s}", .{ path, name }) else path;
+
+        var client: ?temporal.client.Client = null;
+        defer if (client) |*c| c.close();
+        if (needs_endpoint or capabilities.len != 0) {
+            client = temporal.client.Client.connect(runner.gpa, runner.io, .{
+                .host_port = address,
+                .namespace = namespace,
+                .rpc_timeout = .fromSeconds(10),
+            }) catch |err| return failure(arena, "cannot connect to {s} for feature setup: {t}", .{ address, err });
+        }
+        var rpc_failure: ?temporal.client.RpcFailure = null;
+        if (capabilities.len != 0) {
+            const response = client.?.callService(.workflow, "DescribeNamespace", arena, .{ .namespace = namespace }, &rpc_failure) catch |err|
+                return serviceFailure(arena, "DescribeNamespace", namespace, err, rpc_failure);
+            const actual: NamespaceCapabilities = if (response.namespace_info) |info| info.capabilities orelse .{} else .{};
+            if (try checkCapabilities(arena, actual, capabilities)) |message| return .{ .fail = message };
+        }
+
+        const NexusEndpoint = temporal.proto.temporal.api.nexus.v1.Endpoint;
+        var endpoint: ?NexusEndpoint = null;
+        var endpoint_name: ?[]const u8 = null;
+        defer if (endpoint) |ep| {
+            // Cleanup must also run if waiting for the child was canceled.
+            const protection = runner.io.swapCancelProtection(.blocked);
+            defer _ = runner.io.swapCancelProtection(protection);
+            if (client.?.callService(.operator, "DeleteNexusEndpoint", arena, .{ .id = ep.id, .version = ep.version }, &rpc_failure)) |_| {
+                std.log.debug("deleted Nexus endpoint {s}", .{endpoint_name.?});
+            } else |err| {
+                const outcome = serviceFailure(arena, "DeleteNexusEndpoint", endpoint_name.?, err, rpc_failure);
+                std.log.warn("{s}", .{outcome.fail});
+            }
         };
+        if (needs_endpoint) {
+            const name = try arena.dupe(u8, task_queue);
+            std.mem.replaceScalar(u8, name, '/', '-');
+            std.mem.replaceScalar(u8, name, '_', '-');
+            const response = client.?.callService(.operator, "CreateNexusEndpoint", arena, .{ .spec = .{
+                .name = name,
+                .target = .{ .variant = .{ .worker = .{ .namespace = namespace, .task_queue = task_queue } } },
+            } }, &rpc_failure) catch |err| return serviceFailure(arena, "CreateNexusEndpoint", name, err, rpc_failure);
+            endpoint = response.endpoint orelse return failure(arena, "CreateNexusEndpoint {s} returned no endpoint", .{name});
+            endpoint_name = name;
+            std.log.debug("created Nexus endpoint {s} for task queue {s}", .{ name, task_queue });
+        }
+        const result_path = try std.fmt.allocPrint(arena, "{s}.result.json", .{stem});
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ runner.exe, "feature", path, "--address", address, "--namespace", namespace, "--task-queue", task_queue, "--result", result_path });
+        if (variant_name) |name| try argv.appendSlice(arena, &.{ "--variant", name });
+        if (endpoint_name) |name| try argv.appendSlice(arena, &.{ "--nexus-endpoint", name });
+        for (capabilities) |capability| {
+            const arg = try std.fmt.allocPrint(arena, "{s}={}", .{ capability.name, capability.value });
+            try argv.appendSlice(arena, &.{ "--capability", arg });
+        }
+        std.log.info("running {s} (log {s})", .{ label, log_path });
+        return runOne(arena, runner.io, argv.items, result_path, log_path) catch |err|
+            failure(arena, "cannot run child (log {s}, result {s}): {t}", .{ log_path, result_path, err });
+    }
+};
+
+fn serviceFailure(
+    arena: Allocator,
+    method: []const u8,
+    target: []const u8,
+    err: temporal.client.CallServiceError,
+    rpc_failure: ?temporal.client.RpcFailure,
+) report.Outcome {
+    if (rpc_failure) |detail| return failure(arena, "{s} {s} returned error.{t}: {s}", .{ method, target, err, detail.message });
+    return failure(arena, "{s} {s} returned error.{t}", .{ method, target, err });
+}
+
+const NamespaceCapabilities = temporal.proto.temporal.api.namespace.v1.NamespaceInfo.Capabilities;
+
+fn checkCapabilities(arena: Allocator, actual: NamespaceCapabilities, expected: []const harness.Context.Capability) error{OutOfMemory}!?[]const u8 {
+    capabilities: for (expected) |capability| {
+        inline for (@typeInfo(@TypeOf(NamespaceCapabilities._desc_table)).@"struct".field_names) |field| {
+            if (std.mem.eql(u8, capability.name, comptime capabilityJsonName(field))) {
+                const value = @field(actual, field);
+                if (@TypeOf(value) == bool) {
+                    if (value != capability.value) return try std.fmt.allocPrint(arena, "namespace capability \"{s}\" = {}, expected {}", .{ capability.name, value, capability.value });
+                    continue :capabilities;
+                } else return try std.fmt.allocPrint(arena, "namespace capability \"{s}\" is not boolean", .{capability.name});
+            }
+        }
+        return try std.fmt.allocPrint(arena, "unknown namespace capability \"{s}\"", .{capability.name});
+    }
+    return null;
+}
+
+fn capabilityJsonName(comptime field: []const u8) []const u8 {
+    comptime {
+        var name: []const u8 = "";
+        var upper = false;
+        for (field) |c| {
+            if (c == '_') {
+                upper = true;
+                continue;
+            }
+            name = name ++ &[_]u8{if (upper) std.ascii.toUpper(c) else c};
+            upper = false;
+        }
+        return name;
     }
 }
 
 fn runOne(
     arena: Allocator,
     io: Io,
-    exe: []const u8,
-    path: []const u8,
-    address: []const u8,
-    task_queue: []const u8,
+    argv: []const []const u8,
     result_path: []const u8,
     log_path: []const u8,
 ) !report.Outcome {
@@ -211,7 +418,7 @@ fn runOne(
     const log_file = try cwd.createFile(io, log_path, .{ .read = true });
     defer log_file.close(io);
     var child = try std.process.spawn(io, .{
-        .argv = &.{ exe, "feature", path, "--address", address, "--namespace", namespace, "--task-queue", task_queue, "--result", result_path },
+        .argv = argv,
         .stdin = .ignore,
         .stdout = .{ .file = log_file },
         .stderr = .{ .file = log_file },
@@ -309,7 +516,12 @@ fn showReport(io: Io, result: report.Report, path: []const u8) !void {
 }
 
 fn runChild(gpa: Allocator, io: Io, path: []const u8, args: []const [:0]const u8) !void {
-    const options = try parseOptions(ChildOption, args, gpa, null);
+    var state = std.heap.ArenaAllocator.init(gpa);
+    defer state.deinit();
+    const arena = state.allocator();
+    var capability_args: std.ArrayList([]const u8) = .empty;
+    const options = try parseOptions(ChildOption, args, arena, .{ .flag = "--capability", .values = &capability_args }, &.{ .variant, .@"nexus-endpoint" });
+    const capabilities = try parseCapabilities(arena, capability_args.items);
     const feature = for (features.all) |entry| {
         if (std.mem.eql(u8, path, entry.path)) break entry.feature;
     } else {
@@ -317,10 +529,19 @@ fn runChild(gpa: Allocator, io: Io, path: []const u8, args: []const [:0]const u8
         return error.UnknownFeature;
     };
 
-    var state = std.heap.ArenaAllocator.init(gpa);
-    defer state.deinit();
-    const arena = state.allocator();
-    const outcome = executeFeature(gpa, arena, io, path, feature, options.get(.address).?, options.get(.namespace).?, options.get(.@"task-queue").?);
+    var ctx: harness.Context = .{
+        .gpa = gpa,
+        .io = io,
+        .arena = arena,
+        .client = undefined,
+        .feature = path,
+        .namespace = options.get(.namespace).?,
+        .task_queue = options.get(.@"task-queue").?,
+        .variant = options.get(.variant),
+        .nexus_endpoint = options.get(.@"nexus-endpoint"),
+        .capabilities = capabilities,
+    };
+    const outcome = executeFeature(feature, &ctx, options.get(.address).?);
     const result: ChildResult = switch (outcome) {
         .pass => .{ .status = .pass },
         .fail => |message| .{
@@ -335,27 +556,38 @@ fn runChild(gpa: Allocator, io: Io, path: []const u8, args: []const [:0]const u8
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = options.get(.result).?, .data = data });
 }
 
-fn executeFeature(
-    gpa: Allocator,
-    arena: Allocator,
-    io: Io,
-    path: []const u8,
-    feature: *const harness.Feature,
-    address: []const u8,
-    ns: []const u8,
-    task_queue: []const u8,
-) report.Outcome {
+fn parseCapabilities(arena: Allocator, args: []const []const u8) ![]const harness.Context.Capability {
+    const capabilities = try arena.alloc(harness.Context.Capability, args.len);
+    for (capabilities, args, 0..) |*capability, arg, i| {
+        const separator = std.mem.indexOfScalar(u8, arg, '=') orelse return error.InvalidArguments;
+        const name = arg[0..separator];
+        if (name.len == 0) return error.InvalidArguments;
+        for (capabilities[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, name)) return error.InvalidArguments;
+        }
+        const value = arg[separator + 1 ..];
+        capability.* = .{ .name = name, .value = if (std.mem.eql(u8, value, "true"))
+            true
+        else if (std.mem.eql(u8, value, "false"))
+            false
+        else
+            return error.InvalidArguments };
+    }
+    return capabilities;
+}
+
+fn executeFeature(feature: *const harness.Feature, ctx: *harness.Context, address: []const u8) report.Outcome {
     var client_options: temporal.client.Options = .{};
     if (feature.configureClient) |configure| configure(&client_options);
     client_options.host_port = address;
-    client_options.namespace = ns;
-    var client = temporal.client.Client.connect(gpa, io, client_options) catch |err|
-        return failure(arena, "connect to {s} returned error.{t}", .{ address, err });
+    client_options.namespace = ctx.namespace;
+    var client = temporal.client.Client.connect(ctx.gpa, ctx.io, client_options) catch |err|
+        return failure(ctx.arena, "connect to {s} returned error.{t}", .{ address, err });
     defer client.close();
-    var ctx: harness.Context = .{ .gpa = gpa, .io = io, .arena = arena, .client = &client, .feature = path, .namespace = ns, .task_queue = task_queue };
+    ctx.client = &client;
 
-    if (!feature.has_worker) return execute(feature, &ctx);
-    return executeWithWorker(feature, &ctx);
+    if (!feature.has_worker) return execute(feature, ctx);
+    return executeWithWorker(feature, ctx);
 }
 
 fn executeWithWorker(feature: *const harness.Feature, ctx: *harness.Context) report.Outcome {
@@ -375,12 +607,14 @@ fn executeWithWorker(feature: *const harness.Feature, ctx: *harness.Context) rep
         };
         return failure(arena, "worker failed to start with error.{t}", .{start_err});
     };
+    ctx.worker_ = &worker;
+    ctx.running_ = &running;
     var worker_result: temporal.worker.Worker.RunError!void = {};
     const outcome = blk: {
-        defer {
-            worker.stop();
-            worker_result = running.await(io);
-        }
+        defer ctx.stopWorker() catch |err| switch (err) {
+            error.NoWorker => {},
+            else => |e| worker_result = e,
+        };
         break :blk execute(feature, ctx);
     };
     worker_result catch |err| {
@@ -413,8 +647,75 @@ fn failure(arena: Allocator, comptime fmt: []const u8, args: anytype) report.Out
 
 test {
     _ = dynamic_config;
+    _ = feature_config;
     _ = inventory;
     _ = report;
+}
+
+test "conformance plans only selected configs and reports unsupported keys without running them" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    const paths = [_][]const u8{ "test/bad", "test/endpoint", "test/missing", "test/variants" };
+    for (paths) |path| try tmp.dir.createDirPath(io, path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "test/bad/config.json", .data = "{\"extraSetting\": true}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "test/endpoint/config.json", .data = "{\"needsNexusEndpoint\": true}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "test/variants/config.json", .data = "{\"runVariants\": [{\"name\": \"one\"}]}" });
+
+    var outcomes: [paths.len]?report.Outcome = @splat(null);
+    const configs = try selectConfigs(arena, io, tmp.dir, &paths, &.{"test/bad"}, &outcomes);
+    for (configs) |config| try std.testing.expectEqual(null, config);
+    const result = try report.assemble(arena, "test", "0.0.0", .{ .features = &paths, .readme_only_directories = 0 }, &.{}, &paths, &.{"test/bad"}, &outcomes);
+    try std.testing.expectEqual(report.Status.fail, result.features[0].status);
+    try std.testing.expectEqualStrings("test/bad/config.json: unsupported key \"extraSetting\"", result.features[0].message.?);
+    for (result.features[1..]) |entry| try std.testing.expectEqual(report.Status.not_run, entry.status);
+
+    const all = try selectConfigs(arena, io, tmp.dir, &paths, &.{}, &outcomes);
+    try std.testing.expect(all[1].?.needs_nexus_endpoint);
+    try std.testing.expectEqualDeep(feature_config.Config{}, all[2].?);
+    try std.testing.expectEqualStrings("one", all[3].?.run_variants[0].name);
+}
+
+test "conformance checks namespace capabilities by their JSON names" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const actual: NamespaceCapabilities = .{ .worker_poll_complete_on_shutdown = true };
+    try std.testing.expectEqual(null, try checkCapabilities(arena, actual, &.{
+        .{ .name = "workerPollCompleteOnShutdown", .value = true },
+        .{ .name = "workerHeartbeats", .value = false },
+    }));
+    try std.testing.expectEqualStrings("namespace capability \"workerPollCompleteOnShutdown\" = false, expected true", (try checkCapabilities(arena, .{}, &.{.{ .name = "workerPollCompleteOnShutdown", .value = true }})).?);
+    try std.testing.expectEqualStrings("unknown namespace capability \"worker_heartbeats\"", (try checkCapabilities(arena, actual, &.{.{ .name = "worker_heartbeats", .value = false }})).?);
+}
+
+test "conformance child parses optional setup arguments and explicit false capabilities" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    var repeated: std.ArrayList([]const u8) = .empty;
+    const options = try parseOptions(ChildOption, &.{
+        "--address",        "localhost:1234",
+        "--namespace",      "default",
+        "--task-queue",     "conformance-a/b",
+        "--result",         "result.json",
+        "--variant",        "first",
+        "--nexus-endpoint", "conformance-a-b-first",
+        "--capability",     "workerHeartbeats=false",
+        "--capability",     "eagerWorkflowStart=true",
+    }, arena, .{ .flag = "--capability", .values = &repeated }, &.{ .variant, .@"nexus-endpoint" });
+    try std.testing.expectEqualStrings("first", options.get(.variant).?);
+    try std.testing.expectEqualStrings("conformance-a-b-first", options.get(.@"nexus-endpoint").?);
+    try std.testing.expectEqualDeep(@as([]const harness.Context.Capability, &.{
+        .{ .name = "workerHeartbeats", .value = false },
+        .{ .name = "eagerWorkflowStart", .value = true },
+    }), try parseCapabilities(arena, repeated.items));
+    try std.testing.expectError(error.InvalidArguments, parseCapabilities(arena, &.{"workerHeartbeats=0"}));
+    try std.testing.expectError(error.InvalidArguments, parseCapabilities(arena, &.{ "workerHeartbeats=true", "workerHeartbeats=false" }));
 }
 
 test "conformance parent removes a stale report before validating options" {

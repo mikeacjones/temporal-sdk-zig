@@ -19,16 +19,18 @@ pub fn define(comptime spec: anytype) Feature {
         if (comptime !std.mem.eql(u8, name, "execute") and
             !std.mem.eql(u8, name, "workflows") and
             !std.mem.eql(u8, name, "activities") and
+            !std.mem.eql(u8, name, "nexus_services") and
             !std.mem.eql(u8, name, "worker_options") and
             !std.mem.eql(u8, name, "configureClient"))
         {
-            @compileError("unknown feature field ." ++ name ++ "; expected .execute, .workflows, .activities, .worker_options or .configureClient");
+            @compileError("unknown feature field ." ++ name ++ "; expected .execute, .workflows, .activities, .nexus_services, .worker_options or .configureClient");
         }
     }
     if (!@hasField(@TypeOf(spec), "execute")) @compileError("a feature requires .execute");
 
     const workflows = if (@hasField(@TypeOf(spec), "workflows")) spec.workflows else .{};
     const activities = if (@hasField(@TypeOf(spec), "activities")) spec.activities else .{};
+    const nexus_services = if (@hasField(@TypeOf(spec), "nexus_services")) spec.nexus_services else .{};
     const worker_options = comptime blk: {
         var options: temporal.worker.Options = .{};
         if (@hasField(@TypeOf(spec), "worker_options")) {
@@ -41,12 +43,13 @@ pub fn define(comptime spec: anytype) Feature {
         break :blk options;
     };
     return .{
-        .has_worker = workflows.len != 0 or activities.len != 0,
+        .has_worker = workflows.len != 0 or activities.len != 0 or nexus_services.len != 0,
         .worker_options = worker_options,
         .register = struct {
             fn register(worker: *temporal.worker.Worker) anyerror!void {
                 inline for (workflows) |Workflow| try worker.registerWorkflow(Workflow);
                 inline for (activities) |Activity| try worker.registerActivity(Activity);
+                inline for (nexus_services) |Service| try worker.registerNexusService(Service);
             }
         }.register,
         .execute = spec.execute,
@@ -96,6 +99,22 @@ test "conformance define accepts worker options written as a struct literal" {
     });
     try std.testing.expectEqual(@as(u32, 0), feature.worker_options.max_cached_workflows);
     try std.testing.expectEqual(@as(usize, 1), feature.worker_options.max_concurrent_workflow_task_pollers);
+}
+
+test "conformance define requires a worker for a Nexus-only feature" {
+    const nexus = temporal.nexus;
+    const Operation = nexus.OperationDef("echo", []const u8, []const u8);
+    const Service = nexus.ServiceDef("test-service", .{Operation});
+    const functions = struct {
+        fn echo(_: *nexus.Context, input: []const u8) ![]const u8 {
+            return input;
+        }
+
+        fn execute(_: *Context) !void {}
+    };
+    const Handler = nexus.ServiceHandler(Service, .{nexus.OperationHandler(Operation, functions.echo)});
+    const feature = define(.{ .nexus_services = .{Handler}, .execute = functions.execute });
+    try std.testing.expect(feature.has_worker);
 }
 
 test "conformance define preserves typed worker options and defaults for omitted fields" {

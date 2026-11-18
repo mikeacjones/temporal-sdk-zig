@@ -62,12 +62,28 @@ pub fn parse(arena: Allocator, yaml: []const u8) error{ OutOfMemory, InvalidDyna
         .next_entry => {},
     }
 
+    sortEntries(entries.items);
+    return entries.items;
+}
+
+fn sortEntries(entries: []Entry) void {
     // Preserve the order of values within each setting's list.
-    std.mem.sort(Entry, entries.items, {}, struct {
+    std.mem.sort(Entry, entries, {}, struct {
         fn lessThan(_: void, a: Entry, b: Entry) bool {
             return std.mem.lessThan(u8, a.key, b.key);
         }
     }.lessThan);
+}
+
+pub fn merge(arena: Allocator, defaults: []const Entry, overrides: []const Entry) error{OutOfMemory}![]const Entry {
+    var entries: std.ArrayList(Entry) = try .initCapacity(arena, defaults.len + overrides.len);
+    for (defaults) |entry| {
+        for (overrides) |override| {
+            if (std.mem.eql(u8, entry.key, override.key)) break;
+        } else entries.appendAssumeCapacity(entry);
+    }
+    entries.appendSliceAssumeCapacity(overrides);
+    sortEntries(entries.items);
     return entries.items;
 }
 
@@ -156,4 +172,27 @@ test "dynamic config rejects unsupported keys, values, constraints and incomplet
     }) |source| {
         try std.testing.expectError(error.InvalidDynamicConfig, parse(state.allocator(), source));
     }
+}
+
+test "dynamic config variants replace all values for overridden keys and preserve other values" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const defaults: []const Entry = &.{
+        .{ .key = "b", .json_value = "1" },
+        .{ .key = "b", .json_value = "2" },
+        .{ .key = "c", .json_value = "8" },
+        .{ .key = "c", .json_value = "3" },
+    };
+    const overrides: []const Entry = &.{
+        .{ .key = "b", .json_value = "4" },
+        .{ .key = "a", .json_value = "true" },
+    };
+    const arena = state.allocator();
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{
+        "--dynamic-config-value", "a=true",
+        "--dynamic-config-value", "b=4",
+        "--dynamic-config-value", "c=8",
+        "--dynamic-config-value", "c=3",
+    }), try serverArgs(arena, try merge(arena, defaults, overrides)));
+    try std.testing.expectEqualDeep(defaults, try merge(arena, defaults, &.{}));
 }
