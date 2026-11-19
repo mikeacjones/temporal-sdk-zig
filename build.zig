@@ -519,15 +519,16 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
             .{ .name = "fuzz crash", .target = "crashes", .seconds = "5", .exit_code = 1 },
             .{ .name = "fuzz clean", .target = "clean", .seconds = "3", .exit_code = 0 },
         }) |case| {
-            const dir = b.addWriteFiles();
-            _ = dir.add(case.name, "");
+            // A fresh directory per build: concurrent and successive builds share .zig-cache.
+            const dir = b.tmpPath();
             const run = addCheckCase(b, in.test_step, tool, case.name, case.exit_code);
             run.addDirectoryArg(fixtures);
             run.addArg("known.zon");
             run.addFileArg(.zig_exe);
-            run.addDirectoryArg2(dir.getDirectory().path(b, "cache"), .{ .make_absolute = true });
-            run.addDirectoryArg2(dir.getDirectory().path(b, "crashes"), .{ .make_absolute = true });
+            run.addDirectoryArg2(dir.path(b, "cache"), .{ .make_absolute = true });
+            run.addDirectoryArg2(dir.path(b, "crashes"), .{ .make_absolute = true });
             run.addArgs(&.{ case.seconds, case.target });
+            removeAfterPass(b, in.test_step, run, dir);
             if (case.exit_code == 1) {
                 run.expectStdOutMatch("crashes: crash (");
                 run.expectStdOutMatch("input saved to");
@@ -557,16 +558,17 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         // `zig build fuzz` in a terminal: the build runner gives the wrapper CLICOLOR_FORCE
         // (Run.color .auto with inherited stdio), so the nested build colors its crash line.
         // The crash must still be reported as one, with its input saved.
-        const colored_dir = b.addWriteFiles();
-        _ = colored_dir.add("fuzz crash in color", "");
+        // A fresh directory per build: concurrent and successive builds share .zig-cache.
+        const colored_dir = b.tmpPath();
         const colored = addCheckCase(b, in.test_step, tool, "fuzz crash in color", 1);
         colored.color = .enable;
         colored.addDirectoryArg(fixtures);
         colored.addArg("known.zon");
         colored.addFileArg(.zig_exe);
-        colored.addDirectoryArg2(colored_dir.getDirectory().path(b, "cache"), .{ .make_absolute = true });
-        colored.addDirectoryArg2(colored_dir.getDirectory().path(b, "crashes"), .{ .make_absolute = true });
+        colored.addDirectoryArg2(colored_dir.path(b, "cache"), .{ .make_absolute = true });
+        colored.addDirectoryArg2(colored_dir.path(b, "crashes"), .{ .make_absolute = true });
         colored.addArgs(&.{ "5", "crashes" });
+        removeAfterPass(b, in.test_step, colored, colored_dir);
         colored.expectStdOutMatch("crashes: crash (");
         colored.expectStdOutMatch("input saved to");
         colored.expectStdErrMatch("fuzz: crashes: building and replaying the corpus in process group ");
@@ -620,7 +622,9 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         run.addDirectoryArg(b.path("."));
         run.addArg("tools/checks/test_allocators.zon");
         run.has_side_effects = true;
+        run.setName("check test-allocators tree");
         b.step("test-allocators", "Check that tests allocate through std.testing.allocator").dependOn(&run.step);
+        in.test_step.dependOn(&run.step);
 
         const fixtures = b.path("tools/checks/fixtures/test_allocators");
         const page = addCheckCase(b, in.test_step, tool, "test-allocators page allocator", 1);
@@ -732,6 +736,17 @@ fn addCheckCase(b: *std.Build, test_step: *std.Build.Step, tool: *std.Build.Step
     run.expectExitCode(exit_code);
     test_step.dependOn(&run.step);
     return run;
+}
+
+/// Removes a check case's `b.tmpPath()` directory once the case passes. Zig 0.17.1 deletes
+/// temporary directories after a failed build but leaves them after a successful one.
+fn removeAfterPass(b: *std.Build, test_step: *std.Build.Step, case: *std.Build.Step.Run, dir: std.Build.LazyPath) void {
+    const remove = b.addSystemCommand(&.{ "rm", "-rf" });
+    remove.setName(b.fmt("clean up after {s}", .{case.step.name}));
+    remove.addDirectoryArg(dir);
+    remove.has_side_effects = true;
+    remove.step.dependOn(&case.step);
+    test_step.dependOn(&remove.step);
 }
 
 /// Gives the lister an SDK module and imports for the host. Reflection needs no core library.

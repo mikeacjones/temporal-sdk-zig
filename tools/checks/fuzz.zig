@@ -209,6 +209,15 @@ fn runBuild(io: Io, arena: Allocator, run: Run, target: []const u8, args: []cons
     };
     defer watchdog.kill(io);
     const group = watchdog.id.?;
+    // SIGKILL does not wait for the group to exit, and a fuzzer that is still exiting holds
+    // its corpus lock in <cache>/f, so the next run on this cache would see the corpus in
+    // use and abort. Each run waits for every process to exit before it goes on.
+    var exits = Exits.init() catch |err| {
+        _ = stopWatchdog(io, target, &watchdog) catch {};
+        std.debug.print("fuzz: {s}: cannot create a pipe: {t}\n", .{ target, err });
+        return err;
+    };
+    defer exits.close(io);
     var child = std.process.spawn(io, .{
         .argv = args,
         .cwd = .{ .dir = run.root },
@@ -217,12 +226,14 @@ fn runBuild(io: Io, arena: Allocator, run: Run, target: []const u8, args: []cons
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .inherit_files = &.{exits.write.?},
     }) catch |err| {
         _ = stopWatchdog(io, target, &watchdog) catch {};
         std.debug.print("fuzz: {s}: cannot start {s}: {t}\n", .{ target, run.zig, err });
         return err;
     };
     defer child.kill(io);
+    exits.closeWrite(io);
 
     const timeout: Io.Timeout = if (timed)
         (Io.Timeout{ .duration = .{ .raw = .fromSeconds(run.seconds), .clock = .awake } }).toDeadline(io)
@@ -264,8 +275,55 @@ fn runBuild(io: Io, arena: Allocator, run: Run, target: []const u8, args: []cons
         if (!term.success()) break :problem try std.fmt.allocPrint(arena, "warm-up {f}", .{term});
         break :problem null;
     };
+    const exit_timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(exit_seconds), .clock = .awake } };
+    exits.wait(io, arena, exit_timeout.toDeadline(io)) catch |err| if (problem == null) {
+        return .{
+            .output = .{ try reader.toOwnedSlice(0), try reader.toOwnedSlice(1) },
+            .problem = try std.fmt.allocPrint(arena, "a process of group {d} did not exit within {d} s of SIGKILL: {t}", .{ group, exit_seconds, err }),
+        };
+    };
     return .{ .output = .{ try reader.toOwnedSlice(0), try reader.toOwnedSlice(1) }, .problem = problem };
 }
+
+/// How long the processes of a nested build may take to exit after SIGKILL.
+const exit_seconds = 30;
+
+/// A pipe whose write end every process of a nested build inherits. Its read end reaches
+/// end of stream only when all of them have exited, and so released their file locks.
+/// Unlike signal 0 to the group, it does not count exited processes nobody has reaped.
+const Exits = struct {
+    read: Io.File,
+    write: ?Io.File,
+
+    fn init() !Exits {
+        const fds = try Io.Threaded.pipe2(.{ .CLOEXEC = true });
+        return .{
+            .read = .{ .handle = fds[0], .flags = .{ .nonblocking = false } },
+            .write = .{ .handle = fds[1], .flags = .{ .nonblocking = false } },
+        };
+    }
+
+    /// Once the children have their copies, so that only they keep the pipe open.
+    fn closeWrite(exits: *Exits, io: Io) void {
+        if (exits.write) |file| file.close(io);
+        exits.write = null;
+    }
+
+    fn close(exits: *Exits, io: Io) void {
+        exits.closeWrite(io);
+        exits.read.close(io);
+    }
+
+    /// Returns once every holder of the write end has exited, or error.Timeout.
+    fn wait(exits: *Exits, io: Io, arena: Allocator, timeout: Io.Timeout) !void {
+        exits.closeWrite(io);
+        var buffer: Io.File.MultiReader.Buffer(1) = undefined;
+        var reader: Io.File.MultiReader = undefined;
+        reader.init(arena, io, buffer.toStreams(), &.{exits.read});
+        defer reader.deinit();
+        try readOutput(io, &reader, timeout);
+    }
+};
 
 fn readOutput(io: Io, reader: *Io.File.MultiReader, timeout: Io.Timeout) !void {
     while (reader.fill(4096, timeout)) |_| {
@@ -403,4 +461,52 @@ test "nested builds get no color or progress pipe from the wrapper's environment
     try std.testing.expect(env.get("ZIG_PROGRESS") == null);
     try std.testing.expectEqualStrings("1", env.get("NO_COLOR").?);
     try std.testing.expectEqualStrings("/bin", env.get("PATH").?);
+}
+
+test "Exits waits for a process that outlives the one it was started for" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var exits = try Exits.init();
+    defer exits.close(io);
+    // The shell exits at once. The job it leaves behind, like a fuzzer still exiting
+    // after its build is gone, holds the pipe and writes its file just before it exits.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "(sleep 1; echo exited > left) &" },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .inherit_files = &.{exits.write.?},
+    });
+    defer child.kill(io);
+    exits.closeWrite(io);
+    _ = try child.wait(io);
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(exit_seconds), .clock = .awake } };
+    try exits.wait(io, arena.allocator(), timeout.toDeadline(io));
+    const left = try tmp.dir.readFileAlloc(io, "left", arena.allocator(), .limited(64));
+    try std.testing.expectEqualStrings("exited\n", left);
+}
+
+test "Exits reports a process that does not exit in time" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var exits = try Exits.init();
+    defer exits.close(io);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "exec sleep 60" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .inherit_files = &.{exits.write.?},
+    });
+    defer child.kill(io);
+    exits.closeWrite(io);
+    const short: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } };
+    try std.testing.expectError(error.Timeout, exits.wait(io, arena.allocator(), short.toDeadline(io)));
+    child.kill(io);
+    try exits.wait(io, arena.allocator(), .none);
 }

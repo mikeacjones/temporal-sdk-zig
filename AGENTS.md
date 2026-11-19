@@ -18,7 +18,7 @@ This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust 
   - `scripts/changelog-check.sh [<base>]` checks the changelog fragments, and the commits since `<base>` for a fragment or trailer; `scripts/changelog-test.sh` tests the changelog scripts.
   - See [Correctness commands](#correctness-commands) for the checks and reports available in a checkout.
 - For focused tests, use `-Dtest-filter` (repeatable): `zig build test -Dtest-filter="fibers interleave"`.
-- Use `std.testing.allocator` in tests so leaks fail them. Run `zig build test-allocators` to check for other allocators. Avoid fixed sleeps in tests: wait on the condition itself.
+- Use `std.testing.allocator` in tests so leaks fail them. `zig build test` also runs the `zig build test-allocators` scan of the tree, so a test that allocates through another allocator fails it. Avoid fixed sleeps in tests: wait on the condition itself.
 - Keep comments sparse. Comments explain non-obvious reasons, invariants, and ownership, not what the code already says.
 - Error messages must be actionable: include the operation, option, input, or state that helps the caller diagnose the problem.
 - Don't add abstractions for one-off helpers. Follow the style of the file you are changing.
@@ -84,7 +84,7 @@ Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, `sam
 
 ### `zig build fuzz`
 
-Runs the `failure_attributes`, `history_json`, `nexus_links`, `payload`, `protojson`, `search_attributes`, and `time_parse` targets with Zig's fuzzer. A panic or failed safety check, a leak, an error outside the declared set, or a failed round trip counts as a crash. The default box is 30 seconds per target. Set `-Dfuzz-seconds=<n>` to change it. Each target runs in two nested builds. The first builds the target and replays the corpus, and the second fuzzes until its deadline. A second run in the same checkout waits on `.zig-cache/fuzz.lock`. Interrupting the command or killing its wrapper stops the nested build and fuzzer. Zig keeps the inputs it learns under `.zig-cache/f/`.
+Runs the `failure_attributes`, `history_json`, `nexus_links`, `payload`, `protojson`, `search_attributes`, and `time_parse` targets with Zig's fuzzer. A panic or failed safety check, a leak, an error outside the declared set, or a failed round trip counts as a crash. The default box is 30 seconds per target. Set `-Dfuzz-seconds=<n>` to change it. Each target runs in two nested builds. The first builds the target and replays the corpus, and the second fuzzes until its deadline. A second run in the same checkout waits on `.zig-cache/fuzz.lock`. A run keeps the lock until every process of its nested builds has exited, the stopped fuzzer included, and fails if one is still running 30 seconds after it was stopped. Interrupting the command or killing its wrapper stops the nested build and fuzzer. Zig keeps the inputs it learns under `.zig-cache/f/`.
 
 Crash inputs are saved under `zig-out/fuzz/<target>/crash-<8 hex digits>`. Copy the saved input into `src/fuzz/<target>/` and run `zig build test` to replay it. `tools/checks/fuzz.zon` lists the open bugs with their targets and the reason for each guard. `zig build test` fails for an entry without a guard.
 
@@ -100,9 +100,9 @@ Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, `samples`, 
 
 ### `zig build test-allocators`
 
-Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check.
+Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check. `zig build test` runs this scan too, as its `check test-allocators tree` step.
 
-- When to run: When adding or changing tests or reviewing an allow-list entry.
+- When to run: When adding or changing tests or reviewing an allow-list entry; `zig build test` runs it every time.
 - Run time: about 0.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.8 s).
 
 ## Conformance
