@@ -299,6 +299,14 @@ var test_injected_download_failures: std.atomic.Value(u32) = .init(0);
 /// Counts every attempt, fake ones included.
 var test_start_attempts: std.atomic.Value(u32) = .init(0);
 
+/// Its own function, not inline in startRetrying: Zig 0.17.1's self-hosted x86_64 backend
+/// (Debug on x86_64 Linux) keeps a comparison's result in the CPU flags and does not save it
+/// before the `lock xadd` of a `fetchAdd`, which overwrites the flags. Inline, `last` read
+/// false on attempt 3 and the backoff table was indexed past its end. A call saves the flags.
+fn countTestAttempt() void {
+    _ = test_start_attempts.fetchAdd(1, .monotonic);
+}
+
 fn takeInjectedFailure() bool {
     var n = test_injected_download_failures.load(.monotonic);
     while (n > 0) {
@@ -313,7 +321,7 @@ fn startRetrying(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput,
     while (true) : (attempt += 1) {
         const last = attempt == max_start_attempts;
         if (builtin.is_test) {
-            _ = test_start_attempts.fetchAdd(1, .monotonic);
+            countTestAttempt();
             if (takeInjectedFailure()) {
                 const message = try std.fmt.allocPrint(gpa, "invalid ephemeral server download: injected by a test on attempt {d}", .{attempt});
                 if (last or !isDownloadFailure(message) or !backoff(io, attempt)) {
