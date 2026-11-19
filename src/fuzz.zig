@@ -12,6 +12,9 @@ const corpus = @import("fuzz_corpus");
 
 const targets = struct {
     pub const history_json = @import("fuzz/history_json.zig");
+    pub const payload = @import("fuzz/payload.zig");
+    pub const protojson = @import("fuzz/protojson.zig");
+    pub const time_parse = @import("fuzz/time_parse.zig");
 };
 
 const Finding = struct { target: []const u8, bead: []const u8, reason: []const u8 };
@@ -50,6 +53,18 @@ fn fuzzTarget(comptime name: []const u8) !void {
 
 test "fuzz history_json" {
     try fuzzTarget("history_json");
+}
+
+test "fuzz payload" {
+    try fuzzTarget("payload");
+}
+
+test "fuzz protojson" {
+    try fuzzTarget("protojson");
+}
+
+test "fuzz time_parse" {
+    try fuzzTarget("time_parse");
 }
 
 test "every known finding has a guard in its target" {

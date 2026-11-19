@@ -1,1 +1,7 @@
-.{}
+.{
+    .{
+        .target = "protojson",
+        .bead = "temporal-sdk-zig-ljo",
+        .reason = "A decoded message holding a Timestamp on 29 February of a year not divisible by 400 is not re-encoded, because zig-protobuf's Timestamp.jsonStringify overflows in civil_from_days on that day.",
+    },
+}
