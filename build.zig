@@ -216,6 +216,75 @@ const CheckInputs = struct {
 
 /// Correctness commands (see AGENTS.md). A fetched package has no tools/checks.
 fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
+    // zig build alloc-failures
+    {
+        const helper = struct {
+            fn module(owner: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, known: []const u8) *std.Build.Module {
+                const m = owner.createModule(.{
+                    .root_source_file = owner.path("tools/checks/alloc_failures.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                });
+                m.addAnonymousImport("alloc_failures_known", .{ .root_source_file = owner.path(known) });
+                return m;
+            }
+        }.module;
+
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/alloc_failure.zig"),
+            .target = in.target,
+            .optimize = in.optimize,
+            .error_tracing = testErrorTracing(in.optimize),
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "protobuf", .module = in.protobuf },
+                .{ .name = "core_c", .module = in.core_c },
+                .{ .name = "alloc_failures", .module = helper(b, in.target, in.optimize, "tools/checks/alloc_failures.zon") },
+            },
+        });
+        module.addOptions("build_options", in.build_options);
+        linkCoreLib(module, in.target, in.core.lib);
+        // The SDK files the cases import bring their own tests, which the SDK's test binary
+        // runs, so by default only the cases of src/alloc_failure.zig run here.
+        const tests = b.addTest(.{
+            .name = "alloc-failures",
+            .root_module = module,
+            .filters = if (in.test_filters.len > 0) in.test_filters else &.{"alloc_failure.test."},
+        });
+        b.step("alloc-failures", "Fail every allocation of the SDK's user-path functions once and expect error.OutOfMemory").dependOn(&b.addRunArtifact(tests).step);
+        // Other goals' pipelines run `zig build test`, so an API change to a tested function
+        // must break the compile there. The cases themselves run only under
+        // `zig build alloc-failures`.
+        in.test_step.dependOn(&tests.step);
+
+        const fixtures = "tools/checks/fixtures/alloc_failures/";
+        for ([_]struct { name: []const u8, root: []const u8, known: []const u8, exit_code: u8, stderr: []const u8 }{
+            .{ .name = "wrong error", .root = "wrong_error.zig", .known = "empty.zon", .exit_code = 1, .stderr = "alloc-failures: fixture.wrong_error: fail index 1: returned error.InvalidInput instead of error.OutOfMemory" },
+            .{ .name = "clean", .root = "correct.zig", .known = "empty.zon", .exit_code = 0, .stderr = "All 3 tests passed." },
+            .{ .name = "known finding", .root = "wrong_error.zig", .known = "known.zon", .exit_code = 0, .stderr = "All 2 tests passed." },
+            .{ .name = "stale entry", .root = "correct.zig", .known = "stale.zon", .exit_code = 1, .stderr = "alloc-failures: fixture.arena: listed in the known-findings file for temporal-sdk-zig-example but no longer fails; remove its entry" },
+            .{ .name = "unknown case", .root = "correct.zig", .known = "gone.zon", .exit_code = 1, .stderr = "alloc-failures: fixture.gone: listed in the known-findings file for temporal-sdk-zig-example, but no case has that name" },
+            .{ .name = "case only in a comment", .root = "commented.zig", .known = "commented.zon", .exit_code = 1, .stderr = "alloc-failures: fixture.commented: listed in the known-findings file for temporal-sdk-zig-example, but no case has that name" },
+        }) |case| {
+            const fixture = b.addTest(.{
+                .name = b.fmt("alloc-failures-fixture-{s}", .{std.mem.sliceTo(case.root, '.')}),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.fmt("{s}{s}", .{ fixtures, case.root })),
+                    .target = b.graph.host,
+                    .optimize = .Debug,
+                    .imports = &.{.{ .name = "alloc_failures", .module = helper(b, b.graph.host, .Debug, b.fmt("{s}{s}", .{ fixtures, case.known })) }},
+                }),
+            });
+            // addRunArtifact would turn on test-runner mode and hide the exit code.
+            const run = std.Build.Step.Run.create(b, b.fmt("check alloc-failures {s}", .{case.name}));
+            run.addArtifactArg(fixture);
+            run.has_side_effects = true;
+            run.expectExitCode(case.exit_code);
+            run.expectStdErrMatch(case.stderr);
+            in.test_step.dependOn(&run.step);
+        }
+    }
+
     // zig build api
     const api_lister, const api_options = api: {
         const source = "tools/checks/api_list.zig";

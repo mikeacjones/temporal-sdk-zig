@@ -1,0 +1,7 @@
+.{
+    .{
+        .case = "fixture.wrong_error",
+        .bead = "temporal-sdk-zig-example",
+        .reason = "The second allocation's failure becomes error.InvalidInput at fail index 1.",
+    },
+}

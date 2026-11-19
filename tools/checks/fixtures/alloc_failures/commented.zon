@@ -1,0 +1,7 @@
+.{
+    .{
+        .case = "fixture.commented",
+        .bead = "temporal-sdk-zig-example",
+        .reason = "Names a case that only a comment quotes.",
+    },
+}

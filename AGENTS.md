@@ -50,6 +50,17 @@ Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md),
 
 `addCheckSteps` in build.zig adds these commands in a checkout. Programs, fixtures, and allow-lists live under `tools/checks/`. Exit code 0 means the tool ran successfully, 1 means a check found a problem or the tool could not run, and 2 means the arguments were invalid. Run times are measurements, not limits.
 
+### `zig build alloc-failures`
+
+Calls SDK functions that take an allocator with each of their allocations failing in turn: fail index 0, 1, 2, and so on, until a call ends with no induced failure. Every call that saw a failure must return `error.OutOfMemory`. A success, another error, or a leak fails the case, as does a case that sees fewer than 2 induced failures or reaches the cap of 20,000. Each problem prints one line naming the case and the fail index. A function that allocates into a caller's arena gets a `std.testing.FailingAllocator` between it and a fresh scratch arena, so every allocation fails once; a function that frees what it allocates runs through `std.testing.checkAllAllocationFailures`. The cases are in `src/alloc_failure.zig`, its top comment lists the functions covered, and the helper is `tools/checks/alloc_failures.zig`. A case is named by the function's path from `src` with dots, such as `converter.Header.fromEntries`, and `-Dtest-filter=<case>` runs one case.
+
+`zig build test` compiles the cases, in its own optimize mode, but does not run them, so a case that stops compiling fails `zig build test`. It runs only the fixtures under `tools/checks/fixtures/alloc_failures/`, which check the helper itself.
+
+To add a case, follow the top comment of `src/alloc_failure.zig`: a `test "<case>"` that builds its inputs with `std.testing.allocator` and calls `alloc_failures.run("<case>", .arena, <wrapper>, .{inputs...})`, where the wrapper takes the allocator first and fixes the comptime arguments. A finding that is not fixed with its case goes in `tools/checks/alloc_failures.zon` with its `case`, `bead`, and `reason`; a listed case that still fails passes quietly. An entry whose case no longer fails, or whose case no test names, fails the command.
+
+- When to run: When changing a function a case calls, or adding a case.
+- Run time: about 2.5 s on the factory's Apple-silicon Mac, measured 2026-11-19 (first run about 80 s, most of it cargo building the Rust core).
+
 ### `zig build api`
 
 Lists the public names reachable from `@import("temporal")` in byte order, with aliases under each path. The command takes no arguments. It lists names only, so signature changes do not show up. It includes the members of public error sets and omits the errors a function can return. It lists `temporal.proto` without expanding it. The list is for the machine running the build, regardless of `-Dtarget`. A public declaration that evaluates to `@compileError` prevents the lister from compiling.
