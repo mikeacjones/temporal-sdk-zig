@@ -1,0 +1,3 @@
+.{
+    .{ .target = "gone", .bead = "temporal-sdk-zig-example", .reason = "Fixture for a removed target." },
+}

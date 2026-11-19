@@ -4,7 +4,7 @@ Evaluated zlinter commit `e1f92a1159a36fa301730596f742d0f66e60908d` from `0.17.x
 
 ## Rules
 
-The evaluation build registered all 30 `BuiltinLintRule` members with their default settings. The scan covered `src`, `tools`, `examples`, and `samples`, excluding `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, and `tools/checks/fixtures/`. This is 337 hand-written Zig files on the baseline. zlinter also recognizes ZON files in the included directories. Counts include warnings and errors. Paths and line numbers below refer to the baseline. For zero counts, the table gives examples of what would trigger the rule.
+The evaluation build registered all 30 `BuiltinLintRule` members with their default settings. The scan covered `src`, `tools`, `examples`, and `samples`, excluding `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, and `tools/checks/fixtures/`. This is 337 hand-written Zig files on the baseline. The current `lint` step also scans `conformance/`, where the six kept rules found no issues. zlinter also recognizes ZON files in the included directories. Counts include warnings and errors. Paths and line numbers below refer to the baseline. For zero counts, the table gives examples of what would trigger the rule.
 
 To reproduce the full survey, replace the `addRule` calls in a scratch build with an `inline for` over `std.enums.values(zlinter.BuiltinLintRule)`, passing `.{}` as each rule's configuration. Run `zig build lint -- --format json --exit-zero` and count `.results[].messages[].ruleId` in the JSON on stdout. For the baseline measurement, the resulting executable ran from a copy of `origin/main` with its own build graph and the same paths passed via `--build-include` and `--build-exclude`.
 
