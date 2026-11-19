@@ -682,6 +682,14 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         held.addArtifactArg(stderr_held);
         held.addArg("--hang-report=2");
 
+        // A test may point fd 2 at /dev/null, as EphemeralServer's OutputRedirect does while a
+        // dev server starts; the report must still reach the stderr the runner started with.
+        const redirected = Fixture.build(b, "stderr-redirected", "stderr_redirected.zig", runner);
+        const redirect = addCheckCase(b, in.test_step, tool, "hang report names a test whose stderr is redirected", 0);
+        redirect.addArgs(&.{ "60", "still running after", "waits forever with stderr pointed at /dev/null", "in waitsWithStderrRedirected (", "end of the report for", "--" });
+        redirect.addArtifactArg(redirected);
+        redirect.addArg("--hang-report=2");
+
         // addRunArtifact would turn on test-runner mode and hide the output.
         for ([_]struct { name: []const u8, limit: []const u8 }{
             .{ .name = "slow test passes", .limit = "1" },
@@ -715,8 +723,9 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         busy_run.expectStdErrMatch("All 1 tests passed.");
         in.test_step.dependOn(&busy_run.step);
 
-        // A thread frozen while the report's unwind waits on a lock goes on by itself after the
-        // hold limit and reuses its stack; the report must not then read that stack and crash.
+        // Threads go on and reuse their stacks after the report lets them go, while another
+        // holds std.debug's symbol lock; the report must use only what it read while each was
+        // frozen, not wait on the lock without end, and not crash.
         const moved_on = Fixture.build(b, "moved-on", "moved_on.zig", runner);
         const moved_on_run = std.Build.Step.Run.create(b, "check hang report thread that goes on before its unwind passes");
         moved_on_run.addArtifactArg(moved_on);

@@ -1,10 +1,14 @@
-//! A test whose thread the hang report freezes and then keeps waiting on for longer than the
-//! report's hold limit, for the "check hang report thread that goes on before its unwind
-//! passes" case. Another thread holds std.debug's SelfInfo lock (as one does while it loads
-//! symbols for the first time), so the report's unwind of the frozen thread waits on it. The
-//! frozen thread then goes on by itself and reuses the stack the report has not read yet. The
-//! report must not read that stack as if the thread were still frozen: it must not crash or
-//! hang the process, and the test must pass.
+//! A test whose threads go on after the hang report has frozen and let go of them, while
+//! another thread holds std.debug's SelfInfo lock, for the "check hang report thread that goes
+//! on before its unwind passes" case. The report freezes one thread at a time and, while it is
+//! frozen, only records the return addresses its frame pointers lead to (read through
+//! process_vm_readv or mach_vm_read_overwrite); it looks symbols up after every thread runs
+//! again. Here the holder takes the SelfInfo lock as soon as the report starts freezing and
+//! keeps it for 8 s, so the lookup finds it taken; and a thread that notices it was stopped
+//! for more than 3 s fills the stack it was stopped on with frame records that point at
+//! unmapped memory. The report must use only the addresses it recorded while the thread was
+//! frozen, must not wait on the lock without end (after 1 s it shows bare addresses), must not
+//! crash or hang the process, and the test must pass.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -31,8 +35,8 @@ fn nowNanoseconds() i64 {
     return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
-/// Whether the hang report has installed its SIGURG handler, which it does once its own unwind
-/// info is loaded and right before it freezes the first thread.
+/// Whether the hang report has installed its SIGURG handler, which it does right before it
+/// freezes the first thread.
 fn reportFreezing() bool {
     var old: std.posix.Sigaction = undefined;
     std.posix.sigaction(.URG, null, &old);
@@ -49,8 +53,8 @@ fn unlockSelfInfo(io: std.Io) void {
     if (builtin.os.tag.isDarwin()) si.target.mutex.unlock(io) else si.target.rwlock.unlock(io);
 }
 
-/// Takes the SelfInfo lock as soon as the report starts freezing, and keeps it for 8 s or until
-/// this thread itself was frozen past the hold limit.
+/// Takes the SelfInfo lock as soon as the report starts freezing, and keeps it for 8 s, or
+/// until `waitUntil` finds this thread was stopped for more than 3 s.
 fn holdSelfInfoLock() void {
     const io = std.Io.Threaded.global_single_threaded.io();
     while (!reportFreezing()) {

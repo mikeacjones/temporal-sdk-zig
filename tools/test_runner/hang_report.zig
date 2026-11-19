@@ -7,6 +7,10 @@
 //! out' error, so the report says where a hung test waits. AGENTS.md ("Hang reports")
 //! documents the format.
 //!
+//! "Stderr" here is the one the process had when `start` ran: the report writes to a copy of
+//! file descriptor 2 taken then, so a test that points fd 2 at /dev/null while it starts a dev
+//! server still gets its report seen.
+//!
 //! Stacks are read by freezing one thread at a time: SIGURG is sent to it, its handler copies
 //! the interrupted registers into a global slot and spins until the watchdog lets it go.
 //!
@@ -22,8 +26,8 @@
 //!
 //! Nor does the report wait without end on a lock another thread holds, frozen or not: a hung
 //! test may well be stuck holding one. It tries std's stderr lock and std.debug's symbol lock
-//! for at most `lock_wait`; when stderr's stays taken, the rest of the report is written to
-//! file descriptor 2 directly, and when the symbol lock's does, rows show bare addresses.
+//! for at most `lock_wait`; when stderr's stays taken, the rest of the report is written
+//! without it, and when the symbol lock's does, rows show bare addresses.
 //!
 //! Nothing here may end the process: every failure becomes a `test-hang-report: ` line.
 
@@ -83,6 +87,7 @@ fn nowNanoseconds() i64 {
 pub fn start(seconds: u32) void {
     if (seconds == 0 or watching) return;
     limit_seconds = seconds;
+    report_fd = saveStderr();
     test_thread_id = currentThreadId();
     const thread = std.Thread.spawn(.{}, watchdogMain, .{}) catch |err| {
         print("cannot start the watchdog thread: {t}; hang reports are off\n", .{err});
@@ -164,6 +169,26 @@ fn currentThreadId() u64 {
     return 0;
 }
 
+/// Where the report is written: a close-on-exec copy of file descriptor 2 taken by `start`,
+/// before any test runs, so that a test that points fd 2 elsewhere (as
+/// src/bridge/EphemeralServer.zig's OutputRedirect does, to /dev/null, while a dev server
+/// downloads and starts) does not send the report there too. Fd 2 itself if the copy failed.
+var report_fd: posix.fd_t = posix.STDERR_FILENO;
+
+/// A close-on-exec copy of file descriptor 2, so that the processes a test starts do not
+/// inherit it, or fd 2 itself when it cannot be copied.
+fn saveStderr() posix.fd_t {
+    const min_fd = 3;
+    const rc = if (builtin.link_libc)
+        std.c.fcntl(posix.STDERR_FILENO, posix.F.DUPFD_CLOEXEC, @as(c_int, min_fd))
+    else if (is_linux)
+        std.os.linux.fcntl(posix.STDERR_FILENO, posix.F.DUPFD_CLOEXEC, min_fd)
+    else
+        return posix.STDERR_FILENO;
+    if (posix.errno(rc) != .SUCCESS) return posix.STDERR_FILENO;
+    return @intCast(rc);
+}
+
 /// Writes one line, or several, to stderr. Errors are ignored: the report only prints.
 fn print(comptime format: []const u8, args: anytype) void {
     var buffer: [4096]u8 = undefined;
@@ -188,9 +213,11 @@ fn writeStderr(bytes: []const u8) void {
         const deadline = Io.Clock.awake.now(io()).addDuration(lock_wait);
         while (true) {
             const locked = debug_io.tryLockStderr(&.{}, null) catch null;
-            if (locked) |stderr| {
+            if (locked) |_| {
+                // The lock keeps the report's lines apart from other threads' writes to
+                // stderr; the bytes go to `report_fd`, which may no longer be what fd 2 is.
                 defer debug_io.unlockStderr();
-                stderr.file_writer.interface.writeAll(bytes) catch {};
+                writeUnlocked(bytes);
                 return;
             }
             if (Io.Clock.awake.now(io()).compare(.gte, deadline)) break;
@@ -202,11 +229,11 @@ fn writeStderr(bytes: []const u8) void {
     writeUnlocked(bytes);
 }
 
-/// Writes to file descriptor 2 without std's stderr lock.
+/// Writes to `report_fd` without std's stderr lock.
 fn writeUnlocked(bytes: []const u8) void {
     var rest = bytes;
     while (rest.len != 0) {
-        const rc = posix.system.write(posix.STDERR_FILENO, rest.ptr, rest.len);
+        const rc = posix.system.write(report_fd, rest.ptr, rest.len);
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 const written: usize = @intCast(rc);
@@ -411,7 +438,7 @@ fn readLinuxName(t: *Thread) void {
     t.name_len = std.mem.trimEnd(u8, text, "\n").len;
 }
 
-// macOS: the send rights and the array task_threads returns, owned until the report ends.
+// macOS: the pthread of a Mach thread, or null for a thread that has none; std lacks it.
 extern "c" fn pthread_from_mach_thread_np(std.c.mach_port_t) ?std.c.pthread_t;
 // macOS: copies memory through the kernel; std declares it but does not export it from std.c.
 extern "c" fn mach_vm_read_overwrite(
@@ -454,8 +481,6 @@ fn machThreadId(port: std.c.mach_port_t) u64 {
     return info.thread_id;
 }
 
-/// Freezes each thread in turn, unwinds its stack and lets it go.
-///
 /// Freezes each thread in turn, records its return addresses and lets it go. See the
 /// invariant at the top of this file.
 fn freezeAll(list: []Thread, watchdog_id: u64) void {
