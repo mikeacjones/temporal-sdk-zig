@@ -62,17 +62,55 @@ pub fn decode(comptime T: type, arena: Allocator, json: []const u8) DecodeError!
     // Short enum names must be rewritten before the generated decoder runs: with
     // `ignore_unknown_fields` it turns a name it doesn't know into 0 without an error.
     const text = if (comptime mayHoldEnum(T)) try rewriteShortEnumNames(T, arena, json) else json;
+    var witness: FailureWitness = .{ .child = arena };
     const parsed = T.jsonDecode(text, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
-    }, arena) catch |err| switch (err) {
+    }, witness.allocator()) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidProtoJson,
+        // The generated decoder reports a failed allocation of a bytes value as a syntax
+        // error (zig-protobuf's `parse_bytes` catches it): after a failed allocation, an
+        // error is the allocation's.
+        else => return if (witness.failed) error.OutOfMemory else error.InvalidProtoJson,
     };
     var message = parsed.value;
     try decodeBytesMaps(T, &message, arena);
     return message;
 }
+
+/// Passes allocations through to `child` and records whether one failed.
+const FailureWitness = struct {
+    child: Allocator,
+    failed: bool = false,
+
+    fn allocator(w: *FailureWitness) Allocator {
+        return .{ .ptr = w, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const w: *FailureWitness = @ptrCast(@alignCast(ctx));
+        const memory = w.child.rawAlloc(len, alignment, ret_addr);
+        if (memory == null) w.failed = true;
+        return memory;
+    }
+
+    // A refused resize or remap is not a failure: the caller allocates anew, and that
+    // allocation is recorded if it fails.
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const w: *FailureWitness = @ptrCast(@alignCast(ctx));
+        return w.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const w: *FailureWitness = @ptrCast(@alignCast(ctx));
+        return w.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const w: *FailureWitness = @ptrCast(@alignCast(ctx));
+        w.child.rawFree(memory, alignment, ret_addr);
+    }
+};
 
 fn isMessage(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "_desc_table") and std.meta.hasFn(T, "jsonDecode");
