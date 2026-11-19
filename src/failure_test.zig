@@ -543,6 +543,9 @@ const StaleTrace = struct {
 
 test "an activity's stack trace holds only its own error's frames, not those of earlier tasks on its thread" {
     if (@errorReturnTrace() == null) return error.SkipZigTest;
+    // 64 threads spin on a barrier, which took more than 10 minutes under Thread Sanitizer
+    // (measured 2026-11-16, aarch64-macos).
+    if (@import("builtin").sanitize_thread) return error.SkipZigTest;
     var threaded: Io.Threaded = .init(testing.allocator, .{
         .environ = testing.environ,
         .async_limit = .limited(StaleTrace.threads),

@@ -395,6 +395,49 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         clean.expectStdOutEqual("");
         clean.expectStdErrEqual("");
     }
+
+    // zig build tsan
+    {
+        // Mirrors the unit test module of `build()`, with Thread Sanitizer. The core library
+        // is not instrumented.
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/temporal.zig"),
+            .target = in.target,
+            .optimize = in.optimize,
+            .error_tracing = testErrorTracing(in.optimize),
+            .link_libc = true,
+            .sanitize_thread = true,
+            .imports = &.{
+                .{ .name = "protobuf", .module = in.protobuf },
+                .{ .name = "core_c", .module = in.core_c },
+            },
+        });
+        module.addOptions("build_options", in.build_options);
+        linkCoreLib(module, in.target, in.core.lib);
+        const tests = b.addTest(.{ .name = "tsan-unit-tests", .root_module = module, .filters = in.test_filters });
+        // When the sanitizer reported anything, the runtime ends the process at exit (see
+        // the "tsan race" case), which fails the run even when every test passed.
+        b.step("tsan", "Run the unit tests under Thread Sanitizer").dependOn(&b.addRunArtifact(tests).step);
+
+        // Libc, so that threads come from pthreads, which the sanitizer intercepts.
+        const race_tool = checkTool(b, "tsan-race-fixture", "tools/checks/fixtures/tsan/race.zig");
+        race_tool.root_module.sanitize_thread = true;
+        race_tool.root_module.link_libc = true;
+        // How the runtime ends a process that reported: on Apple platforms its
+        // `abort_on_error` flag defaults to true, so it aborts; elsewhere it exits 66.
+        const race = b.addRunArtifact(race_tool);
+        race.setName("check tsan race");
+        race.has_side_effects = true;
+        race.addCheck(.{ .expect_term = if (comptime builtin.os.tag.isDarwin()) .{ .signal = .ABRT } else .{ .exited = 66 } });
+        race.expectStdErrMatch("WARNING: ThreadSanitizer: data race");
+        in.test_step.dependOn(&race.step);
+
+        const mutex_tool = checkTool(b, "tsan-mutex-fixture", "tools/checks/fixtures/tsan/mutex.zig");
+        mutex_tool.root_module.sanitize_thread = true;
+        mutex_tool.root_module.link_libc = true;
+        const mutex = addCheckCase(b, in.test_step, mutex_tool, "tsan mutex", 0);
+        mutex.expectStdErrEqual("");
+    }
 }
 
 /// Builds a check tool for the machine running the build.
