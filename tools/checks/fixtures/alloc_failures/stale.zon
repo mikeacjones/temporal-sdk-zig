@@ -1,0 +1,7 @@
+.{
+    .{
+        .case = "fixture.arena",
+        .bead = "temporal-sdk-zig-example",
+        .reason = "Listed although every allocation failure returns error.OutOfMemory.",
+    },
+}

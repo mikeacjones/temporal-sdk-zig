@@ -1,0 +1,1 @@
+`protojson.decode` and `history.fromJson` return `error.OutOfMemory` when an allocation fails while decoding a bytes field, instead of reporting the valid input as `error.InvalidProtoJson` or `error.InvalidHistoryJson`.
