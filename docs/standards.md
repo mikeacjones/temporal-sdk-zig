@@ -107,7 +107,8 @@ placement of a test. The examples come from the SDK source.
 - Back test allocations and test arenas with `std.testing.allocator` so leaks
   fail the test, as in `test "newline maps join keys and values, and reject newlines in either"`.
   `zig build test-allocators` scans test bodies for other allocator names and
-  supports per-test exceptions. [src/bridge/bytes.zig](../src/bridge/bytes.zig)
+  supports per-test exceptions; `zig build test` runs the same scan.
+  [src/bridge/bytes.zig](../src/bridge/bytes.zig)
 - Use `WorkflowEnvironment.start` for tests that exercise a dev server's
   service behavior. Use `WorkflowEnvironment.startTimeSkipping` when a test
   needs to advance timers or retry delays quickly. [src/testing.zig](../src/testing.zig)

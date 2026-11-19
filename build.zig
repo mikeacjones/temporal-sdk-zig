@@ -620,7 +620,9 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         run.addDirectoryArg(b.path("."));
         run.addArg("tools/checks/test_allocators.zon");
         run.has_side_effects = true;
+        run.setName("check test-allocators tree");
         b.step("test-allocators", "Check that tests allocate through std.testing.allocator").dependOn(&run.step);
+        in.test_step.dependOn(&run.step);
 
         const fixtures = b.path("tools/checks/fixtures/test_allocators");
         const page = addCheckCase(b, in.test_step, tool, "test-allocators page allocator", 1);
