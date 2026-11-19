@@ -11,9 +11,12 @@ const std = @import("std");
 const corpus = @import("fuzz_corpus");
 
 const targets = struct {
+    pub const failure_attributes = @import("fuzz/failure_attributes.zig");
     pub const history_json = @import("fuzz/history_json.zig");
+    pub const nexus_links = @import("fuzz/nexus_links.zig");
     pub const payload = @import("fuzz/payload.zig");
     pub const protojson = @import("fuzz/protojson.zig");
+    pub const search_attributes = @import("fuzz/search_attributes.zig");
     pub const time_parse = @import("fuzz/time_parse.zig");
 };
 
@@ -51,8 +54,16 @@ fn fuzzTarget(comptime name: []const u8) !void {
     try std.testing.fuzz({}, @field(targets, name).testOne, .{ .corpus = seeds });
 }
 
+test "fuzz failure_attributes" {
+    try fuzzTarget("failure_attributes");
+}
+
 test "fuzz history_json" {
     try fuzzTarget("history_json");
+}
+
+test "fuzz nexus_links" {
+    try fuzzTarget("nexus_links");
 }
 
 test "fuzz payload" {
@@ -61,6 +72,10 @@ test "fuzz payload" {
 
 test "fuzz protojson" {
     try fuzzTarget("protojson");
+}
+
+test "fuzz search_attributes" {
+    try fuzzTarget("search_attributes");
 }
 
 test "fuzz time_parse" {

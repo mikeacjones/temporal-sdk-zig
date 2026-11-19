@@ -394,7 +394,11 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
             linkCoreLib(module.*, in.target, in.core.lib);
         }
         const module, const guard_module = modules;
-        const tests = b.addTest(.{ .name = "fuzz-targets", .root_module = module, .filters = in.test_filters });
+        // The SDK files a target imports bring their tests into this module; the SDK's own
+        // test binary runs those (src/nexus/wire.zig alone brings over 700), so by default
+        // only the tests of src/fuzz.zig run here.
+        const filters: []const []const u8 = if (in.test_filters.len > 0) in.test_filters else &.{"fuzz.test."};
+        const tests = b.addTest(.{ .name = "fuzz-targets", .root_module = module, .filters = filters });
         in.test_step.dependOn(&b.addRunArtifact(tests).step);
         const guard_tests = b.addTest(.{ .name = "fuzz-known-guard", .root_module = guard_module, .filters = &.{"known compiles as a guard"} });
         in.test_step.dependOn(&b.addRunArtifact(guard_tests).step);
