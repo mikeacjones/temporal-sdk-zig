@@ -412,6 +412,10 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
                 .name = "fuzz-targets",
                 .root_module = module,
                 .filters = &.{b.fmt("fuzz {s}", .{name})},
+                // Only LLVM emits the coverage sections --fuzz reads. Zig 0.17.1's own x86_64
+                // backend, its default for Debug on x86_64 Linux, emits none, and the fuzzer
+                // then panics with "missing __start___sancov_cntrs symbol".
+                .use_llvm = true,
             });
             step.dependOn(&b.addRunArtifact(single).step);
         } else {
