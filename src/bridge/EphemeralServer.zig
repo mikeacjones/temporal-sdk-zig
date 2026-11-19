@@ -315,7 +315,7 @@ fn startRetrying(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput,
         if (builtin.is_test) {
             _ = test_start_attempts.fetchAdd(1, .monotonic);
             if (takeInjectedFailure()) {
-                const message = try std.fmt.allocPrint(gpa, "Connection failed: invalid ephemeral server download: injected by a test on attempt {d}", .{attempt});
+                const message = try std.fmt.allocPrint(gpa, "invalid ephemeral server download: injected by a test on attempt {d}", .{attempt});
                 if (last or !isDownloadFailure(message) or !backoff(io, attempt)) {
                     if (failure) |f| f.* = message else gpa.free(message);
                     return error.StartFailed;
@@ -490,7 +490,7 @@ test "three download failures return the last attempt's message" {
     defer if (failure) |f| testing.allocator.free(f);
     try testing.expectError(error.StartFailed, startTestServer(testing.allocator, testing.io, rt, .{}, &failure));
     try testing.expectEqual(3, test_start_attempts.load(.monotonic));
-    try testing.expectEqualStrings("Connection failed: invalid ephemeral server download: injected by a test on attempt 3", failure orelse "(no message)");
+    try testing.expectEqualStrings("invalid ephemeral server download: injected by a test on attempt 3", failure orelse "(no message)");
 }
 
 test "a real download failure from the core is retried" {
