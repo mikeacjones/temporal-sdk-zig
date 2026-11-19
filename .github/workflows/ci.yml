@@ -51,6 +51,9 @@ jobs:
       - name: Test the changelog scripts
         run: scripts/changelog-test.sh
 
+      - name: Test the core pin check
+        run: scripts/core-pins-test.sh
+
       - name: Check the changelog fragments
         if: github.event_name != 'pull_request'
         run: scripts/changelog-check.sh

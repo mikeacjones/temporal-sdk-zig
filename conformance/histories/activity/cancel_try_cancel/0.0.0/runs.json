@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-activity/cancel_try_cancel",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-activity/cancel_try_cancel"
+    }
+  ]
+}
