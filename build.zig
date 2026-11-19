@@ -126,6 +126,15 @@ pub fn build(b: *std.Build) void {
         .test_filters = test_filters,
         .forwarded = .{ .core_lib = core_lib_opt, .core_bundle = core_bundle_opt, .protoc = protoc_opt },
     });
+    // The test of the hang-dump script CI wraps samples-test in. It needs bash and ps, so a
+    // checkout runs it on hosts other than Windows; it prints a skip where ps or job control is
+    // missing.
+    if (b.graph.host.result.os.tag != .windows and pathExists(b, "scripts/run-with-hang-dump-test.sh")) {
+        const hang_dump = b.addSystemCommand(&.{ "bash", "scripts/run-with-hang-dump-test.sh" });
+        hang_dump.setCwd(b.path("."));
+        hang_dump.has_side_effects = true;
+        test_step.dependOn(&hang_dump.step);
+    }
     if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, .{
         .core_lib = core_lib_opt,
         .core_bundle = core_bundle_opt,
