@@ -40,6 +40,7 @@ const builtin = @import("builtin");
 const Scheduler = @import("Scheduler.zig");
 const WorkflowIo = @import("WorkflowIo.zig");
 const call_sites = @import("call_sites.zig");
+const system = @import("../nexus/system.zig");
 const Allocator = std.mem.Allocator;
 
 const act_pb = proto.coresdk.workflow_activation;
@@ -2142,6 +2143,24 @@ fn signalWithContext(inst: *Instance, target: SignalTarget, context: ?*const con
     });
 }
 
+/// Encodes `args` and `signal_args` with the target's converter context and sends a
+/// signal-with-start through the system Nexus endpoint. It goes through no interceptor and
+/// sends an empty header.
+pub fn signalWithStart(inst: *Instance, workflow_type: []const u8, options: workflow.SignalWithStartOptions, args: anytype, signal_name: []const u8, signal_args: anytype) workflow.SignalWithStartFuture {
+    if (inst.wio.refuse("signalWithStartWorkflow")) return .{ .ctx = &inst.ctx, .workflow_id = "", .state = error.InvalidOptions };
+    const a = inst.arena();
+    const workflow_id = a.dupe(u8, options.id) catch return .{ .ctx = &inst.ctx, .workflow_id = "", .state = error.OutOfMemory };
+    const fail: workflow.SignalWithStartFuture = .{ .ctx = &inst.ctx, .workflow_id = workflow_id, .state = error.OutOfMemory };
+    const context = inst.contextWith(.{ .workflow_id = options.id, .workflow_type = workflow_type }) catch return fail;
+    const payloads = converter.toPayloadsWithContext(a, context, args) catch return fail;
+    const signal_payloads = converter.toPayloadsWithContext(a, context, signal_args) catch return fail;
+    return .{
+        .ctx = &inst.ctx,
+        .workflow_id = workflow_id,
+        .state = inst.sendSignalWithStart(workflow_type, signal_name, options, payloads.items, signal_payloads.items, .{}),
+    };
+}
+
 /// Encodes `input`, adds the propagated values to the Nexus headers (see
 /// `nexusHeadersWithPropagated`), and schedules a Nexus operation through the outbound
 /// interceptors.
@@ -2929,6 +2948,119 @@ fn resolveNexusOperation(inst: *Instance, r: *const act_pb.ResolveNexusOperation
 }
 
 const NexusResult = proto.coresdk.nexus.NexusOperationResult;
+
+// ---------------------------------------------------------------- signal-with-start
+
+/// Validates `options` and schedules the signal-with-start: a ScheduleNexusOperation on the
+/// system endpoint whose input is the request's envelope. The request names no request ID,
+/// clock, or random value, so it is the same bytes on replay. `args`, `signal_args` and
+/// `header` must be arena memory; the request's strings are serialized into the envelope.
+fn sendSignalWithStart(
+    inst: *Instance,
+    workflow_type: []const u8,
+    signal_name: []const u8,
+    options: workflow.SignalWithStartOptions,
+    args: []const converter.Payload,
+    signal_args: []const converter.Payload,
+    header: converter.Header,
+) ScheduleError!*NexusOperationState {
+    const fields = .{ .WorkflowID = options.id, .WorkflowType = workflow_type, .SignalName = signal_name };
+    if (options.id.len == 0) {
+        inst.logger.warn("signalWithStartWorkflow: SignalWithStartOptions.id is empty; name the workflow to start and signal", fields);
+        return error.InvalidOptions;
+    }
+    if (workflow_type.len == 0 or signal_name.len == 0) {
+        inst.logger.warn("signalWithStartWorkflowByName: the workflow type or signal name is empty; name both", fields);
+        return error.InvalidOptions;
+    }
+    if (options.id_conflict_policy == .fail) {
+        inst.logger.warn("signalWithStartWorkflow: SignalWithStartOptions.id_conflict_policy .fail is refused by the server for signal-with-start; use .use_existing", fields);
+        return error.InvalidOptions;
+    }
+    inline for (.{ "execution_timeout", "run_timeout", "task_timeout", "start_delay" }) |name| {
+        if (@field(options, name)) |d| if (d.nanoseconds < 0) {
+            inst.logger.warn("signalWithStartWorkflow: SignalWithStartOptions." ++ name ++ " is negative; leave it null for none", fields);
+            return error.InvalidOptions;
+        };
+    }
+    // The server checks these while validating the command, and a command it refuses fails
+    // the workflow task on every attempt, so `get` would never return.
+    if (options.start_delay != null and options.cron_schedule.len > 0) {
+        inst.logger.warn("signalWithStartWorkflow: SignalWithStartOptions.start_delay and cron_schedule can't be used together; the server refuses the pair", fields);
+        return error.InvalidOptions;
+    }
+    inline for (.{ "id", "task_queue", "cron_schedule" }) |name| {
+        if (!std.unicode.utf8ValidateSlice(@field(options, name))) {
+            inst.logger.warn("signalWithStartWorkflow: SignalWithStartOptions." ++ name ++ " is not valid UTF-8", fields);
+            return error.InvalidOptions;
+        }
+    }
+    if (!std.unicode.utf8ValidateSlice(workflow_type) or !std.unicode.utf8ValidateSlice(signal_name)) {
+        inst.logger.warn("signalWithStartWorkflowByName: the workflow type or signal name is not valid UTF-8", fields);
+        return error.InvalidOptions;
+    }
+    if (options.retry_policy) |rp| if (retryPolicyError(rp)) |problem| {
+        inst.logger.warn("signalWithStartWorkflow: SignalWithStartOptions.retry_policy is one the server refuses", .{ .WorkflowID = options.id, .WorkflowType = workflow_type, .Problem = problem });
+        return error.InvalidOptions;
+    };
+    const a = inst.arena();
+    var request: system.SignalWithStartRequest = .{
+        .namespace = inst.namespace,
+        .workflow_id = options.id,
+        .workflow_type = .{ .name = workflow_type },
+        .task_queue = .{ .name = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue, .kind = .TASK_QUEUE_KIND_NORMAL },
+        .input = .{ .payloads = try payloadList(a, args) },
+        .workflow_execution_timeout = protoDuration(options.execution_timeout),
+        .workflow_run_timeout = protoDuration(options.run_timeout),
+        .workflow_task_timeout = protoDuration(options.task_timeout),
+        .workflow_start_delay = protoDuration(options.start_delay),
+        .workflow_id_reuse_policy = switch (options.id_reuse_policy) {
+            .unspecified => .WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED,
+            .allow_duplicate => .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+            .allow_duplicate_failed_only => .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+            .reject_duplicate => .WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+        },
+        .workflow_id_conflict_policy = switch (options.id_conflict_policy) {
+            .unspecified => .WORKFLOW_ID_CONFLICT_POLICY_UNSPECIFIED,
+            .fail => unreachable,
+            .use_existing => .WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+            .terminate_existing => .WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING,
+        },
+        .signal_name = signal_name,
+        .signal_input = .{ .payloads = try payloadList(a, signal_args) },
+        .cron_schedule = options.cron_schedule,
+    };
+    if (options.retry_policy) |rp| request.retry_policy = try protoRetryPolicy(a, rp);
+    if (options.memo.len > 0) {
+        var memo: common.Memo = .{};
+        try memo.fields.ensureTotalCapacity(a, options.memo.len);
+        for (options.memo) |f| memo.fields.appendAssumeCapacity(.{ .key = f.name, .value = f.value });
+        request.memo = memo;
+    }
+    if (options.search_attributes.len > 0) request.search_attributes = sa.toProto(a, options.search_attributes, .start) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidSearchAttribute => {
+            inst.logger.warn("signalWithStartWorkflow: SignalWithStartOptions.search_attributes holds a value the server can't index", fields);
+            return error.InvalidOptions;
+        },
+    };
+    if (header.fields.len > 0) request.header = .{ .fields = try header.toEntries(common.Header.FieldsEntry, a) };
+    const payload = try system.envelope(a, request);
+    return inst.scheduleNexusOperation(system.workflow_service, system.signal_with_start_operation, .{ .endpoint = system.endpoint }, payload);
+}
+
+/// Why the server would refuse `rp` (temporalio/temporal common/retrypolicy
+/// `ValidateRetryPolicy`), or null if it accepts it. Zero values mean the server's defaults.
+fn retryPolicyError(rp: workflow.RetryPolicy) ?[]const u8 {
+    if (rp.maximum_attempts < 0) return "maximum_attempts is negative; use 0 for unlimited";
+    if (rp.backoff_coefficient != 0 and !(rp.backoff_coefficient >= 1)) return "backoff_coefficient is below 1; use 0 for the default";
+    const initial: i96 = if (rp.initial_interval) |d| d.nanoseconds else 0;
+    const maximum: i96 = if (rp.maximum_interval) |d| d.nanoseconds else 0;
+    if (initial < 0) return "initial_interval is negative";
+    if (maximum < 0) return "maximum_interval is negative";
+    if (maximum > 0 and maximum < initial) return "maximum_interval is less than initial_interval";
+    return null;
+}
 
 // ---------------------------------------------------------------- external workflows
 
@@ -9963,4 +10095,257 @@ test "failure converter: a query handler's failure is sent through it, and the S
     const done = commandsOf(try bare.activate(&try initActivation(a, "Bare", .{}), a));
     try testing.expectStringStartsWith(done[0].variant.?.fail_workflow_execution.failure.?.message, "workflow \"Bare\" returned error.ContinueAsNew");
     try testing.expectEqual(@as(usize, 0), stamping.calls);
+}
+
+const SignalWithStartWf = struct {
+    const Add = workflow.SignalDef("add", fn (value: []const u8) void);
+    fn target(_: *workflow.Context, start: []const u8) ![]const u8 {
+        return start;
+    }
+    const Target = workflow.Def("Target", target);
+    const Tier = sa.key(.keyword, "Tier");
+
+    /// Signals-with-start `Target` with every option set; returns what `get` returned, as
+    /// "<id> <run> <started>" or the error's name.
+    fn full(ctx: *workflow.Context) ![]const u8 {
+        const memo = try converter.toFields(ctx.allocator(), .{ .note = @as([]const u8, "hello") });
+        const f = ctx.signalWithStartWorkflow(Target, .{
+            .id = "target-1",
+            .execution_timeout = .fromSeconds(60),
+            .run_timeout = .fromSeconds(30),
+            .task_timeout = .fromSeconds(5),
+            .start_delay = .fromMilliseconds(1500),
+            .id_reuse_policy = .allow_duplicate_failed_only,
+            .id_conflict_policy = .use_existing,
+            .retry_policy = .{ .maximum_attempts = 3 },
+            .memo = memo,
+            .search_attributes = &.{Tier.set("gold")},
+        }, .{"go"}, Add, .{"one"});
+        const r = f.get() catch |err| return @errorName(err);
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s} {}", .{ r.workflow_id, r.run_id, r.started });
+    }
+    const Full = workflow.Def("FullSignalWithStart", full);
+
+    /// The by-name form with the default options and a task queue.
+    fn byName(ctx: *workflow.Context) ![]const u8 {
+        const f = ctx.signalWithStartWorkflowByName("Target", .{ .id = "target-2", .task_queue = "other-tq" }, .{"go"}, "add", .{});
+        const r = f.get() catch |err| return @errorName(err);
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s} {}", .{ r.workflow_id, r.run_id, r.started });
+    }
+    const ByName = workflow.Def("ByNameSignalWithStart", byName);
+};
+
+/// The first activation's only command, which must be a ScheduleNexusOperation.
+fn signalWithStartCommand(inst: *Instance, a: Allocator, workflow_type: []const u8) !cmd_pb.ScheduleNexusOperation {
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, workflow_type, .{}), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expect(cmds[0].user_metadata == null);
+    return cmds[0].variant.?.schedule_nexus_operation;
+}
+
+test "signal-with-start: the command schedules the system operation with the request's envelope, the same bytes every run" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SignalWithStartWf.Full.registered, .{ .task_queue = "tq-1", .namespace = "ns-1" });
+    defer inst.destroy();
+    const cmd = try signalWithStartCommand(inst, a, "FullSignalWithStart");
+    try testing.expectEqualStrings("__temporal_system", cmd.endpoint);
+    try testing.expectEqualStrings("temporal.api.workflowservice.v1.WorkflowService", cmd.service);
+    try testing.expectEqualStrings("SignalWithStartWorkflowExecution", cmd.operation);
+    try testing.expect(cmd.cancellation_type == .WAIT_CANCELLATION_COMPLETED);
+    try testing.expect(cmd.schedule_to_close_timeout == null and cmd.schedule_to_start_timeout == null and cmd.start_to_close_timeout == null);
+    try testing.expectEqual(@as(usize, 0), cmd.nexus_header.items.len);
+
+    const input = cmd.input.?;
+    try testing.expect(system.isMarked(input));
+    const req = (try system.decode(a, input)).signal_with_start_request;
+    try testing.expectEqualStrings("ns-1", req.namespace);
+    try testing.expectEqualStrings("target-1", req.workflow_id);
+    try testing.expectEqualStrings("Target", req.workflow_type.?.name);
+    try testing.expectEqualStrings("tq-1", req.task_queue.?.name);
+    try testing.expect(req.task_queue.?.kind == .TASK_QUEUE_KIND_NORMAL);
+    try testing.expectEqualStrings("\"go\"", req.input.?.payloads.items[0].data);
+    try testing.expectEqualStrings("add", req.signal_name);
+    try testing.expectEqualStrings("\"one\"", req.signal_input.?.payloads.items[0].data);
+    try testing.expectEqual(@as(i64, 60), req.workflow_execution_timeout.?.seconds);
+    try testing.expectEqual(@as(i64, 30), req.workflow_run_timeout.?.seconds);
+    try testing.expectEqual(@as(i64, 5), req.workflow_task_timeout.?.seconds);
+    try testing.expectEqual(@as(i64, 1), req.workflow_start_delay.?.seconds);
+    try testing.expectEqual(@as(i32, 500_000_000), req.workflow_start_delay.?.nanos);
+    try testing.expect(req.workflow_id_reuse_policy == .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY);
+    try testing.expect(req.workflow_id_conflict_policy == .WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING);
+    try testing.expectEqual(@as(i32, 3), req.retry_policy.?.maximum_attempts);
+    try testing.expectEqualStrings("note", req.memo.?.fields.items[0].key);
+    try testing.expectEqualStrings("Tier", req.search_attributes.?.indexed_fields.items[0].key);
+    // Nothing the server refuses or that could differ on replay.
+    try testing.expectEqualStrings("", req.request_id);
+    try testing.expectEqualStrings("", req.identity);
+    try testing.expectEqualStrings("", req.control);
+    try testing.expectEqual(@as(usize, 0), req.links.items.len);
+    try testing.expect(req.header == null and req.user_metadata == null and req.versioning_override == null and req.priority == null and req.time_skipping_config == null);
+
+    // A second run of the same workflow (as on replay) sends the same bytes.
+    const again = try create(testing.allocator, SignalWithStartWf.Full.registered, .{ .task_queue = "tq-1", .namespace = "ns-1" });
+    defer again.destroy();
+    try testing.expectEqualSlices(u8, input.data, (try signalWithStartCommand(again, a, "FullSignalWithStart")).input.?.data);
+
+    // The response completes `get`.
+    const response = try system.envelope(a, system.SignalWithStartResponse{ .run_id = "run-9", .started = true });
+    try testing.expectEqualStrings("\"target-1 run-9 true\"", nexusResultOf(try inst.activate(&try nexusResolved(a, 1, .{ .completed = response }), a)));
+}
+
+test "signal-with-start: the by-name form takes the task queue and a response without the mark" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, SignalWithStartWf.ByName.registered, .{ .task_queue = "tq-1" });
+    defer inst.destroy();
+    const cmd = try signalWithStartCommand(inst, a, "ByNameSignalWithStart");
+    const req = (try system.decode(a, cmd.input.?)).signal_with_start_request;
+    try testing.expectEqualStrings("other-tq", req.task_queue.?.name);
+    try testing.expectEqualStrings("Target", req.workflow_type.?.name);
+    try testing.expectEqualStrings("\"go\"", req.input.?.payloads.items[0].data);
+    try testing.expectEqual(@as(usize, 0), req.signal_input.?.payloads.items.len);
+    try testing.expect(req.workflow_id_conflict_policy == .WORKFLOW_ID_CONFLICT_POLICY_UNSPECIFIED);
+    try testing.expect(req.memo == null and req.search_attributes == null and req.retry_policy == null);
+
+    const plain = try (converter.ProtoBinary(system.SignalWithStartResponse){ .message = .{ .run_id = "run-3" } }).toPayload(a);
+    try testing.expectEqualStrings("\"target-2 run-3 false\"", nexusResultOf(try inst.activate(&try nexusResolved(a, 1, .{ .completed = plain }), a)));
+}
+
+test "signal-with-start: get maps a taken ID, other failures, cancellation and a bad response to their errors" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const taken: Failure = .{
+        .message = "WorkflowExecutionAlreadyStarted: Workflow execution already finished. WorkflowId: target-1, RunId: r. Workflow Id reuse policy: reject duplicate workflow Id.",
+        .failure_info = .{ .server_failure_info = .{} },
+    };
+    const other: Failure = .{ .message = "InvalidArgument: bad cron", .failure_info = .{ .server_failure_info = .{} } };
+    const handler_taken: Failure = .{
+        .message = "Workflow execution already finished successfully. WorkflowId: target-1, RunId: r.",
+        .failure_info = .{ .nexus_handler_failure_info = .{ .type = "BAD_REQUEST" } },
+    };
+    const handler_other: Failure = .{ .message = handler_taken.message, .failure_info = .{ .nexus_handler_failure_info = .{ .type = "INTERNAL" } } };
+    // The prefix only counts on a server failure.
+    const app: Failure = .{ .message = taken.message, .failure_info = .{ .application_failure_info = .{} } };
+    const cases = [_]struct { status: NexusResult.status_union, want: []const u8 }{
+        .{ .status = .{ .failed = try nexusFailure(a, "nexus operation completed unsuccessfully", taken) }, .want = "WorkflowExecutionAlreadyStarted" },
+        .{ .status = .{ .failed = try nexusFailure(a, "nexus operation completed unsuccessfully", other) }, .want = "SignalWithStartFailed" },
+        .{ .status = .{ .failed = try nexusFailure(a, "nexus operation completed unsuccessfully", handler_taken) }, .want = "WorkflowExecutionAlreadyStarted" },
+        .{ .status = .{ .failed = try nexusFailure(a, "nexus operation completed unsuccessfully", handler_other) }, .want = "SignalWithStartFailed" },
+        .{ .status = .{ .failed = try nexusFailure(a, "nexus operation completed unsuccessfully", app) }, .want = "SignalWithStartFailed" },
+        .{ .status = .{ .timed_out = try nexusFailure(a, "timed out", .{ .message = "", .failure_info = .{ .timeout_failure_info = .{} } }) }, .want = "SignalWithStartFailed" },
+        .{ .status = .{ .cancelled = try nexusCanceledFailure(a, "canceled") }, .want = "Canceled" },
+        .{ .status = .{ .completed = try converter.toPayload(a, @as([]const u8, "not a response")) }, .want = "InvalidPayload" },
+    };
+    for (cases) |c| {
+        const inst = try create(testing.allocator, SignalWithStartWf.Full.registered, .{});
+        defer inst.destroy();
+        _ = try signalWithStartCommand(inst, a, "FullSignalWithStart");
+        const want = try std.fmt.allocPrint(a, "\"{s}\"", .{c.want});
+        try testing.expectEqualStrings(want, nexusResultOf(try inst.activate(&try nexusResolved(a, 1, c.status), a)));
+    }
+}
+
+test "signal-with-start: refused in a query handler like the other commands" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const W = struct {
+        fn query(ctx: *workflow.Context) []const u8 {
+            const f = ctx.signalWithStartWorkflow(SignalWithStartWf.Target, .{ .id = "t" }, .{"go"}, SignalWithStartWf.Add, .{"one"});
+            _ = f.get() catch |err| return @errorName(err);
+            return "sent";
+        }
+        fn run(ctx: *workflow.Context) ![]const u8 {
+            try ctx.setQueryHandler(workflow.QueryDef("try", fn () []const u8), ctx, query);
+            try ctx.sleep(.fromSeconds(60), .{});
+            return "";
+        }
+        const Def = workflow.Def("QuerySignalWithStart", run);
+    };
+    const inst = try create(testing.allocator, W.Def.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "QuerySignalWithStart", .{}), a);
+    const c = try inst.activate(&try queryActivation(a, &.{.{ "q1", "try", &.{} }}), a);
+    try testing.expectEqual(@as(usize, 1), commandsOf(c).len);
+    const failed = answer(c, 0).variant.?.failed;
+    try testing.expect(std.mem.find(u8, failed.message, "signalWithStartWorkflow") != null);
+}
+
+test "signal-with-start: start_delay with cron_schedule is InvalidOptions and sends nothing" {
+    // The server refuses this pair while validating the ScheduleNexusOperation command
+    // ("BadScheduleNexusOperationAttributes: CronSchedule and WorkflowStartDelay may not be
+    // used together."), which fails the caller's workflow task on every attempt: `get` would
+    // never return. The SDK knows the pair is invalid, so it must refuse it before sending.
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const W = struct {
+        fn run(ctx: *workflow.Context) ![]const u8 {
+            const f = ctx.signalWithStartWorkflow(SignalWithStartWf.Target, .{
+                .id = "target-cron",
+                .cron_schedule = "* * * * *",
+                .start_delay = .fromSeconds(5),
+            }, .{"go"}, SignalWithStartWf.Add, .{"one"});
+            _ = f.get() catch |err| return @errorName(err);
+            return "sent";
+        }
+        const Def = workflow.Def("CronDelaySignalWithStart", run);
+    };
+    const inst = try create(testing.allocator, W.Def.registered, .{});
+    defer inst.destroy();
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "CronDelaySignalWithStart", .{}), a));
+    for (cmds) |c| try testing.expect(c.variant.? != .schedule_nexus_operation);
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expectEqualStrings("\"InvalidOptions\"", cmds[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "signal-with-start: invalid UTF-8 and retry policies the server refuses are InvalidOptions and send nothing" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const W = struct {
+        fn run(ctx: *workflow.Context) ![]const u8 {
+            const T = SignalWithStartWf.Target;
+            const S = SignalWithStartWf.Add;
+            const calls = [_]workflow.SignalWithStartFuture{
+                ctx.signalWithStartWorkflow(T, .{ .id = "bad\xff" }, .{"go"}, S, .{"one"}),
+                ctx.signalWithStartWorkflow(T, .{ .id = "t", .task_queue = "\xc3" }, .{"go"}, S, .{"one"}),
+                ctx.signalWithStartWorkflowByName("T\xff", .{ .id = "t" }, .{"go"}, "add", .{"one"}),
+                ctx.signalWithStartWorkflowByName("Target", .{ .id = "t" }, .{"go"}, "a\xff", .{"one"}),
+                ctx.signalWithStartWorkflow(T, .{ .id = "t", .retry_policy = .{ .maximum_attempts = -1 } }, .{"go"}, S, .{"one"}),
+                ctx.signalWithStartWorkflow(T, .{ .id = "t", .retry_policy = .{ .backoff_coefficient = 0.5 } }, .{"go"}, S, .{"one"}),
+                ctx.signalWithStartWorkflow(T, .{ .id = "t", .retry_policy = .{ .initial_interval = .fromSeconds(-1) } }, .{"go"}, S, .{"one"}),
+                ctx.signalWithStartWorkflow(T, .{ .id = "t", .retry_policy = .{ .initial_interval = .fromSeconds(10), .maximum_interval = .fromSeconds(5) } }, .{"go"}, S, .{"one"}),
+            };
+            for (calls) |f| if (f.get()) |_| return "sent" else |err| if (err != error.InvalidOptions) return @errorName(err);
+            return "all invalid";
+        }
+        const Def = workflow.Def("InvalidMoreSignalWithStart", run);
+    };
+    const inst = try create(testing.allocator, W.Def.registered, .{});
+    defer inst.destroy();
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "InvalidMoreSignalWithStart", .{}), a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expectEqualStrings("\"all invalid\"", cmds[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "signal-with-start: a valid retry policy with defaults is sent" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const W = struct {
+        fn run(ctx: *workflow.Context) ![]const u8 {
+            _ = ctx.signalWithStartWorkflow(SignalWithStartWf.Target, .{ .id = "t", .retry_policy = .{ .backoff_coefficient = 2, .initial_interval = .fromSeconds(1), .maximum_interval = .fromSeconds(1) } }, .{"go"}, SignalWithStartWf.Add, .{"one"});
+            return "";
+        }
+        const Def = workflow.Def("ValidRetrySignalWithStart", run);
+    };
+    const inst = try create(testing.allocator, W.Def.registered, .{});
+    defer inst.destroy();
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "ValidRetrySignalWithStart", .{}), a));
+    try testing.expect(cmds[0].variant.? == .schedule_nexus_operation);
 }

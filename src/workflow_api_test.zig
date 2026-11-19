@@ -484,3 +484,252 @@ test "workflow: the worker answers __stack_trace with no handler, and the run's 
     try replayer.registerWorkflow(BlockedWorkflow);
     try replayer.replayHistory(history);
 }
+
+/// The dev server only accepts signal-with-start from a workflow with this setting on.
+const signal_with_start_args = [_][]const u8{ "--dynamic-config-value", "history.enableSignalWithStartFromWorkflow=true" };
+
+const SignalWithStart = struct {
+    const Add = workflow.SignalDef("add", fn (value: []const u8) void);
+
+    /// Waits for two `add` signals and returns "started: <start>|signal: <first>|signal: <second>".
+    fn target(ctx: *workflow.Context, start: []const u8) ![]const u8 {
+        const ch = try ctx.signalChannel(Add);
+        const first = try ch.receive();
+        const second = try ch.receive();
+        return std.fmt.allocPrint(ctx.allocator(), "started: {s}|signal: {s}|signal: {s}", .{ start, first, second });
+    }
+    const Target = workflow.Def("sws_target", target);
+
+    /// Returns its argument at once.
+    fn done(_: *workflow.Context, value: []const u8) ![]const u8 {
+        return value;
+    }
+    const Done = workflow.Def("sws_done", done);
+
+    /// Signals-with-start `Target` as `id` twice: typed, starting it, then by name under
+    /// use-existing. Returns "<id> <run> <started> <run> <started>".
+    fn caller(ctx: *workflow.Context, id: []const u8) ![]const u8 {
+        const first = try ctx.signalWithStartWorkflow(Target, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{"go"}, Add, .{"one"}).get();
+        const by_name = ctx.signalWithStartWorkflowByName("sws_target", .{ .id = id, .id_conflict_policy = .use_existing }, .{@as([]const u8, "ignored")}, "add", .{@as([]const u8, "two")});
+        const second = try by_name.get();
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s} {} {s} {}", .{ first.workflow_id, first.run_id, first.started, second.run_id, second.started });
+    }
+    const Caller = workflow.Def("sws_caller", caller);
+
+    /// `caller` with its first call replaced by a timer.
+    fn callerChanged(ctx: *workflow.Context, id: []const u8) ![]const u8 {
+        try ctx.sleep(.fromSeconds(1), .{});
+        return id;
+    }
+
+    /// Signals-with-start `Done` as `id` under reject-duplicate; returns the error's name and
+    /// the failure's messages down its causes.
+    fn refused(ctx: *workflow.Context, id: []const u8) ![]const u8 {
+        const f = ctx.signalWithStartWorkflow(Done, .{ .id = id, .id_reuse_policy = .reject_duplicate }, .{"again"}, Add, .{"one"});
+        const result = f.get() catch |err| {
+            var out: std.ArrayList(u8) = .empty;
+            try out.appendSlice(ctx.allocator(), @errorName(err));
+            var cause = f.failure();
+            while (cause) |c| : (cause = c.cause) {
+                try out.print(ctx.allocator(), " <- {s}", .{c.message});
+                if (c.failure_info) |i| switch (i) {
+                    .nexus_handler_failure_info => |h| try out.print(ctx.allocator(), " [handler {s}]", .{h.type}),
+                    .application_failure_info => |h| try out.print(ctx.allocator(), " [app {s} nonretry={}]", .{ h.type, h.non_retryable }),
+                    else => |t| try out.print(ctx.allocator(), " [{s}]", .{@tagName(t)}),
+                };
+            }
+            return out.items;
+        };
+        return std.fmt.allocPrint(ctx.allocator(), "sent: {s}", .{result.run_id});
+    }
+    const Refused = workflow.Def("sws_refused", refused);
+
+    /// Each invalid option set, by error name, comma-separated.
+    fn invalid(ctx: *workflow.Context, id: []const u8) ![]const u8 {
+        const a = ctx.allocator();
+        var out: std.ArrayList(u8) = .empty;
+        const calls = [_]workflow.SignalWithStartFuture{
+            ctx.signalWithStartWorkflow(Target, .{ .id = "" }, .{"go"}, Add, .{"one"}),
+            ctx.signalWithStartWorkflowByName("", .{ .id = id }, .{"go"}, "add", .{"one"}),
+            ctx.signalWithStartWorkflowByName("sws_target", .{ .id = id }, .{"go"}, "", .{"one"}),
+            ctx.signalWithStartWorkflow(Target, .{ .id = id, .id_conflict_policy = .fail }, .{"go"}, Add, .{"one"}),
+            ctx.signalWithStartWorkflow(Target, .{ .id = id, .run_timeout = .fromSeconds(-1) }, .{"go"}, Add, .{"one"}),
+            ctx.signalWithStartWorkflow(Target, .{ .id = id, .start_delay = .fromSeconds(-1) }, .{"go"}, Add, .{"one"}),
+        };
+        for (calls) |f| {
+            if (!f.isReady()) return error.NotReady;
+            if (f.failure() != null) return error.FailureSet;
+            if (f.get()) |_| try out.appendSlice(a, "sent,") else |err| try out.print(a, "{s},", .{@errorName(err)});
+        }
+        return out.items;
+    }
+    const Invalid = workflow.Def("sws_invalid", invalid);
+
+    fn waitForResult(f: workflow.SignalWithStartFuture) workflow.SignalWithStartError!workflow.SignalWithStartResult {
+        return f.get();
+    }
+
+    /// Cancels the coroutine waiting in `get` in the same workflow task; returns the error's
+    /// name and whether the failure is set.
+    fn cancel(ctx: *workflow.Context, id: []const u8) ![]const u8 {
+        const io = ctx.io();
+        const f = ctx.signalWithStartWorkflow(Target, .{ .id = id }, .{"go"}, Add, .{"one"});
+        var waiting = io.async(waitForResult, .{f});
+        const outcome = waiting.cancel(io);
+        if (outcome) |_| return "sent" else |err| return std.fmt.allocPrint(ctx.allocator(), "{s} failure={}", .{ @errorName(err), f.failure() != null });
+    }
+    const Cancel = workflow.Def("sws_cancel", cancel);
+};
+
+fn startSignalWithStartEnv(codecs: []const converter.PayloadCodec) !*testing_ns.WorkflowEnvironment {
+    const env = try testing_ns.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .dev_server_extra_args = &signal_with_start_args,
+        .codecs = codecs,
+    });
+    errdefer env.deinit();
+    inline for (.{ SignalWithStart.Target, SignalWithStart.Done, SignalWithStart.Caller, SignalWithStart.Refused, SignalWithStart.Invalid, SignalWithStart.Cancel }) |W| try env.registerWorkflow(W);
+    return env;
+}
+
+/// Runs `SignalWithStart.Caller` and checks its answers and the target's result.
+fn expectStartThenSignal(env: *testing_ns.WorkflowEnvironment, a: std.mem.Allocator) !void {
+    const id = try std.fmt.allocPrint(a, "sws-target-{s}", .{env.task_queue});
+    const result = try env.executeWorkflow(SignalWithStart.Caller, .{id}, a, null);
+    var parts = std.mem.splitScalar(u8, result, ' ');
+    try testing.expectEqualStrings(id, parts.next().?);
+    const run_id = parts.next().?;
+    try testing.expect(run_id.len > 0);
+    try testing.expectEqualStrings("true", parts.next().?);
+    try testing.expectEqualStrings(run_id, parts.next().?);
+    try testing.expectEqualStrings("false", parts.next().?);
+
+    var target = try env.client.getWorkflow([]const u8, id, run_id);
+    defer target.deinit();
+    try testing.expectEqualStrings("started: go|signal: one|signal: two", try env.getResult(SignalWithStart.Target, &target, a, null));
+}
+
+test "workflow: signalWithStartWorkflow starts the target, then only signals it under use-existing" {
+    const env = try startSignalWithStartEnv(&.{});
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try expectStartThenSignal(env, arena.allocator());
+}
+
+/// Wraps each payload in one of encoding "test/wrapped" holding it serialized, so no payload
+/// reaches the server as it was.
+const WrappingCodec = struct {
+    const encoding = "test/wrapped";
+    encoded: std.atomic.Value(u32) = .init(0),
+
+    fn codec(w: *WrappingCodec) converter.PayloadCodec {
+        return .{ .ptr = w, .vtable = &.{ .encode = encode, .decode = decode } };
+    }
+
+    fn encode(ptr: *anyopaque, arena: std.mem.Allocator, _: std.Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const w: *WrappingCodec = @ptrCast(@alignCast(ptr));
+        _ = w.encoded.fetchAdd(@intCast(payloads.len), .monotonic);
+        const out = try arena.alloc(converter.Payload, payloads.len);
+        for (payloads, out) |p, *o| {
+            var serialized: std.Io.Writer.Allocating = .init(arena);
+            p.encode(&serialized.writer, arena) catch return error.OutOfMemory;
+            o.* = try converter.payloadWithEncoding(arena, encoding, serialized.written());
+        }
+        return out;
+    }
+
+    fn decode(_: *anyopaque, arena: std.mem.Allocator, _: std.Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const out = try arena.dupe(converter.Payload, payloads);
+        for (out) |*p| {
+            if (!std.mem.eql(u8, converter.encodingOf(p.*) orelse "", encoding)) continue;
+            var reader: std.Io.Reader = .fixed(try arena.dupe(u8, p.data));
+            p.* = converter.Payload.decode(&reader, arena) catch return error.CodecFailed;
+        }
+        return out;
+    }
+};
+
+test "workflow: signalWithStartWorkflow through a worker's encoding codec reaches the target decodable" {
+    var wrapping: WrappingCodec = .{};
+    const codecs = [_]converter.PayloadCodec{wrapping.codec()};
+    const env = try startSignalWithStartEnv(&codecs);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try expectStartThenSignal(env, a);
+
+    // The target's start argument and signals reached the server wrapped.
+    const id = try std.fmt.allocPrint(a, "sws-target-{s}", .{env.task_queue});
+    var raw = try @import("client.zig").Client.connect(testing.allocator, testing.io, env.server.dev.clientOptions());
+    defer raw.close();
+    const history = try raw.fetchHistory(a, id, "");
+    var wrapped: usize = 0;
+    for (history.events.items) |event| switch (event.attributes.?) {
+        .workflow_execution_started_event_attributes => |attrs| {
+            for (attrs.input.?.payloads.items) |p| try testing.expectEqualStrings(WrappingCodec.encoding, converter.encodingOf(p).?);
+            wrapped += 1;
+        },
+        .workflow_execution_signaled_event_attributes => |attrs| {
+            for (attrs.input.?.payloads.items) |p| try testing.expectEqualStrings(WrappingCodec.encoding, converter.encodingOf(p).?);
+            wrapped += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 3), wrapped);
+}
+
+test "workflow: signalWithStartWorkflow on a closed workflow under reject-duplicate returns WorkflowExecutionAlreadyStarted" {
+    const env = try startSignalWithStartEnv(&.{});
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const id = try std.fmt.allocPrint(a, "sws-done-{s}", .{env.task_queue});
+    try testing.expectEqualStrings("first", try env.executeWorkflowWithOptions(SignalWithStart.Done, .{ .id = id }, .{"first"}, a, null));
+    const result = try env.executeWorkflow(SignalWithStart.Refused, .{id}, a, null);
+    try testing.expect(std.mem.startsWith(u8, result, "WorkflowExecutionAlreadyStarted <- nexus operation completed unsuccessfully [nexus_operation_execution_failure_info] <- WorkflowExecutionAlreadyStarted: Workflow execution already finished."));
+    try testing.expect(std.mem.endsWith(u8, result, "[server_failure_info]"));
+}
+
+test "workflow: invalid signalWithStartWorkflow options return InvalidOptions and send nothing" {
+    const env = try startSignalWithStartEnv(&.{});
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(SignalWithStart.Invalid, .{}, .{"sws-invalid"});
+    defer run.deinit();
+    try testing.expectEqualStrings("InvalidOptions,InvalidOptions,InvalidOptions,InvalidOptions,InvalidOptions,InvalidOptions,", try env.getResult(SignalWithStart.Invalid, &run, a, null));
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    for (history.events.items) |event| try testing.expect(event.attributes.? != .nexus_operation_scheduled_event_attributes);
+}
+
+test "workflow: canceling the coroutine waiting on signalWithStartWorkflow returns Canceled" {
+    const env = try startSignalWithStartEnv(&.{});
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = try std.fmt.allocPrint(a, "sws-cancel-{s}", .{env.task_queue});
+    try testing.expectEqualStrings("Canceled failure=true", try env.executeWorkflow(SignalWithStart.Cancel, .{id}, a, null));
+}
+
+/// A dev-server run of `SignalWithStart.Caller` for target "sws-recorded-target" (started
+/// with the flag in `signal_with_start_args`), fetched with `Client.fetchHistory` and encoded
+/// as ProtoJSON (`temporal.protojson.encode`), indented.
+const signal_with_start_history = @embedFile("testdata/signal_with_start_history.json");
+
+test "WorkflowReplayer replays a signal-with-start and catches a workflow that starts a timer instead" {
+    var ok: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(SignalWithStart.Caller);
+    try ok.replayHistoryJson(signal_with_start_history);
+
+    var changed: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(workflow.Def("sws_caller", SignalWithStart.callerChanged));
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(signal_with_start_history));
+}
