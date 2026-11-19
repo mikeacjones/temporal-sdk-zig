@@ -398,6 +398,25 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
 
     // zig build tsan
     {
+        // Renders a known-findings file and runs `artifact` with it through `exec`, which
+        // also makes a report end the process with exit 66 (see tools/checks/tsan_suppressions.zig).
+        const Known = struct {
+            fn run(b2: *std.Build, tool: *std.Build.Step.Compile, zon: []const u8, artifact: *std.Build.Step.Compile) *std.Build.Step.Run {
+                const render = b2.addRunArtifact(tool);
+                render.setName(b2.fmt("render {s}", .{zon}));
+                render.addArg("render");
+                render.addFileArg(b2.path(zon));
+                const exec = b2.addRunArtifact(tool);
+                exec.addArg("exec");
+                exec.addFileArg(render.captureStdOut(.{ .basename = "tsan.supp" }));
+                exec.addArtifactArg(artifact);
+                return exec;
+            }
+        };
+        const suppressions_tool = checkTool(b, "tsan-suppressions", "tools/checks/tsan_suppressions.zig");
+        const suppressions_tests = b.addTest(.{ .name = "tsan-suppressions", .root_module = suppressions_tool.root_module, .filters = in.test_filters });
+        in.test_step.dependOn(&b.addRunArtifact(suppressions_tests).step);
+
         // Mirrors the unit test module of `build()`, with Thread Sanitizer. The core library
         // is not instrumented.
         const module = b.createModule(.{
@@ -415,22 +434,32 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         module.addOptions("build_options", in.build_options);
         linkCoreLib(module, in.target, in.core.lib);
         const tests = b.addTest(.{ .name = "tsan-unit-tests", .root_module = module, .filters = in.test_filters });
-        // When the sanitizer reported anything, the runtime ends the process at exit (see
-        // the "tsan race" case), which fails the run even when every test passed.
-        b.step("tsan", "Run the unit tests under Thread Sanitizer").dependOn(&b.addRunArtifact(tests).step);
+        // When the sanitizer reported anything, the runtime exits 66 at exit (see the
+        // "tsan race" case), which fails the run even when every test passed.
+        const run = Known.run(b, suppressions_tool, "tools/checks/tsan.zon", tests);
+        run.setName("run test tsan-unit-tests");
+        run.enableTestRunnerMode();
+        b.step("tsan", "Run the unit tests under Thread Sanitizer").dependOn(&run.step);
 
         // Libc, so that threads come from pthreads, which the sanitizer intercepts.
         const race_tool = checkTool(b, "tsan-race-fixture", "tools/checks/fixtures/tsan/race.zig");
         race_tool.root_module.sanitize_thread = true;
         race_tool.root_module.link_libc = true;
-        // How the runtime ends a process that reported: on Apple platforms its
-        // `abort_on_error` flag defaults to true, so it aborts; elsewhere it exits 66.
-        const race = b.addRunArtifact(race_tool);
-        race.setName("check tsan race");
-        race.has_side_effects = true;
-        race.addCheck(.{ .expect_term = if (comptime builtin.os.tag.isDarwin()) .{ .signal = .ABRT } else .{ .exited = 66 } });
+        // On Apple platforms `abort_on_error` defaults to true, which would end the process
+        // with SIGABRT and leave a crash report.
+        const race = addCheckCase(b, in.test_step, race_tool, "tsan race", 66);
+        race.setEnvironmentVariable("TSAN_OPTIONS", "abort_on_error=0");
         race.expectStdErrMatch("WARNING: ThreadSanitizer: data race");
-        in.test_step.dependOn(&race.step);
+
+        // The same program with its racing function listed: the suppression must take, and
+        // `exec` keeps the caller's options (the runtime prints matches only when asked).
+        const known = Known.run(b, suppressions_tool, "tools/checks/fixtures/tsan/known.zon", race_tool);
+        known.setName("check tsan known finding");
+        known.has_side_effects = true;
+        known.setEnvironmentVariable("TSAN_OPTIONS", "print_suppressions=1");
+        known.expectExitCode(0);
+        known.expectStdErrMatch("ThreadSanitizer: Matched");
+        in.test_step.dependOn(&known.step);
 
         const mutex_tool = checkTool(b, "tsan-mutex-fixture", "tools/checks/fixtures/tsan/mutex.zig");
         mutex_tool.root_module.sanitize_thread = true;

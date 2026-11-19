@@ -1,0 +1,9 @@
+// Known Thread Sanitizer findings that `zig build tsan` suppresses. Each entry is a real
+// race in SDK code, filed as a bug:
+//   .{ .site = "<function as the report prints it>", .bead = "temporal-sdk-zig-<id>",
+//      .reason = "<what races and why it is not fixed here>", .kind = .race }
+// `kind` is optional and defaults to `.race`. Remove an entry when its bead closes: the
+// command cannot tell that an entry matched nothing.
+// A false report from a handoff through the core, which is not instrumented, is never
+// listed here: annotate the handoff instead (see src/bridge/tsan.zig).
+.{}
