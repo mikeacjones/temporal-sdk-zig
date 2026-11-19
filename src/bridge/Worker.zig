@@ -24,6 +24,8 @@ const bytes = @import("bytes.zig");
 const Runtime = @import("Runtime.zig");
 const Connection = @import("Connection.zig");
 const Completion = @import("completion.zig").Completion;
+const handToCore = @import("tsan.zig").handToCore;
+const takeFromCore = @import("tsan.zig").takeFromCore;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -236,6 +238,7 @@ pub fn deinit(w: Worker) void {
 /// `failure` (if given) receives the reason.
 pub fn validate(w: Worker, gpa: Allocator, io: Io, failure: ?*?[]u8) error{ OutOfMemory, ValidationFailed }!void {
     const done = try Completion(?bytes.Owned).create(gpa, io, freeOwned);
+    handToCore(done);
     c.temporal_core_worker_validate(w.ptr, done, onDone);
     return finishDone(gpa, done.waitUncancelable(), failure, error.ValidationFailed);
 }
@@ -265,6 +268,7 @@ const PollFn = *const fn (?*c.TemporalCoreWorker, ?*anyopaque, c.TemporalCoreWor
 
 fn poll(w: Worker, gpa: Allocator, io: Io, poll_fn: PollFn, failure: ?*?[]u8) PollError!?Polled {
     const done = try Completion(PollResult).create(gpa, io, PollResult.free);
+    handToCore(done);
     poll_fn(w.ptr, done, onPoll);
     const result = done.waitUncancelable();
     if (result.fail) |fail| {
@@ -298,6 +302,7 @@ const CompleteFn = *const fn (?*c.TemporalCoreWorker, c.TemporalCoreByteArrayRef
 
 fn complete(w: Worker, gpa: Allocator, io: Io, complete_fn: CompleteFn, completion: []const u8, failure: ?*?[]u8) CompleteError!void {
     const done = try Completion(?bytes.Owned).create(gpa, io, freeOwned);
+    handToCore(done);
     complete_fn(w.ptr, bytes.ref(completion), done, onDone);
     // Completions are always awaited: the core must learn the outcome of every task.
     return finishDone(gpa, done.waitUncancelable(), failure, error.CompletionFailed);
@@ -334,6 +339,7 @@ pub fn initiateShutdown(w: Worker) void {
 /// another thread (see the lifecycle above): the core does not guard against that, and it hangs.
 pub fn finalizeShutdown(w: Worker, gpa: Allocator, io: Io, failure: ?*?[]u8) error{ OutOfMemory, ShutdownFailed }!void {
     const done = try Completion(?bytes.Owned).create(gpa, io, freeOwned);
+    handToCore(done);
     c.temporal_core_worker_finalize_shutdown(w.ptr, done, onDone);
     return finishDone(gpa, done.waitUncancelable(), failure, error.ShutdownFailed);
 }
@@ -349,11 +355,13 @@ const PollResult = struct {
 };
 
 fn onPoll(user_data: ?*anyopaque, success: ?*const c.TemporalCoreByteArray, fail: ?*const c.TemporalCoreByteArray) callconv(.c) void {
+    takeFromCore(user_data.?);
     const done: *Completion(PollResult) = @ptrCast(@alignCast(user_data.?));
     done.complete(.{ .success = bytes.Owned.take(null, success), .fail = bytes.Owned.take(null, fail) });
 }
 
 fn onDone(user_data: ?*anyopaque, fail: ?*const c.TemporalCoreByteArray) callconv(.c) void {
+    takeFromCore(user_data.?);
     const done: *Completion(?bytes.Owned) = @ptrCast(@alignCast(user_data.?));
     done.complete(bytes.Owned.take(null, fail));
 }
@@ -549,6 +557,39 @@ test "a workflow started by RPC is polled, completed, and shut down through the 
             .status = .{ .successful = .{} },
         }, a), &failure);
     }
+    try worker.finalizeShutdown(testing.allocator, testing.io, &failure);
+}
+
+// Under `zig build tsan -Doptimize=ReleaseSafe` the sanitizer reports each completion that
+// `validate`, `pollWorkflowActivation` and `finalizeShutdown` hand to a core thread (`onDone`,
+// `onPoll`), as for `Connecting` in Connection.zig: the core is not instrumented, so only an
+// annotation orders the handoff. A report makes the sanitized run exit 66. Without the
+// sanitizer the annotations compile to nothing and there is no report to check, so the test
+// runs only under it.
+test "a worker's validate, poll and shutdown completions are handed to core threads in order" {
+    if (!@import("builtin").sanitize_thread) return error.SkipZigTest;
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    const url = try std.fmt.allocPrint(testing.allocator, "http://{s}", .{server.target});
+    defer testing.allocator.free(url);
+    const conn = try Connection.connect(testing.allocator, testing.io, rt, .{ .target_url = url, .identity = "worker-handoff-test@zig" }, null);
+    defer conn.deinit();
+
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    const worker = try Worker.init(testing.allocator, conn, .{
+        .namespace = "default",
+        .task_queue = "bridge-worker-handoff-test",
+        .task_types = .{ .local_activities = false, .remote_activities = false, .nexus = false },
+        .workflow_task_pollers = .{ .simple_maximum = 2 },
+    }, &failure);
+    defer worker.deinit();
+    try worker.validate(testing.allocator, testing.io, &failure);
+
+    worker.initiateShutdown();
+    while (try worker.pollWorkflowActivation(testing.allocator, testing.io, &failure)) |polled| polled.deinit();
     try worker.finalizeShutdown(testing.allocator, testing.io, &failure);
 }
 

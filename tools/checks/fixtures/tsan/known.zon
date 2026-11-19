@@ -1,0 +1,8 @@
+// The racing function of race.zig, for the "tsan known finding" case.
+.{
+    .{
+        .site = "race.write",
+        .bead = "temporal-sdk-zig-d51.1.25",
+        .reason = "The fixture's deliberate race, to check that a listed site is suppressed.",
+    },
+}

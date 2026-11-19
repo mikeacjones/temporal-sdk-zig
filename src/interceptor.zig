@@ -22,12 +22,13 @@
 //! `client.Options.worker_interceptors`). For each workflow run and each activity attempt, a
 //! `Worker` interceptor hands out the run's interceptors: `WorkflowInbound` around what
 //! reaches the workflow (its start, signals, queries, updates), `WorkflowOutbound` around what
-//! the workflow sends (activities, children, signals, continue-as-new, its logger), and
-//! `ActivityInbound` and `ActivityOutbound` likewise for an activity. For each Nexus request
-//! the worker handles, it hands out `NexusOperationInbound`, around the start and the cancel
-//! of the operation, and `NexusOperationOutbound`, around the handler's logger. A workflow's
-//! Nexus calls pass through `WorkflowOutbound.executeNexusOperation`. The first interceptor in
-//! a list is the outermost.
+//! the workflow sends (activities, children, signals, signal-with-start, continue-as-new, its
+//! logger), and `ActivityInbound` and `ActivityOutbound` likewise for an activity. For each
+//! Nexus request the worker handles, it hands out `NexusOperationInbound`, around the start
+//! and the cancel of the operation, and `NexusOperationOutbound`, around the handler's logger.
+//! A workflow's Nexus calls pass through `WorkflowOutbound.executeNexusOperation`, except a
+//! signal-with-start, which passes through `WorkflowOutbound.signalWithStartWorkflow` only.
+//! The first interceptor in a list is the outermost.
 //!
 //! Clients take `Client` interceptors (`client.Options.interceptors`), which wrap every request
 //! the client sends to the server (`ClientCall`): they see each operation's method and its
@@ -254,6 +255,21 @@ pub const SignalExternalInput = struct {
     header: *HeaderWriter,
 };
 
+/// Experimental: a signal-with-start the workflow sends, from `ctx.signalWithStartWorkflow` or
+/// `signalWithStartWorkflowByName`. `header` holds what the propagators wrote; change it in
+/// place. Its values become the request's header, which the target reads in
+/// `ctx.propagated()`. Arguments are arena memory of the run, and a changed `args` or
+/// `signal_args` must be `ctx.allocator()` memory. Options are validated after the
+/// interceptors.
+pub const SignalWithStartInput = struct {
+    workflow_type: []const u8,
+    signal_name: []const u8,
+    options: workflow.SignalWithStartOptions,
+    args: EncodedValues,
+    signal_args: EncodedValues,
+    header: *HeaderWriter,
+};
+
 /// A cancellation request the workflow sends to another workflow.
 pub const CancelExternalInput = struct {
     workflow_id: []const u8,
@@ -318,6 +334,20 @@ pub const WorkflowOutbound = struct {
         /// the endpoint, service or operation is a nondeterministic change for histories
         /// recorded without it; changing headers is not.
         executeNexusOperation: ?*const fn (ptr: *anyopaque, input: NexusOperationInput, next: Next) workflow.NexusOperationFuture(Payload) = null,
+        /// Experimental: sends a signal-with-start, for `ctx.signalWithStartWorkflow` and
+        /// `signalWithStartWorkflowByName`. The call goes to the server's system Nexus
+        /// endpoint `__temporal_system`, but `executeNexusOperation` is not called for it:
+        /// this entry is its only one. The root builds the request from what the
+        /// interceptors pass on, so a changed argument, option or header value is what the
+        /// server receives.
+        ///
+        /// A workflow's own `executeNexusOperationByName` call on endpoint
+        /// `__temporal_system` is an ordinary Nexus call: it goes through
+        /// `executeNexusOperation`, its input is converted by the payload converter and is
+        /// not marked as a system payload, so the codecs encode it whole, and propagated
+        /// values are added to it as Nexus headers, which the server refuses on that
+        /// endpoint (the workflow task fails).
+        signalWithStartWorkflow: ?*const fn (ptr: *anyopaque, input: SignalWithStartInput, next: Next) workflow.SignalWithStartFuture = null,
         /// The logger `ctx.logger()` returns, called on every `ctx.logger()`. Add fields with
         /// `with` (cache the result: the run's arena grows with each call).
         logger: ?*const fn (ptr: *anyopaque, input: LoggerInput, next: Next) log.Logger = null,
@@ -351,6 +381,9 @@ pub const WorkflowOutbound = struct {
         }
         pub fn executeNexusOperation(n: Next, input: NexusOperationInput) workflow.NexusOperationFuture(Payload) {
             return dispatch(WorkflowOutbound, "executeNexusOperation", n, input);
+        }
+        pub fn signalWithStartWorkflow(n: Next, input: SignalWithStartInput) workflow.SignalWithStartFuture {
+            return dispatch(WorkflowOutbound, "signalWithStartWorkflow", n, input);
         }
         pub fn logger(n: Next, input: LoggerInput) log.Logger {
             return dispatch(WorkflowOutbound, "logger", n, input);

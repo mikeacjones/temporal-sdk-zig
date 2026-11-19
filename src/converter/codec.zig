@@ -5,6 +5,7 @@ const std = @import("std");
 const proto = @import("../proto.zig");
 const converter = @import("../converter.zig");
 const propagation = @import("../propagation.zig");
+const system = @import("../nexus/system.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Payload = converter.Payload;
@@ -13,7 +14,9 @@ const flate = std.compress.flate;
 const log = std.log.scoped(.temporal);
 
 /// `CodecFailed` covers payloads a codec can't transform (corrupt or foreign data, a missing
-/// key); the codec logs why under the `temporal` scope.
+/// key); the codec logs why under the `temporal` scope. `encodeMessage` and `decodeMessage`
+/// also return it, logged, for a payload marked `__temporal_system_payload: "true"` of a
+/// message type the SDK doesn't know.
 pub const CodecError = error{ OutOfMemory, Canceled, CodecFailed };
 
 /// What a conversion is for: the call whose payloads a codec encodes or decodes, or whose
@@ -151,13 +154,19 @@ fn checkCount(want: usize, got: []Payload, comptime what: []const u8) CodecError
 /// Encodes every payload in the protobuf message `msg` with `codecs` (see `visitPayloads`
 /// for which ones), replacing them in place, passing `context` to each codec. Memory comes
 /// from `arena`; `msg` may borrow memory it doesn't own, which is left unchanged. No codecs
-/// leaves `msg` as it is.
+/// leaves `msg` as it is. A payload marked `__temporal_system_payload: "true"` (a system
+/// Nexus envelope) is not given to the codecs; the payloads inside it are, with the context
+/// of the workflow its request names. A marked payload of a message type the SDK doesn't
+/// know is `error.CodecFailed` (logged).
 pub fn encodeMessage(comptime T: type, msg: *T, codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const Context) CodecError!void {
     if (codecs.len == 0) return;
     return visitPayloads(T, msg, arena, ChainVisitor{ .codecs = codecs, .arena = arena, .io = io, .context = context, .encode = true });
 }
 
-/// Decodes every payload in the protobuf message `msg` with `codecs`, as `encodeMessage`.
+/// Decodes every payload in the protobuf message `msg` with `codecs`, as `encodeMessage`. A
+/// payload marked `__temporal_system_payload: "true"` is not given to the codecs; the
+/// payloads inside it are, with the context of the workflow its request names. A marked
+/// payload of a message type the SDK doesn't know is `error.CodecFailed` (logged).
 pub fn decodeMessage(comptime T: type, msg: *T, codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const Context) CodecError!void {
     if (codecs.len == 0) return;
     return visitPayloads(T, msg, arena, ChainVisitor{ .codecs = codecs, .arena = arena, .io = io, .context = context, .encode = false });
@@ -169,9 +178,77 @@ const ChainVisitor = struct {
     io: Io,
     context: *const Context,
     encode: bool,
+    /// How many system envelopes enclose the payloads being visited.
+    depth: u8 = 0,
+
+    /// The deepest nesting of system envelopes the pass opens. The SDK writes one level;
+    /// the limit keeps a payload's author, who decides how deep envelopes nest, from
+    /// overflowing the stack of the thread doing the pass.
+    const max_system_payload_depth = 8;
 
     pub fn visit(v: ChainVisitor, payloads: []const Payload) CodecError![]Payload {
-        return chainPayloads(v.codecs, v.arena, v.io, v.context, payloads, v.encode);
+        const any_marked = for (payloads) |p| {
+            if (system.isMarked(p)) break true;
+        } else false;
+        if (!any_marked) return chainPayloads(v.codecs, v.arena, v.io, v.context, payloads, v.encode);
+
+        // The unmarked payloads are still coded together in one call, and go back to their
+        // positions; each marked one is opened instead of coded.
+        var plain: std.ArrayList(Payload) = .empty;
+        for (payloads) |p| if (!system.isMarked(p)) try plain.append(v.arena, p);
+        const coded = if (plain.items.len == 0)
+            plain.items
+        else
+            try chainPayloads(v.codecs, v.arena, v.io, v.context, plain.items, v.encode);
+        const out = try v.arena.alloc(Payload, payloads.len);
+        var next: usize = 0;
+        for (payloads, out) |p, *o| {
+            if (system.isMarked(p)) {
+                o.* = try v.visitSystemPayload(p);
+            } else {
+                o.* = coded[next];
+                next += 1;
+            }
+        }
+        return out;
+    }
+
+    /// Codes the payloads inside the system Nexus envelope `p` and encodes it again with its
+    /// metadata kept; the envelope's own bytes never reach a codec. A request's payloads get
+    /// the context of the workflow it names.
+    fn visitSystemPayload(v: ChainVisitor, p: Payload) CodecError!Payload {
+        const what = if (v.encode) "encoding" else "decoding";
+        if (v.depth >= max_system_payload_depth) {
+            log.warn("{s} payloads failed: Temporal system payloads (marked {s}: \"{s}\") are nested more than {d} deep", .{ what, system.mark_key, system.mark_value, max_system_payload_depth });
+            return error.CodecFailed;
+        }
+        var inner = v;
+        inner.depth += 1;
+        const message = system.decode(v.arena, p) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnknownMessageType => {
+                log.warn("{s} payloads failed: a payload marked {s}: \"{s}\" has message type \"{s}\", which is not a Temporal system payload this SDK knows", .{ what, system.mark_key, system.mark_value, system.messageTypeOf(p) orelse "" });
+                return error.CodecFailed;
+            },
+            error.InvalidPayload => {
+                log.warn("{s} payloads failed: a payload marked {s}: \"{s}\" is not binary/protobuf of its message type \"{s}\"", .{ what, system.mark_key, system.mark_value, system.messageTypeOf(p) orelse "" });
+                return error.CodecFailed;
+            },
+        };
+        switch (message) {
+            .signal_with_start_request => |request| {
+                var req = request;
+                const target = system.targetContext(v.context, &req);
+                inner.context = &target;
+                try visitPayloads(system.SignalWithStartRequest, &req, v.arena, inner);
+                return system.reencode(v.arena, p, .{ .signal_with_start_request = req });
+            },
+            .signal_with_start_response => |response| {
+                var resp = response;
+                try visitPayloads(system.SignalWithStartResponse, &resp, v.arena, inner);
+                return system.reencode(v.arena, p, .{ .signal_with_start_response = resp });
+            },
+        }
     }
 };
 
@@ -324,6 +401,10 @@ pub const ZlibCodec = struct {
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
+
+test {
+    _ = system;
+}
 
 /// Replaces each payload with one of encoding `name` holding the original, serialized and
 /// reversed; decoding undoes payloads of encoding `name` only.
@@ -634,4 +715,400 @@ test "a context-aware codec sees the context; a codec without one still works in
     const with_context = try encodePayloadsWithContext(chain[0..1], a, testing.io, &context, &.{try converter.toPayload(a, @as(i64, 1))});
     try testing.expectEqualStrings("acme", TenantCodec.tagOf(with_context[0]).?);
     try testing.expectEqual(@as(i64, 1), try converter.fromPayload(i64, a, (try decodePayloadsWithContext(chain[0..1], a, testing.io, &context, with_context))[0]));
+}
+
+/// Serializes and reverses each payload, as `MarkingCodec`, and records the context and the
+/// payload count of every call. Records live in `records_arena`, not the pass's arena.
+const RecordingCodec = struct {
+    const name = "test/recorded";
+
+    records_arena: Allocator,
+    records: std.ArrayList(Record) = .empty,
+
+    const Record = struct {
+        encode: bool,
+        values: *const propagation.Values,
+        namespace: []const u8,
+        workflow_id: []const u8,
+        workflow_type: []const u8,
+        count: usize,
+    };
+
+    fn codec(r: *RecordingCodec) PayloadCodec {
+        return .{ .ptr = r, .vtable = &.{ .encode = encode, .decode = decode, .encodeWithContext = encodeWithContext, .decodeWithContext = decodeWithContext } };
+    }
+
+    fn encode(ptr: *anyopaque, arena: Allocator, io: Io, payloads: []const Payload) CodecError![]Payload {
+        return encodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn decode(ptr: *anyopaque, arena: Allocator, io: Io, payloads: []const Payload) CodecError![]Payload {
+        return decodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn record(r: *RecordingCodec, encoding: bool, context: *const Context, count: usize) CodecError!void {
+        try r.records.append(r.records_arena, .{
+            .encode = encoding,
+            .values = context.values,
+            .namespace = context.namespace,
+            .workflow_id = context.workflow_id,
+            .workflow_type = context.workflow_type,
+            .count = count,
+        });
+    }
+
+    fn encodeWithContext(ptr: *anyopaque, arena: Allocator, _: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload {
+        const r: *RecordingCodec = @ptrCast(@alignCast(ptr));
+        try r.record(true, context, payloads.len);
+        const out = try arena.alloc(Payload, payloads.len);
+        for (payloads, out) |p, *o| {
+            var serialized: Io.Writer.Allocating = .init(arena);
+            p.encode(&serialized.writer, arena) catch return error.OutOfMemory;
+            std.mem.reverse(u8, serialized.written());
+            o.* = try converter.payloadWithEncoding(arena, name, serialized.written());
+        }
+        return out;
+    }
+
+    fn decodeWithContext(ptr: *anyopaque, arena: Allocator, _: Io, context: *const Context, payloads: []const Payload) CodecError![]Payload {
+        const r: *RecordingCodec = @ptrCast(@alignCast(ptr));
+        try r.record(false, context, payloads.len);
+        const out = try arena.dupe(Payload, payloads);
+        for (out) |*p| {
+            if (!std.mem.eql(u8, converter.encodingOf(p.*) orelse "", name)) continue;
+            const data = try arena.dupe(u8, p.data);
+            std.mem.reverse(u8, data);
+            var reader: Io.Reader = .fixed(data);
+            p.* = Payload.decode(&reader, arena) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.CodecFailed,
+            };
+        }
+        return out;
+    }
+
+    /// The number of payloads coded in the direction `encoding` for `workflow_id`, failing
+    /// the test if any of those calls had a context other than `want`'s.
+    fn countFor(r: *const RecordingCodec, encoding: bool, want: Context) !usize {
+        var n: usize = 0;
+        for (r.records.items) |rec| {
+            if (rec.encode != encoding or !std.mem.eql(u8, rec.workflow_id, want.workflow_id)) continue;
+            try testing.expect(rec.values == want.values);
+            try testing.expectEqualStrings(want.namespace, rec.namespace);
+            try testing.expectEqualStrings(want.workflow_type, rec.workflow_type);
+            n += rec.count;
+        }
+        return n;
+    }
+};
+
+/// A request with 2 workflow arguments, 1 signal argument, a memo, a header, a summary and
+/// details (7 payloads codecs see) and a search attribute (which they don't).
+fn testSignalWithStartRequest(a: Allocator) !system.SignalWithStartRequest {
+    var request: system.SignalWithStartRequest = .{
+        .namespace = "target-ns",
+        .workflow_id = "target",
+        .workflow_type = .{ .name = "Target" },
+        .signal_name = "add",
+        .input = .{ .payloads = try converter.toPayloads(a, .{ @as([]const u8, "start"), @as(i64, 2) }) },
+        .signal_input = .{ .payloads = try converter.toPayloads(a, .{@as([]const u8, "s1")}) },
+        .memo = .{},
+        .header = .{},
+        .search_attributes = .{},
+        .user_metadata = .{
+            .summary = try converter.toPayload(a, @as([]const u8, "summary")),
+            .details = try converter.toPayload(a, @as([]const u8, "details")),
+        },
+    };
+    try request.memo.?.fields.append(a, .{ .key = "note", .value = try converter.toPayload(a, @as([]const u8, "memo")) });
+    try request.header.?.fields.append(a, .{ .key = "trace", .value = try converter.toPayload(a, @as([]const u8, "header")) });
+    try request.search_attributes.?.indexed_fields.append(a, .{ .key = "CustomKeywordField", .value = try converter.toPayload(a, @as([]const u8, "k")) });
+    return request;
+}
+
+/// A completion scheduling an activity with 2 arguments and the system Nexus operation
+/// whose input is `input`.
+fn testCompletion(a: Allocator, input: Payload) !proto.coresdk.workflow_completion.WorkflowActivationCompletion {
+    const cmd_pb = proto.coresdk.workflow_commands;
+    var schedule: cmd_pb.ScheduleActivity = .{ .seq = 1, .activity_type = "Greet" };
+    try schedule.arguments.appendSlice(a, (try converter.toPayloads(a, .{ @as([]const u8, "x"), @as([]const u8, "y") })).items);
+    var success: proto.coresdk.workflow_completion.Success = .{};
+    try success.commands.append(a, .{ .variant = .{ .schedule_activity = schedule } });
+    try success.commands.append(a, .{ .variant = .{ .schedule_nexus_operation = .{
+        .seq = 2,
+        .endpoint = system.endpoint,
+        .service = system.workflow_service,
+        .operation = system.signal_with_start_operation,
+        .input = input,
+    } } });
+    return .{ .run_id = "run", .status = .{ .successful = success } };
+}
+
+fn nexusInputOf(completion: proto.coresdk.workflow_completion.WorkflowActivationCompletion) Payload {
+    return completion.status.?.successful.commands.items[1].variant.?.schedule_nexus_operation.input.?;
+}
+
+fn expectSameMetadata(want: Payload, got: Payload) !void {
+    try testing.expectEqual(want.metadata.items.len, got.metadata.items.len);
+    for (want.metadata.items, got.metadata.items) |w, g| {
+        try testing.expectEqualStrings(w.key, g.key);
+        try testing.expectEqualStrings(w.value, g.value);
+    }
+}
+
+test "encodeMessage and decodeMessage code a system envelope's inner payloads with the target's context" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recording: RecordingCodec = .{ .records_arena = a };
+    const chain = [_]PayloadCodec{recording.codec()};
+
+    var values: propagation.Values = .init(a);
+    try values.put(TenantCodec.tenant, "acme");
+    const run_context: Context = .{ .values = &values, .namespace = "caller-ns", .workflow_id = "caller", .workflow_type = "Caller" };
+    const target_context: Context = .{ .values = &values, .namespace = "target-ns", .workflow_id = "target", .workflow_type = "Target" };
+
+    const envelope = try system.envelope(a, try testSignalWithStartRequest(a));
+    const envelope_data = try a.dupe(u8, envelope.data);
+    var completion = try testCompletion(a, envelope);
+    try encodeMessage(@TypeOf(completion), &completion, &chain, a, testing.io, &run_context);
+
+    // Each inner payload coded once, with the target's context; the activity's arguments
+    // with the run's.
+    try testing.expectEqual(@as(usize, 7), try recording.countFor(true, target_context));
+    try testing.expectEqual(@as(usize, 2), try recording.countFor(true, run_context));
+    try testing.expectEqual(@as(usize, 7), recording.records.items.len);
+    // The envelope the completion borrowed is unchanged.
+    try testing.expectEqualSlices(u8, envelope_data, envelope.data);
+
+    const sent = nexusInputOf(completion);
+    try expectSameMetadata(envelope, sent);
+    try testing.expect(system.isMarked(sent));
+    const encoded = (try system.decode(a, sent)).signal_with_start_request;
+    try testing.expectEqualStrings("add", encoded.signal_name);
+    try testing.expectEqualStrings("target", encoded.workflow_id);
+    for (encoded.input.?.payloads.items) |p| try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(p).?);
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(encoded.signal_input.?.payloads.items[0]).?);
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(encoded.memo.?.fields.items[0].value.?).?);
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(encoded.header.?.fields.items[0].value.?).?);
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(encoded.user_metadata.?.summary.?).?);
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(encoded.user_metadata.?.details.?).?);
+    try testing.expectEqualStrings("json/plain", converter.encodingOf(encoded.search_attributes.?.indexed_fields.items[0].value.?).?);
+
+    recording.records.clearRetainingCapacity();
+    try decodeMessage(@TypeOf(completion), &completion, &chain, a, testing.io, &run_context);
+    try testing.expectEqual(@as(usize, 7), try recording.countFor(false, target_context));
+    try testing.expectEqual(@as(usize, 2), try recording.countFor(false, run_context));
+    const received = nexusInputOf(completion);
+    try expectSameMetadata(envelope, received);
+    const decoded = (try system.decode(a, received)).signal_with_start_request;
+    const args = try converter.fromPayloads(struct { []const u8, i64 }, a, decoded.input.?.payloads.items);
+    try testing.expectEqualStrings("start", args[0]);
+    try testing.expectEqual(@as(i64, 2), args[1]);
+    try testing.expectEqualStrings("s1", try converter.fromPayload([]const u8, a, decoded.signal_input.?.payloads.items[0]));
+    try testing.expectEqualStrings("memo", try converter.fromPayload([]const u8, a, decoded.memo.?.fields.items[0].value.?));
+    try testing.expectEqualStrings("header", try converter.fromPayload([]const u8, a, decoded.header.?.fields.items[0].value.?));
+    try testing.expectEqualStrings("summary", try converter.fromPayload([]const u8, a, decoded.user_metadata.?.summary.?));
+    try testing.expectEqualStrings("details", try converter.fromPayload([]const u8, a, decoded.user_metadata.?.details.?));
+    try testing.expectEqualStrings("k", try converter.fromPayload([]const u8, a, decoded.search_attributes.?.indexed_fields.items[0].value.?));
+    // Coding there and back gives the envelope as it was built.
+    try testing.expectEqualSlices(u8, envelope_data, received.data);
+}
+
+test "unmarked payloads beside a system envelope are coded together and keep their places" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recording: RecordingCodec = .{ .records_arena = a };
+    const chain = [_]PayloadCodec{recording.codec()};
+    const run_context: Context = .{ .workflow_id = "caller" };
+
+    const envelope = try system.envelope(a, system.SignalWithStartRequest{ .workflow_id = "target" });
+    var request: proto.temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest = .{ .signal_name = "s", .input = .{} };
+    try request.input.?.payloads.append(a, try converter.toPayload(a, @as(i64, 1)));
+    try request.input.?.payloads.append(a, envelope);
+    try request.input.?.payloads.append(a, try converter.toPayload(a, @as(i64, 3)));
+    try encodeMessage(@TypeOf(request), &request, &chain, a, testing.io, &run_context);
+    // One call for both unmarked payloads; the empty envelope needs none.
+    try testing.expectEqual(@as(usize, 1), recording.records.items.len);
+    try testing.expectEqual(@as(usize, 2), recording.records.items[0].count);
+    const items = request.input.?.payloads.items;
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(items[0]).?);
+    try testing.expect(system.isMarked(items[1]));
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(items[2]).?);
+
+    try decodeMessage(@TypeOf(request), &request, &chain, a, testing.io, &run_context);
+    try testing.expectEqual(@as(i64, 1), try converter.fromPayload(i64, a, request.input.?.payloads.items[0]));
+    try testing.expectEqual(@as(i64, 3), try converter.fromPayload(i64, a, request.input.?.payloads.items[2]));
+    try testing.expectEqualStrings("target", (try system.decode(a, request.input.?.payloads.items[1])).signal_with_start_request.workflow_id);
+}
+
+test "a system envelope with no payloads inside is encoded again without calling the codecs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recording: RecordingCodec = .{ .records_arena = a };
+    const chain = [_]PayloadCodec{recording.codec()};
+
+    const envelope = try system.envelope(a, system.SignalWithStartRequest{ .namespace = "ns", .workflow_id = "target", .signal_name = "add" });
+    var command: proto.coresdk.workflow_commands.ScheduleNexusOperation = .{ .endpoint = system.endpoint, .input = envelope };
+    try encodeMessage(@TypeOf(command), &command, &chain, a, testing.io, &.{});
+    try testing.expectEqual(@as(usize, 0), recording.records.items.len);
+    try expectSameMetadata(envelope, command.input.?);
+    try testing.expectEqualSlices(u8, envelope.data, command.input.?.data);
+    try decodeMessage(@TypeOf(command), &command, &chain, a, testing.io, &.{});
+    try testing.expectEqual(@as(usize, 0), recording.records.items.len);
+    try testing.expectEqualStrings("add", (try system.decode(a, command.input.?)).signal_with_start_request.signal_name);
+}
+
+test "a marked payload of an unknown message type fails the pass and never reaches a codec" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recording: RecordingCodec = .{ .records_arena = a };
+    const chain = [_]PayloadCodec{recording.codec()};
+
+    const unknown = try system.envelope(a, system.SignalWithStartResponse{ .run_id = "run" });
+    for (unknown.metadata.items) |*entry| {
+        if (std.mem.eql(u8, entry.key, converter.message_type_key)) entry.value = "temporal.api.workflowservice.v1.UpdateWorkflowExecutionRequest";
+    }
+    var not_binary = try converter.toPayload(a, @as([]const u8, "json"));
+    try not_binary.metadata.append(a, .{ .key = system.mark_key, .value = system.mark_value });
+    try not_binary.metadata.append(a, .{ .key = converter.message_type_key, .value = converter.protoMessageType(system.SignalWithStartRequest) });
+
+    for ([_]Payload{ unknown, not_binary }) |p| {
+        var command: proto.coresdk.workflow_commands.ScheduleNexusOperation = .{ .input = p };
+        try testing.expectError(error.CodecFailed, encodeMessage(@TypeOf(command), &command, &chain, a, testing.io, &.{}));
+        var activation: proto.coresdk.workflow_activation.ResolveNexusOperation = .{ .seq = 1, .result = .{ .status = .{ .completed = p } } };
+        try testing.expectError(error.CodecFailed, decodeMessage(@TypeOf(activation), &activation, &chain, a, testing.io, &.{}));
+    }
+    try testing.expectEqual(@as(usize, 0), recording.records.items.len);
+}
+
+test "decodeMessage leaves a system response in an activation's Nexus resolution readable and unchanged" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recording: RecordingCodec = .{ .records_arena = a };
+    const chain = [_]PayloadCodec{recording.codec()};
+
+    const response = try system.envelope(a, system.SignalWithStartResponse{ .run_id = "target-run", .started = true });
+    var activation: proto.coresdk.workflow_activation.WorkflowActivation = .{ .run_id = "run" };
+    try activation.jobs.append(a, .{ .variant = .{ .resolve_nexus_operation = .{ .seq = 2, .result = .{ .status = .{ .completed = response } } } } });
+    try decodeMessage(@TypeOf(activation), &activation, &chain, a, testing.io, &.{ .workflow_id = "caller" });
+    try testing.expectEqual(@as(usize, 0), recording.records.items.len);
+    const got = activation.jobs.items[0].variant.?.resolve_nexus_operation.result.?.status.?.completed;
+    try expectSameMetadata(response, got);
+    try testing.expectEqualSlices(u8, response.data, got.data);
+    const decoded = try system.decodeSignalWithStartResponse(a, got);
+    try testing.expectEqualStrings("target-run", decoded.run_id);
+    try testing.expect(decoded.started);
+}
+
+test "an allocation failure while coding a system envelope is error.OutOfMemory" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recording: RecordingCodec = .{ .records_arena = a };
+    const chain = [_]PayloadCodec{recording.codec()};
+    const run_context: Context = .{ .workflow_id = "caller" };
+
+    const plain = try testCompletion(a, try system.envelope(a, try testSignalWithStartRequest(a)));
+    var encoded = plain;
+    try encodeMessage(@TypeOf(encoded), &encoded, &chain, a, testing.io, &run_context);
+
+    for ([_]bool{ true, false }) |encoding| {
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var pass: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer pass.deinit();
+            var failing: std.testing.FailingAllocator = .init(pass.allocator(), .{ .fail_index = fail_index });
+            var completion = if (encoding) plain else encoded;
+            const result = if (encoding)
+                encodeMessage(@TypeOf(completion), &completion, &chain, failing.allocator(), testing.io, &run_context)
+            else
+                decodeMessage(@TypeOf(completion), &completion, &chain, failing.allocator(), testing.io, &run_context);
+            if (!failing.has_induced_failure) {
+                try result;
+                break;
+            }
+            try testing.expectError(error.OutOfMemory, result);
+        }
+        // The descent into the envelope allocates, so some of those failures were inside it.
+        try testing.expect(fail_index > 10);
+    }
+}
+
+/// Runs `encodeMessage` over a ScheduleNexusOperation whose input is `nested` on a thread
+/// with a 4 MiB stack, a quarter of a worker thread's, and stores its result.
+const NestedEnvelopePass = struct {
+    nested: Payload,
+    result: CodecError!void = {},
+
+    fn run(n: *NestedEnvelopePass) void {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var recording: RecordingCodec = .{ .records_arena = arena.allocator() };
+        const chain = [_]PayloadCodec{recording.codec()};
+        var command: proto.coresdk.workflow_commands.ScheduleNexusOperation = .{ .input = n.nested };
+        n.result = encodeMessage(@TypeOf(command), &command, &chain, arena.allocator(), testing.io, &.{});
+    }
+};
+
+test "a system envelope nested thousands deep fails the pass instead of overflowing the stack" {
+    // The payload's bytes are opaque to sdk-core, which bounds the depth of the messages it
+    // decodes, so whoever writes a payload (a signal's sender, a Nexus handler) chooses how
+    // deep envelopes nest inside it. This one is 2,000 deep and about 300 KB.
+    const depth = 2000;
+    var data: []u8 = try testing.allocator.dupe(u8, "leaf");
+    defer testing.allocator.free(data);
+    var outer: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer outer.deinit();
+    var nested = try converter.payloadWithEncoding(outer.allocator(), "binary/plain", data);
+    for (0..depth) |_| {
+        var level: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer level.deinit();
+        const a = level.allocator();
+        var request: system.SignalWithStartRequest = .{ .workflow_id = "w", .input = .{} };
+        try request.input.?.payloads.append(a, nested);
+        const wrapped = try system.envelope(a, request);
+        const bytes = try testing.allocator.dupe(u8, wrapped.data);
+        testing.allocator.free(data);
+        data = bytes;
+        _ = outer.reset(.retain_capacity);
+        nested = try system.envelope(outer.allocator(), system.SignalWithStartRequest{});
+        nested.data = data;
+    }
+
+    var pass: NestedEnvelopePass = .{ .nested = nested };
+    const thread = try std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, NestedEnvelopePass.run, .{&pass});
+    thread.join();
+    pass.result catch |err| try testing.expectEqual(error.CodecFailed, err);
+}
+
+test "system envelopes nested up to the limit are coded; one more level fails the pass" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recording: RecordingCodec = .{ .records_arena = a };
+    const chain = [_]PayloadCodec{recording.codec()};
+
+    var nested = try converter.toPayload(a, @as([]const u8, "leaf"));
+    for (0..ChainVisitor.max_system_payload_depth + 1) |level| {
+        var command: proto.coresdk.workflow_commands.ScheduleNexusOperation = .{ .input = nested };
+        if (level <= ChainVisitor.max_system_payload_depth) {
+            try encodeMessage(@TypeOf(command), &command, &chain, a, testing.io, &.{});
+            try decodeMessage(@TypeOf(command), &command, &chain, a, testing.io, &.{});
+        } else {
+            try testing.expectError(error.CodecFailed, encodeMessage(@TypeOf(command), &command, &chain, a, testing.io, &.{}));
+            try testing.expectError(error.CodecFailed, decodeMessage(@TypeOf(command), &command, &chain, a, testing.io, &.{}));
+        }
+        var request: system.SignalWithStartRequest = .{ .workflow_id = "w", .input = .{} };
+        try request.input.?.payloads.append(a, nested);
+        nested = try system.envelope(a, request);
+    }
+    // The leaf was coded once in each direction for each level that passed.
+    var leaf_calls: usize = 0;
+    for (recording.records.items) |rec| leaf_calls += rec.count;
+    try testing.expectEqual(2 * (ChainVisitor.max_system_payload_depth + 1), leaf_calls);
 }

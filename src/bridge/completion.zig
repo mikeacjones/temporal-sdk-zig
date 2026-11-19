@@ -124,6 +124,7 @@ pub fn Completion(comptime T: type) type {
 const testing = std.testing;
 const c = @import("core_c");
 const bytes = @import("bytes.zig");
+const tsan = @import("tsan.zig");
 
 const Text = struct {
     buf: []u8,
@@ -184,6 +185,7 @@ fn onStart(
     target: ?*const c.TemporalCoreByteArray,
     fail: ?*const c.TemporalCoreByteArray,
 ) callconv(.c) void {
+    tsan.takeFromCore(user_data.?);
     const done: *Completion(StartResult) = @ptrCast(@alignCast(user_data.?));
     if (bytes.Owned.take(null, target)) |t| t.deinit();
     done.complete(.{ .server = server, .fail = bytes.Owned.take(null, fail) });
@@ -218,6 +220,7 @@ test "a real core callback completes on a core thread" {
         .log_level = bytes.ref("warn"),
     };
     const done = try Completion(StartResult).create(testing.allocator, testing.io, StartResult.free);
+    tsan.handToCore(done);
     c.temporal_core_ephemeral_server_start_dev_server(rt.runtime, &dev, done, onStart);
     const result = try done.wait();
     defer result.free();

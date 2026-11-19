@@ -273,6 +273,7 @@ const search_attributes = @import("search_attributes.zig");
 const metrics_mod = @import("metrics.zig");
 const deployment = @import("deployment.zig");
 const nexus = @import("nexus.zig");
+const system_nexus = @import("nexus/system.zig");
 const Instance = @import("workflow/Instance.zig");
 const WorkflowIo = @import("workflow/WorkflowIo.zig");
 const Allocator = std.mem.Allocator;
@@ -1238,6 +1239,47 @@ pub const Context = struct {
         return ctx.instance.signalExternal(.{ .execution = .{ .workflow_id = workflow_id, .run_id = run_id } }, signal_name, args);
     }
 
+    /// Experimental: starts the workflow `Workflow` (a `Def`) with `args` if no run of
+    /// `options.id` is running, and sends it `Signal` (a `SignalDef`) with `signal_args`
+    /// either way, in one server call through the server's system Nexus endpoint. The target
+    /// is in this workflow's namespace. Wrong argument types are compile errors. Returns a
+    /// future for the target's run ID and whether this call started it; every error comes
+    /// from its `get`.
+    ///
+    ///     const sent = ctx.signalWithStartWorkflow(Counter, .{ .id = "counter-1", .id_conflict_policy = .use_existing }, .{0}, Add, .{5});
+    ///     const result = try sent.get();
+    ///
+    /// The payload converter encodes `args` and `signal_args` here, with the target's
+    /// converter context (namespace, `options.id`, and the workflow type); the worker's payload
+    /// codecs encode them, and the memo, when the command is sent. The call is a Nexus
+    /// operation on endpoint `__temporal_system` in history, but no interceptor's
+    /// `executeNexusOperation` sees it.
+    ///
+    /// The server must have `history.enableSignalWithStartFromWorkflow` turned on (the dev
+    /// server: `--dynamic-config-value history.enableSignalWithStartFromWorkflow=true`).
+    /// Without it, the server refuses to complete the workflow task that sends the call
+    /// (gRPC Unimplemented, "SignalWithStart operation is disabled", which the worker logs as
+    /// a warning). The SDK can't tell beforehand, so no error is returned: the task times out
+    /// and is retried until the setting is turned on, and `get` waits meanwhile.
+    ///
+    /// Options the SDK can check are checked before anything is sent: `error.InvalidOptions`
+    /// (logged) for an empty ID or name, `.fail` as the conflict policy, a negative timeout or
+    /// start delay, `start_delay` with `cron_schedule`, strings that aren't UTF-8, a retry
+    /// policy the server refuses, or a search attribute value that can't be indexed. Other
+    /// request errors only the server finds (a search attribute it doesn't know, a workflow
+    /// ID over its length limit, a reserved task queue) refuse the workflow task the same way
+    /// as the missing setting, as for child workflows: the task is retried and `get` waits.
+    pub fn signalWithStartWorkflow(ctx: *Context, comptime Workflow: type, options: SignalWithStartOptions, args: Workflow.Args, comptime Signal: type, signal_args: Signal.Args) SignalWithStartFuture {
+        return ctx.instance.signalWithStart(Workflow.workflow_name, options, args, Signal.signal_name, signal_args);
+    }
+
+    /// Experimental: `signalWithStartWorkflow` with the workflow type and the signal named at
+    /// run time. `args` and `signal_args` are tuples of argument values. An empty
+    /// `workflow_type` or `signal_name` makes `get` return `error.InvalidOptions` (logged).
+    pub fn signalWithStartWorkflowByName(ctx: *Context, workflow_type: []const u8, options: SignalWithStartOptions, args: anytype, signal_name: []const u8, signal_args: anytype) SignalWithStartFuture {
+        return ctx.instance.signalWithStart(workflow_type, options, args, signal_name, signal_args);
+    }
+
     /// Requests cancellation of the workflow `workflow_id` and returns a future for the
     /// request's delivery. An empty `run_id` targets the workflow's latest run. The target runs
     /// in this workflow's namespace and decides what canceling means: its code sees the
@@ -2098,6 +2140,158 @@ const ExternalFuture = struct {
         return state.outcome != null;
     }
 };
+
+/// Experimental: how `Context.signalWithStartWorkflow` starts and signals the target. Only
+/// read during the call; strings are copied.
+pub const SignalWithStartOptions = struct {
+    /// The target's workflow ID. Required: empty makes `get` return `error.InvalidOptions`
+    /// (logged).
+    id: []const u8,
+    /// Empty: this run's task queue.
+    task_queue: []const u8 = "",
+    /// Limits the target's whole chain of runs, as in `client.StartWorkflowOptions`.
+    execution_timeout: ?Duration = null,
+    /// Limits one run of the target.
+    run_timeout: ?Duration = null,
+    /// Limits one workflow task of the target.
+    task_timeout: ?Duration = null,
+    /// Delay before the target's first workflow task. Not with `cron_schedule`: setting both
+    /// is `error.InvalidOptions` (logged).
+    start_delay: ?Duration = null,
+    /// Runs the target on a cron schedule, such as "0 * * * *".
+    cron_schedule: []const u8 = "",
+    /// Whether a closed run's ID may be used again. `.unspecified` uses the server's default,
+    /// `.allow_duplicate`. A closed run the policy keeps from being reused makes `get` return
+    /// `error.WorkflowExecutionAlreadyStarted`.
+    id_reuse_policy: enum { unspecified, allow_duplicate, allow_duplicate_failed_only, reject_duplicate } = .unspecified,
+    /// `.unspecified` and `.use_existing` signal a running target. `.terminate_existing`
+    /// replaces it. `.fail` is `error.InvalidOptions` (logged), because the server refuses it
+    /// for signal-with-start.
+    id_conflict_policy: enum { unspecified, fail, use_existing, terminate_existing } = .unspecified,
+    /// How the server retries the target when a run fails or times out. Null retries none.
+    retry_policy: ?RetryPolicy = null,
+    /// Non-indexed values recorded with the target, built with `converter.toFields`, as for
+    /// `ChildWorkflowOptions.memo`.
+    memo: []const converter.Field = &.{},
+    /// The target's search attributes, built with `search_attributes.Key.set`; unsets are
+    /// ignored. A value that can't be indexed is `error.InvalidOptions` (logged).
+    search_attributes: []const search_attributes.Update = &.{},
+};
+
+/// Experimental: what a signal-with-start did. Memory comes from the run's arena
+/// (`ctx.allocator()`).
+pub const SignalWithStartResult = struct {
+    workflow_id: []const u8,
+    run_id: []const u8,
+    /// True when this call started the run; false when it only signaled a running one.
+    started: bool,
+};
+
+/// Experimental: errors of `SignalWithStartFuture.get`.
+///
+/// `WorkflowExecutionAlreadyStarted`: the server refused because the workflow ID is taken in
+/// a way `id_reuse_policy` forbids, for example a closed run under `.reject_duplicate`.
+/// `SignalWithStartFailed`: any other refusal or failure: the operation failed or timed out,
+/// or the server rejected the request. Read the failure with the future's `failure` after
+/// either.
+/// `Canceled`: the coroutine waiting in `get` was canceled and the operation was canceled, or
+/// the run is being evicted.
+/// `InvalidOptions`: the options were rejected before anything was sent (the worker logs
+/// why).
+/// `InvalidPayload`: the server's response doesn't decode.
+pub const SignalWithStartError = error{
+    WorkflowExecutionAlreadyStarted,
+    SignalWithStartFailed,
+    Canceled,
+    OutOfMemory,
+    InvalidOptions,
+    InvalidPayload,
+};
+
+/// Experimental: the pending result of `Context.signalWithStartWorkflow` or
+/// `signalWithStartWorkflowByName`.
+pub const SignalWithStartFuture = struct {
+    ctx: *Context,
+    /// The target's ID, copied into the run's arena.
+    workflow_id: []const u8,
+    /// The validation error, if the call was rejected before anything was sent; `get`
+    /// returns it.
+    state: Instance.ScheduleError!*Instance.NexusOperationState,
+
+    /// Experimental: waits for the server's answer. If the calling coroutine is canceled
+    /// while waiting (the workflow is canceled, or an enclosing future, `Select`, or `Group`
+    /// is), the operation's cancellation is requested and this waits for the core to resolve
+    /// it: it returns `error.Canceled` once the operation resolved as canceled. If the server
+    /// answered first, this returns that answer, and the coroutine's next cancelable wait
+    /// returns `error.Canceled`. Eviction ends the wait with `error.Canceled`.
+    pub fn get(f: SignalWithStartFuture) SignalWithStartError!SignalWithStartResult {
+        const state = try f.state;
+        try f.ctx.instance.awaitNexusOperation(state, .result);
+        switch (state.outcome.?) {
+            .completed => |p| {
+                const response = try system_nexus.decodeSignalWithStartResponse(f.ctx.allocator(), p);
+                return .{ .workflow_id = f.workflow_id, .run_id = response.run_id, .started = response.started };
+            },
+            .canceled => |fl| {
+                f.ctx.instance.setLastFailure(fl);
+                return error.Canceled;
+            },
+            .failed, .timed_out => |fl| {
+                f.ctx.instance.setLastFailure(fl);
+                return if (alreadyStarted(fl)) error.WorkflowExecutionAlreadyStarted else error.SignalWithStartFailed;
+            },
+        }
+    }
+
+    /// Experimental: the failure after `get` returned `error.WorkflowExecutionAlreadyStarted`,
+    /// `error.SignalWithStartFailed` or `error.Canceled`; null otherwise. Arena memory of the
+    /// run.
+    pub fn failure(f: SignalWithStartFuture) ?*const failure_mod.Failure {
+        const state = f.state catch return null;
+        const outcome = state.outcome orelse return null;
+        return switch (outcome) {
+            .completed => null,
+            .failed, .canceled, .timed_out => |fl| fl,
+        };
+    }
+
+    /// Experimental: whether `get` won't block.
+    pub fn isReady(f: SignalWithStartFuture) bool {
+        const state = f.state catch return true;
+        return state.outcome != null;
+    }
+};
+
+/// The start of the message of the server failure that refuses a taken workflow ID. The
+/// system Nexus endpoint passes the server's error on as the operation failure's cause, a
+/// server failure whose message is the gRPC error's type and text, as the dev server
+/// (CLI 1.10.1, server 1.32.2) sends it: "WorkflowExecutionAlreadyStarted: Workflow execution already
+/// finished. WorkflowId: <id>, RunId: <run>. Workflow Id reuse policy: reject duplicate
+/// workflow Id."
+const already_started_prefix = "WorkflowExecutionAlreadyStarted: ";
+
+/// The start of the same message without the error type's name, as a Nexus handler failure
+/// of type BAD_REQUEST carries it.
+const handler_already_started_prefix = "Workflow execution already";
+
+/// Whether `f`, or a failure in its cause chain, is the server's refusal of a taken
+/// workflow ID: a server failure whose message starts with `already_started_prefix`, or a
+/// BAD_REQUEST Nexus handler failure whose message starts with
+/// `handler_already_started_prefix`. It reads the failure history recorded, so it decides the same on replay.
+fn alreadyStarted(f: *const failure_mod.Failure) bool {
+    var next: ?*const failure_mod.Failure = f;
+    while (next) |cur| : (next = cur.cause) {
+        const info = cur.failure_info orelse continue;
+        switch (info) {
+            .server_failure_info => if (std.mem.startsWith(u8, cur.message, already_started_prefix)) return true,
+            // The form the server's Nexus error conversion gives AlreadyExists (common/nexus
+            // ConvertGRPCError): a bad-request handler failure carrying the gRPC message.
+            .nexus_handler_failure_info => |h| if (std.mem.eql(u8, h.type, "BAD_REQUEST") and std.mem.startsWith(u8, cur.message, handler_already_started_prefix)) return true,
+            else => {},
+        }
+    }
+    return false;
+}
 
 /// The signals of one name, from `Context.signalChannel` or `signalChannelByName`, read in
 /// arrival order. `Args` is the signal's argument tuple; each receive returns a `Value`: the

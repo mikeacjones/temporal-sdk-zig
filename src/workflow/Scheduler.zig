@@ -30,6 +30,9 @@ gpa: Allocator,
 options: Options,
 /// Saved stack pointer of the thread inside `run` while a fiber is executing.
 main_sp: usize = undefined,
+/// Thread Sanitizer's context of the thread inside `run`, set at every `run` call because
+/// successive calls can come from different threads. `void` without the sanitizer.
+tsan_thread: tsan.Handle = undefined,
 current: ?*Fiber = null,
 ready_head: ?*Fiber = null,
 ready_tail: ?*Fiber = null,
@@ -77,6 +80,8 @@ pub const Fiber = struct {
     live_next: ?*Fiber = null,
     /// Owned by the layer that spawned the fiber (the workflow `std.Io` keeps its task here).
     user: ?*anyopaque = null,
+    /// Thread Sanitizer's fiber for this stack; `void` without the sanitizer.
+    tsan_fiber: tsan.Handle,
 
     pub const State = enum { ready, running, blocked, done };
 };
@@ -100,6 +105,10 @@ pub fn deinit(s: *Scheduler) void {
 /// on their stacks) must never be resumed or woken afterwards.
 pub fn deinitLeakingLive(s: *Scheduler) void {
     assert(s.current == null);
+    if (builtin.sanitize_thread) {
+        var it = s.live_head;
+        while (it) |f| : (it = f.live_next) tsan.destroy(f.tsan_fiber);
+    }
     for (s.free_stacks.items) |stack| stack.unmap();
     s.free_stacks.deinit(s.gpa);
     s.* = undefined;
@@ -151,6 +160,7 @@ pub fn spawn(s: *Scheduler, name: []const u8, comptime func: anytype, args: std.
         .id = s.next_id,
         .name = name,
         .state = .ready,
+        .tsan_fiber = tsan.create(),
     };
     s.next_id += 1;
     s.live += 1;
@@ -165,16 +175,22 @@ pub fn spawn(s: *Scheduler, name: []const u8, comptime func: anytype, args: std.
 /// blocked. Must not be called from a fiber.
 pub fn run(s: *Scheduler) void {
     assert(s.current == null);
+    s.tsan_thread = tsan.current();
     while (s.pop()) |f| {
         assert(f.state == .ready);
         f.state = .running;
         s.current = f;
+        tsan.switchTo(f.tsan_fiber);
         switchStack(&s.main_sp, f.sp);
         // Back on the scheduler: the fiber blocked, yielded, or finished.
         _ = s.switches.fetchAdd(1, .release);
         const prev = s.current.?;
         s.current = null;
-        if (prev.state == .done) s.releaseStack(prev.stack);
+        if (prev.state == .done) {
+            // The handle lives on the stack, so it goes before the stack can be unmapped.
+            tsan.destroy(prev.tsan_fiber);
+            s.releaseStack(prev.stack);
+        }
     }
 }
 
@@ -273,6 +289,7 @@ pub fn wakeFirst(s: *Scheduler, f: *Fiber) void {
 }
 
 fn switchToMain(s: *Scheduler, f: *Fiber) void {
+    tsan.switchTo(s.tsan_thread);
     switchStack(&f.sp, s.main_sp);
     // Resumed by `run`.
     assert(s.current == f);
@@ -304,6 +321,7 @@ fn fiberMain(f: *Fiber) callconv(.c) noreturn {
     if (f.live_next) |n| n.live_prev = f.live_prev else s.live_tail = f.live_prev;
     // `run` releases the stack once it is no longer executing on it.
     var dead_sp: usize = undefined;
+    tsan.switchTo(s.tsan_thread);
     switchStack(&dead_sp, s.main_sp);
     unreachable; // a finished fiber is never resumed
 }
@@ -412,6 +430,36 @@ fn fiberEntry() callconv(.naked) void {
         else => unreachable,
     }
 }
+
+/// Thread Sanitizer's fiber interface. `switchStack` changes stacks behind the sanitizer's
+/// back, so the scheduler tells it which fiber runs. Without the sanitizer `Handle` is
+/// `void` and every function is empty.
+const tsan = struct {
+    const Handle = if (builtin.sanitize_thread) *anyopaque else void;
+    extern fn __tsan_get_current_fiber() *anyopaque;
+    extern fn __tsan_create_fiber(flags: c_uint) *anyopaque;
+    extern fn __tsan_destroy_fiber(fiber: *anyopaque) void;
+    extern fn __tsan_switch_to_fiber(fiber: *anyopaque, flags: c_uint) void;
+
+    /// The calling thread's own context.
+    inline fn current() Handle {
+        return if (builtin.sanitize_thread) __tsan_get_current_fiber() else {};
+    }
+
+    inline fn create() Handle {
+        return if (builtin.sanitize_thread) __tsan_create_fiber(0) else {};
+    }
+
+    inline fn destroy(h: Handle) void {
+        if (builtin.sanitize_thread) __tsan_destroy_fiber(h);
+    }
+
+    /// Flags 0 make the switch synchronizing: it releases on the old context and acquires
+    /// on the new one, so a fiber resumed on another thread sees what it wrote before.
+    inline fn switchTo(h: Handle) void {
+        if (builtin.sanitize_thread) __tsan_switch_to_fiber(h, 0);
+    }
+};
 
 /// Builds the frame `switchStack` restores the first time it switches to `f`: a saved
 /// register set whose return address is `fiberEntry` and whose first callee-saved register

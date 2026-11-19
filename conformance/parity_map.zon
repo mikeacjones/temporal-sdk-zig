@@ -69,7 +69,7 @@
     .{ .feature = "signal/external", .parity = .{ .row = "Signal, query, and update a workflow" } },
     .{ .feature = "signal/prevent_close", .parity = .{ .row = "Signal handlers and signal channels" } },
     .{ .feature = "signal/signal_with_start", .parity = .{ .row = "Signal-with-start" } },
-    .{ .feature = "system_nexus/signal_with_start", .parity = .{ .none = "The table covers client signal-with-start and user Nexus operations but has no row for starting a workflow through System Nexus." } },
+    .{ .feature = "system_nexus/signal_with_start", .parity = .{ .row = "Signal-with-start from a workflow" } },
     .{ .feature = "telemetry/metrics", .parity = .{ .row = "Metrics: Prometheus, OpenTelemetry, custom handlers" } },
     .{ .feature = "update/activities", .parity = .{ .row = "Update handlers and validators" } },
     .{ .feature = "update/async_accepted", .parity = .{ .row = "Signal, query, and update a workflow" } },

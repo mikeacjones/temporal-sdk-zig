@@ -10,6 +10,8 @@ const c = @import("core_c");
 const bytes = @import("bytes.zig");
 const Runtime = @import("Runtime.zig");
 const Completion = @import("completion.zig").Completion;
+const handToCore = @import("tsan.zig").handToCore;
+const takeFromCore = @import("tsan.zig").takeFromCore;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -102,6 +104,7 @@ pub const GrpcOverride = struct {
     handle: *const fn (ctx: ?*anyopaque, request: GrpcRequest) void,
 
     fn onRequest(req: ?*c.TemporalCoreClientGrpcOverrideRequest, user_data: ?*anyopaque) callconv(.c) void {
+        takeFromCore(user_data.?);
         const o: *const GrpcOverride = @ptrCast(@alignCast(user_data.?));
         o.handle(o.ctx, .{ .ptr = req.? });
     }
@@ -213,6 +216,7 @@ pub fn connect(gpa: Allocator, io: Io, runtime: Runtime, options: Options, failu
     try core.init(arena_state.allocator(), options);
 
     const done = try Completion(ConnectResult).create(gpa, io, ConnectResult.free);
+    handToCore(done);
     c.temporal_core_client_connect(runtime.ptr, &core.connection, done, onConnect);
     const result = done.waitUncancelable();
     const conn = result.conn orelse {
@@ -274,6 +278,7 @@ pub const Connecting = struct {
         try core.init(arena_state.allocator(), options);
         const self = try allocator.create(Connecting);
         self.* = .{ .io = io, .runtime = runtime };
+        handToCore(self);
         c.temporal_core_client_connect(runtime.ptr, &core.connection, self, onConnecting);
         return self;
     }
@@ -380,6 +385,7 @@ pub const Connecting = struct {
     }
 
     fn onConnecting(user_data: ?*anyopaque, conn: ?*c.TemporalCoreConnection, fail: ?*const c.TemporalCoreByteArray) callconv(.c) void {
+        takeFromCore(user_data.?);
         const self: *Connecting = @ptrCast(@alignCast(user_data.?));
         const fail_bytes = bytes.Owned.take(null, fail);
         if (self.word.fetchOr(calling, .acq_rel) & orphaned != 0) {
@@ -457,6 +463,7 @@ const CoreOptions = struct {
         if (options.grpc_override) |handler| {
             core.grpc_override_callback = GrpcOverride.onRequest;
             core.grpc_override_callback_user_data = @constCast(handler);
+            handToCore(handler);
         }
         core.grpc_compression = switch (options.compression) {
             .gzip => c.TemporalCoreClientGrpcCompression_Gzip,
@@ -565,6 +572,7 @@ pub fn call(
         .cancellation_token = token,
     };
     const done = try Completion(CallResult).create(gpa, io, CallResult.free);
+    handToCore(done);
     c.temporal_core_client_rpc_call(conn.ptr, &core, done, onCall);
     const result = try done.waitCancelingWith(token, cancelToken);
     defer result.free();
@@ -604,6 +612,7 @@ const ConnectResult = struct {
 };
 
 fn onConnect(user_data: ?*anyopaque, conn: ?*c.TemporalCoreConnection, fail: ?*const c.TemporalCoreByteArray) callconv(.c) void {
+    takeFromCore(user_data.?);
     const done: *Completion(ConnectResult) = @ptrCast(@alignCast(user_data.?));
     done.complete(.{ .conn = conn, .fail = bytes.Owned.take(null, fail) });
 }
@@ -628,6 +637,7 @@ fn onCall(
     message: ?*const c.TemporalCoreByteArray,
     details: ?*const c.TemporalCoreByteArray,
 ) callconv(.c) void {
+    takeFromCore(user_data.?);
     const done: *Completion(CallResult) = @ptrCast(@alignCast(user_data.?));
     done.complete(.{
         .success = bytes.Owned.take(null, success),
