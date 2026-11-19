@@ -37,6 +37,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Signals, queries, and updates](#signals-queries-and-updates-1)
     - [Child workflows](#child-workflows)
     - [External workflows](#external-workflows)
+      - [Signal-with-start from a workflow](#signal-with-start-from-a-workflow)
     - [Continue-as-new](#continue-as-new)
     - [Cancellation](#cancellation)
     - [Versioning and patching](#versioning-and-patching)
@@ -1106,6 +1107,45 @@ Notes:
 - `ctx.signalExternalWorkflow` and `ctx.cancelExternalWorkflow` signal or cancel a workflow by ID; an empty run ID targets the latest run.
 - `get` returns `error.ExternalWorkflowNotFound` for a missing or closed target, `error.ExternalWorkflowRequestFailed` when the server refuses for another reason, `error.InvalidOptions` (logged) for an empty workflow ID, and `error.Canceled` if the waiting coroutine is canceled.
 - The target runs in the same namespace; a child finds its parent in `ctx.info().parent`.
+
+##### Signal-with-start from a workflow
+Experimental. `workflow.Context.signalWithStartWorkflow` starts a workflow if no run of its ID is running and signals it either way, in one server call, and returns a `workflow.SignalWithStartFuture`. The typed form takes the workflow's `Def` with its arguments and a `SignalDef` with the signal's arguments, so wrong argument types are compile errors; `signalWithStartWorkflowByName` names the workflow type and the signal at run time and takes both argument lists as tuples.
+
+<!-- example: workflow-signal-with-start -->
+```zig
+/// Keeps a guest book open until `capacity` guests have signed it.
+fn guestBook(ctx: *workflow.Context, capacity: u32) ![]const u8 {
+    const guests = try ctx.signalChannel(AddGuest);
+    var names: std.ArrayList([]const u8) = .empty;
+    while (names.items.len < capacity) try names.append(ctx.allocator(), try guests.receive());
+    return std.mem.join(ctx.allocator(), ", ", names.items);
+}
+pub const GuestBook = workflow.Def("guest_book", guestBook);
+
+/// Signs `guest` into the book `book_id`, opening it first if it isn't open.
+fn signIn(ctx: *workflow.Context, book_id: []const u8, guest: []const u8) !workflow.SignalWithStartResult {
+    const sent = ctx.signalWithStartWorkflow(GuestBook, .{
+        .id = book_id,
+        .execution_timeout = .fromSeconds(3600),
+        .id_conflict_policy = .use_existing, // only signal a book that is already open
+    }, .{2}, AddGuest, .{guest});
+    return sent.get() catch |err| {
+        if (sent.failure()) |f| ctx.logger().warn("sign-in refused", .{ .reason = temporal.failure.rootCause(f).message });
+        return err;
+    };
+}
+pub const SignIn = workflow.Def("sign_in", signIn);
+```
+
+Notes:
+- `workflow.SignalWithStartOptions` has the start options of `client.StartWorkflowOptions` and `ChildWorkflowOptions`: `id` (required), `task_queue` (empty: this run's), the timeouts, `start_delay`, `cron_schedule`, `id_reuse_policy`, `retry_policy`, `memo` and `search_attributes`. `id_conflict_policy` says what happens when the target is running: `.unspecified` and `.use_existing` only signal it, `.terminate_existing` replaces it with a new run, and `.fail` is `error.InvalidOptions`, because the server refuses it for signal-with-start.
+- `get` returns a `workflow.SignalWithStartResult`: the target's `workflow_id`, the `run_id` of the run that got the signal, and `started`, true when this call started that run and false when it only signaled a running one.
+- `get`'s errors (`workflow.SignalWithStartError`): `error.WorkflowExecutionAlreadyStarted` when the ID is taken in a way `id_reuse_policy` forbids, such as a closed run under `.reject_duplicate`; `error.SignalWithStartFailed` for any other refusal or failure; `error.Canceled` when the waiting coroutine is canceled (the call is canceled and `get` waits until it is) or the run is evicted; `error.InvalidOptions` (logged, nothing sent) for an empty ID or name, `.fail`, a negative timeout or start delay, `start_delay` with `cron_schedule`, or a search attribute value that can't be indexed; and `error.InvalidPayload` when the server's answer doesn't decode. After the first three, `sent.failure()` holds the server's failure.
+- The target is in this workflow's namespace.
+- The workflow's arguments and the signal's arguments are converted with the target's converter context (namespace, `id` and workflow type). The worker's payload codecs encode them, the memo and the header inside the request, with that same context, so the target decodes its start as usual.
+- The server must enable `history.enableSignalWithStartFromWorkflow`. On a dev server, pass `--dynamic-config-value history.enableSignalWithStartFromWorkflow=true` in `testing.DevServer.Options.extra_args`, or in `WorkflowEnvironment.Options.dev_server_extra_args`, as the example's test does. Without it, the server refuses to complete the workflow task that sends the call ("SignalWithStart operation is disabled", logged by the worker as a warning): the task is retried until the setting is on, and `get` waits meanwhile.
+- The time-skipping test server doesn't support it: test with a dev server (`WorkflowEnvironment.startWithOptions`) or a real server.
+- The call is a Nexus operation on the server's system endpoint, recorded in history as one, but interceptors see it on `WorkflowOutbound.signalWithStartWorkflow`, not `executeNexusOperation`. Replay checks that the call is still made, not its arguments, as for every Nexus operation.
 
 #### Continue-as-new
 Returning `workflow.Context.continueAsNew` ends the run and starts a fresh one with the same workflow ID and new arguments.
