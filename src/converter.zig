@@ -1327,6 +1327,26 @@ test "protobuf messages round-trip as json/protobuf and binary/protobuf" {
     try testing.expectError(error.InvalidPayload, fromPayload(Failure, a, corrupt));
 }
 
+test "a json/protobuf message holding a Timestamp on 29 February round-trips" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const HistoryEvent = proto.temporal.api.history.v1.HistoryEvent;
+    const event: HistoryEvent = .{
+        .event_id = 1,
+        .event_time = .{ .seconds = 1_709_208_000, .nanos = 5_000_000 }, // 2024-02-29T12:00:00.005Z
+        .event_type = .EVENT_TYPE_TIMER_FIRED,
+    };
+    const p = try toPayload(a, event);
+    try testing.expectEqualStrings("json/protobuf", encodingOf(p).?);
+    try testing.expectEqualStrings(
+        \\{"eventId":"1","eventTime":"2024-02-29T12:00:00.005Z","eventType":"EVENT_TYPE_TIMER_FIRED"}
+    , p.data);
+    const back = try fromPayload(HistoryEvent, a, p);
+    try testing.expectEqual(event.event_time.?.seconds, back.event_time.?.seconds);
+    try testing.expectEqual(event.event_time.?.nanos, back.event_time.?.nanos);
+}
+
 test "a json/protobuf message that holds a binary Payload round-trips" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
