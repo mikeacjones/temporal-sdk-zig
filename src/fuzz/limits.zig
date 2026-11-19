@@ -4,11 +4,13 @@
 /// The most slice bytes a target draws from one stream.
 pub const max_input_len = 8192;
 
-/// The most bytes of slice lengths (4 each), fixed-size values (8 each) and eos bytes
-/// (1 each) a target draws besides its slice bytes.
+/// The framing budget, in bytes of slice lengths (4 each), fixed-size values (8 each) and
+/// eos bytes (1 each), of a target that draws a full `max_input_len` of slice bytes. A target
+/// that draws less slice data may use the difference for framing.
 pub const max_framing_len = 64;
 
-/// The largest corpus file build.zig accepts, which is the largest stream a target can consume.
+/// The most bytes of any stream a target consumes, its slice bytes and framing together,
+/// and the largest corpus file build.zig accepts.
 pub const max_file_len = max_input_len + max_framing_len;
 
 /// The most bytes build.zig accepts over every corpus file in src/fuzz/*/ together.

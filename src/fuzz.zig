@@ -9,11 +9,14 @@
 //!
 //! A crash file `zig build fuzz` saves is exactly the stream the target consumed, so a
 //! full-length slice adds 4 bytes of framing to its `max_input_len` bytes. The limits are in
-//! fuzz/limits.zig, which build.zig shares. A target draws slices of at most `max_input_len`
-//! bytes in total, plus at most `max_framing_len` bytes of lengths, fixed-size values and
-//! eos bytes. So any stream it consumes, a saved crash file included, is at most
-//! `max_file_len` bytes, the per-file limit build.zig enforces. All corpus files together
-//! are at most `max_corpus_len` bytes. A target that would need more must shrink its buffers.
+//! fuzz/limits.zig, which build.zig shares. The bound is on the whole stream: every stream a
+//! target consumes, a saved crash file included, is at most `max_file_len` bytes, the
+//! per-file limit build.zig enforces. A target draws slices of at most `max_input_len` bytes
+//! in total. `max_framing_len` is the budget for lengths, fixed-size values and eos bytes
+//! beside a full `max_input_len` of slice bytes; a target that draws less slice data may use
+//! the difference for framing, as search_attributes and failure_attributes do. All corpus
+//! files together are at most `max_corpus_len` bytes. A target whose stream could exceed
+//! `max_file_len` must shrink its buffers.
 
 const std = @import("std");
 const corpus = @import("fuzz_corpus");
@@ -35,11 +38,13 @@ const findings: []const Finding = @import("fuzz_known");
 /// The most slice bytes a target draws from one stream.
 pub const max_input_len = limits.max_input_len;
 
-/// The most bytes of slice lengths, fixed-size values and eos bytes a target draws
-/// besides its slice bytes.
+/// The framing budget, in bytes of slice lengths, fixed-size values and eos bytes, of a
+/// target that draws a full `max_input_len` of slice bytes. A target that draws less slice
+/// data may use more framing, as long as its stream stays within `max_file_len`.
 pub const max_framing_len = limits.max_framing_len;
 
-/// The largest corpus file build.zig accepts: `max_input_len` plus `max_framing_len`.
+/// The most bytes of any stream a target consumes, and the largest corpus file build.zig
+/// accepts: `max_input_len` plus `max_framing_len`.
 pub const max_file_len = limits.max_file_len;
 
 /// Marks the place where target stops on an input that meets the open bug bead.
