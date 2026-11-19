@@ -465,6 +465,54 @@ test "workflows: child workflows" {
     try testing.expectEqualStrings("Hello, Bo!", result[1]);
 }
 
+// example: workflow-signal-with-start
+/// Keeps a guest book open until `capacity` guests have signed it.
+fn guestBook(ctx: *workflow.Context, capacity: u32) ![]const u8 {
+    const guests = try ctx.signalChannel(AddGuest);
+    var names: std.ArrayList([]const u8) = .empty;
+    while (names.items.len < capacity) try names.append(ctx.allocator(), try guests.receive());
+    return std.mem.join(ctx.allocator(), ", ", names.items);
+}
+pub const GuestBook = workflow.Def("guest_book", guestBook);
+
+/// Signs `guest` into the book `book_id`, opening it first if it isn't open.
+fn signIn(ctx: *workflow.Context, book_id: []const u8, guest: []const u8) !workflow.SignalWithStartResult {
+    const sent = ctx.signalWithStartWorkflow(GuestBook, .{
+        .id = book_id,
+        .execution_timeout = .fromSeconds(3600),
+        .id_conflict_policy = .use_existing, // only signal a book that is already open
+    }, .{2}, AddGuest, .{guest});
+    return sent.get() catch |err| {
+        if (sent.failure()) |f| ctx.logger().warn("sign-in refused", .{ .reason = temporal.failure.rootCause(f).message });
+        return err;
+    };
+}
+pub const SignIn = workflow.Def("sign_in", signIn);
+// end-example
+
+test "workflows: signal-with-start opens a guest book once, then signs it" {
+    const extra_args = [_][]const u8{ "--dynamic-config-value", "history.enableSignalWithStartFromWorkflow=true" };
+    const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &extra_args });
+    defer env.deinit();
+    try env.registerWorkflow(GuestBook);
+    try env.registerWorkflow(SignIn);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const book_id = try std.fmt.allocPrint(a, "guest-book-{s}", .{env.task_queue});
+    const first = try env.executeWorkflow(SignIn, .{ book_id, "Ann" }, a, null);
+    try testing.expect(first.started);
+    try testing.expectEqualStrings(book_id, first.workflow_id);
+    const second = try env.executeWorkflow(SignIn, .{ book_id, "Bob" }, a, null);
+    try testing.expect(!second.started);
+    try testing.expectEqualStrings(first.run_id, second.run_id);
+
+    var book = try env.client.getWorkflow([]const u8, book_id, first.run_id);
+    defer book.deinit();
+    try testing.expectEqualStrings("Ann, Bob", try env.getResult(GuestBook, &book, a, null));
+}
+
 // example: workflow-continue-as-new
 fn greetInBatches(ctx: *workflow.Context, names: []const []const u8, greeted: u32) !u32 {
     const batch = names[0..@min(names.len, 2)];
