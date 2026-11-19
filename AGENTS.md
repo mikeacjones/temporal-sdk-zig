@@ -18,6 +18,7 @@ This repository is an unofficial Temporal SDK for Zig, built on Temporal's Rust 
   - `scripts/changelog-check.sh [<base>]` checks the changelog fragments, and the commits since `<base>` for a fragment or trailer; `scripts/changelog-test.sh` tests the changelog scripts.
   - See [Correctness commands](#correctness-commands) for the checks and reports available in a checkout.
 - For focused tests, use `-Dtest-filter` (repeatable): `zig build test -Dtest-filter="fibers interleave"`.
+- A test still running after `-Dtest-hang-report=<seconds>` (default 300) prints its name and every thread's stack and goes on running; see [Hang reports](#hang-reports).
 - Use `std.testing.allocator` in tests so leaks fail them. `zig build test` also runs the `zig build test-allocators` scan of the tree, so a test that allocates through another allocator fails it. Avoid fixed sleeps in tests: wait on the condition itself.
 - Keep comments sparse. Comments explain non-obvious reasons, invariants, and ownership, not what the code already says.
 - Error messages must be actionable: include the operation, option, input, or state that helps the caller diagnose the problem.
@@ -45,6 +46,27 @@ scripts/changelog-check.sh origin/main
 A clean build of the Rust core takes a minute or two; later builds reuse `.zig-cache/cargo-target`. Pass `-Dcore-lib=<path>` to link a prebuilt core library instead (the header still comes from the submodule), `-Dcore-bundle=<dir>` to link an extracted core bundle from `scripts/package-core-bundle.sh` (library and header), and `-Dprotoc=<path>` to override the pinned `protoc` that cargo uses. Without the submodule and either option, build.zig links the bundle that build.zig.zon pins as `core-<CORE_VERSION>-<target>`, and fails naming the target if there is none. `.github/workflows/core-bundles.yml` builds and publishes the bundles.
 
 Moving to a new sdk-core release follows [docs/core-bump.md](docs/core-bump.md), and releases follow [docs/releasing.md](docs/releasing.md).
+
+### Hang reports
+
+`zig build test` runs the unit tests, `readme-examples`, `conformance-harness`, `conformance-runner` and `conformance-replay` through the project's test runner, `tools/test_runner/main.zig`. When one test has run for `-Dtest-hang-report=<seconds>` (default 300, half of CI's `--test-timeout 10m`), the runner prints a report to stderr: the test's name, the elapsed time, and the stack of every thread in the process. `-Dtest-hang-report=0` turns it off. The report only prints: the test goes on, and passes if it finishes. With `--test-timeout`, a test that never finishes is then killed, and the build runner's `'<test>' timed out after <d> with stderr:` error shows the report. Each test is reported at most once. Other test binaries (the tool tests, the fuzz binaries, `zig build tsan`, `zig build alloc-failures` and the samples' tests) use Zig's runner and have no report.
+
+A report looks like this. Every line the runner writes starts with `test-hang-report: `, and the frames between them are as `std.debug` prints a stack trace:
+
+```text
+test-hang-report: 'worker.test.a heartbeating activity canceled by its workflow sees the cancel and reports canceled' is still running after 300s; the stacks of its 14 threads follow
+test-hang-report: thread 1 of 14, id 81234, "main" (running the test):
+<frames>
+test-hang-report: thread 2 of 14, id 81240, "tokio-runtime-w":
+<frames>
+test-hang-report: thread 3 of 14, id 81241: did not stop within 1s; stack not shown
+test-hang-report: thread 14 of 14, id 81299, "hang-report" (this report's watchdog; stack not shown)
+test-hang-report: end of the report for 'worker.test.a heartbeating activity canceled by its workflow sees the cancel and reports canceled'
+```
+
+The id is the Linux thread id, or on macOS the one `pthread_threadid_np` gives (as `sample` and lldb show it). The name is left out when a thread has none. The thread running the test comes first, then the others in the order the OS lists them. On Linux, a `did not stop within 1s` row also gives the thread's scheduler state and whether SIGURG is pending for it or blocked by it, from `/proc/self/task/<tid>/status`. A row can also say `exited before its stack was read`, `not a POSIX thread; stack not shown` (macOS), or end the list with `N more threads not shown` after 512 threads; a stack shows at most 64 frames. Stacks come from SIGURG sent to each thread in turn (`tools/test_runner/hang_report.zig`), on Linux and macOS (aarch64 and x86_64); elsewhere the report says `thread stacks are not available on this OS`. While a thread is frozen, the report only walks its frame pointers (which Zig keeps in Debug and ReleaseSafe), reading each frame record through the kernel (`process_vm_readv` on Linux, `mach_vm_read_overwrite` on macOS), so it takes no lock a frozen thread could hold and cannot fault on a bad frame. A frame compiled without a frame pointer (in some C or Rust code) ends a trace early, shown as `(additional stack frames may have been skipped...)`. Symbols are looked up only after every thread runs again, and each row is formatted before stderr is locked. The report waits at most 1 s for a lock another thread may hold: if std's stderr lock stays taken, it says so and writes the rest to file descriptor 2 directly; if std.debug's symbol lock does, it says so and the stacks that follow are bare addresses. Workflow coroutines run on fiber stacks of their own, which the report does not show.
+
+`tools/test_runner/main.zig` is a copy of Zig 0.17.1's `lib/compiler/test_runner.zig` with each change marked `// temporal-sdk-zig:`. On a Zig upgrade, copy the new upstream file over it and reapply the marked changes. It is left out of `zig build lint`, `zig build dupes`, the test-allocators scan, and the review reports' ast-check and zlint (`.review/reports.sh`) so it stays close to upstream; zlint reports upstream's `try` in a function that returns a bare error set as `homeless-try`, which Zig accepts. Six cases in `zig build test` check the report against the fixtures in `tools/checks/fixtures/hang_report/`: `check hang report names a waiting test` and `check hang report names a test while stderr is held` (run by `tools/checks/hang_report.zig`), `check hang report slow test passes`, `check hang report allocating test passes`, `check hang report thread that goes on before its unwind passes`, and `check hang report off`.
 
 ## Correctness commands
 
@@ -77,7 +99,7 @@ Compares the public names from `-Dbase=<ref>` with the working tree, including u
 
 ### `zig build dupes`
 
-Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` as `file:start-end` line ranges, longest first. It compares both token kind and exact text, including identifiers and literals, and ignores comments and whitespace between tokens. It leaves out `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, and `tools/checks/fixtures/`. Directory walks also skip hidden directories, `zig-out`, and `zig-pkg`. The default minimum is 100 tokens. Set it with `-Ddupes-min-tokens=<n>`, or pass relative file and directory paths after `--` to limit the scan. Finding duplicates does not fail the command.
+Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` as `file:start-end` line ranges, longest first. It compares both token kind and exact text, including identifiers and literals, and ignores comments and whitespace between tokens. It leaves out `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, `tools/checks/fixtures/`, and `tools/test_runner/main.zig` (a copy of Zig's test runner). Directory walks also skip hidden directories, `zig-out`, and `zig-pkg`. The default minimum is 100 tokens. Set it with `-Ddupes-min-tokens=<n>`, or pass relative file and directory paths after `--` to limit the scan. Finding duplicates does not fail the command.
 
 - When to run: When reviewing new code for copies of existing code.
 - Run time: about 0.8 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.3 s).
@@ -93,14 +115,14 @@ Crash inputs are saved under `zig-out/fuzz/<target>/crash-<8 hex digits>`. Copy 
 
 ### `zig build lint`
 
-Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance`, excluding generated code and check fixtures. The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init`, even if you pass `-Dcore-bundle` or `-Dcore-lib`. zlinter configures the build a second time with `zig build --print-configuration-path` and omits the outer command's `-D` options. Without the submodule or a default bundle pin for the host, that configuration stops with `no prebuilt core`. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.
+Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance`, excluding generated code, check fixtures, and `tools/test_runner/main.zig` (a copy of Zig's test runner). The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init`, even if you pass `-Dcore-bundle` or `-Dcore-lib`. zlinter configures the build a second time with `zig build --print-configuration-path` and omits the outer command's `-D` options. Without the submodule or a default bundle pin for the host, that configuration stops with `no prebuilt core`. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.
 
 - When to run: When changing hand-written Zig code or the lint rules.
 - Run time: about 2.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 24 s with packages already fetched).
 
 ### `zig build test-allocators`
 
-Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check. `zig build test` runs this scan too, as its `check test-allocators tree` step.
+Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. It leaves out the same paths as `zig build dupes`. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check. `zig build test` runs this scan too, as its `check test-allocators tree` step.
 
 - When to run: When adding or changing tests or reviewing an allow-list entry; `zig build test` runs it every time.
 - Run time: about 0.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.8 s).
@@ -233,6 +255,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `samples/` holds the samples, and `tools/samples_runner.zig` validates them. PARITY.md lists them, explains how parity is measured, and has the feature table; `scripts/parity-check.sh` checks the table.
 - `examples/readme/` holds the compiled examples that README.md's code blocks copy, and `tools/readme_examples.zig` checks or rewrites the copies.
 - `tools/checks/` holds the correctness commands and their fixtures.
+- `tools/test_runner/` holds the test runner `zig build test` uses, with the hang report (see [Hang reports](#hang-reports)).
 - `conformance/` holds the features-suite conformance run: `features/<area>/<name>/feature.zig` are the Zig features, `harness/` and `runner/` run them, `parity_map.zon` maps each suite feature to a PARITY.md row, `not_applicable.zon` lists the features with no Zig equivalent, `histories/` holds the stored workflow histories, and `replay/` replays them in `zig build test`.
 - `scripts/` holds maintenance scripts, each with usage in its header.
 - `.review/` holds the review tooling: `reports.sh` runs the checks and the scanners (gitleaks, osv-scanner, cargo-deny, shellcheck, actionlint, typos, zlint) on a change, `install.sh` installs them, and the `.toml` files are their settings. It isn't part of the SDK and isn't in the release tarball.

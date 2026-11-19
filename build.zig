@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     );
     const protoc_opt = b.option([]const u8, "protoc", "Path to protoc used by the cargo build (default: pinned download)");
     const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
+    const hang_report = b.option(u32, "test-hang-report", "Print the name, elapsed time and every thread's stack of a test still running after this many seconds, without ending it (default: 300; 0 turns the report off)") orelse 300;
     // A checkout tests against the test server release its tests were last verified with: a
     // new release reaches every machine without a cached copy at once, and one has broken
     // updates (sdk-java 1.41.0's never delivers a workflow task that carries one). A project
@@ -103,12 +104,12 @@ pub fn build(b: *std.Build) void {
     });
     test_module.addOptions("build_options", build_options);
     linkCoreLib(test_module, target, core.lib);
-    const unit_tests = b.addTest(.{ .root_module = test_module, .filters = test_filters });
+    const unit_tests = b.addTest(.{ .root_module = test_module, .filters = test_filters, .test_runner = testRunner(b) });
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    test_step.dependOn(&runTests(b, unit_tests, hang_report).step);
 
     if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance);
-    if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters);
+    if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters, hang_report);
     if (pathExists(b, "tools/checks")) addCheckSteps(b, .{
         .target = target,
         .optimize = optimize,
@@ -121,7 +122,7 @@ pub fn build(b: *std.Build) void {
         .test_filters = test_filters,
         .forwarded = .{ .core_lib = core_lib_opt, .core_bundle = core_bundle_opt, .protoc = protoc_opt },
     });
-    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, .{
+    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, hang_report, .{
         .core_lib = core_lib_opt,
         .core_bundle = core_bundle_opt,
         .protoc = protoc_opt,
@@ -151,6 +152,7 @@ fn addReadmeSteps(
     temporal: *std.Build.Module,
     test_step: *std.Build.Step,
     test_filters: []const []const u8,
+    hang_report: u32,
 ) void {
     const examples = b.addTest(.{
         .name = "readme-examples",
@@ -162,8 +164,9 @@ fn addReadmeSteps(
             .imports = &.{.{ .name = "temporal", .module = temporal }},
         }),
         .filters = test_filters,
+        .test_runner = testRunner(b),
     });
-    test_step.dependOn(&b.addRunArtifact(examples).step);
+    test_step.dependOn(&runTests(b, examples, hang_report).step);
 
     const tool_module = b.createModule(.{
         .root_source_file = b.path("tools/readme_examples.zig"),
@@ -593,7 +596,7 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         linter.addPaths(.{
             .include_dirs = if (pathExists(b, "conformance")) &include_dirs else include_dirs[0 .. include_dirs.len - 1],
             .exclude_dirs = &.{ b.path("src/proto"), b.path("tools/checks/fixtures") },
-            .exclude_files = &.{ b.path("src/proto.zig"), b.path("samples/dispatch.zig") },
+            .exclude_files = &.{ b.path("src/proto.zig"), b.path("samples/dispatch.zig"), b.path("tools/test_runner/main.zig") },
         });
         const scan = linter.build().cast(std.Build.Step.Run).?;
         // zlinter resolves the build configuration relative to its working directory.
@@ -644,6 +647,85 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         clean.addArgs(&.{ "empty.zon", "clean.zig" });
         clean.expectStdOutEqual("");
         clean.expectStdErrEqual("");
+    }
+
+    // hang report (tools/test_runner)
+    if (testRunner(b)) |runner| {
+        const fixtures = "tools/checks/fixtures/hang_report/";
+        const Fixture = struct {
+            fn build(owner: *std.Build, name: []const u8, root: []const u8, test_runner: std.Build.Step.Compile.TestRunner) *std.Build.Step.Compile {
+                return owner.addTest(.{
+                    .name = owner.fmt("hang-report-fixture-{s}", .{name}),
+                    .root_module = owner.createModule(.{
+                        .root_source_file = owner.path(owner.fmt("{s}{s}", .{ fixtures, root })),
+                        .target = owner.graph.host,
+                        .optimize = .Debug,
+                    }),
+                    .test_runner = test_runner,
+                });
+            }
+        };
+        const hang = Fixture.build(b, "hang", "hang.zig", runner);
+        const slow = Fixture.build(b, "slow", "slow.zig", runner);
+
+        const tool = checkTool(b, "hang-report-check", "tools/checks/hang_report.zig");
+        const names = addCheckCase(b, in.test_step, tool, "hang report names a waiting test", 0);
+        // "in <function> (" is a frame's own line: the bare name also appears in its caller's source line.
+        names.addArgs(&.{ "60", "still running after", "waits forever on an event nothing sets", "in waitsForever (", "in helperWaitsForever (", "--" });
+        names.addArtifactArg(hang);
+        names.addArg("--hang-report=2");
+
+        // A hung test may be stuck holding std's stderr lock; the report must not wait for it.
+        const stderr_held = Fixture.build(b, "stderr-held", "stderr_held.zig", runner);
+        const held = addCheckCase(b, in.test_step, tool, "hang report names a test while stderr is held", 0);
+        held.addArgs(&.{ "60", "still running after", "waits while another thread holds stderr", "in holdsStderrForever (", "--" });
+        held.addArtifactArg(stderr_held);
+        held.addArg("--hang-report=2");
+
+        // addRunArtifact would turn on test-runner mode and hide the output.
+        for ([_]struct { name: []const u8, limit: []const u8 }{
+            .{ .name = "slow test passes", .limit = "1" },
+            .{ .name = "off", .limit = "0" },
+        }) |case| {
+            const run = std.Build.Step.Run.create(b, b.fmt("check hang report {s}", .{case.name}));
+            run.addArtifactArg(slow);
+            run.addArg(b.fmt("--hang-report={s}", .{case.limit}));
+            run.has_side_effects = true;
+            run.expectExitCode(0);
+            if (std.mem.eql(u8, case.limit, "0")) {
+                run.expectStdErrEqual("1/1 slow.test.finishes after the limit...OK\nAll 1 tests passed.\n");
+            } else {
+                run.expectStdErrMatch("still running after 1s");
+                run.expectStdErrMatch("All 1 tests passed.");
+            }
+            in.test_step.dependOn(&run.step);
+        }
+
+        in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "hang-report-check-tool", .root_module = tool.root_module, .filters = in.test_filters })).step);
+
+        // A test frozen while it allocates through std.testing.allocator holds std.debug's
+        // unwinder lock; the report must not wait on it forever. The fixture bounds itself.
+        const busy = Fixture.build(b, "busy", "busy.zig", runner);
+        const busy_run = std.Build.Step.Run.create(b, "check hang report allocating test passes");
+        busy_run.addArtifactArg(busy);
+        busy_run.addArg("--hang-report=1");
+        busy_run.has_side_effects = true;
+        busy_run.expectExitCode(0);
+        busy_run.expectStdErrMatch("still running after 1s");
+        busy_run.expectStdErrMatch("All 1 tests passed.");
+        in.test_step.dependOn(&busy_run.step);
+
+        // A thread frozen while the report's unwind waits on a lock goes on by itself after the
+        // hold limit and reuses its stack; the report must not then read that stack and crash.
+        const moved_on = Fixture.build(b, "moved-on", "moved_on.zig", runner);
+        const moved_on_run = std.Build.Step.Run.create(b, "check hang report thread that goes on before its unwind passes");
+        moved_on_run.addArtifactArg(moved_on);
+        moved_on_run.addArg("--hang-report=1");
+        moved_on_run.has_side_effects = true;
+        moved_on_run.expectExitCode(0);
+        moved_on_run.expectStdErrMatch("still running after 1s");
+        moved_on_run.expectStdErrMatch("All 1 tests passed.");
+        in.test_step.dependOn(&moved_on_run.step);
     }
 
     // zig build tsan
@@ -726,6 +808,20 @@ fn checkTool(b: *std.Build, name: []const u8, source: []const u8) *std.Build.Ste
         .target = b.graph.host,
         .optimize = .Debug,
     }) });
+}
+
+/// The project's test runner: Zig's, plus the hang report (tools/test_runner/main.zig).
+/// Null in a fetched package, which has no tools/, so its tests use Zig's runner.
+fn testRunner(b: *std.Build) ?std.Build.Step.Compile.TestRunner {
+    if (!pathExists(b, "tools/test_runner")) return null;
+    return .{ .path = b.path("tools/test_runner/main.zig"), .mode = .server };
+}
+
+/// addRunArtifact, plus the -Dtest-hang-report limit when `tests` uses the project's runner.
+fn runTests(b: *std.Build, tests: *std.Build.Step.Compile, hang_report: u32) *std.Build.Step.Run {
+    const run = b.addRunArtifact(tests);
+    if (tests.test_runner != null) run.addArg(b.fmt("--hang-report={d}", .{hang_report}));
+    return run;
 }
 
 /// Adds a tool run to test. Tools can read files by path, so their runs are never cached.
@@ -968,6 +1064,7 @@ fn addConformanceSteps(
     temporal: *std.Build.Module,
     test_step: *std.Build.Step,
     test_filters: []const []const u8,
+    hang_report: u32,
     forwarded: ConformanceForwarded,
 ) void {
     const patterns = b.option([]const []const u8, "feature", "Run conformance features matching this path pattern (repeatable)") orelse &.{};
@@ -996,11 +1093,12 @@ fn addConformanceSteps(
     runner.addAnonymousImport("PARITY.md", .{ .root_source_file = b.path("PARITY.md") });
     runner.addAnonymousImport("parity_map.zon", .{ .root_source_file = b.path("conformance/parity_map.zon") });
     inline for (.{ .{ "conformance-harness", harness }, .{ "conformance-runner", runner } }) |artifact| {
-        test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        test_step.dependOn(&runTests(b, b.addTest(.{
             .name = artifact[0],
             .root_module = artifact[1],
             .filters = test_filters,
-        })).step);
+            .test_runner = testRunner(b),
+        }), hang_report).step);
     }
 
     var source: std.Io.Writer.Allocating = .init(b.allocator);
@@ -1043,7 +1141,7 @@ fn addConformanceSteps(
     stored_histories.root_source_file = b.addWriteFiles().add("stored_histories.zig", stored_source.written());
     runner.addImport("stored_histories", stored_histories);
 
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+    test_step.dependOn(&runTests(b, b.addTest(.{
         .name = "conformance-replay",
         .root_module = b.createModule(.{
             .root_source_file = b.path("conformance/replay/replay.zig"),
@@ -1057,7 +1155,8 @@ fn addConformanceSteps(
             },
         }),
         .filters = test_filters,
-    })).step);
+        .test_runner = testRunner(b),
+    }), hang_report).step);
 
     if (!with_suite) {
         // Only the nested build requests the lazy dependency. Clear the report even if
