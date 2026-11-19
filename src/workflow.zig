@@ -268,6 +268,7 @@ const converter = @import("converter.zig");
 const failure_mod = @import("failure.zig");
 const log = @import("log.zig");
 const proto = @import("proto.zig");
+const proto_time = @import("proto_time.zig");
 const propagation = @import("propagation.zig");
 const search_attributes = @import("search_attributes.zig");
 const metrics_mod = @import("metrics.zig");
@@ -350,6 +351,8 @@ pub const HandlerOptions = struct {
     unfinished_policy: HandlerUnfinishedPolicy = .warn_and_abandon,
 };
 
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const RetryPolicy = struct {
     initial_interval: ?Duration = null,
     backoff_coefficient: f64 = 0,
@@ -388,6 +391,8 @@ pub const ActivityCancellationType = enum { try_cancel, wait_cancellation_comple
 
 /// How an activity is scheduled. At least one of `start_to_close_timeout` and
 /// `schedule_to_close_timeout` is required.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const ActivityOptions = struct {
     /// Empty runs the activity on the workflow's task queue.
     task_queue: []const u8 = "",
@@ -421,6 +426,8 @@ pub const ActivityOptions = struct {
 /// How `Context.createSession` and `recreateSession` open a session. A session is held by a
 /// creation activity that runs on the host for the session's whole life, so its timeouts are
 /// that activity's, and it gets one attempt.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const SessionOptions = struct {
     /// The task queue whose session workers (`worker.Options.sessions`) may take the session.
     /// Empty uses the workflow's. `recreateSession` ignores it.
@@ -508,6 +515,8 @@ pub const Session = struct {
 /// history as a marker. At least one of `start_to_close_timeout` and
 /// `schedule_to_close_timeout` is required: without either, the future's `get` returns
 /// `error.InvalidOptions`.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const LocalActivityOptions = struct {
     /// Empty uses the activity's sequence number, which changes when a retry waits on a
     /// workflow timer.
@@ -568,6 +577,8 @@ pub const ParentClosePolicy = enum { terminate, abandon, request_cancel };
 /// by a coroutine started with `io.async` that nothing awaits) is left running; call its
 /// future's `cancel` to cancel it, or rely on its `parent_close_policy`, which the server
 /// applies when the parent closes (by default it terminates the child).
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const ChildWorkflowOptions = struct {
     /// Empty generates a UUID from the workflow's seeded randomness, the same on replay.
     id: []const u8 = "",
@@ -639,6 +650,8 @@ pub const NexusOperationCancellationType = enum { wait_cancellation_completed, w
 
 /// How a Nexus operation is scheduled (`Context.executeNexusOperation`). Only read while
 /// scheduling; strings are copied.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const NexusOperationOptions = struct {
     /// The name of the Nexus endpoint to call through. It must exist on the server: an
     /// operator creates it, routing to a namespace and task queue (in tests,
@@ -672,6 +685,8 @@ pub const NexusOperationOptions = struct {
 };
 
 /// How `Context.continueAsNew` starts the next run.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const ContinueAsNewOptions = struct {
     /// Empty continues on this run's task queue.
     task_queue: []const u8 = "",
@@ -804,7 +819,9 @@ pub const Context = struct {
     /// Blocks the calling coroutine on a durable timer, as `ctx.io().sleep` does, with
     /// `options` on the timer. To race or cancel it, run it as a coroutine (`io.async`, or a
     /// `std.Io.Select` case): canceling the coroutine cancels the timer and returns
-    /// `error.Canceled`. A zero or negative duration returns at once and starts no timer.
+    /// `error.Canceled`. A zero or negative duration returns at once and starts no timer. A
+    /// duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`,
+    /// starts a timer of the longest one it can.
     pub fn sleep(ctx: *Context, duration: Duration, options: SleepOptions) std.Io.Cancelable!void {
         return ctx.instance.sleep(duration, options.summary);
     }
@@ -819,7 +836,9 @@ pub const Context = struct {
     }
 
     /// Like `await`, but gives up after `timeout` (a durable timer) and returns false if the
-    /// condition still doesn't hold.
+    /// condition still doesn't hold. A zero or negative timeout returns false at once. A
+    /// duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`,
+    /// starts a timer of the longest one it can.
     pub fn awaitTimeout(ctx: *Context, timeout: Duration, state: anytype, comptime condition: fn (@TypeOf(state)) bool) error{ Canceled, OutOfMemory }!bool {
         return ctx.awaitInner(state, condition, timeout);
     }
@@ -1123,7 +1142,11 @@ pub const Context = struct {
         const a = ctx.allocator();
         const input: Instance.SessionCreateInput = .{
             .session_id = try @import("client.zig").uuid(a, ctx.io()),
-            .heartbeat_interval_ms = @max(1, @divTrunc(options.heartbeat_timeout.toMilliseconds(), 3)),
+            // In i96 and clamped like the timeout itself, so `Duration.max` cannot overflow.
+            .heartbeat_interval_ms = @max(1, @as(i64, @intCast(@divTrunc(
+                @min(options.heartbeat_timeout.nanoseconds, proto_time.max_duration.nanoseconds),
+                3 * std.time.ns_per_ms,
+            )))),
         };
         const creation = ctx.executeActivityByName(void, Instance.session_create_activity_type, .{
             .task_queue = queue,
@@ -2143,6 +2166,8 @@ const ExternalFuture = struct {
 
 /// Experimental: how `Context.signalWithStartWorkflow` starts and signals the target. Only
 /// read during the call; strings are copied.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const SignalWithStartOptions = struct {
     /// The target's workflow ID. Required: empty makes `get` return `error.InvalidOptions`
     /// (logged).
