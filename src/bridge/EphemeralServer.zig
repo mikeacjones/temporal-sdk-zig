@@ -11,6 +11,8 @@ const c = @import("core_c");
 const bytes = @import("bytes.zig");
 const Runtime = @import("Runtime.zig");
 const Completion = @import("completion.zig").Completion;
+const handToCore = @import("tsan.zig").handToCore;
+const takeFromCore = @import("tsan.zig").takeFromCore;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -106,6 +108,7 @@ pub fn startDevServer(gpa: Allocator, io: Io, runtime: Runtime, options: DevServ
     const done = try Completion(StartResult).create(gpa, io, StartResult.free);
     const redirect: OutputRedirect = .begin(options.output);
     defer redirect.end();
+    handToCore(done);
     c.temporal_core_ephemeral_server_start_dev_server(runtime.ptr, &dev, done, onStart);
     // Uncancelable: the core reads the options from `arena` until it calls back, and startup
     // is bounded by its timeout.
@@ -122,6 +125,7 @@ pub fn startTestServer(gpa: Allocator, io: Io, runtime: Runtime, options: TestSe
     const done = try Completion(StartResult).create(gpa, io, StartResult.free);
     const redirect: OutputRedirect = .begin(options.output);
     defer redirect.end();
+    handToCore(done);
     c.temporal_core_ephemeral_server_start_test_server(runtime.ptr, test_server, done, onStart);
     return finishStart(gpa, runtime, done.waitUncancelable(), failure);
 }
@@ -131,6 +135,7 @@ pub fn startTestServer(gpa: Allocator, io: Io, runtime: Runtime, options: TestSe
 pub fn shutdown(s: *EphemeralServer, io: Io, failure: ?*?[]u8) error{ OutOfMemory, ShutdownFailed }!void {
     defer s.deinit();
     const done = try Completion(?bytes.Owned).create(s.gpa, io, freeOwned);
+    handToCore(done);
     c.temporal_core_ephemeral_server_shutdown(s.ptr, done, onShutdown);
     const fail = done.waitUncancelable() orelse return;
     defer fail.deinit();
@@ -223,6 +228,7 @@ fn onStart(
     target: ?*const c.TemporalCoreByteArray,
     fail: ?*const c.TemporalCoreByteArray,
 ) callconv(.c) void {
+    takeFromCore(user_data.?);
     const done: *Completion(StartResult) = @ptrCast(@alignCast(user_data.?));
     // The arrays come from the runtime's pool; freeing without the runtime pointer is allowed
     // and only skips recycling the buffer.
@@ -230,6 +236,7 @@ fn onStart(
 }
 
 fn onShutdown(user_data: ?*anyopaque, fail: ?*const c.TemporalCoreByteArray) callconv(.c) void {
+    takeFromCore(user_data.?);
     const done: *Completion(?bytes.Owned) = @ptrCast(@alignCast(user_data.?));
     done.complete(bytes.Owned.take(null, fail));
 }
