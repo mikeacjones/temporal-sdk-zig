@@ -773,7 +773,9 @@ pub const Time = struct {
         return w.buffered();
     }
 
-    /// Parses an RFC 3339 time ("2006-01-02T15:04:05.999999999Z07:00").
+    /// Parses an RFC 3339 time ("2006-01-02T15:04:05.999999999Z07:00"). A time whose offset
+    /// moves it out of the years 0000 to 9999 in UTC is `error.InvalidTime`, since `format`
+    /// can't write it.
     pub fn parse(text: []const u8) error{InvalidTime}!Time {
         if (text.len < 20 or text[4] != '-' or text[7] != '-' or (text[10] != 'T' and text[10] != 't') or text[13] != ':' or text[16] != ':')
             return error.InvalidTime;
@@ -811,6 +813,9 @@ pub const Time = struct {
         if (i != text.len) return error.InvalidTime;
         const days = daysFromCivil(year, month, day);
         const secs = days * std.time.s_per_day + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset_s;
+        const first_secs = comptime daysFromCivil(0, 1, 1) * std.time.s_per_day;
+        const end_secs = comptime daysFromCivil(10000, 1, 1) * std.time.s_per_day;
+        if (secs < first_secs or secs >= end_secs) return error.InvalidTime;
         return .{ .unix_ns = @as(i96, secs) * std.time.ns_per_s + nanos };
     }
 
@@ -947,6 +952,12 @@ test "Time encodes as RFC 3339 text" {
     const frac = try Time.parse("2018-08-22T09:30:00.12-07:00");
     try std.testing.expectEqualStrings("2018-08-22T16:30:00.12Z", frac.format(&buf));
     try std.testing.expectError(error.InvalidTime, Time.parse("2018-08-22 16:30:00"));
+    // Years format can't write: the offset or a leap second moves these out of 0000 to 9999.
+    try std.testing.expectError(error.InvalidTime, Time.parse("0000-01-01T00:00:00+00:01"));
+    try std.testing.expectError(error.InvalidTime, Time.parse("9999-12-31T23:59:59-00:01"));
+    try std.testing.expectError(error.InvalidTime, Time.parse("9999-12-31T23:59:60Z"));
+    try std.testing.expectEqualStrings("0000-01-01T00:00:00Z", (try Time.parse("0000-01-01T01:00:00+01:00")).format(&buf));
+    try std.testing.expectEqualStrings("9999-12-31T23:59:59.999999999Z", (try Time.parse("9999-12-31T22:59:59.999999999-01:00")).format(&buf));
 
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
