@@ -2144,21 +2144,22 @@ fn signalWithContext(inst: *Instance, target: SignalTarget, context: ?*const con
 }
 
 /// Encodes `args` and `signal_args` with the target's converter context and sends a
-/// signal-with-start through the system Nexus endpoint. It goes through no interceptor and
-/// sends an empty header.
+/// signal-with-start through the outbound interceptors. The propagators write into the
+/// request's header, as for a child workflow's start, not into Nexus headers.
 pub fn signalWithStart(inst: *Instance, workflow_type: []const u8, options: workflow.SignalWithStartOptions, args: anytype, signal_name: []const u8, signal_args: anytype) workflow.SignalWithStartFuture {
     if (inst.wio.refuse("signalWithStartWorkflow")) return .{ .ctx = &inst.ctx, .workflow_id = "", .state = error.InvalidOptions };
-    const a = inst.arena();
-    const workflow_id = a.dupe(u8, options.id) catch return .{ .ctx = &inst.ctx, .workflow_id = "", .state = error.OutOfMemory };
-    const fail: workflow.SignalWithStartFuture = .{ .ctx = &inst.ctx, .workflow_id = workflow_id, .state = error.OutOfMemory };
+    const fail: workflow.SignalWithStartFuture = .{ .ctx = &inst.ctx, .workflow_id = "", .state = error.OutOfMemory };
     const context = inst.contextWith(.{ .workflow_id = options.id, .workflow_type = workflow_type }) catch return fail;
-    const payloads = converter.toPayloadsWithContext(a, context, args) catch return fail;
-    const signal_payloads = converter.toPayloadsWithContext(a, context, signal_args) catch return fail;
-    return .{
-        .ctx = &inst.ctx,
-        .workflow_id = workflow_id,
-        .state = inst.sendSignalWithStart(workflow_type, signal_name, options, payloads.items, signal_payloads.items, .{}),
-    };
+    const out = inst.outgoing(context, args) catch return fail;
+    const signal_payloads = converter.toPayloadsWithContext(inst.arena(), context, signal_args) catch return fail;
+    return inst.outboundNext().signalWithStartWorkflow(.{
+        .workflow_type = workflow_type,
+        .signal_name = signal_name,
+        .options = options,
+        .args = out.args,
+        .signal_args = .{ .payloads = signal_payloads.items, .context = context },
+        .header = out.header,
+    });
 }
 
 /// Encodes `input`, adds the propagated values to the Nexus headers (see
@@ -3315,6 +3316,7 @@ const outbound_root: interceptor.WorkflowOutbound.VTable = .{
     .continueAsNew = rootContinueAsNew,
     .sideEffect = rootSideEffect,
     .executeNexusOperation = rootExecuteNexusOperation,
+    .signalWithStartWorkflow = rootSignalWithStartWorkflow,
     .logger = rootLogger,
 };
 
@@ -3371,6 +3373,16 @@ fn rootExecuteChildWorkflow(ptr: *anyopaque, input: interceptor.ChildWorkflowInp
 fn rootExecuteNexusOperation(ptr: *anyopaque, input: interceptor.NexusOperationInput, _: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(converter.Payload) {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
     return .{ .ctx = &inst.ctx, .state = inst.scheduleNexusOperation(input.service, input.operation, input.options, input.payload) };
+}
+
+fn rootSignalWithStartWorkflow(ptr: *anyopaque, input: interceptor.SignalWithStartInput, _: interceptor.WorkflowOutbound.Next) workflow.SignalWithStartFuture {
+    const inst: *Instance = @ptrCast(@alignCast(ptr));
+    const workflow_id = inst.arena().dupe(u8, input.options.id) catch return .{ .ctx = &inst.ctx, .workflow_id = "", .state = error.OutOfMemory };
+    return .{
+        .ctx = &inst.ctx,
+        .workflow_id = workflow_id,
+        .state = inst.sendSignalWithStart(input.workflow_type, input.signal_name, input.options, input.args.payloads, input.signal_args.payloads, input.header.header()),
+    };
 }
 
 fn rootSignalExternalWorkflow(ptr: *anyopaque, input: interceptor.SignalExternalInput, _: interceptor.WorkflowOutbound.Next) workflow.SignalExternalFuture {
