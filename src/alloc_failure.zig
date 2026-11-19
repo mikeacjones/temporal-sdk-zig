@@ -14,6 +14,18 @@
 //! - search_attributes.toProto, search_attributes.encodeValue,
 //!   search_attributes.View.fromProto, search_attributes.View.get,
 //!   search_attributes.View.dupe, search_attributes.View.toProto
+//! - nexus.wire.fromNexusLink, nexus.wire.toNexusLink, nexus.wire.handlerFailure,
+//!   nexus.wire.operationFailure
+//! - schedule.Schedule.toProto, schedule.Schedule.fromProto, schedule.Description.fromProto
+//! - propagation.injectAll, propagation.extractAll
+//! - client.loadOptions, from `LoadOptions.config_data` and `LoadOptions.env` only
+//!
+//! Left out: every function that needs a core runtime, a worker or a server, such as the
+//! `Client` calls, a worker's polling and task completions (including the Nexus worker's
+//! task decoding), and the workflow and activity context calls. A case here is
+//! single-threaded and starts nothing, and those functions can't run without what they
+//! connect to; worker.zig tests their allocation failures where it can. client.loadOptions
+//! is in because sdk-core reads its profile without a runtime.
 //!
 //! Adding a case: write a `test "<case>"`, where the case is the function's path from src
 //! with dots ("converter.Header.fromEntries"). Build the inputs before the call, with
@@ -33,6 +45,11 @@ const failure = @import("failure.zig");
 const history = @import("history.zig");
 const protojson = @import("protojson.zig");
 const search_attributes = @import("search_attributes.zig");
+const nexus = @import("nexus.zig");
+const wire = @import("nexus/wire.zig");
+const schedule = @import("schedule.zig");
+const propagation = @import("propagation.zig");
+const client = @import("client.zig");
 
 const Color = enum { red, green, blue };
 
@@ -449,6 +466,303 @@ test "history.fromJson reports OutOfMemory on payloads of every size" {
     try alloc_failures.run("history.fromJson", .arena, historyFromJson, .{@as([]const u8, json.items)});
 }
 
+// ---------------------------------------------------------------- Nexus wire
+
+const common = proto.temporal.api.common.v1;
+
+/// A Nexus link to a workflow event with percent-encoded segments and query values, and the
+/// event type in PascalCase, so the reading decodes each part and spells the type again.
+const nexus_link: proto.temporal.api.nexus.v1.Link = .{
+    .url = "temporal:///namespaces/d%C3%A9j%C3%A0/workflows/order%2F42/run%201/history?referenceType=RequestIdReference&requestID=req+7%2B8&eventType=NexusOperationScheduled",
+    .type = wire.workflow_event_link_type,
+};
+
+/// The Temporal form of a link to a workflow event, with segments that need encoding.
+const temporal_link: common.Link = .{ .variant = .{ .workflow_event = .{
+    .namespace = "d\u{e9}j\u{e0}",
+    .workflow_id = "order/42",
+    .run_id = "run 1",
+    .reference = .{ .event_ref = .{ .event_id = 7, .event_type = .EVENT_TYPE_NEXUS_OPERATION_SCHEDULED } },
+} } };
+
+fn nexusFromLink(a: Allocator, link: proto.temporal.api.nexus.v1.Link) !void {
+    var why: []const u8 = "";
+    _ = try wire.fromNexusLink(a, link, &why);
+}
+
+fn nexusToLink(a: Allocator, link: common.Link) !void {
+    var why: []const u8 = "";
+    _ = try wire.toNexusLink(a, link, &why);
+}
+
+fn nexusHandlerFailure(a: Allocator, cause: *const Failure) !void {
+    _ = try wire.handlerFailure(a, .{
+        .type = .internal,
+        .message = "inventory unavailable",
+        .retry = .non_retryable,
+        .cause = .{ .message = "warehouse down", .type = "WarehouseDown", .details = &.{.{ .data = "\"east\"" }}, .cause = cause },
+    });
+}
+
+fn nexusOperationFailure(a: Allocator, cause: *const Failure) !void {
+    // A failed operation copies its cause chain; a canceled one copies its details.
+    _ = try wire.operationFailure(a, .{ .state = .failed, .failure = .{
+        .message = "reservation failed",
+        .type = "ReservationFailed",
+        .details = &.{.{ .data = "\"r-9\"" }},
+        .cause = cause,
+    } });
+    _ = try wire.operationFailure(a, .{ .state = .canceled, .failure = .{
+        .message = "reservation canceled",
+        .details = &.{ .{ .data = "\"r-9\"" }, .{ .data = "2" } },
+    } });
+}
+
+test "nexus.wire.fromNexusLink" {
+    var why: []const u8 = "";
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // The input is valid: with no failure it converts.
+    _ = try wire.fromNexusLink(arena.allocator(), nexus_link, &why);
+    try alloc_failures.run("nexus.wire.fromNexusLink", .arena, nexusFromLink, .{nexus_link});
+}
+
+test "nexus.wire.toNexusLink" {
+    try alloc_failures.run("nexus.wire.toNexusLink", .arena, nexusToLink, .{temporal_link});
+}
+
+test "nexus.wire.handlerFailure" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const chain = try failureChain(arena.allocator());
+    try alloc_failures.run("nexus.wire.handlerFailure", .arena, nexusHandlerFailure, .{chain});
+}
+
+test "nexus.wire.operationFailure" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const chain = try failureChain(arena.allocator());
+    try alloc_failures.run("nexus.wire.operationFailure", .arena, nexusOperationFailure, .{chain});
+}
+
+// ---------------------------------------------------------------- schedule
+
+const schedule_pb = proto.temporal.api.schedule.v1;
+const DescribeScheduleResponse = proto.temporal.api.workflowservice.v1.DescribeScheduleResponse;
+
+/// A schedule with calendars, a skip calendar, intervals and cron expressions, a workflow
+/// start with arguments, a memo and search attributes, and every policy set, built in `a`.
+fn scheduleValue(a: Allocator) !schedule.Schedule {
+    const action = try schedule.startWorkflowByName(a, "Checkout", .{ order, @as([]const u8, "nightly") }, .{
+        .id = "checkout-nightly",
+        .task_queue = "orders",
+        .run_timeout = .fromSeconds(600),
+        .memo = try converter.toFields(a, .{ .owner = "billing", .order = order }),
+        .search_attributes = &.{ customer_id.set("c-42"), priority.set(3), regions.set(&.{ "eu-west", "us-east" }) },
+    });
+    return .{
+        .action = action,
+        .spec = .{
+            .calendars = &.{
+                .{ .hour = &.{.{ .start = 9, .end = 17, .step = 2 }}, .day_of_week = &.{.{ .start = 1, .end = 5 }}, .comment = "weekdays" },
+                .{ .minute = &.{ .{ .start = 0 }, .{ .start = 30 } }, .year = &.{.{ .start = 2027 }} },
+            },
+            // Duration.fromSeconds runs at run time, so a literal here would be an array in
+            // this function's frame; the intervals are copied into `a` to outlive it.
+            .intervals = try a.dupe(schedule.Interval, &.{
+                .{ .every = .fromSeconds(3600), .offset = .fromSeconds(15 * 60) },
+                .{ .every = .fromSeconds(86400) },
+            }),
+            .cron_expressions = &.{ "0 12 * * MON-FRI", "@hourly" },
+            .skip = &.{.{ .month = &.{.{ .start = 12 }}, .day_of_month = &.{.{ .start = 25 }} }},
+            .start_at = .fromNanoseconds(1_795_000_000_000_000_000),
+            .jitter = .fromSeconds(30),
+            .time_zone_name = "America/New_York",
+        },
+        .policies = .{ .overlap = .buffer_one, .catchup_window = .fromSeconds(3600), .pause_on_failure = true, .keep_original_workflow_id = true },
+        .state = .{ .note = "nightly checkout", .paused = true, .remaining_actions = 10 },
+    };
+}
+
+fn scheduleToProto(a: Allocator, s: schedule.Schedule, base: ?schedule_pb.Schedule) !void {
+    // Once with no base and once over the schedule as described, as an update does.
+    _ = try s.toProto(a, null);
+    _ = try s.toProto(a, base);
+}
+
+fn scheduleFromProto(a: Allocator, s: schedule_pb.Schedule) !void {
+    _ = try schedule.Schedule.fromProto(a, s);
+}
+
+fn scheduleDescriptionFromProto(a: Allocator, response: DescribeScheduleResponse) !void {
+    _ = try schedule.Description.fromProto(a, "checkout-nightly", response);
+}
+
+/// A describe response for `scheduleValue`, with running workflows, recent actions, future
+/// action times, a memo and search attributes, built in `a`.
+fn describeResponse(a: Allocator) !DescribeScheduleResponse {
+    const s = try (try scheduleValue(a)).toProto(a, null);
+    const running = try a.dupe(common.WorkflowExecution, &.{
+        .{ .workflow_id = "checkout-nightly-1", .run_id = "r1" },
+        .{ .workflow_id = "checkout-nightly-2", .run_id = "r2" },
+    });
+    const recent = try a.dupe(schedule_pb.ScheduleActionResult, &.{
+        .{ .schedule_time = .{ .seconds = 1_795_000_000 }, .actual_time = .{ .seconds = 1_795_000_001 }, .start_workflow_result = .{ .workflow_id = "checkout-nightly-1", .run_id = "r1" } },
+        .{ .schedule_time = .{ .seconds = 1_795_003_600 }, .actual_time = .{ .seconds = 1_795_003_602 }, .start_workflow_result = .{ .workflow_id = "checkout-nightly-2", .run_id = "r2" } },
+    });
+    const future = try a.dupe(proto.google.protobuf.Timestamp, &.{ .{ .seconds = 1_795_007_200 }, .{ .seconds = 1_795_010_800 } });
+    const memo_fields = try converter.toFields(a, .{ .owner = "billing", .order = order });
+    var memo: common.Memo = .{};
+    for (memo_fields) |f| try memo.fields.append(a, .{ .key = f.name, .value = f.value });
+    return .{
+        .schedule = s,
+        .info = .{
+            .action_count = 2,
+            .running_workflows = .fromOwnedSlice(running),
+            .recent_actions = .fromOwnedSlice(recent),
+            .future_action_times = .fromOwnedSlice(future),
+            .create_time = .{ .seconds = 1_794_990_000 },
+        },
+        .memo = memo,
+        .search_attributes = try sa.toProto(a, &updates, .upsert),
+    };
+}
+
+test "schedule.Schedule.toProto" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const s = try scheduleValue(arena.allocator());
+    const base = try s.toProto(arena.allocator(), null);
+    try alloc_failures.run("schedule.Schedule.toProto", .arena, scheduleToProto, .{ s, @as(?schedule_pb.Schedule, base) });
+}
+
+test "schedule.Schedule.fromProto" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const s = try (try scheduleValue(arena.allocator())).toProto(arena.allocator(), null);
+    try alloc_failures.run("schedule.Schedule.fromProto", .arena, scheduleFromProto, .{s});
+}
+
+test "schedule.Description.fromProto" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try alloc_failures.run("schedule.Description.fromProto", .arena, scheduleDescriptionFromProto, .{try describeResponse(arena.allocator())});
+}
+
+// ---------------------------------------------------------------- propagation
+
+const tenant = propagation.key([]const u8, "tenant");
+const Caller = struct { user: []const u8, roles: []const []const u8, level: u8 };
+const caller = propagation.key(Caller, "caller");
+
+const propagators = [_]propagation.ContextPropagator{
+    propagation.HeaderPropagator(tenant).propagator,
+    propagation.HeaderPropagator(caller).propagator,
+};
+
+fn propagationInjectAll(a: Allocator, values: *const propagation.Values) !void {
+    var header: converter.HeaderWriter = .init(a);
+    try propagation.injectAll(&propagators, a, values, &header);
+}
+
+fn propagationExtractAll(a: Allocator, header: converter.Header) !void {
+    var values: propagation.Values = .init(a);
+    try propagation.extractAll(&propagators, a, header, &values, "a test call");
+}
+
+/// A store with a value for each of `propagators`, built in `a`.
+fn propagatedValues(a: Allocator) !propagation.Values {
+    var values: propagation.Values = .init(a);
+    try values.put(tenant, "acme");
+    try values.put(caller, .{ .user = "ada", .roles = &.{ "admin", "billing" }, .level = 3 });
+    return values;
+}
+
+test "propagation.injectAll" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const values = try propagatedValues(arena.allocator());
+    try alloc_failures.run("propagation.injectAll", .arena, propagationInjectAll, .{&values});
+}
+
+test "propagation.extractAll" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const values = try propagatedValues(a);
+    var header: converter.HeaderWriter = .init(a);
+    try propagation.injectAll(&propagators, a, &values, &header);
+    // The input is valid: with no failure both propagators read their value back.
+    var back: propagation.Values = .init(a);
+    try propagation.extractAll(&propagators, a, header.header(), &back, "a test call");
+    try std.testing.expectEqualStrings("acme", back.get(tenant).?);
+    try std.testing.expectEqualStrings("billing", back.get(caller).?.roles[1]);
+    try alloc_failures.run("propagation.extractAll", .arena, propagationExtractAll, .{header.header()});
+}
+
+// ---------------------------------------------------------------- client
+
+/// A profile with every key `loadOptions` lifts: address, namespace, API key, TLS settings
+/// and gRPC metadata.
+const client_config =
+    \\[profile.prod]
+    \\address = "prod.example.com:7233"
+    \\namespace = "orders"
+    \\api_key = "secret-key"
+    \\[profile.prod.tls]
+    \\server_name = "prod.example.com"
+    \\server_ca_cert_path = "/etc/temporal/ca.pem"
+    \\client_cert_data = "-----BEGIN CERTIFICATE-----"
+    \\client_key_path = "/etc/temporal/client.key"
+    \\[profile.prod.grpc_meta]
+    \\region = "eu"
+    \\team = "billing"
+;
+
+fn clientLoadOptions(a: Allocator, env: *const std.process.Environ.Map) !void {
+    _ = try client.loadOptions(a, .{ .config_data = client_config, .env = env });
+}
+
+test "client.loadOptions" {
+    // The environment is this map, not the process's, and the config is `client_config`, not
+    // a file: TEMPORAL_PROFILE picks the profile and the other variables override it.
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_PROFILE", "prod");
+    try env.put("TEMPORAL_NAMESPACE", "orders-eu");
+    try env.put("TEMPORAL_GRPC_META_TRACE", "on");
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const options = try client.loadOptions(arena.allocator(), .{ .config_data = client_config, .env = &env });
+    try std.testing.expectEqualStrings("prod.example.com:7233", options.host_port);
+    try std.testing.expectEqualStrings("orders-eu", options.namespace);
+    try std.testing.expectEqualStrings("secret-key", options.api_key);
+    try std.testing.expectEqualStrings("/etc/temporal/ca.pem", options.tls.?.server_root_ca_cert_path);
+    try std.testing.expectEqual(3, options.headers.len);
+    try alloc_failures.run("client.loadOptions", .arena, clientLoadOptions, .{@as(*const std.process.Environ.Map, &env)});
+}
+
 test "every known finding names a case" {
     try alloc_failures.expectFindingsHaveCases(@embedFile("alloc_failure.zig"));
+}
+
+/// Writes over the stack below the caller's frame, where a function the caller has returned
+/// from kept its locals, so a slice that still points there reads something else.
+noinline fn overwriteDeadStack() void {
+    var scratch: [64 * 1024]u8 = undefined;
+    @memset(&scratch, 0xaa);
+    std.mem.doNotOptimizeAway(&scratch);
+}
+
+test "the schedule cases' input outlives the function that builds it" {
+    // scheduleValue's intervals must not point into its own returned-from stack frame: the
+    // schedule cases read them after it returns (in ReleaseSafe, toProto panics on them).
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const s = try scheduleValue(arena.allocator());
+    overwriteDeadStack();
+    try std.testing.expectEqual(2, s.spec.intervals.len);
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(3600), s.spec.intervals[0].every);
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(15 * 60), s.spec.intervals[0].offset);
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(86400), s.spec.intervals[1].every);
 }

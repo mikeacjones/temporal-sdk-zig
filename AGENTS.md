@@ -59,7 +59,7 @@ Calls SDK functions that take an allocator with each of their allocations failin
 To add a case, follow the top comment of `src/alloc_failure.zig`: a `test "<case>"` that builds its inputs with `std.testing.allocator` and calls `alloc_failures.run("<case>", .arena, <wrapper>, .{inputs...})`, where the wrapper takes the allocator first and fixes the comptime arguments. A finding that is not fixed with its case goes in `tools/checks/alloc_failures.zon` with its `case`, `bead`, and `reason`; a listed case that still fails passes quietly. An entry whose case no longer fails, or whose case no test names, fails the command.
 
 - When to run: When changing a function a case calls, or adding a case.
-- Run time: about 6.3 s on the factory's Apple-silicon Mac, measured 2026-11-19 with the converter, failure, history, ProtoJSON and search-attribute cases, most of it compiling the test root (first run about 65 s, most of it cargo building the Rust core).
+- Run time: about 7.2 s for the whole command with all 32 cases (41 tests as the runner counts them) on the factory's Apple-silicon Mac, measured 2026-11-19: about 4 s compiling the test root and 2 s running the cases (first run about 64 s, most of it cargo building the Rust core).
 
 ### `zig build api`
 
