@@ -1,0 +1,3 @@
+.{
+    .{ .target = "history_json", .bead = "temporal-sdk-zig-example", .reason = "Fixture for the guard idiom." },
+}

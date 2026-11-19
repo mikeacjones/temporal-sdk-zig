@@ -1,1 +1,0 @@
-`interceptor.WorkflowOutbound.executeNexusOperation` intercepts the Nexus operations a workflow calls, and `interceptor.Worker.interceptNexusOperation` hands out `NexusOperationInbound` and `NexusOperationOutbound` interceptors around the start and cancel of each operation a worker handles and around its handler's logger.

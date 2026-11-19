@@ -1,0 +1,12 @@
+.{
+    .{
+        .target = "protojson",
+        .bead = "temporal-sdk-zig-ljo",
+        .reason = "A decoded message holding a Timestamp on 29 February of a year not divisible by 400 is not re-encoded, because zig-protobuf's Timestamp.jsonStringify overflows in civil_from_days on that day.",
+    },
+    .{
+        .target = "nexus_links",
+        .bead = "temporal-sdk-zig-d51.10.8",
+        .reason = "A percent-encoded link that decodes to invalid UTF-8 converts, so the target does not round-trip such a link.",
+    },
+}

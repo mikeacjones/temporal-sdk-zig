@@ -1,1 +1,0 @@
-`workflow.Context.randomUuid` returns a random (version 4) UUID as text, drawn from the run's seeded randomness, so a replay gets the same values in the same order; use it for child workflow IDs or activity arguments. See [Determinism](https://github.com/mikeacjones/temporal-sdk-zig#determinism).

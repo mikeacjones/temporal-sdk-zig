@@ -1,1 +1,0 @@
-The `test-server-version` build option (`.test_server_version` in `b.dependency`'s arguments) sets the time-skipping test server release that `testing.TestServer` and `WorkflowEnvironment.startTimeSkipping` download, such as `"v1.40.0"`; it stays `"default"`, the release sdk-core picks, unless set.

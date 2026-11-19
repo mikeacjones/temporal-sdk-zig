@@ -66,24 +66,100 @@ Compares the public names from `-Dbase=<ref>` with the working tree, including u
 
 ### `zig build dupes`
 
-Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, and `samples` as `file:start-end` line ranges, longest first. It compares both token kind and exact text, including identifiers and literals, and ignores comments and whitespace between tokens. It leaves out `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, and `tools/checks/fixtures/`. Directory walks also skip hidden directories, `zig-out`, and `zig-pkg`. The default minimum is 100 tokens. Set it with `-Ddupes-min-tokens=<n>`, or pass relative file and directory paths after `--` to limit the scan. Finding duplicates does not fail the command.
+Reports repeated runs in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` as `file:start-end` line ranges, longest first. It compares both token kind and exact text, including identifiers and literals, and ignores comments and whitespace between tokens. It leaves out `src/proto/`, `src/proto.zig`, `samples/dispatch.zig`, and `tools/checks/fixtures/`. Directory walks also skip hidden directories, `zig-out`, and `zig-pkg`. The default minimum is 100 tokens. Set it with `-Ddupes-min-tokens=<n>`, or pass relative file and directory paths after `--` to limit the scan. Finding duplicates does not fail the command.
 
 - When to run: When reviewing new code for copies of existing code.
-- Run time: about 0.7 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.0 s).
+- Run time: about 0.8 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.3 s).
+
+### `zig build fuzz`
+
+Runs the `failure_attributes`, `history_json`, `nexus_links`, `payload`, `protojson`, `search_attributes`, and `time_parse` targets with Zig's fuzzer. A panic or failed safety check, a leak, an error outside the declared set, or a failed round trip counts as a crash. The default box is 30 seconds per target. Set `-Dfuzz-seconds=<n>` to change it. Each target runs in two nested builds. The first builds the target and replays the corpus, and the second fuzzes until its deadline. A second run in the same checkout waits on `.zig-cache/fuzz.lock`. Interrupting the command or killing its wrapper stops the nested build and fuzzer. Zig keeps the inputs it learns under `.zig-cache/f/`.
+
+Crash inputs are saved under `zig-out/fuzz/<target>/crash-<8 hex digits>`. Copy the saved input into `src/fuzz/<target>/` and run `zig build test` to replay it. `tools/checks/fuzz.zon` lists the open bugs with their targets and the reason for each guard. `zig build test` fails for an entry without a guard.
+
+- When to run: When changing code a target calls, or adding a target.
+- Run time: about 4.1 min for the 7 targets at the default 30 s each (7 × 30 s of fuzzing plus builds and start-up) on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.1 min, with an empty local cache).
 
 ### `zig build lint`
 
-Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, and `samples`, excluding generated code and check fixtures. The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init` so zlinter can evaluate the default build configuration. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.
+Runs zlinter over hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance`, excluding generated code and check fixtures. The rules are the `addRule` calls in the `lint` block of `addCheckSteps` in `build.zig`. Findings fail the step. Initialize `deps/sdk-core` with `git submodule update --init`, even if you pass `-Dcore-bundle` or `-Dcore-lib`. zlinter configures the build a second time with `zig build --print-configuration-path` and omits the outer command's `-D` options. Without the submodule or a default bundle pin for the host, that configuration stops with `no prebuilt core`. [docs/zlinter.md](docs/zlinter.md) records the rule evaluation.
 
 - When to run: When changing hand-written Zig code or the lint rules.
-- Run time: about 2.5 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 31 s with packages already fetched).
+- Run time: about 2.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 24 s with packages already fetched).
 
 ### `zig build test-allocators`
 
-Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, and `samples` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check.
+Scans test bodies in hand-written Zig under `src`, `tools`, `examples`, `samples`, and `conformance` for allocator names such as `page_allocator` and `FixedBufferAllocator`. Helpers defined outside test blocks are outside the scan's scope. The ZON allow-list at `tools/checks/test_allocators.zon` has one entry per exempt test with a root-relative `file`, a `test_name` (the test's string or identifier, empty for an unnamed test), and a `reason`. Entries with no matching use fail the check.
 
 - When to run: When adding or changing tests or reviewing an allow-list entry.
-- Run time: about 0.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 8.6 s).
+- Run time: about 0.4 s on the factory's Apple-silicon Mac, measured 2026-11-18 (first run about 5.8 s).
+
+## Conformance
+
+`addConformanceSteps` in build.zig adds three commands that run Temporal's cross-SDK features suite against this SDK. The suite is `temporalio/features` at the commit build.zig.zon pins as the lazy dependency `temporal_features`. Each command runs a nested `zig build <step> -Dconformance-suite=true`, and only the nested build fetches the suite. The first run needs network, for that fetch and for the dev server's download. The suite's own Go, TypeScript, and other harnesses are not used: the Zig versions of its features live in `conformance/features/`, and no Go toolchain is needed. The harness is `conformance/harness/` and the runner `conformance/runner/`. Run times are measurements, not limits: they were measured on 2026-11-18 on the factory's Mac (Apple M4 Pro, 14 cores, 64 GB, macOS 27.2.1), each command in its own fresh `git clone --recursive` with no `.zig-cache`, while other builds ran on the machine. The first runs include building the Rust core with cargo (about 70 s). Machine-wide caches were already warm: Zig's global package cache held the suite and the other dependencies, so nothing was downloaded; the dev server's Temporal CLI binary was already in `$TMPDIR`; and cargo's registry and the Rust toolchain were installed.
+
+### `zig build conformance`
+
+Starts a dev server on a free local port it picks itself (sdk-core downloads the Temporal CLI on the first run and caches it in the temporary directory), runs each written feature in a child process with a 240 s limit, and prints a table of every suite feature with the counts on stdout. A feature whose suite `config.json` lists run variants gets a dev server of its own for each variant. Logs go to standard error. `-Dfeature=<pattern>` (repeatable, `*` matches any run of characters) runs only the matching features, as in `zig build conformance -Dfeature='signal/*'`; a pattern that matches no suite feature fails the run.
+
+The report is written to `zig-out/conformance/report.json` (under `--prefix` when one is given), and the previous one is removed first, also when the run fails. It is JSON with the fields `suite_commit`, `sdk_version`, `filter` (the `-Dfeature` patterns), `readme_only_directories` (the number of suite directories that hold only a README.md, which are not features), and `features`: one entry per suite feature (84), sorted by path in byte order, each with `path`, `status`, and, for `fail` and `not_applicable`, `message`. The statuses:
+
+- `pass`: the Zig feature ran and passed.
+- `fail`: the Zig feature failed, timed out, or could not run; `message` says why.
+- `unwritten`: the suite has the feature and `conformance/features/` doesn't.
+- `not_applicable`: `conformance/not_applicable.zon` lists it; `message` is the reason.
+- `not_run`: written but excluded by `-Dfeature`. It appears only with `-Dfeature`.
+
+The table on stdout ends with the count of each status and the report's path.
+
+- When to run: After writing or changing a feature, or a change to the SDK that a written feature covers.
+- Run time: about 42 s on a repeat run, almost all of it running the features (first run about 103 s).
+
+### `zig build conformance-check`
+
+Runs `zig build conformance-map`'s check, then the whole suite as `zig build conformance` does (rewriting the same report), then compares the report with `conformance/parity_map.zon` and PARITY.md's feature table. The suite's table and progress go to standard error, so stdout holds only the finding lines and the counts line, and `zig build conformance-check > findings.tsv` captures them. Each line's fields are separated by one tab:
+
+```
+failing<TAB><row><TAB><feature><TAB><status>
+uncovered<TAB><row>
+unknown-row<TAB><row text><TAB><feature>
+counts<TAB>failing=<n><TAB>uncovered=<n><TAB>unknown-row=<n>
+```
+
+- `failing`: a feature mapped to a PARITY.md row whose status is `supported` did not pass; `<status>` is its report status, such as `fail` or `unwritten`.
+- `uncovered`: a `supported` row that no feature maps to. These lines are information and don't fail the command.
+- `unknown-row`: a parity_map.zon entry names a row text PARITY.md's feature table lacks.
+- `counts`: always the last line; `failing` counts lines, not rows.
+
+Supported rows come first in table order, then the `unknown-row` lines by feature path. Rows that are partial, missing, or not applicable print nothing. The command exits non-zero when there is a `failing` or `unknown-row` line, and also, with nothing on stdout, when the map check fails, when the suite run fails, or when the report or PARITY.md's feature table cannot be read. A feature that fails doesn't fail the suite run: it reaches the comparison as a `fail` status. It takes no `-Dfeature`, and fails at once if given one. On main it exits non-zero while supported rows map to unwritten features, which is expected: each `failing ... unwritten` line is a feature still to write.
+
+- When to run: When changing PARITY.md's statuses, parity_map.zon, or before claiming a row as supported.
+- Run time: about 37 s on a repeat run (first run about 114 s).
+
+### `zig build conformance-map`
+
+Checks `conformance/parity_map.zon` against the suite's features and `conformance/not_applicable.zon`, without starting a server or writing a report. It reports a duplicate entry, an entry for a feature the suite lacks, a not-applicable feature mapped to a row, a `.none` with an empty reason, and a suite feature with no entry, and on success prints one line to standard error: `./conformance/parity_map.zon: 84 entries, 77 mapped to 31 PARITY.md rows, 7 none`. It doesn't read PARITY.md, and `-Dfeature` has no effect.
+
+- When to run: After editing parity_map.zon or moving to a new suite commit.
+- Run time: about 10 s on a repeat run (first run about 82 s).
+
+### The parity map and PARITY.md
+
+`conformance/parity_map.zon` has one entry per suite feature, sorted by path in byte order: `.{ .feature = "signal/basic", .parity = .{ .row = "<the Feature cell of a PARITY.md row>" } }`, or `.parity = .{ .none = "<one sentence on why no row covers it>" }`. The row text is the Feature cell as written, trimmed, with `\|` read as `|`, and matched byte for byte; several features may name one row. PARITY.md's Feature texts must therefore stay unique. `zig build test` checks this offline, without the suite: it fails when PARITY.md's feature table has a duplicate Feature text, and when a parity_map.zon entry names a row the table lacks (test `conformance parity map names only rows PARITY.md's feature table has`). Renaming a row means updating its entries in parity_map.zon in the same commit. `zig build fmt` checks the formatting of the `.zon` files under `conformance/`, and `zig fmt conformance/` rewrites them.
+
+### Adding a feature
+
+1. Read the suite feature's README.md and its other SDKs' code in the fetched suite, which a run extracts under `zig-pkg/`.
+2. Write `conformance/features/<area>/<name>/feature.zig`, where `<area>/<name>` is the suite path, with `pub const feature = harness.define(.{ .workflows = ..., .activities = ..., .execute = execute });`. `.execute` is required; `.workflows`, `.activities`, `.nexus_services`, `.worker_options`, and `.configureClient` are optional. build.zig finds the file by its path, and the runner rejects a feature the suite doesn't have.
+3. Check that its entry in `conformance/parity_map.zon` names the right row, or change it from `.none` to `.row` when the feature now covers one.
+4. Run `zig build conformance -Dfeature=<area>/<name>`, then `zig build conformance-check`.
+5. When it passes and declares workflows, record its histories with `zig build conformance -Dfeature=<area>/<name> -Drecord-histories` and commit them (see Stored histories below), or `zig build test` fails for the missing history.
+
+When the feature fails because the SDK lacks something, keep the feature as written and file a bead for the gap. Don't add it to not_applicable.zon or work around the gap in the feature: the report keeps it as `fail` with its message, and `zig build conformance-check` lists it as `failing` while its row is supported. With no history to record, it also gets an entry in `conformance/replay/exclusions.zon` with that bead ID, as Stored histories below says.
+
+### Stored histories
+
+The workflow histories of the written conformance features live in `conformance/histories/<feature path>/<temporal.version>/[<variant>/]`, one `<n>-<workflow type>.json` per closed run in start order, with a `runs.json` that gives the namespace, task queue and each run's workflow ID. `zig build conformance -Drecord-histories` records them for every passing feature, and `-Dfeature=<pattern>` limits that to the matching features. A history's directory is named by `temporal.version` (`src/temporal.zig`) as it is when the history is recorded, not by `build.zig.zon`'s `.version`, and the recorder writes only into the current version's directory. The directory of every version other than the current `temporal.version` is frozen: nothing in it is re-recorded, edited or removed. That includes the 0.0.0 set: release 0.1.0-alpha.1 reports itself as 0.0.0, so the 0.0.0 set is what that release records. While `temporal.version` is itself 0.0.0, that directory is also the current one and follows the rule for the current version's directory. The current version's directory takes the history of each newly written feature, recorded with `-Dfeature=<its path>` so that no other history changes; a history already in it is re-recorded only on purpose, with the reason in the commit message. The commit that changes `temporal.version` for a release records the new version's set with `zig build conformance -Drecord-histories` in the same commit, beside the directories of the earlier versions. `zig build test` replays every stored file, of every version, against its feature's workflows (`conformance/replay/replay.zig`), and fails for a written feature that declares workflows and has no history for the current version. A replay failure on a frozen file is an SDK bug, not a reason to re-record: file it, and list the feature in `conformance/replay/exclusions.zon` with that bead ID and the reason. A written feature that fails because of an SDK gap, and so has no history to record, is listed there the same way. An entry exempts its feature from replay and from the missing-history rule, and the test prints it on every run; the commit that fixes the defect, or makes the feature pass and records its history, removes the entry.
 
 ### `zig build tsan`
 
@@ -146,6 +222,7 @@ Each feature is demonstrated by a sample under `samples/`, validated against a d
 - `samples/` holds the samples, and `tools/samples_runner.zig` validates them. PARITY.md lists them, explains how parity is measured, and has the feature table; `scripts/parity-check.sh` checks the table.
 - `examples/readme/` holds the compiled examples that README.md's code blocks copy, and `tools/readme_examples.zig` checks or rewrites the copies.
 - `tools/checks/` holds the correctness commands and their fixtures.
+- `conformance/` holds the features-suite conformance run: `features/<area>/<name>/feature.zig` are the Zig features, `harness/` and `runner/` run them, `parity_map.zon` maps each suite feature to a PARITY.md row, `not_applicable.zon` lists the features with no Zig equivalent, `histories/` holds the stored workflow histories, and `replay/` replays them in `zig build test`.
 - `scripts/` holds maintenance scripts, each with usage in its header.
 - `.review/` holds the review tooling: `reports.sh` runs the checks and the scanners (gitleaks, osv-scanner, cargo-deny, shellcheck, actionlint, typos, zlint) on a change, `install.sh` installs them, and the `.toml` files are their settings. It isn't part of the SDK and isn't in the release tarball.
 - `docs/` holds maintainer documentation.

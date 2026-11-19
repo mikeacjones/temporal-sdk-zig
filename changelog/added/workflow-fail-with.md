@@ -1,1 +1,0 @@
-`workflow.Context.failWith` fails a workflow (or rejects an update) with a failure you already have, such as an activity's from `future.failure()`, so cleanup activities that fail afterwards on the error path no longer replace the workflow's failure. See [Failures](https://github.com/mikeacjones/temporal-sdk-zig#failures).

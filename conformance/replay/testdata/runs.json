@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "hello-world",
+  "runs": [
+    {
+      "file": "1-HelloWorld.json",
+      "workflow_id": "hello-world"
+    }
+  ]
+}

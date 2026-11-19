@@ -9,7 +9,9 @@ const converter = @import("converter.zig");
 const failure_mod = @import("failure.zig");
 const interceptor = @import("interceptor.zig");
 const log = @import("log.zig");
+const propagation = @import("propagation.zig");
 const proto = @import("proto.zig");
+const system_nexus = @import("nexus/system.zig");
 const schedule = @import("schedule.zig");
 const testing_mod = @import("testing.zig");
 const WorkflowEnvironment = testing_mod.WorkflowEnvironment;
@@ -846,4 +848,219 @@ test "rejectNexusOperation fails the call without scheduling it, naming the oper
     );
     const history = try env.client.fetchHistory(a, run.id, run.run_id);
     for (history.events.items) |event| try testing.expect(event.event_type != .EVENT_TYPE_NEXUS_OPERATION_SCHEDULED);
+}
+
+// ---------------------------------------------------------------- signal-with-start
+
+/// The dev server only accepts signal-with-start from a workflow with this setting on.
+const signal_with_start_args = [_][]const u8{ "--dynamic-config-value", "history.enableSignalWithStartFromWorkflow=true" };
+
+const SignalWithStartFixtures = struct {
+    const tenant = propagation.key([]const u8, "tenant");
+    const propagators = [_]propagation.ContextPropagator{propagation.HeaderPropagator(tenant).propagator};
+
+    const Add = workflow.SignalDef("add", fn (value: []const u8) void);
+
+    /// Waits for one `add` signal; returns its start argument, the signal, its header's `via`
+    /// and its propagated tenant.
+    fn target(ctx: *workflow.Context, start: []const u8) ![]const u8 {
+        const signal = try (try ctx.signalChannel(Add)).receive();
+        const via = (try ctx.headers().value([]const u8, ctx.allocator(), "via")) orelse "none";
+        return std.fmt.allocPrint(ctx.allocator(), "start={s} signal={s} via={s} tenant={s}", .{ start, signal, via, ctx.propagated().get(tenant) orelse "none" });
+    }
+    const Target = workflow.Def("sws_icpt_target", target);
+
+    /// Signals-with-start `Target` as `id` once; returns "<workflow id> <run id> <started>".
+    fn caller(ctx: *workflow.Context, id: []const u8) ![]const u8 {
+        const r = try ctx.signalWithStartWorkflow(Target, .{ .id = id, .execution_timeout = .fromSeconds(60) }, .{"go"}, Add, .{"one"}).get();
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s} {}", .{ r.workflow_id, r.run_id, r.started });
+    }
+    const Caller = workflow.Def("sws_icpt_caller", caller);
+
+    /// Records every signal-with-start and Nexus call it sees outside replay, and changes each
+    /// signal-with-start: "+in" on the first argument, "+sig" on the first signal argument,
+    /// "-changed" on the workflow ID, and the header field `via: interceptor`.
+    const Shaping = struct {
+        observed: ?*Observed = null,
+
+        pub fn interceptWorkflow(s: *Shaping, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+            const run = try ctx.allocator().create(Run);
+            run.* = .{ .s = s, .ctx = ctx };
+            return .{ .outbound = interceptor.WorkflowOutbound.from(Run, run) };
+        }
+
+        const Run = struct {
+            s: *Shaping,
+            ctx: *workflow.Context,
+
+            pub fn signalWithStartWorkflow(r: *Run, input: interceptor.SignalWithStartInput, next: interceptor.WorkflowOutbound.Next) workflow.SignalWithStartFuture {
+                return r.shape(input, next) catch |err| .{ .ctx = r.ctx, .workflow_id = "", .state = switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.InvalidOptions,
+                } };
+            }
+
+            fn shape(r: *Run, input: interceptor.SignalWithStartInput, next: interceptor.WorkflowOutbound.Next) !workflow.SignalWithStartFuture {
+                const a = r.ctx.allocator();
+                if (r.s.observed) |o| if (!r.ctx.isReplaying()) o.add("sws:{s}/{s} id={s} args={s} signal={s} tenant={s}", .{
+                    input.workflow_type,
+                    input.signal_name,
+                    input.options.id,
+                    try input.args.get([]const u8, a, 0),
+                    try input.signal_args.get([]const u8, a, 0),
+                    if (input.header.header().get("tenant") != null) "yes" else "no",
+                });
+                var changed = input;
+                changed.args = try suffixFirst(a, input.args, "+in");
+                changed.signal_args = try suffixFirst(a, input.signal_args, "+sig");
+                changed.options.id = try std.mem.concat(a, u8, &.{ input.options.id, "-changed" });
+                try input.header.set("via", @as([]const u8, "interceptor"));
+                return next.signalWithStartWorkflow(changed);
+            }
+
+            pub fn executeNexusOperation(r: *Run, input: interceptor.NexusOperationInput, next: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(Payload) {
+                if (r.s.observed) |o| if (!r.ctx.isReplaying()) o.add("nexus:{s}/{s}", .{ input.service, input.operation });
+                return next.executeNexusOperation(input);
+            }
+        };
+    };
+
+    fn startEnv(options: struct {
+        interceptors: []const interceptor.Worker = &.{},
+        propagators: []const propagation.ContextPropagator = &.{},
+    }) !*WorkflowEnvironment {
+        const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+            .dev_server_extra_args = &signal_with_start_args,
+            .worker_interceptors = options.interceptors,
+            .propagators = options.propagators,
+        });
+        errdefer env.deinit();
+        try env.registerWorkflow(Caller);
+        try env.registerWorkflow(Target);
+        return env;
+    }
+
+    /// Runs `Caller` as "<id>-caller" for target `id` with `values` propagated, and returns
+    /// the target's result after checking the caller's answer names `want_id` as a new run.
+    fn runCaller(env: *WorkflowEnvironment, a: std.mem.Allocator, id: []const u8, want_id: []const u8, values: ?*const propagation.Values) ![]const u8 {
+        const caller_id = try std.fmt.allocPrint(a, "{s}-caller", .{id});
+        const result = try env.executeWorkflowWithOptions(Caller, .{ .id = caller_id, .context = values, .execution_timeout = .fromSeconds(60) }, .{id}, a, null);
+        var parts = std.mem.splitScalar(u8, result, ' ');
+        try testing.expectEqualStrings(want_id, parts.next().?);
+        const run_id = parts.next().?;
+        try testing.expect(run_id.len > 0);
+        try testing.expectEqualStrings("true", parts.next().?);
+        var handle = try env.client.getWorkflow([]const u8, want_id, run_id);
+        defer handle.deinit();
+        return env.getResult(Target, &handle, a, null);
+    }
+};
+
+test "a workflow outbound interceptor sees a signal-with-start's args and header, and its changes reach the target" {
+    var observed: Observed = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer observed.arena.deinit();
+    var shaping: SignalWithStartFixtures.Shaping = .{ .observed = &observed };
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(SignalWithStartFixtures.Shaping, &shaping)};
+    const env = try SignalWithStartFixtures.startEnv(.{ .interceptors = &interceptors, .propagators = &SignalWithStartFixtures.propagators });
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var values: propagation.Values = .init(a);
+    try values.put(SignalWithStartFixtures.tenant, "acme");
+    const id = try std.fmt.allocPrint(a, "sws-icpt-{s}", .{env.task_queue});
+    const changed_id = try std.fmt.allocPrint(a, "{s}-changed", .{id});
+    const result = try SignalWithStartFixtures.runCaller(env, a, id, changed_id, &values);
+    try testing.expectEqualStrings("start=go+in signal=one+sig via=interceptor tenant=acme", result);
+    const seen = try std.fmt.allocPrint(a, "sws:sws_icpt_target/add id={s} args=go signal=one tenant=yes", .{id});
+    if (!observed.has(seen)) {
+        std.debug.print("the interceptor never saw {s}; saw {any}\n", .{ seen, observed.events.items });
+        return error.TestExpectedEvent;
+    }
+}
+
+test "a propagated value reaches a signal-with-start's target in its header, not in Nexus headers" {
+    const env = try SignalWithStartFixtures.startEnv(.{ .propagators = &SignalWithStartFixtures.propagators });
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var values: propagation.Values = .init(a);
+    try values.put(SignalWithStartFixtures.tenant, "acme");
+    const id = try std.fmt.allocPrint(a, "sws-propagated-{s}", .{env.task_queue});
+    try testing.expectEqualStrings("start=go signal=one via=none tenant=acme", try SignalWithStartFixtures.runCaller(env, a, id, id, &values));
+
+    // The target's start carries the value in its header; the caller's Nexus command carries
+    // no Nexus header.
+    const target_history = try env.client.fetchHistory(a, id, "");
+    const started = target_history.events.items[0].attributes.?.workflow_execution_started_event_attributes;
+    var found = false;
+    for (started.header.?.fields.items) |f| found = found or std.mem.eql(u8, f.key, "tenant");
+    try testing.expect(found);
+    const caller_history = try env.client.fetchHistory(a, try std.fmt.allocPrint(a, "{s}-caller", .{id}), "");
+    var scheduled: usize = 0;
+    for (caller_history.events.items) |event| switch (event.attributes.?) {
+        .nexus_operation_scheduled_event_attributes => |attrs| {
+            try testing.expectEqualStrings("__temporal_system", attrs.endpoint);
+            try testing.expectEqual(@as(usize, 0), attrs.nexus_header.items.len);
+            scheduled += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), scheduled);
+}
+
+test "an interceptor implementing executeNexusOperation and signalWithStartWorkflow sees a signal-with-start once, on signalWithStartWorkflow" {
+    var observed: Observed = .{ .io = testing.io, .arena = .init(testing.allocator) };
+    defer observed.arena.deinit();
+    var shaping: SignalWithStartFixtures.Shaping = .{ .observed = &observed };
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(SignalWithStartFixtures.Shaping, &shaping)};
+    const env = try SignalWithStartFixtures.startEnv(.{ .interceptors = &interceptors });
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const id = try std.fmt.allocPrint(a, "sws-once-{s}", .{env.task_queue});
+    _ = try SignalWithStartFixtures.runCaller(env, a, id, try std.fmt.allocPrint(a, "{s}-changed", .{id}), null);
+    // Both entries are declared, so a call on executeNexusOperation would be recorded.
+    var signal_with_start: usize = 0;
+    var nexus_calls: usize = 0;
+    for (observed.events.items) |e| {
+        if (std.mem.startsWith(u8, e, "sws:")) signal_with_start += 1;
+        if (std.mem.startsWith(u8, e, "nexus:")) nexus_calls += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), nexus_calls);
+    try testing.expectEqual(@as(usize, 1), signal_with_start);
+    const outbound = interceptor.WorkflowOutbound.from(SignalWithStartFixtures.Shaping.Run, undefined);
+    try testing.expect(outbound.vtable.executeNexusOperation != null and outbound.vtable.signalWithStartWorkflow != null);
+}
+
+/// A dev-server run of `SignalWithStartFixtures.Caller` for target
+/// "sws-icpt-recorded-target" with `SignalWithStartFixtures.Shaping` installed (started with
+/// the flag in `signal_with_start_args`), fetched with `Client.fetchHistory` and encoded as
+/// ProtoJSON (`temporal.protojson.encode`), indented.
+const signal_with_start_interceptor_history = @embedFile("testdata/signal_with_start_interceptor_history.json");
+
+test "WorkflowReplayer replays a signal-with-start shaped by a workflow outbound interceptor" {
+    var shaping: SignalWithStartFixtures.Shaping = .{};
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(SignalWithStartFixtures.Shaping, &shaping)};
+    var replayer: testing_mod.WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer replayer.deinit();
+    try replayer.registerWorkflow(SignalWithStartFixtures.Caller);
+    try replayer.replayHistoryJson(signal_with_start_interceptor_history);
+
+    // The recorded request is the one the interceptor changed.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const history = try @import("history.zig").fromJson(a, signal_with_start_interceptor_history);
+    const scheduled = history.events.items[4].attributes.?.nexus_operation_scheduled_event_attributes;
+    const request = (try system_nexus.decode(a, scheduled.input.?)).signal_with_start_request;
+    try testing.expectEqualStrings("sws-icpt-recorded-target-changed", request.workflow_id);
+    try testing.expectEqualStrings("go+in", try converter.fromPayload([]const u8, a, request.input.?.payloads.items[0]));
+    try testing.expectEqualStrings("one+sig", try converter.fromPayload([]const u8, a, request.signal_input.?.payloads.items[0]));
+    try testing.expectEqualStrings("via", request.header.?.fields.items[0].key);
 }

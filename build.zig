@@ -109,7 +109,18 @@ pub fn build(b: *std.Build) void {
 
     if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance);
     if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters);
-    if (pathExists(b, "tools/checks")) addCheckSteps(b, .{ .target = target, .optimize = optimize, .temporal = temporal, .protobuf = protobuf_dep.module("protobuf"), .core_c = core_c, .build_options = build_options, .core = core, .test_step = test_step, .test_filters = test_filters });
+    if (pathExists(b, "tools/checks")) addCheckSteps(b, .{
+        .target = target,
+        .optimize = optimize,
+        .temporal = temporal,
+        .protobuf = protobuf_dep.module("protobuf"),
+        .core_c = core_c,
+        .build_options = build_options,
+        .core = core,
+        .test_step = test_step,
+        .test_filters = test_filters,
+        .forwarded = .{ .core_lib = core_lib_opt, .core_bundle = core_bundle_opt, .protoc = protoc_opt },
+    });
     if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, .{
         .core_lib = core_lib_opt,
         .core_bundle = core_bundle_opt,
@@ -199,6 +210,8 @@ const CheckInputs = struct {
     core: Core,
     test_step: *std.Build.Step,
     test_filters: []const []const u8,
+    /// The core options of this build, which a nested build repeats to link the same core.
+    forwarded: struct { core_lib: ?[]const u8, core_bundle: ?[]const u8, protoc: ?[]const u8 },
 };
 
 /// Correctness commands (see AGENTS.md). A fetched package has no tools/checks.
@@ -326,11 +339,168 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         missing.expectStdErrMatch("dupes: cannot read dupes-test-no-such-path: FileNotFound");
         missing.expectStdOutEqual("");
 
+        const absent = addCheckCase(b, in.test_step, tool, "dupes default roots absent", 0);
+        absent.addDirectoryArg(fixtures);
+        absent.expectStdOutEqual("0 groups of 100 or more tokens in 0 files\n");
+        absent.expectStdErrEqual("");
+
         const invalid = addCheckCase(b, in.test_step, tool, "dupes invalid minimum", 2);
         invalid.addDirectoryArg(fixtures);
         invalid.addArgs(&.{ "--min-tokens", "0" });
         invalid.expectStdErrMatch("dupes: --min-tokens must be a positive integer");
         invalid.expectStdOutEqual("");
+    }
+
+    // zig build fuzz
+    {
+        const seconds = b.option(u32, "fuzz-seconds", "fuzz: seconds to fuzz each target (default: 30)") orelse 30;
+        const selected = b.option([]const u8, "fuzz-target", "Internal option set by the fuzz step on its nested build: fuzz only this target (with --fuzz)");
+        const step = b.step("fuzz", "Fuzz each target for a time box and fail on a crash");
+        const known = "tools/checks/fuzz.zon";
+        const targets = findFuzzTargets(b);
+
+        var source: std.Io.Writer.Allocating = .init(b.allocator);
+        for (targets) |target| {
+            source.writer.print("pub const @\"{s}\" = [_][]const u8{{\n", .{target.name}) catch @panic("OOM");
+            for (target.corpus) |file| {
+                source.writer.print("    @embedFile(\"{s}/{s}\"),\n", .{ target.name, file }) catch @panic("OOM");
+            }
+            source.writer.writeAll("};\n") catch @panic("OOM");
+        }
+        const corpus = b.createModule(.{ .root_source_file = b.addWriteFiles().add("fuzz_corpus.zig", source.written()) });
+        for (targets) |target| for (target.corpus) |file| {
+            const path = b.fmt("{s}/{s}", .{ target.name, file });
+            corpus.addAnonymousImport(path, .{ .root_source_file = b.path(b.fmt("src/fuzz/{s}", .{path})) });
+        };
+
+        // The fuzz-targets module, and the same module over a fixture that lists one
+        // finding, so the guard idiom `return fuzz.known(target, bead)` must compile.
+        var modules: [2]*std.Build.Module = undefined;
+        for (&modules, [_][]const u8{ known, "tools/checks/fixtures/fuzz/guard.zon" }) |*module, known_path| {
+            module.* = b.createModule(.{
+                .root_source_file = b.path("src/fuzz.zig"),
+                .target = in.target,
+                .optimize = in.optimize,
+                .error_tracing = testErrorTracing(in.optimize),
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "protobuf", .module = in.protobuf },
+                    .{ .name = "core_c", .module = in.core_c },
+                    .{ .name = "fuzz_corpus", .module = corpus },
+                },
+            });
+            module.*.addOptions("build_options", in.build_options);
+            module.*.addAnonymousImport("fuzz_known", .{ .root_source_file = b.path(known_path) });
+            linkCoreLib(module.*, in.target, in.core.lib);
+        }
+        const module, const guard_module = modules;
+        // The SDK files a target imports bring their tests into this module; the SDK's own
+        // test binary runs those (src/nexus/wire.zig alone brings over 700), so by default
+        // only the tests of src/fuzz.zig run here.
+        const filters: []const []const u8 = if (in.test_filters.len > 0) in.test_filters else &.{"fuzz.test."};
+        const tests = b.addTest(.{ .name = "fuzz-targets", .root_module = module, .filters = filters });
+        in.test_step.dependOn(&b.addRunArtifact(tests).step);
+        const guard_tests = b.addTest(.{ .name = "fuzz-known-guard", .root_module = guard_module, .filters = &.{"known compiles as a guard"} });
+        in.test_step.dependOn(&b.addRunArtifact(guard_tests).step);
+
+        const tool = checkTool(b, "fuzz", "tools/checks/fuzz.zig");
+        if (selected) |name| {
+            for (targets) |target| {
+                if (std.mem.eql(u8, target.name, name)) break;
+            } else std.process.fatal("no fuzz target named {s}", .{name});
+            const single = b.addTest(.{
+                .name = "fuzz-targets",
+                .root_module = module,
+                .filters = &.{b.fmt("fuzz {s}", .{name})},
+                // Only LLVM emits the coverage sections --fuzz reads. Zig 0.17.1's own x86_64
+                // backend, its default for Debug on x86_64 Linux, emits none, and the fuzzer
+                // then panics with "missing __start___sancov_cntrs symbol".
+                .use_llvm = true,
+            });
+            step.dependOn(&b.addRunArtifact(single).step);
+        } else {
+            const run = b.addRunArtifact(tool);
+            run.addDirectoryArg(b.path("."));
+            run.addArg(known);
+            run.addFileArg(.zig_exe);
+            run.addDirectoryArg2(b.graph.path(.local_cache, ""), .{ .make_absolute = true });
+            run.addDirectoryArg2(b.graph.path(.install_prefix, "fuzz"), .{ .make_absolute = true });
+            run.addArg(b.fmt("{d}", .{seconds}));
+            for (targets) |target| run.addArg(target.name);
+            run.addArgs(&.{ "--", b.fmt("-Doptimize={t}", .{in.optimize}) });
+            if (in.forwarded.core_lib) |path| {
+                run.addArg(b.fmt("-Dcore-lib={s}", .{path}));
+            } else if (in.forwarded.core_bundle == null and in.target.query.isNative() and pathExists(b, core_header)) {
+                // Cargo built the core. A nested build would rerun cargo, get a fresh copy
+                // of the library and relink the target inside its box, so it links this one.
+                // Nested builds fuzz the host, so only a core built for the host is passed.
+                run.addFileArg2(in.core.lib, .{ .prefix = "-Dcore-lib=", .make_absolute = true });
+            }
+            if (in.forwarded.core_bundle) |path| run.addArg(b.fmt("-Dcore-bundle={s}", .{path}));
+            if (in.forwarded.protoc) |path| run.addArg(b.fmt("-Dprotoc={s}", .{path}));
+            run.stdio = .inherit;
+            run.has_side_effects = true;
+            step.dependOn(&run.step);
+        }
+
+        const tool_tests = b.addTest(.{ .name = "fuzz-tool", .root_module = tool.root_module, .filters = in.test_filters });
+        in.test_step.dependOn(&b.addRunArtifact(tool_tests).step);
+        const fixtures = b.path("tools/checks/fixtures/fuzz");
+        for ([_]struct { name: []const u8, target: []const u8, seconds: []const u8, exit_code: u8 }{
+            .{ .name = "fuzz crash", .target = "crashes", .seconds = "5", .exit_code = 1 },
+            .{ .name = "fuzz clean", .target = "clean", .seconds = "3", .exit_code = 0 },
+        }) |case| {
+            const dir = b.addWriteFiles();
+            _ = dir.add(case.name, "");
+            const run = addCheckCase(b, in.test_step, tool, case.name, case.exit_code);
+            run.addDirectoryArg(fixtures);
+            run.addArg("known.zon");
+            run.addFileArg(.zig_exe);
+            run.addDirectoryArg2(dir.getDirectory().path(b, "cache"), .{ .make_absolute = true });
+            run.addDirectoryArg2(dir.getDirectory().path(b, "crashes"), .{ .make_absolute = true });
+            run.addArgs(&.{ case.seconds, case.target });
+            if (case.exit_code == 1) {
+                run.expectStdOutMatch("crashes: crash (");
+                run.expectStdOutMatch("input saved to");
+                run.expectStdErrMatch("fuzz: crashes: building and replaying the corpus in process group ");
+            } else {
+                run.expectStdOutEqual("clean: no crash in 3 s\n");
+                run.expectStdErrMatch("fuzz: clean: fuzzing for 3 s in process group ");
+            }
+        }
+
+        const stale = addCheckCase(b, in.test_step, tool, "fuzz stale entry", 1);
+        stale.addDirectoryArg(fixtures);
+        stale.addArg("stale.zon");
+        stale.addFileArg(.zig_exe);
+        stale.addArgs(&.{ "stale-cache-not-created", "stale-crashes-not-created", "3", "clean" });
+        stale.expectStdOutEqual("stale: gone temporal-sdk-zig-example (no such target; remove the entry)\n");
+        stale.expectStdErrEqual("");
+
+        const usage = addCheckCase(b, in.test_step, tool, "fuzz usage", 2);
+        usage.addDirectoryArg(fixtures);
+        usage.addArg("known.zon");
+        usage.addFileArg(.zig_exe);
+        usage.addArgs(&.{ "usage-cache-not-created", "usage-crashes-not-created", "3" });
+        usage.expectStdErrMatch("fuzz: usage: ");
+        usage.expectStdOutEqual("");
+
+        // `zig build fuzz` in a terminal: the build runner gives the wrapper CLICOLOR_FORCE
+        // (Run.color .auto with inherited stdio), so the nested build colors its crash line.
+        // The crash must still be reported as one, with its input saved.
+        const colored_dir = b.addWriteFiles();
+        _ = colored_dir.add("fuzz crash in color", "");
+        const colored = addCheckCase(b, in.test_step, tool, "fuzz crash in color", 1);
+        colored.color = .enable;
+        colored.addDirectoryArg(fixtures);
+        colored.addArg("known.zon");
+        colored.addFileArg(.zig_exe);
+        colored.addDirectoryArg2(colored_dir.getDirectory().path(b, "cache"), .{ .make_absolute = true });
+        colored.addDirectoryArg2(colored_dir.getDirectory().path(b, "crashes"), .{ .make_absolute = true });
+        colored.addArgs(&.{ "5", "crashes" });
+        colored.expectStdOutMatch("crashes: crash (");
+        colored.expectStdOutMatch("input saved to");
+        colored.expectStdErrMatch("fuzz: crashes: building and replaying the corpus in process group ");
     }
 
     // zig build lint
@@ -342,8 +512,15 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         linter.addRule(.{ .builtin = .no_literal_only_bool_expression }, .{});
         linter.addRule(.{ .builtin = .no_todo }, .{ .severity = .@"error" });
         linter.addRule(.{ .builtin = .switch_case_ordering }, .{ .else_is_last = .@"error" });
+        const include_dirs = [_]std.Build.LazyPath{
+            b.path("src"),
+            b.path("tools"),
+            b.path("examples"),
+            b.path("samples"),
+            b.path("conformance"),
+        };
         linter.addPaths(.{
-            .include_dirs = &.{ b.path("src"), b.path("tools"), b.path("examples"), b.path("samples") },
+            .include_dirs = if (pathExists(b, "conformance")) &include_dirs else include_dirs[0 .. include_dirs.len - 1],
             .exclude_dirs = &.{ b.path("src/proto"), b.path("tools/checks/fixtures") },
             .exclude_files = &.{ b.path("src/proto.zig"), b.path("samples/dispatch.zig") },
         });
@@ -510,6 +687,80 @@ fn checkSdkModule(b: *std.Build, in: CheckInputs, root: std.Build.LazyPath) *std
     return module;
 }
 
+/// A directory src/fuzz/<name>/ and the corpus files in it, both sorted by name.
+const FuzzTarget = struct {
+    name: []const u8,
+    corpus: []const []const u8,
+
+    fn lessThan(_: void, a: FuzzTarget, c: FuzzTarget) bool {
+        return std.mem.lessThan(u8, a.name, c.name);
+    }
+
+    fn fileLessThan(_: void, a: []const u8, c: []const u8) bool {
+        return std.mem.lessThan(u8, a, c);
+    }
+};
+
+fn findFuzzTargets(b: *std.Build) []const FuzzTarget {
+    const root = "src/fuzz";
+    const target_chars = "abcdefghijklmnopqrstuvwxyz0123456789_";
+    const file_chars = target_chars ++ "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-";
+    const io = b.graph.io;
+    const dir = b.root.openDir(io, root, .{ .iterate = true }) catch |err|
+        std.process.fatal("cannot open {s}: {t}", .{ root, err });
+    defer dir.close(io);
+    b.dependOnDirectoryContents(b.path(root));
+
+    var targets: std.ArrayList(FuzzTarget) = .empty;
+    var total: u64 = 0;
+    var dirs = dir.iterate();
+    while (dirs.next(io) catch |err| std.process.fatal("cannot scan {s}: {t}", .{ root, err })) |entry| {
+        const target_path = b.fmt("{s}/{s}", .{ root, entry.name });
+        const kind = if (entry.kind == .unknown)
+            (dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err|
+                std.process.fatal("cannot stat {s}: {t}", .{ target_path, err })).kind
+        else
+            entry.kind;
+        if (kind != .directory) continue;
+        if (std.mem.findNone(u8, entry.name, target_chars) != null)
+            std.process.fatal("invalid fuzz target name in {s}: use [a-z0-9_]+", .{target_path});
+        const name = b.dupe(entry.name);
+        const target_dir = b.root.openDir(io, target_path, .{ .iterate = true }) catch |err|
+            std.process.fatal("cannot open {s}: {t}", .{ target_path, err });
+        defer target_dir.close(io);
+        b.dependOnDirectoryContents(b.path(target_path));
+
+        var corpus: std.ArrayList([]const u8) = .empty;
+        var files = target_dir.iterate();
+        while (files.next(io) catch |err| std.process.fatal("cannot scan {s}: {t}", .{ target_path, err })) |file| {
+            if (file.name[0] == '.' or (file.kind != .file and file.kind != .unknown)) continue;
+            const path = b.fmt("{s}/{s}", .{ target_path, file.name });
+            const stat = target_dir.statFile(io, file.name, .{ .follow_symlinks = false }) catch |err|
+                std.process.fatal("cannot stat {s}: {t}", .{ path, err });
+            if (stat.kind != .file) continue;
+            if (std.mem.findNone(u8, file.name, file_chars) != null)
+                std.process.fatal("invalid fuzz corpus file name in {s}: use [A-Za-z0-9._-]+", .{path});
+            const max_input_len = 8192; // src/fuzz.zig also uses this as the target input limit.
+            if (stat.size > max_input_len)
+                std.process.fatal("{s} is {d} bytes, exceeding the {d}-byte fuzz input limit", .{ path, stat.size, max_input_len });
+            b.dependOnFileMetadata(b.path(path));
+            total += stat.size;
+            corpus.append(b.allocator, b.dupe(file.name)) catch @panic("OOM");
+        }
+        std.mem.sort([]const u8, corpus.items, {}, FuzzTarget.fileLessThan);
+        targets.append(b.allocator, .{ .name = name, .corpus = corpus.items }) catch @panic("OOM");
+    }
+    const max_corpus_len = 65536;
+    if (total > max_corpus_len)
+        std.process.fatal("{s} contains {d} corpus bytes, exceeding the {d}-byte total limit", .{ root, total, max_corpus_len });
+    std.mem.sort(FuzzTarget, targets.items, {}, FuzzTarget.lessThan);
+    if (targets.items.len > 1) for (targets.items[0 .. targets.items.len - 1], targets.items[1..]) |a, c| {
+        if (std.mem.startsWith(u8, c.name, a.name))
+            std.process.fatal("fuzz target {s}/{s} is a prefix of {s}/{s}", .{ root, a.name, root, c.name });
+    };
+    return targets.items;
+}
+
 fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8, have_conformance: bool) void {
     // zig build fmt
     const fmt_paths = [_]std.Build.LazyPath{
@@ -622,6 +873,10 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     }
 }
 
+const ConformanceForwarded = struct { core_lib: ?[]const u8, core_bundle: ?[]const u8, protoc: ?[]const u8 };
+
+const conformance_histories = "conformance/histories";
+
 fn addConformanceSteps(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -629,11 +884,17 @@ fn addConformanceSteps(
     temporal: *std.Build.Module,
     test_step: *std.Build.Step,
     test_filters: []const []const u8,
-    forwarded: struct { core_lib: ?[]const u8, core_bundle: ?[]const u8, protoc: ?[]const u8 },
+    forwarded: ConformanceForwarded,
 ) void {
     const patterns = b.option([]const []const u8, "feature", "Run conformance features matching this path pattern (repeatable)") orelse &.{};
+    const record = b.option(bool, "record-histories", "Store the workflow histories of passing conformance features under conformance/histories") orelse false;
     const with_suite = b.option(bool, "conformance-suite", "Internal option set by the conformance step on its nested build") orelse false;
     const step = b.step("conformance", "Run the Temporal features suite and write conformance/report.json");
+    const map_step = b.step("conformance-map", "Check conformance/parity_map.zon against the features suite");
+    const check_step = b.step("conformance-check", "Run the features suite and fail when a supported PARITY.md row's feature is not passing");
+    if (patterns.len != 0) {
+        check_step.dependOn(&b.addFail("zig build conformance-check takes no -Dfeature: it compares the whole suite with PARITY.md (use zig build conformance -Dfeature=... to run part of the suite)").step);
+    }
     const report_path = b.graph.path(.install_prefix, "conformance/report.json");
 
     const harness = b.createModule(.{
@@ -648,6 +909,8 @@ fn addConformanceSteps(
         .optimize = optimize,
         .imports = &.{ .{ .name = "temporal", .module = temporal }, .{ .name = "harness", .module = harness } },
     });
+    runner.addAnonymousImport("PARITY.md", .{ .root_source_file = b.path("PARITY.md") });
+    runner.addAnonymousImport("parity_map.zon", .{ .root_source_file = b.path("conformance/parity_map.zon") });
     inline for (.{ .{ "conformance-harness", harness }, .{ "conformance-runner", runner } }) |artifact| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{
             .name = artifact[0],
@@ -679,44 +942,162 @@ fn addConformanceSteps(
     registry.root_source_file = b.addWriteFiles().add("features.zig", source.written());
     runner.addImport("features", registry);
 
+    const stored_histories = b.createModule(.{ .imports = &.{.{ .name = "harness", .module = harness }} });
+    var stored_source: std.Io.Writer.Allocating = .init(b.allocator);
+    const stored_writer = &stored_source.writer;
+    stored_writer.writeAll(
+        \\const harness = @import("harness");
+        \\pub const files = [_]harness.stored.File{
+        \\
+    ) catch @panic("OOM");
+    for (findStoredHistories(b), 0..) |path, i| {
+        const name = b.fmt("stored-{d}", .{i});
+        stored_histories.addAnonymousImport(name, .{ .root_source_file = b.path(b.fmt("{s}/{s}", .{ conformance_histories, path })) });
+        stored_writer.print("    .{{ .path = \"{f}\", .bytes = @embedFile(\"{s}\") }},\n", .{ std.zig.fmtString(path), name }) catch @panic("OOM");
+    }
+    stored_writer.writeAll("};\n") catch @panic("OOM");
+    stored_histories.root_source_file = b.addWriteFiles().add("stored_histories.zig", stored_source.written());
+    runner.addImport("stored_histories", stored_histories);
+
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .name = "conformance-replay",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("conformance/replay/replay.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "temporal", .module = temporal },
+                .{ .name = "harness", .module = harness },
+                .{ .name = "features", .module = registry },
+                .{ .name = "stored_histories", .module = stored_histories },
+            },
+        }),
+        .filters = test_filters,
+    })).step);
+
     if (!with_suite) {
         // Only the nested build requests the lazy dependency. Clear the report even if
         // fetching the suite or compiling the runner fails before the parent can clear it.
         const clear = b.addSystemCommand(&.{ "rm", "-f", "--" });
         clear.addFileArg2(report_path, .{ .make_absolute = true });
         clear.has_side_effects = true;
-        const nested = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "conformance", "-Dconformance-suite=true", "--prefix" });
-        nested.addFileArg2(b.graph.path(.install_prefix, ""), .{ .make_absolute = true });
-        nested.removeEnvironmentVariable("DESTDIR");
-        nested.setCwd(b.path(""));
-        nested.stdio = .inherit;
-        nested.has_side_effects = true;
-        nested.addArg(b.fmt("-Doptimize={t}", .{optimize}));
-        if (forwarded.core_lib) |path| nested.addArg(b.fmt("-Dcore-lib={s}", .{path}));
-        if (forwarded.core_bundle) |path| nested.addArg(b.fmt("-Dcore-bundle={s}", .{path}));
-        if (forwarded.protoc) |path| nested.addArg(b.fmt("-Dprotoc={s}", .{path}));
+        const nested = nestedConformanceBuild(b, "conformance", optimize, forwarded);
+        if (record) nested.addArg("-Drecord-histories=true");
         for (patterns) |pattern| nested.addArg(b.fmt("-Dfeature={s}", .{pattern}));
         nested.step.dependOn(&clear.step);
         step.dependOn(&nested.step);
+        map_step.dependOn(&nestedConformanceBuild(b, "conformance-map", optimize, forwarded).step);
+        if (patterns.len == 0) {
+            const nested_check = nestedConformanceBuild(b, "conformance-check", optimize, forwarded);
+            nested_check.step.dependOn(&clear.step);
+            check_step.dependOn(&nested_check.step);
+        }
         return;
     }
 
     const suite = b.lazyDependency("temporal_features", .{}) orelse return;
+    const executable = b.addExecutable(.{ .name = "conformance-runner", .root_module = runner });
+    const map = b.addRunArtifact(executable);
+    map.addArgs(&.{ "map", "--suite" });
+    map.addDirectoryArg(suite.path(""));
+    map.addArg("--not-applicable");
+    map.addFileArg(b.path("conformance/not_applicable.zon"));
+    map.addArg("--parity-map");
+    map.addFileArg(b.path("conformance/parity_map.zon"));
+    map.stdio = .inherit;
+    map.has_side_effects = true;
+    map_step.dependOn(&map.step);
+
     const suite_url = @import("build.zig.zon").dependencies.temporal_features.url;
     const suite_commit = suite_url[std.mem.lastIndexOfScalar(u8, suite_url, '#').? + 1 ..];
-    const run = b.addRunArtifact(b.addExecutable(.{ .name = "conformance-runner", .root_module = runner }));
-    run.addArgs(&.{ "run", "--suite" });
-    run.addDirectoryArg(suite.path(""));
-    run.addArgs(&.{ "--suite-commit", suite_commit, "--not-applicable" });
-    run.addFileArg(b.path("conformance/not_applicable.zon"));
-    run.addArg("--report");
-    run.addFileArg2(report_path, .{ .make_absolute = true });
-    run.addArg("--work-dir");
-    run.addDirectoryArg(b.addWriteFiles().getDirectory());
-    for (patterns) |pattern| run.addArgs(&.{ "--feature", pattern });
-    run.stdio = .inherit;
-    run.has_side_effects = true;
-    step.dependOn(&run.step);
+    const work_dir = b.addWriteFiles().getDirectory();
+    for ([_]*std.Build.Step{ step, check_step }) |suite_step| {
+        const checking = suite_step == check_step;
+        if (checking and patterns.len != 0) continue;
+
+        const run = b.addRunArtifact(executable);
+        run.addArgs(&.{ "run", "--suite" });
+        run.addDirectoryArg(suite.path(""));
+        run.addArgs(&.{ "--suite-commit", suite_commit, "--not-applicable" });
+        run.addFileArg(b.path("conformance/not_applicable.zon"));
+        run.addArg("--report");
+        run.addFileArg2(report_path, .{ .make_absolute = true });
+        run.addArg("--work-dir");
+        run.addDirectoryArg(work_dir);
+        run.stdio = .inherit;
+        run.has_side_effects = true;
+        if (!checking) {
+            if (record) {
+                const package_root = b.root.root_dir.handle.realPathFileAlloc(b.graph.io, b.root.subPathOrDot(), b.allocator) catch |err|
+                    std.process.fatal("cannot resolve the conformance package root: {t}", .{err});
+                run.addArgs(&.{ "--histories", b.pathJoin(&.{ package_root, conformance_histories }) });
+            }
+            for (patterns) |pattern| run.addArgs(&.{ "--feature", pattern });
+            suite_step.dependOn(&run.step);
+            continue;
+        }
+
+        run.addArgs(&.{ "--stdout-to", "stderr" });
+        run.step.dependOn(&map.step);
+        const check = b.addRunArtifact(executable);
+        check.addArgs(&.{ "check", "--report" });
+        check.addFileArg2(report_path, .{ .make_absolute = true });
+        check.addArg("--parity-map");
+        check.addFileArg(b.path("conformance/parity_map.zon"));
+        check.addArg("--parity");
+        check.addFileArg(b.path("PARITY.md"));
+        check.stdio = .inherit;
+        check.has_side_effects = true;
+        check.step.dependOn(&run.step);
+        suite_step.dependOn(&check.step);
+    }
+}
+
+fn nestedConformanceBuild(b: *std.Build, step_name: []const u8, optimize: std.builtin.OptimizeMode, forwarded: ConformanceForwarded) *std.Build.Step.Run {
+    const nested = b.addSystemCommand(&.{ b.graph.zig_exe, "build", step_name, "-Dconformance-suite=true", "--prefix" });
+    nested.addFileArg2(b.graph.path(.install_prefix, ""), .{ .make_absolute = true });
+    nested.removeEnvironmentVariable("DESTDIR");
+    nested.setCwd(b.path(""));
+    nested.stdio = .inherit;
+    nested.has_side_effects = true;
+    nested.addArg(b.fmt("-Doptimize={t}", .{optimize}));
+    if (forwarded.core_lib) |path| nested.addArg(b.fmt("-Dcore-lib={s}", .{path}));
+    if (forwarded.core_bundle) |path| nested.addArg(b.fmt("-Dcore-bundle={s}", .{path}));
+    if (forwarded.protoc) |path| nested.addArg(b.fmt("-Dprotoc={s}", .{path}));
+    return nested;
+}
+
+fn findStoredHistories(b: *std.Build) []const []const u8 {
+    const io = b.graph.io;
+    const dir = b.root.openDir(io, conformance_histories, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            b.dependOnDirectoryContents(b.path("conformance"));
+            return &.{};
+        },
+        else => std.process.fatal("cannot open {s}: {t}", .{ conformance_histories, err }),
+    };
+    defer dir.close(io);
+    b.dependOnDirectoryContents(b.path(conformance_histories));
+    var walker = dir.walkSelectively(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    while (walker.next(io) catch |err| std.process.fatal("cannot scan {s}: {t}", .{ conformance_histories, err })) |entry| {
+        if (entry.basename[0] == '.') continue;
+        switch (entry.kind) {
+            .directory => {
+                b.dependOnDirectoryContents(b.path(b.fmt("{s}/{s}", .{ conformance_histories, entry.path })));
+                walker.enter(io, entry) catch |err| std.process.fatal("cannot open {s}/{s}: {t}", .{ conformance_histories, entry.path, err });
+            },
+            .file => paths.append(b.allocator, b.dupe(entry.path)) catch @panic("OOM"),
+            else => {},
+        }
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lessThan);
+    return paths.items;
 }
 
 fn findConformanceFeatures(b: *std.Build) []const []const u8 {

@@ -5,7 +5,9 @@
 #   zon        build.zig.zon's .version is <version>
 #   changelog  CHANGELOG.md has a "## [<version>]" section with at least one entry
 #   fragments  no changelog fragments remain under changelog/<category>/
-#   core-pins  build.zig.zon pins a core bundle, core-<CORE_VERSION>-<target>, per tier-1 target
+#   core-pins  build.zig.zon pins a core bundle, core-<CORE_VERSION>-<target>, per tier-1 target:
+#              an entry under .dependencies with that bundle's .url and a .hash
+#              (scripts/core-pins.sh; it can't tell that a hash matches the published bundle)
 # Every failing check is reported, each named, and the script exits 1 if any failed.
 #
 # Usage: scripts/release-preflight.sh <version>
@@ -59,12 +61,9 @@ if [ -n "$remaining" ]; then
 fi
 
 core_version="$(tr -d '[:space:]' < "$root/CORE_VERSION")"
-missing=()
-for t in "${tier1[@]}"; do
-  grep -qF ".@\"core-$core_version-$t\" = .{" "$zon" || missing+=("core-$core_version-$t")
-done
-if [ ${#missing[@]} -gt 0 ]; then
-  fail core-pins "build.zig.zon doesn't pin ${missing[*]}; publish bundles for sdk-core $core_version with core-bundles.yml and add the entries its summary lists"
+# Read from the manifest's structure: a pin in a comment or under another key doesn't count.
+if ! pins="$("$root/scripts/core-pins.sh" "$zon" "$core_version" "${tier1[@]}" 2>&1)"; then
+  fail core-pins "$(tr '\n' ';' <<<"$pins" | sed 's/;$//; s/;/; /g'); publish bundles for sdk-core $core_version with core-bundles.yml and add the entries its summary lists"
 fi
 
 if [ "$failed" -ne 0 ]; then exit 1; fi

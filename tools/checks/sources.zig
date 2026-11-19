@@ -1,8 +1,8 @@
 const std = @import("std");
 const Dir = std.Io.Dir;
 
-/// The directories the source scans read when given no path.
-pub const default_roots = [_][]const u8{ "src", "tools", "examples", "samples" };
+/// The directories the source scans read when given no path. One that does not exist is skipped.
+pub const default_roots = [_][]const u8{ "src", "tools", "examples", "samples", "conformance" };
 /// Left out of every scan. An entry ending in '/' is a directory, any other a file.
 pub const excluded = [_][]const u8{ "src/proto/", "src/proto.zig", "samples/dispatch.zig", "tools/checks/fixtures/" };
 
@@ -21,7 +21,11 @@ pub fn collect(io: std.Io, arena: std.mem.Allocator, root: Dir, paths: []const [
             return error.InvalidRelativePath;
         if (isExcluded(relative)) continue;
         failed.* = relative;
-        switch ((try root.statFile(io, relative, .{})).kind) {
+        const stat = root.statFile(io, relative, .{}) catch |err| {
+            if (paths.len == 0 and err == error.FileNotFound) continue;
+            return err;
+        };
+        switch (stat.kind) {
             .directory => try collectDir(io, arena, root, relative, failed, &files),
             .file => if (std.mem.endsWith(u8, relative, ".zig")) try files.append(arena, relative),
             else => return error.NotFileOrDirectory,

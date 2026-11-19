@@ -38,6 +38,8 @@ Inputs: `revision` (a positive integer) and `dry_run` (default true).
 
 It refuses a revision that isn't a positive integer, a revision whose tag `core-<CORE_VERSION>-r<revision>` already exists, and a publish run that isn't on main. Then it builds one bundle per tier 1 target with `scripts/package-core-bundle.sh` on a runner of that target, and runs `zig build test -Dcore-bundle=<bundle>` there with cargo removed from PATH. The run's summary lists each bundle's SHA-256, its zig hash, and the `build.zig.zon` entry that pins it, in dry runs too. Unless `dry_run` is set, it publishes the bundles and a `SHA256SUMS` file as a pre-release under the tag.
 
+Each bundle carries the notices for the code in its library: sdk-core's `LICENSE.txt`, and `THIRD_PARTY_NOTICES.txt`, which lists every Rust crate linked into the library for that target (`cargo tree -e normal,no-proc-macro`; build scripts and proc-macros run on the build machine and aren't in it) with its declared license and the license files its package ships, followed by one copy of the Apache License 2.0 for the crates that declare it without shipping its text. The packaging script fails when sdk-core's license is missing, when a crate has neither a license expression nor a license file, and when the packed archive lacks either notice; it lists the archive's contents in the job's log.
+
 ### release.yml
 
 Inputs: `version` (SemVer without the `v`), `dry_run` and `prerelease` (both default true), and `publish_draft` (default false).
@@ -53,7 +55,7 @@ The `gate` job refuses the run, naming each failed check:
 | `changelog` | `CHANGELOG.md` has a `## [<version>]` section with at least one entry |
 | `fragments` | no changelog fragments remain under `changelog/` |
 | `ci.yml`, `samples.yml` | the newest CI and Samples runs on the commit succeeded |
-| `core-pins` | `build.zig.zon` pins a core bundle at `CORE_VERSION` for every tier 1 target |
+| `core-pins` | `build.zig.zon` pins a core bundle at `CORE_VERSION` for every tier 1 target: an entry under `.dependencies` named `core-<CORE_VERSION>-<target>`, with a `.url` ending in that target's bundle and a `.hash` (`scripts/core-pins.sh`, which reads the manifest's structure, so a pin in a comment or under another key doesn't count). It can't tell whether a hash matches the published bundle; a build that fetches the pin checks that, and the smoke test does so for two targets |
 
 `scripts/release-preflight.sh <version>` runs the checks that need only the checkout (`semver`, `zon`, `changelog`, `fragments` and `core-pins`), so run it before dispatching.
 
