@@ -5225,7 +5225,7 @@ test "default options send what the client always sent" {
     for ([_]Options{ .{}, loaded }) |o| {
         const b = try bridgeConnectionOptions("http://localhost:7233", "id", o.connectionOptions(), null, &rejection);
         try testing.expectEqualStrings("temporal-zig", b.client_name);
-        try testing.expectEqualStrings(@import("temporal.zig").version, b.client_version);
+        try testing.expectEqualStrings(@import("build_options").version, b.client_version);
         try testing.expectEqual(@as(u64, 30_000), b.keep_alive.?.interval_ms);
         try testing.expectEqual(@as(u64, 15_000), b.keep_alive.?.timeout_ms);
         try testing.expect(b.retry == null);

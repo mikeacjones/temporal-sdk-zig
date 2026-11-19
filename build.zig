@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protobuf = @import("protobuf");
 const protos = @import("deps/protos.zig");
+/// The package manifest: its `.version` is the SDK's version, which `temporal.version` reads.
+const manifest = @import("build.zig.zon");
 
 const core_header_name = "temporal-sdk-core-c-bridge.h";
 const core_header = "deps/sdk-core/crates/sdk-core-c-bridge/include/" ++ core_header_name;
@@ -36,6 +38,7 @@ pub fn build(b: *std.Build) void {
     ) orelse if (b.isRoot()) verified_test_server_version else "default";
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "test_server_version", test_server_version);
+    build_options.addOption([]const u8, "version", manifest.version);
 
     // A fetched package has neither the submodule nor samples/, so the steps that need them
     // exist only in a checkout.
@@ -1238,14 +1241,14 @@ fn findSamples(b: *std.Build) []const Sample {
             else => std.debug.panic("cannot read {s}: {t}", .{ manifest_path, err }),
         };
         var diag: std.zon.parse.Diagnostics = undefined;
-        const manifest = std.zon.parse.fromSlice(struct { tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{}, programs: []const []const u8 = &.{} }, .{
+        const sample_manifest = std.zon.parse.fromSlice(struct { tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{}, programs: []const []const u8 = &.{} }, .{
             .gpa = b.allocator,
             .arena = b.allocator,
             .source = source,
             .diagnostics = &diag,
             .ignore_unknown_fields = true,
         }) catch std.debug.panic("invalid {s}: {f}", .{ manifest_path, diag.fmt(manifest_path) });
-        found.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = manifest.tests, .imports = manifest.imports, .programs = manifest.programs }) catch @panic("OOM");
+        found.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = sample_manifest.tests, .imports = sample_manifest.imports, .programs = sample_manifest.programs }) catch @panic("OOM");
     }
     std.mem.sort(Sample, found.items, {}, struct {
         fn lessThan(_: void, a: Sample, c: Sample) bool {

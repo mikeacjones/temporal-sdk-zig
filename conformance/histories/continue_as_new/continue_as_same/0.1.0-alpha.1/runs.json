@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-continue_as_new/continue_as_same",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "TestID"
+    },
+    {
+      "file": "2-Workflow.json",
+      "workflow_id": "TestID"
+    }
+  ]
+}
