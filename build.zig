@@ -4,6 +4,8 @@ const protobuf = @import("protobuf");
 const protos = @import("deps/protos.zig");
 /// The package manifest: its `.version` is the SDK's version, which `temporal.version` reads.
 const manifest = @import("build.zig.zon");
+/// The fuzz corpus size limits, which src/fuzz.zig shares.
+const fuzz_limits = @import("src/fuzz/limits.zig");
 
 const core_header_name = "temporal-sdk-core-c-bridge.h";
 const core_header = "deps/sdk-core/crates/sdk-core-c-bridge/include/" ++ core_header_name;
@@ -827,9 +829,8 @@ fn findFuzzTargets(b: *std.Build) []const FuzzTarget {
             if (stat.kind != .file) continue;
             if (std.mem.findNone(u8, file.name, file_chars) != null)
                 std.process.fatal("invalid fuzz corpus file name in {s}: use [A-Za-z0-9._-]+", .{path});
-            const max_input_len = 8192; // src/fuzz.zig also uses this as the target input limit.
-            if (stat.size > max_input_len)
-                std.process.fatal("{s} is {d} bytes, exceeding the {d}-byte fuzz input limit", .{ path, stat.size, max_input_len });
+            if (stat.size > fuzz_limits.max_file_len)
+                std.process.fatal("{s} is {d} bytes, exceeding the {d}-byte fuzz corpus file limit (src/fuzz/limits.zig)", .{ path, stat.size, fuzz_limits.max_file_len });
             b.dependOnFileMetadata(b.path(path));
             total += stat.size;
             corpus.append(b.allocator, b.dupe(file.name)) catch @panic("OOM");
@@ -837,9 +838,8 @@ fn findFuzzTargets(b: *std.Build) []const FuzzTarget {
         std.mem.sort([]const u8, corpus.items, {}, FuzzTarget.fileLessThan);
         targets.append(b.allocator, .{ .name = name, .corpus = corpus.items }) catch @panic("OOM");
     }
-    const max_corpus_len = 65536;
-    if (total > max_corpus_len)
-        std.process.fatal("{s} contains {d} corpus bytes, exceeding the {d}-byte total limit", .{ root, total, max_corpus_len });
+    if (total > fuzz_limits.max_corpus_len)
+        std.process.fatal("{s} contains {d} corpus bytes, exceeding the {d}-byte total limit", .{ root, total, fuzz_limits.max_corpus_len });
     std.mem.sort(FuzzTarget, targets.items, {}, FuzzTarget.lessThan);
     if (targets.items.len > 1) for (targets.items[0 .. targets.items.len - 1], targets.items[1..]) |a, c| {
         if (std.mem.startsWith(u8, c.name, a.name))
