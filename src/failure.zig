@@ -193,15 +193,27 @@ pub fn traceText(arena: Allocator, trace: ?*const std.builtin.StackTrace) error{
     return addressesText(arena, t.instruction_addresses[0..@min(t.instruction_addresses.len, t.index)]);
 }
 
+/// The SDK's own reader of the executable's debug info, which `addressesText` reads through.
+/// Not std's (`std.debug.getSelfDebugInfo`): std's holds its one mutex for the whole of a
+/// lookup, the first of which loads and parses the executable's debug info, and in a Debug
+/// build every allocation's stack capture takes that mutex too (on macOS, once per frame).
+/// Measured for bead temporal-sdk-zig-d51.1.34: a failed activity's first trace took 2.1 s of
+/// the unit tests on an Apple-silicon Mac, with every allocation of the process waiting
+/// behind it, and on an x86_64 macOS runner it outlasted the activity's 10 s StartToClose
+/// timeout. With an instance of its own the SDK neither waits for nor holds std's mutex, and
+/// the worker loads it ahead of the first failure (`worker.zig`'s `warmDebugInfo`). It is
+/// never freed, like std's.
+var sdk_debug_info: if (std.debug.SelfInfo == void) void else std.debug.SelfInfo = if (std.debug.SelfInfo == void) {} else .init;
+
 /// `traceText` for return addresses copied out of an error return trace.
 pub fn addressesText(arena: Allocator, addresses: []const usize) error{OutOfMemory}![]const u8 {
     if (comptime !std.options.allow_stack_tracing or std.debug.SelfInfo == void) return "";
     if (addresses.len == 0) return "";
-    const di = std.debug.getSelfDebugInfo() catch return "";
+    const di = &sdk_debug_info;
     const io = std.Options.debug_io;
     // As std's own trace printers do: a cancel pending on this thread (an activity's) would
-    // otherwise fail the debug-info file open, and std caches that failure, losing every
-    // later stack trace in the process.
+    // otherwise fail the debug-info file open, and the reader caches that failure, losing
+    // every later stack trace in the process.
     const prev = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(prev);
     // Not std's shared debug-info allocator: its arena frees only its latest allocation, so
@@ -1035,4 +1047,300 @@ test "addressesText symbolizes a trace on a thread with a cancel pending, and de
     defer testing.allocator.free(later);
     try testing.expect(std.mem.indexOf(u8, later, "pendingCancelLeaf") != null);
     try testing.expect(std.mem.indexOf(u8, canceled_text, "pendingCancelLeaf") != null);
+}
+
+/// An activity that fails while the executable's debug info is still being read for the first
+/// time: `SlowFirstRead`'s test holds the SDK's debug info reader the way a slow first load
+/// does (seconds on a loaded runner), from before the worker starts.
+const SlowFirstRead = struct {
+    const activity_mod = @import("activity.zig");
+    const workflow_mod = @import("workflow.zig");
+
+    /// How long the test holds the reader at most, as a first load on a slow runner would.
+    const hold_limit: std.Io.Duration = .fromSeconds(6);
+
+    var held: std.Io.Event = .unset;
+    var seen: std.Io.Event = .unset;
+
+    noinline fn declined() error{Declined}!void {
+        return error.Declined;
+    }
+
+    fn charge(_: *activity_mod.Context) !void {
+        try declined();
+    }
+    const Charge = activity_mod.Def("SlowFirstReadCharge", charge);
+
+    /// Returns the stack trace of the activity's failure.
+    fn order(ctx: *workflow_mod.Context) ![]const u8 {
+        const charged = ctx.executeActivity(Charge, .{ .start_to_close_timeout = .fromSeconds(60), .retry_policy = .{ .maximum_attempts = 1 } }, .{});
+        charged.get() catch |err| switch (err) {
+            error.ActivityFailed => {
+                seen.set(ctx.io());
+                return rootCause(charged.failure().?).stack_trace;
+            },
+            else => return err,
+        };
+        return "charged";
+    }
+    const Order = workflow_mod.Def("SlowFirstReadOrder", order);
+
+    /// Holds the SDK's reader until the activity's failure reaches the workflow, or
+    /// `hold_limit`. Allocates nothing while it holds it.
+    fn hold() void {
+        const io = std.Options.debug_io;
+        sdk_debug_info.mutex.lockUncancelable(io);
+        defer sdk_debug_info.mutex.unlock(io);
+        held.set(io);
+        seen.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
+    }
+};
+
+test "an activity that fails while the executable's debug info is still loading still carries its stack trace" {
+    const SelfInfo = std.debug.SelfInfo;
+    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+        return error.SkipZigTest;
+    if (@errorReturnTrace() == null) return error.SkipZigTest;
+    SlowFirstRead.held = .unset;
+    SlowFirstRead.seen = .unset;
+    const env = try @import("testing.zig").WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SlowFirstRead.Order);
+    try env.registerActivity(SlowFirstRead.Charge);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var holder = try testing.io.concurrent(SlowFirstRead.hold, .{});
+    defer holder.await(testing.io);
+    defer SlowFirstRead.seen.set(testing.io);
+    try SlowFirstRead.held.wait(testing.io);
+    // The worker starts here, while the debug info is still "loading".
+    const trace = try env.executeWorkflow(SlowFirstRead.Order, .{}, arena.allocator(), null);
+    if (std.mem.indexOf(u8, trace, "failure.zig:") == null or std.mem.indexOf(u8, trace, "declined") == null) {
+        std.debug.print("the activity's failure arrived without its stack trace:\n{s}\n", .{trace});
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// A worker stopped before it runs, while the executable's debug info is still being read for
+/// the first time: `StoppedWhileReading`'s test holds the SDK's debug info reader the way a
+/// slow first load does (seconds on a loaded runner, past 10 s on an x86_64 macOS runner).
+const StoppedWhileReading = struct {
+    const workflow_mod = @import("workflow.zig");
+
+    /// How long the test holds the reader at most, as a first load on a slow runner would.
+    const hold_limit: std.Io.Duration = .fromSeconds(12);
+
+    var held: std.Io.Event = .unset;
+    var returned: std.Io.Event = .unset;
+
+    fn idle(_: *workflow_mod.Context) ![]const u8 {
+        return "idle";
+    }
+    const Idle = workflow_mod.Def("StoppedWhileReadingIdle", idle);
+
+    /// Holds the SDK's reader until `run` returned, or `hold_limit`. Allocates nothing while
+    /// it holds it.
+    fn hold() void {
+        const io = std.Options.debug_io;
+        sdk_debug_info.mutex.lockUncancelable(io);
+        defer sdk_debug_info.mutex.unlock(io);
+        held.set(io);
+        returned.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
+    }
+};
+
+test "a worker stopped before run returns from run at once while the executable's debug info is still loading" {
+    const SelfInfo = std.debug.SelfInfo;
+    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+        return error.SkipZigTest;
+    if (@errorReturnTrace() == null) return error.SkipZigTest;
+    const client_mod = @import("client.zig");
+    const worker_mod = @import("worker.zig");
+    // The abandoned connection is logged as a warning.
+    testing.log_level = .err;
+    StoppedWhileReading.held = .unset;
+    StoppedWhileReading.returned = .unset;
+    // A listener that never accepts: connecting waits until the client gives up.
+    const any: std.Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    defer silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var client = try client_mod.Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .rpc_timeout = .fromSeconds(20) });
+    defer client.close();
+    var w = try worker_mod.Worker.init(testing.allocator, testing.io, &client, "stopped-while-reading", .{});
+    defer w.deinit();
+    try w.registerWorkflow(StoppedWhileReading.Idle);
+
+    var holder = try testing.io.concurrent(StoppedWhileReading.hold, .{});
+    defer holder.await(testing.io);
+    defer StoppedWhileReading.returned.set(testing.io);
+    try StoppedWhileReading.held.wait(testing.io);
+    // `run` documents that a worker stopped before its client connected returns at once.
+    w.stop();
+    const start = std.Io.Clock.awake.now(testing.io);
+    const result = w.run();
+    const waited = start.durationTo(std.Io.Clock.awake.now(testing.io));
+    StoppedWhileReading.returned.set(testing.io);
+    if (waited.nanoseconds >= 5 * std.time.ns_per_s) {
+        std.debug.print("run took {d} ms to return after stop while the debug info was loading\n", .{waited.toMilliseconds()});
+        return error.TestUnexpectedResult;
+    }
+    try result;
+}
+
+/// A worker stopped after it connected and created its core, while it waits for the first
+/// read of the executable's debug info before it polls: `WaitingForRead`'s test holds the
+/// SDK's debug info reader the way a slow first load does.
+const WaitingForRead = struct {
+    /// How long the test holds the reader at most, as a first load on a slow runner would.
+    const hold_limit: std.Io.Duration = .fromSeconds(12);
+
+    var held: std.Io.Event = .unset;
+    var returned: std.Io.Event = .unset;
+
+    /// Holds the SDK's reader until `run` returned, or `hold_limit`. Allocates nothing while
+    /// it holds it.
+    fn hold() void {
+        const io = std.Options.debug_io;
+        sdk_debug_info.mutex.lockUncancelable(io);
+        defer sdk_debug_info.mutex.unlock(io);
+        held.set(io);
+        returned.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
+    }
+};
+
+test "a worker stopped while it waits for the executable's debug info before polling returns from run at once" {
+    const SelfInfo = std.debug.SelfInfo;
+    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+        return error.SkipZigTest;
+    if (@errorReturnTrace() == null) return error.SkipZigTest;
+    const worker_mod = @import("worker.zig");
+    WaitingForRead.held = .unset;
+    WaitingForRead.returned = .unset;
+    const env = try @import("testing.zig").WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var w = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, "stopped-while-waiting-for-read", .{});
+    defer w.deinit();
+    try w.registerWorkflow(StoppedWhileReading.Idle);
+
+    var holder = try testing.io.concurrent(WaitingForRead.hold, .{});
+    defer holder.await(testing.io);
+    defer WaitingForRead.returned.set(testing.io);
+    try WaitingForRead.held.wait(testing.io);
+    var running = try testing.io.concurrent(worker_mod.Worker.run, .{&w});
+    // Until `run` has connected and created its core: what is left is the wait for the read.
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = .fromSeconds(30), .clock = .awake });
+    while (true) {
+        const created = created: {
+            w.stop_mutex.lockUncancelable(testing.io);
+            defer w.stop_mutex.unlock(testing.io);
+            break :created w.core_ptrs[0] != null;
+        };
+        if (created) break;
+        if (deadline.durationFromNow(testing.io).raw.nanoseconds <= 0) {
+            w.stop();
+            _ = running.await(testing.io) catch {};
+            return error.Timeout;
+        }
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    w.stop();
+    const start = std.Io.Clock.awake.now(testing.io);
+    const result = running.await(testing.io);
+    const waited = start.durationTo(std.Io.Clock.awake.now(testing.io));
+    WaitingForRead.returned.set(testing.io);
+    if (waited.nanoseconds >= 5 * std.time.ns_per_s) {
+        std.debug.print("run took {d} ms to return after stop while it waited for the debug info\n", .{waited.toMilliseconds()});
+        return error.TestUnexpectedResult;
+    }
+    try result;
+    // A worker that started the process's first read, which the test held, never polled. In
+    // a process that read the debug info before, the worker polled and `stop` ended that.
+    if (w.debug_info_read != null) try testing.expectError(error.WorkerFailedToStart, w.waitUntilRunning());
+}
+
+/// A worker with an activity registered, stopped after it connected and created its core,
+/// while it waits for the first read of the executable's debug info before it polls:
+/// `StoppedActivityWorker`'s test holds the SDK's debug info reader the way a slow first load
+/// does. The worker's core never polled for activity tasks.
+const StoppedActivityWorker = struct {
+    const activity_mod = @import("activity.zig");
+    const worker_mod = @import("worker.zig");
+
+    /// How long the test holds the reader at most, as a first load on a slow runner would.
+    const hold_limit: std.Io.Duration = .fromSeconds(12);
+    /// How long `run` may take to return after `stop`, read included, before the test calls
+    /// it hung. A hung `run` can't be cleaned up after, so the test panics.
+    const return_limit: std.Io.Duration = .fromSeconds(30);
+
+    var held: std.Io.Event = .unset;
+    var returned: std.Io.Event = .unset;
+
+    fn ship(_: *activity_mod.Context) !void {}
+    const Ship = activity_mod.Def("StoppedActivityWorkerShip", ship);
+
+    /// Holds the SDK's reader until `run` returned, or `hold_limit`. Allocates nothing while
+    /// it holds it.
+    fn hold() void {
+        const io = std.Options.debug_io;
+        sdk_debug_info.mutex.lockUncancelable(io);
+        defer sdk_debug_info.mutex.unlock(io);
+        held.set(io);
+        returned.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
+    }
+
+    fn run(w: *worker_mod.Worker) worker_mod.Worker.RunError!void {
+        defer returned.set(testing.io);
+        return w.run();
+    }
+};
+
+test "a worker with an activity stopped while it waits for the executable's debug info before polling returns from run" {
+    const SelfInfo = std.debug.SelfInfo;
+    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+        return error.SkipZigTest;
+    if (@errorReturnTrace() == null) return error.SkipZigTest;
+    const worker_mod = StoppedActivityWorker.worker_mod;
+    StoppedActivityWorker.held = .unset;
+    StoppedActivityWorker.returned = .unset;
+    const env = try @import("testing.zig").WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var w = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, "stopped-activity-worker", .{});
+    defer w.deinit();
+    try w.registerActivity(StoppedActivityWorker.Ship);
+
+    var holder = try testing.io.concurrent(StoppedActivityWorker.hold, .{});
+    defer holder.await(testing.io);
+    defer StoppedActivityWorker.returned.set(testing.io);
+    try StoppedActivityWorker.held.wait(testing.io);
+    var running = try testing.io.concurrent(StoppedActivityWorker.run, .{&w});
+    // Until `run` has connected and created its core: what is left is the wait for the read.
+    const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = .fromSeconds(30), .clock = .awake });
+    while (true) {
+        const created = created: {
+            w.stop_mutex.lockUncancelable(testing.io);
+            defer w.stop_mutex.unlock(testing.io);
+            break :created w.core_ptrs[0] != null;
+        };
+        if (created) break;
+        if (deadline.durationFromNow(testing.io).raw.nanoseconds <= 0) {
+            w.stop();
+            _ = running.await(testing.io) catch {};
+            return error.Timeout;
+        }
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    w.stop();
+    StoppedActivityWorker.returned.waitTimeout(testing.io, .{ .duration = .{ .raw = StoppedActivityWorker.return_limit, .clock = .awake } }) catch |err| switch (err) {
+        error.Timeout => {
+            // Nothing can free a hung worker: end the environment's server first, so it doesn't
+            // outlive the test's process.
+            env.server.dev.stop(testing.io);
+            std.debug.panic("Worker.run didn't return within {d} s of stop: a worker with an activity, stopped while it waited for the debug info, hangs", .{StoppedActivityWorker.return_limit.toSeconds()});
+        },
+        else => |e| return e,
+    };
+    try running.await(testing.io);
 }

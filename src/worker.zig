@@ -197,7 +197,10 @@ pub const Options = struct {
     /// `.error_tracing = true` on the executable's root module and the module with the
     /// workflows and activities), and only one whose debug info the worker can read;
     /// otherwise the stack trace is empty. A failure passed on unchanged (a future's failure,
-    /// `ctx.failWith`) keeps its own.
+    /// `ctx.failWith`) keeps its own. The first worker of a process reads the executable's
+    /// debug info before it starts polling, so its start takes that read's time (in a large
+    /// Debug build, seconds) and a failed activity's completion doesn't. `stop` doesn't wait
+    /// for the read; `Worker.deinit` does.
     failure_stack_traces: bool = true,
     /// Errors that fail the workflow task instead of the workflow when a workflow function,
     /// signal handler, or update handler returns them, for every workflow of this worker. A
@@ -385,12 +388,19 @@ pub const Worker = struct {
     interceptors: []const interceptor.Worker = &.{},
     /// The sessions this worker holds, while `run` is active with `options.sessions`.
     session_host: ?*SessionHost = null,
+    /// The process's first read of the executable's debug info, when this worker started it
+    /// (`warmDebugInfo`). `deinit` joins it; `run` doesn't, so that `stop` ends `run` at once.
+    debug_info_read: ?Io.Future(void) = null,
+    /// Set when `debug_info_read` ends and by `stop`: wakes `run`'s wait for the read. Never
+    /// reset (`awaitDebugInfo`).
+    debug_info_wake: Io.Event = .unset,
 
     pub fn init(gpa: Allocator, io: Io, client: *client_mod.Client, task_queue: []const u8, options: Options) error{OutOfMemory}!Worker {
         return .{ .gpa = gpa, .io = io, .client = client, .task_queue = try gpa.dupe(u8, task_queue), .options = options };
     }
 
     pub fn deinit(w: *Worker) void {
+        if (w.debug_info_read) |*f| f.await(w.io);
         w.workflows.deinit(w.gpa);
         w.activities.deinit(w.gpa);
         w.nexus_services.deinit(w.gpa);
@@ -618,6 +628,10 @@ pub const Worker = struct {
         const registered: Registered = .{ .workflows = w.hasWorkflows(), .activities = w.hasActivities(), .nexus = w.hasNexusServices() };
         try checkOptions(w.options, w.task_queue, registered);
         const strategy = try w.versioningStrategy();
+        // Read while the worker connects and creates its core; `awaitDebugInfo` waits for it
+        // before the worker polls, so no activity fails before it is done.
+        if (w.readsDebugInfo() and w.debug_info_read == null and !debug_info_warm.load(.acquire))
+            w.debug_info_read = w.io.concurrent(warmDebugInfo, .{w}) catch null;
         var core_options = coreOptions(w.options, w.client.namespace, w.task_queue, strategy, registered);
         const nondeterminism_types = try w.nondeterminismFailTypes();
         defer w.gpa.free(nondeterminism_types);
@@ -703,10 +717,16 @@ pub const Worker = struct {
             w.core_ptrs = @splat(null);
             w.stop_mutex.unlock(w.io);
         }
-        log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
-        if (host) |h| log.info("Worker hosts sessions TaskQueue={s} SessionTaskQueue={s} HostTaskQueue={s}", .{ w.task_queue, h.creation_queue, h.host_queue });
-        running = true;
-        w.started.set(w.io);
+        // Stopped first, the worker has started nothing (`waitUntilRunning` says so), but
+        // its loops still run: a core is finalized only after each of its pollers has seen
+        // the shutdown `stop` began, and one finalized without ever being polled for
+        // activities never finishes. They return at once.
+        if (w.awaitDebugInfo()) {
+            log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
+            if (host) |h| log.info("Worker hosts sessions TaskQueue={s} SessionTaskQueue={s} HostTaskQueue={s}", .{ w.task_queue, h.creation_queue, h.host_queue });
+            running = true;
+            w.started.set(w.io);
+        } else log.info("Worker stopped before it polled TaskQueue={s}", .{w.task_queue});
 
         var workflows_done = if (w.hasWorkflows()) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
         // Once a loop polls a core, returning early would free the core worker under it: shut
@@ -777,6 +797,29 @@ pub const Worker = struct {
         if (start_failed) |err| return err;
         if (poll_failed) |err| return err;
         if (shutdown_failed) |err| return err;
+    }
+
+    /// Whether this worker puts stack traces in failures, which read the executable's debug
+    /// info (`warmDebugInfo`).
+    fn readsDebugInfo(w: *const Worker) bool {
+        return w.options.failure_stack_traces and @errorReturnTrace() != null;
+    }
+
+    /// Waits until the executable's debug info is read (`warmDebugInfo`), or until `stop`;
+    /// false when stopped first. `run` calls it before it polls, so no failed activity's
+    /// completion waits for the read (bead temporal-sdk-zig-d51.1.34), and `stop` still ends
+    /// `run` at once. Reads it here when it couldn't start beside the worker.
+    fn awaitDebugInfo(w: *Worker) bool {
+        if (!w.readsDebugInfo()) return true;
+        if (w.debug_info_read == null and !debug_info_warm.load(.acquire)) warmDebugInfo(w);
+        // Never reset: both conditions only turn true, and each is stored before the event is
+        // set (`warmDebugInfo`, `stop`), so a set event means one of them holds. A reset here
+        // could be ordered after a set and lose it (store buffering on x86-TSO).
+        while (true) {
+            if (debug_info_warm.load(.acquire)) return true;
+            if (w.stopping.load(.acquire)) return false;
+            w.debug_info_wake.waitUncancelable(w.io);
+        }
     }
 
     /// Reports a poll loop that couldn't start while others already poll, and shuts every
@@ -1028,8 +1071,10 @@ pub const Worker = struct {
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
         w.stop_requested = true;
-        // Sets `stopping`, which a wait for the client's first connection checks once woken.
+        // Sets `stopping`, which a wait for the client's first connection or for the debug
+        // info (`awaitDebugInfo`) checks once woken.
         w.notifyActivitiesOfStop();
+        w.debug_info_wake.set(w.io);
         if (w.waiting_for_connection) w.client.wakeConnecting();
         for (w.core_ptrs) |p| if (p) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
     }
@@ -2212,9 +2257,12 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
             .source = failure_mod.source,
             .failure_info = .{ .canceled_failure_info = .{} },
         } } } };
-        const trace = if (w.options.failure_stack_traces) @errorReturnTrace() else null;
+        // Copied before anything else can return an error and add to the trace.
+        const trace = if (w.options.failure_stack_traces) try failure_mod.captureTrace(a, @errorReturnTrace()) else &.{};
         var f = if (ctx.pending_failure) |p| try failure_mod.application(a, p) else try failure_mod.fromError(a, err);
-        f.stack_trace = try failure_mod.traceText(a, trace);
+        // The worker read the debug info before it polled (`warmDebugInfo`): this only looks
+        // the addresses up.
+        f.stack_trace = try failure_mod.addressesText(a, trace);
         if (failure_mod.applicationCategory(f) == .benign)
             ctx.logger_.debug("Activity failed", .{ .Error = f.message })
         else
@@ -2223,6 +2271,31 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };
+}
+
+/// Set once `warmDebugInfo` has read the executable's debug info, the first time in the
+/// process; stack traces resolve without loading it from then on.
+var debug_info_warm: std.atomic.Value(bool) = .init(false);
+
+/// Reads the executable's debug info for stack traces (`failure.addressesText`), so a failed
+/// activity doesn't, then wakes `w`'s `run` (`Worker.awaitDebugInfo`). The first read loads
+/// and parses the debug info, and its time grows with the executable: bead
+/// temporal-sdk-zig-d51.1.34 measured 0.6 s alone and 2.1 s within the unit tests on an
+/// Apple-silicon Mac in Debug, all of it on the failed activity's thread before its
+/// completion, and on an x86_64 macOS runner the activity's 10 s StartToClose timeout ran
+/// out first. `Worker.run` starts it while the worker connects and doesn't poll before it
+/// ends; `Worker.deinit` joins it.
+noinline fn warmDebugInfo(w: *Worker) void {
+    defer w.debug_info_wake.set(w.io);
+    defer debug_info_warm.store(true, .release);
+    // Scratch that belongs to no worker or activity, freed here.
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    // An address in the SDK's code and one in std's: where a build has a compile unit per
+    // module, each unit's line table is parsed on its first lookup. `addressesText` looks up
+    // the byte before each address.
+    const addresses = [_]usize{ @intFromPtr(&warmDebugInfo) + 1, @intFromPtr(std.heap.page_allocator.vtable.alloc) + 1 };
+    _ = failure_mod.addressesText(scratch.allocator(), &addresses) catch {};
 }
 
 /// An activity's info from its Start task; borrows `start`'s memory.
@@ -4409,6 +4482,103 @@ test "a cancel pending while a heartbeat waits for std's debug info lock still r
     try CancelTest.waitFor(&CancelTest.observed, "BeatWhenTold to see error.Canceled after its heartbeat waited for the debug info lock");
     try CancelTest.awaitWorker(env);
     try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
+}
+
+// Bead temporal-sdk-zig-d51.1.34: an activity's failure resolves its stack trace before the
+// worker completes it, and that read used std's debug info, whose one lock every Debug
+// allocation's stack capture takes and whose first read holds it for seconds. A failed
+// activity then waited on whatever held the lock, past its StartToClose timeout on a slow
+// runner.
+test "a failed activity's completion doesn't wait for std's debug info lock, and its stack trace still resolves" {
+    const SelfInfo = std.debug.SelfInfo;
+    if (comptime builtin.mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+        return error.SkipZigTest;
+    // An activity that fails while the test holds std's debug info lock, on a worker whose
+    // allocations and threads never take that lock: `testing.allocator` captures a stack trace
+    // on each allocation, and on macOS that takes the lock, so neither it nor `testing.io`
+    // (which spawns threads with it) is used here.
+    const TraceLockTest = struct {
+        /// How long the test holds the lock at most; the activity's failure must arrive well
+        /// within it.
+        const hold_limit: Io.Duration = .fromSeconds(20);
+        const arrival_limit: Io.Duration = .fromSeconds(5);
+
+        var io: Io = undefined;
+        var go: Io.Event = .unset;
+        var seen: Io.Event = .unset;
+        var trace_resolved: bool = false;
+
+        fn charge(ctx: *activity.Context) !void {
+            go.waitUncancelable(ctx.io());
+            return ctx.fail(.{ .message = "card declined", .type = "Declined", .non_retryable = true });
+        }
+        const Charge = activity.Def("TraceLockCharge", charge);
+
+        fn order(ctx: *workflow.Context) ![]const u8 {
+            const charged = ctx.executeActivity(Charge, .{ .start_to_close_timeout = .fromSeconds(60), .retry_policy = .{ .maximum_attempts = 1 } }, .{});
+            charged.get() catch |err| switch (err) {
+                error.ActivityFailed => {
+                    trace_resolved = std.mem.indexOf(u8, failure_mod.rootCause(charged.failure().?).stack_trace, "worker.zig:") != null;
+                    seen.set(io);
+                    return "failed";
+                },
+                else => return err,
+            };
+            return "completed";
+        }
+        const Order = workflow.Def("TraceLockOrder", order);
+
+        /// Runs `Order` and holds std's debug info lock from `Charge`'s start until its failure
+        /// reaches the workflow, or `hold_limit`. Returns how long that took.
+        fn run(trace_was_resolved: *bool) !Io.Duration {
+            go = .unset;
+            seen = .unset;
+            trace_resolved = false;
+            // No stack traces: capturing one takes the lock this test holds.
+            var gpa_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+            defer if (gpa_state.deinit() == .leak) @panic("TraceLockTest leaked");
+            const gpa = gpa_state.allocator();
+            var threaded: Io.Threaded = .init(gpa, .{ .environ = testing.environ });
+            defer threaded.deinit();
+            io = threaded.io();
+
+            const env = try CancelTest.Env.start(gpa, io);
+            defer env.deinit();
+            // Before the environment's teardown, whatever the test did.
+            defer go.set(io);
+            try env.registerWorkflow(Order);
+            try env.registerActivity(Charge);
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            var started = try env.startWorkflow(Order, .{ .task_queue = "", .execution_timeout = .fromSeconds(60) }, .{});
+            defer started.deinit();
+            // Reads the executable's debug info the way stack traces do, before the hold, so the
+            // time measured is the activity's and not the first read's.
+            _ = try failure_mod.addressesText(arena.allocator(), &.{@returnAddress()});
+
+            const si = try std.debug.getSelfDebugInfo();
+            const elapsed = hold: {
+                // Nothing here may allocate or log.
+                si.mutex.lockUncancelable(io);
+                defer si.mutex.unlock(io);
+                const begin = Io.Clock.awake.now(io);
+                go.set(io);
+                seen.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
+                break :hold begin.durationTo(Io.Clock.awake.now(io));
+            };
+            try testing.expectEqualStrings("failed", try env.getResult(Order, &started, arena.allocator(), null));
+            trace_was_resolved.* = trace_resolved;
+            return elapsed;
+        }
+    };
+
+    var trace_resolved = false;
+    const elapsed = try TraceLockTest.run(&trace_resolved);
+    if (elapsed.nanoseconds >= TraceLockTest.arrival_limit.nanoseconds) {
+        log.err("the activity's failure took {d} ms to reach its workflow while std's debug info lock was held", .{elapsed.toMilliseconds()});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(trace_resolved);
 }
 
 /// Holds an activity attempt in `interceptActivity`, before the SDK decodes the activity's
