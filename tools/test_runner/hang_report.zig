@@ -25,9 +25,14 @@
 //! stderr while it waits on that lock.
 //!
 //! Nor does the report wait without end on a lock another thread holds, frozen or not: a hung
-//! test may well be stuck holding one. It tries std's stderr lock and std.debug's symbol lock
-//! for at most `lock_wait`; when stderr's stays taken, the rest of the report is written
-//! without it, and when the symbol lock's does, rows show bare addresses.
+//! test may well be stuck holding one. It tries std's stderr lock for at most `lock_wait`, and
+//! when it stays taken, the rest of the report is written without it. std.debug's symbol lock
+//! cannot be tried: std takes it inside each lookup, again for every frame, so a thread can take
+//! it between any two of them. So the rows are formatted and written by a helper thread (named
+//! "hang-report-sym") whose lookups go through an Io that records when it starts waiting on a
+//! futex. When the helper has waited `lock_wait` in one futex wait, the watchdog takes the rest
+//! of the report over and shows bare addresses; the helper, if it ever goes on, writes nothing
+//! more.
 //!
 //! Nothing here may end the process: every failure becomes a `test-hang-report: ` line.
 
@@ -203,9 +208,6 @@ const lock_wait: Io.Duration = .fromSeconds(1);
 /// Set when std's stderr lock stayed taken for `lock_wait`; the rest of the report then writes
 /// without it. Reset by each report.
 var stderr_held = false;
-/// Set when std.debug's symbol lock stayed taken for `lock_wait`; the rest of the report then
-/// shows bare addresses. Reset by each report.
-var symbols_held = false;
 
 fn writeStderr(bytes: []const u8) void {
     if (!stderr_held) {
@@ -243,30 +245,6 @@ fn writeUnlocked(bytes: []const u8) void {
             .INTR => {},
             else => return,
         }
-    }
-}
-
-/// Whether std.debug's symbol lock came free within `lock_wait`. It is let go at once: this
-/// only tells whether looking up symbols would wait on a thread that keeps it.
-fn symbolLockFree() bool {
-    if (TargetSelfInfo == void) return true;
-    const si = std.debug.getSelfDebugInfo() catch return true;
-    const debug_io = std.Options.debug_io;
-    const deadline = Io.Clock.awake.now(io()).addDuration(lock_wait);
-    while (true) {
-        if (@hasField(TargetSelfInfo, "mutex")) {
-            if (si.target.mutex.tryLock()) {
-                si.target.mutex.unlock(debug_io);
-                return true;
-            }
-        } else if (@hasField(TargetSelfInfo, "rwlock")) {
-            if (si.target.rwlock.tryLockShared(debug_io)) {
-                si.target.rwlock.unlockShared(debug_io);
-                return true;
-            }
-        } else return true;
-        if (Io.Clock.awake.now(io()).compare(.gte, deadline)) return false;
-        io().sleep(.fromMilliseconds(5), .awake) catch {};
     }
 }
 
@@ -324,7 +302,6 @@ const List = struct { count: usize, total: usize };
 fn report(index: usize, elapsed_seconds: u64) void {
     const name = builtin.test_functions[index].name;
     stderr_held = false;
-    symbols_held = false;
     if (!have_stacks) {
         print("'{s}' is still running after {d}s\n", .{ name, elapsed_seconds });
         print("thread stacks are not available on this OS\n", .{});
@@ -645,19 +622,110 @@ fn freezeHandler(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque)
 var row_buffer: [64 * 1024]u8 = undefined;
 
 fn writeReport(list: []const Thread, total: usize) void {
-    for (list, 0..) |*t, i| {
-        if (t.outcome == .captured and !symbols_held and !symbolLockFree()) {
-            symbols_held = true;
-            print("another thread holds std.debug's symbol lock; the stacks that follow are bare addresses\n", .{});
-        }
+    const written = writeRowsWithSymbols(list, total);
+    for (list[written..], written..) |*t, i| {
         var row: Io.Writer = .fixed(&row_buffer);
-        writeRow(&row, t, i, total);
+        writeRow(&row, t, i, total, false);
         writeStderr(row.buffered());
     }
     if (total > list.len) print("{d} more threads not shown\n", .{total - list.len});
 }
 
-fn writeRow(w: *Io.Writer, t: *const Thread, i: usize, total: usize) void {
+// The symbol lookup thread. One exists at a time: from `writeRowsWithSymbols` until it has
+// written its last row or, abandoned, its lookup returns.
+
+/// The row the helper is on; `list.len` once it has written them all.
+var lookup_row: std.atomic.Value(usize) = .init(0);
+/// Whether the helper may write the row it is formatting. The helper moves it from
+/// `formatting` to `writing` before it writes a row, and the watchdog from `formatting` to
+/// `abandoned` when it takes the rest over, so exactly one of them writes each row.
+var lookup_phase: std.atomic.Value(enum(u32) { formatting, writing, abandoned }) = .init(.formatting);
+/// Set from the helper's spawn until it returns.
+var lookup_busy: std.atomic.Value(bool) = .init(false);
+/// When the helper began the futex wait it is in (`nowNanoseconds`), or 0.
+var lookup_wait_since: std.atomic.Value(i64) = .init(0);
+/// The helper's row, apart from the watchdog's `row_buffer`.
+var lookup_row_buffer: [64 * 1024]u8 = undefined;
+threadlocal var is_lookup_thread = false;
+
+/// Writes rows with their symbols from a helper thread, and returns how many it wrote: all of
+/// them, or those before the row whose lookup waited `lock_wait` on a futex. The caller writes
+/// the rest with bare addresses.
+fn writeRowsWithSymbols(list: []const Thread, total: usize) usize {
+    if (lookup_busy.load(.acquire)) {
+        print("an earlier report's symbol lookup still waits on std.debug's symbol lock; the stacks that follow are bare addresses\n", .{});
+        return 0;
+    }
+    lookup_row.store(0, .release);
+    lookup_phase.store(.formatting, .release);
+    lookup_wait_since.store(0, .release);
+    lookup_busy.store(true, .release);
+    const helper = std.Thread.spawn(.{}, lookupMain, .{ list, total }) catch |err| {
+        lookup_busy.store(false, .release);
+        print("cannot start the symbol lookup thread: {t}; the stacks that follow are bare addresses\n", .{err});
+        return 0;
+    };
+    helper.setName(io(), "hang-report-sym") catch {};
+    helper.detach();
+    while (true) {
+        const row = lookup_row.load(.acquire);
+        if (row == list.len) return row;
+        const since = lookup_wait_since.load(.acquire);
+        if (since != 0 and nowNanoseconds() - since >= lock_wait.toNanoseconds()) {
+            if (lookup_phase.cmpxchgStrong(.formatting, .abandoned, .acq_rel, .acquire) == null) {
+                print("another thread holds std.debug's symbol lock; the stacks that follow are bare addresses\n", .{});
+                return lookup_row.load(.acquire);
+            }
+        }
+        io().sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+}
+
+fn lookupMain(list: []const Thread, total: usize) void {
+    is_lookup_thread = true;
+    defer lookup_busy.store(false, .release);
+    for (list, 0..) |*t, i| {
+        var row: Io.Writer = .fixed(&lookup_row_buffer);
+        writeRow(&row, t, i, total, true);
+        if (lookup_phase.cmpxchgStrong(.formatting, .writing, .acq_rel, .acquire) != null) return;
+        writeStderr(row.buffered());
+        lookup_row.store(i + 1, .release);
+        lookup_phase.store(.formatting, .release);
+    }
+}
+
+/// The Io the helper's lookups get in place of `io_`: the same, except that each futex wait
+/// is recorded in `lookup_wait_since`. On any other thread, `io_` itself.
+fn lookupIo(io_: Io) Io {
+    if (!is_lookup_thread or io_.vtable == &lookup_vtable) return io_;
+    lookup_base = io_;
+    lookup_vtable = io_.vtable.*;
+    lookup_vtable.futexWait = lookupFutexWait;
+    lookup_vtable.futexWaitUncancelable = lookupFutexWaitUncancelable;
+    return .{ .userdata = io_.userdata, .vtable = &lookup_vtable };
+}
+var lookup_base: Io = undefined;
+var lookup_vtable: Io.VTable = undefined;
+
+fn markWait(waiting: bool) void {
+    // std may keep the Io it was given; only the helper's waits count.
+    if (!is_lookup_thread) return;
+    lookup_wait_since.store(if (waiting) @max(1, nowNanoseconds()) else 0, .release);
+}
+
+fn lookupFutexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
+    markWait(true);
+    defer markWait(false);
+    return lookup_base.vtable.futexWait(userdata, ptr, expected, timeout);
+}
+
+fn lookupFutexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
+    markWait(true);
+    defer markWait(false);
+    lookup_base.vtable.futexWaitUncancelable(userdata, ptr, expected);
+}
+
+fn writeRow(w: *Io.Writer, t: *const Thread, i: usize, total: usize, with_symbols: bool) void {
     const terminal: Io.Terminal = .{ .writer = w, .mode = .no_color };
     {
         w.print(prefix ++ "thread {d} of {d}, id {d}", .{ i + 1, total, t.id }) catch {};
@@ -666,10 +734,10 @@ fn writeRow(w: *Io.Writer, t: *const Thread, i: usize, total: usize) void {
         switch (t.outcome) {
             .captured => {
                 w.writeAll(":\n") catch {};
-                if (symbols_held) {
-                    for (traces[i].return_addresses) |address| w.print("0x{x}\n", .{address}) catch {};
-                } else {
+                if (with_symbols) {
                     std.debug.writeStackTrace(&traces[i], terminal) catch {};
+                } else {
+                    for (traces[i].return_addresses) |address| w.print("0x{x}\n", .{address}) catch {};
                 }
             },
             .watchdog => w.writeAll(" (this report's watchdog; stack not shown)\n") catch {},
@@ -694,11 +762,12 @@ fn writeRow(w: *Io.Writer, t: *const Thread, i: usize, total: usize) void {
     }
 }
 
-/// std.debug's SelfInfo for this target, unchanged: every call is forwarded. The runner installs
-/// it as `root.debug.SelfInfo` (main.zig) only so that std's own lock is reachable as
-/// `std.debug.getSelfDebugInfo().target`, which the fixture
-/// tools/checks/fixtures/hang_report/moved_on.zig takes directly to stall the report's symbol
-/// lookup.
+/// std.debug's SelfInfo for this target: every call is forwarded, on the report's symbol lookup
+/// thread with `lookupIo`'s Io, so that the watchdog sees that thread wait on std's lock. The
+/// runner installs it as `root.debug.SelfInfo` (main.zig). std's own lock is reachable as
+/// `std.debug.getSelfDebugInfo().target`, which the fixtures moved_on.zig and
+/// symbol_lock_late.zig in tools/checks/fixtures/hang_report take directly to stall the
+/// report's symbol lookup.
 pub const SelfInfo = if (TargetSelfInfo == void) void else struct {
     target: TargetSelfInfo,
 
@@ -721,19 +790,19 @@ pub const SelfInfo = if (TargetSelfInfo == void) void else struct {
         resolve_inline_callers: bool,
         symbols: *std.ArrayList(std.debug.Symbol),
     ) Error!void {
-        return si.target.getSymbols(io_, symbol_allocator, text_arena, address, resolve_inline_callers, symbols);
+        return si.target.getSymbols(lookupIo(io_), symbol_allocator, text_arena, address, resolve_inline_callers, symbols);
     }
 
     pub fn getModuleName(si: *SelfInfo, io_: Io, address: usize) Error![]const u8 {
-        return si.target.getModuleName(io_, address);
+        return si.target.getModuleName(lookupIo(io_), address);
     }
 
     pub fn getModuleSlide(si: *SelfInfo, io_: Io, address: usize) Error!usize {
-        return si.target.getModuleSlide(io_, address);
+        return si.target.getModuleSlide(lookupIo(io_), address);
     }
 
     pub fn unwindFrame(si: *SelfInfo, io_: Io, context: *UnwindContext) Error!usize {
-        return si.target.unwindFrame(io_, context);
+        return si.target.unwindFrame(lookupIo(io_), context);
     }
 };
 const TargetSelfInfo = std.debug.TargetInfo(builtin.os.tag, builtin.cpu.arch);

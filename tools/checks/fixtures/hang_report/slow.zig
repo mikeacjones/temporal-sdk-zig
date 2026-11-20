@@ -1,5 +1,5 @@
-//! A test that runs past the hang report's limit and then passes, for the "check hang report
-//! slow test passes" and "check hang report off" cases.
+//! A test that runs past any short limit and then passes, for the "check hang report off" case:
+//! with the report off, the runner's output must be Zig's, byte for byte.
 
 const std = @import("std");
 

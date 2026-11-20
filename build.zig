@@ -690,38 +690,42 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         redirect.addArtifactArg(redirected);
         redirect.addArg("--hang-report=2");
 
-        // addRunArtifact would turn on test-runner mode and hide the output.
-        for ([_]struct { name: []const u8, limit: []const u8 }{
-            .{ .name = "slow test passes", .limit = "1" },
-            .{ .name = "off", .limit = "0" },
-        }) |case| {
-            const run = std.Build.Step.Run.create(b, b.fmt("check hang report {s}", .{case.name}));
-            run.addArtifactArg(slow);
-            run.addArg(b.fmt("--hang-report={s}", .{case.limit}));
-            run.has_side_effects = true;
-            run.expectExitCode(0);
-            if (std.mem.eql(u8, case.limit, "0")) {
-                run.expectStdErrEqual("1/1 slow.test.finishes after the limit...OK\nAll 1 tests passed.\n");
-            } else {
-                run.expectStdErrMatch("still running after 1s");
+        // addRunArtifact would turn on test-runner mode and hide the output. The report's first
+        // line is matched without its elapsed seconds, which a stall of the whole process makes
+        // larger than the limit; each fixture passes only once the report has frozen its thread
+        // and let it go, which proves the report came while the test ran. The test may pass and
+        // the process end before the report has printed the stacks, so only its first line is
+        // matched.
+        const RunsToPass = struct {
+            fn add(owner: *std.Build, test_step: *std.Build.Step, name: []const u8, fixture: *std.Build.Step.Compile, test_name: []const u8) void {
+                const run = std.Build.Step.Run.create(owner, owner.fmt("check hang report {s}", .{name}));
+                run.addArtifactArg(fixture);
+                run.addArg("--hang-report=1");
+                run.has_side_effects = true;
+                run.expectExitCode(0);
+                run.expectStdErrMatch(owner.fmt("test-hang-report: '{s}' is still running after ", .{test_name}));
                 run.expectStdErrMatch("All 1 tests passed.");
+                test_step.dependOn(&run.step);
             }
-            in.test_step.dependOn(&run.step);
-        }
+        };
+        const outlasts = Fixture.build(b, "outlasts", "outlasts.zig", runner);
+        RunsToPass.add(b, in.test_step, "slow test passes", outlasts, "outlasts.test.passes once the report has let it go");
+
+        // With the report off, the output is Zig's runner's, byte for byte.
+        const off = std.Build.Step.Run.create(b, "check hang report off");
+        off.addArtifactArg(slow);
+        off.addArg("--hang-report=0");
+        off.has_side_effects = true;
+        off.expectExitCode(0);
+        off.expectStdErrEqual("1/1 slow.test.finishes after the limit...OK\nAll 1 tests passed.\n");
+        in.test_step.dependOn(&off.step);
 
         in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "hang-report-check-tool", .root_module = tool.root_module, .filters = in.test_filters })).step);
 
         // A test frozen while it allocates through std.testing.allocator holds std.debug's
         // unwinder lock; the report must not wait on it forever. The fixture bounds itself.
         const busy = Fixture.build(b, "busy", "busy.zig", runner);
-        const busy_run = std.Build.Step.Run.create(b, "check hang report allocating test passes");
-        busy_run.addArtifactArg(busy);
-        busy_run.addArg("--hang-report=1");
-        busy_run.has_side_effects = true;
-        busy_run.expectExitCode(0);
-        busy_run.expectStdErrMatch("still running after 1s");
-        busy_run.expectStdErrMatch("All 1 tests passed.");
-        in.test_step.dependOn(&busy_run.step);
+        RunsToPass.add(b, in.test_step, "allocating test passes", busy, "busy.test.allocates until the report has let it go");
 
         // Threads go on and reuse their stacks the moment the report lets them go, while another
         // holds std.debug's symbol lock; the report must use only what it read while each was
@@ -730,16 +734,29 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         const moved = addCheckCase(b, in.test_step, tool, "hang report thread that goes on before its unwind passes", 0);
         moved.addArgs(&.{
             "60",
-            "still running after",
-            "goes on after the report lets it go while another thread holds the symbol lock",
+            "'moved_on.test.goes on after the report lets it go while another thread holds the symbol lock' is still running after ",
             "moved_on: the test's thread went on after the report let it go",
             "moved_on: the thread holding std.debug's symbol lock went on after the report let it go",
             "another thread holds std.debug's symbol lock",
-            "end of the report for",
+            "end of the report for 'moved_on.test.goes on after the report lets it go while another thread holds the symbol lock'",
             "--",
         });
         moved.addArtifactArg(moved_on);
         moved.addArg("--hang-report=1");
+
+        // A thread may take std.debug's symbol lock after the report found it free and keep it,
+        // as moved_on.zig's holder does when its setup is slow by about a second; the report
+        // must still reach its end line.
+        const symbol_lock_late = Fixture.build(b, "symbol-lock-late", "symbol_lock_late.zig", runner);
+        const late = addCheckCase(b, in.test_step, tool, "hang report finishes when the symbol lock is taken during its lookup", 0);
+        late.addArgs(&.{
+            "60",
+            "'symbol_lock_late.test.waits while another thread takes the symbol lock during the report' is still running after ",
+            "end of the report for 'symbol_lock_late.test.waits while another thread takes the symbol lock during the report'",
+            "--",
+        });
+        late.addArtifactArg(symbol_lock_late);
+        late.addArg("--hang-report=1");
     }
 
     // zig build tsan
