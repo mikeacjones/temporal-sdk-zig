@@ -115,6 +115,7 @@
 const std = @import("std");
 const proto = @import("proto.zig");
 const protojson = @import("protojson.zig");
+const proto_time = @import("proto_time.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Payload = proto.temporal.api.common.v1.Payload;
@@ -758,7 +759,7 @@ pub const Time = struct {
         const nanos: u32 = @intCast(@mod(t.unix_ns, std.time.ns_per_s));
         const days = @divFloor(secs, std.time.s_per_day);
         const sod: u32 = @intCast(@mod(secs, std.time.s_per_day));
-        const date = civilFromDays(days);
+        const date = proto_time.civilFromDays(days);
         var w: std.Io.Writer = .fixed(buf);
         w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
             @as(u64, @intCast(@max(date.year, 0))), date.month, date.day, sod / 3600, sod / 60 % 60, sod % 60,
@@ -773,9 +774,15 @@ pub const Time = struct {
         return w.buffered();
     }
 
-    /// Parses an RFC 3339 time ("2006-01-02T15:04:05.999999999Z07:00"). A time whose offset
-    /// moves it out of the years 0000 to 9999 in UTC is `error.InvalidTime`, since `format`
-    /// can't write it.
+    /// Parses an RFC 3339 time of the form "YYYY-MM-DDTHH:MM:SS[.F+](Z|±HH:MM)", where `T` and
+    /// `Z` may be lowercase. Every numeric field is ASCII digits only: no sign, underscore or
+    /// space. The month is 1 to 12 and the day 1 to the month's length, leap years included
+    /// (0000 is a leap year in the proleptic Gregorian calendar). The hour is at most 23, the
+    /// minute at most 59 and the second at most 59: a leap second (":60") is rejected, as
+    /// protobuf's Timestamp parser rejects it. The fraction has one or more digits, and digits
+    /// after the ninth are dropped. An offset's hour is at most 23 and its minute at most 59.
+    /// The time in UTC must fall within the years 0000 to 9999, since `format` can't write
+    /// others. Anything else is `error.InvalidTime`.
     pub fn parse(text: []const u8) error{InvalidTime}!Time {
         if (text.len < 20 or text[4] != '-' or text[7] != '-' or (text[10] != 'T' and text[10] != 't') or text[13] != ':' or text[16] != ':')
             return error.InvalidTime;
@@ -785,7 +792,8 @@ pub const Time = struct {
         const hour = try digitsOf(text[11..13]);
         const minute = try digitsOf(text[14..16]);
         const second = try digitsOf(text[17..19]);
-        if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60) return error.InvalidTime;
+        if (month < 1 or month > 12 or hour > 23 or minute > 59 or second > 59) return error.InvalidTime;
+        if (day < 1 or day > std.time.epoch.getDaysInMonth(@intCast(year), @fromBackingInt(@intCast(month)))) return error.InvalidTime;
         var i: usize = 19;
         var nanos: i96 = 0;
         if (text[i] == '.') {
@@ -804,17 +812,20 @@ pub const Time = struct {
             'Z', 'z' => i += 1,
             '+', '-' => {
                 if (text.len < i + 6 or text[i + 3] != ':') return error.InvalidTime;
-                const off = @as(i64, try digitsOf(text[i + 1 .. i + 3])) * 3600 + @as(i64, try digitsOf(text[i + 4 .. i + 6])) * 60;
+                const off_hour = try digitsOf(text[i + 1 .. i + 3]);
+                const off_minute = try digitsOf(text[i + 4 .. i + 6]);
+                if (off_hour > 23 or off_minute > 59) return error.InvalidTime;
+                const off = @as(i64, off_hour) * 3600 + @as(i64, off_minute) * 60;
                 offset_s = if (text[i] == '-') -off else off;
                 i += 6;
             },
             else => return error.InvalidTime,
         }
         if (i != text.len) return error.InvalidTime;
-        const days = daysFromCivil(year, month, day);
+        const days = proto_time.daysFromCivil(year, @intCast(month), @intCast(day));
         const secs = days * std.time.s_per_day + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset_s;
-        const first_secs = comptime daysFromCivil(0, 1, 1) * std.time.s_per_day;
-        const end_secs = comptime daysFromCivil(10000, 1, 1) * std.time.s_per_day;
+        const first_secs = comptime proto_time.daysFromCivil(0, 1, 1) * std.time.s_per_day;
+        const end_secs = comptime proto_time.daysFromCivil(10000, 1, 1) * std.time.s_per_day;
         if (secs < first_secs or secs >= end_secs) return error.InvalidTime;
         return .{ .unix_ns = @as(i96, secs) * std.time.ns_per_s + nanos };
     }
@@ -836,32 +847,15 @@ pub const Time = struct {
         return parse(source.string) catch error.UnexpectedToken;
     }
 
-    fn digitsOf(s: []const u8) error{InvalidTime}!u32 {
-        return std.fmt.parseUnsigned(u32, s, 10) catch error.InvalidTime;
-    }
-
-    // Howard Hinnant's days_from_civil / civil_from_days, valid for the proleptic Gregorian
-    // calendar in both directions from the epoch.
-    fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
-        const y = if (m <= 2) y0 - 1 else y0;
-        const era = @divFloor(y, 400);
-        const yoe = y - era * 400;
-        const mp: i64 = if (m > 2) m - 3 else m + 9;
-        const doy = @divFloor(153 * mp + 2, 5) + d - 1;
-        const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-        return era * 146097 + doe - 719468;
-    }
-
-    fn civilFromDays(z0: i64) struct { year: i64, month: u32, day: u32 } {
-        const z = z0 + 719468;
-        const era = @divFloor(z, 146097);
-        const doe = z - era * 146097;
-        const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-        const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-        const mp = @divFloor(5 * doy + 2, 153);
-        const day: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-        const month: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-        return .{ .year = yoe + era * 400 + @intFromBool(month <= 2), .month = month, .day = day };
+    /// The value of `s`, which must be ASCII digits only: no sign, underscore or space.
+    /// Callers pass at most four digits, so the value always fits.
+    fn digitsOf(s: []const u8) error{InvalidTime}!u16 {
+        var value: u16 = 0;
+        for (s) |c| {
+            if (c < '0' or c > '9') return error.InvalidTime;
+            value = value * 10 + (c - '0');
+        }
+        return value;
     }
 };
 
@@ -965,6 +959,66 @@ test "Time encodes as RFC 3339 text" {
     const p = try toPayload(arena.allocator(), S{ .run_time = t });
     try std.testing.expectEqualStrings("{\"run_time\":\"2018-08-22T16:30:00Z\"}", p.data);
     try std.testing.expectEqual(t, (try fromPayload(S, arena.allocator(), p)).run_time);
+}
+
+test "Time.parse rejects impossible dates, offsets and non-digit fields" {
+    const rejected = [_][]const u8{
+        // Days beyond the month's length.
+        "2023-02-29T00:00:00Z",
+        "2023-02-31T00:00:00Z",
+        "2100-02-29T00:00:00Z",
+        "2024-04-31T00:00:00Z",
+        "2024-01-00T00:00:00Z",
+        // Offsets out of range.
+        "2023-01-01T00:00:00+00:99",
+        "2023-01-01T00:00:00+24:00",
+        "2023-01-01T00:00:00-23:60",
+        // Fields that aren't ASCII digits only.
+        "20_3-01-01T00:00:00Z",
+        "+023-01-01T00:00:00Z",
+        " 2023-01-01T00:00:00Z",
+        "2023-+1-01T00:00:00Z",
+        "2023-01-01T0_:00:00Z",
+        "2023-01-01T00:00:00+0_:00",
+        "2023-01-01T00:00:00-+1:00",
+        // A leap second.
+        "2023-06-30T23:59:60Z",
+    };
+    for (rejected) |text| {
+        _ = Time.parse(text) catch continue;
+        std.debug.print("Time.parse accepted \"{s}\"\n", .{text});
+        return error.TestUnexpectedResult;
+    }
+
+    var buf: [Time.max_len]u8 = undefined;
+    const accepted = [_]struct { []const u8, []const u8 }{
+        .{ "2024-02-29T00:00:00Z", "2024-02-29T00:00:00Z" },
+        .{ "2000-02-29T00:00:00Z", "2000-02-29T00:00:00Z" },
+        .{ "0000-02-29T00:00:00Z", "0000-02-29T00:00:00Z" },
+        .{ "2023-01-31T00:00:00Z", "2023-01-31T00:00:00Z" },
+        .{ "2023-06-15t12:00:00+23:59", "2023-06-14T12:01:00Z" },
+        .{ "2023-06-15T12:00:00-23:59", "2023-06-16T11:59:00Z" },
+        .{ "2023-06-30T23:59:59.123456789012z", "2023-06-30T23:59:59.123456789Z" },
+    };
+    for (accepted) |case| {
+        const t = Time.parse(case[0]) catch |err| {
+            std.debug.print("Time.parse rejected \"{s}\"\n", .{case[0]});
+            return err;
+        };
+        try std.testing.expectEqualStrings(case[1], t.format(&buf));
+    }
+    // 29 February of a leap year is the day after the 28th.
+    const leap = try Time.parse("2024-02-29T00:00:00Z");
+    const before = try Time.parse("2024-02-28T00:00:00Z");
+    try std.testing.expectEqual(@as(i96, std.time.ns_per_day), leap.unix_ns - before.unix_ns);
+
+    // JSON decoding reports the rejected text as a malformed token.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const S = struct { run_time: Time };
+    var p = try toPayload(arena.allocator(), S{ .run_time = leap });
+    p.data = "{\"run_time\":\"2023-02-29T00:00:00Z\"}";
+    try std.testing.expectError(error.InvalidPayload, fromPayload(S, arena.allocator(), p));
 }
 
 test "fields encode in declaration order and decode by name" {
