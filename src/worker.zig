@@ -2447,20 +2447,42 @@ fn receiveNexusTask(w: *Worker, core: bridge.Worker, running: *RunningNexusReque
     }
 }
 
-/// Fails a request whose task doesn't decode (for example a header that isn't UTF-8), so the
-/// core doesn't wait for it forever: its task token is read from the raw bytes (the token is
-/// field 1 of the poll response, itself field 1 of the task).
+/// Fails a request whose task doesn't decode, so the core doesn't wait for it forever: its
+/// task token is read from the raw bytes (the token is field 1 of the poll response, itself
+/// field 1 of the task). A malformed task (for example a header that isn't UTF-8) fails as a
+/// non-retryable bad request; one that ran out of memory decoding fails as a retryable
+/// internal error, so the caller retries it. Uses no heap, since it may run out of memory.
 fn failUndecodableNexusTask(w: *Worker, core: bridge.Worker, bytes: []const u8, err: anyerror) void {
     const token = if (runId(bytes)) |response| runId(response) else null;
     const t = token orelse return log.err("decoding a Nexus task on task queue {s} failed: {t}; it has no task token to complete it with", .{ w.task_queue, err });
-    log.warn("decoding a Nexus task on task queue {s} failed: {t}; failing the request as a bad request", .{ w.task_queue, err });
-    var arena: std.heap.ArenaAllocator = .init(w.gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const message = std.fmt.allocPrint(a, "the worker on task queue {s} couldn't decode the Nexus request: {t}", .{ w.task_queue, err }) catch "the worker couldn't decode the Nexus request";
-    const completion = wire.failedCompletion(a, t, .{ .type = .bad_request, .message = message, .retry = .non_retryable }) catch
-        return log.err("out of memory failing an undecodable Nexus task on task queue {s}", .{w.task_queue});
-    sendNexusCompletion(w, core, a, completion, .{ .sink = w.logSink() });
+    if (err == error.OutOfMemory)
+        log.err("out of memory decoding a Nexus task on task queue {s}; failing the request as retryable", .{w.task_queue})
+    else
+        log.warn("decoding a Nexus task on task queue {s} failed: {t}; failing the request as a bad request", .{ w.task_queue, err });
+    var message_buf: [512]u8 = undefined;
+    const e = undecodableNexusError(err, w.task_queue, &message_buf);
+    const logger: log_mod.Logger = .{ .sink = w.logSink() };
+    var buffer: [wire.failed_completion_buffer_len]u8 = undefined;
+    const completion = wire.encodeFailedCompletion(&buffer, t, e) orelse return dropNexusTask(w, core, t, logger);
+    completeNexusTask(w, core, completion, logger);
+}
+
+/// The handler error a Nexus task that failed to decode with `err` is failed with: retryable
+/// for running out of memory, a non-retryable bad request otherwise. Its message is formatted
+/// into `message_buf`, or left without the task queue when that doesn't fit.
+fn undecodableNexusError(err: anyerror, task_queue: []const u8, message_buf: []u8) nexus.HandlerError {
+    if (err == error.OutOfMemory) return .{
+        .type = .internal,
+        .retry = .retryable,
+        .message = std.fmt.bufPrint(message_buf, "the worker on task queue {s} ran out of memory decoding the Nexus request", .{task_queue}) catch
+            "the worker ran out of memory decoding the Nexus request",
+    };
+    return .{
+        .type = .bad_request,
+        .retry = .non_retryable,
+        .message = std.fmt.bufPrint(message_buf, "the worker on task queue {s} couldn't decode the Nexus request: {t}", .{ task_queue, err }) catch
+            "the worker couldn't decode the Nexus request",
+    };
 }
 
 /// Runs a request's handler on a task of its own, waits for it to return or for a cancel,
@@ -5670,6 +5692,59 @@ test "a run ID is read from an activation's bytes without decoding it" {
     try testing.expect(runId(&.{ 0x0a, 0 }) == null);
     try testing.expect(runId(&.{ 0x0a, 9, 'r' }) == null);
     try testing.expect(runId(&.{ 0x10, 0xff }) == null);
+}
+
+test "a Nexus task that ran out of memory decoding fails retryably, a malformed one as a bad request" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var header = [_]proto.temporal.api.nexus.v1.Request.HeaderEntry{.{ .key = "request-id", .value = "r-1" }};
+    const task: nexus_pb.NexusTask = .{ .endpoint = "endpoint", .variant = .{ .task = .{
+        .task_token = "task-token",
+        .request = .{ .header = .fromOwnedSlice(&header), .variant = .{ .start_operation = .{ .service = "svc", .operation = "op" } } },
+    } } };
+    var encoded: Io.Writer.Allocating = .init(a);
+    try task.encode(&encoded.writer, a);
+    const valid = encoded.written();
+
+    // The completion `failUndecodableNexusTask` sends for a decode that failed with `err`.
+    const Sent = struct {
+        fn failure(arena_a: Allocator, bytes: []const u8, err: anyerror) !proto.temporal.api.failure.v1.Failure {
+            const token = runId(runId(bytes).?).?;
+            var message_buf: [512]u8 = undefined;
+            var buffer: [wire.failed_completion_buffer_len]u8 = undefined;
+            const completion = wire.encodeFailedCompletion(&buffer, token, undecodableNexusError(err, "queue", &message_buf)).?;
+            var reader: Io.Reader = .fixed(completion);
+            const decoded = try wire.Completion.decode(&reader, arena_a);
+            try testing.expectEqualStrings("task-token", decoded.task_token);
+            return decoded.status.?.failure;
+        }
+    };
+
+    // A one-time allocation failure while decoding a valid task.
+    var failing: std.testing.FailingAllocator = .init(a, .{ .fail_index = 0 });
+    var reader: Io.Reader = .fixed(valid);
+    const oom = if (nexus_pb.NexusTask.decode(&reader, failing.allocator())) |_| return error.TestUnexpectedResult else |err| err;
+    try testing.expectEqual(error.OutOfMemory, oom);
+    const retryable = try Sent.failure(a, valid, oom);
+    try testing.expectEqualStrings("the worker on task queue queue ran out of memory decoding the Nexus request", retryable.message);
+    try testing.expectEqualStrings("INTERNAL", retryable.failure_info.?.nexus_handler_failure_info.type);
+    try testing.expectEqual(.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE, retryable.failure_info.?.nexus_handler_failure_info.retry_behavior);
+
+    // The same task with an endpoint that isn't UTF-8 appended (field 4; the last one read wins).
+    const malformed = try std.mem.concat(a, u8, &.{ valid, &.{ 0x22, 2, 0xff, 0xfe } });
+    reader = .fixed(malformed);
+    const bad = if (nexus_pb.NexusTask.decode(&reader, a)) |_| return error.TestUnexpectedResult else |err| err;
+    try testing.expect(bad != error.OutOfMemory);
+    const refused = try Sent.failure(a, malformed, bad);
+    try testing.expect(std.mem.startsWith(u8, refused.message, "the worker on task queue queue couldn't decode the Nexus request: "));
+    try testing.expectEqualStrings("BAD_REQUEST", refused.failure_info.?.nexus_handler_failure_info.type);
+    try testing.expectEqual(.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE, refused.failure_info.?.nexus_handler_failure_info.retry_behavior);
+
+    // Without room for the task queue, the message leaves it out.
+    var small: [8]u8 = undefined;
+    try testing.expectEqualStrings("the worker ran out of memory decoding the Nexus request", undecodableNexusError(error.OutOfMemory, "queue", &small).message);
+    try testing.expectEqualStrings("the worker couldn't decode the Nexus request", undecodableNexusError(error.InvalidInput, "queue", &small).message);
 }
 
 test "evictions are logged by reason unless a callback takes them" {
