@@ -745,6 +745,9 @@ pub const Time = struct {
     /// The longest text `format` writes: "-YYYYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ" fits easily.
     pub const max_len = 40;
 
+    /// Any `std.Io.Timestamp` is accepted. `format` and `jsonStringify` (and so `toPayload`)
+    /// write a time before 0000-01-01T00:00:00Z or after 9999-12-31T23:59:59.999999999Z as
+    /// that bound, the range `parse` accepts; `toTimestamp` still gives back the exact value.
     pub fn fromTimestamp(ts: std.Io.Timestamp) Time {
         return .{ .unix_ns = ts.nanoseconds };
     }
@@ -753,16 +756,24 @@ pub const Time = struct {
         return .{ .nanoseconds = t.unix_ns };
     }
 
-    /// Writes `t` in UTC, with trailing zeros of the fraction dropped.
+    /// The earliest and latest instants `format` writes and `parse` accepts:
+    /// 0000-01-01T00:00:00Z and 9999-12-31T23:59:59.999999999Z.
+    const first_ns: i96 = @as(i96, proto_time.daysFromCivil(0, 1, 1)) * std.time.s_per_day * std.time.ns_per_s;
+    const last_ns: i96 = @as(i96, proto_time.daysFromCivil(10000, 1, 1)) * std.time.s_per_day * std.time.ns_per_s - 1;
+
+    /// Writes `t` in UTC, with trailing zeros of the fraction dropped. A time before
+    /// 0000-01-01T00:00:00Z or after 9999-12-31T23:59:59.999999999Z is written as that bound,
+    /// so the text always parses back with `parse`; it never panics.
     pub fn format(t: Time, buf: *[max_len]u8) []const u8 {
-        const secs: i64 = @intCast(@divFloor(t.unix_ns, std.time.ns_per_s));
-        const nanos: u32 = @intCast(@mod(t.unix_ns, std.time.ns_per_s));
+        const ns = std.math.clamp(t.unix_ns, first_ns, last_ns);
+        const secs: i64 = @intCast(@divFloor(ns, std.time.ns_per_s));
+        const nanos: u32 = @intCast(@mod(ns, std.time.ns_per_s));
         const days = @divFloor(secs, std.time.s_per_day);
         const sod: u32 = @intCast(@mod(secs, std.time.s_per_day));
         const date = proto_time.civilFromDays(days);
         var w: std.Io.Writer = .fixed(buf);
         w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
-            @as(u64, @intCast(@max(date.year, 0))), date.month, date.day, sod / 3600, sod / 60 % 60, sod % 60,
+            @as(u64, @intCast(date.year)), date.month, date.day, sod / 3600, sod / 60 % 60, sod % 60,
         }) catch unreachable;
         if (nanos != 0) {
             var frac: [9]u8 = undefined;
@@ -824,12 +835,12 @@ pub const Time = struct {
         if (i != text.len) return error.InvalidTime;
         const days = proto_time.daysFromCivil(year, @intCast(month), @intCast(day));
         const secs = days * std.time.s_per_day + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second - offset_s;
-        const first_secs = comptime proto_time.daysFromCivil(0, 1, 1) * std.time.s_per_day;
-        const end_secs = comptime proto_time.daysFromCivil(10000, 1, 1) * std.time.s_per_day;
-        if (secs < first_secs or secs >= end_secs) return error.InvalidTime;
-        return .{ .unix_ns = @as(i96, secs) * std.time.ns_per_s + nanos };
+        const unix_ns = @as(i96, secs) * std.time.ns_per_s + nanos;
+        if (unix_ns < first_ns or unix_ns > last_ns) return error.InvalidTime;
+        return .{ .unix_ns = unix_ns };
     }
 
+    /// Writes `t` as a JSON string, clamped to the years 0000 to 9999 as `format` does.
     pub fn jsonStringify(t: Time, jws: anytype) !void {
         var buf: [max_len]u8 = undefined;
         try jws.write(t.format(&buf));
@@ -1019,6 +1030,39 @@ test "Time.parse rejects impossible dates, offsets and non-digit fields" {
     var p = try toPayload(arena.allocator(), S{ .run_time = leap });
     p.data = "{\"run_time\":\"2023-02-29T00:00:00Z\"}";
     try std.testing.expectError(error.InvalidPayload, fromPayload(S, arena.allocator(), p));
+}
+
+test "Time outside the years 0000 to 9999 is written as the nearest bound" {
+    const day_ns: i96 = std.time.ns_per_day;
+    const cases = .{
+        .{ std.math.maxInt(i96), "9999-12-31T23:59:59.999999999Z" },
+        .{ std.math.minInt(i96), "0000-01-01T00:00:00Z" },
+        .{ proto_time.daysFromCivil(10000, 6, 1) * day_ns, "9999-12-31T23:59:59.999999999Z" },
+        .{ proto_time.daysFromCivil(10000, 1, 1) * day_ns, "9999-12-31T23:59:59.999999999Z" },
+        .{ proto_time.daysFromCivil(-1, 6, 1) * day_ns, "0000-01-01T00:00:00Z" },
+        .{ proto_time.daysFromCivil(0, 1, 1) * day_ns - 1, "0000-01-01T00:00:00Z" },
+        .{ proto_time.daysFromCivil(0, 1, 1) * day_ns, "0000-01-01T00:00:00Z" },
+        .{ proto_time.daysFromCivil(10000, 1, 1) * day_ns - 1, "9999-12-31T23:59:59.999999999Z" },
+    };
+    var buf: [Time.max_len]u8 = undefined;
+    inline for (cases) |case| {
+        const t = Time.fromTimestamp(.{ .nanoseconds = case[0] });
+        const text = t.format(&buf);
+        try std.testing.expectEqualStrings(case[1], text);
+        const back = try Time.parse(text);
+        try std.testing.expectEqualStrings(text, back.format(&buf));
+    }
+
+    // toPayload of a struct holding such a time succeeds with the clamped text, which decodes.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const S = struct { run_time: Time };
+    const far = try toPayload(arena.allocator(), S{ .run_time = .fromTimestamp(.{ .nanoseconds = std.math.maxInt(i96) }) });
+    try std.testing.expectEqualStrings("{\"run_time\":\"9999-12-31T23:59:59.999999999Z\"}", far.data);
+    const read = try fromPayload(S, arena.allocator(), far);
+    try std.testing.expectEqual(proto_time.daysFromCivil(10000, 1, 1) * day_ns - 1, read.run_time.unix_ns);
+    const early = try toPayload(arena.allocator(), S{ .run_time = .fromTimestamp(.{ .nanoseconds = std.math.minInt(i96) }) });
+    try std.testing.expectEqualStrings("{\"run_time\":\"0000-01-01T00:00:00Z\"}", early.data);
 }
 
 test "fields encode in declaration order and decode by name" {
