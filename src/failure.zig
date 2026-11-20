@@ -1049,6 +1049,27 @@ test "addressesText symbolizes a trace on a thread with a cancel pending, and de
     try testing.expect(std.mem.indexOf(u8, canceled_text, "pendingCancelLeaf") != null);
 }
 
+/// The lock of the SDK's debug info reader (`sdk_debug_info`), for the tests that hold it the
+/// way a slow first read does: SlowFirstRead, StoppedWhileReading, WaitingForRead,
+/// StoppedActivityWorker. Under this project's test runner `std.debug.SelfInfo` is the hang
+/// report's forwarding wrapper (tools/test_runner/hang_report.zig), and std's reader, with the
+/// lock, is its `target`; under Zig's own runner (`zig build tsan`) it is std's reader itself.
+const DebugInfoLock = struct {
+    /// std's reader for this target: the wrapper's `target` when the wrapper is installed.
+    const Reader = if (@hasField(std.debug.SelfInfo, "target")) @FieldType(std.debug.SelfInfo, "target") else std.debug.SelfInfo;
+
+    /// Whether a test can hold the reader's lock here: Debug, stack tracing available, a
+    /// SelfInfo for this target, and a reader with a mutex (the ELF reader has a read-write
+    /// lock instead, so this is false on Linux).
+    const holdable = @import("builtin").mode == .debug and std.debug.sys_can_stack_trace and
+        std.debug.SelfInfo != void and @hasField(Reader, "mutex");
+
+    /// The reader's lock. Only call it where `holdable` is true.
+    fn mutex() *std.Io.Mutex {
+        return if (@hasField(std.debug.SelfInfo, "target")) &sdk_debug_info.target.mutex else &sdk_debug_info.mutex;
+    }
+};
+
 /// An activity that fails while the executable's debug info is still being read for the first
 /// time: `SlowFirstRead`'s test holds the SDK's debug info reader the way a slow first load
 /// does, from before the worker starts, until the worker has connected and created its core.
@@ -1065,18 +1086,6 @@ const SlowFirstRead = struct {
     const hold_limit: std.Io.Duration = .fromSeconds(6);
     /// How often `hold` looks whether the worker created its core.
     const poll_interval: std.Io.Duration = .fromMilliseconds(5);
-
-    /// The reader's lock. Under this project's test runner `std.debug.SelfInfo` is the hang
-    /// report's forwarding wrapper (tools/test_runner/hang_report.zig), and std's reader, with
-    /// the lock, is its `target`.
-    const Reader = if (@hasField(std.debug.SelfInfo, "target")) @FieldType(std.debug.SelfInfo, "target") else std.debug.SelfInfo;
-    /// Whether this target's reader has a lock the test can hold (the ELF reader has a
-    /// read-write lock instead).
-    const lockable = @hasField(Reader, "mutex");
-
-    fn readerMutex() *std.Io.Mutex {
-        return if (@hasField(std.debug.SelfInfo, "target")) &sdk_debug_info.target.mutex else &sdk_debug_info.mutex;
-    }
 
     var held: std.Io.Event = .unset;
     var seen: std.Io.Event = .unset;
@@ -1118,7 +1127,7 @@ const SlowFirstRead = struct {
     /// held past `hold_limit`. Allocates nothing while it holds the lock.
     fn hold(w: *worker_mod.Worker) void {
         const io = std.Options.debug_io;
-        const mutex = readerMutex();
+        const mutex = DebugInfoLock.mutex();
         mutex.lockUncancelable(io);
         defer mutex.unlock(io);
         held.set(io);
@@ -1132,9 +1141,7 @@ const SlowFirstRead = struct {
 };
 
 test "an activity that fails while the executable's debug info is still loading still carries its stack trace" {
-    const SelfInfo = std.debug.SelfInfo;
-    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !SlowFirstRead.lockable)
-        return error.SkipZigTest;
+    if (comptime !DebugInfoLock.holdable) return error.SkipZigTest;
     if (@errorReturnTrace() == null) return error.SkipZigTest;
     SlowFirstRead.held = .unset;
     SlowFirstRead.seen = .unset;
@@ -1178,17 +1185,16 @@ const StoppedWhileReading = struct {
     /// it holds it.
     fn hold() void {
         const io = std.Options.debug_io;
-        sdk_debug_info.mutex.lockUncancelable(io);
-        defer sdk_debug_info.mutex.unlock(io);
+        const mutex = DebugInfoLock.mutex();
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
         held.set(io);
         returned.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
     }
 };
 
 test "a worker stopped before run returns from run at once while the executable's debug info is still loading" {
-    const SelfInfo = std.debug.SelfInfo;
-    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
-        return error.SkipZigTest;
+    if (comptime !DebugInfoLock.holdable) return error.SkipZigTest;
     if (@errorReturnTrace() == null) return error.SkipZigTest;
     const client_mod = @import("client.zig");
     const worker_mod = @import("worker.zig");
@@ -1239,17 +1245,16 @@ const WaitingForRead = struct {
     /// it holds it.
     fn hold() void {
         const io = std.Options.debug_io;
-        sdk_debug_info.mutex.lockUncancelable(io);
-        defer sdk_debug_info.mutex.unlock(io);
+        const mutex = DebugInfoLock.mutex();
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
         held.set(io);
         returned.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
     }
 };
 
 test "a worker stopped while it waits for the executable's debug info before polling returns from run at once" {
-    const SelfInfo = std.debug.SelfInfo;
-    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
-        return error.SkipZigTest;
+    if (comptime !DebugInfoLock.holdable) return error.SkipZigTest;
     if (@errorReturnTrace() == null) return error.SkipZigTest;
     const worker_mod = @import("worker.zig");
     WaitingForRead.held = .unset;
@@ -1320,8 +1325,9 @@ const StoppedActivityWorker = struct {
     /// it holds it.
     fn hold() void {
         const io = std.Options.debug_io;
-        sdk_debug_info.mutex.lockUncancelable(io);
-        defer sdk_debug_info.mutex.unlock(io);
+        const mutex = DebugInfoLock.mutex();
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
         held.set(io);
         returned.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
     }
@@ -1333,9 +1339,7 @@ const StoppedActivityWorker = struct {
 };
 
 test "a worker with an activity stopped while it waits for the executable's debug info before polling returns from run" {
-    const SelfInfo = std.debug.SelfInfo;
-    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
-        return error.SkipZigTest;
+    if (comptime !DebugInfoLock.holdable) return error.SkipZigTest;
     if (@errorReturnTrace() == null) return error.SkipZigTest;
     const worker_mod = StoppedActivityWorker.worker_mod;
     StoppedActivityWorker.held = .unset;
