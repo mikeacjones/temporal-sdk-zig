@@ -27,8 +27,16 @@ pub const proto = @import("proto.zig");
 
 const bridge = @import("bridge.zig");
 
-/// SDK version reported to the server. Keep in sync with build.zig.zon.
-pub const version = "0.0.0";
+/// SDK version reported to the server and recorded as `sdkVersion` in workflow histories:
+/// build.zig.zon's `.version`, which build.zig passes in as a build option.
+pub const version: []const u8 = @import("build_options").version;
+
+test "version is build.zig.zon's .version" {
+    const std = @import("std");
+    try std.testing.expectEqualStrings(@import("build_options").version, version);
+    _ = try std.SemanticVersion.parse(version);
+    try std.testing.expect(!std.mem.eql(u8, "0.0.0", version));
+}
 
 test {
     @import("std").testing.refAllDecls(@This());

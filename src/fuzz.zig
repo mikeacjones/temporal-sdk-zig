@@ -6,9 +6,21 @@
 //! bytes are literal, and a slice is a 4-byte little-endian length followed by its bytes.
 //! Fit seeds to the target's buffers. An oversized slice replays as an empty slice,
 //! and a stream that runs out yields defaults.
+//!
+//! A crash file `zig build fuzz` saves is exactly the stream the target consumed, so a
+//! full-length slice adds 4 bytes of framing to its `max_input_len` bytes. The limits are in
+//! fuzz/limits.zig, which build.zig shares. The bound is on the whole stream: every stream a
+//! target consumes, a saved crash file included, is at most `max_file_len` bytes, the
+//! per-file limit build.zig enforces. A target draws slices of at most `max_input_len` bytes
+//! in total. `max_framing_len` is the budget for lengths, fixed-size values and eos bytes
+//! beside a full `max_input_len` of slice bytes; a target that draws less slice data may use
+//! the difference for framing, as search_attributes and failure_attributes do. All corpus
+//! files together are at most `max_corpus_len` bytes. A target whose stream could exceed
+//! `max_file_len` must shrink its buffers.
 
 const std = @import("std");
 const corpus = @import("fuzz_corpus");
+const limits = @import("fuzz/limits.zig");
 
 const targets = struct {
     pub const failure_attributes = @import("fuzz/failure_attributes.zig");
@@ -23,8 +35,17 @@ const targets = struct {
 const Finding = struct { target: []const u8, bead: []const u8, reason: []const u8 };
 const findings: []const Finding = @import("fuzz_known");
 
-/// The longest input a target reads, and the largest corpus file build.zig accepts.
-pub const max_input_len = 8192;
+/// The most slice bytes a target draws from one stream.
+pub const max_input_len = limits.max_input_len;
+
+/// The framing budget, in bytes of slice lengths, fixed-size values and eos bytes, of a
+/// target that draws a full `max_input_len` of slice bytes. A target that draws less slice
+/// data may use more framing, as long as its stream stays within `max_file_len`.
+pub const max_framing_len = limits.max_framing_len;
+
+/// The most bytes of any stream a target consumes, and the largest corpus file build.zig
+/// accepts: `max_input_len` plus `max_framing_len`.
+pub const max_file_len = limits.max_file_len;
 
 /// Marks the place where target stops on an input that meets the open bug bead.
 /// The pair must be listed in tools/checks/fuzz.zon.
@@ -80,6 +101,32 @@ test "fuzz search_attributes" {
 
 test "fuzz time_parse" {
     try fuzzTarget("time_parse");
+}
+
+test "fuzz: a stream with full-length slices fits max_file_len and replays whole" {
+    const text = comptime text: {
+        var bytes: [max_input_len]u8 = @splat(' ');
+        bytes[0] = '[';
+        bytes[bytes.len - 1] = ']';
+        break :text bytes;
+    };
+    const length = std.mem.toBytes(std.mem.nativeToLittle(u32, max_input_len));
+    const payloads = std.mem.toBytes(std.mem.nativeToLittle(u64, 1));
+    const streams = .{
+        .{ targets.history_json, length ++ text },
+        .{ targets.protojson, payloads ++ length ++ text },
+    };
+    inline for (streams) |case| {
+        const stream: []const u8 = &case[1];
+        try std.testing.expect(stream.len <= max_file_len);
+        var smith: std.testing.Smith = .{ .in = stream };
+        try case[0].testOne({}, &smith);
+        try std.testing.expectEqual(@as(usize, 0), smith.in.?.len);
+        // The slice is taken whole, not replayed as an oversized empty one.
+        var buffer: [max_input_len]u8 = undefined;
+        var slices: std.testing.Smith = .{ .in = stream[stream.len - max_input_len - 4 ..] };
+        try std.testing.expectEqual(@as(u32, max_input_len), slices.slice(&buffer));
+    }
 }
 
 test "every known finding has a guard in its target" {

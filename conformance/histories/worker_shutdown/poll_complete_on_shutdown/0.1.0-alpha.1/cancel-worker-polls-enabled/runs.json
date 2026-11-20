@@ -1,0 +1,26 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-worker_shutdown/poll_complete_on_shutdown-cancel-worker-polls-enabled",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-worker_shutdown/poll_complete_on_shutdown-cancel-worker-polls-enabled-0"
+    },
+    {
+      "file": "2-Workflow.json",
+      "workflow_id": "conformance-worker_shutdown/poll_complete_on_shutdown-cancel-worker-polls-enabled-1"
+    },
+    {
+      "file": "3-Workflow.json",
+      "workflow_id": "conformance-worker_shutdown/poll_complete_on_shutdown-cancel-worker-polls-enabled-2"
+    },
+    {
+      "file": "4-Workflow.json",
+      "workflow_id": "conformance-worker_shutdown/poll_complete_on_shutdown-cancel-worker-polls-enabled-3"
+    },
+    {
+      "file": "5-Workflow.json",
+      "workflow_id": "conformance-worker_shutdown/poll_complete_on_shutdown-cancel-worker-polls-enabled-4"
+    }
+  ]
+}
