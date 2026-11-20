@@ -903,3 +903,57 @@ test "WorkflowReplayer replays a signal-with-start and catches a workflow that s
     try changed.registerWorkflow(workflow.Def("sws_caller", SignalWithStart.callerChanged));
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(signal_with_start_history));
 }
+
+const AwaitTimeoutTie = struct {
+    const Ready = workflow.SignalDef("ready", fn () void);
+
+    fn markReady(ready: *bool) void {
+        ready.* = true;
+    }
+
+    fn isReady(ready: *bool) bool {
+        return ready.*;
+    }
+
+    /// Waits up to 2 s for the "ready" signal. Completes at once if it arrived, and otherwise
+    /// sleeps 1 s first.
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const ready = try ctx.allocator().create(bool);
+        ready.* = false;
+        try ctx.setSignalHandler(Ready, ready, markReady);
+        if (try ctx.awaitTimeout(.fromSeconds(2), ready, isReady)) return "ready";
+        try ctx.sleep(.fromSeconds(1), .{});
+        return "timed out";
+    }
+
+    /// `run` as it would take the timeout branch whatever the signal did.
+    fn alwaysTimesOut(ctx: *workflow.Context) ![]const u8 {
+        const ready = try ctx.allocator().create(bool);
+        ready.* = false;
+        try ctx.setSignalHandler(Ready, ready, markReady);
+        _ = try ctx.awaitTimeout(.fromSeconds(2), ready, isReady);
+        try ctx.sleep(.fromSeconds(1), .{});
+        return "timed out";
+    }
+
+    const Workflow = workflow.Def("await_timeout_tie", run);
+};
+
+/// A dev-server run of `AwaitTimeoutTie.Workflow`, fetched with `Client.fetchHistory` and
+/// encoded as ProtoJSON (`temporal.protojson.encode`), indented. The worker was stopped once
+/// the timer had started, the timer was let fire, the "ready" signal was sent, and a new
+/// worker was started, so one workflow task carries `TimerFired` and
+/// `WorkflowExecutionSignaled`. The run completed with "ready".
+const await_timeout_tie_history = @embedFile("testdata/await_timeout_tie_history.json");
+
+test "WorkflowReplayer replays an awaitTimeout whose timer fired in the signal's workflow task as true" {
+    var ok: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(AwaitTimeoutTie.Workflow);
+    try ok.replayHistoryJson(await_timeout_tie_history);
+
+    var changed: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(workflow.Def("await_timeout_tie", AwaitTimeoutTie.alwaysTimesOut));
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(await_timeout_tie_history));
+}

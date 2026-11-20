@@ -1590,15 +1590,24 @@ fn removeHandler(inst: *Instance, run: *HandlerRun) void {
 /// Runs coroutines until all are blocked and no awaited condition holds. Conditions are
 /// checked in the order they were awaited, one wake-up at a time, so a coroutine woken by
 /// its condition can change the state another condition reads before that one is checked.
+/// Only when none holds is the first one whose timer fired woken, to return false: anything
+/// the activation's jobs and coroutines do before quiescence counts before the timeout.
 fn runUntilQuiet(inst: *Instance) void {
     while (true) {
         inst.wio.run();
         const met = for (inst.conditions.items, 0..) |c, i| {
             if (c.check(c.context)) break i;
+        } else null;
+        if (met) |i| {
+            const c = inst.conditions.orderedRemove(i);
+            c.met = true;
+            inst.wio.wake(c.wait);
+            continue;
+        }
+        const timed_out = for (inst.conditions.items, 0..) |c, i| {
+            if (c.timer) |t| if (t.fired) break i;
         } else return;
-        const c = inst.conditions.orderedRemove(met);
-        c.met = true;
-        inst.wio.wake(c.wait);
+        inst.wio.wake(inst.conditions.orderedRemove(timed_out).wait);
     }
 }
 
@@ -1607,6 +1616,9 @@ pub const Condition = struct {
     check: *const fn (context: *const anyopaque) bool,
     context: *const anyopaque,
     wait: *WorkflowIo.Wait,
+    /// `Context.awaitTimeout`'s timer. Its firing only marks it `fired`; `runUntilQuiet` wakes
+    /// the waiter once no condition holds.
+    timer: ?*const WorkflowIo.Timer = null,
     met: bool = false,
 };
 
@@ -1621,16 +1633,20 @@ pub fn awaitCondition(inst: *Instance, check: *const fn (context: *const anyopaq
         .{ .what = "a condition, with a timeout (Context.awaitTimeout)", .duration = timeout.? }
     else
         .{ .what = "a condition (Context.await)" });
-    var cond: Condition = .{ .check = check, .context = context, .wait = &wait };
+    // The timer wakes a wait no one blocks on, already woken so its firing wakes nothing:
+    // the result is settled at quiescence, after the rest of the activation has run.
+    var timer_wait = wait;
+    timer_wait.woken = true;
+    var timer: WorkflowIo.Timer = .{ .wait = &timer_wait };
+    var cond: Condition = .{ .check = check, .context = context, .wait = &wait, .timer = if (timed) &timer else null };
     try inst.conditions.append(inst.arena(), &cond);
     defer if (!cond.met) inst.removeCondition(&cond);
 
-    var timer: WorkflowIo.Timer = .{ .wait = &wait };
     if (timed) hostStartTimer(inst, &timer, timeout.?);
     defer if (timed and !timer.fired) hostCancelTimer(inst, &timer);
 
     try inst.wio.waitFor(&wait, true);
-    return cond.met;
+    return cond.met or check(context);
 }
 
 fn removeCondition(inst: *Instance, cond: *Condition) void {
@@ -5569,6 +5585,160 @@ test "awaitTimeout returns false when its timer fires first" {
     try testing.expectEqual(@as(i64, 5), first[0].variant.?.start_timer.start_to_fire_timeout.?.seconds);
     const done = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a));
     try testing.expectEqualStrings("false", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// A signal sets `ready` while the workflow waits on it with a 5 s timeout; returns the
+// result and what `ready` read when awaitTimeout returned.
+const AwaitTimeoutTie = struct {
+    const Ready = workflow.SignalDef("ready", fn () void);
+
+    fn markReady(ready: *bool) void {
+        ready.* = true;
+    }
+
+    fn isReady(ready: *bool) bool {
+        return ready.*;
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const ready = try ctx.allocator().create(bool);
+        ready.* = false;
+        try ctx.setSignalHandler(Ready, ready, markReady);
+        const result = try ctx.awaitTimeout(.fromSeconds(5), ready, isReady);
+        return std.fmt.allocPrint(ctx.allocator(), "result={},ready={}", .{ result, ready.* });
+    }
+};
+const AwaitTimeoutTieWf = workflow.Def("AwaitTimeoutTie", AwaitTimeoutTie.run);
+
+test "awaitTimeout returns true when a signal in its timer's activation made the condition true, in either job order" {
+    for ([_]bool{ true, false }) |signal_first| {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const inst = try create(testing.allocator, AwaitTimeoutTieWf.registered, .{});
+        defer inst.destroy();
+
+        const first = commandsOf(try inst.activate(&try initActivation(a, "AwaitTimeoutTie", .{}), a));
+        try testing.expectEqual(@as(usize, 1), first.len);
+        try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+
+        const signal = try signalJob(a, "ready", .{});
+        const fire: act_pb.WorkflowActivationJob.variant_union = .{ .fire_timer = .{ .seq = 1 } };
+        var act = try oneJob(a, if (signal_first) signal else fire);
+        try act.jobs.append(a, .{ .variant = if (signal_first) fire else signal });
+        const done = commandsOf(try inst.activate(&act, a));
+        try testing.expectEqual(@as(usize, 1), done.len);
+        const got = done[0].variant.?.complete_workflow_execution.result.?.data;
+        // Signal first, the handler sets `ready` before the timer wakes the waiter. Timer
+        // first, the waiter may return before the handler runs; either way the result must
+        // equal `ready` as the waiter returned.
+        if (signal_first) {
+            try testing.expectEqualStrings("\"result=true,ready=true\"", got);
+        } else if (!std.mem.eql(u8, got, "\"result=true,ready=true\"")) {
+            try testing.expectEqualStrings("\"result=false,ready=false\"", got);
+        }
+    }
+}
+
+// A coroutine sets `ready` once its activity returns, while the workflow waits on `ready`
+// with a 5 s timeout. Returns awaitTimeout's result and `ready` at the end of the activation.
+const AwaitTimeoutResultTie = struct {
+    fn fetch(ctx: *workflow.Context, ready: *bool) void {
+        _ = ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get() catch return;
+        ready.* = true;
+    }
+
+    fn isReady(ready: *bool) bool {
+        return ready.*;
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const ready = try ctx.allocator().create(bool);
+        ready.* = false;
+        var f = ctx.io().async(fetch, .{ ctx, ready });
+        const result = try ctx.awaitTimeout(.fromSeconds(5), ready, isReady);
+        f.await(ctx.io());
+        return std.fmt.allocPrint(ctx.allocator(), "result={},ready={}", .{ result, ready.* });
+    }
+};
+const AwaitTimeoutResultTieWf = workflow.Def("AwaitTimeoutResultTie", AwaitTimeoutResultTie.run);
+
+test "awaitTimeout returns true when an activity result in its timer's activation, after the timer, made the condition true" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, AwaitTimeoutResultTieWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "AwaitTimeoutResultTie", .{}), a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+    try testing.expectEqual(@as(u32, 1), first[1].variant.?.schedule_activity.seq);
+
+    // sdk-core gives FireTimer and a non-local ResolveActivity the same rank, so they keep
+    // history order: TimerFired, then ActivityTaskCompleted, in one workflow task.
+    var act = try oneJob(a, .{ .fire_timer = .{ .seq = 1 } });
+    try act.jobs.append(a, .{ .variant = .{ .resolve_activity = .{ .seq = 1, .result = .{ .status = .{ .completed = .{ .result = try converter.toPayload(a, "hi") } } } } } });
+    const done = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    // The result that made the condition true came in the timer's workflow task, so the
+    // documented tie rule ("true also when the timer fired in the same workflow task as the
+    // change that made it true") says true.
+    try testing.expectEqualStrings("\"result=true,ready=true\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// A signal handler queues a request; a coroutine awaiting the queue marks the workflow ready
+// once it sees it, while the workflow waits on `ready` with a 5 s timeout.
+const AwaitTimeoutRelayTie = struct {
+    const Request = workflow.SignalDef("request", fn () void);
+    const State = struct { queued: bool = false, ready: bool = false };
+
+    fn onRequest(s: *State) void {
+        s.queued = true;
+    }
+
+    fn isQueued(s: *State) bool {
+        return s.queued;
+    }
+
+    fn isReady(s: *State) bool {
+        return s.ready;
+    }
+
+    fn relay(ctx: *workflow.Context, s: *State) void {
+        ctx.await(s, isQueued) catch return;
+        s.ready = true;
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{};
+        try ctx.setSignalHandler(Request, s, onRequest);
+        var f = ctx.io().async(relay, .{ ctx, s });
+        const result = try ctx.awaitTimeout(.fromSeconds(5), s, isReady);
+        f.await(ctx.io());
+        return std.fmt.allocPrint(ctx.allocator(), "result={},ready={}", .{ result, s.ready });
+    }
+};
+const AwaitTimeoutRelayTieWf = workflow.Def("AwaitTimeoutRelayTie", AwaitTimeoutRelayTie.run);
+
+test "awaitTimeout returns true when a signal in its timer's activation made the condition true through another coroutine" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, AwaitTimeoutRelayTieWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "AwaitTimeoutRelayTie", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+
+    // The order sdk-core sends: SignalWorkflow before FireTimer.
+    var act = try oneJob(a, try signalJob(a, "request", .{}));
+    try act.jobs.append(a, .{ .variant = .{ .fire_timer = .{ .seq = 1 } } });
+    const done = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("\"result=true,ready=true\"", done[0].variant.?.complete_workflow_execution.result.?.data);
 }
 
 test "eviction while awaiting a condition frees everything" {

@@ -823,8 +823,11 @@ pub const Context = struct {
         _ = try ctx.awaitInner(state, condition, null);
     }
 
-    /// Like `await`, but gives up after `timeout` (a durable timer) and returns false if the
-    /// condition still doesn't hold.
+    /// Like `await`, but gives up after `timeout` (a durable timer). Returns whether the
+    /// condition holds when it returns: true also when the timer fired in the same workflow task
+    /// as the change that made it true; false only if it still doesn't hold. A fired timer
+    /// takes effect once the workflow task's other work (handlers, results, and the
+    /// coroutines they wake) has run with no awaited condition left to hold.
     pub fn awaitTimeout(ctx: *Context, timeout: Duration, state: anytype, comptime condition: fn (@TypeOf(state)) bool) error{ Canceled, OutOfMemory }!bool {
         return ctx.awaitInner(state, condition, timeout);
     }

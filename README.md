@@ -814,7 +814,7 @@ pub const PatientGreeting = workflow.Def("patient_greeting", patientGreeting);
 
 Notes:
 - The condition reruns whenever all coroutines have blocked, so it must be cheap and change nothing.
-- `awaitTimeout` returns false if the timeout passed first; both return `error.Canceled` if the coroutine is canceled.
+- `awaitTimeout` returns whether the condition holds when it returns: false only if the timeout passed and the condition still doesn't hold. When the timer fires in the same workflow task as the signal, update, or result that makes the condition true, directly or through another coroutine, it returns true: the timeout takes effect only after the rest of that workflow task has run. Both return `error.Canceled` if the coroutine is canceled.
 - To race or cancel a timer, run `std.Io.sleep` or `workflow.Context.sleep` as a coroutine (`io.async`, or a `std.Io.Select` case, as the next example does): canceling the coroutine cancels the timer, and the sleep returns `error.Canceled`.
 - The summary is sent as a JSON string payload through the worker's payload codecs; an empty one sends none, so the timer is the one `ctx.io().sleep` starts. A summary doesn't affect replay. `awaitTimeout`'s timer has no summary.
 
