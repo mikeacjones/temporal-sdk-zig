@@ -60,6 +60,9 @@ read_only_sections: ?*ReadOnly = null,
 /// Whether any read-only section is open, in any coroutine or outside them. The rules apply
 /// only to the code each section belongs to: see `currentReadOnly`.
 read_only: bool = false,
+/// The first coroutine start that failed. Sticky: never cleared, since the run already went
+/// on differently than it would have with the coroutine started.
+start_failure: ?StartFailure = null,
 
 /// Read-only code (a query handler, an update validator) run by the host between
 /// `beginReadOnly` and `endReadOnly`. The section belongs to the coroutine it began on, or to
@@ -99,6 +102,34 @@ pub const Timer = struct {
     fired: bool = false,
     /// For the host's bookkeeping (for example the command sequence number).
     host_data: usize = 0,
+};
+
+/// A coroutine `io.async` or `Group.async` (and so `Select.async`) had to start and couldn't.
+/// Kept in `start_failure`; the host fails the activation with it.
+pub const StartFailure = struct {
+    /// "io.async" or "Group.async".
+    operation: []const u8,
+    cause: Cause,
+
+    pub const Cause = enum {
+        /// The coroutine's Task block (or its Group's state) couldn't be allocated from the
+        /// run's memory.
+        task_block,
+        /// `Scheduler.spawn` couldn't get a stack: mmap or the guard page's mprotect failed.
+        stack,
+
+        fn text(c: Cause) []const u8 {
+            return switch (c) {
+                .task_block => "out of memory allocating its task block",
+                .stack => "the operating system refused to map its stack (memory or the process's limit on memory mappings is exhausted; lower worker.Options.workflow_stack_size or max_cached_workflows)",
+            };
+        }
+    };
+
+    /// "<operation> could not start a workflow coroutine: <cause text>"
+    pub fn format(f: StartFailure, writer: *Io.Writer) Io.Writer.Error!void {
+        try writer.print("{s} could not start a workflow coroutine: {s}", .{ f.operation, f.cause.text() });
+    }
 };
 
 pub fn init(memory: Allocator, scheduler: *Scheduler, host: Host, random_seed: u64) WorkflowIo {
@@ -302,7 +333,7 @@ fn createTask(
     result_alignment: Alignment,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     kind: Task.Kind,
-) !*Task {
+) error{ OutOfMemory, StackUnavailable }!*Task {
     const alignment = Alignment.of(Task).max(context_alignment).max(result_alignment);
     const context_offset = context_alignment.forward(@sizeOf(Task));
     const result_offset = result_alignment.forward(context_offset + context.len);
@@ -320,7 +351,7 @@ fn createTask(
     };
     @memcpy(task.context, context);
     errdefer w.destroyTask(task);
-    task.fiber = try w.scheduler.spawn(name, taskMain, .{ w, task });
+    task.fiber = w.scheduler.spawn(name, taskMain, .{ w, task }) catch return error.StackUnavailable;
     task.fiber.user = task;
     return task;
 }
@@ -556,14 +587,40 @@ fn async(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) ?*Io.AnyFuture {
+    const w = self(userdata);
     // Read-only code may not start a coroutine, which would run after it returned.
-    if (self(userdata).currentReadOnly() != null) {
+    if (w.currentReadOnly() != null) {
         start(context.ptr, result.ptr);
         return null;
     }
-    // Always a coroutine, never run inline, so ordering doesn't depend on allocation success.
-    return concurrent(userdata, result.len, result_alignment, context, context_alignment, start) catch
-        @panic("out of memory starting a workflow coroutine");
+    return w.startFuture(result.len, result_alignment, context, context_alignment, start) catch |err| {
+        // Run inline so the caller's future has its result. The run already differs from one
+        // where the coroutine started, so the activation fails and its commands are never
+        // sent: the inline run never reaches history.
+        w.recordStartFailure("io.async", err);
+        start(context.ptr, result.ptr);
+        return null;
+    };
+}
+
+fn recordStartFailure(w: *WorkflowIo, operation: []const u8, err: error{ OutOfMemory, StackUnavailable }) void {
+    if (w.start_failure != null) return;
+    w.start_failure = .{ .operation = operation, .cause = switch (err) {
+        error.OutOfMemory => .task_block,
+        error.StackUnavailable => .stack,
+    } };
+}
+
+fn startFuture(
+    w: *WorkflowIo,
+    result_len: usize,
+    result_alignment: Alignment,
+    context: []const u8,
+    context_alignment: Alignment,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) error{ OutOfMemory, StackUnavailable }!*Io.AnyFuture {
+    const task = try w.createTask("async", context, context_alignment, result_len, result_alignment, start, .future);
+    return @ptrCast(task);
 }
 
 fn concurrent(
@@ -576,9 +633,8 @@ fn concurrent(
 ) Io.ConcurrentError!*Io.AnyFuture {
     const w = self(userdata);
     if (w.refuse("io.concurrent")) return error.ConcurrencyUnavailable;
-    const task = w.createTask("async", context, context_alignment, result_len, result_alignment, start, .future) catch
-        return error.ConcurrencyUnavailable;
-    return @ptrCast(task);
+    return w.startFuture(result_len, result_alignment, context, context_alignment, start) catch
+        error.ConcurrencyUnavailable;
 }
 
 /// Waits for `task` to finish and copies its result out. With `pass_cancel`, a cancellation
@@ -620,7 +676,7 @@ fn cancel(userdata: ?*anyopaque, any_future: *Io.AnyFuture, result: []u8, _: Ali
     w.awaitTask(task, result, false);
 }
 
-fn groupState(w: *WorkflowIo, group: *Io.Group) !*GroupState {
+fn groupState(w: *WorkflowIo, group: *Io.Group) error{OutOfMemory}!*GroupState {
     if (group.token.raw) |t| return @ptrCast(@alignCast(t));
     const mem = try w.allocBlock(@sizeOf(GroupState), .of(GroupState));
     const g: *GroupState = @ptrCast(@alignCast(mem.ptr));
@@ -638,7 +694,17 @@ fn groupConcurrent(
 ) Io.ConcurrentError!void {
     const w = self(userdata);
     if (w.refuse("Group.concurrent")) return error.ConcurrencyUnavailable;
-    const g = w.groupState(group) catch return error.ConcurrencyUnavailable;
+    return w.startGroupTask(group, context, context_alignment, start) catch error.ConcurrencyUnavailable;
+}
+
+fn startGroupTask(
+    w: *WorkflowIo,
+    group: *Io.Group,
+    context: []const u8,
+    context_alignment: Alignment,
+    start: *const fn (context: *const anyopaque) void,
+) error{ OutOfMemory, StackUnavailable }!void {
+    const g = try w.groupState(group);
     const Erased = struct {
         fn run(ctx: *const anyopaque, result: *anyopaque) void {
             // The group start function rides in the result slot, which group tasks don't use.
@@ -646,8 +712,7 @@ fn groupConcurrent(
             f.*(ctx);
         }
     };
-    const task = w.createTask("group", context, context_alignment, @sizeOf(usize), .of(usize), Erased.run, .group) catch
-        return error.ConcurrencyUnavailable;
+    const task = try w.createTask("group", context, context_alignment, @sizeOf(usize), .of(usize), Erased.run, .group);
     const slot: **const fn (context: *const anyopaque) void = @ptrCast(@alignCast(task.result.ptr));
     slot.* = start;
     task.group = g;
@@ -665,9 +730,13 @@ fn groupAsync(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque) void,
 ) void {
-    if (self(userdata).currentReadOnly() != null) return start(context.ptr);
-    groupConcurrent(userdata, group, context, context_alignment, start) catch
-        @panic("out of memory starting a workflow coroutine");
+    const w = self(userdata);
+    if (w.currentReadOnly() != null) return start(context.ptr);
+    w.startGroupTask(group, context, context_alignment, start) catch |err| {
+        // As in `async`: the activation fails, so the inline run never reaches history.
+        w.recordStartFailure("Group.async", err);
+        start(context.ptr);
+    };
 }
 
 fn finishGroup(w: *WorkflowIo, group: *Io.Group, g: *GroupState) void {
@@ -1883,4 +1952,183 @@ test "std.Io.Select races a std.Io.Queue receive against a timer" {
         try testing.expectEqual(@as(u32, 0), e.fake.canceled);
         try testing.expectEqual(@as(usize, 0), e.sched.live);
     }
+}
+
+/// How a test makes the next coroutine start fail, from inside a coroutine.
+const StartFault = union(enum) {
+    /// The run's memory fails from this allocation on (0: the first one).
+    task_block: usize,
+    stack,
+
+    /// Arms the fault; `disarm` undoes it. `failing` must outlive the armed span.
+    fn arm(fault: StartFault, w: *WorkflowIo, failing: *std.testing.FailingAllocator) void {
+        switch (fault) {
+            .task_block => |index| {
+                failing.* = .init(w.memory, .{ .fail_index = index });
+                w.memory = failing.allocator();
+            },
+            .stack => w.scheduler.fail_stack_maps = 1,
+        }
+    }
+
+    fn disarm(fault: StartFault, w: *WorkflowIo, failing: *std.testing.FailingAllocator) void {
+        switch (fault) {
+            .task_block => w.memory = failing.internal_allocator,
+            .stack => w.scheduler.fail_stack_maps = 0,
+        }
+    }
+
+    fn cause(fault: StartFault) StartFailure.Cause {
+        return switch (fault) {
+            .task_block => .task_block,
+            .stack => .stack,
+        };
+    }
+};
+
+fn asyncUnderFault(i: Io, w: *WorkflowIo, fault: StartFault, out: *u64) void {
+    var failing: std.testing.FailingAllocator = undefined;
+    fault.arm(w, &failing);
+    var f = i.async(square, .{5});
+    fault.disarm(w, &failing);
+    // A start that works again doesn't clear the failure.
+    var g = i.async(square, .{2});
+    out.* = f.await(i) + g.await(i);
+}
+
+test "io.async runs its function inline and records the failure when a coroutine can't start" {
+    for ([_]StartFault{ .{ .task_block = 0 }, .stack }) |fault| {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var out: u64 = 0;
+        _ = try e.wio.spawn("wf", asyncUnderFault, .{ e.wio.io(), &e.wio, fault, &out });
+        e.wio.run();
+        try testing.expectEqual(@as(u64, 29), out);
+        try testing.expectEqualDeep(StartFailure{ .operation = "io.async", .cause = fault.cause() }, e.wio.start_failure.?);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+    }
+}
+
+fn twoFailedStarts(i: Io, w: *WorkflowIo, out: *u64) void {
+    var failing: std.testing.FailingAllocator = undefined;
+    StartFault.arm(.stack, w, &failing);
+    var f = i.async(square, .{3});
+    StartFault.disarm(.stack, w, &failing);
+    var g: Io.Group = .init;
+    StartFault.arm(.{ .task_block = 0 }, w, &failing);
+    g.async(i, addSquare, .{ out, 4 });
+    StartFault.disarm(.{ .task_block = 0 }, w, &failing);
+    g.await(i) catch unreachable;
+    out.* += f.await(i);
+}
+
+fn addSquare(out: *u64, x: u64) void {
+    out.* += x * x;
+}
+
+test "the first failed coroutine start is the one kept" {
+    var e: Env = undefined;
+    e.init();
+    defer e.deinit();
+    var out: u64 = 0;
+    _ = try e.wio.spawn("wf", twoFailedStarts, .{ e.wio.io(), &e.wio, &out });
+    e.wio.run();
+    try testing.expectEqual(@as(u64, 25), out);
+    try testing.expectEqualDeep(StartFailure{ .operation = "io.async", .cause = .stack }, e.wio.start_failure.?);
+    try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+fn groupAsyncUnderFault(i: Io, w: *WorkflowIo, fault: StartFault, out: *u64) void {
+    var g: Io.Group = .init;
+    var failing: std.testing.FailingAllocator = undefined;
+    fault.arm(w, &failing);
+    g.async(i, addSquare, .{ out, 5 });
+    fault.disarm(w, &failing);
+    g.async(i, addSquare, .{ out, 2 });
+    g.await(i) catch unreachable;
+}
+
+test "Group.async runs its function inline and records the failure when a coroutine can't start" {
+    // Fail index 0 fails the group's state; 1 fails the task block after the state exists.
+    for ([_]StartFault{ .{ .task_block = 0 }, .{ .task_block = 1 }, .stack }) |fault| {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var out: u64 = 0;
+        _ = try e.wio.spawn("wf", groupAsyncUnderFault, .{ e.wio.io(), &e.wio, fault, &out });
+        e.wio.run();
+        try testing.expectEqual(@as(u64, 29), out);
+        try testing.expectEqualDeep(StartFailure{ .operation = "Group.async", .cause = fault.cause() }, e.wio.start_failure.?);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+    }
+}
+
+const Picked = union(enum) { a: u64, b: u64 };
+
+fn selectUnderFault(i: Io, w: *WorkflowIo, fault: StartFault, out: *u64) void {
+    var buf: [2]Picked = undefined;
+    var sel: Io.Select(Picked) = .init(i, &buf);
+    var failing: std.testing.FailingAllocator = undefined;
+    fault.arm(w, &failing);
+    sel.async(.a, square, .{5});
+    fault.disarm(w, &failing);
+    out.* = switch (sel.await() catch unreachable) {
+        .a => |v| v,
+        .b => |v| v + 1000,
+    };
+    sel.cancelDiscard();
+}
+
+test "a Select case runs inline and records the failure when its coroutine can't start" {
+    for ([_]StartFault{ .{ .task_block = 0 }, .{ .task_block = 1 }, .stack }) |fault| {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var out: u64 = 0;
+        _ = try e.wio.spawn("wf", selectUnderFault, .{ e.wio.io(), &e.wio, fault, &out });
+        e.wio.run();
+        try testing.expectEqual(@as(u64, 25), out);
+        try testing.expectEqualDeep(StartFailure{ .operation = "Group.async", .cause = fault.cause() }, e.wio.start_failure.?);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+    }
+}
+
+fn concurrentUnderFault(i: Io, w: *WorkflowIo, fault: StartFault, results: *[2]?anyerror) void {
+    var failing: std.testing.FailingAllocator = undefined;
+    fault.arm(w, &failing);
+    if (i.concurrent(square, .{5})) |_| unreachable else |err| results[0] = err;
+    fault.disarm(w, &failing);
+    fault.arm(w, &failing);
+    var g: Io.Group = .init;
+    if (g.concurrent(i, addSquare, .{ undefined, 5 })) |_| unreachable else |err| results[1] = err;
+    fault.disarm(w, &failing);
+    g.await(i) catch unreachable;
+}
+
+test "io.concurrent and Group.concurrent still return ConcurrencyUnavailable and record nothing" {
+    for ([_]StartFault{ .{ .task_block = 0 }, .stack }) |fault| {
+        var e: Env = undefined;
+        e.init();
+        defer e.deinit();
+        var results: [2]?anyerror = .{ null, null };
+        _ = try e.wio.spawn("wf", concurrentUnderFault, .{ e.wio.io(), &e.wio, fault, &results });
+        e.wio.run();
+        try testing.expectEqual(@as(?anyerror, error.ConcurrencyUnavailable), results[0]);
+        try testing.expectEqual(@as(?anyerror, error.ConcurrencyUnavailable), results[1]);
+        try testing.expectEqual(@as(?StartFailure, null), e.wio.start_failure);
+        try testing.expectEqual(@as(usize, 0), e.sched.live);
+    }
+}
+
+test "StartFailure formats the operation and the cause" {
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings(
+        "io.async could not start a workflow coroutine: out of memory allocating its task block",
+        try std.fmt.bufPrint(&buf, "{f}", .{StartFailure{ .operation = "io.async", .cause = .task_block }}),
+    );
+    try testing.expectEqualStrings(
+        "Group.async could not start a workflow coroutine: the operating system refused to map its stack (memory or the process's limit on memory mappings is exhausted; lower worker.Options.workflow_stack_size or max_cached_workflows)",
+        try std.fmt.bufPrint(&buf, "{f}", .{StartFailure{ .operation = "Group.async", .cause = .stack }}),
+    );
 }

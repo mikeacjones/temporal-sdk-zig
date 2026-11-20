@@ -1,0 +1,1 @@
+`io.async`, `Group.async` and `std.Io.Select` cases in workflow code fail the workflow task, with type `WorkflowCoroutineStartFailed` and a message naming the cause, instead of ending the worker process when a coroutine can't be started (its memory can't be allocated or its stack can't be mapped); the run is evicted and replayed from history on a later task.
