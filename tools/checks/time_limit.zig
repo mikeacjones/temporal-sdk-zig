@@ -26,6 +26,11 @@ pub const timeout_status = 124;
 /// signal handler.
 var group: std.atomic.Value(posix.pid_t) = .init(0);
 
+/// The status this process ends with because the watchdog or a signal killed the group; 0
+/// while neither has. It is stored before the kill, so the main thread, which wakes from
+/// waiting once the program dies, exits with it rather than with 128 + SIGKILL.
+var forced_status: std.atomic.Value(u8) = .init(0);
+
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag == .windows) @compileError("time-limit kills a process group, which needs POSIX");
     const arena = init.arena.allocator();
@@ -51,20 +56,33 @@ pub fn main(init: std.process.Init) !void {
     watchdog.detach();
 
     const term = child.wait(init.io) catch |err| fatal("{s}: cannot wait for {s}: {t}", .{ case, argv[0], err });
-    std.process.exit(exitStatus(term));
+    std.process.exit(statusAfterWait(term));
 }
 
-/// Ends this process with `timeout_status` after `seconds`, having killed the group.
+/// The status to exit with once the program has ended: the one the watchdog or a signal
+/// handler recorded before killing the group, or else the program's own.
+pub fn statusAfterWait(term: std.process.Child.Term) u8 {
+    const forced = forced_status.load(.acquire);
+    return if (forced != 0) forced else exitStatus(term);
+}
+
+/// Ends this process with `timeout_status` after `seconds`, having killed the group. The
+/// status and the message come first: the kill wakes the main thread, which may exit
+/// before this thread does, and must then exit with the same status after the message.
 fn watch(io: std.Io, seconds: u32, message: []const u8) void {
     std.Io.sleep(io, .fromSeconds(seconds), .awake) catch {};
-    killGroup();
+    forced_status.store(timeout_status, .release);
     std.Io.File.stderr().writeStreamingAll(io, message) catch {};
+    killGroup();
     std.process.exit(timeout_status);
 }
 
 fn onSignal(sig: posix.SIG) callconv(.c) void {
+    const status = 128 +| @as(u8, @truncate(@backingInt(sig)));
+    // A first forced status wins, so a signal during a timeout still ends with 124.
+    _ = forced_status.cmpxchgStrong(0, status, .acq_rel, .acquire);
     killGroup();
-    exitNow(128 +| @as(u8, @truncate(@backingInt(sig))));
+    exitNow(forced_status.load(.acquire));
 }
 
 /// Exits without running exit handlers, which is safe in a signal handler.
@@ -110,6 +128,15 @@ test "seconds are a whole number from 1 to a day" {
     try testing.expectEqual(@as(?u32, 86400), parseSeconds("86400"));
     for ([_][]const u8{ "", "0", "-1", "1.5", "1s", "86401", "99999999999" }) |text|
         try testing.expectEqual(@as(?u32, null), parseSeconds(text));
+}
+
+test "after a timeout or a signal killed the group, the recorded status wins over SIGKILL's" {
+    defer forced_status.store(0, .release);
+    try testing.expectEqual(@as(u8, 128 + 9), statusAfterWait(.{ .signal = .KILL }));
+    try testing.expectEqual(@as(u8, 3), statusAfterWait(.{ .exited = 3 }));
+    forced_status.store(timeout_status, .release);
+    try testing.expectEqual(@as(u8, timeout_status), statusAfterWait(.{ .signal = .KILL }));
+    try testing.expectEqual(@as(u8, timeout_status), statusAfterWait(.{ .exited = 0 }));
 }
 
 test "the exit status is the program's, or 128 plus the signal that ended it" {
