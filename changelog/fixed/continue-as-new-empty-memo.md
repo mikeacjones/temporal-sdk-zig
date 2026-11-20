@@ -1,0 +1,1 @@
+`workflow.Context.continueAsNew` with `ContinueAsNewOptions.memo` set to an empty slice now gives the new run this run's current memo, `upsertMemo` changes included, as documented; it gave the new run the memo this run started with. A memo whose every key `upsertMemo` removed still continues with the start memo, a limit `ContinueAsNewOptions.memo` now documents.

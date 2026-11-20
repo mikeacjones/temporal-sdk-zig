@@ -697,8 +697,11 @@ pub const ContinueAsNewOptions = struct {
     run_timeout: ?Duration = null,
     /// Limits one workflow task of the new run. Null keeps this run's task timeout.
     task_timeout: ?Duration = null,
-    /// The new run's memo, built with `converter.toFields`. Null (or an empty slice, which the
-    /// command can't tell apart from null) keeps this run's memo, `upsertMemo` changes included.
+    /// The new run's memo, built with `converter.toFields`. Null or an empty slice keeps this
+    /// run's memo, `upsertMemo` changes included. If that memo is empty because `upsertMemo`
+    /// removed every key, the new run gets the memo this run started with instead: an empty
+    /// memo on the command tells sdk-core to keep the start memo, and no command can ask for an
+    /// empty one.
     memo: ?[]const converter.Field = null,
     /// The new run's search attributes, built with `search_attributes.Key.set` (unsets are
     /// ignored). Null keeps this run's current search attributes, upserts included.
@@ -760,7 +763,9 @@ pub const Context = struct {
 
     /// A logger carrying the workflow's type, ID, and run ID as fields, as the workflow's
     /// outbound interceptors (`interceptor.WorkflowOutbound.logger`) return it. It is silent
-    /// while the workflow replays unless `worker.Options.log_during_replay` is set.
+    /// while the workflow replays, and while its run is evicted from the worker's cache (its
+    /// coroutines unwinding after the worker stops or drops the run), unless
+    /// `worker.Options.log_during_replay` is set.
     pub fn logger(ctx: *const Context) log.Logger {
         return ctx.instance.currentLogger();
     }
@@ -838,10 +843,14 @@ pub const Context = struct {
         _ = try ctx.awaitInner(state, condition, null);
     }
 
-    /// Like `await`, but gives up after `timeout` (a durable timer) and returns false if the
-    /// condition still doesn't hold. A zero or negative timeout returns false at once. A
-    /// duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`,
-    /// starts a timer of the longest one it can.
+    /// Like `await`, but gives up after `timeout` (a durable timer). Returns whether the
+    /// condition holds when it returns: true also when the timer fired in the same workflow task
+    /// as the change that made it true; false only if it still doesn't hold. A fired timer
+    /// takes effect once the workflow task's other work (handlers, results, and the
+    /// coroutines they wake) has run with no awaited condition left to hold. A zero or
+    /// negative timeout returns false at once unless the condition already holds. A duration
+    /// longer than protobuf can carry (about 10,000 years), such as `Duration.max`, starts a
+    /// timer of the longest one it can.
     pub fn awaitTimeout(ctx: *Context, timeout: Duration, state: anytype, comptime condition: fn (@TypeOf(state)) bool) error{ Canceled, OutOfMemory }!bool {
         return ctx.awaitInner(state, condition, timeout);
     }
@@ -1849,6 +1858,10 @@ pub fn ActivityFuture(comptime T: type) type {
         /// `wait_cancellation_completed`. If that activity completes or fails instead of
         /// acknowledging the cancel, this returns its result or `error.ActivityFailed`, and
         /// the next cancelable wait returns `error.Canceled`.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn get(f: Self) ActivityError!T {
             const state = try f.state;
             try f.ctx.instance.awaitActivity(state);
@@ -1919,6 +1932,10 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// `error.ChildWorkflowAlreadyStarted` if its ID is taken, and `error.ChildWorkflowFailed`
         /// if it could not start for another reason or was canceled before it started.
         /// Canceling the calling coroutine cancels the child as `get` does.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn started(f: Self) ChildWorkflowError!WorkflowExecution {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .started);
@@ -1936,6 +1953,10 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// `wait_cancellation_completed` (see `ChildWorkflowCancellationType`). If the child
         /// completes or fails first, this returns its result or error, and the next
         /// cancelable wait returns `error.Canceled`.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn get(f: Self) ChildWorkflowError!T {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .result);
@@ -2027,6 +2048,10 @@ pub fn NexusOperationFuture(comptime T: type) type {
         /// start. The token is arena memory of the run. Returns `error.NexusOperationFailed` if the
         /// operation failed, timed out, or was canceled before it started. Canceling the
         /// calling coroutine cancels the operation as `get` does.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn started(f: Self) NexusOperationError!?[]const u8 {
             const state = try f.state;
             try f.ctx.instance.awaitNexusOperation(state, .started);
@@ -2043,6 +2068,10 @@ pub fn NexusOperationFuture(comptime T: type) type {
         /// canceled. If it completed or failed instead, this returns its result or error, and
         /// the coroutine's next cancelable wait returns `error.Canceled`. Eviction ends the
         /// wait with `error.Canceled`.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn get(f: Self) NexusOperationError!T {
             const state = try f.state;
             try f.ctx.instance.awaitNexusOperation(state, .result);
@@ -2132,6 +2161,10 @@ const ExternalFuture = struct {
     /// calling coroutine is canceled while waiting, this returns `error.Canceled` at once.
     /// A signal is also withdrawn if the server hasn't recorded it yet; once recorded it is
     /// delivered anyway. A cancellation request is never withdrawn.
+    ///
+    /// Any number of coroutines may wait on the same future; all of them return once it
+    /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+    /// cancellation as described above, which the others then see in its outcome.
     pub fn get(f: Self) ExternalWorkflowError!void {
         const state = try f.state;
         try f.ctx.instance.awaitExternal(state);

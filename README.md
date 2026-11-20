@@ -783,6 +783,7 @@ Notes:
 - `start_to_close_timeout` or `schedule_to_close_timeout` is required. Without either, a local activity's `get` returns `error.InvalidOptions` (logged); `executeActivity` doesn't check and sends the command as given, leaving validation to the server.
 - On `error.ActivityFailed`, `future.failure()` has the failure; returning the error fails the workflow with that failure.
 - `future.cancel()`, or canceling the waiting coroutine, cancels the activity as `cancellation_type` says.
+- Any number of coroutines may wait on the same future, of any kind: an activity's or local activity's, a child workflow's or Nexus operation's (`get` and `started`), or a signal or cancellation request to another workflow. All of them return once it resolves, in the order they began waiting. Canceling one of them still requests the operation's cancellation, which the others then see in its outcome.
 - `summary` (on `workflow.ActivityOptions` and `workflow.LocalActivityOptions`) is a single line the UI and CLI show on the activity's scheduled or marker event. It is sent as a JSON string payload through the worker's codecs; empty sends none.
 - `priority` is a `workflow.Priority`; null uses the workflow's, and each zero field inherits the workflow's value. A value the server rejects fails the workflow task.
 - `versioning_intent` (`workflow.VersioningIntent`: `unspecified`, `compatible`, `default`) picks the build an activity runs on, only on task queues with build-ID-based versioning rules. `unspecified` means `compatible` on the workflow's own task queue and `default` elsewhere.
@@ -813,7 +814,7 @@ pub const PatientGreeting = workflow.Def("patient_greeting", patientGreeting);
 
 Notes:
 - The condition reruns whenever all coroutines have blocked, so it must be cheap and change nothing.
-- `awaitTimeout` returns false if the timeout passed first; both return `error.Canceled` if the coroutine is canceled.
+- `awaitTimeout` returns whether the condition holds when it returns: false only if the timeout passed and the condition still doesn't hold. When the timer fires in the same workflow task as the signal, update, or result that makes the condition true, directly or through another coroutine, it returns true: the timeout takes effect only after the rest of that workflow task has run. Both return `error.Canceled` if the coroutine is canceled.
 - To race or cancel a timer, run `std.Io.sleep` or `workflow.Context.sleep` as a coroutine (`io.async`, or a `std.Io.Select` case, as the next example does): canceling the coroutine cancels the timer, and the sleep returns `error.Canceled`.
 - The summary is sent as a JSON string payload through the worker's payload codecs; an empty one sends none, so the timer is the one `ctx.io().sleep` starts. A summary doesn't affect replay. `awaitTimeout`'s timer has no summary.
 
@@ -1166,6 +1167,7 @@ Notes:
 - Only the workflow function's return continues as new; from a handler the error fails the workflow or rejects the update.
 - `ctx.continueAsNewSuggested()` says when the server suggests it; `historyLength` and `historySizeBytes` give the size.
 - `ContinueAsNewOptions` fields left null keep this run's values; a client waiting on the result follows the chain.
+- `ContinueAsNewOptions.memo` null or empty keeps this run's memo, `upsertMemo` changes included. If `upsertMemo` removed every key, the new run gets the memo this run started with instead: an empty memo on the command tells the core to keep the start memo, and no command can ask for an empty one.
 
 `workflow.Context.continueAsNewByName` continues as a workflow type named at run time, with the arguments as a tuple. A dynamic workflow uses it to continue under the type it runs as:
 
@@ -1306,7 +1308,7 @@ Notes:
 
 #### Workflow info
 - `ctx.info()` returns the run's IDs, type, task queue, namespace, attempt, timeouts, parent, start time, retry policy, and priority.
-- `ctx.isReplaying()` says whether the task replays history. `ctx.metrics()` records nothing during replay, and `ctx.logger()` drops its records then unless `worker.Options.log_during_replay` is set.
+- `ctx.isReplaying()` says whether the task replays history. `ctx.metrics()` records nothing during replay, and `ctx.logger()` drops its records then, and while the run is evicted from the worker's cache (its code unwinding with `error.Canceled` after the worker stops or drops the run), unless `worker.Options.log_during_replay` is set. Eviction doesn't change `ctx.isReplaying()`: it keeps the value the last activation set.
 - `ctx.lastCompletionResult(T)` and `ctx.previousRunFailure()` read a cron or retried workflow's previous run.
 
 #### Failure policy
@@ -2472,7 +2474,7 @@ fn greeting(ctx: *workflow.Context, name: []const u8) ![]const u8 {
 Notes:
 
 - A sink is called concurrently from workflow, activity, and sdk-core threads and must outlive its clients and workers.
-- A workflow's logger drops records while it replays history, unless `worker.Options.log_during_replay` is set.
+- A workflow's logger drops records while it replays history, and while its run is evicted from the worker's cache (its code unwinding with `error.Canceled` after the worker stops or drops the run, though nothing failed), unless `worker.Options.log_during_replay` is set. The SDK's own warning about coroutines that did not exit at eviction is not silenced by eviction: it follows the replay rule only, so it is dropped when the run's last activation replayed, unless `worker.Options.log_during_replay` is set.
 - `Logger.with` allocates from the arena it is given: in a workflow, build the logger once.
 - A worker logs each workflow run it evicts from its cache, with `run_id`, `reason`, `message`, and, for a run it had cached, `workflow_id` and `workflow_type`: at error for nondeterminism or a fatal core error, at warn when fetching history failed, and at debug for routine cache evictions.
 
