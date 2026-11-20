@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stands in for /usr/bin/atos, which the Thread Sanitizer runtime on macOS starts to
+# symbolize a report, as a wedged atos behaves: it never answers. The runtime accepts it
+# through TSAN_OPTIONS=external_symbolizer_path=<this file> because it is named atos.
+# time-limit kills it with the rest of the case's process group.
+exec sleep 86400

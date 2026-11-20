@@ -26,6 +26,7 @@ const Instance = @This();
 
 const std = @import("std");
 const proto = @import("../proto.zig");
+const proto_time = @import("../proto_time.zig");
 const converter = @import("../converter.zig");
 const failure_mod = @import("../failure.zig");
 const log = @import("../log.zig");
@@ -1609,10 +1610,10 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         .cron_schedule = try a.dupe(u8, init.cron_schedule),
         .first_run_id = try a.dupe(u8, init.first_execution_run_id),
         .continued_run_id = try a.dupe(u8, init.continued_from_execution_run_id),
-        .execution_timeout = zigDuration(init.workflow_execution_timeout),
-        .run_timeout = zigDuration(init.workflow_run_timeout),
-        .task_timeout = zigDuration(init.workflow_task_timeout),
-        .start_time = zigTimestamp(init.start_time),
+        .execution_timeout = proto_time.positiveDurationFromProto(init.workflow_execution_timeout),
+        .run_timeout = proto_time.positiveDurationFromProto(init.workflow_run_timeout),
+        .task_timeout = proto_time.positiveDurationFromProto(init.workflow_task_timeout),
+        .start_time = proto_time.timestampFromProto(init.start_time),
     };
     if (init.parent_workflow_info) |p| inst.info.parent = .{
         .namespace = try a.dupe(u8, p.namespace),
@@ -1858,8 +1859,8 @@ fn recordContinueAsNew(inst: *Instance, workflow_type: []const u8, options: work
         .task_queue = try a.dupe(u8, options.task_queue),
         .arguments = try payloadList(a, args),
         .headers = try header.toEntries(cmd_pb.ContinueAsNewWorkflowExecution.HeadersEntry, a),
-        .workflow_run_timeout = protoDuration(options.run_timeout),
-        .workflow_task_timeout = protoDuration(options.task_timeout),
+        .workflow_run_timeout = proto_time.durationToProto(options.run_timeout),
+        .workflow_task_timeout = proto_time.durationToProto(options.task_timeout),
     };
     if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
     // Core fills an empty memo with the memo this run started with, which would drop
@@ -2301,10 +2302,10 @@ fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflo
         .task_queue = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue,
         .arguments = try payloadList(a, args),
         .headers = try header.toEntries(cmd_pb.ScheduleActivity.HeadersEntry, a),
-        .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
-        .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
-        .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
-        .heartbeat_timeout = protoDuration(options.heartbeat_timeout),
+        .schedule_to_close_timeout = proto_time.durationToProto(options.schedule_to_close_timeout),
+        .schedule_to_start_timeout = proto_time.durationToProto(options.schedule_to_start_timeout),
+        .start_to_close_timeout = proto_time.durationToProto(options.start_to_close_timeout),
+        .heartbeat_timeout = proto_time.durationToProto(options.heartbeat_timeout),
         .cancellation_type = protoCancellationType(options.cancellation_type),
         .do_not_eagerly_execute = options.disable_eager_execution,
     };
@@ -2351,10 +2352,10 @@ fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: wo
             .activity_type = activity_type,
             .arguments = try payloadList(a, args),
             .headers = try header.toEntries(cmd_pb.ScheduleLocalActivity.HeadersEntry, a),
-            .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
-            .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
-            .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
-            .local_retry_threshold = protoDuration(options.local_retry_threshold),
+            .schedule_to_close_timeout = proto_time.durationToProto(options.schedule_to_close_timeout),
+            .schedule_to_start_timeout = proto_time.durationToProto(options.schedule_to_start_timeout),
+            .start_to_close_timeout = proto_time.durationToProto(options.start_to_close_timeout),
+            .local_retry_threshold = proto_time.durationToProto(options.local_retry_threshold),
             .cancellation_type = protoCancellationType(options.cancellation_type),
         },
         .id_from_seq = options.activity_id.len == 0,
@@ -2417,24 +2418,19 @@ fn zigRetryPolicy(a: Allocator, p: common.RetryPolicy) error{OutOfMemory}!workfl
     const types = try a.alloc([]const u8, p.non_retryable_error_types.items.len);
     for (p.non_retryable_error_types.items, types) |t, *d| d.* = try a.dupe(u8, t);
     return .{
-        .initial_interval = positiveDuration(p.initial_interval),
+        .initial_interval = proto_time.positiveDurationFromProto(p.initial_interval),
         .backoff_coefficient = p.backoff_coefficient,
-        .maximum_interval = positiveDuration(p.maximum_interval),
+        .maximum_interval = proto_time.positiveDurationFromProto(p.maximum_interval),
         .maximum_attempts = p.maximum_attempts,
         .non_retryable_error_types = types,
     };
 }
 
-fn positiveDuration(d: ?proto.google.protobuf.Duration) ?std.Io.Duration {
-    const v = zigDuration(d) orelse return null;
-    return if (v.nanoseconds > 0) v else null;
-}
-
 fn protoRetryPolicy(a: Allocator, rp: workflow.RetryPolicy) !common.RetryPolicy {
     var p: common.RetryPolicy = .{
-        .initial_interval = protoDuration(rp.initial_interval),
+        .initial_interval = proto_time.durationToProto(rp.initial_interval),
         .backoff_coefficient = rp.backoff_coefficient,
-        .maximum_interval = protoDuration(rp.maximum_interval),
+        .maximum_interval = proto_time.durationToProto(rp.maximum_interval),
         .maximum_attempts = rp.maximum_attempts,
     };
     try p.non_retryable_error_types.appendSlice(a, rp.non_retryable_error_types);
@@ -2591,9 +2587,9 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
         .task_queue = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue,
         .input = try payloadList(a, args),
         .headers = try header.toEntries(cmd_pb.StartChildWorkflowExecution.HeadersEntry, a),
-        .workflow_execution_timeout = protoDuration(options.execution_timeout),
-        .workflow_run_timeout = protoDuration(options.run_timeout),
-        .workflow_task_timeout = protoDuration(options.task_timeout),
+        .workflow_execution_timeout = proto_time.durationToProto(options.execution_timeout),
+        .workflow_run_timeout = proto_time.durationToProto(options.run_timeout),
+        .workflow_task_timeout = proto_time.durationToProto(options.task_timeout),
         .parent_close_policy = switch (options.parent_close_policy) {
             .terminate => .PARENT_CLOSE_POLICY_TERMINATE,
             .abandon => .PARENT_CLOSE_POLICY_ABANDON,
@@ -2825,9 +2821,9 @@ pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: [
         .service = state.service,
         .operation = state.operation,
         .input = payload,
-        .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
-        .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
-        .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
+        .schedule_to_close_timeout = proto_time.durationToProto(options.schedule_to_close_timeout),
+        .schedule_to_start_timeout = proto_time.durationToProto(options.schedule_to_start_timeout),
+        .start_to_close_timeout = proto_time.durationToProto(options.start_to_close_timeout),
         .cancellation_type = switch (options.cancellation_type) {
             .wait_cancellation_completed => .WAIT_CANCELLATION_COMPLETED,
             .wait_cancellation_requested => .WAIT_CANCELLATION_REQUESTED,
@@ -3011,10 +3007,10 @@ fn sendSignalWithStart(
         .workflow_type = .{ .name = workflow_type },
         .task_queue = .{ .name = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue, .kind = .TASK_QUEUE_KIND_NORMAL },
         .input = .{ .payloads = try payloadList(a, args) },
-        .workflow_execution_timeout = protoDuration(options.execution_timeout),
-        .workflow_run_timeout = protoDuration(options.run_timeout),
-        .workflow_task_timeout = protoDuration(options.task_timeout),
-        .workflow_start_delay = protoDuration(options.start_delay),
+        .workflow_execution_timeout = proto_time.durationToProto(options.execution_timeout),
+        .workflow_run_timeout = proto_time.durationToProto(options.run_timeout),
+        .workflow_task_timeout = proto_time.durationToProto(options.task_timeout),
+        .workflow_start_delay = proto_time.durationToProto(options.start_delay),
         .workflow_id_reuse_policy = switch (options.id_reuse_policy) {
             .unspecified => .WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED,
             .allow_duplicate => .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
@@ -3217,24 +3213,6 @@ fn dupeFailure(a: Allocator, f: ?Failure) !*const Failure {
     const out = try a.create(Failure);
     out.* = if (f) |v| try v.dupe(a) else .{ .message = "failed without a failure from the core" };
     return out;
-}
-
-fn zigTimestamp(t: ?proto.google.protobuf.Timestamp) ?std.Io.Timestamp {
-    const v = t orelse return null;
-    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
-}
-
-fn zigDuration(d: ?proto.google.protobuf.Duration) ?std.Io.Duration {
-    const v = d orelse return null;
-    return .{ .nanoseconds = @as(i96, v.seconds) * std.time.ns_per_s + v.nanos };
-}
-
-fn protoDuration(d: ?std.Io.Duration) ?proto.google.protobuf.Duration {
-    const v = d orelse return null;
-    return .{
-        .seconds = @intCast(@divFloor(v.nanoseconds, std.time.ns_per_s)),
-        .nanos = @intCast(@mod(v.nanoseconds, std.time.ns_per_s)),
-    };
 }
 
 // ---------------------------------------------------------------- interceptor chain ends
@@ -3446,7 +3424,7 @@ fn hostStartTimer(ctx: *anyopaque, timer: *WorkflowIo.Timer, duration: std.Io.Du
     };
     inst.emit(.{ .user_metadata = metadata, .variant = .{ .start_timer = .{
         .seq = seq,
-        .start_to_fire_timeout = protoDuration(duration),
+        .start_to_fire_timeout = proto_time.durationToProto(duration),
     } } }) catch {
         inst.task_failure = "out of memory starting a timer";
     };
@@ -3559,6 +3537,140 @@ test "sleep becomes a durable timer that fires on FireTimer" {
 
     const second = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a);
     try testing.expectEqualStrings("\"rested\"", commandsOf(second)[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+/// Workflows that pass durations beyond protobuf's range; the mode picks the call.
+const LongTimes = struct {
+    const max_retry: workflow.RetryPolicy = .{ .initial_interval = .max, .maximum_interval = .max };
+
+    fn never(_: *const bool) bool {
+        return false;
+    }
+
+    fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, mode, "sleep")) {
+            try ctx.sleep(.max, .{});
+        } else if (std.mem.eql(u8, mode, "await")) {
+            const flag = false;
+            _ = try ctx.awaitTimeout(.max, @as(*const bool, &flag), never);
+        } else if (std.mem.eql(u8, mode, "activity")) {
+            _ = ctx.executeActivityByName(void, "Act", .{
+                .schedule_to_close_timeout = .max,
+                .schedule_to_start_timeout = .max,
+                .start_to_close_timeout = .max,
+                .heartbeat_timeout = .max,
+                .retry_policy = max_retry,
+            }, .{}).get() catch {};
+        } else if (std.mem.eql(u8, mode, "negative")) {
+            _ = ctx.executeActivityByName(void, "Act", .{
+                .start_to_close_timeout = .fromSeconds(10),
+                .heartbeat_timeout = .fromMilliseconds(-1500),
+            }, .{}).get() catch {};
+        } else if (std.mem.eql(u8, mode, "local")) {
+            _ = ctx.executeLocalActivityByName(void, "Act", .{
+                .schedule_to_close_timeout = .max,
+                .schedule_to_start_timeout = .max,
+                .start_to_close_timeout = .max,
+                .local_retry_threshold = .max,
+                .retry_policy = max_retry,
+            }, .{}).get() catch {};
+        } else if (std.mem.eql(u8, mode, "child")) {
+            _ = ctx.executeChildWorkflowByName(void, "Kid", .{
+                .execution_timeout = .max,
+                .run_timeout = .max,
+                .task_timeout = .max,
+                .retry_policy = max_retry,
+            }, .{}).get() catch {};
+        } else if (std.mem.eql(u8, mode, "session")) {
+            _ = try ctx.createSession(.{ .creation_timeout = .max, .execution_timeout = .max, .heartbeat_timeout = .max });
+        } else if (std.mem.eql(u8, mode, "continue")) {
+            return ctx.continueAsNewByName("LongTimes", .{
+                .run_timeout = .max,
+                .task_timeout = .max,
+                .retry_policy = max_retry,
+            }, .{mode});
+        }
+        return "done";
+    }
+    const Def = workflow.Def("LongTimes", run);
+};
+
+/// The protobuf Duration that `Duration.max` is clamped to.
+const longest: proto.google.protobuf.Duration = .{ .seconds = 315_576_000_000, .nanos = 999_999_999 };
+
+/// The commands of a LongTimes run's first activation in `mode`; they live as long as `inst`.
+fn longTimesCommands(inst: *Instance, a: Allocator, mode: []const u8) ![]const cmd_pb.WorkflowCommand {
+    return commandsOf(try inst.activate(&try initActivation(a, "LongTimes", .{mode}), a));
+}
+
+fn expectLongestRetry(rp: ?common.RetryPolicy) !void {
+    try testing.expectEqual(longest, rp.?.initial_interval.?);
+    try testing.expectEqual(longest, rp.?.maximum_interval.?);
+}
+
+test "durations beyond protobuf's range are clamped in workflow commands, and negative ones keep one sign" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    // sleep and awaitTimeout of Duration.max start a timer of the longest protobuf Duration.
+    for ([_][]const u8{ "sleep", "await" }) |mode| {
+        const inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+        defer inst.destroy();
+        const cmds = try longTimesCommands(inst, a, mode);
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqual(longest, cmds[0].variant.?.start_timer.start_to_fire_timeout.?);
+    }
+
+    // Activity, local activity, child, continue-as-new and session timeouts and retry intervals.
+    const act_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer act_inst.destroy();
+    const sched = (try longTimesCommands(act_inst, a, "activity"))[0].variant.?.schedule_activity;
+    try testing.expectEqual(longest, sched.schedule_to_close_timeout.?);
+    try testing.expectEqual(longest, sched.schedule_to_start_timeout.?);
+    try testing.expectEqual(longest, sched.start_to_close_timeout.?);
+    try testing.expectEqual(longest, sched.heartbeat_timeout.?);
+    try expectLongestRetry(sched.retry_policy);
+
+    const local_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer local_inst.destroy();
+    const local = (try longTimesCommands(local_inst, a, "local"))[0].variant.?.schedule_local_activity;
+    try testing.expectEqual(longest, local.schedule_to_close_timeout.?);
+    try testing.expectEqual(longest, local.schedule_to_start_timeout.?);
+    try testing.expectEqual(longest, local.start_to_close_timeout.?);
+    try testing.expectEqual(longest, local.local_retry_threshold.?);
+    try expectLongestRetry(local.retry_policy);
+
+    const child_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer child_inst.destroy();
+    const child = (try longTimesCommands(child_inst, a, "child"))[0].variant.?.start_child_workflow_execution;
+    try testing.expectEqual(longest, child.workflow_execution_timeout.?);
+    try testing.expectEqual(longest, child.workflow_run_timeout.?);
+    try testing.expectEqual(longest, child.workflow_task_timeout.?);
+    try expectLongestRetry(child.retry_policy);
+
+    const can_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer can_inst.destroy();
+    const can_cmds = try longTimesCommands(can_inst, a, "continue");
+    const can = can_cmds[can_cmds.len - 1].variant.?.continue_as_new_workflow_execution;
+    try testing.expectEqual(longest, can.workflow_run_timeout.?);
+    try testing.expectEqual(longest, can.workflow_task_timeout.?);
+    try expectLongestRetry(can.retry_policy);
+
+    // A session's host heartbeats every third of the clamped heartbeat timeout.
+    const session_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer session_inst.destroy();
+    const creation = (try longTimesCommands(session_inst, a, "session"))[0].variant.?.schedule_activity;
+    try testing.expectEqual(longest, creation.schedule_to_start_timeout.?);
+    try testing.expectEqual(longest, creation.start_to_close_timeout.?);
+    try testing.expectEqual(longest, creation.heartbeat_timeout.?);
+    try testing.expect(std.mem.indexOf(u8, creation.arguments.items[0].data, "\"heartbeat_interval_ms\":105192000000333") != null);
+
+    // A negative heartbeat timeout is sent with seconds and nanos of the same sign.
+    const neg_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer neg_inst.destroy();
+    const negative = (try longTimesCommands(neg_inst, a, "negative"))[0].variant.?.schedule_activity;
+    try testing.expectEqual(proto.google.protobuf.Duration{ .seconds = -1, .nanos = -500_000_000 }, negative.heartbeat_timeout.?);
 }
 
 test "workflow cancellation cancels the pending activity and the workflow" {
@@ -6169,6 +6281,47 @@ test "info: retry policy, priority, original run ID, and the previous run's fail
     try testing.expect(inst.ctx.info().retry_policy == null);
     try testing.expectEqualDeep(workflow.Priority{}, inst.ctx.info().priority);
     try testing.expect(inst.ctx.previousRunFailure() == null);
+}
+
+const TimeoutInfoWf = struct {
+    /// Returns "<execution>/<run>/<task>" in whole seconds, "null" for each unset one.
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const info = ctx.info();
+        return std.fmt.allocPrint(ctx.allocator(), "{?d}/{?d}/{?d}", .{
+            seconds(info.execution_timeout),
+            seconds(info.run_timeout),
+            seconds(info.task_timeout),
+        });
+    }
+
+    fn seconds(d: ?std.Io.Duration) ?i96 {
+        return if (d) |v| @divTrunc(v.nanoseconds, std.time.ns_per_s) else null;
+    }
+};
+const TimeoutInfoWfDef = workflow.Def("TimeoutInfo", TimeoutInfoWf.run);
+
+test "info: timeouts are null when absent or zero and the start values when set" {
+    const Case = struct { execution: ?proto.google.protobuf.Duration, run: ?proto.google.protobuf.Duration, task: ?proto.google.protobuf.Duration, want: []const u8 };
+    const cases = [_]Case{
+        .{ .execution = null, .run = null, .task = null, .want = "\"null/null/null\"" },
+        // The server sends a zero Duration for a timeout the workflow was started without.
+        .{ .execution = .{}, .run = .{}, .task = .{}, .want = "\"null/null/null\"" },
+        .{ .execution = .{ .seconds = -1 }, .run = .{ .nanos = -1 }, .task = .{}, .want = "\"null/null/null\"" },
+        .{ .execution = .{ .seconds = 3600 }, .run = .{ .seconds = 60 }, .task = .{ .seconds = 10 }, .want = "\"3600/60/10\"" },
+    };
+    for (cases) |c| {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const inst = try create(testing.allocator, TimeoutInfoWfDef.registered, .{});
+        defer inst.destroy();
+        var act = try initActivation(a, "TimeoutInfo", .{});
+        const init = &act.jobs.items[0].variant.?.initialize_workflow;
+        init.workflow_execution_timeout = c.execution;
+        init.workflow_run_timeout = c.run;
+        init.workflow_task_timeout = c.task;
+        try testing.expectEqualStrings(c.want, completedWith(try inst.activate(&act, a)));
+    }
 }
 
 const CurrentUpdateWf = struct {

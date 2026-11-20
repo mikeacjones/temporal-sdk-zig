@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const proto = @import("proto.zig");
+const proto_time = @import("proto_time.zig");
 const converter = @import("converter.zig");
 const search_attributes = @import("search_attributes.zig");
 const client_mod = @import("client.zig");
@@ -55,7 +56,7 @@ pub const Schedule = struct {
         };
         var policies = b.policies orelse pb.SchedulePolicies{};
         policies.overlap_policy = @fromBackingInt(@backingInt(s.policies.overlap));
-        policies.catchup_window = protoDuration(s.policies.catchup_window);
+        policies.catchup_window = proto_time.durationToProto(s.policies.catchup_window);
         policies.pause_on_failure = s.policies.pause_on_failure;
         policies.keep_original_workflow_id = s.policies.keep_original_workflow_id;
         out.policies = policies;
@@ -83,7 +84,7 @@ pub const Schedule = struct {
             .spec = try .fromProto(arena, s.spec orelse .{}),
             .policies = .{
                 .overlap = @fromBackingInt(@backingInt(policies.overlap_policy)),
-                .catchup_window = duration(policies.catchup_window),
+                .catchup_window = proto_time.durationFromProto(policies.catchup_window),
                 .pause_on_failure = policies.pause_on_failure,
                 .keep_original_workflow_id = policies.keep_original_workflow_id,
             },
@@ -107,12 +108,16 @@ pub const Spec = struct {
     cron_expressions: []const []const u8 = &.{},
     /// Times to leave out, even when another field matches them.
     skip: []const Calendar = &.{},
-    /// No action before this time.
+    /// No action before this time. A time before 0001-01-01 or after 9999-12-31 UTC is sent
+    /// as that bound.
     start_at: ?Io.Timestamp = null,
-    /// No action after this time.
+    /// No action after this time. A time before 0001-01-01 or after 9999-12-31 UTC is sent
+    /// as that bound.
     end_at: ?Io.Timestamp = null,
     /// Each action is delayed by a random amount up to this, to spread out the load of
-    /// many schedules that match the same time.
+    /// many schedules that match the same time. A duration longer than protobuf can carry
+    /// (about 10,000 years), such as `Duration.max`, is sent as the longest one it can; a
+    /// negative one is sent as it is.
     jitter: ?Duration = null,
     /// The IANA time zone calendars and cron expressions are read in, such as
     /// "America/New_York". Empty is UTC.
@@ -128,26 +133,26 @@ pub const Spec = struct {
         out.exclude_calendar = .empty;
         out.cron_string = .fromOwnedSlice(try arena.dupe([]const u8, s.cron_expressions));
         const intervals = try arena.alloc(pb.IntervalSpec, s.intervals.len);
-        for (s.intervals, intervals) |i, *o| o.* = .{ .interval = protoDuration(i.every), .phase = protoDuration(i.offset) };
+        for (s.intervals, intervals) |i, *o| o.* = .{ .interval = proto_time.durationToProto(i.every), .phase = proto_time.durationToProto(i.offset) };
         out.interval = .fromOwnedSlice(intervals);
-        out.start_time = protoTimestamp(s.start_at);
-        out.end_time = protoTimestamp(s.end_at);
-        out.jitter = protoDuration(s.jitter);
+        out.start_time = proto_time.timestampToProto(s.start_at);
+        out.end_time = proto_time.timestampToProto(s.end_at);
+        out.jitter = proto_time.durationToProto(s.jitter);
         out.timezone_name = s.time_zone_name;
         return out;
     }
 
     fn fromProto(arena: Allocator, s: pb.ScheduleSpec) error{OutOfMemory}!Spec {
         const intervals = try arena.alloc(Interval, s.interval.items.len);
-        for (s.interval.items, intervals) |i, *o| o.* = .{ .every = duration(i.interval) orelse .zero, .offset = duration(i.phase) orelse .zero };
+        for (s.interval.items, intervals) |i, *o| o.* = .{ .every = proto_time.durationFromProto(i.interval) orelse .zero, .offset = proto_time.durationFromProto(i.phase) orelse .zero };
         return .{
             .calendars = try calendarsFromProto(arena, s.structured_calendar.items),
             .intervals = intervals,
             .cron_expressions = s.cron_string.items,
             .skip = try calendarsFromProto(arena, s.exclude_structured_calendar.items),
-            .start_at = timestamp(s.start_time),
-            .end_at = timestamp(s.end_time),
-            .jitter = duration(s.jitter),
+            .start_at = proto_time.timestampFromProto(s.start_time),
+            .end_at = proto_time.timestampFromProto(s.end_time),
+            .jitter = proto_time.durationFromProto(s.jitter),
             .time_zone_name = s.timezone_name,
         };
     }
@@ -179,7 +184,8 @@ pub const Range = struct {
 
 /// Matches the times `epoch + n * every + offset`, so `.{ .every = .fromSeconds(3600),
 /// .offset = .fromSeconds(15 * 60) }` is every hour at a quarter past. Both are truncated
-/// to whole seconds.
+/// to whole seconds. A duration longer than protobuf can carry (about 10,000 years), such as
+/// `Duration.max`, is sent as the longest one it can; a negative one is sent as it is.
 pub const Interval = struct {
     every: Duration,
     offset: Duration = .zero,
@@ -214,9 +220,9 @@ pub const StartWorkflowAction = struct {
         out.workflow_type = .{ .name = sw.workflow_type };
         out.task_queue = .{ .name = sw.task_queue, .kind = .TASK_QUEUE_KIND_NORMAL };
         out.input = .{ .payloads = .fromOwnedSlice(try arena.dupe(converter.Payload, sw.args)) };
-        out.workflow_execution_timeout = protoDuration(sw.execution_timeout);
-        out.workflow_run_timeout = protoDuration(sw.run_timeout);
-        out.workflow_task_timeout = protoDuration(sw.task_timeout);
+        out.workflow_execution_timeout = proto_time.durationToProto(sw.execution_timeout);
+        out.workflow_run_timeout = proto_time.durationToProto(sw.run_timeout);
+        out.workflow_task_timeout = proto_time.durationToProto(sw.task_timeout);
         out.memo = null;
         if (sw.memo.len > 0) {
             var memo: common.Memo = .{};
@@ -234,16 +240,18 @@ pub const StartWorkflowAction = struct {
             .args = if (sw.input) |in| in.payloads.items else &.{},
             .id = sw.workflow_id,
             .task_queue = if (sw.task_queue) |q| q.name else "",
-            .execution_timeout = duration(sw.workflow_execution_timeout),
-            .run_timeout = duration(sw.workflow_run_timeout),
-            .task_timeout = duration(sw.workflow_task_timeout),
+            .execution_timeout = proto_time.durationFromProto(sw.workflow_execution_timeout),
+            .run_timeout = proto_time.durationFromProto(sw.workflow_run_timeout),
+            .task_timeout = proto_time.durationFromProto(sw.workflow_task_timeout),
             .memo = if (sw.memo) |m| try converter.fieldsFromMap(arena, m.fields.items) else &.{},
             .search_attributes = try .fromProto(arena, sw.search_attributes),
         };
     }
 };
 
-/// How each workflow a schedule starts is started.
+/// How each workflow a schedule starts is started. A duration longer than protobuf can carry
+/// (about 10,000 years), such as `Duration.max`, is sent as the longest one it can; a
+/// negative one is sent as it is.
 pub const StartWorkflowOptions = struct {
     /// The workflow ID; see `StartWorkflowAction.id`.
     id: []const u8,
@@ -306,7 +314,9 @@ pub const OverlapPolicy = enum(i32) {
 pub const Policies = struct {
     overlap: OverlapPolicy = .unspecified,
     /// How late an action may still be taken after the server was unavailable; at least 10
-    /// seconds. Null uses the server's default, one year.
+    /// seconds. Null uses the server's default, one year. A duration longer than protobuf can
+    /// carry (about 10,000 years), such as `Duration.max`, is sent as the longest one it can;
+    /// a negative one is sent as it is.
     catchup_window: ?Duration = null,
     /// Pause the schedule when a workflow it started fails or times out.
     pause_on_failure: bool = false,
@@ -324,7 +334,8 @@ pub const State = struct {
 };
 
 /// Takes the actions a schedule would have taken between `start` and `end`, as if it had
-/// been running then.
+/// been running then. A `start` or `end` before 0001-01-01 or after 9999-12-31 UTC is sent
+/// as that bound.
 pub const Backfill = struct {
     start: Io.Timestamp,
     end: Io.Timestamp,
@@ -332,8 +343,8 @@ pub const Backfill = struct {
 
     pub fn toProto(b: Backfill) pb.BackfillRequest {
         return .{
-            .start_time = protoTimestamp(b.start),
-            .end_time = protoTimestamp(b.end),
+            .start_time = proto_time.timestampToProto(b.start),
+            .end_time = proto_time.timestampToProto(b.end),
             .overlap_policy = @fromBackingInt(@backingInt(b.overlap)),
         };
     }
@@ -437,8 +448,8 @@ pub const Description = struct {
                 .running_workflows = running,
                 .recent_actions = try actionResults(arena, info.recent_actions.items),
                 .next_action_times = try timestamps(arena, info.future_action_times.items),
-                .create_time = timestamp(info.create_time),
-                .update_time = timestamp(info.update_time),
+                .create_time = proto_time.timestampFromProto(info.create_time),
+                .update_time = proto_time.timestampFromProto(info.update_time),
             },
             .memo = if (response.memo) |m| try converter.fieldsFromMap(arena, m.fields.items) else &.{},
             .search_attributes = try .fromProto(arena, response.search_attributes),
@@ -491,8 +502,8 @@ fn actionResults(arena: Allocator, results: []const pb.ScheduleActionResult) err
     for (results, out) |r, *o| {
         const e = r.start_workflow_result orelse common.WorkflowExecution{};
         o.* = .{
-            .scheduled_at = timestamp(r.schedule_time),
-            .taken_at = timestamp(r.actual_time),
+            .scheduled_at = proto_time.timestampFromProto(r.schedule_time),
+            .taken_at = proto_time.timestampFromProto(r.actual_time),
             .workflow = .{ .workflow_id = e.workflow_id, .run_id = e.run_id },
             .status = @fromBackingInt(@backingInt(r.start_workflow_status)),
         };
@@ -502,7 +513,7 @@ fn actionResults(arena: Allocator, results: []const pb.ScheduleActionResult) err
 
 fn timestamps(arena: Allocator, ts: []const proto.google.protobuf.Timestamp) error{OutOfMemory}![]Io.Timestamp {
     const out = try arena.alloc(Io.Timestamp, ts.len);
-    for (ts, out) |t, *o| o.* = timestamp(t).?;
+    for (ts, out) |t, *o| o.* = proto_time.timestampFromProto(t).?;
     return out;
 }
 
@@ -546,32 +557,6 @@ fn rangesFromProto(arena: Allocator, ranges: []const pb.Range) error{OutOfMemory
     const out = try arena.alloc(Range, ranges.len);
     for (ranges, out) |r, *o| o.* = .{ .start = r.start, .end = r.end, .step = r.step };
     return out;
-}
-
-fn timestamp(t: ?proto.google.protobuf.Timestamp) ?Io.Timestamp {
-    const v = t orelse return null;
-    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
-}
-
-fn protoTimestamp(t: ?Io.Timestamp) ?proto.google.protobuf.Timestamp {
-    const v = t orelse return null;
-    return .{
-        .seconds = @intCast(@divFloor(v.nanoseconds, std.time.ns_per_s)),
-        .nanos = @intCast(@mod(v.nanoseconds, std.time.ns_per_s)),
-    };
-}
-
-fn duration(d: ?proto.google.protobuf.Duration) ?Duration {
-    const v = d orelse return null;
-    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
-}
-
-fn protoDuration(d: ?Duration) ?proto.google.protobuf.Duration {
-    const v = d orelse return null;
-    return .{
-        .seconds = @intCast(@divFloor(v.nanoseconds, std.time.ns_per_s)),
-        .nanos = @intCast(@mod(v.nanoseconds, std.time.ns_per_s)),
-    };
 }
 
 // ---------------------------------------------------------------- tests
@@ -670,4 +655,59 @@ test "a schedule survives a round trip through its proto, keeping fields it does
     const unlimited = try Schedule.fromProto(a, try (Schedule{ .action = s.action, .spec = .{} }).toProto(a, null));
     try testing.expectEqual(@as(?u64, null), unlimited.state.remaining_actions);
     try testing.expectEqual(OverlapPolicy.unspecified, unlimited.policies.overlap);
+}
+
+test "times and durations beyond protobuf's range are clamped to its bounds" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Wf = struct {
+        fn run(ctx: *@import("workflow.zig").Context) !void {
+            _ = ctx;
+        }
+    };
+    const Def = @import("workflow.zig").Def("Forever", Wf.run);
+    const PbDuration = proto.google.protobuf.Duration;
+    const PbTimestamp = proto.google.protobuf.Timestamp;
+    const longest: PbDuration = .{ .seconds = 315_576_000_000, .nanos = 999_999_999 };
+    const earliest: PbTimestamp = .{ .seconds = -62_135_596_800 };
+    const latest: PbTimestamp = .{ .seconds = 253_402_300_799, .nanos = 999_999_999 };
+
+    const s: Schedule = .{
+        .action = try startWorkflow(a, Def, .{}, .{
+            .id = "forever",
+            .task_queue = "q",
+            .execution_timeout = .max,
+            .run_timeout = .max,
+            .task_timeout = .max,
+        }),
+        .spec = .{
+            .intervals = &.{.{ .every = .max, .offset = .fromMilliseconds(-1500) }},
+            .start_at = .fromNanoseconds(std.math.minInt(i96)),
+            .end_at = .fromNanoseconds(std.math.maxInt(i96)),
+            .jitter = .max,
+        },
+        .policies = .{ .catchup_window = .max },
+    };
+    const encoded = try s.toProto(a, null);
+    const spec = encoded.spec.?;
+    try testing.expectEqual(earliest, spec.start_time.?);
+    try testing.expectEqual(latest, spec.end_time.?);
+    try testing.expectEqual(longest, spec.jitter.?);
+    try testing.expectEqual(longest, spec.interval.items[0].interval.?);
+    try testing.expectEqual(PbDuration{ .seconds = -1, .nanos = -500_000_000 }, spec.interval.items[0].phase.?);
+    try testing.expectEqual(longest, encoded.policies.?.catchup_window.?);
+    const sw = encoded.action.?.start_workflow.?;
+    try testing.expectEqual(longest, sw.workflow_execution_timeout.?);
+    try testing.expectEqual(longest, sw.workflow_run_timeout.?);
+    try testing.expectEqual(longest, sw.workflow_task_timeout.?);
+
+    const backfill = (Backfill{ .start = .fromNanoseconds(std.math.minInt(i96)), .end = .fromNanoseconds(std.math.maxInt(i96)) }).toProto();
+    try testing.expectEqual(earliest, backfill.start_time.?);
+    try testing.expectEqual(latest, backfill.end_time.?);
+    const far_past: Io.Timestamp = .fromNanoseconds(-62_135_596_801 * std.time.ns_per_s);
+    const far_future: Io.Timestamp = .fromNanoseconds(253_402_300_800 * std.time.ns_per_s);
+    const near = (Backfill{ .start = far_past, .end = far_future }).toProto();
+    try testing.expectEqual(earliest, near.start_time.?);
+    try testing.expectEqual(latest, near.end_time.?);
 }

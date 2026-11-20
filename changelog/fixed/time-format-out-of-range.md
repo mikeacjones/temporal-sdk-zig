@@ -1,0 +1,1 @@
+`converter.Time.format`, and with it `converter.toPayload` of a value holding a `Time`, no longer panics on a time beyond the years 0000 to 9999: a time before 0000-01-01T00:00:00Z or after 9999-12-31T23:59:59.999999999Z is written as that bound, so the text always parses back with `Time.parse`.

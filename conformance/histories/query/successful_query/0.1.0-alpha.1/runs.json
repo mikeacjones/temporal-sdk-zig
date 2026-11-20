@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-query/successful_query",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-query/successful_query"
+    }
+  ]
+}
