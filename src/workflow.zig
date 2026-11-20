@@ -300,8 +300,11 @@ pub const Info = struct {
     first_run_id: []const u8 = "",
     /// The run this one continued from, or empty.
     continued_run_id: []const u8 = "",
+    /// Null when the workflow was started without one: the server sends zero for unset, and zero is read as null.
     execution_timeout: ?Duration = null,
+    /// Null when the workflow was started without one: the server sends zero for unset, and zero is read as null.
     run_timeout: ?Duration = null,
+    /// Null when the workflow was started without one: the server sends zero for unset, and zero is read as null.
     task_timeout: ?Duration = null,
     /// The workflow that started this one as a child, or null for a top-level workflow.
     parent: ?WorkflowExecution = null,

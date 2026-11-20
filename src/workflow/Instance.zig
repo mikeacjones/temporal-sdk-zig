@@ -1610,9 +1610,9 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         .cron_schedule = try a.dupe(u8, init.cron_schedule),
         .first_run_id = try a.dupe(u8, init.first_execution_run_id),
         .continued_run_id = try a.dupe(u8, init.continued_from_execution_run_id),
-        .execution_timeout = proto_time.durationFromProto(init.workflow_execution_timeout),
-        .run_timeout = proto_time.durationFromProto(init.workflow_run_timeout),
-        .task_timeout = proto_time.durationFromProto(init.workflow_task_timeout),
+        .execution_timeout = proto_time.positiveDurationFromProto(init.workflow_execution_timeout),
+        .run_timeout = proto_time.positiveDurationFromProto(init.workflow_run_timeout),
+        .task_timeout = proto_time.positiveDurationFromProto(init.workflow_task_timeout),
         .start_time = proto_time.timestampFromProto(init.start_time),
     };
     if (init.parent_workflow_info) |p| inst.info.parent = .{
@@ -6281,6 +6281,47 @@ test "info: retry policy, priority, original run ID, and the previous run's fail
     try testing.expect(inst.ctx.info().retry_policy == null);
     try testing.expectEqualDeep(workflow.Priority{}, inst.ctx.info().priority);
     try testing.expect(inst.ctx.previousRunFailure() == null);
+}
+
+const TimeoutInfoWf = struct {
+    /// Returns "<execution>/<run>/<task>" in whole seconds, "null" for each unset one.
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const info = ctx.info();
+        return std.fmt.allocPrint(ctx.allocator(), "{?d}/{?d}/{?d}", .{
+            seconds(info.execution_timeout),
+            seconds(info.run_timeout),
+            seconds(info.task_timeout),
+        });
+    }
+
+    fn seconds(d: ?std.Io.Duration) ?i96 {
+        return if (d) |v| @divTrunc(v.nanoseconds, std.time.ns_per_s) else null;
+    }
+};
+const TimeoutInfoWfDef = workflow.Def("TimeoutInfo", TimeoutInfoWf.run);
+
+test "info: timeouts are null when absent or zero and the start values when set" {
+    const Case = struct { execution: ?proto.google.protobuf.Duration, run: ?proto.google.protobuf.Duration, task: ?proto.google.protobuf.Duration, want: []const u8 };
+    const cases = [_]Case{
+        .{ .execution = null, .run = null, .task = null, .want = "\"null/null/null\"" },
+        // The server sends a zero Duration for a timeout the workflow was started without.
+        .{ .execution = .{}, .run = .{}, .task = .{}, .want = "\"null/null/null\"" },
+        .{ .execution = .{ .seconds = -1 }, .run = .{ .nanos = -1 }, .task = .{}, .want = "\"null/null/null\"" },
+        .{ .execution = .{ .seconds = 3600 }, .run = .{ .seconds = 60 }, .task = .{ .seconds = 10 }, .want = "\"3600/60/10\"" },
+    };
+    for (cases) |c| {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const inst = try create(testing.allocator, TimeoutInfoWfDef.registered, .{});
+        defer inst.destroy();
+        var act = try initActivation(a, "TimeoutInfo", .{});
+        const init = &act.jobs.items[0].variant.?.initialize_workflow;
+        init.workflow_execution_timeout = c.execution;
+        init.workflow_run_timeout = c.run;
+        init.workflow_task_timeout = c.task;
+        try testing.expectEqualStrings(c.want, completedWith(try inst.activate(&act, a)));
+    }
 }
 
 const CurrentUpdateWf = struct {
