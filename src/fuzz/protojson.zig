@@ -8,7 +8,6 @@ const std = @import("std");
 const fuzz = @import("../fuzz.zig");
 const protojson = @import("../protojson.zig");
 const proto = @import("../proto.zig");
-const converter = @import("../converter.zig");
 
 const Message = enum { history_event, payloads };
 
@@ -29,40 +28,7 @@ fn roundTrip(comptime T: type, arena: std.mem.Allocator, json: []const u8) !void
     const first = result catch |err| switch (err) {
         error.OutOfMemory, error.InvalidProtoJson => return,
     };
-    if (hasLeapDayTimestamp(first)) return fuzz.known("protojson", "temporal-sdk-zig-ljo");
     const encoded = try protojson.encode(arena, first);
     const second = try protojson.decode(T, arena, encoded);
     try std.testing.expectEqualStrings(encoded, try protojson.encode(arena, second));
-}
-
-/// Whether `value` holds a Timestamp on 29 February of a year not divisible by 400, on which
-/// zig-protobuf's `Timestamp.jsonStringify` overflows in `civil_from_days`.
-fn hasLeapDayTimestamp(value: anytype) bool {
-    const T = @TypeOf(value);
-    if (T == proto.google.protobuf.Timestamp) {
-        var text: [converter.Time.max_len]u8 = undefined;
-        const date = (converter.Time{ .unix_ns = @as(i96, value.seconds) * std.time.ns_per_s }).format(&text);
-        const year = std.fmt.parseUnsigned(u32, date[0..4], 10) catch unreachable;
-        return std.mem.eql(u8, date[4..10], "-02-29") and year % 400 != 0;
-    }
-    switch (@typeInfo(T)) {
-        .optional => return if (value) |child| hasLeapDayTimestamp(child) else false,
-        .pointer => |pointer| switch (pointer.size) {
-            .one => return hasLeapDayTimestamp(value.*),
-            .slice => {
-                if (pointer.child == u8) return false;
-                for (value) |item| if (hasLeapDayTimestamp(item)) return true;
-                return false;
-            },
-            else => return false,
-        },
-        .@"struct" => |info| {
-            inline for (info.field_names) |name| if (hasLeapDayTimestamp(@field(value, name))) return true;
-            return false;
-        },
-        .@"union" => switch (value) {
-            inline else => |child| return hasLeapDayTimestamp(child),
-        },
-        else => return false,
-    }
 }

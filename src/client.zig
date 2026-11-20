@@ -16,6 +16,7 @@
 const std = @import("std");
 const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
+const proto_time = @import("proto_time.zig");
 const converter = @import("converter.zig");
 const search_attributes = @import("search_attributes.zig");
 const failure_mod = @import("failure.zig");
@@ -153,7 +154,9 @@ pub const Options = struct {
     };
 
     /// Each field defaults to sdk-core's default policy, so setting one changes only that
-    /// one. Durations must not be negative.
+    /// one. Durations must not be negative: `Client.init` returns `error.InvalidOptions` for
+    /// one that is. A duration longer than a u64 of milliseconds, such as `Duration.max`, is
+    /// sent as the longest one it can.
     pub const Retry = struct {
         /// The wait before the first retry.
         initial_interval: Duration = .fromMilliseconds(100),
@@ -483,7 +486,8 @@ fn coreLogFields(a: Allocator, json: []const u8, out: []log_mod.Field) usize {
 }
 
 /// The runtime's metrics options for `options`. A custom handler is wrapped in a core custom
-/// meter, which `bridge.Runtime.init` owns from then on.
+/// meter, which `bridge.Runtime.init` owns from then on. The OpenTelemetry periodicity is
+/// converted in i96, not through `Duration.toMilliseconds`, which panics past i64.
 fn runtimeMetrics(gpa: Allocator, options: metrics_mod.Options) InitError!bridge.Runtime.Metrics {
     const exporter: bridge.Runtime.Metrics.Exporter = switch (options.exporter) {
         .prometheus => |p| .{ .prometheus = .{
@@ -496,7 +500,7 @@ fn runtimeMetrics(gpa: Allocator, options: metrics_mod.Options) InitError!bridge
         .opentelemetry => |o| .{ .opentelemetry = .{
             .url = o.url,
             .headers = o.headers,
-            .metric_periodicity_ms = if (o.periodicity) |d| std.math.cast(u32, @max(d.toMilliseconds(), 1)) orelse std.math.maxInt(u32) else 0,
+            .metric_periodicity_ms = if (o.periodicity) |d| std.math.cast(u32, @max(@divTrunc(d.nanoseconds, std.time.ns_per_ms), 1)) orelse std.math.maxInt(u32) else 0,
             .temporality = switch (o.temporality) {
                 .cumulative => .cumulative,
                 .delta => .delta,
@@ -1441,10 +1445,10 @@ pub const Client = struct {
             .workflow_type = .{ .name = workflow_type },
             .task_queue = .{ .name = options.task_queue, .kind = .TASK_QUEUE_KIND_NORMAL },
             .input = .{ .payloads = try converter.toPayloadsWithContext(a, &context, args) },
-            .workflow_execution_timeout = protoDuration(options.execution_timeout),
-            .workflow_run_timeout = protoDuration(options.run_timeout),
-            .workflow_task_timeout = protoDuration(options.task_timeout),
-            .workflow_start_delay = protoDuration(options.start_delay),
+            .workflow_execution_timeout = proto_time.durationToProto(options.execution_timeout),
+            .workflow_run_timeout = proto_time.durationToProto(options.run_timeout),
+            .workflow_task_timeout = proto_time.durationToProto(options.task_timeout),
+            .workflow_start_delay = proto_time.durationToProto(options.start_delay),
             .cron_schedule = options.cron_schedule,
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
@@ -1480,9 +1484,9 @@ pub const Client = struct {
 
     fn protoRetryPolicy(a: Allocator, rp: workflow.RetryPolicy) error{OutOfMemory}!proto.temporal.api.common.v1.RetryPolicy {
         var p: proto.temporal.api.common.v1.RetryPolicy = .{
-            .initial_interval = protoDuration(rp.initial_interval),
+            .initial_interval = proto_time.durationToProto(rp.initial_interval),
             .backoff_coefficient = rp.backoff_coefficient,
-            .maximum_interval = protoDuration(rp.maximum_interval),
+            .maximum_interval = proto_time.durationToProto(rp.maximum_interval),
             .maximum_attempts = rp.maximum_attempts,
         };
         try p.non_retryable_error_types.appendSlice(a, rp.non_retryable_error_types);
@@ -2080,10 +2084,10 @@ pub const Client = struct {
             .activity_id = id,
             .activity_type = .{ .name = activity_type },
             .task_queue = .{ .name = options.task_queue, .kind = .TASK_QUEUE_KIND_NORMAL },
-            .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
-            .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
-            .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
-            .heartbeat_timeout = protoDuration(options.heartbeat_timeout),
+            .schedule_to_close_timeout = proto_time.durationToProto(options.schedule_to_close_timeout),
+            .schedule_to_start_timeout = proto_time.durationToProto(options.schedule_to_start_timeout),
+            .start_to_close_timeout = proto_time.durationToProto(options.start_to_close_timeout),
+            .heartbeat_timeout = proto_time.durationToProto(options.heartbeat_timeout),
             .input = .{ .payloads = try converter.toPayloadsWithContext(a, &.{
                 .values = options.context orelse &.empty,
                 .namespace = c.namespace,
@@ -2106,7 +2110,7 @@ pub const Client = struct {
         if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
         if (options.summary.len > 0) request.user_metadata = .{ .summary = try converter.toPayload(a, options.summary) };
         if (options.priority) |p| request.priority = .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight };
-        request.start_delay = protoDuration(options.start_delay);
+        request.start_delay = proto_time.durationToProto(options.start_delay);
         var status: ?RpcStatus = null;
         var header = try c.outgoingHeader(a, options.context);
         const response = c.rpcCall(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status, &header, options.context) catch |err| switch (err) {
@@ -2727,6 +2731,9 @@ pub const Client = struct {
     }
 };
 
+/// How `Client.startWorkflow` and `executeWorkflow` start a workflow.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const StartWorkflowOptions = struct {
     /// Workflow ID. Empty generates a random UUID; read it from the run.
     id: []const u8 = "",
@@ -3286,9 +3293,9 @@ fn executionInfo(arena: Allocator, info: proto.temporal.api.workflow.v1.Workflow
         .workflow_type = if (info.type) |t| t.name else "",
         .task_queue = info.task_queue,
         .status = @fromBackingInt(@intCast(@backingInt(info.status))),
-        .start_time = timestamp(info.start_time),
-        .execution_time = timestamp(info.execution_time),
-        .close_time = timestamp(info.close_time),
+        .start_time = proto_time.timestampFromProto(info.start_time),
+        .execution_time = proto_time.timestampFromProto(info.execution_time),
+        .close_time = proto_time.timestampFromProto(info.close_time),
         .history_length = info.history_length,
         .memo = if (info.memo) |m| try converter.fieldsFromMap(arena, m.fields.items) else &.{},
         .search_attributes = try .fromProto(arena, info.search_attributes),
@@ -3355,6 +3362,8 @@ pub const WorkflowExecutionIterator = struct {
 
 /// How `Client.executeActivity` starts an activity. At least one of
 /// `start_to_close_timeout` and `schedule_to_close_timeout` is required.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const StartActivityOptions = struct {
     /// Activity ID, unique among the namespace's running standalone activities. Empty
     /// generates a random UUID; read it from the handle.
@@ -3626,16 +3635,16 @@ pub fn ActivityHandle(comptime T: type) type {
                 .task_queue = info.task_queue,
                 .status = @fromBackingInt(@intCast(@backingInt(info.status))),
                 .attempt = info.attempt,
-                .schedule_time = timestamp(info.schedule_time),
-                .last_started_time = timestamp(info.last_started_time),
-                .close_time = timestamp(info.close_time),
+                .schedule_time = proto_time.timestampFromProto(info.schedule_time),
+                .last_started_time = proto_time.timestampFromProto(info.last_started_time),
+                .close_time = proto_time.timestampFromProto(info.close_time),
                 .search_attributes = try .fromProto(arena, info.search_attributes),
                 .heartbeat_details = .{
                     .payloads = if (info.heartbeat_details) |d| d.payloads.items else &.{},
                     .context = try Client.dupeContext(arena, .{ .namespace = c.namespace, .activity_id = info.activity_id, .activity_type = if (info.activity_type) |t| t.name else "" }),
                 },
-                .last_heartbeat_time = timestamp(info.last_heartbeat_time),
-                .start_delay = if (duration(info.start_delay)) |d| if (d.nanoseconds == 0) null else d else null,
+                .last_heartbeat_time = proto_time.timestampFromProto(info.last_heartbeat_time),
+                .start_delay = if (proto_time.durationFromProto(info.start_delay)) |d| if (d.nanoseconds == 0) null else d else null,
                 .priority = if (info.priority) |p| if (p.priority_key == 0 and p.fairness_key.len == 0 and p.fairness_weight == 0) null else .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight } else null,
                 .summary = summary: {
                     const md = info.user_metadata orelse break :summary "";
@@ -3763,7 +3772,7 @@ pub fn ActivityHandle(comptime T: type) type {
                 .run_id = h.run_id,
                 .identity = c.identity,
                 .reason = options.reason,
-                .jitter = protoDuration(options.jitter),
+                .jitter = proto_time.durationToProto(options.jitter),
                 .resource_id = try std.fmt.allocPrint(a, "activity:{s}", .{h.id}),
                 .request_id = try uuid(a, c.io),
             }, a, &status) catch |err| return h.pauseError(err, status, "unpausing");
@@ -3794,7 +3803,9 @@ pub const UnpauseActivityOptions = struct {
     /// Recorded with the request.
     reason: []const u8 = "",
     /// Schedules the next attempt at a random time within this long, to spread out many
-    /// activities unpaused at once. Null schedules it at once.
+    /// activities unpaused at once. Null schedules it at once. A duration longer than
+    /// protobuf can carry (about 10,000 years), such as `Duration.max`, is sent as the longest
+    /// one it can; a negative one is sent as it is.
     jitter: ?Duration = null,
 };
 
@@ -3837,8 +3848,8 @@ pub const ActivityExecutionIterator = struct {
             .activity_type = if (raw.activity_type) |t| t.name else "",
             .task_queue = raw.task_queue,
             .status = @fromBackingInt(@intCast(@backingInt(raw.status))),
-            .schedule_time = timestamp(raw.schedule_time),
-            .close_time = timestamp(raw.close_time),
+            .schedule_time = proto_time.timestampFromProto(raw.schedule_time),
+            .close_time = proto_time.timestampFromProto(raw.close_time),
             .search_attributes = try .fromProto(arena, raw.search_attributes),
             .raw = raw,
         };
@@ -4957,24 +4968,6 @@ pub fn uuid(arena: Allocator, io: Io) error{OutOfMemory}![]const u8 {
     return std.fmt.allocPrint(arena, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
 }
 
-fn timestamp(t: ?proto.google.protobuf.Timestamp) ?Io.Timestamp {
-    const v = t orelse return null;
-    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
-}
-
-fn duration(d: ?proto.google.protobuf.Duration) ?Duration {
-    const v = d orelse return null;
-    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
-}
-
-fn protoDuration(d: ?Duration) ?proto.google.protobuf.Duration {
-    const v = d orelse return null;
-    return .{
-        .seconds = @intCast(@divFloor(v.nanoseconds, std.time.ns_per_s)),
-        .nanos = @intCast(@mod(v.nanoseconds, std.time.ns_per_s)),
-    };
-}
-
 test "uuids are version 4 and well formed" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -5379,6 +5372,59 @@ test "rpc_timeout cuts short a query the server holds" {
         return error.TestUnexpectedResult;
     }
     try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
+}
+
+test "retry policy intervals and the OpenTelemetry periodicity are clamped, not narrowed" {
+    // Retry intervals: clamped to the longest protobuf Duration; a negative one keeps one sign.
+    {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const longest: proto.google.protobuf.Duration = .{ .seconds = 315_576_000_000, .nanos = 999_999_999 };
+        const p = try Client.protoRetryPolicy(arena.allocator(), .{ .initial_interval = .max, .maximum_interval = .max });
+        try testing.expectEqual(longest, p.initial_interval.?);
+        try testing.expectEqual(longest, p.maximum_interval.?);
+        const negative = try Client.protoRetryPolicy(arena.allocator(), .{ .initial_interval = .fromMilliseconds(-1500) });
+        try testing.expectEqual(proto.google.protobuf.Duration{ .seconds = -1, .nanos = -500_000_000 }, negative.initial_interval.?);
+    }
+    // The OpenTelemetry periodicity: clamped to 1 ms through maxInt(u32) ms.
+    {
+        const cases = [_]struct { Duration, u32 }{
+            .{ .max, std.math.maxInt(u32) },
+            .{ .{ .nanoseconds = std.math.minInt(i96) }, 1 },
+            .{ .fromSeconds(-1), 1 },
+            .{ .zero, 1 },
+            .{ .fromMicroseconds(1500), 1 },
+            .{ .fromSeconds(30), 30_000 },
+            .{ .fromMilliseconds(std.math.maxInt(u32)), std.math.maxInt(u32) },
+            .{ .fromMilliseconds(@as(i64, std.math.maxInt(u32)) + 1), std.math.maxInt(u32) },
+        };
+        for (cases) |case| {
+            const m = try runtimeMetrics(testing.allocator, .{ .exporter = .{ .opentelemetry = .{ .url = "http://localhost:4317", .periodicity = case[0] } } });
+            try testing.expectEqual(case[1], m.exporter.opentelemetry.metric_periodicity_ms);
+        }
+    }
+}
+
+test "the server accepts a workflow started with Duration.max execution and run timeouts" {
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var c = try Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer c.close();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No worker polls this task queue; the start alone shows the server takes the values.
+    var run = try c.executeWorkflowByName(void, "Unpolled", .{
+        .task_queue = try uuid(a, testing.io),
+        .execution_timeout = .max,
+        .run_timeout = .max,
+        .task_timeout = .fromSeconds(10),
+    }, .{});
+    defer run.deinit();
+    const d = try c.describeWorkflow(a, run.id, run.run_id);
+    try testing.expectEqual(WorkflowExecutionStatus.running, d.status);
+    try c.terminateWorkflow(run.id, run.run_id, "test done");
 }
 
 test "RpcOptions are rejected for a timeout that isn't positive and metadata gRPC can't send" {
