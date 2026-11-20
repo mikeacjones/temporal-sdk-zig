@@ -1051,13 +1051,32 @@ test "addressesText symbolizes a trace on a thread with a cancel pending, and de
 
 /// An activity that fails while the executable's debug info is still being read for the first
 /// time: `SlowFirstRead`'s test holds the SDK's debug info reader the way a slow first load
-/// does (seconds on a loaded runner), from before the worker starts.
+/// does, from before the worker starts, until the worker has connected and created its core.
+/// What is left of `Worker.run` then is the wait for that read (a cold read), or, when an
+/// earlier test of the process already read the debug info, the polling that runs the
+/// activity.
 const SlowFirstRead = struct {
     const activity_mod = @import("activity.zig");
     const workflow_mod = @import("workflow.zig");
+    const worker_mod = @import("worker.zig");
 
-    /// How long the test holds the reader at most, as a first load on a slow runner would.
+    /// The most the test holds the reader: only a ceiling, for when the worker never gets as
+    /// far as creating its core.
     const hold_limit: std.Io.Duration = .fromSeconds(6);
+    /// How often `hold` looks whether the worker created its core.
+    const poll_interval: std.Io.Duration = .fromMilliseconds(5);
+
+    /// The reader's lock. Under this project's test runner `std.debug.SelfInfo` is the hang
+    /// report's forwarding wrapper (tools/test_runner/hang_report.zig), and std's reader, with
+    /// the lock, is its `target`.
+    const Reader = if (@hasField(std.debug.SelfInfo, "target")) @FieldType(std.debug.SelfInfo, "target") else std.debug.SelfInfo;
+    /// Whether this target's reader has a lock the test can hold (the ELF reader has a
+    /// read-write lock instead).
+    const lockable = @hasField(Reader, "mutex");
+
+    fn readerMutex() *std.Io.Mutex {
+        return if (@hasField(std.debug.SelfInfo, "target")) &sdk_debug_info.target.mutex else &sdk_debug_info.mutex;
+    }
 
     var held: std.Io.Event = .unset;
     var seen: std.Io.Event = .unset;
@@ -1085,20 +1104,36 @@ const SlowFirstRead = struct {
     }
     const Order = workflow_mod.Def("SlowFirstReadOrder", order);
 
-    /// Holds the SDK's reader until the activity's failure reaches the workflow, or
-    /// `hold_limit`. Allocates nothing while it holds it.
-    fn hold() void {
+    /// Whether `w` has connected and created its core.
+    fn coreCreated(w: *worker_mod.Worker, io: std.Io) bool {
+        w.stop_mutex.lockUncancelable(io);
+        defer w.stop_mutex.unlock(io);
+        return w.core_ptrs[0] != null;
+    }
+
+    /// Holds the SDK's reader until `w` has created its core, so that only the wait for the
+    /// read is left of starting it. It does not wait for the activity's failure: `Worker.run`
+    /// waits for the read before it polls, so the failure cannot arrive while the lock is
+    /// held. Released early when `seen` is set (the test's error paths set it), and never
+    /// held past `hold_limit`. Allocates nothing while it holds the lock.
+    fn hold(w: *worker_mod.Worker) void {
         const io = std.Options.debug_io;
-        sdk_debug_info.mutex.lockUncancelable(io);
-        defer sdk_debug_info.mutex.unlock(io);
+        const mutex = readerMutex();
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
         held.set(io);
-        seen.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
+        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = hold_limit, .clock = .awake });
+        while (true) {
+            if (coreCreated(w, io)) return;
+            if (seen.waitTimeout(io, .{ .duration = .{ .raw = poll_interval, .clock = .awake } })) |_| return else |_| {}
+            if (deadline.durationFromNow(io).raw.nanoseconds <= 0) return;
+        }
     }
 };
 
 test "an activity that fails while the executable's debug info is still loading still carries its stack trace" {
     const SelfInfo = std.debug.SelfInfo;
-    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+    if (comptime @import("builtin").mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !SlowFirstRead.lockable)
         return error.SkipZigTest;
     if (@errorReturnTrace() == null) return error.SkipZigTest;
     SlowFirstRead.held = .unset;
@@ -1110,7 +1145,7 @@ test "an activity that fails while the executable's debug info is still loading 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    var holder = try testing.io.concurrent(SlowFirstRead.hold, .{});
+    var holder = try testing.io.concurrent(SlowFirstRead.hold, .{&env.worker});
     defer holder.await(testing.io);
     defer SlowFirstRead.seen.set(testing.io);
     try SlowFirstRead.held.wait(testing.io);
