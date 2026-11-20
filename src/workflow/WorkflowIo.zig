@@ -545,7 +545,13 @@ fn timeoutDuration(w: *WorkflowIo, timeout: Io.Timeout) ?Io.Duration {
     return switch (timeout) {
         .none => null,
         .duration => |d| d.raw,
-        .deadline => |t| w.host.vtable.now(w.host.ctx).durationTo(t.raw),
+        // Saturating, not `Timestamp.durationTo`: any i96 deadline is valid input, and one far
+        // from workflow time would overflow. The host clamps a huge duration to protobuf's range.
+        .deadline => |t| blk: {
+            const now_ns = w.host.vtable.now(w.host.ctx).nanoseconds;
+            break :blk .{ .nanoseconds = std.math.sub(i96, t.raw.nanoseconds, now_ns) catch
+                if (t.raw.nanoseconds < now_ns) std.math.minInt(i96) else std.math.maxInt(i96) };
+        },
     };
 }
 

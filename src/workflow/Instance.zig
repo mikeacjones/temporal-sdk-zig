@@ -3725,6 +3725,49 @@ test "durations beyond protobuf's range are clamped in workflow commands, and ne
     try testing.expectEqual(proto.google.protobuf.Duration{ .seconds = -1, .nanos = -500_000_000 }, negative.heartbeat_timeout.?);
 }
 
+/// Waits with a deadline at an end of i96, through `sleep` or a futex wait; the mode picks which.
+const FarDeadline = struct {
+    fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        const ns: i96 = if (std.mem.endsWith(u8, mode, "min")) std.math.minInt(i96) else std.math.maxInt(i96);
+        const timeout: std.Io.Timeout = .{ .deadline = .{ .raw = .fromNanoseconds(ns), .clock = .awake } };
+        if (std.mem.startsWith(u8, mode, "sleep")) {
+            try timeout.sleep(ctx.io());
+        } else {
+            // `Io.Event.waitTimeout` would reach the same wait, but recomputes the remaining
+            // time itself with std's unchecked `durationFromNow` after the wait returns.
+            const word: u32 = 0;
+            try ctx.io().futexWaitTimeout(u32, &word, 0, timeout);
+        }
+        return "done";
+    }
+    const Def = workflow.Def("FarDeadline", run);
+};
+
+test "a wait whose deadline is at either end of i96 doesn't overflow: the past one has expired, the future one starts the longest timer" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    for ([_][]const u8{ "sleep-min", "futex-min" }) |mode| {
+        const inst = try create(testing.allocator, FarDeadline.Def.registered, .{});
+        defer inst.destroy();
+        const cmds = commandsOf(try inst.activate(&try initActivation(a, "FarDeadline", .{mode}), a));
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqualStrings("\"done\"", cmds[0].variant.?.complete_workflow_execution.result.?.data);
+    }
+
+    // With workflow time before 1970, maxInt(i96) minus now doesn't fit in i96.
+    for ([_][]const u8{ "sleep-max", "futex-max" }) |mode| {
+        const inst = try create(testing.allocator, FarDeadline.Def.registered, .{});
+        defer inst.destroy();
+        var act = try initActivation(a, "FarDeadline", .{mode});
+        act.timestamp = .{ .seconds = -1 };
+        const cmds = commandsOf(try inst.activate(&act, a));
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqual(proto_time.durationToProto(proto_time.max_duration).?, cmds[0].variant.?.start_timer.start_to_fire_timeout.?);
+    }
+}
+
 test "workflow cancellation cancels the pending activity and the workflow" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
