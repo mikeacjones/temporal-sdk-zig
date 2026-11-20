@@ -1,0 +1,1 @@
+A workflow's logger (`workflow.Context.logger`, also through outbound interceptors) is now silent while its run is evicted from the worker's cache, as it is during replay unless `worker.Options.log_during_replay` is set, so workflow code that logs when an activity, child or timer wait returns `error.Canceled` no longer logs a false error when the worker stops or drops the run.

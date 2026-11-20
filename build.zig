@@ -794,14 +794,19 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
     {
         // Renders a known-findings file and adds to `run` the arguments that run `artifact`
         // with it through `exec`, which also makes a report end the process with exit 66
-        // (see tools/checks/tsan_suppressions.zig). `run` runs the suppressions tool.
+        // (see tools/checks/tsan_suppressions.zig), and symbolize with `symbolizer` when
+        // given. `run` runs the suppressions tool.
         const Known = struct {
-            fn addArgs(b2: *std.Build, tool: *std.Build.Step.Compile, zon: []const u8, run: *std.Build.Step.Run, artifact: *std.Build.Step.Compile) void {
+            fn addArgs(b2: *std.Build, tool: *std.Build.Step.Compile, zon: []const u8, run: *std.Build.Step.Run, artifact: *std.Build.Step.Compile, symbolizer: ?*std.Build.Step.Compile) void {
                 const render = b2.addRunArtifact(tool);
                 render.setName(b2.fmt("render {s}", .{zon}));
                 render.addArg("render");
                 render.addFileArg(b2.path(zon));
                 run.addArg("exec");
+                if (symbolizer) |s| {
+                    run.addArg("--symbolizer");
+                    run.addArtifactArg(s);
+                }
                 run.addFileArg(render.captureStdOut(.{ .basename = "tsan.supp" }));
                 run.addArtifactArg(artifact);
             }
@@ -832,19 +837,27 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         // for the symbolizer, which only `--test-timeout` bounds here: the tests need their
         // reports' function names, which the suppressions match.
         const run = b.addRunArtifact(suppressions_tool);
-        Known.addArgs(b, suppressions_tool, "tools/checks/tsan.zon", run, tests);
+        Known.addArgs(b, suppressions_tool, "tools/checks/tsan.zon", run, tests, null);
         run.setName("run test tsan-unit-tests");
         run.enableTestRunnerMode();
         b.step("tsan", "Run the unit tests under Thread Sanitizer").dependOn(&run.step);
 
         // To print a report, the runtime symbolizes its stacks, which on macOS starts
         // `atos -p <pid>` and waits for its answer with no limit, so a wedged atos (as on
-        // 2026-11-19) hung `zig build test` for good. So each case below runs its program
-        // through time-limit, which fails the case, naming it, when the program has not
-        // ended within the given seconds; and the cases that need no function names turn
-        // symbolization off.
+        // 2026-11-19) hung `zig build test` for good, and while the host's atos stays wedged
+        // a case that uses it cannot pass. So each case below runs its program through
+        // time-limit, which fails the case, naming it, when the program has not ended within
+        // the given seconds; the cases that need no function names turn symbolization off;
+        // and on macOS the one that needs them uses the build's own symbolizer instead of
+        // the host's atos: tools/checks/symbolizer.zig, built under the file name
+        // llvm-symbolizer, the name that makes the runtime speak llvm-symbolizer's protocol
+        // to it, which names the binary's file and an address in it, not the live process.
         const limit_tool = checkTool(b, "time-limit", "tools/checks/time_limit.zig");
         in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "time-limit", .root_module = limit_tool.root_module, .filters = in.test_filters })).step);
+        const symbolizer_tool = checkTool(b, "llvm-symbolizer", "tools/checks/symbolizer.zig");
+        in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "symbolizer", .root_module = symbolizer_tool.root_module, .filters = in.test_filters })).step);
+        // Linux keeps the runtime's own choice.
+        const own_symbolizer: ?*std.Build.Step.Compile = if (b.graph.host.result.os.tag.isDarwin()) symbolizer_tool else null;
         const Limited = struct {
             /// Ample for a fixture and the symbolizer, even on a loaded machine.
             const seconds = 120;
@@ -885,15 +898,16 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
 
             // The same program with its racing function listed: the suppression must take,
             // and `exec` keeps the caller's options (the runtime prints matches only when
-            // asked). Suppressions match function names, so this case symbolizes, as the
-            // unit tests do; a stuck symbolizer ends it with time-limit's message.
+            // asked). Suppressions match function names, so this case symbolizes, on macOS
+            // with the build's symbolizer, so that it never starts the host's atos; given a
+            // stuck symbolizer instead, it ends with time-limit's message.
             const known_name = b.fmt("tsan known finding{s}", .{suffix});
             const known = if (symbolizer == null)
                 Limited.case(b, in.test_step, limit_tool, known_name, Limited.seconds, 0)
             else
                 Limited.case(b, in.test_step, limit_tool, known_name, 5, 124);
             known.addArtifactArg(suppressions_tool);
-            Known.addArgs(b, suppressions_tool, "tools/checks/fixtures/tsan/known.zon", known, race_tool);
+            Known.addArgs(b, suppressions_tool, "tools/checks/fixtures/tsan/known.zon", known, race_tool, if (symbolizer == null) own_symbolizer else null);
             known.setEnvironmentVariable("TSAN_OPTIONS", b.fmt("print_suppressions=1{s}", .{extra}));
             if (symbolizer == null)
                 known.expectStdErrMatch("ThreadSanitizer: Matched")
