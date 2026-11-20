@@ -26,6 +26,7 @@ const Instance = @This();
 
 const std = @import("std");
 const proto = @import("../proto.zig");
+const proto_time = @import("../proto_time.zig");
 const converter = @import("../converter.zig");
 const failure_mod = @import("../failure.zig");
 const log = @import("../log.zig");
@@ -94,6 +95,10 @@ now_ns: i96 = 0,
 /// the activation it was made in is still valid (see `ActivityState.activity_type`).
 activations: u64 = 0,
 replaying: bool = false,
+/// True while the run replays history or is being evicted (`teardown`): the logger workflow
+/// code gets (`workflowLogger`) is silent then. `replaying` alone gates the SDK's own records
+/// (`logger`), the metrics, and `Context.isReplaying`.
+log_silenced: bool = false,
 /// Commands produced during the current activation.
 commands: std.ArrayList(cmd_pb.WorkflowCommand) = .empty,
 next_activity_seq: u32 = 1,
@@ -434,9 +439,41 @@ pub const PendingFailure = union(enum) {
 /// `requestContinueAsNew`; the request is in `continue_as_new`.
 const RootOutcome = union(enum) { completed: converter.Payload, failed: anyerror, continued_as_new };
 
+/// The coroutines blocked on one operation's future, in the order they began waiting. Each
+/// entry lives on its waiting coroutine's stack: the coroutine adds it before it first blocks
+/// and removes it with a `defer`, on every path out of the wait.
+const FutureWaiters = struct {
+    list: std.DoublyLinkedList = .{},
+
+    const Entry = struct {
+        wait: WorkflowIo.Wait,
+        node: std.DoublyLinkedList.Node = .{},
+    };
+
+    fn add(ws: *FutureWaiters, e: *Entry) void {
+        ws.list.append(&e.node);
+    }
+
+    fn remove(ws: *FutureWaiters, e: *Entry) void {
+        ws.list.remove(&e.node);
+    }
+
+    /// Wakes every waiter, oldest first (`WorkflowIo.wake`, which queues each behind the
+    /// coroutines already ready), so they resume in the order they began waiting. Unlinks
+    /// nothing: each woken coroutine removes its own entry when it resumes.
+    fn wakeAll(ws: *const FutureWaiters, wio: *WorkflowIo) void {
+        var it = ws.list.first;
+        while (it) |node| : (it = node.next) {
+            const e: *Entry = @alignCast(@fieldParentPtr("node", node));
+            wio.wake(&e.wait);
+        }
+    }
+};
+
 pub const ActivityState = struct {
     seq: u32,
-    waiter: ?*WorkflowIo.Wait = null,
+    /// The coroutines blocked in `awaitActivity`.
+    waiters: FutureWaiters = .{},
     outcome: ?Outcome = null,
     cancel_requested: bool = false,
     cancellation_type: CancellationType = .try_cancel,
@@ -485,8 +522,8 @@ pub const ChildState = struct {
     workflow_type: []const u8,
     cancellation_type: workflow.ChildWorkflowCancellationType,
     /// The coroutines blocked in `started` and in `get`.
-    start_waiter: ?*WorkflowIo.Wait = null,
-    result_waiter: ?*WorkflowIo.Wait = null,
+    start_waiters: FutureWaiters = .{},
+    result_waiters: FutureWaiters = .{},
     /// Set once the server started the child.
     run_id: ?[]const u8 = null,
     /// Set once the child closed, or failed to start (or was canceled before it started).
@@ -511,8 +548,8 @@ pub const ChildState = struct {
     }
 
     fn wake(state: *ChildState, wio: *WorkflowIo) void {
-        if (state.start_waiter) |w| wio.wake(w);
-        if (state.result_waiter) |w| wio.wake(w);
+        state.start_waiters.wakeAll(wio);
+        state.result_waiters.wakeAll(wio);
     }
 };
 
@@ -525,8 +562,8 @@ pub const NexusOperationState = struct {
     operation: []const u8,
     cancellation_type: workflow.NexusOperationCancellationType,
     /// The coroutines blocked in `started` and in `get`.
-    start_waiter: ?*WorkflowIo.Wait = null,
-    result_waiter: ?*WorkflowIo.Wait = null,
+    start_waiters: FutureWaiters = .{},
+    result_waiters: FutureWaiters = .{},
     /// Set once the handler started the operation, or completed it synchronously.
     started: bool = false,
     /// The operation token of an asynchronous start; null for a synchronous one.
@@ -551,8 +588,8 @@ pub const NexusOperationState = struct {
     }
 
     fn wake(state: *NexusOperationState, wio: *WorkflowIo) void {
-        if (state.start_waiter) |w| wio.wake(w);
-        if (state.result_waiter) |w| wio.wake(w);
+        state.start_waiters.wakeAll(wio);
+        state.result_waiters.wakeAll(wio);
     }
 };
 
@@ -563,7 +600,8 @@ pub const ExternalState = struct {
     kind: Kind,
     /// The target's workflow ID, named in the failure's message.
     workflow_id: []const u8,
-    waiter: ?*WorkflowIo.Wait = null,
+    /// The coroutines blocked in `awaitExternal`.
+    waiters: FutureWaiters = .{},
     outcome: ?Outcome = null,
     cancel_requested: bool = false,
     /// Set for a request canceling this child under `wait_cancellation_requested`.
@@ -603,7 +641,7 @@ pub const Options = struct {
     failure_converter: ?converter.FailureConverter = null,
     /// Where the workflow's logger writes.
     logger: log.Sink = .std_log,
-    /// Keep the workflow's logger on while it replays history.
+    /// Keep the workflow's logger on while it replays history and while a run is evicted.
     log_during_replay: bool = false,
     /// Extract `Context.propagated` from the start header and inject it into outgoing
     /// commands. Borrowed: must outlive the instance.
@@ -678,21 +716,26 @@ pub fn destroy(inst: *Instance) void {
 pub fn teardown(inst: *Instance) usize {
     if (inst.evicting) return inst.sched.live;
     inst.evicting = true;
+    inst.log_silenced = true;
     inst.commands.clearRetainingCapacity();
     // The root and handler coroutines may still be blocked even after the workflow finished
     // (a handler's error finishes it, and handlers outlive the root).
     if (inst.root) |root| inst.wio.cancelTask(root);
     for (inst.handlers.items) |run| inst.wio.cancelTask(run.task);
-    // Coroutines already waiting for an activity's cancellation to complete don't see the
-    // cancel above; wake them. The order doesn't matter: nothing they do is sent to the core.
+    // Coroutines already waiting for an operation's cancellation to complete don't see the
+    // cancel above, and neither do coroutines it doesn't reach (one waiter of several on a
+    // shared future); wake every waiter. The order doesn't matter: nothing they do is sent to
+    // the core.
     var pending = inst.activities.valueIterator();
-    while (pending.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
+    while (pending.next()) |state| state.*.waiters.wakeAll(&inst.wio);
     var backing_off = inst.backoffs.valueIterator();
-    while (backing_off.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
+    while (backing_off.next()) |state| state.*.waiters.wakeAll(&inst.wio);
     var children = inst.children.valueIterator();
     while (children.next()) |state| state.*.wake(&inst.wio);
     var operations = inst.nexus_operations.valueIterator();
     while (operations.next()) |state| state.*.wake(&inst.wio);
+    var externals = inst.externals.valueIterator();
+    while (externals.next()) |state| state.*.waiters.wakeAll(&inst.wio);
     inst.wio.run();
     std.debug.assert(inst.commands.items.len == 0);
     return inst.sched.live;
@@ -781,6 +824,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         try inst.setDeploymentVersion(act.deployment_version_for_current_task);
     }
     inst.replaying = act.is_replaying;
+    inst.log_silenced = act.is_replaying or inst.evicting;
     inst.commands.clearRetainingCapacity();
     inst.task_failure = null;
     inst.task_failure_type = "UnsupportedJob";
@@ -1547,15 +1591,24 @@ fn removeHandler(inst: *Instance, run: *HandlerRun) void {
 /// Runs coroutines until all are blocked and no awaited condition holds. Conditions are
 /// checked in the order they were awaited, one wake-up at a time, so a coroutine woken by
 /// its condition can change the state another condition reads before that one is checked.
+/// Only when none holds is the first one whose timer fired woken, to return false: anything
+/// the activation's jobs and coroutines do before quiescence counts before the timeout.
 fn runUntilQuiet(inst: *Instance) void {
     while (true) {
         inst.wio.run();
         const met = for (inst.conditions.items, 0..) |c, i| {
             if (c.check(c.context)) break i;
+        } else null;
+        if (met) |i| {
+            const c = inst.conditions.orderedRemove(i);
+            c.met = true;
+            inst.wio.wake(c.wait);
+            continue;
+        }
+        const timed_out = for (inst.conditions.items, 0..) |c, i| {
+            if (c.timer) |t| if (t.fired) break i;
         } else return;
-        const c = inst.conditions.orderedRemove(met);
-        c.met = true;
-        inst.wio.wake(c.wait);
+        inst.wio.wake(inst.conditions.orderedRemove(timed_out).wait);
     }
 }
 
@@ -1564,6 +1617,9 @@ pub const Condition = struct {
     check: *const fn (context: *const anyopaque) bool,
     context: *const anyopaque,
     wait: *WorkflowIo.Wait,
+    /// `Context.awaitTimeout`'s timer. Its firing only marks it `fired`; `runUntilQuiet` wakes
+    /// the waiter once no condition holds.
+    timer: ?*const WorkflowIo.Timer = null,
     met: bool = false,
 };
 
@@ -1578,16 +1634,20 @@ pub fn awaitCondition(inst: *Instance, check: *const fn (context: *const anyopaq
         .{ .what = "a condition, with a timeout (Context.awaitTimeout)", .duration = timeout.? }
     else
         .{ .what = "a condition (Context.await)" });
-    var cond: Condition = .{ .check = check, .context = context, .wait = &wait };
+    // The timer wakes a wait no one blocks on, already woken so its firing wakes nothing:
+    // the result is settled at quiescence, after the rest of the activation has run.
+    var timer_wait = wait;
+    timer_wait.woken = true;
+    var timer: WorkflowIo.Timer = .{ .wait = &timer_wait };
+    var cond: Condition = .{ .check = check, .context = context, .wait = &wait, .timer = if (timed) &timer else null };
     try inst.conditions.append(inst.arena(), &cond);
     defer if (!cond.met) inst.removeCondition(&cond);
 
-    var timer: WorkflowIo.Timer = .{ .wait = &wait };
     if (timed) hostStartTimer(inst, &timer, timeout.?);
     defer if (timed and !timer.fired) hostCancelTimer(inst, &timer);
 
     try inst.wio.waitFor(&wait, true);
-    return cond.met;
+    return cond.met or check(context);
 }
 
 fn removeCondition(inst: *Instance, cond: *Condition) void {
@@ -1609,10 +1669,10 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
         .cron_schedule = try a.dupe(u8, init.cron_schedule),
         .first_run_id = try a.dupe(u8, init.first_execution_run_id),
         .continued_run_id = try a.dupe(u8, init.continued_from_execution_run_id),
-        .execution_timeout = zigDuration(init.workflow_execution_timeout),
-        .run_timeout = zigDuration(init.workflow_run_timeout),
-        .task_timeout = zigDuration(init.workflow_task_timeout),
-        .start_time = zigTimestamp(init.start_time),
+        .execution_timeout = proto_time.positiveDurationFromProto(init.workflow_execution_timeout),
+        .run_timeout = proto_time.positiveDurationFromProto(init.workflow_run_timeout),
+        .task_timeout = proto_time.positiveDurationFromProto(init.workflow_task_timeout),
+        .start_time = proto_time.timestampFromProto(init.start_time),
     };
     if (init.parent_workflow_info) |p| inst.info.parent = .{
         .namespace = try a.dupe(u8, p.namespace),
@@ -1858,13 +1918,15 @@ fn recordContinueAsNew(inst: *Instance, workflow_type: []const u8, options: work
         .task_queue = try a.dupe(u8, options.task_queue),
         .arguments = try payloadList(a, args),
         .headers = try header.toEntries(cmd_pb.ContinueAsNewWorkflowExecution.HeadersEntry, a),
-        .workflow_run_timeout = protoDuration(options.run_timeout),
-        .workflow_task_timeout = protoDuration(options.task_timeout),
+        .workflow_run_timeout = proto_time.durationToProto(options.run_timeout),
+        .workflow_task_timeout = proto_time.durationToProto(options.task_timeout),
     };
     if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
     // Core fills an empty memo with the memo this run started with, which would drop
-    // `upsertMemo` changes; sending the current view keeps them.
-    const memo = options.memo orelse inst.memo;
+    // `upsertMemo` changes; sending the current view keeps them. Core can't tell an empty
+    // command memo from an unset one, so an empty option means "keep" too. A current memo
+    // emptied by upserts still gets the start memo back: no command can ask for an empty one.
+    const memo = if (options.memo) |m| (if (m.len > 0) m else inst.memo) else inst.memo;
     try cmd.memo.ensureTotalCapacity(a, memo.len);
     for (memo) |f| cmd.memo.appendAssumeCapacity(.{ .key = try a.dupe(u8, f.name), .value = try f.value.dupe(a) });
     // Core fills missing search attributes with the start values plus upserts, removals
@@ -2078,7 +2140,7 @@ fn outboundNext(inst: *Instance) interceptor.WorkflowOutbound.Next {
 
 /// The logger workflow code gets: the run's, through the outbound interceptors.
 pub fn currentLogger(inst: *Instance) log.Logger {
-    if (inst.outbound.len == 0) return inst.logger;
+    if (inst.outbound.len == 0) return inst.workflowLogger();
     return inst.outboundNext().logger(.{});
 }
 
@@ -2301,10 +2363,10 @@ fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflo
         .task_queue = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue,
         .arguments = try payloadList(a, args),
         .headers = try header.toEntries(cmd_pb.ScheduleActivity.HeadersEntry, a),
-        .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
-        .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
-        .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
-        .heartbeat_timeout = protoDuration(options.heartbeat_timeout),
+        .schedule_to_close_timeout = proto_time.durationToProto(options.schedule_to_close_timeout),
+        .schedule_to_start_timeout = proto_time.durationToProto(options.schedule_to_start_timeout),
+        .start_to_close_timeout = proto_time.durationToProto(options.start_to_close_timeout),
+        .heartbeat_timeout = proto_time.durationToProto(options.heartbeat_timeout),
         .cancellation_type = protoCancellationType(options.cancellation_type),
         .do_not_eagerly_execute = options.disable_eager_execution,
     };
@@ -2351,10 +2413,10 @@ fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: wo
             .activity_type = activity_type,
             .arguments = try payloadList(a, args),
             .headers = try header.toEntries(cmd_pb.ScheduleLocalActivity.HeadersEntry, a),
-            .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
-            .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
-            .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
-            .local_retry_threshold = protoDuration(options.local_retry_threshold),
+            .schedule_to_close_timeout = proto_time.durationToProto(options.schedule_to_close_timeout),
+            .schedule_to_start_timeout = proto_time.durationToProto(options.schedule_to_start_timeout),
+            .start_to_close_timeout = proto_time.durationToProto(options.start_to_close_timeout),
+            .local_retry_threshold = proto_time.durationToProto(options.local_retry_threshold),
             .cancellation_type = protoCancellationType(options.cancellation_type),
         },
         .id_from_seq = options.activity_id.len == 0,
@@ -2417,24 +2479,19 @@ fn zigRetryPolicy(a: Allocator, p: common.RetryPolicy) error{OutOfMemory}!workfl
     const types = try a.alloc([]const u8, p.non_retryable_error_types.items.len);
     for (p.non_retryable_error_types.items, types) |t, *d| d.* = try a.dupe(u8, t);
     return .{
-        .initial_interval = positiveDuration(p.initial_interval),
+        .initial_interval = proto_time.positiveDurationFromProto(p.initial_interval),
         .backoff_coefficient = p.backoff_coefficient,
-        .maximum_interval = positiveDuration(p.maximum_interval),
+        .maximum_interval = proto_time.positiveDurationFromProto(p.maximum_interval),
         .maximum_attempts = p.maximum_attempts,
         .non_retryable_error_types = types,
     };
 }
 
-fn positiveDuration(d: ?proto.google.protobuf.Duration) ?std.Io.Duration {
-    const v = zigDuration(d) orelse return null;
-    return if (v.nanoseconds > 0) v else null;
-}
-
 fn protoRetryPolicy(a: Allocator, rp: workflow.RetryPolicy) !common.RetryPolicy {
     var p: common.RetryPolicy = .{
-        .initial_interval = protoDuration(rp.initial_interval),
+        .initial_interval = proto_time.durationToProto(rp.initial_interval),
         .backoff_coefficient = rp.backoff_coefficient,
-        .maximum_interval = protoDuration(rp.maximum_interval),
+        .maximum_interval = proto_time.durationToProto(rp.maximum_interval),
         .maximum_attempts = rp.maximum_attempts,
     };
     try p.non_retryable_error_types.appendSlice(a, rp.non_retryable_error_types);
@@ -2481,15 +2538,15 @@ pub fn awaitActivity(inst: *Instance, state: *ActivityState) error{Canceled}!voi
         .{ .what = "a side effect (Context.sideEffect)" }
     else
         .{ .what = "local activity", .name = name, .seq = seq };
-    var wait = inst.wio.newWaitPoint(reason);
-    state.waiter = &wait;
-    defer state.waiter = null;
+    var entry: FutureWaiters.Entry = .{ .wait = inst.wio.newWaitPoint(reason) };
+    state.waiters.add(&entry);
+    defer state.waiters.remove(&entry);
     var canceled = false;
     while (state.outcome == null) {
         if (inst.evicting) return error.Canceled;
         // A cancel also wakes the wait point, so each block starts from a fresh one.
-        wait = inst.wio.newWaitPoint(reason);
-        inst.wio.waitFor(&wait, !canceled) catch |err| {
+        entry.wait = inst.wio.newWaitPoint(reason);
+        inst.wio.waitFor(&entry.wait, !canceled) catch |err| {
             inst.cancelActivity(state);
             if (state.cancellation_type != .wait_cancellation_completed) return err;
             canceled = true;
@@ -2521,7 +2578,7 @@ fn requestCancel(inst: *Instance, state: *ActivityState) !void {
     local.backoff_timer = null;
     try inst.emit(.{ .variant = .{ .cancel_timer = .{ .seq = timer } } });
     state.outcome = .{ .cancelled = try localCancelFailure(a, local) };
-    if (state.waiter) |w| inst.wio.wake(w);
+    state.waiters.wakeAll(&inst.wio);
 }
 
 fn localCancelFailure(a: Allocator, local: *const ActivityState.Local) !*const Failure {
@@ -2554,13 +2611,13 @@ fn resolveActivity(inst: *Instance, r: *const act_pb.ResolveActivity) !void {
             if (state.cancel_requested) if (state.local) |local| {
                 // Canceled while the attempt ran: don't start another.
                 state.outcome = .{ .cancelled = try localCancelFailure(a, local) };
-                if (state.waiter) |w| inst.wio.wake(w);
+                state.waiters.wakeAll(&inst.wio);
                 return;
             };
             return inst.startLocalBackoff(state, b);
         },
     };
-    if (state.waiter) |w| inst.wio.wake(w);
+    state.waiters.wakeAll(&inst.wio);
 }
 
 // ---------------------------------------------------------------- child workflows
@@ -2591,9 +2648,9 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
         .task_queue = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue,
         .input = try payloadList(a, args),
         .headers = try header.toEntries(cmd_pb.StartChildWorkflowExecution.HeadersEntry, a),
-        .workflow_execution_timeout = protoDuration(options.execution_timeout),
-        .workflow_run_timeout = protoDuration(options.run_timeout),
-        .workflow_task_timeout = protoDuration(options.task_timeout),
+        .workflow_execution_timeout = proto_time.durationToProto(options.execution_timeout),
+        .workflow_run_timeout = proto_time.durationToProto(options.run_timeout),
+        .workflow_task_timeout = proto_time.durationToProto(options.task_timeout),
         .parent_close_policy = switch (options.parent_close_policy) {
             .terminate => .PARENT_CLOSE_POLICY_TERMINATE,
             .abandon => .PARENT_CLOSE_POLICY_ABANDON,
@@ -2653,18 +2710,18 @@ pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) 
         .started => "the start of child workflow",
         .result => "child workflow",
     }, .name = state.workflow_type };
-    var wait = inst.wio.newWaitPoint(reason);
-    const waiter = switch (phase) {
-        .started => &state.start_waiter,
-        .result => &state.result_waiter,
+    const waiters = switch (phase) {
+        .started => &state.start_waiters,
+        .result => &state.result_waiters,
     };
-    waiter.* = &wait;
-    defer waiter.* = null;
+    var entry: FutureWaiters.Entry = .{ .wait = inst.wio.newWaitPoint(reason) };
+    waiters.add(&entry);
+    defer waiters.remove(&entry);
     var canceled = false;
     while (!state.reached(phase)) {
         if (inst.evicting) return error.Canceled;
-        wait = inst.wio.newWaitPoint(reason);
-        inst.wio.waitFor(&wait, !canceled) catch |err| {
+        entry.wait = inst.wio.newWaitPoint(reason);
+        inst.wio.waitFor(&entry.wait, !canceled) catch |err| {
             inst.cancelChild(state);
             switch (state.cancellation_type) {
                 .try_cancel, .abandon => return err,
@@ -2825,9 +2882,9 @@ pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: [
         .service = state.service,
         .operation = state.operation,
         .input = payload,
-        .schedule_to_close_timeout = protoDuration(options.schedule_to_close_timeout),
-        .schedule_to_start_timeout = protoDuration(options.schedule_to_start_timeout),
-        .start_to_close_timeout = protoDuration(options.start_to_close_timeout),
+        .schedule_to_close_timeout = proto_time.durationToProto(options.schedule_to_close_timeout),
+        .schedule_to_start_timeout = proto_time.durationToProto(options.schedule_to_start_timeout),
+        .start_to_close_timeout = proto_time.durationToProto(options.start_to_close_timeout),
         .cancellation_type = switch (options.cancellation_type) {
             .wait_cancellation_completed => .WAIT_CANCELLATION_COMPLETED,
             .wait_cancellation_requested => .WAIT_CANCELLATION_REQUESTED,
@@ -2863,18 +2920,18 @@ pub fn awaitNexusOperation(inst: *Instance, state: *NexusOperationState, phase: 
         .started => "the start of Nexus operation",
         .result => "Nexus operation",
     }, .name = state.operation };
-    var wait = inst.wio.newWaitPoint(reason);
-    const waiter = switch (phase) {
-        .started => &state.start_waiter,
-        .result => &state.result_waiter,
+    const waiters = switch (phase) {
+        .started => &state.start_waiters,
+        .result => &state.result_waiters,
     };
-    waiter.* = &wait;
-    defer waiter.* = null;
+    var entry: FutureWaiters.Entry = .{ .wait = inst.wio.newWaitPoint(reason) };
+    waiters.add(&entry);
+    defer waiters.remove(&entry);
     var canceled = false;
     while (!state.reached(phase)) {
         if (inst.evicting) return error.Canceled;
-        wait = inst.wio.newWaitPoint(reason);
-        inst.wio.waitFor(&wait, !canceled) catch {
+        entry.wait = inst.wio.newWaitPoint(reason);
+        inst.wio.waitFor(&entry.wait, !canceled) catch {
             inst.cancelNexusOperation(state);
             canceled = true;
         };
@@ -3011,10 +3068,10 @@ fn sendSignalWithStart(
         .workflow_type = .{ .name = workflow_type },
         .task_queue = .{ .name = if (options.task_queue.len > 0) options.task_queue else inst.info.task_queue, .kind = .TASK_QUEUE_KIND_NORMAL },
         .input = .{ .payloads = try payloadList(a, args) },
-        .workflow_execution_timeout = protoDuration(options.execution_timeout),
-        .workflow_run_timeout = protoDuration(options.run_timeout),
-        .workflow_task_timeout = protoDuration(options.task_timeout),
-        .workflow_start_delay = protoDuration(options.start_delay),
+        .workflow_execution_timeout = proto_time.durationToProto(options.execution_timeout),
+        .workflow_run_timeout = proto_time.durationToProto(options.run_timeout),
+        .workflow_task_timeout = proto_time.durationToProto(options.task_timeout),
+        .workflow_start_delay = proto_time.durationToProto(options.start_delay),
         .workflow_id_reuse_policy = switch (options.id_reuse_policy) {
             .unspecified => .WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED,
             .allow_duplicate => .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
@@ -3146,13 +3203,13 @@ pub fn awaitExternal(inst: *Instance, state: *ExternalState) error{Canceled}!voi
         .signal => "a signal to external workflow",
         .cancel => "a cancellation request to external workflow",
     }, .name = state.workflow_id };
-    var wait = inst.wio.newWaitPoint(reason);
-    state.waiter = &wait;
-    defer state.waiter = null;
+    var entry: FutureWaiters.Entry = .{ .wait = inst.wio.newWaitPoint(reason) };
+    state.waiters.add(&entry);
+    defer state.waiters.remove(&entry);
     while (state.outcome == null) {
         if (inst.evicting) return error.Canceled;
-        wait = inst.wio.newWaitPoint(reason);
-        inst.wio.waitFor(&wait, true) catch |err| {
+        entry.wait = inst.wio.newWaitPoint(reason);
+        inst.wio.waitFor(&entry.wait, true) catch |err| {
             inst.cancelExternal(state);
             return err;
         };
@@ -3175,7 +3232,7 @@ fn resolveExternal(inst: *Instance, seq: u32, failure: ?Failure, not_found: bool
     const state = kv.value;
     const f = failure orelse {
         state.outcome = .delivered;
-        if (state.waiter) |w| inst.wio.wake(w);
+        state.waiters.wakeAll(&inst.wio);
         if (state.child) |child| try inst.childCancelRecorded(child);
         return;
     };
@@ -3189,7 +3246,7 @@ fn resolveExternal(inst: *Instance, seq: u32, failure: ?Failure, not_found: bool
         copy.message = try std.fmt.allocPrint(a, "{s} (workflow ID \"{s}\")", .{ copy.message, state.workflow_id });
         state.outcome = if (not_found) .{ .not_found = copy } else .{ .failed = copy };
     }
-    if (state.waiter) |w| inst.wio.wake(w);
+    state.waiters.wakeAll(&inst.wio);
 }
 
 /// A failure user code will read, from the core: a copy in the run's arena of `f`, passed
@@ -3217,24 +3274,6 @@ fn dupeFailure(a: Allocator, f: ?Failure) !*const Failure {
     const out = try a.create(Failure);
     out.* = if (f) |v| try v.dupe(a) else .{ .message = "failed without a failure from the core" };
     return out;
-}
-
-fn zigTimestamp(t: ?proto.google.protobuf.Timestamp) ?std.Io.Timestamp {
-    const v = t orelse return null;
-    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
-}
-
-fn zigDuration(d: ?proto.google.protobuf.Duration) ?std.Io.Duration {
-    const v = d orelse return null;
-    return .{ .nanoseconds = @as(i96, v.seconds) * std.time.ns_per_s + v.nanos };
-}
-
-fn protoDuration(d: ?std.Io.Duration) ?proto.google.protobuf.Duration {
-    const v = d orelse return null;
-    return .{
-        .seconds = @intCast(@divFloor(v.nanoseconds, std.time.ns_per_s)),
-        .nanos = @intCast(@mod(v.nanoseconds, std.time.ns_per_s)),
-    };
 }
 
 // ---------------------------------------------------------------- interceptor chain ends
@@ -3403,7 +3442,16 @@ fn rootContinueAsNew(ptr: *anyopaque, input: interceptor.ContinueAsNewInput, _: 
 
 fn rootLogger(ptr: *anyopaque, _: interceptor.LoggerInput, _: interceptor.WorkflowOutbound.Next) log.Logger {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    return inst.logger;
+    return inst.workflowLogger();
+}
+
+/// The logger workflow code gets before the outbound interceptors: the run's `logger`, gated
+/// by `log_silenced` instead of `replaying`. Left on when `Options.log_during_replay` is set
+/// (`logger.replaying == null`).
+fn workflowLogger(inst: *Instance) log.Logger {
+    var l = inst.logger;
+    if (l.replaying != null) l.replaying = &inst.log_silenced;
+    return l;
 }
 
 // ---------------------------------------------------------------- timers (WorkflowIo host)
@@ -3446,7 +3494,7 @@ fn hostStartTimer(ctx: *anyopaque, timer: *WorkflowIo.Timer, duration: std.Io.Du
     };
     inst.emit(.{ .user_metadata = metadata, .variant = .{ .start_timer = .{
         .seq = seq,
-        .start_to_fire_timeout = protoDuration(duration),
+        .start_to_fire_timeout = proto_time.durationToProto(duration),
     } } }) catch {
         inst.task_failure = "out of memory starting a timer";
     };
@@ -3559,6 +3607,140 @@ test "sleep becomes a durable timer that fires on FireTimer" {
 
     const second = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a);
     try testing.expectEqualStrings("\"rested\"", commandsOf(second)[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+/// Workflows that pass durations beyond protobuf's range; the mode picks the call.
+const LongTimes = struct {
+    const max_retry: workflow.RetryPolicy = .{ .initial_interval = .max, .maximum_interval = .max };
+
+    fn never(_: *const bool) bool {
+        return false;
+    }
+
+    fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, mode, "sleep")) {
+            try ctx.sleep(.max, .{});
+        } else if (std.mem.eql(u8, mode, "await")) {
+            const flag = false;
+            _ = try ctx.awaitTimeout(.max, @as(*const bool, &flag), never);
+        } else if (std.mem.eql(u8, mode, "activity")) {
+            _ = ctx.executeActivityByName(void, "Act", .{
+                .schedule_to_close_timeout = .max,
+                .schedule_to_start_timeout = .max,
+                .start_to_close_timeout = .max,
+                .heartbeat_timeout = .max,
+                .retry_policy = max_retry,
+            }, .{}).get() catch {};
+        } else if (std.mem.eql(u8, mode, "negative")) {
+            _ = ctx.executeActivityByName(void, "Act", .{
+                .start_to_close_timeout = .fromSeconds(10),
+                .heartbeat_timeout = .fromMilliseconds(-1500),
+            }, .{}).get() catch {};
+        } else if (std.mem.eql(u8, mode, "local")) {
+            _ = ctx.executeLocalActivityByName(void, "Act", .{
+                .schedule_to_close_timeout = .max,
+                .schedule_to_start_timeout = .max,
+                .start_to_close_timeout = .max,
+                .local_retry_threshold = .max,
+                .retry_policy = max_retry,
+            }, .{}).get() catch {};
+        } else if (std.mem.eql(u8, mode, "child")) {
+            _ = ctx.executeChildWorkflowByName(void, "Kid", .{
+                .execution_timeout = .max,
+                .run_timeout = .max,
+                .task_timeout = .max,
+                .retry_policy = max_retry,
+            }, .{}).get() catch {};
+        } else if (std.mem.eql(u8, mode, "session")) {
+            _ = try ctx.createSession(.{ .creation_timeout = .max, .execution_timeout = .max, .heartbeat_timeout = .max });
+        } else if (std.mem.eql(u8, mode, "continue")) {
+            return ctx.continueAsNewByName("LongTimes", .{
+                .run_timeout = .max,
+                .task_timeout = .max,
+                .retry_policy = max_retry,
+            }, .{mode});
+        }
+        return "done";
+    }
+    const Def = workflow.Def("LongTimes", run);
+};
+
+/// The protobuf Duration that `Duration.max` is clamped to.
+const longest: proto.google.protobuf.Duration = .{ .seconds = 315_576_000_000, .nanos = 999_999_999 };
+
+/// The commands of a LongTimes run's first activation in `mode`; they live as long as `inst`.
+fn longTimesCommands(inst: *Instance, a: Allocator, mode: []const u8) ![]const cmd_pb.WorkflowCommand {
+    return commandsOf(try inst.activate(&try initActivation(a, "LongTimes", .{mode}), a));
+}
+
+fn expectLongestRetry(rp: ?common.RetryPolicy) !void {
+    try testing.expectEqual(longest, rp.?.initial_interval.?);
+    try testing.expectEqual(longest, rp.?.maximum_interval.?);
+}
+
+test "durations beyond protobuf's range are clamped in workflow commands, and negative ones keep one sign" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    // sleep and awaitTimeout of Duration.max start a timer of the longest protobuf Duration.
+    for ([_][]const u8{ "sleep", "await" }) |mode| {
+        const inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+        defer inst.destroy();
+        const cmds = try longTimesCommands(inst, a, mode);
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqual(longest, cmds[0].variant.?.start_timer.start_to_fire_timeout.?);
+    }
+
+    // Activity, local activity, child, continue-as-new and session timeouts and retry intervals.
+    const act_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer act_inst.destroy();
+    const sched = (try longTimesCommands(act_inst, a, "activity"))[0].variant.?.schedule_activity;
+    try testing.expectEqual(longest, sched.schedule_to_close_timeout.?);
+    try testing.expectEqual(longest, sched.schedule_to_start_timeout.?);
+    try testing.expectEqual(longest, sched.start_to_close_timeout.?);
+    try testing.expectEqual(longest, sched.heartbeat_timeout.?);
+    try expectLongestRetry(sched.retry_policy);
+
+    const local_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer local_inst.destroy();
+    const local = (try longTimesCommands(local_inst, a, "local"))[0].variant.?.schedule_local_activity;
+    try testing.expectEqual(longest, local.schedule_to_close_timeout.?);
+    try testing.expectEqual(longest, local.schedule_to_start_timeout.?);
+    try testing.expectEqual(longest, local.start_to_close_timeout.?);
+    try testing.expectEqual(longest, local.local_retry_threshold.?);
+    try expectLongestRetry(local.retry_policy);
+
+    const child_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer child_inst.destroy();
+    const child = (try longTimesCommands(child_inst, a, "child"))[0].variant.?.start_child_workflow_execution;
+    try testing.expectEqual(longest, child.workflow_execution_timeout.?);
+    try testing.expectEqual(longest, child.workflow_run_timeout.?);
+    try testing.expectEqual(longest, child.workflow_task_timeout.?);
+    try expectLongestRetry(child.retry_policy);
+
+    const can_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer can_inst.destroy();
+    const can_cmds = try longTimesCommands(can_inst, a, "continue");
+    const can = can_cmds[can_cmds.len - 1].variant.?.continue_as_new_workflow_execution;
+    try testing.expectEqual(longest, can.workflow_run_timeout.?);
+    try testing.expectEqual(longest, can.workflow_task_timeout.?);
+    try expectLongestRetry(can.retry_policy);
+
+    // A session's host heartbeats every third of the clamped heartbeat timeout.
+    const session_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer session_inst.destroy();
+    const creation = (try longTimesCommands(session_inst, a, "session"))[0].variant.?.schedule_activity;
+    try testing.expectEqual(longest, creation.schedule_to_start_timeout.?);
+    try testing.expectEqual(longest, creation.start_to_close_timeout.?);
+    try testing.expectEqual(longest, creation.heartbeat_timeout.?);
+    try testing.expect(std.mem.indexOf(u8, creation.arguments.items[0].data, "\"heartbeat_interval_ms\":105192000000333") != null);
+
+    // A negative heartbeat timeout is sent with seconds and nanos of the same sign.
+    const neg_inst = try create(testing.allocator, LongTimes.Def.registered, .{});
+    defer neg_inst.destroy();
+    const negative = (try longTimesCommands(neg_inst, a, "negative"))[0].variant.?.schedule_activity;
+    try testing.expectEqual(proto.google.protobuf.Duration{ .seconds = -1, .nanos = -500_000_000 }, negative.heartbeat_timeout.?);
 }
 
 test "workflow cancellation cancels the pending activity and the workflow" {
@@ -5517,6 +5699,160 @@ test "awaitTimeout returns false when its timer fires first" {
     try testing.expectEqualStrings("false", done[0].variant.?.complete_workflow_execution.result.?.data);
 }
 
+// A signal sets `ready` while the workflow waits on it with a 5 s timeout; returns the
+// result and what `ready` read when awaitTimeout returned.
+const AwaitTimeoutTie = struct {
+    const Ready = workflow.SignalDef("ready", fn () void);
+
+    fn markReady(ready: *bool) void {
+        ready.* = true;
+    }
+
+    fn isReady(ready: *bool) bool {
+        return ready.*;
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const ready = try ctx.allocator().create(bool);
+        ready.* = false;
+        try ctx.setSignalHandler(Ready, ready, markReady);
+        const result = try ctx.awaitTimeout(.fromSeconds(5), ready, isReady);
+        return std.fmt.allocPrint(ctx.allocator(), "result={},ready={}", .{ result, ready.* });
+    }
+};
+const AwaitTimeoutTieWf = workflow.Def("AwaitTimeoutTie", AwaitTimeoutTie.run);
+
+test "awaitTimeout returns true when a signal in its timer's activation made the condition true, in either job order" {
+    for ([_]bool{ true, false }) |signal_first| {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const inst = try create(testing.allocator, AwaitTimeoutTieWf.registered, .{});
+        defer inst.destroy();
+
+        const first = commandsOf(try inst.activate(&try initActivation(a, "AwaitTimeoutTie", .{}), a));
+        try testing.expectEqual(@as(usize, 1), first.len);
+        try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+
+        const signal = try signalJob(a, "ready", .{});
+        const fire: act_pb.WorkflowActivationJob.variant_union = .{ .fire_timer = .{ .seq = 1 } };
+        var act = try oneJob(a, if (signal_first) signal else fire);
+        try act.jobs.append(a, .{ .variant = if (signal_first) fire else signal });
+        const done = commandsOf(try inst.activate(&act, a));
+        try testing.expectEqual(@as(usize, 1), done.len);
+        const got = done[0].variant.?.complete_workflow_execution.result.?.data;
+        // Signal first, the handler sets `ready` before the timer wakes the waiter. Timer
+        // first, the waiter may return before the handler runs; either way the result must
+        // equal `ready` as the waiter returned.
+        if (signal_first) {
+            try testing.expectEqualStrings("\"result=true,ready=true\"", got);
+        } else if (!std.mem.eql(u8, got, "\"result=true,ready=true\"")) {
+            try testing.expectEqualStrings("\"result=false,ready=false\"", got);
+        }
+    }
+}
+
+// A coroutine sets `ready` once its activity returns, while the workflow waits on `ready`
+// with a 5 s timeout. Returns awaitTimeout's result and `ready` at the end of the activation.
+const AwaitTimeoutResultTie = struct {
+    fn fetch(ctx: *workflow.Context, ready: *bool) void {
+        _ = ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get() catch return;
+        ready.* = true;
+    }
+
+    fn isReady(ready: *bool) bool {
+        return ready.*;
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const ready = try ctx.allocator().create(bool);
+        ready.* = false;
+        var f = ctx.io().async(fetch, .{ ctx, ready });
+        const result = try ctx.awaitTimeout(.fromSeconds(5), ready, isReady);
+        f.await(ctx.io());
+        return std.fmt.allocPrint(ctx.allocator(), "result={},ready={}", .{ result, ready.* });
+    }
+};
+const AwaitTimeoutResultTieWf = workflow.Def("AwaitTimeoutResultTie", AwaitTimeoutResultTie.run);
+
+test "awaitTimeout returns true when an activity result in its timer's activation, after the timer, made the condition true" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, AwaitTimeoutResultTieWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "AwaitTimeoutResultTie", .{}), a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+    try testing.expectEqual(@as(u32, 1), first[1].variant.?.schedule_activity.seq);
+
+    // sdk-core gives FireTimer and a non-local ResolveActivity the same rank, so they keep
+    // history order: TimerFired, then ActivityTaskCompleted, in one workflow task.
+    var act = try oneJob(a, .{ .fire_timer = .{ .seq = 1 } });
+    try act.jobs.append(a, .{ .variant = .{ .resolve_activity = .{ .seq = 1, .result = .{ .status = .{ .completed = .{ .result = try converter.toPayload(a, "hi") } } } } } });
+    const done = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    // The result that made the condition true came in the timer's workflow task, so the
+    // documented tie rule ("true also when the timer fired in the same workflow task as the
+    // change that made it true") says true.
+    try testing.expectEqualStrings("\"result=true,ready=true\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// A signal handler queues a request; a coroutine awaiting the queue marks the workflow ready
+// once it sees it, while the workflow waits on `ready` with a 5 s timeout.
+const AwaitTimeoutRelayTie = struct {
+    const Request = workflow.SignalDef("request", fn () void);
+    const State = struct { queued: bool = false, ready: bool = false };
+
+    fn onRequest(s: *State) void {
+        s.queued = true;
+    }
+
+    fn isQueued(s: *State) bool {
+        return s.queued;
+    }
+
+    fn isReady(s: *State) bool {
+        return s.ready;
+    }
+
+    fn relay(ctx: *workflow.Context, s: *State) void {
+        ctx.await(s, isQueued) catch return;
+        s.ready = true;
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{};
+        try ctx.setSignalHandler(Request, s, onRequest);
+        var f = ctx.io().async(relay, .{ ctx, s });
+        const result = try ctx.awaitTimeout(.fromSeconds(5), s, isReady);
+        f.await(ctx.io());
+        return std.fmt.allocPrint(ctx.allocator(), "result={},ready={}", .{ result, s.ready });
+    }
+};
+const AwaitTimeoutRelayTieWf = workflow.Def("AwaitTimeoutRelayTie", AwaitTimeoutRelayTie.run);
+
+test "awaitTimeout returns true when a signal in its timer's activation made the condition true through another coroutine" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, AwaitTimeoutRelayTieWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "AwaitTimeoutRelayTie", .{}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+
+    // The order sdk-core sends: SignalWorkflow before FireTimer.
+    var act = try oneJob(a, try signalJob(a, "request", .{}));
+    try act.jobs.append(a, .{ .variant = .{ .fire_timer = .{ .seq = 1 } } });
+    const done = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("\"result=true,ready=true\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
 test "eviction while awaiting a condition frees everything" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
@@ -5686,6 +6022,131 @@ test "eviction ends a wait for an activity's cancellation to complete" {
     const running = try create(testing.allocator, WaitCancelWf.registered, .{});
     _ = try running.activate(&try initActivation(a, "WaitCancel", .{mode}), a);
     running.destroy();
+}
+
+// Two coroutines wait on one future: first a coroutine started with `io.async`, which nothing
+// cancels, then the workflow function. The workflow returns the order they returned in and
+// what each got: "<first> <second>: async=<outcome> root=<outcome>", an outcome being the
+// result, "delivered", or the error's name. The future is the one `kind` names ("activity",
+// "local", "child", "nexus" or "signal"), with the cancellation type `cancellation`. A child
+// or Nexus operation is waited on in `started`, then in `get`.
+const SharedFuture = struct {
+    const Order = struct {
+        ready: std.Io.Event = .unset,
+        who: [2][]const u8 = .{ "", "" },
+        n: usize = 0,
+
+        fn returned(o: *Order, who: []const u8) void {
+            o.who[o.n] = who;
+            o.n += 1;
+        }
+    };
+
+    fn Waiters(comptime F: type) type {
+        return struct {
+            fn outcome(f: F) []const u8 {
+                if (@hasDecl(F, "started")) _ = f.started() catch |err| return @errorName(err);
+                const r = f.get() catch |err| return @errorName(err);
+                return if (@TypeOf(r) == void) "delivered" else r;
+            }
+
+            fn first(f: F, io: std.Io, order: *Order) []const u8 {
+                order.ready.set(io);
+                const r = outcome(f);
+                order.returned("async");
+                return r;
+            }
+
+            fn run(ctx: *workflow.Context, f: F) ![]const u8 {
+                const io = ctx.io();
+                var order: Order = .{};
+                var other = io.async(first, .{ f, io, &order });
+                // The coroutine above begins waiting before this one does.
+                order.ready.waitUncancelable(io);
+                const mine = outcome(f);
+                order.returned("root");
+                const theirs = other.await(io);
+                return std.fmt.allocPrint(ctx.allocator(), "{s} {s}: async={s} root={s}", .{ order.who[0], order.who[1], theirs, mine });
+            }
+        };
+    }
+
+    fn run(ctx: *workflow.Context, kind: []const u8, cancellation: []const u8) ![]const u8 {
+        const k = std.meta.stringToEnum(enum { activity, local, child, nexus, signal }, kind) orelse return error.InvalidPayload;
+        switch (k) {
+            .activity => {
+                const ct = std.meta.stringToEnum(ActivityState.CancellationType, cancellation) orelse return error.InvalidPayload;
+                const f = ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10), .cancellation_type = ct }, .{"x"});
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+            .local => {
+                const ct = std.meta.stringToEnum(ActivityState.CancellationType, cancellation) orelse return error.InvalidPayload;
+                const f = ctx.executeLocalActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(5), .cancellation_type = ct }, .{"x"});
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+            .child => {
+                const ct = std.meta.stringToEnum(workflow.ChildWorkflowCancellationType, cancellation) orelse return error.InvalidPayload;
+                const f = ctx.executeChildWorkflow(ChildWf.Kid, .{ .id = "kid-1", .cancellation_type = ct }, .{"kid"});
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+            .nexus => {
+                const ct = std.meta.stringToEnum(workflow.NexusOperationCancellationType, cancellation) orelse return error.InvalidPayload;
+                const f = ctx.executeNexusOperation(NexusWf.Service, NexusWf.Echo, .{ .endpoint = "hello-endpoint", .cancellation_type = ct }, .{ .message = "hi" });
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+            .signal => {
+                const f = ctx.signalExternalWorkflow(ExternalWf.Approve, "target", "", .{"ann"});
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+        }
+    }
+    const Def = workflow.Def("SharedFuture", run);
+
+    /// A run of `SharedFuture` for `kind` and `cancellation`, after its first activation.
+    fn start(a: Allocator, kind: []const u8, cancellation: []const u8) !*Instance {
+        const inst = try create(testing.allocator, Def.registered, .{});
+        errdefer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "SharedFuture", .{ kind, cancellation }), a);
+        return inst;
+    }
+
+    /// Evicts `inst` while both coroutines wait: `teardown` must leave no coroutine alive, and
+    /// `destroy` must free everything (testing.allocator reports leaks).
+    fn evict(inst: *Instance) !void {
+        defer inst.destroy();
+        try testing.expectEqual(@as(usize, 0), inst.teardown());
+    }
+};
+
+test "activity: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "activity", "wait_cancellation_completed");
+    defer inst.destroy();
+    const done = try inst.activate(&try resolveOk(a, 1, "shared"), a);
+    try testing.expectEqualStrings("\"async root: async=shared root=shared\"", completedWith(done));
+}
+
+test "activity: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "activity", "try_cancel");
+    defer inst.destroy();
+    // Canceling the workflow function's wait requests the activity's cancellation.
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.request_cancel_activity.seq);
+    const done = try inst.activate(&try resolveOk(a, 1, "finished anyway"), a);
+    try testing.expectEqualStrings("\"root async: async=finished anyway root=Canceled\"", completedWith(done));
+}
+
+test "activity: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "activity", "wait_cancellation_completed"));
 }
 
 // Runs `Greet` as a local activity with the cancellation type named by `mode`; "no_timeouts"
@@ -6015,6 +6476,41 @@ test "eviction while a local activity backs off frees everything" {
     inst.destroy();
 }
 
+test "local activity: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "local", "wait_cancellation_completed");
+    defer inst.destroy();
+    const done = try inst.activate(&try resolveLocal(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, "shared") } }), a);
+    try testing.expectEqualStrings("\"async root: async=shared root=shared\"", completedWith(done));
+}
+
+test "local activity: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "local", "try_cancel");
+    defer inst.destroy();
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.request_cancel_local_activity.seq);
+    const done = try inst.activate(&try resolveLocal(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, "finished anyway") } }), a);
+    try testing.expectEqualStrings("\"root async: async=finished anyway root=Canceled\"", completedWith(done));
+}
+
+test "local activity: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "local", "wait_cancellation_completed"));
+
+    // While the local activity waits for its next attempt.
+    const backing_off = try SharedFuture.start(a, "local", "wait_cancellation_completed");
+    _ = try backing_off.activate(&try localBackoff(a, 1), a);
+    try SharedFuture.evict(backing_off);
+}
+
 const Cron = struct {
     fn run(ctx: *workflow.Context) !i64 {
         const last: i64 = if (ctx.hasLastCompletionResult()) try ctx.lastCompletionResult(i64) else 0;
@@ -6169,6 +6665,47 @@ test "info: retry policy, priority, original run ID, and the previous run's fail
     try testing.expect(inst.ctx.info().retry_policy == null);
     try testing.expectEqualDeep(workflow.Priority{}, inst.ctx.info().priority);
     try testing.expect(inst.ctx.previousRunFailure() == null);
+}
+
+const TimeoutInfoWf = struct {
+    /// Returns "<execution>/<run>/<task>" in whole seconds, "null" for each unset one.
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const info = ctx.info();
+        return std.fmt.allocPrint(ctx.allocator(), "{?d}/{?d}/{?d}", .{
+            seconds(info.execution_timeout),
+            seconds(info.run_timeout),
+            seconds(info.task_timeout),
+        });
+    }
+
+    fn seconds(d: ?std.Io.Duration) ?i96 {
+        return if (d) |v| @divTrunc(v.nanoseconds, std.time.ns_per_s) else null;
+    }
+};
+const TimeoutInfoWfDef = workflow.Def("TimeoutInfo", TimeoutInfoWf.run);
+
+test "info: timeouts are null when absent or zero and the start values when set" {
+    const Case = struct { execution: ?proto.google.protobuf.Duration, run: ?proto.google.protobuf.Duration, task: ?proto.google.protobuf.Duration, want: []const u8 };
+    const cases = [_]Case{
+        .{ .execution = null, .run = null, .task = null, .want = "\"null/null/null\"" },
+        // The server sends a zero Duration for a timeout the workflow was started without.
+        .{ .execution = .{}, .run = .{}, .task = .{}, .want = "\"null/null/null\"" },
+        .{ .execution = .{ .seconds = -1 }, .run = .{ .nanos = -1 }, .task = .{}, .want = "\"null/null/null\"" },
+        .{ .execution = .{ .seconds = 3600 }, .run = .{ .seconds = 60 }, .task = .{ .seconds = 10 }, .want = "\"3600/60/10\"" },
+    };
+    for (cases) |c| {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const inst = try create(testing.allocator, TimeoutInfoWfDef.registered, .{});
+        defer inst.destroy();
+        var act = try initActivation(a, "TimeoutInfo", .{});
+        const init = &act.jobs.items[0].variant.?.initialize_workflow;
+        init.workflow_execution_timeout = c.execution;
+        init.workflow_run_timeout = c.run;
+        init.workflow_task_timeout = c.task;
+        try testing.expectEqualStrings(c.want, completedWith(try inst.activate(&act, a)));
+    }
 }
 
 const CurrentUpdateWf = struct {
@@ -8360,6 +8897,43 @@ test "child workflow: eviction ends waits for the start and for the cancellation
     canceling.destroy();
 }
 
+test "child workflow: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "child", "wait_cancellation_completed");
+    defer inst.destroy();
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try childStarted(a, 1, "kid-run"), a)).len);
+    const done = try inst.activate(&try childResolved(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, "shared") } }), a);
+    try testing.expectEqualStrings("\"async root: async=shared root=shared\"", completedWith(done));
+}
+
+test "child workflow: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "child", "try_cancel");
+    defer inst.destroy();
+    _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.cancel_child_workflow_execution.child_workflow_seq);
+    const done = try inst.activate(&try childResolved(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, "finished anyway") } }), a);
+    try testing.expectEqualStrings("\"root async: async=finished anyway root=Canceled\"", completedWith(done));
+}
+
+test "child workflow: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "child", "wait_cancellation_completed"));
+
+    // Both waiting in `get`, once the child started.
+    const started = try SharedFuture.start(a, "child", "wait_cancellation_completed");
+    _ = try started.activate(&try childStarted(a, 1, "kid-run"), a);
+    try SharedFuture.evict(started);
+}
+
 test "child workflow: an empty workflow type returns error.InvalidOptions from get" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
@@ -8851,6 +9425,44 @@ test "nexus: eviction ends waits for the start and for the cancellation to resol
     canceling.destroy();
 }
 
+test "nexus: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "nexus", "wait_cancellation_completed");
+    defer inst.destroy();
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a)).len);
+    const done = try inst.activate(&try nexusResolved(a, 1, try nexusOutput(a, "shared")), a);
+    try testing.expectEqualStrings("\"async root: async=shared root=shared\"", completedWith(done));
+}
+
+test "nexus: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "nexus", "try_cancel");
+    defer inst.destroy();
+    _ = try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+    // A canceled wait on a Nexus operation goes on until the core resolves it.
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.request_cancel_nexus_operation.seq);
+    const done = try inst.activate(&try nexusResolved(a, 1, try nexusOutput(a, "finished anyway")), a);
+    try testing.expectEqualStrings("\"async root: async=finished anyway root=finished anyway\"", completedWith(done));
+}
+
+test "nexus: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "nexus", "wait_cancellation_completed"));
+
+    // Both waiting in `get`, once the operation started.
+    const started = try SharedFuture.start(a, "nexus", "wait_cancellation_completed");
+    _ = try started.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+    try SharedFuture.evict(started);
+}
+
 // Signals to other workflows. `ExternalWf.Kid` never runs here: the tests resolve it.
 const ExternalWf = struct {
     const Approve = workflow.SignalDef("approve", fn (approver: []const u8) void);
@@ -9015,6 +9627,37 @@ test "signal external: eviction ends a wait for a delivery" {
     inst.destroy(); // testing.allocator reports leaks
 }
 
+test "signal external: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "signal", "wait_cancellation_completed");
+    defer inst.destroy();
+    const done = try inst.activate(&try signalResolved(a, 1, null, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a);
+    try testing.expectEqualStrings("\"async root: async=delivered root=delivered\"", completedWith(done));
+}
+
+test "signal external: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "signal", "try_cancel");
+    defer inst.destroy();
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.cancel_signal_workflow.seq);
+    // The server had recorded the signal, so it is delivered anyway.
+    const done = try inst.activate(&try signalResolved(a, 1, null, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a);
+    try testing.expectEqualStrings("\"root async: async=delivered root=Canceled\"", completedWith(done));
+}
+
+test "signal external: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "signal", "wait_cancellation_completed"));
+}
+
 fn cancelResolved(a: Allocator, seq: u32, failure: ?Failure, cause: proto.temporal.api.enums.v1.CancelExternalWorkflowExecutionFailedCause) !act_pb.WorkflowActivation {
     return oneJob(a, .{ .resolve_request_cancel_external_workflow = .{ .seq = seq, .failure = failure, .cause = cause } });
 }
@@ -9105,8 +9748,20 @@ const Continue = struct {
     fn continueFromHandler(ctx: *workflow.Context) !void {
         return ctx.continueAsNew(FromSignal, .{}, .{});
     }
+    /// Upserts the memo's status, then continues as new with an explicit empty memo.
+    fn emptyMemo(ctx: *workflow.Context, n: u32) !u32 {
+        try ctx.upsertMemo(.{ .status = "updated" });
+        return ctx.continueAsNew(EmptyMemo, .{ .memo = &.{} }, .{n + 1});
+    }
+    /// Removes every memo key, then continues as new with the default options.
+    fn clearedMemo(ctx: *workflow.Context, n: u32) !u32 {
+        try ctx.upsertMemo(.{ .status = null });
+        return ctx.continueAsNew(ClearedMemo, .{}, .{n + 1});
+    }
     const WithOptions = workflow.Def("WithOptions", withOptions);
     const Defaults = workflow.Def("Defaults", defaults);
+    const EmptyMemo = workflow.Def("EmptyMemo", emptyMemo);
+    const ClearedMemo = workflow.Def("ClearedMemo", clearedMemo);
     const Bare = workflow.Def("Bare", bare);
     const FromSignal = workflow.Def("FromSignal", fromSignal);
 };
@@ -9160,6 +9815,39 @@ test "continue-as-new: default options keep the task queue, timeouts and retry p
     try testing.expectEqualStrings("owner", can.memo.items[0].key);
     try testing.expectEqualStrings("status", can.memo.items[1].key);
     try testing.expectEqualStrings("\"upserted\"", can.memo.items[1].value.?.data);
+}
+
+test "continue-as-new: an empty memo option sends the current memo, and a memo emptied by upserts sends none" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var start_memo: common.Memo = .{};
+    for (try converter.toFields(a, .{ .status = "original" })) |f|
+        try start_memo.fields.append(a, .{ .key = f.name, .value = f.value });
+
+    {
+        const inst = try create(testing.allocator, Continue.EmptyMemo.registered, .{ .task_queue = "tq" });
+        defer inst.destroy();
+        var act = try initActivation(a, "EmptyMemo", .{@as(u32, 1)});
+        act.jobs.items[0].variant.?.initialize_workflow.memo = start_memo;
+        const cmds = commandsOf(try inst.activate(&act, a));
+        try testing.expectEqual(@as(usize, 2), cmds.len);
+        const can = cmds[1].variant.?.continue_as_new_workflow_execution;
+        try testing.expectEqual(@as(usize, 1), can.memo.items.len);
+        try testing.expectEqualStrings("status", can.memo.items[0].key);
+        try testing.expectEqualStrings("\"updated\"", can.memo.items[0].value.?.data);
+    }
+    {
+        // Core fills this empty command memo with the start memo: the documented limit.
+        const inst = try create(testing.allocator, Continue.ClearedMemo.registered, .{ .task_queue = "tq" });
+        defer inst.destroy();
+        var act = try initActivation(a, "ClearedMemo", .{@as(u32, 1)});
+        act.jobs.items[0].variant.?.initialize_workflow.memo = start_memo;
+        const cmds = commandsOf(try inst.activate(&act, a));
+        try testing.expectEqual(@as(usize, 2), cmds.len);
+        try testing.expectEqual(@as(usize, 0), inst.memo.len);
+        try testing.expectEqual(@as(usize, 0), cmds[1].variant.?.continue_as_new_workflow_execution.memo.items.len);
+    }
 }
 
 test "continue-as-new: error.ContinueAsNew without ctx.continueAsNew fails the workflow saying so" {
@@ -9734,6 +10422,75 @@ test "a coroutine that refuses to exit on eviction is reported, and the rest of 
     try testing.expectEqualStrings("workflow coroutines did not exit on eviction (blocked with cancel protection on?); leaking their stacks", recorder.message);
     try testing.expectEqualStrings("1", recorder.get("count").?);
     try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{hog_stack}), recorder.get("stack_bytes").?);
+}
+
+// A workflow that logs an error when its activity wait fails, as ordinary workflow code does.
+// Eviction ends the wait with error.Canceled, though nothing failed: the run only leaves this
+// worker. The logger built with `with` before the wait must fall silent too.
+const EvictionLog = struct {
+    var replaying_after_wait: ?bool = null;
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const tagged = try ctx.logger().with(ctx.allocator(), .{ .Step = "charge" });
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get() catch |err| {
+            replaying_after_wait = ctx.isReplaying();
+            tagged.err("activity failed", .{ .err = err });
+            ctx.logger().err("activity failed", .{ .err = err });
+            return err;
+        };
+    }
+
+    /// Wraps the next logger with a field, as a logging interceptor does.
+    const Tagging = struct {
+        ctx: ?*workflow.Context = null,
+
+        pub fn interceptWorkflow(t: *Tagging, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+            t.ctx = ctx;
+            return .{ .outbound = interceptor.WorkflowOutbound.from(Tagging, t) };
+        }
+
+        pub fn logger(t: *Tagging, input: interceptor.LoggerInput, next: interceptor.WorkflowOutbound.Next) log.Logger {
+            const base = next.logger(input);
+            return base.with(t.ctx.?.allocator(), .{ .Tagged = "workflow" }) catch base;
+        }
+    };
+};
+const EvictionLogWf = workflow.Def("EvictionLog", EvictionLog.run);
+
+test "a run evicted while its code waits logs nothing from the workflow's logger, unless log_during_replay is set" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_]bool{ false, true }) |log_during_replay| {
+        var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
+        defer recorder.arena.deinit();
+        EvictionLog.replaying_after_wait = null;
+        const inst = try create(testing.allocator, EvictionLogWf.registered, .{ .logger = recorder.sink(), .log_during_replay = log_during_replay });
+        const first = commandsOf(try inst.activate(&try initActivation(a, "EvictionLog", .{}), a));
+        try testing.expectEqual(@as(usize, 1), first.len);
+        try testing.expectEqual(@as(usize, 0), inst.teardown());
+        inst.destroy();
+        // With log_during_replay, lines logged during eviction are emitted as replay's are.
+        try testing.expectEqual(@as(usize, if (log_during_replay) 2 else 0), recorder.count);
+        if (log_during_replay) try testing.expectEqualStrings("activity failed", recorder.message);
+        // Eviction is not replay: isReplaying still reads what the activation set.
+        try testing.expectEqual(@as(?bool, false), EvictionLog.replaying_after_wait);
+    }
+}
+
+test "a run evicted while its code waits logs nothing through an outbound interceptor's logger" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
+    defer recorder.arena.deinit();
+    var impl: EvictionLog.Tagging = .{};
+    const interceptors = [_]interceptor.Worker{.from(EvictionLog.Tagging, &impl)};
+    const inst = try create(testing.allocator, EvictionLogWf.registered, .{ .logger = recorder.sink(), .interceptors = &interceptors });
+    _ = try inst.activate(&try initActivation(a, "EvictionLog", .{}), a);
+    try testing.expectEqual(@as(usize, 0), inst.teardown());
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 0), recorder.count);
 }
 
 test "eviction sends nothing: commands from unwinding coroutines are dropped" {

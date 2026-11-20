@@ -2,6 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protobuf = @import("protobuf");
 const protos = @import("deps/protos.zig");
+/// The package manifest: its `.version` is the SDK's version, which `temporal.version` reads.
+const manifest = @import("build.zig.zon");
+/// The fuzz corpus size limits, which src/fuzz.zig shares.
+const fuzz_limits = @import("src/fuzz/limits.zig");
 
 const core_header_name = "temporal-sdk-core-c-bridge.h";
 const core_header = "deps/sdk-core/crates/sdk-core-c-bridge/include/" ++ core_header_name;
@@ -25,6 +29,7 @@ pub fn build(b: *std.Build) void {
     );
     const protoc_opt = b.option([]const u8, "protoc", "Path to protoc used by the cargo build (default: pinned download)");
     const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
+    const hang_report = b.option(u32, "test-hang-report", "Print the name, elapsed time and every thread's stack of a test still running after this many seconds, without ending it (default: 300; 0 turns the report off)") orelse 300;
     // A checkout tests against the test server release its tests were last verified with: a
     // new release reaches every machine without a cached copy at once, and one has broken
     // updates (sdk-java 1.41.0's never delivers a workflow task that carries one). A project
@@ -36,6 +41,7 @@ pub fn build(b: *std.Build) void {
     ) orelse if (b.isRoot()) verified_test_server_version else "default";
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "test_server_version", test_server_version);
+    build_options.addOption([]const u8, "version", manifest.version);
 
     // A fetched package has neither the submodule nor samples/, so the steps that need them
     // exist only in a checkout.
@@ -103,12 +109,12 @@ pub fn build(b: *std.Build) void {
     });
     test_module.addOptions("build_options", build_options);
     linkCoreLib(test_module, target, core.lib);
-    const unit_tests = b.addTest(.{ .root_module = test_module, .filters = test_filters });
+    const unit_tests = b.addTest(.{ .root_module = test_module, .filters = test_filters, .test_runner = testRunner(b) });
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    test_step.dependOn(&runTests(b, unit_tests, hang_report).step);
 
     if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance);
-    if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters);
+    if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters, hang_report);
     if (pathExists(b, "tools/checks")) addCheckSteps(b, .{
         .target = target,
         .optimize = optimize,
@@ -121,7 +127,16 @@ pub fn build(b: *std.Build) void {
         .test_filters = test_filters,
         .forwarded = .{ .core_lib = core_lib_opt, .core_bundle = core_bundle_opt, .protoc = protoc_opt },
     });
-    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, .{
+    // The test of the hang-dump script CI wraps samples-test in. It needs bash and ps, so a
+    // checkout runs it on hosts other than Windows; it prints a skip where ps or job control is
+    // missing.
+    if (b.graph.host.result.os.tag != .windows and pathExists(b, "scripts/run-with-hang-dump-test.sh")) {
+        const hang_dump = b.addSystemCommand(&.{ "bash", "scripts/run-with-hang-dump-test.sh" });
+        hang_dump.setCwd(b.path("."));
+        hang_dump.has_side_effects = true;
+        test_step.dependOn(&hang_dump.step);
+    }
+    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, hang_report, .{
         .core_lib = core_lib_opt,
         .core_bundle = core_bundle_opt,
         .protoc = protoc_opt,
@@ -151,6 +166,7 @@ fn addReadmeSteps(
     temporal: *std.Build.Module,
     test_step: *std.Build.Step,
     test_filters: []const []const u8,
+    hang_report: u32,
 ) void {
     const examples = b.addTest(.{
         .name = "readme-examples",
@@ -162,8 +178,9 @@ fn addReadmeSteps(
             .imports = &.{.{ .name = "temporal", .module = temporal }},
         }),
         .filters = test_filters,
+        .test_runner = testRunner(b),
     });
-    test_step.dependOn(&b.addRunArtifact(examples).step);
+    test_step.dependOn(&runTests(b, examples, hang_report).step);
 
     const tool_module = b.createModule(.{
         .root_source_file = b.path("tools/readme_examples.zig"),
@@ -593,7 +610,7 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         linter.addPaths(.{
             .include_dirs = if (pathExists(b, "conformance")) &include_dirs else include_dirs[0 .. include_dirs.len - 1],
             .exclude_dirs = &.{ b.path("src/proto"), b.path("tools/checks/fixtures") },
-            .exclude_files = &.{ b.path("src/proto.zig"), b.path("samples/dispatch.zig") },
+            .exclude_files = &.{ b.path("src/proto.zig"), b.path("samples/dispatch.zig"), b.path("tools/test_runner/main.zig") },
         });
         const scan = linter.build().cast(std.Build.Step.Run).?;
         // zlinter resolves the build configuration relative to its working directory.
@@ -646,21 +663,152 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         clean.expectStdErrEqual("");
     }
 
+    // hang report (tools/test_runner)
+    if (testRunner(b)) |runner| {
+        const fixtures = "tools/checks/fixtures/hang_report/";
+        const Fixture = struct {
+            fn build(owner: *std.Build, name: []const u8, root: []const u8, test_runner: std.Build.Step.Compile.TestRunner) *std.Build.Step.Compile {
+                return owner.addTest(.{
+                    .name = owner.fmt("hang-report-fixture-{s}", .{name}),
+                    .root_module = owner.createModule(.{
+                        .root_source_file = owner.path(owner.fmt("{s}{s}", .{ fixtures, root })),
+                        .target = owner.graph.host,
+                        .optimize = .Debug,
+                    }),
+                    .test_runner = test_runner,
+                });
+            }
+        };
+        const hang = Fixture.build(b, "hang", "hang.zig", runner);
+        const slow = Fixture.build(b, "slow", "slow.zig", runner);
+
+        const tool = checkTool(b, "hang-report-check", "tools/checks/hang_report.zig");
+        const names = addCheckCase(b, in.test_step, tool, "hang report names a waiting test", 0);
+        // "in <function> (" is a frame's own line: the bare name also appears in its caller's source line.
+        names.addArgs(&.{ "60", "still running after", "waits forever on an event nothing sets", "in waitsForever (", "in helperWaitsForever (", "--" });
+        names.addArtifactArg(hang);
+        names.addArg("--hang-report=2");
+
+        // A hung test may be stuck holding std's stderr lock; the report must not wait for it.
+        const stderr_held = Fixture.build(b, "stderr-held", "stderr_held.zig", runner);
+        const held = addCheckCase(b, in.test_step, tool, "hang report names a test while stderr is held", 0);
+        held.addArgs(&.{ "60", "still running after", "waits while another thread holds stderr", "in holdsStderrForever (", "--" });
+        held.addArtifactArg(stderr_held);
+        held.addArg("--hang-report=2");
+
+        // A test may point fd 2 at /dev/null, as EphemeralServer's OutputRedirect does while a
+        // dev server starts; the report must still reach the stderr the runner started with.
+        const redirected = Fixture.build(b, "stderr-redirected", "stderr_redirected.zig", runner);
+        const redirect = addCheckCase(b, in.test_step, tool, "hang report names a test whose stderr is redirected", 0);
+        redirect.addArgs(&.{ "60", "still running after", "waits forever with stderr pointed at /dev/null", "in waitsWithStderrRedirected (", "end of the report for", "--" });
+        redirect.addArtifactArg(redirected);
+        redirect.addArg("--hang-report=2");
+
+        // addRunArtifact would turn on test-runner mode and hide the output. The report's first
+        // line is matched without its elapsed seconds, which a stall of the whole process makes
+        // larger than the limit; each fixture passes only once the report has frozen its thread
+        // and let it go, which proves the report came while the test ran. The test may pass and
+        // the process end before the report has printed the stacks, so only its first line is
+        // matched.
+        const RunsToPass = struct {
+            fn add(owner: *std.Build, test_step: *std.Build.Step, name: []const u8, fixture: *std.Build.Step.Compile, test_name: []const u8) void {
+                const run = std.Build.Step.Run.create(owner, owner.fmt("check hang report {s}", .{name}));
+                run.addArtifactArg(fixture);
+                run.addArg("--hang-report=1");
+                run.has_side_effects = true;
+                run.expectExitCode(0);
+                run.expectStdErrMatch(owner.fmt("test-hang-report: '{s}' is still running after ", .{test_name}));
+                run.expectStdErrMatch("All 1 tests passed.");
+                test_step.dependOn(&run.step);
+            }
+        };
+        const outlasts = Fixture.build(b, "outlasts", "outlasts.zig", runner);
+        RunsToPass.add(b, in.test_step, "slow test passes", outlasts, "outlasts.test.passes once the report has let it go");
+
+        // With the report off, the output is Zig's runner's, byte for byte.
+        const off = std.Build.Step.Run.create(b, "check hang report off");
+        off.addArtifactArg(slow);
+        off.addArg("--hang-report=0");
+        off.has_side_effects = true;
+        off.expectExitCode(0);
+        off.expectStdErrEqual("1/1 slow.test.finishes after the limit...OK\nAll 1 tests passed.\n");
+        in.test_step.dependOn(&off.step);
+
+        in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "hang-report-check-tool", .root_module = tool.root_module, .filters = in.test_filters })).step);
+
+        // A test frozen while it allocates through std.testing.allocator holds std.debug's
+        // unwinder lock; the report must not wait on it forever. The fixture bounds itself.
+        const busy = Fixture.build(b, "busy", "busy.zig", runner);
+        RunsToPass.add(b, in.test_step, "allocating test passes", busy, "busy.test.allocates until the report has let it go");
+
+        // Threads go on and reuse their stacks the moment the report lets them go, while another
+        // holds std.debug's symbol lock; the report must use only what it read while each was
+        // frozen, not wait on the lock without end, reach its end line and not crash.
+        const moved_on = Fixture.build(b, "moved-on", "moved_on.zig", runner);
+        const moved = addCheckCase(b, in.test_step, tool, "hang report thread that goes on before its unwind passes", 0);
+        moved.addArgs(&.{
+            "60",
+            "'moved_on.test.goes on after the report lets it go while another thread holds the symbol lock' is still running after ",
+            "moved_on: the test's thread went on after the report let it go",
+            "moved_on: the thread holding std.debug's symbol lock went on after the report let it go",
+            "another thread holds std.debug's symbol lock",
+            "end of the report for 'moved_on.test.goes on after the report lets it go while another thread holds the symbol lock'",
+            "--",
+        });
+        moved.addArtifactArg(moved_on);
+        moved.addArg("--hang-report=1");
+
+        // A thread may take std.debug's symbol lock after the report found it free and keep it,
+        // as moved_on.zig's holder does when its setup is slow by about a second; the report
+        // must still reach its end line.
+        const symbol_lock_late = Fixture.build(b, "symbol-lock-late", "symbol_lock_late.zig", runner);
+        const late = addCheckCase(b, in.test_step, tool, "hang report finishes when the symbol lock is taken during its lookup", 0);
+        late.addArgs(&.{
+            "60",
+            "'symbol_lock_late.test.waits while another thread takes the symbol lock during the report' is still running after ",
+            "end of the report for 'symbol_lock_late.test.waits while another thread takes the symbol lock during the report'",
+            "--",
+        });
+        late.addArtifactArg(symbol_lock_late);
+        late.addArg("--hang-report=1");
+
+        // A thread may keep taking and releasing std.debug's symbol lock, so that no single wait
+        // of the report's symbol helper lasts long; the report must still give up on symbols once
+        // the helper's waits add up to 1 s and reach its end line. The churner also shows that
+        // the waiting helper is named hang-report-sym, which on macOS only the thread itself can do.
+        const symbol_lock_churn = Fixture.build(b, "symbol-lock-churn", "symbol_lock_churn.zig", runner);
+        const churn = addCheckCase(b, in.test_step, tool, "hang report finishes while another thread keeps taking and releasing the symbol lock", 0);
+        churn.addArgs(&.{
+            "60",
+            "'symbol_lock_churn.test.waits while another thread keeps taking and releasing the symbol lock' is still running after ",
+            "symbol_lock_churn: a thread named hang-report-sym waits while this thread holds std.debug's symbol lock",
+            "another thread holds std.debug's symbol lock; the stacks that follow are bare addresses",
+            "end of the report for 'symbol_lock_churn.test.waits while another thread keeps taking and releasing the symbol lock'",
+            "--",
+        });
+        churn.addArtifactArg(symbol_lock_churn);
+        churn.addArg("--hang-report=1");
+    }
+
     // zig build tsan
     {
-        // Renders a known-findings file and runs `artifact` with it through `exec`, which
-        // also makes a report end the process with exit 66 (see tools/checks/tsan_suppressions.zig).
+        // Renders a known-findings file and adds to `run` the arguments that run `artifact`
+        // with it through `exec`, which also makes a report end the process with exit 66
+        // (see tools/checks/tsan_suppressions.zig), and symbolize with `symbolizer` when
+        // given. `run` runs the suppressions tool.
         const Known = struct {
-            fn run(b2: *std.Build, tool: *std.Build.Step.Compile, zon: []const u8, artifact: *std.Build.Step.Compile) *std.Build.Step.Run {
+            fn addArgs(b2: *std.Build, tool: *std.Build.Step.Compile, zon: []const u8, run: *std.Build.Step.Run, artifact: *std.Build.Step.Compile, symbolizer: ?*std.Build.Step.Compile) void {
                 const render = b2.addRunArtifact(tool);
                 render.setName(b2.fmt("render {s}", .{zon}));
                 render.addArg("render");
                 render.addFileArg(b2.path(zon));
-                const exec = b2.addRunArtifact(tool);
-                exec.addArg("exec");
-                exec.addFileArg(render.captureStdOut(.{ .basename = "tsan.supp" }));
-                exec.addArtifactArg(artifact);
-                return exec;
+                run.addArg("exec");
+                if (symbolizer) |s| {
+                    run.addArg("--symbolizer");
+                    run.addArtifactArg(s);
+                }
+                run.addFileArg(render.captureStdOut(.{ .basename = "tsan.supp" }));
+                run.addArtifactArg(artifact);
             }
         };
         const suppressions_tool = checkTool(b, "tsan-suppressions", "tools/checks/tsan_suppressions.zig");
@@ -685,37 +833,93 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         linkCoreLib(module, in.target, in.core.lib);
         const tests = b.addTest(.{ .name = "tsan-unit-tests", .root_module = module, .filters = in.test_filters });
         // When the sanitizer reported anything, the runtime exits 66 at exit (see the
-        // "tsan race" case), which fails the run even when every test passed.
-        const run = Known.run(b, suppressions_tool, "tools/checks/tsan.zon", tests);
+        // "tsan race" case), which fails the run even when every test passed. A report waits
+        // for the symbolizer, which only `--test-timeout` bounds here: the tests need their
+        // reports' function names, which the suppressions match.
+        const run = b.addRunArtifact(suppressions_tool);
+        Known.addArgs(b, suppressions_tool, "tools/checks/tsan.zon", run, tests, null);
         run.setName("run test tsan-unit-tests");
         run.enableTestRunnerMode();
         b.step("tsan", "Run the unit tests under Thread Sanitizer").dependOn(&run.step);
+
+        // To print a report, the runtime symbolizes its stacks, which on macOS starts
+        // `atos -p <pid>` and waits for its answer with no limit, so a wedged atos (as on
+        // 2026-11-19) hung `zig build test` for good, and while the host's atos stays wedged
+        // a case that uses it cannot pass. So each case below runs its program through
+        // time-limit, which fails the case, naming it, when the program has not ended within
+        // the given seconds; the cases that need no function names turn symbolization off;
+        // and on macOS the one that needs them uses the build's own symbolizer instead of
+        // the host's atos: tools/checks/symbolizer.zig, built under the file name
+        // llvm-symbolizer, the name that makes the runtime speak llvm-symbolizer's protocol
+        // to it, which names the binary's file and an address in it, not the live process.
+        const limit_tool = checkTool(b, "time-limit", "tools/checks/time_limit.zig");
+        in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "time-limit", .root_module = limit_tool.root_module, .filters = in.test_filters })).step);
+        const symbolizer_tool = checkTool(b, "llvm-symbolizer", "tools/checks/symbolizer.zig");
+        in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "symbolizer", .root_module = symbolizer_tool.root_module, .filters = in.test_filters })).step);
+        // Linux keeps the runtime's own choice.
+        const own_symbolizer: ?*std.Build.Step.Compile = if (b.graph.host.result.os.tag.isDarwin()) symbolizer_tool else null;
+        const Limited = struct {
+            /// Ample for a fixture and the symbolizer, even on a loaded machine.
+            const seconds = 120;
+
+            fn case(b2: *std.Build, test_step: *std.Build.Step, tool: *std.Build.Step.Compile, name: []const u8, limit: u32, exit_code: u8) *std.Build.Step.Run {
+                const r = addCheckCase(b2, test_step, tool, name, exit_code);
+                r.setCwd(b2.path("."));
+                r.addArgs(&.{ b2.fmt("{d}", .{limit}), r.step.name });
+                return r;
+            }
+        };
 
         // Libc, so that threads come from pthreads, which the sanitizer intercepts.
         const race_tool = checkTool(b, "tsan-race-fixture", "tools/checks/fixtures/tsan/race.zig");
         race_tool.root_module.sanitize_thread = true;
         race_tool.root_module.link_libc = true;
-        // On Apple platforms `abort_on_error` defaults to true, which would end the process
-        // with SIGABRT and leave a crash report.
-        const race = addCheckCase(b, in.test_step, race_tool, "tsan race", 66);
-        race.setEnvironmentVariable("TSAN_OPTIONS", "abort_on_error=0");
-        race.expectStdErrMatch("WARNING: ThreadSanitizer: data race");
-
-        // The same program with its racing function listed: the suppression must take, and
-        // `exec` keeps the caller's options (the runtime prints matches only when asked).
-        const known = Known.run(b, suppressions_tool, "tools/checks/fixtures/tsan/known.zon", race_tool);
-        known.setName("check tsan known finding");
-        known.has_side_effects = true;
-        known.setEnvironmentVariable("TSAN_OPTIONS", "print_suppressions=1");
-        known.expectExitCode(0);
-        known.expectStdErrMatch("ThreadSanitizer: Matched");
-        in.test_step.dependOn(&known.step);
-
         const mutex_tool = checkTool(b, "tsan-mutex-fixture", "tools/checks/fixtures/tsan/mutex.zig");
         mutex_tool.root_module.sanitize_thread = true;
         mutex_tool.root_module.link_libc = true;
-        const mutex = addCheckCase(b, in.test_step, mutex_tool, "tsan mutex", 0);
-        mutex.expectStdErrEqual("");
+
+        // On macOS the cases run a second time with a symbolizer that never answers, to check
+        // that the race and mutex cases do not wait for it and that the known finding case,
+        // which does, fails within its limit.
+        // The path is relative to the build root, where these cases run.
+        const stuck_symbolizer: ?[]const u8 = if (b.graph.host.result.os.tag.isDarwin()) "tools/checks/fixtures/tsan/stuck-symbolizer/atos" else null;
+        for ([_]?[]const u8{ null, stuck_symbolizer }, 0..) |symbolizer, i| {
+            if (i > 0 and symbolizer == null) continue;
+            const suffix = if (symbolizer != null) " with a stuck symbolizer" else "";
+            const extra: []const u8 = if (symbolizer) |path| b.fmt(" external_symbolizer_path=\"{s}\"", .{path}) else "";
+
+            // The check needs only the WARNING line, so the report is printed with addresses.
+            // On Apple platforms `abort_on_error` defaults to true, which would end the
+            // process with SIGABRT and leave a crash report.
+            const race = Limited.case(b, in.test_step, limit_tool, b.fmt("tsan race{s}", .{suffix}), Limited.seconds, 66);
+            race.addArtifactArg(race_tool);
+            race.setEnvironmentVariable("TSAN_OPTIONS", b.fmt("abort_on_error=0 symbolize=0{s}", .{extra}));
+            race.expectStdErrMatch("WARNING: ThreadSanitizer: data race");
+
+            // The same program with its racing function listed: the suppression must take,
+            // and `exec` keeps the caller's options (the runtime prints matches only when
+            // asked). Suppressions match function names, so this case symbolizes, on macOS
+            // with the build's symbolizer, so that it never starts the host's atos; given a
+            // stuck symbolizer instead, it ends with time-limit's message.
+            const known_name = b.fmt("tsan known finding{s}", .{suffix});
+            const known = if (symbolizer == null)
+                Limited.case(b, in.test_step, limit_tool, known_name, Limited.seconds, 0)
+            else
+                Limited.case(b, in.test_step, limit_tool, known_name, 5, 124);
+            known.addArtifactArg(suppressions_tool);
+            Known.addArgs(b, suppressions_tool, "tools/checks/fixtures/tsan/known.zon", known, race_tool, if (symbolizer == null) own_symbolizer else null);
+            known.setEnvironmentVariable("TSAN_OPTIONS", b.fmt("print_suppressions=1{s}", .{extra}));
+            if (symbolizer == null)
+                known.expectStdErrMatch("ThreadSanitizer: Matched")
+            else
+                known.expectStdErrMatch(b.fmt("time-limit: check {s}: ", .{known_name}));
+
+            // Reports nothing, so it never starts the symbolizer.
+            const mutex = Limited.case(b, in.test_step, limit_tool, b.fmt("tsan mutex{s}", .{suffix}), Limited.seconds, 0);
+            mutex.addArtifactArg(mutex_tool);
+            if (symbolizer != null) mutex.setEnvironmentVariable("TSAN_OPTIONS", extra[1..]);
+            mutex.expectStdErrEqual("");
+        }
     }
 }
 
@@ -726,6 +930,20 @@ fn checkTool(b: *std.Build, name: []const u8, source: []const u8) *std.Build.Ste
         .target = b.graph.host,
         .optimize = .Debug,
     }) });
+}
+
+/// The project's test runner: Zig's, plus the hang report (tools/test_runner/main.zig).
+/// Null in a fetched package, which has no tools/, so its tests use Zig's runner.
+fn testRunner(b: *std.Build) ?std.Build.Step.Compile.TestRunner {
+    if (!pathExists(b, "tools/test_runner")) return null;
+    return .{ .path = b.path("tools/test_runner/main.zig"), .mode = .server };
+}
+
+/// addRunArtifact, plus the -Dtest-hang-report limit when `tests` uses the project's runner.
+fn runTests(b: *std.Build, tests: *std.Build.Step.Compile, hang_report: u32) *std.Build.Step.Run {
+    const run = b.addRunArtifact(tests);
+    if (tests.test_runner != null) run.addArg(b.fmt("--hang-report={d}", .{hang_report}));
+    return run;
 }
 
 /// Adds a tool run to test. Tools can read files by path, so their runs are never cached.
@@ -824,9 +1042,8 @@ fn findFuzzTargets(b: *std.Build) []const FuzzTarget {
             if (stat.kind != .file) continue;
             if (std.mem.findNone(u8, file.name, file_chars) != null)
                 std.process.fatal("invalid fuzz corpus file name in {s}: use [A-Za-z0-9._-]+", .{path});
-            const max_input_len = 8192; // src/fuzz.zig also uses this as the target input limit.
-            if (stat.size > max_input_len)
-                std.process.fatal("{s} is {d} bytes, exceeding the {d}-byte fuzz input limit", .{ path, stat.size, max_input_len });
+            if (stat.size > fuzz_limits.max_file_len)
+                std.process.fatal("{s} is {d} bytes, exceeding the {d}-byte fuzz corpus file limit (src/fuzz/limits.zig)", .{ path, stat.size, fuzz_limits.max_file_len });
             b.dependOnFileMetadata(b.path(path));
             total += stat.size;
             corpus.append(b.allocator, b.dupe(file.name)) catch @panic("OOM");
@@ -834,9 +1051,8 @@ fn findFuzzTargets(b: *std.Build) []const FuzzTarget {
         std.mem.sort([]const u8, corpus.items, {}, FuzzTarget.fileLessThan);
         targets.append(b.allocator, .{ .name = name, .corpus = corpus.items }) catch @panic("OOM");
     }
-    const max_corpus_len = 65536;
-    if (total > max_corpus_len)
-        std.process.fatal("{s} contains {d} corpus bytes, exceeding the {d}-byte total limit", .{ root, total, max_corpus_len });
+    if (total > fuzz_limits.max_corpus_len)
+        std.process.fatal("{s} contains {d} corpus bytes, exceeding the {d}-byte total limit", .{ root, total, fuzz_limits.max_corpus_len });
     std.mem.sort(FuzzTarget, targets.items, {}, FuzzTarget.lessThan);
     if (targets.items.len > 1) for (targets.items[0 .. targets.items.len - 1], targets.items[1..]) |a, c| {
         if (std.mem.startsWith(u8, c.name, a.name))
@@ -968,6 +1184,7 @@ fn addConformanceSteps(
     temporal: *std.Build.Module,
     test_step: *std.Build.Step,
     test_filters: []const []const u8,
+    hang_report: u32,
     forwarded: ConformanceForwarded,
 ) void {
     const patterns = b.option([]const []const u8, "feature", "Run conformance features matching this path pattern (repeatable)") orelse &.{};
@@ -996,11 +1213,12 @@ fn addConformanceSteps(
     runner.addAnonymousImport("PARITY.md", .{ .root_source_file = b.path("PARITY.md") });
     runner.addAnonymousImport("parity_map.zon", .{ .root_source_file = b.path("conformance/parity_map.zon") });
     inline for (.{ .{ "conformance-harness", harness }, .{ "conformance-runner", runner } }) |artifact| {
-        test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        test_step.dependOn(&runTests(b, b.addTest(.{
             .name = artifact[0],
             .root_module = artifact[1],
             .filters = test_filters,
-        })).step);
+            .test_runner = testRunner(b),
+        }), hang_report).step);
     }
 
     var source: std.Io.Writer.Allocating = .init(b.allocator);
@@ -1043,7 +1261,7 @@ fn addConformanceSteps(
     stored_histories.root_source_file = b.addWriteFiles().add("stored_histories.zig", stored_source.written());
     runner.addImport("stored_histories", stored_histories);
 
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+    test_step.dependOn(&runTests(b, b.addTest(.{
         .name = "conformance-replay",
         .root_module = b.createModule(.{
             .root_source_file = b.path("conformance/replay/replay.zig"),
@@ -1057,7 +1275,8 @@ fn addConformanceSteps(
             },
         }),
         .filters = test_filters,
-    })).step);
+        .test_runner = testRunner(b),
+    }), hang_report).step);
 
     if (!with_suite) {
         // Only the nested build requests the lazy dependency. Clear the report even if
@@ -1238,14 +1457,14 @@ fn findSamples(b: *std.Build) []const Sample {
             else => std.debug.panic("cannot read {s}: {t}", .{ manifest_path, err }),
         };
         var diag: std.zon.parse.Diagnostics = undefined;
-        const manifest = std.zon.parse.fromSlice(struct { tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{}, programs: []const []const u8 = &.{} }, .{
+        const sample_manifest = std.zon.parse.fromSlice(struct { tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{}, programs: []const []const u8 = &.{} }, .{
             .gpa = b.allocator,
             .arena = b.allocator,
             .source = source,
             .diagnostics = &diag,
             .ignore_unknown_fields = true,
         }) catch std.debug.panic("invalid {s}: {f}", .{ manifest_path, diag.fmt(manifest_path) });
-        found.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = manifest.tests, .imports = manifest.imports, .programs = manifest.programs }) catch @panic("OOM");
+        found.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = sample_manifest.tests, .imports = sample_manifest.imports, .programs = sample_manifest.programs }) catch @panic("OOM");
     }
     std.mem.sort(Sample, found.items, {}, struct {
         fn lessThan(_: void, a: Sample, c: Sample) bool {

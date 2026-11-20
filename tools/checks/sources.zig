@@ -4,7 +4,7 @@ const Dir = std.Io.Dir;
 /// The directories the source scans read when given no path. One that does not exist is skipped.
 pub const default_roots = [_][]const u8{ "src", "tools", "examples", "samples", "conformance" };
 /// Left out of every scan. An entry ending in '/' is a directory, any other a file.
-pub const excluded = [_][]const u8{ "src/proto/", "src/proto.zig", "samples/dispatch.zig", "tools/checks/fixtures/" };
+pub const excluded = [_][]const u8{ "src/proto/", "src/proto.zig", "samples/dispatch.zig", "tools/checks/fixtures/", "tools/test_runner/main.zig" };
 
 /// Returns the Zig files under paths (relative to root), or default_roots if empty.
 /// The result uses '/' separators, is sorted by byte value, and contains no duplicates.

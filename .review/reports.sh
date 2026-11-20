@@ -109,7 +109,8 @@ git diff --stat "$merge_base" >"$out/diff-stat.txt"
 existing() { while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done <"$out/changed-files.txt"; }
 existing >"$out/.existing"
 if [ "$all" -eq 1 ]; then git ls-files >"$out/.scope"; else cp "$out/.existing" "$out/.scope"; fi
-zig_files() { grep '\.zig$' "$1" | grep -v -e '^src/proto/' -e '^src/proto\.zig$' -e '^deps/sdk-core/'; }
+# tools/test_runner/main.zig is a copy of Zig's own test runner, kept close to upstream (AGENTS.md, "Hang reports").
+zig_files() { grep '\.zig$' "$1" | grep -v -e '^src/proto/' -e '^src/proto\.zig$' -e '^deps/sdk-core/' -e '^tools/test_runner/main\.zig$'; }
 
 added="$out/added-lines.txt"
 awk '

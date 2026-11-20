@@ -3,21 +3,22 @@
 //!
 //!   tsan-suppressions render <file.zon>
 //!     Prints one `<kind>:<site>` line per entry. A malformed file fails, naming the entry.
-//!   tsan-suppressions exec <suppressions file> <program> [args...]
+//!   tsan-suppressions exec [--symbolizer <path>] <suppressions file> <program> [args...]
 //!     Runs the program in place of this process with `abort_on_error=0` and the file
 //!     added to `TSAN_OPTIONS`, so a report ends it with exit 66 and no crash report on
 //!     macOS. Replacing the process keeps the build runner's test protocol on stdin and
-//!     stdout intact.
+//!     stdout intact. `--symbolizer` adds `external_symbolizer_path` too, for the
+//!     symbolizer build.zig builds (tools/checks/symbolizer.zig).
 //!
 //! A `__tsan_default_suppressions` in the sanitized binary would need neither, but on macOS
 //! the runtime is a dylib that calls its own weak default directly, so a definition in the
 //! binary is never called. The build cannot pass a generated file's path in an environment
-//! variable either, which is why `exec` exists.
+//! variable either, which is why `exec` exists, and why it takes the symbolizer's path.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const usage_text = "usage: tsan-suppressions render <file.zon> | exec <suppressions file> <program> [args...]\n";
+const usage_text = "usage: tsan-suppressions render <file.zon> | exec [--symbolizer <path>] <suppressions file> <program> [args...]\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -32,22 +33,32 @@ pub fn main(init: std.process.Init) !void {
             .invalid => |msg| fatal("{s}", .{msg}),
         }
     } else if (std.mem.eql(u8, args[1], "exec")) {
-        if (args.len < 4) usage();
-        const options = tsanOptions(arena, init.environ_map.get("TSAN_OPTIONS") orelse "", args[2]) catch |err| switch (err) {
+        var rest = args[2..];
+        var symbolizer: ?[]const u8 = null;
+        if (rest.len > 0 and std.mem.eql(u8, rest[0], "--symbolizer")) {
+            if (rest.len < 2) usage();
+            symbolizer = rest[1];
+            rest = rest[2..];
+        }
+        if (rest.len < 2) usage();
+        const options = tsanOptions(arena, init.environ_map.get("TSAN_OPTIONS") orelse "", rest[0], symbolizer) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.QuoteInPath => fatal("the suppressions path {s} contains '\"', which TSAN_OPTIONS cannot quote", .{args[2]}),
+            error.QuoteInPath => fatal("the suppressions path {s} or the symbolizer path contains '\"', which TSAN_OPTIONS cannot quote", .{rest[0]}),
         };
         try init.environ_map.put("TSAN_OPTIONS", options);
-        const err = std.process.replace(init.io, .{ .argv = args[3..], .environ_map = init.environ_map });
-        fatal("cannot run {s}: {t}", .{ args[3], err });
+        const err = std.process.replace(init.io, .{ .argv = rest[1..], .environ_map = init.environ_map });
+        fatal("cannot run {s}: {t}", .{ rest[1], err });
     } else usage();
 }
 
-/// The caller's options first, so that these two win.
-fn tsanOptions(arena: Allocator, inherited: []const u8, suppressions_path: []const u8) error{ OutOfMemory, QuoteInPath }![]const u8 {
+/// The caller's options first, so that these win.
+fn tsanOptions(arena: Allocator, inherited: []const u8, suppressions_path: []const u8, symbolizer_path: ?[]const u8) error{ OutOfMemory, QuoteInPath }![]const u8 {
     if (std.mem.indexOfScalar(u8, suppressions_path, '"') != null) return error.QuoteInPath;
     const sep = if (inherited.len == 0) "" else " ";
-    return std.fmt.allocPrint(arena, "{s}{s}abort_on_error=0 suppressions=\"{s}\"", .{ inherited, sep, suppressions_path });
+    const options = try std.fmt.allocPrint(arena, "{s}{s}abort_on_error=0 suppressions=\"{s}\"", .{ inherited, sep, suppressions_path });
+    const path = symbolizer_path orelse return options;
+    if (std.mem.indexOfScalar(u8, path, '"') != null) return error.QuoteInPath;
+    return std.fmt.allocPrint(arena, "{s} external_symbolizer_path=\"{s}\"", .{ options, path });
 }
 
 fn usage() noreturn {
@@ -163,7 +174,18 @@ test "exec adds abort_on_error and the quoted suppressions path after the caller
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualStrings("abort_on_error=0 suppressions=\"/c/x y.supp\"", try tsanOptions(a, "", "/c/x y.supp"));
-    try testing.expectEqualStrings("verbosity=1 abort_on_error=0 suppressions=\"s\"", try tsanOptions(a, "verbosity=1", "s"));
-    try testing.expectError(error.QuoteInPath, tsanOptions(a, "", "a\"b"));
+    try testing.expectEqualStrings("abort_on_error=0 suppressions=\"/c/x y.supp\"", try tsanOptions(a, "", "/c/x y.supp", null));
+    try testing.expectEqualStrings("verbosity=1 abort_on_error=0 suppressions=\"s\"", try tsanOptions(a, "verbosity=1", "s", null));
+    try testing.expectError(error.QuoteInPath, tsanOptions(a, "", "a\"b", null));
+}
+
+test "exec --symbolizer adds the quoted symbolizer path last, so it wins over the caller's" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "external_symbolizer_path=\"/x/atos\" abort_on_error=0 suppressions=\"s\" external_symbolizer_path=\"/c/d e/llvm-symbolizer\"",
+        try tsanOptions(a, "external_symbolizer_path=\"/x/atos\"", "s", "/c/d e/llvm-symbolizer"),
+    );
+    try testing.expectError(error.QuoteInPath, tsanOptions(a, "", "s", "a\"b"));
 }

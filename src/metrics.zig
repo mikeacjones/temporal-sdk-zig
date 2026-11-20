@@ -100,7 +100,8 @@ pub const Options = struct {
         url: []const u8,
         /// Headers sent with every export.
         headers: []const Tag = &.{},
-        /// How often to export. Null uses sdk-core's default.
+        /// How often to export. Null uses sdk-core's default. Clamped to 1 ms through
+        /// `maxInt(u32)` ms, so `Duration.max` exports as rarely as sdk-core allows.
         periodicity: ?Duration = null,
         temporality: enum { cumulative, delta } = .cumulative,
         protocol: enum { grpc, http } = .grpc,

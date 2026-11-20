@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const proto = @import("proto.zig");
+const proto_time = @import("proto_time.zig");
 const converter = @import("converter.zig");
 const Allocator = std.mem.Allocator;
 
@@ -41,7 +42,9 @@ pub const Application = struct {
     details: []const converter.Payload = &.{},
     category: Category = .unspecified,
     /// Overrides the retry policy's backoff before the next attempt of the activity this
-    /// fails. Ignored when the failure isn't retried.
+    /// fails. Ignored when the failure isn't retried. A duration longer than protobuf can carry
+    /// (about 10,000 years), such as `Duration.max`, is sent as the longest one it can; a
+    /// negative one is sent as it is.
     next_retry_delay: ?std.Io.Duration = null,
     /// The failure that caused this one, such as a failure read from a future
     /// (`future.failure()`). Borrowed only until the call it is given to returns: every
@@ -74,10 +77,7 @@ pub fn application(arena: Allocator, a: Application) error{OutOfMemory}!Failure 
             .type = a.type,
             .non_retryable = a.non_retryable,
             .details = details,
-            .next_retry_delay = if (a.next_retry_delay) |d| .{
-                .seconds = std.math.cast(i64, @divFloor(d.nanoseconds, std.time.ns_per_s)) orelse std.math.maxInt(i64),
-                .nanos = @intCast(@mod(d.nanoseconds, std.time.ns_per_s)),
-            } else null,
+            .next_retry_delay = proto_time.durationToProto(a.next_retry_delay),
             .category = switch (a.category) {
                 .unspecified => .APPLICATION_ERROR_CATEGORY_UNSPECIFIED,
                 .benign => .APPLICATION_ERROR_CATEGORY_BENIGN,
@@ -608,7 +608,7 @@ pub fn kind(f: *const Failure) Kind {
             .type = a.type,
             .non_retryable = a.non_retryable,
             .details = values(a.details),
-            .next_retry_delay = if (a.next_retry_delay) |d| .fromNanoseconds(@as(i96, d.seconds) * std.time.ns_per_s + d.nanos) else null,
+            .next_retry_delay = proto_time.durationFromProto(a.next_retry_delay),
             .category = applicationCategory(f.*).?,
         } },
         .timeout_failure_info => |*t| .{ .timeout = .{
@@ -720,6 +720,12 @@ test "application failures carry their category and next retry delay" {
 
     const plain = try application(arena.allocator(), .{ .message = "boom" });
     try testing.expectEqual(null, plain.failure_info.?.application_failure_info.next_retry_delay);
+
+    // The longest delay protobuf can carry, not maxInt(i64) seconds, which it can't.
+    const forever = try application(arena.allocator(), .{ .message = "later", .next_retry_delay = .max });
+    const delay = forever.failure_info.?.application_failure_info.next_retry_delay.?;
+    try testing.expectEqual(proto.google.protobuf.Duration{ .seconds = 315_576_000_000, .nanos = 999_999_999 }, delay);
+    try testing.expectEqual(proto_time.max_duration, kind(&forever).application.next_retry_delay.?);
     try testing.expectEqual(Application.Category.unspecified, applicationCategory(plain).?);
     try testing.expectEqual(null, applicationCategory(.{ .failure_info = .{ .canceled_failure_info = .{} } }));
 }

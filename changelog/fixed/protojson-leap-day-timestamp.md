@@ -1,0 +1,1 @@
+`protojson.encode`, and with it `converter.toPayload` of a protobuf message, writes a `google.protobuf.Timestamp` on 29 February of a year not divisible by 400 (2024-02-29, 2028-02-29, ...) instead of panicking with an integer overflow, and writes 29 February of a year divisible by 400 (2000-02-29) as that day instead of silently as 1 March.

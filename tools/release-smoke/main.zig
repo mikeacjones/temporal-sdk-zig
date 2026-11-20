@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
         .retry = .{ .max_retries = 1, .max_elapsed_time = .fromMilliseconds(1_000) },
     }) catch |err| switch (err) {
         error.ConnectFailed => {
-            std.debug.print("release smoke test passed: the core ran, and connecting to {s} failed as expected\n", .{host_port});
+            std.debug.print("release smoke test passed with SDK {s}: the core ran, and connecting to {s} failed as expected\n", .{ temporal.version, host_port });
             return;
         },
         else => {

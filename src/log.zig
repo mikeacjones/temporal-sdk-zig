@@ -96,7 +96,8 @@ pub const Logger = struct {
     sink: Sink = .std_log,
     /// Fields added to every message, after the call's own.
     context: []const Field = &.{},
-    /// When set and true, messages are dropped (the workflow is replaying).
+    /// When set and true, messages are dropped (the workflow is replaying or its run is being
+    /// evicted).
     replaying: ?*const bool = null,
 
     /// Returns a logger that adds `fields` (a struct, rendered now) to every message, after

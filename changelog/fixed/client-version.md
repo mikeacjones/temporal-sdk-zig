@@ -1,0 +1,1 @@
+The client reported its version to the server as 0.0.0 in 0.1.0-alpha.1, and workflow histories recorded `sdkVersion` 0.0.0; it now reports the release's version, which comes from the package manifest.

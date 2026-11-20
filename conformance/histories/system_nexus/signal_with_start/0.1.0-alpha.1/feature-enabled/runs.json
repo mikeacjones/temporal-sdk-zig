@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-system_nexus/signal_with_start-feature-enabled",
+  "runs": [
+    {
+      "file": "1-CallerWorkflow.json",
+      "workflow_id": "conformance-system_nexus/signal_with_start-feature-enabled"
+    },
+    {
+      "file": "2-TargetWorkflow.json",
+      "workflow_id": "system-nexus-signal-with-start-conformance-system_nexus/signal_with_start-feature-enabled"
+    }
+  ]
+}

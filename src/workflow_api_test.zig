@@ -6,6 +6,7 @@ const activity = @import("activity.zig");
 const converter = @import("converter.zig");
 const interceptor = @import("interceptor.zig");
 const testing_ns = @import("testing.zig");
+const log = @import("log.zig");
 
 const testing = std.testing;
 
@@ -88,6 +89,84 @@ test "workflow: two runs draw different UUIDs" {
     const first = try env.executeWorkflow(UuidWorkflow, .{}, a, null);
     const second = try env.executeWorkflow(UuidWorkflow, .{}, a, null);
     try testing.expect(!std.mem.eql(u8, first[0..36], second[0..36]));
+}
+
+/// A workflow that logs an error when its activity wait fails, waiting on an activity sent to a
+/// task queue nothing polls. Its update returns once the activity is scheduled, so the root
+/// coroutine is blocked in `get` when the update's answer reaches the client.
+const EvictionLog = struct {
+    const Scheduled = workflow.UpdateDef("eviction_log_scheduled", fn () void);
+    const message = "eviction_log: activity wait failed";
+
+    const State = struct {
+        ctx: *workflow.Context,
+        scheduled: bool = false,
+        fn waitScheduled(s: *State) !void {
+            try s.ctx.await(s, isScheduled);
+        }
+        fn isScheduled(s: *State) bool {
+            return s.scheduled;
+        }
+    };
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandler(Scheduled, s, State.waitScheduled);
+        const future = ctx.executeActivityByName([]const u8, "eviction_log_never", .{
+            .task_queue = "eviction-log-unpolled",
+            .start_to_close_timeout = .fromSeconds(600),
+        }, .{});
+        s.scheduled = true;
+        return future.get() catch |err| {
+            ctx.logger().err(message, .{ .err = err });
+            return err;
+        };
+    }
+    const Wf = workflow.Def("eviction_log", run);
+
+    /// Counts the error records with `message`. Called from the worker's threads.
+    const Sink = struct {
+        errors: std.atomic.Value(usize) = .init(0),
+
+        fn sink(r: *Sink) log.Sink {
+            return .{ .ptr = r, .vtable = &.{ .log = record } };
+        }
+
+        fn record(ptr: ?*anyopaque, level: log.Level, text: []const u8, _: []const log.Field) void {
+            const r: *Sink = @ptrCast(@alignCast(ptr.?));
+            if (level == .err and std.mem.eql(u8, text, message)) _ = r.errors.fetchAdd(1, .monotonic);
+        }
+    };
+};
+
+test "workflow: a run evicted at worker shutdown while it waits on an activity logs no error, and its history replays" {
+    var sink: EvictionLog.Sink = .{};
+    const env = try testing_ns.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .logger = sink.sink() });
+    var env_open = true;
+    defer if (env_open) env.deinit();
+    try env.registerWorkflow(EvictionLog.Wf);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const history = history: {
+        var run = try env.startWorkflow(EvictionLog.Wf, .{}, .{});
+        defer run.deinit(); // before env.deinit, which frees the client the run points at
+        try env.updateWorkflow(EvictionLog.Scheduled, a, run.id, .{}, null);
+        break :history try env.client.fetchHistory(a, run.id, run.run_id);
+    };
+
+    // Stopping the worker evicts the run, which unwinds its code out of `get` with
+    // error.Canceled: nothing failed, so nothing may be logged at error level.
+    env_open = false;
+    env.deinit();
+    try testing.expectEqual(@as(usize, 0), sink.errors.load(.monotonic));
+
+    var replayer: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(EvictionLog.Wf);
+    try replayer.replayHistory(history);
 }
 
 const ContinueByName = struct {
@@ -222,6 +301,36 @@ test "WorkflowReplayer replays a run that continued as new by name and catches o
     defer changed.deinit();
     try changed.registerDynamicWorkflow(workflow.DynamicDef(countDirectly));
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(continue_as_new_by_name_history));
+}
+
+const ContinueAsNewMemo = struct {
+    /// The first run upserts the memo's status and continues as new: with an explicit empty
+    /// memo when `clear` is false, after removing the status key and with default options
+    /// when it is true. The second run returns its memo's status, or "none".
+    fn run(ctx: *workflow.Context, continued: bool, clear: bool) ![]const u8 {
+        if (continued) return try ctx.memoValue([]const u8, "status") orelse "none";
+        if (clear) {
+            try ctx.upsertMemo(.{ .status = null });
+            return ctx.continueAsNew(Def, .{}, .{ true, clear });
+        }
+        try ctx.upsertMemo(.{ .status = "updated" });
+        return ctx.continueAsNew(Def, .{ .memo = &.{} }, .{ true, clear });
+    }
+    const Def = workflow.Def("can_memo", run);
+};
+
+test "workflow: continue-as-new with an empty memo keeps the upserted memo, and a memo emptied by upserts gets the start memo back" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ContinueAsNewMemo.Def);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const start_memo = try converter.toFields(a, .{ .status = "original" });
+    try testing.expectEqualStrings("updated", try env.executeWorkflowWithOptions(ContinueAsNewMemo.Def, .{ .memo = start_memo }, .{ false, false }, a, null));
+    // The documented limit: core fills an empty command memo with the start memo.
+    try testing.expectEqualStrings("original", try env.executeWorkflowWithOptions(ContinueAsNewMemo.Def, .{ .memo = start_memo }, .{ false, true }, a, null));
 }
 
 const ChildCancel = struct {
@@ -485,6 +594,67 @@ test "workflow: the worker answers __stack_trace with no handler, and the run's 
     try replayer.replayHistory(history);
 }
 
+/// Two coroutines wait on one activity's future: first a coroutine started with `io.async`,
+/// then the workflow function. Each then runs an activity of its own type, so the order of the
+/// two ScheduleActivity commands is the order the coroutines returned from `get`.
+const SharedFuture = struct {
+    fn echo(_: *activity.Context, text: []const u8) ![]const u8 {
+        return text;
+    }
+    const Fetch = activity.Def("shared_fetch", echo);
+    const First = activity.Def("shared_first", echo);
+    const Second = activity.Def("shared_second", echo);
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+
+    fn Then(comptime Next: type) type {
+        return struct {
+            fn run(ctx: *workflow.Context, f: workflow.ActivityFuture([]const u8), ready: *std.Io.Event) ![]const u8 {
+                ready.set(ctx.io());
+                return ctx.executeActivity(Next, opts, .{try f.get()}).get();
+            }
+        };
+    }
+
+    /// The coroutine started with `io.async` runs `AsyncNext` after the shared activity, and
+    /// the workflow function `RootNext`. Returns "<async's result> <root's result>".
+    fn Workflow(comptime AsyncNext: type, comptime RootNext: type) type {
+        return struct {
+            fn run(ctx: *workflow.Context) ![]const u8 {
+                const io = ctx.io();
+                const f = ctx.executeActivity(Fetch, opts, .{"shared"});
+                var ready: std.Io.Event = .unset;
+                var other = io.async(Then(AsyncNext).run, .{ ctx, f, &ready });
+                // The coroutine above begins waiting on `f` first.
+                ready.waitUncancelable(io);
+                const mine = try ctx.executeActivity(RootNext, opts, .{try f.get()}).get();
+                const theirs = try other.await(io);
+                return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ theirs, mine });
+            }
+        };
+    }
+    const Def = workflow.Def("shared_future", Workflow(First, Second).run);
+    /// The same, with the two coroutines' next activities swapped.
+    const Swapped = workflow.Def("shared_future", Workflow(Second, First).run);
+};
+
+/// A dev-server run of `SharedFuture.Def` with its three activities, fetched with
+/// `Client.fetchHistory` and encoded as ProtoJSON (`History.jsonEncode`), indented, the
+/// worker's identity replaced. Its second workflow task schedules `shared_first`, then
+/// `shared_second`.
+const shared_activity_future_history = @embedFile("testdata/shared_activity_future_history.json");
+
+test "WorkflowReplayer replays two coroutines sharing one activity future and catches them resuming in another order" {
+    var ok: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(SharedFuture.Def);
+    try ok.replayHistoryJson(shared_activity_future_history);
+
+    var changed: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(SharedFuture.Swapped);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(shared_activity_future_history));
+}
+
 /// The dev server only accepts signal-with-start from a workflow with this setting on.
 const signal_with_start_args = [_][]const u8{ "--dynamic-config-value", "history.enableSignalWithStartFromWorkflow=true" };
 
@@ -732,4 +902,58 @@ test "WorkflowReplayer replays a signal-with-start and catches a workflow that s
     defer changed.deinit();
     try changed.registerWorkflow(workflow.Def("sws_caller", SignalWithStart.callerChanged));
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(signal_with_start_history));
+}
+
+const AwaitTimeoutTie = struct {
+    const Ready = workflow.SignalDef("ready", fn () void);
+
+    fn markReady(ready: *bool) void {
+        ready.* = true;
+    }
+
+    fn isReady(ready: *bool) bool {
+        return ready.*;
+    }
+
+    /// Waits up to 2 s for the "ready" signal. Completes at once if it arrived, and otherwise
+    /// sleeps 1 s first.
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const ready = try ctx.allocator().create(bool);
+        ready.* = false;
+        try ctx.setSignalHandler(Ready, ready, markReady);
+        if (try ctx.awaitTimeout(.fromSeconds(2), ready, isReady)) return "ready";
+        try ctx.sleep(.fromSeconds(1), .{});
+        return "timed out";
+    }
+
+    /// `run` as it would take the timeout branch whatever the signal did.
+    fn alwaysTimesOut(ctx: *workflow.Context) ![]const u8 {
+        const ready = try ctx.allocator().create(bool);
+        ready.* = false;
+        try ctx.setSignalHandler(Ready, ready, markReady);
+        _ = try ctx.awaitTimeout(.fromSeconds(2), ready, isReady);
+        try ctx.sleep(.fromSeconds(1), .{});
+        return "timed out";
+    }
+
+    const Workflow = workflow.Def("await_timeout_tie", run);
+};
+
+/// A dev-server run of `AwaitTimeoutTie.Workflow`, fetched with `Client.fetchHistory` and
+/// encoded as ProtoJSON (`temporal.protojson.encode`), indented. The worker was stopped once
+/// the timer had started, the timer was let fire, the "ready" signal was sent, and a new
+/// worker was started, so one workflow task carries `TimerFired` and
+/// `WorkflowExecutionSignaled`. The run completed with "ready".
+const await_timeout_tie_history = @embedFile("testdata/await_timeout_tie_history.json");
+
+test "WorkflowReplayer replays an awaitTimeout whose timer fired in the signal's workflow task as true" {
+    var ok: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(AwaitTimeoutTie.Workflow);
+    try ok.replayHistoryJson(await_timeout_tie_history);
+
+    var changed: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(workflow.Def("await_timeout_tie", AwaitTimeoutTie.alwaysTimesOut));
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(await_timeout_tie_history));
 }

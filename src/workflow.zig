@@ -268,6 +268,7 @@ const converter = @import("converter.zig");
 const failure_mod = @import("failure.zig");
 const log = @import("log.zig");
 const proto = @import("proto.zig");
+const proto_time = @import("proto_time.zig");
 const propagation = @import("propagation.zig");
 const search_attributes = @import("search_attributes.zig");
 const metrics_mod = @import("metrics.zig");
@@ -299,8 +300,11 @@ pub const Info = struct {
     first_run_id: []const u8 = "",
     /// The run this one continued from, or empty.
     continued_run_id: []const u8 = "",
+    /// Null when the workflow was started without one: the server sends zero for unset, and zero is read as null.
     execution_timeout: ?Duration = null,
+    /// Null when the workflow was started without one: the server sends zero for unset, and zero is read as null.
     run_timeout: ?Duration = null,
+    /// Null when the workflow was started without one: the server sends zero for unset, and zero is read as null.
     task_timeout: ?Duration = null,
     /// The workflow that started this one as a child, or null for a top-level workflow.
     parent: ?WorkflowExecution = null,
@@ -350,6 +354,8 @@ pub const HandlerOptions = struct {
     unfinished_policy: HandlerUnfinishedPolicy = .warn_and_abandon,
 };
 
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const RetryPolicy = struct {
     initial_interval: ?Duration = null,
     backoff_coefficient: f64 = 0,
@@ -388,6 +394,8 @@ pub const ActivityCancellationType = enum { try_cancel, wait_cancellation_comple
 
 /// How an activity is scheduled. At least one of `start_to_close_timeout` and
 /// `schedule_to_close_timeout` is required.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const ActivityOptions = struct {
     /// Empty runs the activity on the workflow's task queue.
     task_queue: []const u8 = "",
@@ -421,6 +429,8 @@ pub const ActivityOptions = struct {
 /// How `Context.createSession` and `recreateSession` open a session. A session is held by a
 /// creation activity that runs on the host for the session's whole life, so its timeouts are
 /// that activity's, and it gets one attempt.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const SessionOptions = struct {
     /// The task queue whose session workers (`worker.Options.sessions`) may take the session.
     /// Empty uses the workflow's. `recreateSession` ignores it.
@@ -508,6 +518,8 @@ pub const Session = struct {
 /// history as a marker. At least one of `start_to_close_timeout` and
 /// `schedule_to_close_timeout` is required: without either, the future's `get` returns
 /// `error.InvalidOptions`.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const LocalActivityOptions = struct {
     /// Empty uses the activity's sequence number, which changes when a retry waits on a
     /// workflow timer.
@@ -568,6 +580,8 @@ pub const ParentClosePolicy = enum { terminate, abandon, request_cancel };
 /// by a coroutine started with `io.async` that nothing awaits) is left running; call its
 /// future's `cancel` to cancel it, or rely on its `parent_close_policy`, which the server
 /// applies when the parent closes (by default it terminates the child).
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const ChildWorkflowOptions = struct {
     /// Empty generates a UUID from the workflow's seeded randomness, the same on replay.
     id: []const u8 = "",
@@ -639,6 +653,8 @@ pub const NexusOperationCancellationType = enum { wait_cancellation_completed, w
 
 /// How a Nexus operation is scheduled (`Context.executeNexusOperation`). Only read while
 /// scheduling; strings are copied.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const NexusOperationOptions = struct {
     /// The name of the Nexus endpoint to call through. It must exist on the server: an
     /// operator creates it, routing to a namespace and task queue (in tests,
@@ -672,6 +688,8 @@ pub const NexusOperationOptions = struct {
 };
 
 /// How `Context.continueAsNew` starts the next run.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const ContinueAsNewOptions = struct {
     /// Empty continues on this run's task queue.
     task_queue: []const u8 = "",
@@ -679,8 +697,11 @@ pub const ContinueAsNewOptions = struct {
     run_timeout: ?Duration = null,
     /// Limits one workflow task of the new run. Null keeps this run's task timeout.
     task_timeout: ?Duration = null,
-    /// The new run's memo, built with `converter.toFields`. Null (or an empty slice, which the
-    /// command can't tell apart from null) keeps this run's memo, `upsertMemo` changes included.
+    /// The new run's memo, built with `converter.toFields`. Null or an empty slice keeps this
+    /// run's memo, `upsertMemo` changes included. If that memo is empty because `upsertMemo`
+    /// removed every key, the new run gets the memo this run started with instead: an empty
+    /// memo on the command tells sdk-core to keep the start memo, and no command can ask for an
+    /// empty one.
     memo: ?[]const converter.Field = null,
     /// The new run's search attributes, built with `search_attributes.Key.set` (unsets are
     /// ignored). Null keeps this run's current search attributes, upserts included.
@@ -742,7 +763,9 @@ pub const Context = struct {
 
     /// A logger carrying the workflow's type, ID, and run ID as fields, as the workflow's
     /// outbound interceptors (`interceptor.WorkflowOutbound.logger`) return it. It is silent
-    /// while the workflow replays unless `worker.Options.log_during_replay` is set.
+    /// while the workflow replays, and while its run is evicted from the worker's cache (its
+    /// coroutines unwinding after the worker stops or drops the run), unless
+    /// `worker.Options.log_during_replay` is set.
     pub fn logger(ctx: *const Context) log.Logger {
         return ctx.instance.currentLogger();
     }
@@ -804,7 +827,9 @@ pub const Context = struct {
     /// Blocks the calling coroutine on a durable timer, as `ctx.io().sleep` does, with
     /// `options` on the timer. To race or cancel it, run it as a coroutine (`io.async`, or a
     /// `std.Io.Select` case): canceling the coroutine cancels the timer and returns
-    /// `error.Canceled`. A zero or negative duration returns at once and starts no timer.
+    /// `error.Canceled`. A zero or negative duration returns at once and starts no timer. A
+    /// duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`,
+    /// starts a timer of the longest one it can.
     pub fn sleep(ctx: *Context, duration: Duration, options: SleepOptions) std.Io.Cancelable!void {
         return ctx.instance.sleep(duration, options.summary);
     }
@@ -818,8 +843,14 @@ pub const Context = struct {
         _ = try ctx.awaitInner(state, condition, null);
     }
 
-    /// Like `await`, but gives up after `timeout` (a durable timer) and returns false if the
-    /// condition still doesn't hold.
+    /// Like `await`, but gives up after `timeout` (a durable timer). Returns whether the
+    /// condition holds when it returns: true also when the timer fired in the same workflow task
+    /// as the change that made it true; false only if it still doesn't hold. A fired timer
+    /// takes effect once the workflow task's other work (handlers, results, and the
+    /// coroutines they wake) has run with no awaited condition left to hold. A zero or
+    /// negative timeout returns false at once unless the condition already holds. A duration
+    /// longer than protobuf can carry (about 10,000 years), such as `Duration.max`, starts a
+    /// timer of the longest one it can.
     pub fn awaitTimeout(ctx: *Context, timeout: Duration, state: anytype, comptime condition: fn (@TypeOf(state)) bool) error{ Canceled, OutOfMemory }!bool {
         return ctx.awaitInner(state, condition, timeout);
     }
@@ -1123,7 +1154,11 @@ pub const Context = struct {
         const a = ctx.allocator();
         const input: Instance.SessionCreateInput = .{
             .session_id = try @import("client.zig").uuid(a, ctx.io()),
-            .heartbeat_interval_ms = @max(1, @divTrunc(options.heartbeat_timeout.toMilliseconds(), 3)),
+            // In i96 and clamped like the timeout itself, so `Duration.max` cannot overflow.
+            .heartbeat_interval_ms = @max(1, @as(i64, @intCast(@divTrunc(
+                @min(options.heartbeat_timeout.nanoseconds, proto_time.max_duration.nanoseconds),
+                3 * std.time.ns_per_ms,
+            )))),
         };
         const creation = ctx.executeActivityByName(void, Instance.session_create_activity_type, .{
             .task_queue = queue,
@@ -1823,6 +1858,10 @@ pub fn ActivityFuture(comptime T: type) type {
         /// `wait_cancellation_completed`. If that activity completes or fails instead of
         /// acknowledging the cancel, this returns its result or `error.ActivityFailed`, and
         /// the next cancelable wait returns `error.Canceled`.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn get(f: Self) ActivityError!T {
             const state = try f.state;
             try f.ctx.instance.awaitActivity(state);
@@ -1893,6 +1932,10 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// `error.ChildWorkflowAlreadyStarted` if its ID is taken, and `error.ChildWorkflowFailed`
         /// if it could not start for another reason or was canceled before it started.
         /// Canceling the calling coroutine cancels the child as `get` does.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn started(f: Self) ChildWorkflowError!WorkflowExecution {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .started);
@@ -1910,6 +1953,10 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// `wait_cancellation_completed` (see `ChildWorkflowCancellationType`). If the child
         /// completes or fails first, this returns its result or error, and the next
         /// cancelable wait returns `error.Canceled`.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn get(f: Self) ChildWorkflowError!T {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .result);
@@ -2001,6 +2048,10 @@ pub fn NexusOperationFuture(comptime T: type) type {
         /// start. The token is arena memory of the run. Returns `error.NexusOperationFailed` if the
         /// operation failed, timed out, or was canceled before it started. Canceling the
         /// calling coroutine cancels the operation as `get` does.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn started(f: Self) NexusOperationError!?[]const u8 {
             const state = try f.state;
             try f.ctx.instance.awaitNexusOperation(state, .started);
@@ -2017,6 +2068,10 @@ pub fn NexusOperationFuture(comptime T: type) type {
         /// canceled. If it completed or failed instead, this returns its result or error, and
         /// the coroutine's next cancelable wait returns `error.Canceled`. Eviction ends the
         /// wait with `error.Canceled`.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn get(f: Self) NexusOperationError!T {
             const state = try f.state;
             try f.ctx.instance.awaitNexusOperation(state, .result);
@@ -2106,6 +2161,10 @@ const ExternalFuture = struct {
     /// calling coroutine is canceled while waiting, this returns `error.Canceled` at once.
     /// A signal is also withdrawn if the server hasn't recorded it yet; once recorded it is
     /// delivered anyway. A cancellation request is never withdrawn.
+    ///
+    /// Any number of coroutines may wait on the same future; all of them return once it
+    /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+    /// cancellation as described above, which the others then see in its outcome.
     pub fn get(f: Self) ExternalWorkflowError!void {
         const state = try f.state;
         try f.ctx.instance.awaitExternal(state);
@@ -2143,6 +2202,8 @@ const ExternalFuture = struct {
 
 /// Experimental: how `Context.signalWithStartWorkflow` starts and signals the target. Only
 /// read during the call; strings are copied.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
 pub const SignalWithStartOptions = struct {
     /// The target's workflow ID. Required: empty makes `get` return `error.InvalidOptions`
     /// (logged).
