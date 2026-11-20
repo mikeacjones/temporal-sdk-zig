@@ -771,6 +771,23 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         });
         late.addArtifactArg(symbol_lock_late);
         late.addArg("--hang-report=1");
+
+        // A thread may keep taking and releasing std.debug's symbol lock, so that no single wait
+        // of the report's symbol helper lasts long; the report must still give up on symbols once
+        // the helper's waits add up to 1 s and reach its end line. The churner also shows that
+        // the waiting helper is named hang-report-sym, which on macOS only the thread itself can do.
+        const symbol_lock_churn = Fixture.build(b, "symbol-lock-churn", "symbol_lock_churn.zig", runner);
+        const churn = addCheckCase(b, in.test_step, tool, "hang report finishes while another thread keeps taking and releasing the symbol lock", 0);
+        churn.addArgs(&.{
+            "60",
+            "'symbol_lock_churn.test.waits while another thread keeps taking and releasing the symbol lock' is still running after ",
+            "symbol_lock_churn: a thread named hang-report-sym waits while this thread holds std.debug's symbol lock",
+            "another thread holds std.debug's symbol lock; the stacks that follow are bare addresses",
+            "end of the report for 'symbol_lock_churn.test.waits while another thread keeps taking and releasing the symbol lock'",
+            "--",
+        });
+        churn.addArtifactArg(symbol_lock_churn);
+        churn.addArg("--hang-report=1");
     }
 
     // zig build tsan
