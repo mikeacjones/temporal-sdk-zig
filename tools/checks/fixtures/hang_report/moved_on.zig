@@ -1,93 +1,80 @@
-//! A test whose threads go on after the hang report has frozen and let go of them, while
-//! another thread holds std.debug's SelfInfo lock, for the "check hang report thread that goes
-//! on before its unwind passes" case. The report freezes one thread at a time and, while it is
-//! frozen, only records the return addresses its frame pointers lead to (read through
-//! process_vm_readv or mach_vm_read_overwrite); it looks symbols up after every thread runs
-//! again. Here the holder takes the SelfInfo lock as soon as the report starts freezing and
-//! keeps it for 8 s, so the lookup finds it taken; and a thread that notices it was stopped
-//! for more than 3 s fills the stack it was stopped on with frame records that point at
-//! unmapped memory. The report must use only the addresses it recorded while the thread was
-//! frozen, must not wait on the lock without end (after 1 s it shows bare addresses), must not
-//! crash or hang the process, and the test must pass.
+//! A test that never ends, whose threads go on and reuse their stacks as soon as the hang report
+//! has frozen them and let them go, while another thread holds std.debug's SelfInfo lock, for
+//! the "check hang report thread that goes on before its unwind passes" case. The report
+//! freezes one thread at a time and, while it is frozen, only records the return addresses its
+//! frame pointers lead to; it looks symbols up after every thread runs again. Here the holder
+//! takes the SelfInfo lock before the report starts and never lets it go, and each thread, the
+//! moment the report lets it go, fills the stack it was frozen on with frame records that point
+//! at unmapped memory and says so on stderr. The report must use only the addresses it recorded
+//! while each thread was frozen, must not wait on the lock without end (after 1 s it shows bare
+//! addresses), must reach its end line and must not crash the process. The check kills the
+//! process.
+//!
+//! Nothing here waits on a clock: a thread learns that the report has let it go because its
+//! `sigsuspend` returns, which happens only once the report's SIGURG handler has run on it.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const posix = std.posix;
 
-/// When the test ends, as a CLOCK_MONOTONIC reading; set before any thread starts.
-var test_end: i64 = 0;
+test "goes on after the report lets it go while another thread holds the symbol lock" {
+    // SIGURG, the report's freeze signal, stays blocked on this thread and on the holder, which
+    // inherits the mask, except inside `waitUntilLetGo`; one sent before then stays pending.
+    var urg = posix.sigemptyset();
+    posix.sigaddset(&urg, .URG);
+    posix.sigprocmask(posix.SIG.BLOCK, &urg, null);
 
-test "goes on before the report reads its stack and then finishes" {
-    // A fixed run time is what this fixture tests, so AGENTS.md's rule against them does not apply.
-    test_end = nowNanoseconds() + 14 * std.time.ns_per_s;
-    // Spawned first, so that after the test's thread it is the next the report freezes.
-    const holder = try std.Thread.spawn(.{}, holdSelfInfoLock, .{});
-    // The bound of this fixture: a report that ends or stalls the process must fail the check,
-    // not leave `zig build test` waiting.
-    const bound = try std.Thread.spawn(.{}, exitAfterBound, .{});
-    bound.detach();
-    waitUntil(test_end, false);
-    holder.join();
+    var locked: std.Io.Event = .unset;
+    // Never joined: the check kills the process.
+    const holder = try std.Thread.spawn(.{}, holdsSymbolLock, .{&locked});
+    _ = holder;
+    try locked.wait(std.testing.io);
+    goesOnWhenLetGo("the test's thread");
 }
 
-fn nowNanoseconds() i64 {
-    var ts: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
-}
-
-/// Whether the hang report has installed its SIGURG handler, which it does right before it
-/// freezes the first thread.
-fn reportFreezing() bool {
-    var old: std.posix.Sigaction = undefined;
-    std.posix.sigaction(.URG, null, &old);
-    return old.handler.handler != std.posix.SIG.DFL and old.handler.handler != std.posix.SIG.IGN;
-}
-
-fn lockSelfInfo(io: std.Io) void {
-    const si = std.debug.getSelfDebugInfo() catch return;
-    if (builtin.os.tag.isDarwin()) si.target.mutex.lockUncancelable(io) else si.target.rwlock.lockUncancelable(io);
-}
-
-fn unlockSelfInfo(io: std.Io) void {
-    const si = std.debug.getSelfDebugInfo() catch return;
-    if (builtin.os.tag.isDarwin()) si.target.mutex.unlock(io) else si.target.rwlock.unlock(io);
-}
-
-/// Takes the SelfInfo lock as soon as the report starts freezing, and keeps it for 8 s, or
-/// until `waitUntil` finds this thread was stopped for more than 3 s.
-fn holdSelfInfoLock() void {
+/// Takes std.debug's SelfInfo lock and keeps it; then goes on like the test's thread.
+noinline fn holdsSymbolLock(locked: *std.Io.Event) void {
     const io = std.Io.Threaded.global_single_threaded.io();
-    while (!reportFreezing()) {
-        if (nowNanoseconds() >= test_end) return;
-    }
-    lockSelfInfo(io);
-    waitUntil(nowNanoseconds() + 8 * std.time.ns_per_s, true);
+    if (std.debug.getSelfDebugInfo()) |si| {
+        if (builtin.os.tag.isDarwin()) si.target.mutex.lockUncancelable(io) else si.target.rwlock.lockUncancelable(io);
+    } else |_| {}
+    locked.set(std.testing.io);
+    goesOnWhenLetGo("the thread holding std.debug's symbol lock");
 }
 
-/// Sleeps in short steps until `until`. A step that took more than 3 s means the thread was
-/// frozen that long; it then reuses the stack it was frozen on for the rest of the wait.
-/// `unlock`: the thread holds the SelfInfo lock and lets it go at the end of the wait.
-noinline fn waitUntil(until: i64, unlock: bool) void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const code = codeAddress();
-    var last = nowNanoseconds();
-    while (last < until) {
-        io.sleep(.fromMilliseconds(10), .awake) catch {};
-        const now = nowNanoseconds();
-        if (now - last > 3 * std.time.ns_per_s) return overwriteStackAndWait(code, until, unlock);
-        last = now;
-    }
-    if (unlock) unlockSelfInfo(io);
+/// Waits until the report has frozen this thread and let it go, then reuses the stack it was
+/// frozen on, says so, and waits forever.
+noinline fn goesOnWhenLetGo(who: []const u8) void {
+    waitUntilLetGo();
+    overwriteStack(codeAddress());
+    std.debug.print("moved_on: {s} went on after the report let it go and reused its stack\n", .{who});
+    var never: std.Io.Event = .unset;
+    never.wait(std.testing.io) catch {};
 }
+
+/// Returns once a SIGURG handler has run on this thread and returned. Only the report installs
+/// one, and its handler returns when the report lets the thread go. Every other signal stays
+/// blocked meanwhile, so nothing else ends the wait.
+noinline fn waitUntilLetGo() void {
+    var only_urg = posix.sigfillset();
+    posix.sigdelset(&only_urg, .URG);
+    if (builtin.link_libc) {
+        _ = sigsuspend(&only_urg);
+    } else {
+        _ = std.os.linux.syscall2(.rt_sigsuspend, @intFromPtr(&only_urg), std.os.linux.NSIG / 8);
+    }
+}
+
+extern "c" fn sigsuspend(mask: *const posix.sigset_t) c_int;
 
 noinline fn codeAddress() usize {
     return @returnAddress();
 }
 
-/// Fills the stack below the caller, where the frames the thread was frozen in were, with
-/// frame records whose saved frame pointer is unmapped and whose return address is code; lets
-/// the SelfInfo lock go if `unlock`; then waits until `until`.
-noinline fn overwriteStackAndWait(code: usize, until: i64, unlock: bool) void {
+/// Fills the stack below the caller, where the frames the thread was frozen in were (the
+/// signal handler's included), with frame records whose saved frame pointer is unmapped and
+/// whose return address is code.
+noinline fn overwriteStack(code: usize) void {
     var junk: [8192]usize align(16) = undefined;
     var i: usize = 0;
     while (i < junk.len) : (i += 2) {
@@ -95,17 +82,4 @@ noinline fn overwriteStackAndWait(code: usize, until: i64, unlock: bool) void {
         junk[i + 1] = code;
     }
     std.mem.doNotOptimizeAway(&junk);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    if (unlock) unlockSelfInfo(io);
-    while (nowNanoseconds() < until) io.sleep(.fromMilliseconds(10), .awake) catch {};
-    std.mem.doNotOptimizeAway(&junk);
-}
-
-/// Ends the process after 60 s. It writes without std.debug's stderr lock, which a crashing
-/// watchdog may hold.
-fn exitAfterBound() void {
-    waitUntil(nowNanoseconds() + 60 * std.time.ns_per_s, false);
-    const message = "moved_on.test.goes on before the report reads its stack and then finishes: still running after 60s\n";
-    _ = std.posix.system.write(2, message, message.len);
-    std.process.exit(1);
 }

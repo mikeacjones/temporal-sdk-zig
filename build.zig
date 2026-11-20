@@ -723,18 +723,23 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         busy_run.expectStdErrMatch("All 1 tests passed.");
         in.test_step.dependOn(&busy_run.step);
 
-        // Threads go on and reuse their stacks after the report lets them go, while another
+        // Threads go on and reuse their stacks the moment the report lets them go, while another
         // holds std.debug's symbol lock; the report must use only what it read while each was
-        // frozen, not wait on the lock without end, and not crash.
+        // frozen, not wait on the lock without end, reach its end line and not crash.
         const moved_on = Fixture.build(b, "moved-on", "moved_on.zig", runner);
-        const moved_on_run = std.Build.Step.Run.create(b, "check hang report thread that goes on before its unwind passes");
-        moved_on_run.addArtifactArg(moved_on);
-        moved_on_run.addArg("--hang-report=1");
-        moved_on_run.has_side_effects = true;
-        moved_on_run.expectExitCode(0);
-        moved_on_run.expectStdErrMatch("still running after 1s");
-        moved_on_run.expectStdErrMatch("All 1 tests passed.");
-        in.test_step.dependOn(&moved_on_run.step);
+        const moved = addCheckCase(b, in.test_step, tool, "hang report thread that goes on before its unwind passes", 0);
+        moved.addArgs(&.{
+            "60",
+            "still running after",
+            "goes on after the report lets it go while another thread holds the symbol lock",
+            "moved_on: the test's thread went on after the report let it go",
+            "moved_on: the thread holding std.debug's symbol lock went on after the report let it go",
+            "another thread holds std.debug's symbol lock",
+            "end of the report for",
+            "--",
+        });
+        moved.addArtifactArg(moved_on);
+        moved.addArg("--hang-report=1");
     }
 
     // zig build tsan
