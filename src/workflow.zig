@@ -843,18 +843,14 @@ pub const Context = struct {
         _ = try ctx.awaitInner(state, condition, null);
     }
 
-<<<<<<< HEAD
     /// Like `await`, but gives up after `timeout` (a durable timer). Returns whether the
     /// condition holds when it returns: true also when the timer fired in the same workflow task
     /// as the change that made it true; false only if it still doesn't hold. A fired timer
     /// takes effect once the workflow task's other work (handlers, results, and the
-    /// coroutines they wake) has run with no awaited condition left to hold.
-=======
-    /// Like `await`, but gives up after `timeout` (a durable timer) and returns false if the
-    /// condition still doesn't hold. A zero or negative timeout returns false at once. A
-    /// duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`,
-    /// starts a timer of the longest one it can.
->>>>>>> 83fb26a0016e0fe66060772b826525edeea1874c
+    /// coroutines they wake) has run with no awaited condition left to hold. A zero or
+    /// negative timeout returns false at once unless the condition already holds. A duration
+    /// longer than protobuf can carry (about 10,000 years), such as `Duration.max`, starts a
+    /// timer of the longest one it can.
     pub fn awaitTimeout(ctx: *Context, timeout: Duration, state: anytype, comptime condition: fn (@TypeOf(state)) bool) error{ Canceled, OutOfMemory }!bool {
         return ctx.awaitInner(state, condition, timeout);
     }
