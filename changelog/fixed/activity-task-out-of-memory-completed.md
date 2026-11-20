@@ -1,0 +1,2 @@
+An activity worker that runs out of memory receiving, decoding, tracking or reporting an activity task fails that attempt as retryable with type `OutOfMemory`, instead of dropping the task and holding one of its activity slots until it stops; a Nexus request it can't receive or track fails as a retryable internal error, and an activity or Nexus request it can't track for cancellation no longer runs.
+A cancel for a running activity or Nexus request reaches it even when the worker is out of memory.
