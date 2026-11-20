@@ -1906,8 +1906,10 @@ fn recordContinueAsNew(inst: *Instance, workflow_type: []const u8, options: work
     };
     if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
     // Core fills an empty memo with the memo this run started with, which would drop
-    // `upsertMemo` changes; sending the current view keeps them.
-    const memo = options.memo orelse inst.memo;
+    // `upsertMemo` changes; sending the current view keeps them. Core can't tell an empty
+    // command memo from an unset one, so an empty option means "keep" too. A current memo
+    // emptied by upserts still gets the start memo back: no command can ask for an empty one.
+    const memo = if (options.memo) |m| (if (m.len > 0) m else inst.memo) else inst.memo;
     try cmd.memo.ensureTotalCapacity(a, memo.len);
     for (memo) |f| cmd.memo.appendAssumeCapacity(.{ .key = try a.dupe(u8, f.name), .value = try f.value.dupe(a) });
     // Core fills missing search attributes with the start values plus upserts, removals
@@ -9423,8 +9425,20 @@ const Continue = struct {
     fn continueFromHandler(ctx: *workflow.Context) !void {
         return ctx.continueAsNew(FromSignal, .{}, .{});
     }
+    /// Upserts the memo's status, then continues as new with an explicit empty memo.
+    fn emptyMemo(ctx: *workflow.Context, n: u32) !u32 {
+        try ctx.upsertMemo(.{ .status = "updated" });
+        return ctx.continueAsNew(EmptyMemo, .{ .memo = &.{} }, .{n + 1});
+    }
+    /// Removes every memo key, then continues as new with the default options.
+    fn clearedMemo(ctx: *workflow.Context, n: u32) !u32 {
+        try ctx.upsertMemo(.{ .status = null });
+        return ctx.continueAsNew(ClearedMemo, .{}, .{n + 1});
+    }
     const WithOptions = workflow.Def("WithOptions", withOptions);
     const Defaults = workflow.Def("Defaults", defaults);
+    const EmptyMemo = workflow.Def("EmptyMemo", emptyMemo);
+    const ClearedMemo = workflow.Def("ClearedMemo", clearedMemo);
     const Bare = workflow.Def("Bare", bare);
     const FromSignal = workflow.Def("FromSignal", fromSignal);
 };
@@ -9478,6 +9492,39 @@ test "continue-as-new: default options keep the task queue, timeouts and retry p
     try testing.expectEqualStrings("owner", can.memo.items[0].key);
     try testing.expectEqualStrings("status", can.memo.items[1].key);
     try testing.expectEqualStrings("\"upserted\"", can.memo.items[1].value.?.data);
+}
+
+test "continue-as-new: an empty memo option sends the current memo, and a memo emptied by upserts sends none" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var start_memo: common.Memo = .{};
+    for (try converter.toFields(a, .{ .status = "original" })) |f|
+        try start_memo.fields.append(a, .{ .key = f.name, .value = f.value });
+
+    {
+        const inst = try create(testing.allocator, Continue.EmptyMemo.registered, .{ .task_queue = "tq" });
+        defer inst.destroy();
+        var act = try initActivation(a, "EmptyMemo", .{@as(u32, 1)});
+        act.jobs.items[0].variant.?.initialize_workflow.memo = start_memo;
+        const cmds = commandsOf(try inst.activate(&act, a));
+        try testing.expectEqual(@as(usize, 2), cmds.len);
+        const can = cmds[1].variant.?.continue_as_new_workflow_execution;
+        try testing.expectEqual(@as(usize, 1), can.memo.items.len);
+        try testing.expectEqualStrings("status", can.memo.items[0].key);
+        try testing.expectEqualStrings("\"updated\"", can.memo.items[0].value.?.data);
+    }
+    {
+        // Core fills this empty command memo with the start memo: the documented limit.
+        const inst = try create(testing.allocator, Continue.ClearedMemo.registered, .{ .task_queue = "tq" });
+        defer inst.destroy();
+        var act = try initActivation(a, "ClearedMemo", .{@as(u32, 1)});
+        act.jobs.items[0].variant.?.initialize_workflow.memo = start_memo;
+        const cmds = commandsOf(try inst.activate(&act, a));
+        try testing.expectEqual(@as(usize, 2), cmds.len);
+        try testing.expectEqual(@as(usize, 0), inst.memo.len);
+        try testing.expectEqual(@as(usize, 0), cmds[1].variant.?.continue_as_new_workflow_execution.memo.items.len);
+    }
 }
 
 test "continue-as-new: error.ContinueAsNew without ctx.continueAsNew fails the workflow saying so" {

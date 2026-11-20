@@ -679,8 +679,11 @@ pub const ContinueAsNewOptions = struct {
     run_timeout: ?Duration = null,
     /// Limits one workflow task of the new run. Null keeps this run's task timeout.
     task_timeout: ?Duration = null,
-    /// The new run's memo, built with `converter.toFields`. Null (or an empty slice, which the
-    /// command can't tell apart from null) keeps this run's memo, `upsertMemo` changes included.
+    /// The new run's memo, built with `converter.toFields`. Null or an empty slice keeps this
+    /// run's memo, `upsertMemo` changes included. If that memo is empty because `upsertMemo`
+    /// removed every key, the new run gets the memo this run started with instead: an empty
+    /// memo on the command tells sdk-core to keep the start memo, and no command can ask for an
+    /// empty one.
     memo: ?[]const converter.Field = null,
     /// The new run's search attributes, built with `search_attributes.Key.set` (unsets are
     /// ignored). Null keeps this run's current search attributes, upserts included.

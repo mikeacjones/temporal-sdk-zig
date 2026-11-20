@@ -303,6 +303,36 @@ test "WorkflowReplayer replays a run that continued as new by name and catches o
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(continue_as_new_by_name_history));
 }
 
+const ContinueAsNewMemo = struct {
+    /// The first run upserts the memo's status and continues as new: with an explicit empty
+    /// memo when `clear` is false, after removing the status key and with default options
+    /// when it is true. The second run returns its memo's status, or "none".
+    fn run(ctx: *workflow.Context, continued: bool, clear: bool) ![]const u8 {
+        if (continued) return try ctx.memoValue([]const u8, "status") orelse "none";
+        if (clear) {
+            try ctx.upsertMemo(.{ .status = null });
+            return ctx.continueAsNew(Def, .{}, .{ true, clear });
+        }
+        try ctx.upsertMemo(.{ .status = "updated" });
+        return ctx.continueAsNew(Def, .{ .memo = &.{} }, .{ true, clear });
+    }
+    const Def = workflow.Def("can_memo", run);
+};
+
+test "workflow: continue-as-new with an empty memo keeps the upserted memo, and a memo emptied by upserts gets the start memo back" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ContinueAsNewMemo.Def);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const start_memo = try converter.toFields(a, .{ .status = "original" });
+    try testing.expectEqualStrings("updated", try env.executeWorkflowWithOptions(ContinueAsNewMemo.Def, .{ .memo = start_memo }, .{ false, false }, a, null));
+    // The documented limit: core fills an empty command memo with the start memo.
+    try testing.expectEqualStrings("original", try env.executeWorkflowWithOptions(ContinueAsNewMemo.Def, .{ .memo = start_memo }, .{ false, true }, a, null));
+}
+
 const ChildCancel = struct {
     const Finish = workflow.SignalDef("finish", fn () void);
 

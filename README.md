@@ -1167,6 +1167,7 @@ Notes:
 - Only the workflow function's return continues as new; from a handler the error fails the workflow or rejects the update.
 - `ctx.continueAsNewSuggested()` says when the server suggests it; `historyLength` and `historySizeBytes` give the size.
 - `ContinueAsNewOptions` fields left null keep this run's values; a client waiting on the result follows the chain.
+- `ContinueAsNewOptions.memo` null or empty keeps this run's memo, `upsertMemo` changes included. If `upsertMemo` removed every key, the new run gets the memo this run started with instead: an empty memo on the command tells the core to keep the start memo, and no command can ask for an empty one.
 
 `workflow.Context.continueAsNewByName` continues as a workflow type named at run time, with the arguments as a tuple. A dynamic workflow uses it to continue under the type it runs as:
 
