@@ -1825,6 +1825,10 @@ pub fn ActivityFuture(comptime T: type) type {
         /// `wait_cancellation_completed`. If that activity completes or fails instead of
         /// acknowledging the cancel, this returns its result or `error.ActivityFailed`, and
         /// the next cancelable wait returns `error.Canceled`.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn get(f: Self) ActivityError!T {
             const state = try f.state;
             try f.ctx.instance.awaitActivity(state);
@@ -1895,6 +1899,10 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// `error.ChildWorkflowAlreadyStarted` if its ID is taken, and `error.ChildWorkflowFailed`
         /// if it could not start for another reason or was canceled before it started.
         /// Canceling the calling coroutine cancels the child as `get` does.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn started(f: Self) ChildWorkflowError!WorkflowExecution {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .started);
@@ -1912,6 +1920,10 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
         /// `wait_cancellation_completed` (see `ChildWorkflowCancellationType`). If the child
         /// completes or fails first, this returns its result or error, and the next
         /// cancelable wait returns `error.Canceled`.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn get(f: Self) ChildWorkflowError!T {
             const state = try f.state;
             try f.ctx.instance.awaitChild(state, .result);
@@ -2003,6 +2015,10 @@ pub fn NexusOperationFuture(comptime T: type) type {
         /// start. The token is arena memory of the run. Returns `error.NexusOperationFailed` if the
         /// operation failed, timed out, or was canceled before it started. Canceling the
         /// calling coroutine cancels the operation as `get` does.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn started(f: Self) NexusOperationError!?[]const u8 {
             const state = try f.state;
             try f.ctx.instance.awaitNexusOperation(state, .started);
@@ -2019,6 +2035,10 @@ pub fn NexusOperationFuture(comptime T: type) type {
         /// canceled. If it completed or failed instead, this returns its result or error, and
         /// the coroutine's next cancelable wait returns `error.Canceled`. Eviction ends the
         /// wait with `error.Canceled`.
+        ///
+        /// Any number of coroutines may wait on the same future; all of them return once it
+        /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+        /// cancellation as described above, which the others then see in its outcome.
         pub fn get(f: Self) NexusOperationError!T {
             const state = try f.state;
             try f.ctx.instance.awaitNexusOperation(state, .result);
@@ -2108,6 +2128,10 @@ const ExternalFuture = struct {
     /// calling coroutine is canceled while waiting, this returns `error.Canceled` at once.
     /// A signal is also withdrawn if the server hasn't recorded it yet; once recorded it is
     /// delivered anyway. A cancellation request is never withdrawn.
+    ///
+    /// Any number of coroutines may wait on the same future; all of them return once it
+    /// resolves, in the order they began waiting. Canceling one of them requests the operation's
+    /// cancellation as described above, which the others then see in its outcome.
     pub fn get(f: Self) ExternalWorkflowError!void {
         const state = try f.state;
         try f.ctx.instance.awaitExternal(state);

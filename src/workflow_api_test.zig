@@ -564,6 +564,67 @@ test "workflow: the worker answers __stack_trace with no handler, and the run's 
     try replayer.replayHistory(history);
 }
 
+/// Two coroutines wait on one activity's future: first a coroutine started with `io.async`,
+/// then the workflow function. Each then runs an activity of its own type, so the order of the
+/// two ScheduleActivity commands is the order the coroutines returned from `get`.
+const SharedFuture = struct {
+    fn echo(_: *activity.Context, text: []const u8) ![]const u8 {
+        return text;
+    }
+    const Fetch = activity.Def("shared_fetch", echo);
+    const First = activity.Def("shared_first", echo);
+    const Second = activity.Def("shared_second", echo);
+    const opts: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
+
+    fn Then(comptime Next: type) type {
+        return struct {
+            fn run(ctx: *workflow.Context, f: workflow.ActivityFuture([]const u8), ready: *std.Io.Event) ![]const u8 {
+                ready.set(ctx.io());
+                return ctx.executeActivity(Next, opts, .{try f.get()}).get();
+            }
+        };
+    }
+
+    /// The coroutine started with `io.async` runs `AsyncNext` after the shared activity, and
+    /// the workflow function `RootNext`. Returns "<async's result> <root's result>".
+    fn Workflow(comptime AsyncNext: type, comptime RootNext: type) type {
+        return struct {
+            fn run(ctx: *workflow.Context) ![]const u8 {
+                const io = ctx.io();
+                const f = ctx.executeActivity(Fetch, opts, .{"shared"});
+                var ready: std.Io.Event = .unset;
+                var other = io.async(Then(AsyncNext).run, .{ ctx, f, &ready });
+                // The coroutine above begins waiting on `f` first.
+                ready.waitUncancelable(io);
+                const mine = try ctx.executeActivity(RootNext, opts, .{try f.get()}).get();
+                const theirs = try other.await(io);
+                return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ theirs, mine });
+            }
+        };
+    }
+    const Def = workflow.Def("shared_future", Workflow(First, Second).run);
+    /// The same, with the two coroutines' next activities swapped.
+    const Swapped = workflow.Def("shared_future", Workflow(Second, First).run);
+};
+
+/// A dev-server run of `SharedFuture.Def` with its three activities, fetched with
+/// `Client.fetchHistory` and encoded as ProtoJSON (`History.jsonEncode`), indented, the
+/// worker's identity replaced. Its second workflow task schedules `shared_first`, then
+/// `shared_second`.
+const shared_activity_future_history = @embedFile("testdata/shared_activity_future_history.json");
+
+test "WorkflowReplayer replays two coroutines sharing one activity future and catches them resuming in another order" {
+    var ok: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer ok.deinit();
+    try ok.registerWorkflow(SharedFuture.Def);
+    try ok.replayHistoryJson(shared_activity_future_history);
+
+    var changed: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(SharedFuture.Swapped);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(shared_activity_future_history));
+}
+
 /// The dev server only accepts signal-with-start from a workflow with this setting on.
 const signal_with_start_args = [_][]const u8{ "--dynamic-config-value", "history.enableSignalWithStartFromWorkflow=true" };
 

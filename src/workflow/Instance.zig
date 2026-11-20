@@ -438,9 +438,41 @@ pub const PendingFailure = union(enum) {
 /// `requestContinueAsNew`; the request is in `continue_as_new`.
 const RootOutcome = union(enum) { completed: converter.Payload, failed: anyerror, continued_as_new };
 
+/// The coroutines blocked on one operation's future, in the order they began waiting. Each
+/// entry lives on its waiting coroutine's stack: the coroutine adds it before it first blocks
+/// and removes it with a `defer`, on every path out of the wait.
+const FutureWaiters = struct {
+    list: std.DoublyLinkedList = .{},
+
+    const Entry = struct {
+        wait: WorkflowIo.Wait,
+        node: std.DoublyLinkedList.Node = .{},
+    };
+
+    fn add(ws: *FutureWaiters, e: *Entry) void {
+        ws.list.append(&e.node);
+    }
+
+    fn remove(ws: *FutureWaiters, e: *Entry) void {
+        ws.list.remove(&e.node);
+    }
+
+    /// Wakes every waiter, oldest first (`WorkflowIo.wake`, which queues each behind the
+    /// coroutines already ready), so they resume in the order they began waiting. Unlinks
+    /// nothing: each woken coroutine removes its own entry when it resumes.
+    fn wakeAll(ws: *const FutureWaiters, wio: *WorkflowIo) void {
+        var it = ws.list.first;
+        while (it) |node| : (it = node.next) {
+            const e: *Entry = @alignCast(@fieldParentPtr("node", node));
+            wio.wake(&e.wait);
+        }
+    }
+};
+
 pub const ActivityState = struct {
     seq: u32,
-    waiter: ?*WorkflowIo.Wait = null,
+    /// The coroutines blocked in `awaitActivity`.
+    waiters: FutureWaiters = .{},
     outcome: ?Outcome = null,
     cancel_requested: bool = false,
     cancellation_type: CancellationType = .try_cancel,
@@ -489,8 +521,8 @@ pub const ChildState = struct {
     workflow_type: []const u8,
     cancellation_type: workflow.ChildWorkflowCancellationType,
     /// The coroutines blocked in `started` and in `get`.
-    start_waiter: ?*WorkflowIo.Wait = null,
-    result_waiter: ?*WorkflowIo.Wait = null,
+    start_waiters: FutureWaiters = .{},
+    result_waiters: FutureWaiters = .{},
     /// Set once the server started the child.
     run_id: ?[]const u8 = null,
     /// Set once the child closed, or failed to start (or was canceled before it started).
@@ -515,8 +547,8 @@ pub const ChildState = struct {
     }
 
     fn wake(state: *ChildState, wio: *WorkflowIo) void {
-        if (state.start_waiter) |w| wio.wake(w);
-        if (state.result_waiter) |w| wio.wake(w);
+        state.start_waiters.wakeAll(wio);
+        state.result_waiters.wakeAll(wio);
     }
 };
 
@@ -529,8 +561,8 @@ pub const NexusOperationState = struct {
     operation: []const u8,
     cancellation_type: workflow.NexusOperationCancellationType,
     /// The coroutines blocked in `started` and in `get`.
-    start_waiter: ?*WorkflowIo.Wait = null,
-    result_waiter: ?*WorkflowIo.Wait = null,
+    start_waiters: FutureWaiters = .{},
+    result_waiters: FutureWaiters = .{},
     /// Set once the handler started the operation, or completed it synchronously.
     started: bool = false,
     /// The operation token of an asynchronous start; null for a synchronous one.
@@ -555,8 +587,8 @@ pub const NexusOperationState = struct {
     }
 
     fn wake(state: *NexusOperationState, wio: *WorkflowIo) void {
-        if (state.start_waiter) |w| wio.wake(w);
-        if (state.result_waiter) |w| wio.wake(w);
+        state.start_waiters.wakeAll(wio);
+        state.result_waiters.wakeAll(wio);
     }
 };
 
@@ -567,7 +599,8 @@ pub const ExternalState = struct {
     kind: Kind,
     /// The target's workflow ID, named in the failure's message.
     workflow_id: []const u8,
-    waiter: ?*WorkflowIo.Wait = null,
+    /// The coroutines blocked in `awaitExternal`.
+    waiters: FutureWaiters = .{},
     outcome: ?Outcome = null,
     cancel_requested: bool = false,
     /// Set for a request canceling this child under `wait_cancellation_requested`.
@@ -688,16 +721,20 @@ pub fn teardown(inst: *Instance) usize {
     // (a handler's error finishes it, and handlers outlive the root).
     if (inst.root) |root| inst.wio.cancelTask(root);
     for (inst.handlers.items) |run| inst.wio.cancelTask(run.task);
-    // Coroutines already waiting for an activity's cancellation to complete don't see the
-    // cancel above; wake them. The order doesn't matter: nothing they do is sent to the core.
+    // Coroutines already waiting for an operation's cancellation to complete don't see the
+    // cancel above, and neither do coroutines it doesn't reach (one waiter of several on a
+    // shared future); wake every waiter. The order doesn't matter: nothing they do is sent to
+    // the core.
     var pending = inst.activities.valueIterator();
-    while (pending.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
+    while (pending.next()) |state| state.*.waiters.wakeAll(&inst.wio);
     var backing_off = inst.backoffs.valueIterator();
-    while (backing_off.next()) |state| if (state.*.waiter) |w| inst.wio.wake(w);
+    while (backing_off.next()) |state| state.*.waiters.wakeAll(&inst.wio);
     var children = inst.children.valueIterator();
     while (children.next()) |state| state.*.wake(&inst.wio);
     var operations = inst.nexus_operations.valueIterator();
     while (operations.next()) |state| state.*.wake(&inst.wio);
+    var externals = inst.externals.valueIterator();
+    while (externals.next()) |state| state.*.waiters.wakeAll(&inst.wio);
     inst.wio.run();
     std.debug.assert(inst.commands.items.len == 0);
     return inst.sched.live;
@@ -2487,15 +2524,15 @@ pub fn awaitActivity(inst: *Instance, state: *ActivityState) error{Canceled}!voi
         .{ .what = "a side effect (Context.sideEffect)" }
     else
         .{ .what = "local activity", .name = name, .seq = seq };
-    var wait = inst.wio.newWaitPoint(reason);
-    state.waiter = &wait;
-    defer state.waiter = null;
+    var entry: FutureWaiters.Entry = .{ .wait = inst.wio.newWaitPoint(reason) };
+    state.waiters.add(&entry);
+    defer state.waiters.remove(&entry);
     var canceled = false;
     while (state.outcome == null) {
         if (inst.evicting) return error.Canceled;
         // A cancel also wakes the wait point, so each block starts from a fresh one.
-        wait = inst.wio.newWaitPoint(reason);
-        inst.wio.waitFor(&wait, !canceled) catch |err| {
+        entry.wait = inst.wio.newWaitPoint(reason);
+        inst.wio.waitFor(&entry.wait, !canceled) catch |err| {
             inst.cancelActivity(state);
             if (state.cancellation_type != .wait_cancellation_completed) return err;
             canceled = true;
@@ -2527,7 +2564,7 @@ fn requestCancel(inst: *Instance, state: *ActivityState) !void {
     local.backoff_timer = null;
     try inst.emit(.{ .variant = .{ .cancel_timer = .{ .seq = timer } } });
     state.outcome = .{ .cancelled = try localCancelFailure(a, local) };
-    if (state.waiter) |w| inst.wio.wake(w);
+    state.waiters.wakeAll(&inst.wio);
 }
 
 fn localCancelFailure(a: Allocator, local: *const ActivityState.Local) !*const Failure {
@@ -2560,13 +2597,13 @@ fn resolveActivity(inst: *Instance, r: *const act_pb.ResolveActivity) !void {
             if (state.cancel_requested) if (state.local) |local| {
                 // Canceled while the attempt ran: don't start another.
                 state.outcome = .{ .cancelled = try localCancelFailure(a, local) };
-                if (state.waiter) |w| inst.wio.wake(w);
+                state.waiters.wakeAll(&inst.wio);
                 return;
             };
             return inst.startLocalBackoff(state, b);
         },
     };
-    if (state.waiter) |w| inst.wio.wake(w);
+    state.waiters.wakeAll(&inst.wio);
 }
 
 // ---------------------------------------------------------------- child workflows
@@ -2659,18 +2696,18 @@ pub fn awaitChild(inst: *Instance, state: *ChildState, phase: ChildState.Phase) 
         .started => "the start of child workflow",
         .result => "child workflow",
     }, .name = state.workflow_type };
-    var wait = inst.wio.newWaitPoint(reason);
-    const waiter = switch (phase) {
-        .started => &state.start_waiter,
-        .result => &state.result_waiter,
+    const waiters = switch (phase) {
+        .started => &state.start_waiters,
+        .result => &state.result_waiters,
     };
-    waiter.* = &wait;
-    defer waiter.* = null;
+    var entry: FutureWaiters.Entry = .{ .wait = inst.wio.newWaitPoint(reason) };
+    waiters.add(&entry);
+    defer waiters.remove(&entry);
     var canceled = false;
     while (!state.reached(phase)) {
         if (inst.evicting) return error.Canceled;
-        wait = inst.wio.newWaitPoint(reason);
-        inst.wio.waitFor(&wait, !canceled) catch |err| {
+        entry.wait = inst.wio.newWaitPoint(reason);
+        inst.wio.waitFor(&entry.wait, !canceled) catch |err| {
             inst.cancelChild(state);
             switch (state.cancellation_type) {
                 .try_cancel, .abandon => return err,
@@ -2869,18 +2906,18 @@ pub fn awaitNexusOperation(inst: *Instance, state: *NexusOperationState, phase: 
         .started => "the start of Nexus operation",
         .result => "Nexus operation",
     }, .name = state.operation };
-    var wait = inst.wio.newWaitPoint(reason);
-    const waiter = switch (phase) {
-        .started => &state.start_waiter,
-        .result => &state.result_waiter,
+    const waiters = switch (phase) {
+        .started => &state.start_waiters,
+        .result => &state.result_waiters,
     };
-    waiter.* = &wait;
-    defer waiter.* = null;
+    var entry: FutureWaiters.Entry = .{ .wait = inst.wio.newWaitPoint(reason) };
+    waiters.add(&entry);
+    defer waiters.remove(&entry);
     var canceled = false;
     while (!state.reached(phase)) {
         if (inst.evicting) return error.Canceled;
-        wait = inst.wio.newWaitPoint(reason);
-        inst.wio.waitFor(&wait, !canceled) catch {
+        entry.wait = inst.wio.newWaitPoint(reason);
+        inst.wio.waitFor(&entry.wait, !canceled) catch {
             inst.cancelNexusOperation(state);
             canceled = true;
         };
@@ -3152,13 +3189,13 @@ pub fn awaitExternal(inst: *Instance, state: *ExternalState) error{Canceled}!voi
         .signal => "a signal to external workflow",
         .cancel => "a cancellation request to external workflow",
     }, .name = state.workflow_id };
-    var wait = inst.wio.newWaitPoint(reason);
-    state.waiter = &wait;
-    defer state.waiter = null;
+    var entry: FutureWaiters.Entry = .{ .wait = inst.wio.newWaitPoint(reason) };
+    state.waiters.add(&entry);
+    defer state.waiters.remove(&entry);
     while (state.outcome == null) {
         if (inst.evicting) return error.Canceled;
-        wait = inst.wio.newWaitPoint(reason);
-        inst.wio.waitFor(&wait, true) catch |err| {
+        entry.wait = inst.wio.newWaitPoint(reason);
+        inst.wio.waitFor(&entry.wait, true) catch |err| {
             inst.cancelExternal(state);
             return err;
         };
@@ -3181,7 +3218,7 @@ fn resolveExternal(inst: *Instance, seq: u32, failure: ?Failure, not_found: bool
     const state = kv.value;
     const f = failure orelse {
         state.outcome = .delivered;
-        if (state.waiter) |w| inst.wio.wake(w);
+        state.waiters.wakeAll(&inst.wio);
         if (state.child) |child| try inst.childCancelRecorded(child);
         return;
     };
@@ -3195,7 +3232,7 @@ fn resolveExternal(inst: *Instance, seq: u32, failure: ?Failure, not_found: bool
         copy.message = try std.fmt.allocPrint(a, "{s} (workflow ID \"{s}\")", .{ copy.message, state.workflow_id });
         state.outcome = if (not_found) .{ .not_found = copy } else .{ .failed = copy };
     }
-    if (state.waiter) |w| inst.wio.wake(w);
+    state.waiters.wakeAll(&inst.wio);
 }
 
 /// A failure user code will read, from the core: a copy in the run's arena of `f`, passed
@@ -5703,6 +5740,131 @@ test "eviction ends a wait for an activity's cancellation to complete" {
     running.destroy();
 }
 
+// Two coroutines wait on one future: first a coroutine started with `io.async`, which nothing
+// cancels, then the workflow function. The workflow returns the order they returned in and
+// what each got: "<first> <second>: async=<outcome> root=<outcome>", an outcome being the
+// result, "delivered", or the error's name. The future is the one `kind` names ("activity",
+// "local", "child", "nexus" or "signal"), with the cancellation type `cancellation`. A child
+// or Nexus operation is waited on in `started`, then in `get`.
+const SharedFuture = struct {
+    const Order = struct {
+        ready: std.Io.Event = .unset,
+        who: [2][]const u8 = .{ "", "" },
+        n: usize = 0,
+
+        fn returned(o: *Order, who: []const u8) void {
+            o.who[o.n] = who;
+            o.n += 1;
+        }
+    };
+
+    fn Waiters(comptime F: type) type {
+        return struct {
+            fn outcome(f: F) []const u8 {
+                if (@hasDecl(F, "started")) _ = f.started() catch |err| return @errorName(err);
+                const r = f.get() catch |err| return @errorName(err);
+                return if (@TypeOf(r) == void) "delivered" else r;
+            }
+
+            fn first(f: F, io: std.Io, order: *Order) []const u8 {
+                order.ready.set(io);
+                const r = outcome(f);
+                order.returned("async");
+                return r;
+            }
+
+            fn run(ctx: *workflow.Context, f: F) ![]const u8 {
+                const io = ctx.io();
+                var order: Order = .{};
+                var other = io.async(first, .{ f, io, &order });
+                // The coroutine above begins waiting before this one does.
+                order.ready.waitUncancelable(io);
+                const mine = outcome(f);
+                order.returned("root");
+                const theirs = other.await(io);
+                return std.fmt.allocPrint(ctx.allocator(), "{s} {s}: async={s} root={s}", .{ order.who[0], order.who[1], theirs, mine });
+            }
+        };
+    }
+
+    fn run(ctx: *workflow.Context, kind: []const u8, cancellation: []const u8) ![]const u8 {
+        const k = std.meta.stringToEnum(enum { activity, local, child, nexus, signal }, kind) orelse return error.InvalidPayload;
+        switch (k) {
+            .activity => {
+                const ct = std.meta.stringToEnum(ActivityState.CancellationType, cancellation) orelse return error.InvalidPayload;
+                const f = ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10), .cancellation_type = ct }, .{"x"});
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+            .local => {
+                const ct = std.meta.stringToEnum(ActivityState.CancellationType, cancellation) orelse return error.InvalidPayload;
+                const f = ctx.executeLocalActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(5), .cancellation_type = ct }, .{"x"});
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+            .child => {
+                const ct = std.meta.stringToEnum(workflow.ChildWorkflowCancellationType, cancellation) orelse return error.InvalidPayload;
+                const f = ctx.executeChildWorkflow(ChildWf.Kid, .{ .id = "kid-1", .cancellation_type = ct }, .{"kid"});
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+            .nexus => {
+                const ct = std.meta.stringToEnum(workflow.NexusOperationCancellationType, cancellation) orelse return error.InvalidPayload;
+                const f = ctx.executeNexusOperation(NexusWf.Service, NexusWf.Echo, .{ .endpoint = "hello-endpoint", .cancellation_type = ct }, .{ .message = "hi" });
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+            .signal => {
+                const f = ctx.signalExternalWorkflow(ExternalWf.Approve, "target", "", .{"ann"});
+                return Waiters(@TypeOf(f)).run(ctx, f);
+            },
+        }
+    }
+    const Def = workflow.Def("SharedFuture", run);
+
+    /// A run of `SharedFuture` for `kind` and `cancellation`, after its first activation.
+    fn start(a: Allocator, kind: []const u8, cancellation: []const u8) !*Instance {
+        const inst = try create(testing.allocator, Def.registered, .{});
+        errdefer inst.destroy();
+        _ = try inst.activate(&try initActivation(a, "SharedFuture", .{ kind, cancellation }), a);
+        return inst;
+    }
+
+    /// Evicts `inst` while both coroutines wait: `teardown` must leave no coroutine alive, and
+    /// `destroy` must free everything (testing.allocator reports leaks).
+    fn evict(inst: *Instance) !void {
+        defer inst.destroy();
+        try testing.expectEqual(@as(usize, 0), inst.teardown());
+    }
+};
+
+test "activity: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "activity", "wait_cancellation_completed");
+    defer inst.destroy();
+    const done = try inst.activate(&try resolveOk(a, 1, "shared"), a);
+    try testing.expectEqualStrings("\"async root: async=shared root=shared\"", completedWith(done));
+}
+
+test "activity: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "activity", "try_cancel");
+    defer inst.destroy();
+    // Canceling the workflow function's wait requests the activity's cancellation.
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.request_cancel_activity.seq);
+    const done = try inst.activate(&try resolveOk(a, 1, "finished anyway"), a);
+    try testing.expectEqualStrings("\"root async: async=finished anyway root=Canceled\"", completedWith(done));
+}
+
+test "activity: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "activity", "wait_cancellation_completed"));
+}
+
 // Runs `Greet` as a local activity with the cancellation type named by `mode`; "no_timeouts"
 // leaves out both close timeouts.
 const LocalGreet = struct {
@@ -6028,6 +6190,41 @@ test "eviction while a local activity backs off frees everything" {
     _ = try inst.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "wait_cancellation_completed")}), a);
     _ = try inst.activate(&try localBackoff(a, 1), a);
     inst.destroy();
+}
+
+test "local activity: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "local", "wait_cancellation_completed");
+    defer inst.destroy();
+    const done = try inst.activate(&try resolveLocal(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, "shared") } }), a);
+    try testing.expectEqualStrings("\"async root: async=shared root=shared\"", completedWith(done));
+}
+
+test "local activity: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "local", "try_cancel");
+    defer inst.destroy();
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.request_cancel_local_activity.seq);
+    const done = try inst.activate(&try resolveLocal(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, "finished anyway") } }), a);
+    try testing.expectEqualStrings("\"root async: async=finished anyway root=Canceled\"", completedWith(done));
+}
+
+test "local activity: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "local", "wait_cancellation_completed"));
+
+    // While the local activity waits for its next attempt.
+    const backing_off = try SharedFuture.start(a, "local", "wait_cancellation_completed");
+    _ = try backing_off.activate(&try localBackoff(a, 1), a);
+    try SharedFuture.evict(backing_off);
 }
 
 const Cron = struct {
@@ -8375,6 +8572,43 @@ test "child workflow: eviction ends waits for the start and for the cancellation
     canceling.destroy();
 }
 
+test "child workflow: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "child", "wait_cancellation_completed");
+    defer inst.destroy();
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try childStarted(a, 1, "kid-run"), a)).len);
+    const done = try inst.activate(&try childResolved(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, "shared") } }), a);
+    try testing.expectEqualStrings("\"async root: async=shared root=shared\"", completedWith(done));
+}
+
+test "child workflow: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "child", "try_cancel");
+    defer inst.destroy();
+    _ = try inst.activate(&try childStarted(a, 1, "kid-run"), a);
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.cancel_child_workflow_execution.child_workflow_seq);
+    const done = try inst.activate(&try childResolved(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, "finished anyway") } }), a);
+    try testing.expectEqualStrings("\"root async: async=finished anyway root=Canceled\"", completedWith(done));
+}
+
+test "child workflow: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "child", "wait_cancellation_completed"));
+
+    // Both waiting in `get`, once the child started.
+    const started = try SharedFuture.start(a, "child", "wait_cancellation_completed");
+    _ = try started.activate(&try childStarted(a, 1, "kid-run"), a);
+    try SharedFuture.evict(started);
+}
+
 test "child workflow: an empty workflow type returns error.InvalidOptions from get" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
@@ -8866,6 +9100,44 @@ test "nexus: eviction ends waits for the start and for the cancellation to resol
     canceling.destroy();
 }
 
+test "nexus: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "nexus", "wait_cancellation_completed");
+    defer inst.destroy();
+    try testing.expectEqual(@as(usize, 0), commandsOf(try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a)).len);
+    const done = try inst.activate(&try nexusResolved(a, 1, try nexusOutput(a, "shared")), a);
+    try testing.expectEqualStrings("\"async root: async=shared root=shared\"", completedWith(done));
+}
+
+test "nexus: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "nexus", "try_cancel");
+    defer inst.destroy();
+    _ = try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+    // A canceled wait on a Nexus operation goes on until the core resolves it.
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.request_cancel_nexus_operation.seq);
+    const done = try inst.activate(&try nexusResolved(a, 1, try nexusOutput(a, "finished anyway")), a);
+    try testing.expectEqualStrings("\"async root: async=finished anyway root=finished anyway\"", completedWith(done));
+}
+
+test "nexus: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "nexus", "wait_cancellation_completed"));
+
+    // Both waiting in `get`, once the operation started.
+    const started = try SharedFuture.start(a, "nexus", "wait_cancellation_completed");
+    _ = try started.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+    try SharedFuture.evict(started);
+}
+
 // Signals to other workflows. `ExternalWf.Kid` never runs here: the tests resolve it.
 const ExternalWf = struct {
     const Approve = workflow.SignalDef("approve", fn (approver: []const u8) void);
@@ -9028,6 +9300,37 @@ test "signal external: eviction ends a wait for a delivery" {
     const inst = try create(testing.allocator, ExternalWf.Signal.registered, .{});
     _ = try inst.activate(&try initActivation(a, "SignalOther", .{ @as([]const u8, "target"), @as([]const u8, "") }), a);
     inst.destroy(); // testing.allocator reports leaks
+}
+
+test "signal external: two coroutines waiting on one future both return its outcome, in the order they began waiting" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "signal", "wait_cancellation_completed");
+    defer inst.destroy();
+    const done = try inst.activate(&try signalResolved(a, 1, null, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a);
+    try testing.expectEqualStrings("\"async root: async=delivered root=delivered\"", completedWith(done));
+}
+
+test "signal external: when one of two coroutines waiting on one future is canceled, the other still returns its outcome" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try SharedFuture.start(a, "signal", "try_cancel");
+    defer inst.destroy();
+    const canceled = commandsOf(try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a));
+    try testing.expectEqual(@as(usize, 1), canceled.len);
+    try testing.expectEqual(@as(u32, 1), canceled[0].variant.?.cancel_signal_workflow.seq);
+    // The server had recorded the signal, so it is delivered anyway.
+    const done = try inst.activate(&try signalResolved(a, 1, null, .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED), a);
+    try testing.expectEqualStrings("\"root async: async=delivered root=Canceled\"", completedWith(done));
+}
+
+test "signal external: eviction while two coroutines wait on one future ends both waits" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    try SharedFuture.evict(try SharedFuture.start(a, "signal", "wait_cancellation_completed"));
 }
 
 fn cancelResolved(a: Allocator, seq: u32, failure: ?Failure, cause: proto.temporal.api.enums.v1.CancelExternalWorkflowExecutionFailedCause) !act_pb.WorkflowActivation {
