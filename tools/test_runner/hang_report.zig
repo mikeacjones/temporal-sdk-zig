@@ -28,11 +28,13 @@
 //! test may well be stuck holding one. It tries std's stderr lock for at most `lock_wait`, and
 //! when it stays taken, the rest of the report is written without it. std.debug's symbol lock
 //! cannot be tried: std takes it inside each lookup, again for every frame, so a thread can take
-//! it between any two of them. So the rows are formatted and written by a helper thread (named
-//! "hang-report-sym") whose lookups go through an Io that records when it starts waiting on a
-//! futex. When the helper has waited `lock_wait` in one futex wait, the watchdog takes the rest
-//! of the report over and shows bare addresses; the helper, if it ever goes on, writes nothing
-//! more.
+//! it between any two of them. So the rows are formatted and written by a helper thread, which
+//! names itself "hang-report-sym" (macOS can only name the calling thread), and whose lookups go
+//! through an Io that records how long it waits on futexes. When its futex waits during the
+//! report add up to `lock_wait`, counting the one in progress, the watchdog takes the rest of the
+//! report over and shows bare addresses; the helper, if it ever goes on, writes nothing more. A
+//! thread that keeps taking and releasing the lock therefore slows the report by at most
+//! `lock_wait` in all, whatever the number of frames.
 //!
 //! Nothing here may end the process: every failure becomes a `test-hang-report: ` line.
 
@@ -644,13 +646,25 @@ var lookup_phase: std.atomic.Value(enum(u32) { formatting, writing, abandoned })
 var lookup_busy: std.atomic.Value(bool) = .init(false);
 /// When the helper began the futex wait it is in (`nowNanoseconds`), or 0.
 var lookup_wait_since: std.atomic.Value(i64) = .init(0);
+/// Nanoseconds the helper spent in finished futex waits during the current report. `markWait`
+/// adds a wait here before it clears `lookup_wait_since`.
+var lookup_waited_ns: std.atomic.Value(i64) = .init(0);
+
+/// The watchdog's view of how long the helper has waited on futexes during this report, the
+/// wait in progress included. `lookup_wait_since` is loaded first: a wait that finishes between
+/// the two loads is then counted twice at most (giving up a little early), never missed.
+fn lookupWaitedNanoseconds() i64 {
+    const since = lookup_wait_since.load(.acquire);
+    const waited = lookup_waited_ns.load(.acquire);
+    return waited + (if (since != 0) nowNanoseconds() - since else 0);
+}
 /// The helper's row, apart from the watchdog's `row_buffer`.
 var lookup_row_buffer: [64 * 1024]u8 = undefined;
 threadlocal var is_lookup_thread = false;
 
 /// Writes rows with their symbols from a helper thread, and returns how many it wrote: all of
-/// them, or those before the row whose lookup waited `lock_wait` on a futex. The caller writes
-/// the rest with bare addresses.
+/// them, or those before the row during whose lookup its futex waits reached `lock_wait` in
+/// all. The caller writes the rest with bare addresses.
 fn writeRowsWithSymbols(list: []const Thread, total: usize) usize {
     if (lookup_busy.load(.acquire)) {
         print("an earlier report's symbol lookup still waits on std.debug's symbol lock; the stacks that follow are bare addresses\n", .{});
@@ -659,19 +673,18 @@ fn writeRowsWithSymbols(list: []const Thread, total: usize) usize {
     lookup_row.store(0, .release);
     lookup_phase.store(.formatting, .release);
     lookup_wait_since.store(0, .release);
+    lookup_waited_ns.store(0, .release);
     lookup_busy.store(true, .release);
     const helper = std.Thread.spawn(.{}, lookupMain, .{ list, total }) catch |err| {
         lookup_busy.store(false, .release);
         print("cannot start the symbol lookup thread: {t}; the stacks that follow are bare addresses\n", .{err});
         return 0;
     };
-    helper.setName(io(), "hang-report-sym") catch {};
     helper.detach();
     while (true) {
         const row = lookup_row.load(.acquire);
         if (row == list.len) return row;
-        const since = lookup_wait_since.load(.acquire);
-        if (since != 0 and nowNanoseconds() - since >= lock_wait.toNanoseconds()) {
+        if (lookupWaitedNanoseconds() >= lock_wait.toNanoseconds()) {
             if (lookup_phase.cmpxchgStrong(.formatting, .abandoned, .acq_rel, .acquire) == null) {
                 print("another thread holds std.debug's symbol lock; the stacks that follow are bare addresses\n", .{});
                 return lookup_row.load(.acquire);
@@ -682,6 +695,9 @@ fn writeRowsWithSymbols(list: []const Thread, total: usize) usize {
 }
 
 fn lookupMain(list: []const Thread, total: usize) void {
+    // Before any lookup, so every wait the helper makes is a named thread's. macOS names only
+    // the calling thread, so the watchdog cannot do it after the spawn.
+    setOwnName("hang-report-sym");
     is_lookup_thread = true;
     defer lookup_busy.store(false, .release);
     for (list, 0..) |*t, i| {
@@ -695,7 +711,7 @@ fn lookupMain(list: []const Thread, total: usize) void {
 }
 
 /// The Io the helper's lookups get in place of `io_`: the same, except that each futex wait
-/// is recorded in `lookup_wait_since`. On any other thread, `io_` itself.
+/// is recorded in `lookup_wait_since` and `lookup_waited_ns`. On any other thread, `io_` itself.
 fn lookupIo(io_: Io) Io {
     if (!is_lookup_thread or io_.vtable == &lookup_vtable) return io_;
     lookup_base = io_;
@@ -710,7 +726,14 @@ var lookup_vtable: Io.VTable = undefined;
 fn markWait(waiting: bool) void {
     // std may keep the Io it was given; only the helper's waits count.
     if (!is_lookup_thread) return;
-    lookup_wait_since.store(if (waiting) @max(1, nowNanoseconds()) else 0, .release);
+    if (waiting) {
+        lookup_wait_since.store(@max(1, nowNanoseconds()), .release);
+        return;
+    }
+    // Added before the start is cleared, so the watchdog's sum never misses a finished wait.
+    const since = lookup_wait_since.load(.acquire);
+    if (since != 0) _ = lookup_waited_ns.fetchAdd(nowNanoseconds() - since, .release);
+    lookup_wait_since.store(0, .release);
 }
 
 fn lookupFutexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
