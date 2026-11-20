@@ -625,6 +625,7 @@ pub const Options = struct {
 /// InitializeWorkflow job.
 pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*Instance {
     const inst = try gpa.create(Instance);
+    errdefer gpa.destroy(inst);
     inst.* = .{
         .gpa = gpa,
         .arena_state = .init(gpa),
@@ -639,6 +640,9 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
         .task_failure_errors = options.task_failure_errors,
         .failure_converter = options.failure_converter,
     };
+    // `destroy` can't run on a half-built instance; free what's been taken so far instead.
+    // `Scheduler.init` and `WorkflowIo.init` allocate nothing.
+    errdefer inst.arena_state.deinit();
     inst.wio = .init(inst.arena(), &inst.sched, .{ .ctx = inst, .vtable = &host_vtable }, 0);
     inst.ctx = .{ .instance = inst };
     inst.task_queue = try inst.arena().dupe(u8, options.task_queue);
@@ -3542,6 +3546,18 @@ test "hello world: schedule the activity, then complete with its result" {
     const done = commandsOf(second);
     try testing.expectEqual(@as(usize, 1), done.len);
     try testing.expectEqualStrings("\"Hello Temporal!\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+fn createAndDestroy(gpa: Allocator, task_queue: []const u8, namespace: []const u8) !void {
+    const inst = try create(gpa, Hello.registered, .{ .task_queue = task_queue, .namespace = namespace });
+    inst.destroy();
+}
+
+test "Instance.create frees everything it acquired when an allocation fails" {
+    // Longer than the arena's first chunk, so each copy takes a chunk of its own.
+    const task_queue: [4096]u8 = @splat('q');
+    const namespace: [4096]u8 = @splat('n');
+    try testing.checkAllAllocationFailures(testing.allocator, createAndDestroy, .{ &task_queue, &namespace });
 }
 
 test "a failed activity fails the workflow with the activity's failure" {
