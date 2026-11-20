@@ -119,7 +119,13 @@ A breaking change adds a fragment under `changelog/breaking-changes/` that says 
 
    It writes `## [<version>] - <date>` above the previous release in `CHANGELOG.md`, with the Zig and sdk-core line, one heading per category in the order above, and the section's link at the bottom, and deletes the fragments it used. It refuses to run with no fragments or for a version `CHANGELOG.md` already has. Edit the section if entries need merging or rewording.
 
-3. Set `build.zig.zon`'s `.version` to the version, and commit it with the assembled section and the deleted fragments as `Prepare release <version>`.
+3. Set `build.zig.zon`'s `.version` to the version. This also changes `temporal.version`, which is read from it, and so the directory under `conformance/histories/<feature>/` that `zig build test` replays and requires a history in. Record the new version's histories in the same commit:
+
+   ```sh
+   zig build conformance -Drecord-histories
+   ```
+
+   It starts a dev server itself, and needs network access on a first run to download the dev server and the features suite. It writes only into the new version's directories; the earlier versions' directories stay as they are (see Stored histories in [AGENTS.md](../AGENTS.md)). Without it, `zig build test` fails for every written feature that declares workflows and has no history under the new version. Commit the version, the recorded histories, the assembled section and the deleted fragments together as `Prepare release <version>`.
 
 4. Run `scripts/release-preflight.sh <version>`. Every check but `core-pins` should pass now; `core-pins` passes once the pins below exist.
 

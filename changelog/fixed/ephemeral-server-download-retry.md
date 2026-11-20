@@ -1,0 +1,1 @@
+`bridge.EphemeralServer.startDevServer` and `startTestServer`, and so `testing.DevServer.start` and `testing.TestServer.start`, retry a start that fails while downloading or unpacking the server executable, up to three attempts in all, instead of failing at once.

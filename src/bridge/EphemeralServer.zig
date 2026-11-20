@@ -7,6 +7,7 @@
 const EphemeralServer = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("core_c");
 const bytes = @import("bytes.zig");
 const Runtime = @import("Runtime.zig");
@@ -80,8 +81,10 @@ const sdk_name = "temporal-zig";
 const sdk_version = @import("../temporal.zig").version;
 
 /// Starts a dev server and waits for it to accept connections. The runtime must outlive the
-/// server. On `error.StartFailed`, `failure` (if given) receives the core's message, allocated
-/// with `gpa`.
+/// server. A start that fails while downloading or unpacking the server executable is retried,
+/// up to 3 attempts in all, 1 s and then 2 s apart, slept on `io`; any other failure returns
+/// after one attempt. A cancel during that sleep stops the retries. On `error.StartFailed`,
+/// `failure` (if given) receives the last attempt's message, allocated with `gpa`.
 pub fn startDevServer(gpa: Allocator, io: Io, runtime: Runtime, options: DevServerOptions, failure: ?*?[]u8) StartError!EphemeralServer {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -105,14 +108,7 @@ pub fn startDevServer(gpa: Allocator, io: Io, runtime: Runtime, options: DevServ
         .log_format = bytes.ref(options.log_format),
         .log_level = bytes.ref(options.log_level),
     };
-    const done = try Completion(StartResult).create(gpa, io, StartResult.free);
-    const redirect: OutputRedirect = .begin(options.output);
-    defer redirect.end();
-    handToCore(done);
-    c.temporal_core_ephemeral_server_start_dev_server(runtime.ptr, &dev, done, onStart);
-    // Uncancelable: the core reads the options from `arena` until it calls back, and startup
-    // is bounded by its timeout.
-    return finishStart(gpa, runtime, done.waitUncancelable(), failure);
+    return startRetrying(gpa, io, runtime, options.output, .{ .dev = &dev }, failure);
 }
 
 /// Starts the time-skipping test server. See `startDevServer`.
@@ -122,12 +118,7 @@ pub fn startTestServer(gpa: Allocator, io: Io, runtime: Runtime, options: TestSe
     const arena = arena_state.allocator();
 
     const test_server = try testServerOptions(arena, options.executable, options.port, options.extra_args, options.startup_timeout_ms);
-    const done = try Completion(StartResult).create(gpa, io, StartResult.free);
-    const redirect: OutputRedirect = .begin(options.output);
-    defer redirect.end();
-    handToCore(done);
-    c.temporal_core_ephemeral_server_start_test_server(runtime.ptr, test_server, done, onStart);
-    return finishStart(gpa, runtime, done.waitUncancelable(), failure);
+    return startRetrying(gpa, io, runtime, options.output, .{ .test_server = test_server }, failure);
 }
 
 /// Stops the server and frees it. On `error.ShutdownFailed`, `failure` (if given) receives the
@@ -259,6 +250,109 @@ fn finishStart(gpa: Allocator, runtime: Runtime, result: StartResult, failure: ?
     return .{ .ptr = server, .runtime = runtime, .target = target, .gpa = gpa };
 }
 
+const max_start_attempts = 3;
+/// Sleep before attempt 2 and before attempt 3.
+const start_backoff = [_]Io.Duration{ .fromSeconds(1), .fromSeconds(2) };
+comptime {
+    std.debug.assert(start_backoff.len == max_start_attempts - 1);
+}
+const bridge_failure_prefix = "Connection failed: ";
+const download_failure_prefixes = [_][]const u8{
+    "failed to download ephemeral server executable",
+    "invalid ephemeral server download",
+};
+
+/// True when the core's start failure came from downloading or unpacking the executable,
+/// which a fresh start redoes (the core removes its `.downloading` temp file on failure).
+/// The C bridge puts `bridge_failure_prefix` in front of every start error (sdk-core-c-bridge's
+/// testing.rs), so the core's own message follows it.
+fn isDownloadFailure(message: []const u8) bool {
+    const core_message = if (std.mem.startsWith(u8, message, bridge_failure_prefix)) message[bridge_failure_prefix.len..] else message;
+    for (download_failure_prefixes) |prefix| if (std.mem.startsWith(u8, core_message, prefix)) return true;
+    return false;
+}
+
+/// What one attempt starts.
+const Start = union(enum) {
+    dev: *const c.TemporalCoreDevServerOptions,
+    test_server: *const c.TemporalCoreTestServerOptions,
+};
+
+/// Makes one start through the core and waits for its callback.
+fn startOnce(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput, start: Start) error{OutOfMemory}!StartResult {
+    const done = try Completion(StartResult).create(gpa, io, StartResult.free);
+    const redirect: OutputRedirect = .begin(output);
+    defer redirect.end();
+    handToCore(done);
+    switch (start) {
+        .dev => |o| c.temporal_core_ephemeral_server_start_dev_server(runtime.ptr, o, done, onStart),
+        .test_server => |o| c.temporal_core_ephemeral_server_start_test_server(runtime.ptr, o, done, onStart),
+    }
+    // Uncancelable: the core reads the options from `arena` until it calls back, and startup
+    // is bounded by its timeout.
+    return done.waitUncancelable();
+}
+
+// Test hook, read only when builtin.is_test. Tests that set it reset it.
+/// The next N attempts fail with a fake download error and do not call the core.
+var test_injected_download_failures: std.atomic.Value(u32) = .init(0);
+/// Counts every attempt, fake ones included.
+var test_start_attempts: std.atomic.Value(u32) = .init(0);
+
+/// Its own function, not inline in startRetrying: Zig 0.17.1's self-hosted x86_64 backend
+/// (Debug on x86_64 Linux) keeps a comparison's result in the CPU flags and does not save it
+/// before the `lock xadd` of a `fetchAdd`, which overwrites the flags. Inline, `last` read
+/// false on attempt 3 and the backoff table was indexed past its end. A call saves the flags.
+fn countTestAttempt() void {
+    _ = test_start_attempts.fetchAdd(1, .monotonic);
+}
+
+fn takeInjectedFailure() bool {
+    var n = test_injected_download_failures.load(.monotonic);
+    while (n > 0) {
+        n = test_injected_download_failures.cmpxchgWeak(n, n - 1, .monotonic, .monotonic) orelse return true;
+    }
+    return false;
+}
+
+/// The retry loop that startDevServer and startTestServer both end in.
+fn startRetrying(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput, start: Start, failure: ?*?[]u8) StartError!EphemeralServer {
+    var attempt: u32 = 1;
+    while (true) : (attempt += 1) {
+        const last = attempt == max_start_attempts;
+        if (builtin.is_test) {
+            countTestAttempt();
+            if (takeInjectedFailure()) {
+                const message = try std.fmt.allocPrint(gpa, "invalid ephemeral server download: injected by a test on attempt {d}", .{attempt});
+                if (last or !isDownloadFailure(message) or !backoff(io, attempt)) {
+                    if (failure) |f| f.* = message else gpa.free(message);
+                    return error.StartFailed;
+                }
+                gpa.free(message);
+                continue;
+            }
+        }
+        const result = try startOnce(gpa, io, runtime, output, start);
+        const retry = !last and result.server == null and
+            if (result.fail) |f| isDownloadFailure(f.bytes()) else false;
+        // A result with a server never retries, so freeing it below never drops a server.
+        if (!retry or !backoff(io, attempt)) return finishStart(gpa, runtime, result, failure);
+        result.free();
+    }
+}
+
+/// Sleeps before the attempt after `attempt`. False when canceled: the cancel is re-armed so
+/// the caller's next cancelation point still sees it, and no further attempt is made.
+fn backoff(io: Io, attempt: u32) bool {
+    io.sleep(start_backoff[attempt - 1], .awake) catch |err| switch (err) {
+        error.Canceled => {
+            io.recancel();
+            return false;
+        },
+    };
+    return true;
+}
+
 fn testServerOptions(
     arena: Allocator,
     executable: Executable,
@@ -344,4 +438,91 @@ test "a time-skipping test server starts and shuts down" {
     };
     try testing.expect(server.target.len > 0);
     try server.shutdown(testing.io, null);
+}
+
+test "a download failure is retried and the dev server then starts" {
+    test_start_attempts.store(0, .monotonic);
+    test_injected_download_failures.store(1, .monotonic);
+    defer test_injected_download_failures.store(0, .monotonic);
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    var server = startDevServer(testing.allocator, testing.io, rt, .{}, &failure) catch |err| {
+        std.debug.print("dev server failed to start: {s}\n", .{failure orelse "(no message)"});
+        return err;
+    };
+    defer server.shutdown(testing.io, null) catch {};
+    try testing.expectEqual(2, test_start_attempts.load(.monotonic));
+    try testing.expectEqual(null, failure);
+}
+
+test "a download failure is retried and the test server then starts" {
+    test_start_attempts.store(0, .monotonic);
+    test_injected_download_failures.store(1, .monotonic);
+    defer test_injected_download_failures.store(0, .monotonic);
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    var server = startTestServer(testing.allocator, testing.io, rt, .{}, &failure) catch |err| {
+        std.debug.print("test server failed to start: {s}\n", .{failure orelse "(no message)"});
+        return err;
+    };
+    defer server.shutdown(testing.io, null) catch {};
+    try testing.expectEqual(2, test_start_attempts.load(.monotonic));
+    try testing.expectEqual(null, failure);
+}
+
+test "a failure that is not a download error makes one attempt" {
+    test_start_attempts.store(0, .monotonic);
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    try testing.expectError(error.StartFailed, startDevServer(testing.allocator, testing.io, rt, .{
+        .executable = .{ .existing_path = "/nonexistent/temporal" },
+    }, &failure));
+    try testing.expectEqual(1, test_start_attempts.load(.monotonic));
+    try testing.expect(failure != null);
+    try testing.expect(!isDownloadFailure(failure.?));
+}
+
+test "three download failures return the last attempt's message" {
+    test_start_attempts.store(0, .monotonic);
+    test_injected_download_failures.store(3, .monotonic);
+    defer test_injected_download_failures.store(0, .monotonic);
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    try testing.expectError(error.StartFailed, startTestServer(testing.allocator, testing.io, rt, .{}, &failure));
+    try testing.expectEqual(3, test_start_attempts.load(.monotonic));
+    try testing.expectEqualStrings("invalid ephemeral server download: injected by a test on attempt 3", failure orelse "(no message)");
+}
+
+test "a real download failure from the core is retried" {
+    // A download into a directory that does not exist fails in the core's lazy_download_exe
+    // with EphemeralServerError::Download, the kind of failure the retry is for. The C bridge
+    // hands it back as "Connection failed: failed to download ephemeral server executable: ...".
+    test_start_attempts.store(0, .monotonic);
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    try testing.expectError(error.StartFailed, startDevServer(testing.allocator, testing.io, rt, .{
+        .executable = .{ .download = .{ .dest_dir = "/nonexistent/temporal-sdk-zig-download-dir" } },
+    }, &failure));
+    try testing.expect(failure != null);
+    try testing.expect(std.mem.indexOf(u8, failure.?, "failed to download ephemeral server executable") != null);
+    try testing.expectEqual(max_start_attempts, test_start_attempts.load(.monotonic));
+}
+
+test "download failures are recognized behind the bridge's prefix" {
+    try testing.expect(isDownloadFailure("Connection failed: invalid ephemeral server download: could not extract tar archive entry"));
+    try testing.expect(isDownloadFailure("Connection failed: failed to download ephemeral server executable: timed out"));
+    try testing.expect(isDownloadFailure("invalid ephemeral server download: bad"));
+    try testing.expect(!isDownloadFailure("Connection failed: failed to start server: No such file or directory"));
+    try testing.expect(!isDownloadFailure("server says: invalid ephemeral server download"));
+    try testing.expect(!isDownloadFailure(""));
 }

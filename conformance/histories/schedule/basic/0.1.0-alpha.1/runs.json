@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-schedule/basic",
+  "runs": [
+    {
+      "file": "1-BasicScheduleWorkflow.json",
+      "workflow_id": "conformance-schedule/basic-2026-11-19T15:42:26Z"
+    },
+    {
+      "file": "2-BasicScheduleWorkflow.json",
+      "workflow_id": "conformance-schedule/basic-2026-11-19T15:42:28Z"
+    }
+  ]
+}
