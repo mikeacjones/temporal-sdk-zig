@@ -25,6 +25,7 @@
 const std = @import("std");
 const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
+const proto_time = @import("proto_time.zig");
 const converter = @import("converter.zig");
 const failure_mod = @import("failure.zig");
 const log_mod = @import("log.zig");
@@ -2238,16 +2239,16 @@ fn activityInfo(start: *const task_pb.Start, task_queue: []const u8, task_token:
         .attempt = start.attempt,
         .is_local = start.is_local,
         .task_token = task_token,
-        .scheduled_time = zigTimestamp(start.scheduled_time),
-        .current_attempt_scheduled_time = zigTimestamp(start.current_attempt_scheduled_time),
-        .started_time = zigTimestamp(start.started_time),
-        .schedule_to_close_timeout = positiveDuration(start.schedule_to_close_timeout),
-        .start_to_close_timeout = positiveDuration(start.start_to_close_timeout),
-        .heartbeat_timeout = positiveDuration(start.heartbeat_timeout),
+        .scheduled_time = proto_time.timestampFromProto(start.scheduled_time),
+        .current_attempt_scheduled_time = proto_time.timestampFromProto(start.current_attempt_scheduled_time),
+        .started_time = proto_time.timestampFromProto(start.started_time),
+        .schedule_to_close_timeout = proto_time.positiveDurationFromProto(start.schedule_to_close_timeout),
+        .start_to_close_timeout = proto_time.positiveDurationFromProto(start.start_to_close_timeout),
+        .heartbeat_timeout = proto_time.positiveDurationFromProto(start.heartbeat_timeout),
         .retry_policy = if (start.retry_policy) |p| .{
-            .initial_interval = positiveDuration(p.initial_interval),
+            .initial_interval = proto_time.positiveDurationFromProto(p.initial_interval),
             .backoff_coefficient = p.backoff_coefficient,
-            .maximum_interval = positiveDuration(p.maximum_interval),
+            .maximum_interval = proto_time.positiveDurationFromProto(p.maximum_interval),
             .maximum_attempts = p.maximum_attempts,
             .non_retryable_error_types = p.non_retryable_error_types.items,
         } else null,
@@ -2257,18 +2258,6 @@ fn activityInfo(start: *const task_pb.Start, task_queue: []const u8, task_token:
             .fairness_weight = p.fairness_weight,
         } else .{},
     };
-}
-
-/// A duration from the core, or null when absent or not positive (unset).
-fn positiveDuration(d: ?proto.google.protobuf.Duration) ?Io.Duration {
-    const v = d orelse return null;
-    const ns = @as(i96, v.seconds) * std.time.ns_per_s + v.nanos;
-    return if (ns > 0) .{ .nanoseconds = ns } else null;
-}
-
-fn zigTimestamp(t: ?proto.google.protobuf.Timestamp) ?Io.Timestamp {
-    const v = t orelse return null;
-    return .fromNanoseconds(@as(i96, v.seconds) * std.time.ns_per_s + v.nanos);
 }
 
 /// Decodes the activity's header, extracts its propagated values into `run.ctx`, and decodes
@@ -2423,7 +2412,7 @@ fn receiveNexusTask(w: *Worker, core: bridge.Worker, running: *RunningNexusReque
             req.task_token = t.task_token;
             req.request = t.request orelse .{};
             req.endpoint = if (task.endpoint.len > 0) task.endpoint else req.request.endpoint;
-            req.deadline = zigTimestamp(task.request_deadline);
+            req.deadline = proto_time.timestampFromProto(task.request_deadline);
             // Named here, before anything can fail the request, so every failure's log names
             // them; without memory for the fields it logs to the worker's sink without them.
             const info = &req.ctx.info_;

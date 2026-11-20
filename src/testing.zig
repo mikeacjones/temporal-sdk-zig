@@ -15,6 +15,7 @@
 const std = @import("std");
 const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
+const proto_time = @import("proto_time.zig");
 const client_mod = @import("client.zig");
 const worker_mod = @import("worker.zig");
 const workflow = @import("workflow.zig");
@@ -949,17 +950,16 @@ pub const WorkflowEnvironment = struct {
 
     /// Lets `duration` of server time pass. On the time-skipping server this skips time
     /// (workflows see their timers fire) and returns as soon as server time has advanced; on
-    /// the dev server it is a real sleep.
+    /// the dev server it is a real sleep. On the time-skipping server a duration longer than
+    /// protobuf can carry (about 10,000 years), such as `Duration.max`, skips the longest one
+    /// it can.
     pub fn sleep(env: *WorkflowEnvironment, duration: Io.Duration) !void {
         switch (env.server) {
             .dev, .existing => try env.io.sleep(duration, .awake),
             .time_skipping => {
                 var scratch: std.heap.ArenaAllocator = .init(env.gpa);
                 defer scratch.deinit();
-                _ = try env.testService(ts.SleepResponse, "UnlockTimeSkippingWithSleep", ts.SleepRequest{ .duration = .{
-                    .seconds = @intCast(@divFloor(duration.nanoseconds, std.time.ns_per_s)),
-                    .nanos = @intCast(@mod(duration.nanoseconds, std.time.ns_per_s)),
-                } }, scratch.allocator());
+                _ = try env.testService(ts.SleepResponse, "UnlockTimeSkippingWithSleep", ts.SleepRequest{ .duration = proto_time.durationToProto(duration).? }, scratch.allocator());
             },
         }
     }
