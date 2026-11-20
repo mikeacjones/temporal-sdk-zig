@@ -742,7 +742,9 @@ pub const Context = struct {
 
     /// A logger carrying the workflow's type, ID, and run ID as fields, as the workflow's
     /// outbound interceptors (`interceptor.WorkflowOutbound.logger`) return it. It is silent
-    /// while the workflow replays unless `worker.Options.log_during_replay` is set.
+    /// while the workflow replays, and while its run is evicted from the worker's cache (its
+    /// coroutines unwinding after the worker stops or drops the run), unless
+    /// `worker.Options.log_during_replay` is set.
     pub fn logger(ctx: *const Context) log.Logger {
         return ctx.instance.currentLogger();
     }

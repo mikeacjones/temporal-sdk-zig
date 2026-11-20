@@ -94,6 +94,10 @@ now_ns: i96 = 0,
 /// the activation it was made in is still valid (see `ActivityState.activity_type`).
 activations: u64 = 0,
 replaying: bool = false,
+/// True while the run replays history or is being evicted (`teardown`): the logger workflow
+/// code gets (`workflowLogger`) is silent then. `replaying` alone gates the SDK's own records
+/// (`logger`), the metrics, and `Context.isReplaying`.
+log_silenced: bool = false,
 /// Commands produced during the current activation.
 commands: std.ArrayList(cmd_pb.WorkflowCommand) = .empty,
 next_activity_seq: u32 = 1,
@@ -603,7 +607,7 @@ pub const Options = struct {
     failure_converter: ?converter.FailureConverter = null,
     /// Where the workflow's logger writes.
     logger: log.Sink = .std_log,
-    /// Keep the workflow's logger on while it replays history.
+    /// Keep the workflow's logger on while it replays history and while a run is evicted.
     log_during_replay: bool = false,
     /// Extract `Context.propagated` from the start header and inject it into outgoing
     /// commands. Borrowed: must outlive the instance.
@@ -678,6 +682,7 @@ pub fn destroy(inst: *Instance) void {
 pub fn teardown(inst: *Instance) usize {
     if (inst.evicting) return inst.sched.live;
     inst.evicting = true;
+    inst.log_silenced = true;
     inst.commands.clearRetainingCapacity();
     // The root and handler coroutines may still be blocked even after the workflow finished
     // (a handler's error finishes it, and handlers outlive the root).
@@ -781,6 +786,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         try inst.setDeploymentVersion(act.deployment_version_for_current_task);
     }
     inst.replaying = act.is_replaying;
+    inst.log_silenced = act.is_replaying or inst.evicting;
     inst.commands.clearRetainingCapacity();
     inst.task_failure = null;
     inst.task_failure_type = "UnsupportedJob";
@@ -2078,7 +2084,7 @@ fn outboundNext(inst: *Instance) interceptor.WorkflowOutbound.Next {
 
 /// The logger workflow code gets: the run's, through the outbound interceptors.
 pub fn currentLogger(inst: *Instance) log.Logger {
-    if (inst.outbound.len == 0) return inst.logger;
+    if (inst.outbound.len == 0) return inst.workflowLogger();
     return inst.outboundNext().logger(.{});
 }
 
@@ -3403,7 +3409,16 @@ fn rootContinueAsNew(ptr: *anyopaque, input: interceptor.ContinueAsNewInput, _: 
 
 fn rootLogger(ptr: *anyopaque, _: interceptor.LoggerInput, _: interceptor.WorkflowOutbound.Next) log.Logger {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    return inst.logger;
+    return inst.workflowLogger();
+}
+
+/// The logger workflow code gets before the outbound interceptors: the run's `logger`, gated
+/// by `log_silenced` instead of `replaying`. Left on when `Options.log_during_replay` is set
+/// (`logger.replaying == null`).
+fn workflowLogger(inst: *Instance) log.Logger {
+    var l = inst.logger;
+    if (l.replaying != null) l.replaying = &inst.log_silenced;
+    return l;
 }
 
 // ---------------------------------------------------------------- timers (WorkflowIo host)
@@ -9734,6 +9749,75 @@ test "a coroutine that refuses to exit on eviction is reported, and the rest of 
     try testing.expectEqualStrings("workflow coroutines did not exit on eviction (blocked with cancel protection on?); leaking their stacks", recorder.message);
     try testing.expectEqualStrings("1", recorder.get("count").?);
     try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{hog_stack}), recorder.get("stack_bytes").?);
+}
+
+// A workflow that logs an error when its activity wait fails, as ordinary workflow code does.
+// Eviction ends the wait with error.Canceled, though nothing failed: the run only leaves this
+// worker. The logger built with `with` before the wait must fall silent too.
+const EvictionLog = struct {
+    var replaying_after_wait: ?bool = null;
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const tagged = try ctx.logger().with(ctx.allocator(), .{ .Step = "charge" });
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get() catch |err| {
+            replaying_after_wait = ctx.isReplaying();
+            tagged.err("activity failed", .{ .err = err });
+            ctx.logger().err("activity failed", .{ .err = err });
+            return err;
+        };
+    }
+
+    /// Wraps the next logger with a field, as a logging interceptor does.
+    const Tagging = struct {
+        ctx: ?*workflow.Context = null,
+
+        pub fn interceptWorkflow(t: *Tagging, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+            t.ctx = ctx;
+            return .{ .outbound = interceptor.WorkflowOutbound.from(Tagging, t) };
+        }
+
+        pub fn logger(t: *Tagging, input: interceptor.LoggerInput, next: interceptor.WorkflowOutbound.Next) log.Logger {
+            const base = next.logger(input);
+            return base.with(t.ctx.?.allocator(), .{ .Tagged = "workflow" }) catch base;
+        }
+    };
+};
+const EvictionLogWf = workflow.Def("EvictionLog", EvictionLog.run);
+
+test "a run evicted while its code waits logs nothing from the workflow's logger, unless log_during_replay is set" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_]bool{ false, true }) |log_during_replay| {
+        var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
+        defer recorder.arena.deinit();
+        EvictionLog.replaying_after_wait = null;
+        const inst = try create(testing.allocator, EvictionLogWf.registered, .{ .logger = recorder.sink(), .log_during_replay = log_during_replay });
+        const first = commandsOf(try inst.activate(&try initActivation(a, "EvictionLog", .{}), a));
+        try testing.expectEqual(@as(usize, 1), first.len);
+        try testing.expectEqual(@as(usize, 0), inst.teardown());
+        inst.destroy();
+        // With log_during_replay, lines logged during eviction are emitted as replay's are.
+        try testing.expectEqual(@as(usize, if (log_during_replay) 2 else 0), recorder.count);
+        if (log_during_replay) try testing.expectEqualStrings("activity failed", recorder.message);
+        // Eviction is not replay: isReplaying still reads what the activation set.
+        try testing.expectEqual(@as(?bool, false), EvictionLog.replaying_after_wait);
+    }
+}
+
+test "a run evicted while its code waits logs nothing through an outbound interceptor's logger" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
+    defer recorder.arena.deinit();
+    var impl: EvictionLog.Tagging = .{};
+    const interceptors = [_]interceptor.Worker{.from(EvictionLog.Tagging, &impl)};
+    const inst = try create(testing.allocator, EvictionLogWf.registered, .{ .logger = recorder.sink(), .interceptors = &interceptors });
+    _ = try inst.activate(&try initActivation(a, "EvictionLog", .{}), a);
+    try testing.expectEqual(@as(usize, 0), inst.teardown());
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 0), recorder.count);
 }
 
 test "eviction sends nothing: commands from unwinding coroutines are dropped" {

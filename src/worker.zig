@@ -247,8 +247,9 @@ pub const Options = struct {
     /// (`client.Options.logger`). Borrowed: it must outlive the worker. Called concurrently
     /// from workflow and activity threads.
     logger: ?log_mod.Sink = null,
-    /// Keep workflow loggers on while workflows replay history. By default they are silent
-    /// during replay, so each message is logged once.
+    /// Keep workflow loggers on while workflows replay history and while a run is evicted. By
+    /// default they are silent during replay, so each message is logged once, and while a
+    /// run is evicted, when its code unwinds with `error.Canceled` though nothing failed.
     log_during_replay: bool = false,
     /// Interceptors of this worker's workflows, activities and Nexus requests, after the
     /// client's (`client.Options.worker_interceptors`); the first is the outermost. Borrowed:

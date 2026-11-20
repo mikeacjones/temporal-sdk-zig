@@ -1306,7 +1306,7 @@ Notes:
 
 #### Workflow info
 - `ctx.info()` returns the run's IDs, type, task queue, namespace, attempt, timeouts, parent, start time, retry policy, and priority.
-- `ctx.isReplaying()` says whether the task replays history. `ctx.metrics()` records nothing during replay, and `ctx.logger()` drops its records then unless `worker.Options.log_during_replay` is set.
+- `ctx.isReplaying()` says whether the task replays history. `ctx.metrics()` records nothing during replay, and `ctx.logger()` drops its records then, and while the run is evicted from the worker's cache (its code unwinding with `error.Canceled` after the worker stops or drops the run), unless `worker.Options.log_during_replay` is set. Eviction doesn't change `ctx.isReplaying()`: it keeps the value the last activation set.
 - `ctx.lastCompletionResult(T)` and `ctx.previousRunFailure()` read a cron or retried workflow's previous run.
 
 #### Failure policy
@@ -2472,7 +2472,7 @@ fn greeting(ctx: *workflow.Context, name: []const u8) ![]const u8 {
 Notes:
 
 - A sink is called concurrently from workflow, activity, and sdk-core threads and must outlive its clients and workers.
-- A workflow's logger drops records while it replays history, unless `worker.Options.log_during_replay` is set.
+- A workflow's logger drops records while it replays history, and while its run is evicted from the worker's cache (its code unwinding with `error.Canceled` after the worker stops or drops the run, though nothing failed), unless `worker.Options.log_during_replay` is set. The SDK's own warning about coroutines that did not exit at eviction is not silenced by eviction: it follows the replay rule only, so it is dropped when the run's last activation replayed, unless `worker.Options.log_during_replay` is set.
 - `Logger.with` allocates from the arena it is given: in a workflow, build the logger once.
 - A worker logs each workflow run it evicts from its cache, with `run_id`, `reason`, `message`, and, for a run it had cached, `workflow_id` and `workflow_type`: at error for nondeterminism or a fatal core error, at warn when fetching history failed, and at debug for routine cache evictions.
 

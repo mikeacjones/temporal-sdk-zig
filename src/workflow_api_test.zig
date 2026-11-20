@@ -6,6 +6,7 @@ const activity = @import("activity.zig");
 const converter = @import("converter.zig");
 const interceptor = @import("interceptor.zig");
 const testing_ns = @import("testing.zig");
+const log = @import("log.zig");
 
 const testing = std.testing;
 
@@ -88,6 +89,84 @@ test "workflow: two runs draw different UUIDs" {
     const first = try env.executeWorkflow(UuidWorkflow, .{}, a, null);
     const second = try env.executeWorkflow(UuidWorkflow, .{}, a, null);
     try testing.expect(!std.mem.eql(u8, first[0..36], second[0..36]));
+}
+
+/// A workflow that logs an error when its activity wait fails, waiting on an activity sent to a
+/// task queue nothing polls. Its update returns once the activity is scheduled, so the root
+/// coroutine is blocked in `get` when the update's answer reaches the client.
+const EvictionLog = struct {
+    const Scheduled = workflow.UpdateDef("eviction_log_scheduled", fn () void);
+    const message = "eviction_log: activity wait failed";
+
+    const State = struct {
+        ctx: *workflow.Context,
+        scheduled: bool = false,
+        fn waitScheduled(s: *State) !void {
+            try s.ctx.await(s, isScheduled);
+        }
+        fn isScheduled(s: *State) bool {
+            return s.scheduled;
+        }
+    };
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandler(Scheduled, s, State.waitScheduled);
+        const future = ctx.executeActivityByName([]const u8, "eviction_log_never", .{
+            .task_queue = "eviction-log-unpolled",
+            .start_to_close_timeout = .fromSeconds(600),
+        }, .{});
+        s.scheduled = true;
+        return future.get() catch |err| {
+            ctx.logger().err(message, .{ .err = err });
+            return err;
+        };
+    }
+    const Wf = workflow.Def("eviction_log", run);
+
+    /// Counts the error records with `message`. Called from the worker's threads.
+    const Sink = struct {
+        errors: std.atomic.Value(usize) = .init(0),
+
+        fn sink(r: *Sink) log.Sink {
+            return .{ .ptr = r, .vtable = &.{ .log = record } };
+        }
+
+        fn record(ptr: ?*anyopaque, level: log.Level, text: []const u8, _: []const log.Field) void {
+            const r: *Sink = @ptrCast(@alignCast(ptr.?));
+            if (level == .err and std.mem.eql(u8, text, message)) _ = r.errors.fetchAdd(1, .monotonic);
+        }
+    };
+};
+
+test "workflow: a run evicted at worker shutdown while it waits on an activity logs no error, and its history replays" {
+    var sink: EvictionLog.Sink = .{};
+    const env = try testing_ns.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .logger = sink.sink() });
+    var env_open = true;
+    defer if (env_open) env.deinit();
+    try env.registerWorkflow(EvictionLog.Wf);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const history = history: {
+        var run = try env.startWorkflow(EvictionLog.Wf, .{}, .{});
+        defer run.deinit(); // before env.deinit, which frees the client the run points at
+        try env.updateWorkflow(EvictionLog.Scheduled, a, run.id, .{}, null);
+        break :history try env.client.fetchHistory(a, run.id, run.run_id);
+    };
+
+    // Stopping the worker evicts the run, which unwinds its code out of `get` with
+    // error.Canceled: nothing failed, so nothing may be logged at error level.
+    env_open = false;
+    env.deinit();
+    try testing.expectEqual(@as(usize, 0), sink.errors.load(.monotonic));
+
+    var replayer: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(EvictionLog.Wf);
+    try replayer.replayHistory(history);
 }
 
 const ContinueByName = struct {
