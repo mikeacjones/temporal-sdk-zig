@@ -127,9 +127,6 @@ pub fn build(b: *std.Build) void {
         .test_filters = test_filters,
         .forwarded = .{ .core_lib = core_lib_opt, .core_bundle = core_bundle_opt, .protoc = protoc_opt },
     });
-<<<<<<< HEAD
-    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, hang_report, .{
-=======
     // The test of the hang-dump script CI wraps samples-test in. It needs bash and ps, so a
     // checkout runs it on hosts other than Windows; it prints a skip where ps or job control is
     // missing.
@@ -139,8 +136,7 @@ pub fn build(b: *std.Build) void {
         hang_dump.has_side_effects = true;
         test_step.dependOn(&hang_dump.step);
     }
-    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, .{
->>>>>>> 83fb26a0016e0fe66060772b826525edeea1874c
+    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, hang_report, .{
         .core_lib = core_lib_opt,
         .core_bundle = core_bundle_opt,
         .protoc = protoc_opt,
