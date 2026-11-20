@@ -662,19 +662,18 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
 
     // zig build tsan
     {
-        // Renders a known-findings file and runs `artifact` with it through `exec`, which
-        // also makes a report end the process with exit 66 (see tools/checks/tsan_suppressions.zig).
+        // Renders a known-findings file and adds to `run` the arguments that run `artifact`
+        // with it through `exec`, which also makes a report end the process with exit 66
+        // (see tools/checks/tsan_suppressions.zig). `run` runs the suppressions tool.
         const Known = struct {
-            fn run(b2: *std.Build, tool: *std.Build.Step.Compile, zon: []const u8, artifact: *std.Build.Step.Compile) *std.Build.Step.Run {
+            fn addArgs(b2: *std.Build, tool: *std.Build.Step.Compile, zon: []const u8, run: *std.Build.Step.Run, artifact: *std.Build.Step.Compile) void {
                 const render = b2.addRunArtifact(tool);
                 render.setName(b2.fmt("render {s}", .{zon}));
                 render.addArg("render");
                 render.addFileArg(b2.path(zon));
-                const exec = b2.addRunArtifact(tool);
-                exec.addArg("exec");
-                exec.addFileArg(render.captureStdOut(.{ .basename = "tsan.supp" }));
-                exec.addArtifactArg(artifact);
-                return exec;
+                run.addArg("exec");
+                run.addFileArg(render.captureStdOut(.{ .basename = "tsan.supp" }));
+                run.addArtifactArg(artifact);
             }
         };
         const suppressions_tool = checkTool(b, "tsan-suppressions", "tools/checks/tsan_suppressions.zig");
@@ -699,37 +698,84 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         linkCoreLib(module, in.target, in.core.lib);
         const tests = b.addTest(.{ .name = "tsan-unit-tests", .root_module = module, .filters = in.test_filters });
         // When the sanitizer reported anything, the runtime exits 66 at exit (see the
-        // "tsan race" case), which fails the run even when every test passed.
-        const run = Known.run(b, suppressions_tool, "tools/checks/tsan.zon", tests);
+        // "tsan race" case), which fails the run even when every test passed. A report waits
+        // for the symbolizer, which only `--test-timeout` bounds here: the tests need their
+        // reports' function names, which the suppressions match.
+        const run = b.addRunArtifact(suppressions_tool);
+        Known.addArgs(b, suppressions_tool, "tools/checks/tsan.zon", run, tests);
         run.setName("run test tsan-unit-tests");
         run.enableTestRunnerMode();
         b.step("tsan", "Run the unit tests under Thread Sanitizer").dependOn(&run.step);
+
+        // To print a report, the runtime symbolizes its stacks, which on macOS starts
+        // `atos -p <pid>` and waits for its answer with no limit, so a wedged atos (as on
+        // 2026-11-19) hung `zig build test` for good. So each case below runs its program
+        // through time-limit, which fails the case, naming it, when the program has not
+        // ended within the given seconds; and the cases that need no function names turn
+        // symbolization off.
+        const limit_tool = checkTool(b, "time-limit", "tools/checks/time_limit.zig");
+        in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "time-limit", .root_module = limit_tool.root_module, .filters = in.test_filters })).step);
+        const Limited = struct {
+            /// Ample for a fixture and the symbolizer, even on a loaded machine.
+            const seconds = 120;
+
+            fn case(b2: *std.Build, test_step: *std.Build.Step, tool: *std.Build.Step.Compile, name: []const u8, limit: u32, exit_code: u8) *std.Build.Step.Run {
+                const r = addCheckCase(b2, test_step, tool, name, exit_code);
+                r.setCwd(b2.path("."));
+                r.addArgs(&.{ b2.fmt("{d}", .{limit}), r.step.name });
+                return r;
+            }
+        };
 
         // Libc, so that threads come from pthreads, which the sanitizer intercepts.
         const race_tool = checkTool(b, "tsan-race-fixture", "tools/checks/fixtures/tsan/race.zig");
         race_tool.root_module.sanitize_thread = true;
         race_tool.root_module.link_libc = true;
-        // On Apple platforms `abort_on_error` defaults to true, which would end the process
-        // with SIGABRT and leave a crash report.
-        const race = addCheckCase(b, in.test_step, race_tool, "tsan race", 66);
-        race.setEnvironmentVariable("TSAN_OPTIONS", "abort_on_error=0");
-        race.expectStdErrMatch("WARNING: ThreadSanitizer: data race");
-
-        // The same program with its racing function listed: the suppression must take, and
-        // `exec` keeps the caller's options (the runtime prints matches only when asked).
-        const known = Known.run(b, suppressions_tool, "tools/checks/fixtures/tsan/known.zon", race_tool);
-        known.setName("check tsan known finding");
-        known.has_side_effects = true;
-        known.setEnvironmentVariable("TSAN_OPTIONS", "print_suppressions=1");
-        known.expectExitCode(0);
-        known.expectStdErrMatch("ThreadSanitizer: Matched");
-        in.test_step.dependOn(&known.step);
-
         const mutex_tool = checkTool(b, "tsan-mutex-fixture", "tools/checks/fixtures/tsan/mutex.zig");
         mutex_tool.root_module.sanitize_thread = true;
         mutex_tool.root_module.link_libc = true;
-        const mutex = addCheckCase(b, in.test_step, mutex_tool, "tsan mutex", 0);
-        mutex.expectStdErrEqual("");
+
+        // On macOS the cases run a second time with a symbolizer that never answers, to check
+        // that the race and mutex cases do not wait for it and that the known finding case,
+        // which does, fails within its limit.
+        // The path is relative to the build root, where these cases run.
+        const stuck_symbolizer: ?[]const u8 = if (b.graph.host.result.os.tag.isDarwin()) "tools/checks/fixtures/tsan/stuck-symbolizer/atos" else null;
+        for ([_]?[]const u8{ null, stuck_symbolizer }, 0..) |symbolizer, i| {
+            if (i > 0 and symbolizer == null) continue;
+            const suffix = if (symbolizer != null) " with a stuck symbolizer" else "";
+            const extra: []const u8 = if (symbolizer) |path| b.fmt(" external_symbolizer_path=\"{s}\"", .{path}) else "";
+
+            // The check needs only the WARNING line, so the report is printed with addresses.
+            // On Apple platforms `abort_on_error` defaults to true, which would end the
+            // process with SIGABRT and leave a crash report.
+            const race = Limited.case(b, in.test_step, limit_tool, b.fmt("tsan race{s}", .{suffix}), Limited.seconds, 66);
+            race.addArtifactArg(race_tool);
+            race.setEnvironmentVariable("TSAN_OPTIONS", b.fmt("abort_on_error=0 symbolize=0{s}", .{extra}));
+            race.expectStdErrMatch("WARNING: ThreadSanitizer: data race");
+
+            // The same program with its racing function listed: the suppression must take,
+            // and `exec` keeps the caller's options (the runtime prints matches only when
+            // asked). Suppressions match function names, so this case symbolizes, as the
+            // unit tests do; a stuck symbolizer ends it with time-limit's message.
+            const known_name = b.fmt("tsan known finding{s}", .{suffix});
+            const known = if (symbolizer == null)
+                Limited.case(b, in.test_step, limit_tool, known_name, Limited.seconds, 0)
+            else
+                Limited.case(b, in.test_step, limit_tool, known_name, 5, 124);
+            known.addArtifactArg(suppressions_tool);
+            Known.addArgs(b, suppressions_tool, "tools/checks/fixtures/tsan/known.zon", known, race_tool);
+            known.setEnvironmentVariable("TSAN_OPTIONS", b.fmt("print_suppressions=1{s}", .{extra}));
+            if (symbolizer == null)
+                known.expectStdErrMatch("ThreadSanitizer: Matched")
+            else
+                known.expectStdErrMatch(b.fmt("time-limit: check {s}: ", .{known_name}));
+
+            // Reports nothing, so it never starts the symbolizer.
+            const mutex = Limited.case(b, in.test_step, limit_tool, b.fmt("tsan mutex{s}", .{suffix}), Limited.seconds, 0);
+            mutex.addArtifactArg(mutex_tool);
+            if (symbolizer != null) mutex.setEnvironmentVariable("TSAN_OPTIONS", extra[1..]);
+            mutex.expectStdErrEqual("");
+        }
     }
 }
 
