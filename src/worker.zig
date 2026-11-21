@@ -38,6 +38,7 @@ const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const Instance = @import("workflow/Instance.zig");
+const CancelBlockingAllocator = @import("CancelBlockingAllocator.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -1892,6 +1893,8 @@ const RunningActivities = struct {
 
 /// One activity, from its Start task until its result is reported.
 const RunningActivity = struct {
+    /// w.gpa with cancels blocked around each call; backs arena.
+    task_gpa: CancelBlockingAllocator,
     arena: std.heap.ArenaAllocator,
     polled: bridge.Worker.Polled,
     /// The task queue of the core that polled the activity; outlives the run.
@@ -1912,48 +1915,6 @@ const RunningActivity = struct {
     }
 };
 
-/// `w.gpa` with cancels blocked around each call: the memory behind an activity's or a Nexus
-/// request's arena (`activity.Context.allocator`, and the SDK's decoding into it). The worker
-/// cancels such a task once, and an allocation can wait on the task's `std.Io` without
-/// returning the error (in Debug, std's stack capture waits for its debug info lock and drops
-/// a cancel), which would leave the task running for good. Blocked, the cancel reaches the
-/// task's next wait. Valid while `w` is: arenas made with it are freed before `run` returns.
-fn taskAllocator(w: *Worker) Allocator {
-    return .{ .ptr = w, .vtable = &TaskAllocator.vtable };
-}
-
-const TaskAllocator = struct {
-    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
-
-    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        return w.gpa.rawAlloc(len, alignment, ret_addr);
-    }
-
-    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        return w.gpa.rawResize(memory, alignment, new_len, ret_addr);
-    }
-
-    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        return w.gpa.rawRemap(memory, alignment, new_len, ret_addr);
-    }
-
-    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        w.gpa.rawFree(memory, alignment, ret_addr);
-    }
-};
-
 /// Decodes a polled activity task. Returns a new run for a Start task; delivers a Cancel
 /// task to its run and returns null.
 fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.Worker.Polled, task_queue: []const u8) ?*RunningActivity {
@@ -1963,13 +1924,15 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
         return null;
     };
     run.* = .{
-        .arena = .init(taskAllocator(w)),
+        .task_gpa = .{ .io = w.io, .backing = w.gpa },
+        .arena = undefined,
         .polled = polled,
         .task_queue = task_queue,
         .task_token = &.{},
         .start = .{},
         .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = undefined, .logger_ = .{}, .client_ = w.client },
     };
+    run.arena = .init(run.task_gpa.allocator());
     var keep = false;
     defer if (!keep) run.destroy(w.gpa);
 
@@ -2427,6 +2390,8 @@ const RunningNexusRequests = struct {
 /// One Nexus request, from its task until its completion has been sent. Everything it holds
 /// lives in `arena` or `polled`, which the handler's context borrows.
 const NexusRequest = struct {
+    /// w.gpa with cancels blocked around each call; backs arena.
+    task_gpa: CancelBlockingAllocator,
     arena: std.heap.ArenaAllocator,
     polled: bridge.Worker.Polled,
     task_token: []const u8 = &.{},
@@ -2465,10 +2430,12 @@ fn receiveNexusTask(w: *Worker, core: bridge.Worker, running: *RunningNexusReque
         return null;
     };
     req.* = .{
-        .arena = .init(taskAllocator(w)),
+        .task_gpa = .{ .io = w.io, .backing = w.gpa },
+        .arena = undefined,
         .polled = polled,
         .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = .{ .service = "", .operation = "" }, .logger_ = sink_logger, .client_ = w.client, .codecs = w.client.codecs },
     };
+    req.arena = .init(req.task_gpa.allocator());
     var keep = false;
     defer if (!keep) req.destroy(w.gpa);
 
