@@ -391,38 +391,66 @@ var test_connect_failure_log: ?*Io.Writer = null;
 /// targets of core log forwarding.
 const process_allocator = std.heap.smp_allocator;
 
-/// Runtimes of `Client.connect` calls that gave up on an attempt sdk-core still makes. Its
-/// connect has no deadline and can't be canceled, and its task uses the runtime until it
-/// calls back, so the runtime can't be freed before then. Parked here instead of left to
-/// the core for good, a later `connect` with the same options takes the runtime and waits
-/// on the attempt (`takeParkedConnect`), and every access frees those whose attempt has
-/// ended. At most `Client.max_connect_attempts_in_flight` entries, taken ones included;
-/// once that many are, a `connect` that matches none fails at once. A client with a metrics
-/// exporter isn't parked: its runtime uses the caller's allocator and handler, so it is left
-/// to the core as `Client.close` describes. Process-wide, guarded by `mutex`.
+/// Runtimes whose clients closed while sdk-core still made a connection attempt on them.
+/// Its connect has no deadline and can't be canceled, and its task uses the runtime until it
+/// calls back, so the runtime can't be freed before then; parked here, it is freed (with its
+/// forwarding of sdk-core's logs) once every attempt it holds has ended, on the next access.
+/// A later `connect` or `init` with the same options takes a parked runtime, and its first
+/// connection waits on the oldest attempt instead of starting another.
+///
+/// Every client that can be parked owns one `ParkedConnect` from `create` to `destroy`, so
+/// parking never allocates and never fails. A `connect` holds a place in the pool (its entry,
+/// `.held`) from before it creates a runtime until it connects or its client is destroyed,
+/// so a `connect` that gives up always has its place to park in. A `connect` that matches no
+/// parked entry while `Client.max_connect_attempts_in_flight` entries are in the pool fails
+/// at once without creating a runtime. A client from `init` takes no place until it closes
+/// with an attempt in flight, and then parks even past that many: its runtime existed
+/// already, and only the pool can free it.
+///
+/// Invariant: a runtime with an attempt the core hasn't called back is always owned by
+/// exactly one of a live client's `Shared` or a `.parked` entry, and never freed or
+/// abandoned. The one exception is a client with a custom metrics handler, which isn't
+/// parked: freeing its runtime later would use the caller's allocator and handler, so it is
+/// left to the core as `Client.close` describes. Guarded by `mutex`; process-wide.
 var parked_connects: struct {
     mutex: Io.Mutex = .init,
-    entries: [Client.max_connect_attempts_in_flight]?*ParkedConnect = @splat(null),
-    /// Orders the entries, oldest parked first.
+    /// The entries `.held` or `.parked`.
+    head: ?*ParkedConnect = null,
+    count: usize = 0,
+    /// Orders the parked entries, oldest parked first.
     next_seq: u64 = 0,
 } = .{};
 
 const ParkedConnect = struct {
-    /// The options the runtime and the attempt were made with, owned.
+    /// The options the client was made with, owned: what a runtime parked from it matches.
     key: PendingConnection,
     identity: []const u8,
     logger: log_mod.Sink,
     core_log_level: ?log_mod.Level,
     worker_heartbeat_interval: ?Duration,
-    runtime: bridge.Runtime,
-    log_target: ?*CoreLogTarget,
-    /// Holds a reference.
-    attempt: *bridge.Connection.Connecting,
+    /// Made with `Options.metrics`, which is never compared: it never matches.
+    has_metrics: bool,
+    state: State = .detached,
+    next: ?*ParkedConnect = null,
     seq: u64 = 0,
-    /// A `connect` took the runtime and waits on `attempt`; the entry keeps its place.
-    taken: bool = false,
+    // Owned while `.parked`, moved to the client that takes it.
+    runtime: bridge.Runtime = undefined,
+    log_target: ?*CoreLogTarget = null,
+    /// Each holds a reference, oldest first.
+    attempts: [Client.max_connect_attempts_in_flight]*bridge.Connection.Connecting = undefined,
+    attempts_len: usize = 0,
 
-    fn create(options: Options, runtime: bridge.Runtime, log_target: ?*CoreLogTarget, attempt: *bridge.Connection.Connecting) error{OutOfMemory}!*ParkedConnect {
+    const State = enum {
+        /// Not in the pool; its client is alive.
+        detached,
+        /// In the pool for a live client: a `connect` that hasn't connected, or a client that
+        /// took a parked runtime and hasn't connected.
+        held,
+        /// In the pool, owning `runtime` and `attempts`.
+        parked,
+    };
+
+    fn create(options: Options) error{OutOfMemory}!*ParkedConnect {
         var key: PendingConnection = try .init(process_allocator, options.connectionOptions());
         errdefer key.deinit();
         const identity = try key.arena.allocator().dupe(u8, options.identity);
@@ -433,9 +461,7 @@ const ParkedConnect = struct {
             .logger = options.logger orelse log_mod.Sink.std_log,
             .core_log_level = options.core_log_level,
             .worker_heartbeat_interval = options.worker_heartbeat_interval,
-            .runtime = runtime,
-            .log_target = log_target,
-            .attempt = attempt,
+            .has_metrics = options.metrics != null,
         };
         return p;
     }
@@ -446,19 +472,24 @@ const ParkedConnect = struct {
         process_allocator.destroy(p);
     }
 
-    /// Frees the entry and the runtime, once the attempt has called back.
+    fn allCalledBack(p: *const ParkedConnect) bool {
+        for (p.attempts[0..p.attempts_len]) |a| if (!a.calledBack()) return false;
+        return true;
+    }
+
+    /// Frees a parked entry and its runtime, once every attempt has called back.
     fn destroy(p: *ParkedConnect) void {
         // Frees the connection too, if the core made one that nobody took.
-        std.debug.assert(p.attempt.unref() == .freed);
+        for (p.attempts[0..p.attempts_len]) |a| std.debug.assert(a.unref() == .freed);
         p.runtime.deinit();
         if (p.log_target) |t| process_allocator.destroy(t);
         p.destroyKey();
     }
 
-    /// Whether a `connect` with `options` would make the same runtime and the same attempt.
+    /// Whether a client with `options` would make the same runtime and the same attempts.
     /// Options that can't be compared by value (metrics) never match.
     fn matches(p: *const ParkedConnect, options: Options) bool {
-        if (options.metrics != null) return false;
+        if (p.has_metrics or options.metrics != null) return false;
         const logger = options.logger orelse log_mod.Sink.std_log;
         return equalByValue(ConnectionOptions, p.key.options, options.connectionOptions()) and
             std.mem.eql(u8, p.identity, options.identity) and
@@ -467,6 +498,13 @@ const ParkedConnect = struct {
             equalByValue(?Duration, p.worker_heartbeat_interval, options.worker_heartbeat_interval);
     }
 };
+
+/// Whether a client with `options` can be parked: not with a custom metrics handler, which
+/// the runtime would call, and free with the caller's allocator, after the client is gone.
+fn parkable(options: Options) bool {
+    const m = options.metrics orelse return true;
+    return m.exporter != .custom;
+}
 
 /// Whether `a` and `b` hold the same values, slices compared by their contents. A type it
 /// can't compare by value is a compile error.
@@ -493,87 +531,152 @@ fn equalByValue(comptime T: type, a: T, b: T) bool {
     }
 }
 
-/// Moves the entries whose attempt has called back, and no `connect` took, out of
-/// `parked_connects` into `out`, for `freeParkedConnects` once the mutex is unlocked
-/// (freeing a runtime waits for its threads). Call with the mutex held.
-fn reclaimParkedConnects(out: *[Client.max_connect_attempts_in_flight]?*ParkedConnect) void {
-    out.* = @splat(null);
-    for (&parked_connects.entries, out) |*e, *o| {
-        const p = e.* orelse continue;
-        if (p.taken or !p.attempt.calledBack()) continue;
-        o.* = p;
-        e.* = null;
-    }
+/// Call with the mutex held.
+fn linkParkedConnect(p: *ParkedConnect) void {
+    p.next = parked_connects.head;
+    parked_connects.head = p;
+    parked_connects.count += 1;
 }
 
-fn freeParkedConnects(reclaimed: *const [Client.max_connect_attempts_in_flight]?*ParkedConnect) void {
-    for (reclaimed) |e| if (e) |p| p.destroy();
+/// Call with the mutex held.
+fn unlinkParkedConnect(p: *ParkedConnect) void {
+    var link = &parked_connects.head;
+    while (link.*) |q| : (link = &q.next) {
+        if (q != p) continue;
+        link.* = p.next;
+        p.next = null;
+        parked_connects.count -= 1;
+        return;
+    }
+    unreachable; // Only entries in the pool are unlinked.
+}
+
+/// Unlinks the parked entries whose attempts have all called back and returns them, linked
+/// through `next`, for `freeParkedConnects` once the mutex is unlocked (freeing a runtime
+/// waits for its threads). Call with the mutex held.
+fn reclaimParkedConnects() ?*ParkedConnect {
+    var reclaimed: ?*ParkedConnect = null;
+    var link = &parked_connects.head;
+    while (link.*) |p| {
+        if (p.state == .parked and p.allCalledBack()) {
+            link.* = p.next;
+            parked_connects.count -= 1;
+            p.next = reclaimed;
+            reclaimed = p;
+        } else link = &p.next;
+    }
+    return reclaimed;
+}
+
+fn freeParkedConnects(reclaimed: ?*ParkedConnect) void {
+    var it = reclaimed;
+    while (it) |p| {
+        it = p.next;
+        p.destroy();
+    }
 }
 
 const parked_connects_full = std.fmt.comptimePrint("{d} earlier connection attempts in this process are still waiting on servers that never answered; try again later", .{Client.max_connect_attempts_in_flight});
 
-/// The parked entry a `connect` with `options` takes, the oldest that matches, or null to
-/// create a runtime. `error.ConnectFailed`, logged, when every place in the pool is taken
-/// and none matches.
-fn takeParkedConnect(io: Io, options: Options) error{ConnectFailed}!?*ParkedConnect {
-    var reclaimed: [Client.max_connect_attempts_in_flight]?*ParkedConnect = undefined;
-    defer freeParkedConnects(&reclaimed);
-    const found: ?*ParkedConnect, const full = blk: {
+/// What `takeParkedConnect` gives a new client.
+const TakenParkedConnect = struct {
+    /// The client's entry; null when it can't be parked.
+    entry: ?*ParkedConnect,
+    /// `entry` was parked: the client takes its runtime and attempts.
+    adopted: bool,
+};
+
+/// The entry a new client owns: the oldest parked one that matches `options`, whose runtime
+/// it takes, or a new one, which for a `connect` holds its place in the pool before it
+/// creates a runtime. For a `connect` that matches nothing while the pool has no place left,
+/// `error.ConnectFailed`, logged.
+fn takeParkedConnect(io: Io, options: Options, comptime attempt: Attempt) error{ OutOfMemory, ConnectFailed }!TakenParkedConnect {
+    const fresh: ?*ParkedConnect = if (parkable(options)) try ParkedConnect.create(options) else null;
+    var fresh_used = false;
+    defer if (!fresh_used) if (fresh) |f| f.destroyKey();
+    var reclaimed: ?*ParkedConnect = null;
+    defer freeParkedConnects(reclaimed);
+    const taken: ?TakenParkedConnect = blk: {
         parked_connects.mutex.lockUncancelable(io);
         defer parked_connects.mutex.unlock(io);
-        reclaimParkedConnects(&reclaimed);
+        reclaimed = reclaimParkedConnects();
         var oldest: ?*ParkedConnect = null;
-        var used: usize = 0;
-        for (parked_connects.entries) |e| {
-            const p = e orelse continue;
-            used += 1;
-            if (p.taken or !p.matches(options)) continue;
+        var it = parked_connects.head;
+        while (it) |p| : (it = p.next) {
+            if (p.state != .parked or !p.matches(options)) continue;
             if (oldest == null or p.seq < oldest.?.seq) oldest = p;
         }
-        if (oldest) |p| p.taken = true;
-        break :blk .{ oldest, used == parked_connects.entries.len };
+        if (oldest) |p| {
+            p.state = .held;
+            break :blk .{ .entry = p, .adopted = true };
+        }
+        if (attempt == .connect) {
+            if (parked_connects.count >= Client.max_connect_attempts_in_flight) break :blk null;
+            if (fresh) |f| {
+                f.state = .held;
+                linkParkedConnect(f);
+            }
+        }
+        fresh_used = true;
+        break :blk .{ .entry = fresh, .adopted = false };
     };
-    if (found == null and full) {
+    return taken orelse {
         logConnectFailure(.connect, options.host_port, parked_connects_full);
         return error.ConnectFailed;
-    }
-    return found;
+    };
 }
 
-/// Gives back an entry `takeParkedConnect` returned, untouched.
-fn returnParkedConnect(io: Io, p: *ParkedConnect) void {
-    parked_connects.mutex.lockUncancelable(io);
-    defer parked_connects.mutex.unlock(io);
-    p.taken = false;
-}
-
-/// Removes a taken entry, whose runtime its `connect` keeps, and frees the entry.
-fn removeParkedConnect(io: Io, p: *ParkedConnect) void {
+/// Gives back what `takeParkedConnect` returned, for a client that wasn't made.
+fn untakeParkedConnect(io: Io, taken: TakenParkedConnect) void {
+    const p = taken.entry orelse return;
     {
         parked_connects.mutex.lockUncancelable(io);
         defer parked_connects.mutex.unlock(io);
-        for (&parked_connects.entries) |*e| {
-            if (e.* == p) e.* = null;
+        if (taken.adopted) {
+            // Nothing of it was moved.
+            p.state = .parked;
+            return;
         }
+        if (p.state == .held) unlinkParkedConnect(p);
     }
     p.destroyKey();
 }
 
-/// Adds `p` to the pool, or returns false when it is full.
-fn addParkedConnect(io: Io, p: *ParkedConnect) bool {
-    var reclaimed: [Client.max_connect_attempts_in_flight]?*ParkedConnect = undefined;
-    defer freeParkedConnects(&reclaimed);
+/// For a client that connected: its entry gives up its place in the pool.
+fn detachParkedConnect(io: Io, p: *ParkedConnect) void {
     parked_connects.mutex.lockUncancelable(io);
     defer parked_connects.mutex.unlock(io);
-    reclaimParkedConnects(&reclaimed);
-    for (&parked_connects.entries) |*e| {
-        if (e.* != null) continue;
-        p.seq = parked_connects.next_seq;
-        parked_connects.next_seq += 1;
-        e.* = p;
-        return true;
+    if (p.state != .held) return;
+    unlinkParkedConnect(p);
+    p.state = .detached;
+}
+
+/// Parks a destroyed client's runtime with the attempts still in flight on it, each holding
+/// a reference. Never fails: the entry was allocated with the client.
+fn parkRuntime(io: Io, p: *ParkedConnect, runtime: bridge.Runtime, log_target: ?*CoreLogTarget, attempts: []const *bridge.Connection.Connecting) void {
+    p.runtime = runtime;
+    p.log_target = log_target;
+    @memcpy(p.attempts[0..attempts.len], attempts);
+    p.attempts_len = attempts.len;
+    var reclaimed: ?*ParkedConnect = null;
+    defer freeParkedConnects(reclaimed);
+    parked_connects.mutex.lockUncancelable(io);
+    defer parked_connects.mutex.unlock(io);
+    reclaimed = reclaimParkedConnects();
+    if (p.state == .detached) linkParkedConnect(p);
+    p.seq = parked_connects.next_seq;
+    parked_connects.next_seq += 1;
+    p.state = .parked;
+}
+
+/// Frees the entry of a destroyed client that had no attempt in flight.
+fn dropParkedConnect(io: Io, p: *ParkedConnect) void {
+    {
+        parked_connects.mutex.lockUncancelable(io);
+        defer parked_connects.mutex.unlock(io);
+        if (p.state != .detached) unlinkParkedConnect(p);
     }
-    return false;
+    p.destroyKey();
 }
 
 /// Rejects, as `openConnection` would, connection options that are wrong whatever the
@@ -794,11 +897,9 @@ const Shared = struct {
     /// A copy of the first client's logger that the runtime's core log forwarding points
     /// at, freed after the runtime (with `process_allocator`).
     core_log_sink: ?*CoreLogTarget,
-    /// The entry of `parked_connects` whose runtime a `connect` took, until it returns.
-    parked: ?*ParkedConnect = null,
-    /// Set when a failed `connect` parked the runtime: `destroy` leaves it, and
-    /// `core_log_sink`, to `parked_connects`.
-    runtime_parked: bool = false,
+    /// The entry in `parked_connects` that `destroy` parks the runtime in if an attempt is
+    /// still in flight; null when the client can't be parked (see `parkable`).
+    park_entry: ?*ParkedConnect = null,
     /// Null until the client connects: `connect` connects at once, a client from `init` on
     /// first use. Read it with `currentConnection`: `reconnect` replaces it.
     connection: ?bridge.Connection = null,
@@ -851,17 +952,35 @@ const Shared = struct {
         // `firstConnection` made room for it when it started the attempt.
         if (s.connecting) |p| s.abandoned_attempts.appendAssumeCapacity(p);
         // Frees, here, every attempt the core has called back and any connection it made that
-        // nobody took. The core's connect task uses the runtime until it calls back, so
-        // the runtime of an attempt still in flight is left to the core, never freed.
-        var in_flight = false;
+        // nobody took. The core's connect task uses the runtime until it calls back, so the
+        // runtime of an attempt still in flight is never freed here: it is parked with those
+        // attempts in `parked_connects`, which frees it once they end, or, for a client that
+        // can't be parked, left to the core.
+        var in_flight: usize = 0;
+        for (s.abandoned_attempts.items) |p| in_flight += @intFromBool(!p.calledBack());
+        // At most `max_connect_attempts_in_flight` (see `Client.firstConnection`).
+        std.debug.assert(in_flight <= Client.max_connect_attempts_in_flight);
+        const entry = if (in_flight <= Client.max_connect_attempts_in_flight) s.park_entry else null;
+        var stuck: [Client.max_connect_attempts_in_flight]*bridge.Connection.Connecting = undefined;
+        var n: usize = 0;
+        var orphaned = false;
         for (s.abandoned_attempts.items) |p| {
-            if (p.unref() == .orphaned) in_flight = true;
+            // A callback only ever goes from pending to done, so `n` stays within `in_flight`.
+            if (entry != null and !p.calledBack()) {
+                stuck[n] = p;
+                n += 1;
+            } else if (p.unref() == .orphaned) orphaned = true;
         }
         s.abandoned_attempts.deinit(gpa);
         if (s.meter) |m| m.destroy();
-        if (!s.runtime_parked) {
-            if (in_flight) s.runtime.abandon() else s.runtime.deinit();
-            if (s.core_log_sink) |sink| process_allocator.destroy(sink);
+        if (n > 0) {
+            // The logger may be gone once `close` returns.
+            if (s.core_log_sink) |t| t.mute();
+            parkRuntime(s.io, entry.?, s.runtime, s.core_log_sink, stuck[0..n]);
+        } else {
+            if (s.park_entry) |p| dropParkedConnect(s.io, p);
+            if (orphaned) s.runtime.abandon() else s.runtime.deinit();
+            if (s.core_log_sink) |t| process_allocator.destroy(t);
         }
         gpa.destroy(s);
     }
@@ -909,99 +1028,24 @@ pub const Client = struct {
     /// `Options.rpc_timeout` (30 s without one), without cancellation; a server that hasn't
     /// answered by then fails it with `error.ConnectFailed`. sdk-core may still be making that
     /// attempt (it has no deadline of its own, and it can't be canceled), so the client's
-    /// runtime is then kept with it in a pool of the process, and a later `connect` with the
-    /// same options (address, TLS, API key, headers, identity, logger, `core_log_level`, and
-    /// the other connection and runtime options; never with `Options.metrics`) waits on that
-    /// attempt, under its own deadline, instead of starting another. The pool frees a runtime
-    /// once its attempt ends. It holds at most 4 runtimes in the process; while 4 are kept
-    /// and none matches, `connect` fails at once with `error.ConnectFailed`, logged. A client
-    /// with `Options.metrics` isn't kept: its runtime is left to the attempt as `close`
-    /// describes.
+    /// runtime is then kept with it in a pool of the process, as `close` describes, and a
+    /// later `connect` with the same options (address, TLS, API key, headers, identity,
+    /// logger, `core_log_level`, and the other connection and runtime options; never with
+    /// `Options.metrics`) waits on that attempt, under its own deadline, instead of starting
+    /// another. A `connect` takes a place in that pool until it connects or gives up; while 4
+    /// runtimes are kept or connecting there and none matches, `connect` fails at once with
+    /// `error.ConnectFailed`, logged, without creating a runtime.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
         _ = try checkClientOptions(options, .connect);
-        const parked = try takeParkedConnect(io, options);
-        var c = create(gpa, io, options, .connect, parked) catch |err| {
-            if (parked) |p| returnParkedConnect(io, p);
+        const taken = try takeParkedConnect(io, options, .connect);
+        var c = create(gpa, io, options, .connect, taken) catch |err| {
+            untakeParkedConnect(io, taken);
             return err;
         };
-        _ = c.currentConnectionAs(.connect) catch |err| {
-            c.closeFailedConnect(options);
-            return err;
-        };
-        if (c.shared.parked) |p| {
-            // Connected: the runtime is this client's now.
-            removeParkedConnect(io, p);
-            c.shared.parked = null;
-        }
+        // An attempt still in flight is parked with the runtime (see `parked_connects`).
+        errdefer c.close();
+        _ = try c.currentConnectionAs(.connect);
         return c;
-    }
-
-    /// Closes the only client of a `connect` that failed. An attempt the core still makes
-    /// keeps the runtime in use, so the runtime is parked with it in `parked_connects`, for a
-    /// later `connect` to the same server to wait on, rather than left to the core for good.
-    fn closeFailedConnect(c: *Client, options: Options) void {
-        const s = c.shared;
-        var stuck: ?*bridge.Connection.Connecting = null;
-        var others = false;
-        {
-            s.connection_mutex.lockUncancelable(c.io);
-            defer s.connection_mutex.unlock(c.io);
-            // Every waiter is gone: `connect` was the only call.
-            std.debug.assert(s.connecting == null);
-            var i: usize = 0;
-            while (i < s.abandoned_attempts.items.len) {
-                const p = s.abandoned_attempts.items[i];
-                if (p.calledBack()) {
-                    _ = p.unref();
-                    _ = s.abandoned_attempts.orderedRemove(i);
-                } else if (stuck == null) {
-                    stuck = p;
-                    _ = s.abandoned_attempts.orderedRemove(i);
-                } else {
-                    // `connect` makes one attempt or rejoins one, so there are no others.
-                    others = true;
-                    i += 1;
-                }
-            }
-        }
-        if (stuck) |attempt| {
-            if (!others and c.parkRuntime(attempt, options)) {
-                s.runtime_parked = true;
-                s.parked = null;
-            } else {
-                // `close` leaves the runtime to the core, as for any attempt in flight.
-                s.abandoned_attempts.appendAssumeCapacity(attempt);
-            }
-        }
-        if (s.parked) |p| {
-            // The attempt it took ended: the runtime goes with this client, freed by `close`.
-            removeParkedConnect(c.io, p);
-            s.parked = null;
-        }
-        c.close();
-    }
-
-    /// Parks this client's runtime with `attempt`, which holds a reference, in
-    /// `parked_connects`. False if it can't be: the pool is full, or the client has a metrics
-    /// exporter (see `parked_connects`), or out of memory.
-    fn parkRuntime(c: *Client, attempt: *bridge.Connection.Connecting, options: Options) bool {
-        const s = c.shared;
-        if (s.parked) |p| {
-            // Back to the entry it came from, which kept its place in the pool.
-            if (s.core_log_sink) |t| t.mute();
-            p.attempt = attempt;
-            parked_connects.mutex.lockUncancelable(c.io);
-            defer parked_connects.mutex.unlock(c.io);
-            p.taken = false;
-            return true;
-        }
-        if (options.metrics != null) return false;
-        const p = ParkedConnect.create(options, s.runtime, s.core_log_sink, attempt) catch return false;
-        // The logger may be gone once `connect` returns.
-        if (s.core_log_sink) |t| t.mute();
-        if (addParkedConnect(c.io, p)) return true;
-        p.destroyKey();
-        return false;
     }
 
     /// Creates a client that connects on first use, so a process can build its client before
@@ -1025,7 +1069,15 @@ pub const Client = struct {
     /// until its own deadline, for the one abandoned longest ago. Close with `close`,
     /// connected or not, once no call is running.
     pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Client {
-        return create(gpa, io, options, .first_use, null);
+        _ = try checkClientOptions(options, .first_use);
+        const taken = takeParkedConnect(io, options, .first_use) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ConnectFailed => unreachable, // Only for a `connect`.
+        };
+        return create(gpa, io, options, .first_use, taken) catch |err| {
+            untakeParkedConnect(io, taken);
+            return err;
+        };
     }
 
     const CheckedOptions = struct { heartbeat_ms: u64, rpc_timeout_ms: u32 };
@@ -1053,9 +1105,11 @@ pub const Client = struct {
     }
 
     /// The client without a connection: its runtime, and `options`' connection options kept
-    /// for the first connection. With `parked`, a `connect` takes that entry's runtime and
-    /// waits on its attempt instead of creating a runtime; nothing of it is used on error.
-    fn create(gpa: Allocator, io: Io, options: Options, comptime attempt: Attempt, parked: ?*ParkedConnect) InitError!Client {
+    /// for the first connection. The client owns `taken.entry`; when that was parked, the
+    /// client takes its runtime, and its first connection is the oldest attempt in flight on
+    /// it, instead of creating a runtime. Nothing of `taken` is used on error.
+    fn create(gpa: Allocator, io: Io, options: Options, comptime attempt: Attempt, taken: TakenParkedConnect) InitError!Client {
+        const parked: ?*ParkedConnect = if (taken.adopted) taken.entry.? else null;
         var message: ?[]u8 = null;
         defer if (message) |m| gpa.free(m);
 
@@ -1096,10 +1150,10 @@ pub const Client = struct {
         errdefer if (parked == null) runtime.deinit();
         const meter = try bridge.metric.Meter.create(gpa, runtime);
         errdefer if (meter) |m| m.destroy();
-        // Room for `stopWaitingForConnecting` to keep the parked attempt.
+        // Room for the parked attempts, and for `stopWaitingForConnecting` to keep the first.
         var attempts: std.ArrayList(*bridge.Connection.Connecting) = .empty;
         errdefer attempts.deinit(gpa);
-        if (parked != null) try attempts.ensureUnusedCapacity(gpa, 1);
+        if (parked != null) try attempts.ensureTotalCapacity(gpa, max_connect_attempts_in_flight);
 
         const identity = if (options.identity.len > 0) try gpa.dupe(u8, options.identity) else try defaultIdentity(gpa);
         errdefer gpa.free(identity);
@@ -1117,13 +1171,27 @@ pub const Client = struct {
             .pending_connection = pending,
             .abandoned_attempts = attempts,
         };
+        shared.park_entry = taken.entry;
         if (parked) |p| {
-            // The first connection is the parked attempt, started with these same options.
-            shared.connecting = p.attempt;
-            shared.connecting_updates = shared.pending_updates;
-            shared.connect_mutex.lockUncancelable(io);
-            shared.parked = p;
-            if (p.log_target) |t| t.unmute(logger);
+            // The parked attempts were started with these same options. The oldest in flight
+            // is the first connection; those called back since are dropped.
+            var first: ?*bridge.Connection.Connecting = null;
+            for (p.attempts[0..p.attempts_len]) |a| {
+                if (a.calledBack()) {
+                    _ = a.unref();
+                } else if (first == null) {
+                    first = a;
+                } else shared.abandoned_attempts.appendAssumeCapacity(a);
+            }
+            p.attempts_len = 0;
+            p.log_target = null;
+            if (first) |a| {
+                shared.connecting = a;
+                // Applies the latest `api_key` and `headers` to the connection it makes.
+                shared.connecting_updates = null;
+                shared.connect_mutex.lockUncancelable(io);
+            }
+            if (core_log_sink) |t| t.unmute(logger);
         }
 
         return .{
@@ -1392,15 +1460,18 @@ pub const Client = struct {
     /// handlers `metrics` returned on the closed one; sdk-core's logs keep reaching the
     /// first client's `Options.logger`.
     ///
-    /// A first connection attempt that every call gave up on (see `init`) may
+    /// A first connection attempt that every call gave up on (see `init` and `connect`) may
     /// still be running in sdk-core, which has no deadline of its own for it (a server that
     /// never answers a TLS handshake keeps it running for good). sdk-core's task uses the
-    /// client's runtime until the attempt ends, so `close` then leaves the runtime to it
-    /// instead of freeing it: the runtime, its threads, and the attempt stay allocated for
-    /// the rest of the process (the attempt frees itself if it ends). sdk-core's logs stop
-    /// reaching `Options.logger` when the last client sharing the runtime closes, but a
-    /// custom metrics handler (`Options.metrics`) stays in use by that runtime, so it must
-    /// then outlive the process.
+    /// client's runtime until the attempt ends, so `close` then keeps the runtime, with its
+    /// threads and the attempts, in a pool of the process instead of freeing it, and the pool
+    /// frees it once every attempt on it has ended. Until then, a later `init` or `connect`
+    /// with the same options takes the runtime, and its first connection waits on the oldest
+    /// attempt instead of starting another. sdk-core's logs stop reaching `Options.logger`
+    /// when the last client sharing the runtime closes. A client with a custom metrics
+    /// handler (`Options.metrics`) isn't kept: the handler stays in use by its runtime, which
+    /// is then left to the attempt for the rest of the process, so the handler must then
+    /// outlive the process.
     pub fn close(c: *Client) void {
         // A client made by `forNamespace` shares the connection and the runtime: the last
         // client to close frees them. Acquire pairs with the releases of the clients closed
@@ -1592,6 +1663,8 @@ pub const Client = struct {
 
     /// Takes `conn` as the first connection. Call with `connection_mutex` held.
     fn connected(c: *Client, conn: bridge.Connection) void {
+        // Connected: a `connect` no longer needs its place in `parked_connects`.
+        if (c.shared.park_entry) |p| detachParkedConnect(c.io, p);
         c.shared.connection = conn;
         c.shared.pending_connection.?.deinit();
         c.shared.pending_connection = null;
@@ -6433,13 +6506,11 @@ test "connect keeps failing with ConnectFailed however many times it gives up on
     }
 }
 
-/// For tests: the entries in `parked_connects`, taken ones included.
+/// For tests: the entries in `parked_connects`, held ones included.
 fn parkedConnectCount(io: Io) usize {
     parked_connects.mutex.lockUncancelable(io);
     defer parked_connects.mutex.unlock(io);
-    var n: usize = 0;
-    for (parked_connects.entries) |e| n += @intFromBool(e != null);
-    return n;
+    return parked_connects.count;
 }
 
 /// For tests: waits for every parked attempt to call back and frees it, so a test starts
@@ -6448,22 +6519,33 @@ fn parkedConnectCount(io: Io) usize {
 fn drainParkedConnects(io: Io) !void {
     const deadline: Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromSeconds(60), .clock = .awake });
     while (true) {
-        var reclaimed: [Client.max_connect_attempts_in_flight]?*ParkedConnect = undefined;
         var waiting: ?*bridge.Connection.Connecting = null;
-        {
+        var remaining = false;
+        const reclaimed = blk: {
             parked_connects.mutex.lockUncancelable(io);
             defer parked_connects.mutex.unlock(io);
-            reclaimParkedConnects(&reclaimed);
-            for (parked_connects.entries) |e| if (e) |p| {
-                // Only a `connect` in progress takes one, and tests run one at a time.
-                if (p.taken) return error.TestUnexpectedResult;
-                p.attempt.ref();
-                waiting = p.attempt;
-                break;
-            };
-        }
-        freeParkedConnects(&reclaimed);
-        const attempt = waiting orelse return;
+            const reclaimed = reclaimParkedConnects();
+            var it = parked_connects.head;
+            while (it) |p| : (it = p.next) {
+                // Only a live client holds one, and tests close theirs.
+                if (p.state != .parked) return error.TestUnexpectedResult;
+                remaining = true;
+                for (p.attempts[0..p.attempts_len]) |a| if (!a.calledBack()) {
+                    a.ref();
+                    waiting = a;
+                    break;
+                };
+                if (waiting != null) break;
+            }
+            break :blk reclaimed;
+        };
+        freeParkedConnects(reclaimed);
+        if (!remaining) return;
+        const attempt = waiting orelse {
+            // Every attempt has called back since the reclaim: the next one frees them.
+            if (deadline.durationFromNow(io).raw.nanoseconds <= 0) return error.Timeout;
+            continue;
+        };
         // Released before the next reclaim, which frees the attempt.
         defer _ = attempt.unref();
         attempt.wait(deadline, null) catch |err| switch (err) {
@@ -6471,8 +6553,9 @@ fn drainParkedConnects(io: Io) !void {
             error.Canceled => return error.Canceled,
             error.Stopped => unreachable, // No stop flag.
         };
-        // Done comes just before the callback finishes; spin until it has.
-        if (!attempt.calledBack()) std.atomic.spinLoopHint();
+        // Done comes just before the callback finishes, and a superseded attempt returns
+        // early: the next round reclaims it or waits again, until the deadline.
+        if (!attempt.calledBack() and deadline.durationFromNow(io).raw.nanoseconds <= 0) return error.Timeout;
     }
 }
 
