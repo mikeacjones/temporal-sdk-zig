@@ -402,10 +402,11 @@ const process_allocator = std.heap.smp_allocator;
 /// parking never allocates and never fails. A `connect` holds a place in the pool (its entry,
 /// `.held`) from before it creates a runtime until it connects or its client is destroyed,
 /// so a `connect` that gives up always has its place to park in. A `connect` that matches no
-/// parked entry while `Client.max_connect_attempts_in_flight` entries are in the pool fails
-/// at once without creating a runtime. A client from `init` takes no place until it closes
-/// with an attempt in flight, and then parks even past that many: its runtime existed
-/// already, and only the pool can free it.
+/// parked entry while `Client.max_connect_attempts_in_flight` entries are `.parked` fails
+/// at once without creating a runtime; `.held` places don't count, so connects in progress
+/// never stop another. The parked entries can therefore pass that many by the clients that
+/// were connecting, or open, when it was reached: each had a runtime already, and only the
+/// pool can free it.
 ///
 /// Invariant: a runtime with an attempt the core hasn't called back is always owned by
 /// exactly one of a live client's `Shared` or a `.parked` entry, and never freed or
@@ -601,9 +602,14 @@ fn takeParkedConnect(io: Io, options: Options, comptime attempt: Attempt) error{
         defer parked_connects.mutex.unlock(io);
         reclaimed = reclaimParkedConnects();
         var oldest: ?*ParkedConnect = null;
+        // Only parked runtimes fill the pool: a place `.held` by a client still connecting
+        // (or one that took a parked runtime) stands for no attempt anybody gave up on.
+        var parked: usize = 0;
         var it = parked_connects.head;
         while (it) |p| : (it = p.next) {
-            if (p.state != .parked or !p.matches(options)) continue;
+            if (p.state != .parked) continue;
+            parked += 1;
+            if (!p.matches(options)) continue;
             if (oldest == null or p.seq < oldest.?.seq) oldest = p;
         }
         if (oldest) |p| {
@@ -611,7 +617,7 @@ fn takeParkedConnect(io: Io, options: Options, comptime attempt: Attempt) error{
             break :blk .{ .entry = p, .adopted = true };
         }
         if (attempt == .connect) {
-            if (parked_connects.count >= Client.max_connect_attempts_in_flight) break :blk null;
+            if (parked >= Client.max_connect_attempts_in_flight) break :blk null;
             if (fresh) |f| {
                 f.state = .held;
                 linkParkedConnect(f);
@@ -1032,9 +1038,9 @@ pub const Client = struct {
     /// later `connect` with the same options (address, TLS, API key, headers, identity,
     /// logger, `core_log_level`, and the other connection and runtime options; never with
     /// `Options.metrics`) waits on that attempt, under its own deadline, instead of starting
-    /// another. A `connect` takes a place in that pool until it connects or gives up; while 4
-    /// runtimes are kept or connecting there and none matches, `connect` fails at once with
-    /// `error.ConnectFailed`, logged, without creating a runtime.
+    /// another. While 4 runtimes that gave up so are kept there and none matches, `connect`
+    /// fails at once with `error.ConnectFailed`, logged, without creating a runtime; connects
+    /// still in progress don't count, so they never stop another.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
         _ = try checkClientOptions(options, .connect);
         const taken = try takeParkedConnect(io, options, .connect);
@@ -1471,7 +1477,9 @@ pub const Client = struct {
     /// frees it once every attempt on it has ended. Until then, a later `init` or `connect`
     /// with the same options takes the runtime, and its first connection waits on the oldest
     /// attempt instead of starting another. sdk-core's logs stop reaching `Options.logger`
-    /// when the last client sharing the runtime closes. A client with a custom metrics
+    /// when the last client sharing the runtime closes. sdk-core wakes the waiters of a kept
+    /// attempt through the `Io` the client was made with, so that `Io` must stay valid until
+    /// the attempt ends (in practice, for the process). A client with a custom metrics
     /// handler (`Options.metrics`) isn't kept: the handler stays in use by its runtime, which
     /// is then left to the attempt for the rest of the process, so the handler must then
     /// outlive the process.
