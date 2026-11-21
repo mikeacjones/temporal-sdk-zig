@@ -149,7 +149,7 @@ pub fn deinit(s: *EphemeralServer) void {
 ///
 /// Starts that overlap in one process share one redirect. The first start's mode applies until
 /// the last overlapping start finishes, and then fds 1 and 2 are restored to what they were
-/// before the first start. An `.inherit` start that overlaps a redirected one inherits the
+/// before the first start (an fd that was closed then is closed again). An `.inherit` start that overlaps a redirected one inherits the
 /// redirected fds. Other threads' output is redirected for as long as any start is running.
 pub const ServerOutput = enum {
     /// Drop it. A server that outlives this process (if the process crashes) then holds no
@@ -169,12 +169,15 @@ pub const ServerOutput = enum {
 const RedirectState = struct {
     /// Starts between `begin` and `end` that take part (every mode but `.inherit`).
     active: u32 = 0,
-    /// Copies of fds 1 and 2 taken by the first start, or -1 when that fd was not
-    /// redirected. They and the /dev/null fd are close-on-exec, so a server child inherits
-    /// only fds 1 and 2.
+    /// A copy of fd 1/2 (3 or above, close-on-exec), -1 when that fd was not redirected, or
+    /// `fd_was_closed` when it was closed before the first start. The copies and the
+    /// /dev/null fd are close-on-exec, so a server child inherits only fds 1 and 2.
     saved_out: c_int = -1,
     saved_err: c_int = -1,
 };
+/// A `RedirectState.saved_out` / `saved_err` value: that fd was closed before the start
+/// redirected it, so `restore` closes it again instead of putting a copy back.
+const fd_was_closed: c_int = -2;
 /// Held only inside `OutputRedirect.begin` and `end`, never across the core call or the wait
 /// for its callback, so it is safe with any `Io` and with several in one process.
 var redirect_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
@@ -236,13 +239,37 @@ const OutputRedirect = struct {
                 return .{ .out = saved, .err = -1 };
             },
             .discard => {
-                const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
-                if (null_fd < 0) return redirectLocked(.stderr);
+                // Record fds 1 and 2 before opening /dev/null: with one of them closed, open
+                // would take that number and the check would see it open.
+                const out = saveFd(1);
+                const err = saveFd(2);
+                if (out == -1 or err == -1) {
+                    dropSaved(out);
+                    dropSaved(err);
+                    return redirectLocked(.stderr);
+                }
+                const null_fd = nullFd: {
+                    const low = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+                    if (low < 0 or low >= 3) break :nullFd low;
+                    // Keep it off 0-2, so its close below can never close fd 1 or 2.
+                    const high = dupCloexec(low);
+                    _ = std.c.close(low);
+                    break :nullFd high;
+                };
+                if (null_fd < 0) {
+                    dropSaved(out);
+                    dropSaved(err);
+                    return redirectLocked(.stderr);
+                }
                 defer _ = std.c.close(null_fd);
-                const out = dupCloexec(1);
-                const err = dupCloexec(2);
-                if (out < 0 or err < 0 or std.c.dup2(null_fd, 1) < 0 or std.c.dup2(null_fd, 2) < 0) {
-                    restore(out, err);
+                if (std.c.dup2(null_fd, 1) < 0) {
+                    dropSaved(out);
+                    dropSaved(err);
+                    return redirectLocked(.stderr);
+                }
+                if (std.c.dup2(null_fd, 2) < 0) {
+                    restore(out, -1);
+                    dropSaved(err);
                     return redirectLocked(.stderr);
                 }
                 return .{ .out = out, .err = err };
@@ -253,19 +280,42 @@ const OutputRedirect = struct {
     /// A close-on-exec copy of `fd`, made in one call. A plain dup survives exec, so a server
     /// child would keep the test runner's stdout and stderr pipes open after the test process
     /// dies; a dup followed by a separate fcntl leaves a window for another thread's spawn.
+    /// The copy is 3 or above: with fd 1 or 2 closed, a copy on that number would be taken
+    /// for the caller's fd and closed under it.
     fn dupCloexec(fd: c_int) c_int {
-        return std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
+        return std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 3));
     }
 
-    /// Puts saved copies back on fds 1 and 2 and closes them. -1 skips that fd.
+    /// F_GETFD fails only with EBADF.
+    fn isOpen(fd: c_int) bool {
+        return std.c.fcntl(fd, std.c.F.GETFD) >= 0;
+    }
+
+    /// What `restore` needs to put `fd` back: a close-on-exec copy, `fd_was_closed` when it
+    /// is closed, or -1 when the copy failed.
+    fn saveFd(fd: c_int) c_int {
+        if (!isOpen(fd)) return fd_was_closed;
+        return dupCloexec(fd);
+    }
+
+    /// Discards a value `saveFd` returned without touching fd 1 or 2.
+    fn dropSaved(saved: c_int) void {
+        if (saved >= 0) _ = std.c.close(saved);
+    }
+
+    /// Puts saved copies back on fds 1 and 2 and closes them. `fd_was_closed` closes that fd
+    /// again; -1 skips it.
     fn restore(saved_out: c_int, saved_err: c_int) void {
-        if (saved_out >= 0) {
-            _ = std.c.dup2(saved_out, 1);
-            _ = std.c.close(saved_out);
-        }
-        if (saved_err >= 0) {
-            _ = std.c.dup2(saved_err, 2);
-            _ = std.c.close(saved_err);
+        restoreOne(1, saved_out);
+        restoreOne(2, saved_err);
+    }
+
+    fn restoreOne(fd: c_int, saved: c_int) void {
+        if (saved >= 0) {
+            _ = std.c.dup2(saved, fd);
+            _ = std.c.close(saved);
+        } else if (saved == fd_was_closed) {
+            _ = std.c.close(fd);
         }
     }
 };
@@ -686,4 +736,47 @@ test "every fd an output redirect saves is close-on-exec" {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+/// Closes `fd` (1 or 2), runs a `.discard` redirect and checks that /dev/null is on fds 1 and 2
+/// meanwhile and that afterwards `fd` is closed again and the other fd is what it was.
+fn checkDiscardWithClosed(fd: c_int) !void {
+    // Repair copies: the runner's stdout protocol and stderr must come back on every path,
+    // success included, since this closes one of them on purpose.
+    const repair_out = std.c.dup(1);
+    try testing.expect(repair_out >= 0);
+    defer _ = std.c.close(repair_out);
+    const repair_err = std.c.dup(2);
+    try testing.expect(repair_err >= 0);
+    defer _ = std.c.close(repair_err);
+    const other: c_int = if (fd == 1) 2 else 1;
+    const other_id = fdId(other) orelse return error.TestUnexpectedResult;
+    const null_id = null_id: {
+        const n = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        try testing.expect(n >= 0);
+        defer _ = std.c.close(n);
+        break :null_id fdId(n) orelse return error.TestUnexpectedResult;
+    };
+
+    // No `try` from here until the repair.
+    _ = std.c.close(fd);
+    const r: OutputRedirect = .begin(.discard);
+    var ok = fdIs(1, null_id) and fdIs(2, null_id);
+    for ([_]c_int{ 1, 2 }) |f| {
+        const flags = std.c.fcntl(f, std.c.F.GETFD);
+        ok = ok and flags >= 0 and flags & std.c.FD_CLOEXEC == 0;
+    }
+    r.end();
+    ok = ok and std.c.fcntl(fd, std.c.F.GETFD) < 0 and fdIs(other, other_id) and redirect_state.active == 0;
+    _ = std.c.dup2(repair_out, 1);
+    _ = std.c.dup2(repair_err, 2);
+    if (!ok) return error.TestUnexpectedResult;
+}
+
+test "a discard redirect keeps a closed fd 1 closed and puts /dev/null on it meanwhile" {
+    try checkDiscardWithClosed(1);
+}
+
+test "a discard redirect keeps a closed fd 2 closed and puts /dev/null on it meanwhile" {
+    try checkDiscardWithClosed(2);
 }
