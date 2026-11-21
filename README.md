@@ -589,7 +589,7 @@ Notes:
 - `handle.started` is false when `id_conflict_policy = .use_existing` returned the activity already running with the ID.
 - A running attempt learns of `pause` from its next heartbeat as `std.Io` cancellation with `ctx.cancelReason()` `.paused`; the worker ends it as a retryable `ActivityPause` failure, and `describe` reports `.paused`. That failure counts against the retry policy, so pausing a running attempt that is the last `maximum_attempts` allows fails the activity; a cancel requested before the paused attempt ends still ends it canceled. `unpause` schedules the next attempt, within `.jitter` if set.
 - `pause`, `unpause` and `delete` return `error.NotFound` for no such activity, and `pause` and `unpause` return `error.ActivityClosed` for a closed one. The server's other refusals, such as pausing a paused activity or unpausing a running one, are `error.RpcFailed`, logged.
-- `ActivityDescription.heartbeat_details` holds the latest heartbeat's details, decoded through the client's codecs; read each with `get(T, arena, index)`. `delete` terminates a running activity first.
+- `ActivityDescription.heartbeat_details` holds the latest heartbeat's details, decoded through the client's codecs; read each with `get(T, arena, index)`. `delete` terminates a running activity first, and returns once the server has removed the record.
 
 #### Completing activities asynchronously
 

@@ -7694,6 +7694,43 @@ test "client: a standalone activity can be paused, unpaused and deleted, and rep
     try testing.expectError(error.NotFound, missing.delete());
 }
 
+test "client: ActivityHandle.delete returns once the server has removed the record, for a running and a closed activity" {
+    // The server removes a deleted activity's record in a transfer-queue task after the
+    // DeleteActivityExecution call returns. Polling that queue once a second makes the task
+    // run about 1 s later, so a describe right after a delete that doesn't wait for the
+    // record to go reads it every time, not only when the task happens to be slow.
+    const args = DevServer.standalone_activity_args ++ [_][]const u8{
+        "--dynamic-config-value", "history.transferProcessorMaxPollRPS=1",
+        "--dynamic-config-value", "history.transferProcessorMaxPollHostRPS=1",
+    };
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &args });
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+
+    // No worker polls the task queue, so the activity stays running until deleted.
+    var running = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "delete-running", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60) }, .{ "c-1", 1 });
+    defer running.deinit();
+    try running.delete();
+    try testing.expectError(error.NotFound, running.describe(a));
+    try testing.expectError(error.NotFound, running.get(a));
+
+    var closed = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "delete-closed", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60) }, .{ "c-1", 1 });
+    defer closed.deinit();
+    try closed.terminate("done");
+    try closed.delete();
+    try testing.expectError(error.NotFound, closed.describe(a));
+
+    var started = try c.executeActivity(StandaloneFixtures.Charge, .{ .id = "delete-by-id", .task_queue = env.task_queue, .start_to_close_timeout = .fromSeconds(60) }, .{ "c-1", 1 });
+    defer started.deinit();
+    var by_id = try c.getActivityHandle(void, "delete-by-id", "");
+    defer by_id.deinit();
+    try by_id.delete();
+    try testing.expectError(error.NotFound, by_id.describe(a));
+}
+
 const PauseThenCancelFixtures = struct {
     /// Set when the running attempt has learned of the pause.
     var learned: Io.Event = .unset;
