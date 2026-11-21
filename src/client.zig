@@ -429,8 +429,9 @@ const ParkedConnect = struct {
     logger: log_mod.Sink,
     core_log_level: ?log_mod.Level,
     worker_heartbeat_interval: ?Duration,
-    /// Made with `Options.metrics`, which is never compared: it never matches.
-    has_metrics: bool,
+    /// An owned copy of `Options.metrics`, in `key`'s arena: never a custom handler, which
+    /// isn't parked (see `parkable`).
+    metrics: ?metrics_mod.Options,
     state: State = .detached,
     next: ?*ParkedConnect = null,
     seq: u64 = 0,
@@ -455,6 +456,7 @@ const ParkedConnect = struct {
         var key: PendingConnection = try .init(process_allocator, options.connectionOptions());
         errdefer key.deinit();
         const identity = try key.arena.allocator().dupe(u8, options.identity);
+        const metrics = if (options.metrics) |m| try dupeMetrics(key.arena.allocator(), m) else null;
         const p = try process_allocator.create(ParkedConnect);
         p.* = .{
             .key = key,
@@ -462,7 +464,7 @@ const ParkedConnect = struct {
             .logger = options.logger orelse log_mod.Sink.std_log,
             .core_log_level = options.core_log_level,
             .worker_heartbeat_interval = options.worker_heartbeat_interval,
-            .has_metrics = options.metrics != null,
+            .metrics = metrics,
         };
         return p;
     }
@@ -487,10 +489,11 @@ const ParkedConnect = struct {
         p.destroyKey();
     }
 
-    /// Whether a client with `options` would make the same runtime and the same attempts.
-    /// Options that can't be compared by value (metrics) never match.
+    /// Whether a client with `options` would make the same runtime and the same attempts:
+    /// every option that shapes either is equal by value. One that can't be compared (a
+    /// custom metrics handler) never matches.
     fn matches(p: *const ParkedConnect, options: Options) bool {
-        if (p.has_metrics or options.metrics != null) return false;
+        if (!equalMetrics(p.metrics, options.metrics)) return false;
         const logger = options.logger orelse log_mod.Sink.std_log;
         return equalByValue(ConnectionOptions, p.key.options, options.connectionOptions()) and
             std.mem.eql(u8, p.identity, options.identity) and
@@ -505,6 +508,65 @@ const ParkedConnect = struct {
 fn parkable(options: Options) bool {
     const m = options.metrics orelse return true;
     return m.exporter != .custom;
+}
+
+/// Whether two clients' metrics options would make the same exporter: both none, or the same
+/// Prometheus or OpenTelemetry exporter with every setting equal. A custom handler can't be
+/// compared by value, so it never matches.
+fn equalMetrics(a: ?metrics_mod.Options, b: ?metrics_mod.Options) bool {
+    if (a == null or b == null) return a == null and b == null;
+    const x = a.?;
+    const y = b.?;
+    const exporters_equal = switch (x.exporter) {
+        .prometheus => |p| y.exporter == .prometheus and equalByValue(metrics_mod.Options.Prometheus, p, y.exporter.prometheus),
+        .opentelemetry => |o| y.exporter == .opentelemetry and equalByValue(metrics_mod.Options.OpenTelemetry, o, y.exporter.opentelemetry),
+        .custom => false,
+    };
+    if (!exporters_equal) return false;
+    const info = @typeInfo(metrics_mod.Options).@"struct";
+    inline for (info.field_names, info.field_types) |name, F| {
+        if (comptime std.mem.eql(u8, name, "exporter")) continue;
+        if (!equalByValue(F, @field(x, name), @field(y, name))) return false;
+    }
+    return true;
+}
+
+/// A copy of metrics options without a custom handler, every slice in `a`.
+fn dupeMetrics(a: Allocator, m: metrics_mod.Options) error{OutOfMemory}!metrics_mod.Options {
+    var out = m;
+    out.exporter = switch (m.exporter) {
+        .prometheus => |p| .{ .prometheus = try dupeByValue(metrics_mod.Options.Prometheus, a, p) },
+        .opentelemetry => |o| .{ .opentelemetry = try dupeByValue(metrics_mod.Options.OpenTelemetry, a, o) },
+        .custom => unreachable, // Never parked (see `parkable`).
+    };
+    const info = @typeInfo(metrics_mod.Options).@"struct";
+    inline for (info.field_names, info.field_types) |name, F| {
+        if (comptime std.mem.eql(u8, name, "exporter")) continue;
+        @field(out, name) = try dupeByValue(F, a, @field(m, name));
+    }
+    return out;
+}
+
+/// A copy of `v` with every slice copied into `a`, for the types `equalByValue` compares.
+fn dupeByValue(comptime T: type, a: Allocator, v: T) error{OutOfMemory}!T {
+    switch (@typeInfo(T)) {
+        .bool, .int, .float, .@"enum" => return v,
+        .optional => |o| return if (v) |x| try dupeByValue(o.child, a, x) else null,
+        .@"struct" => |info| {
+            var out = v;
+            inline for (info.field_names, info.field_types) |name, F| {
+                @field(out, name) = try dupeByValue(F, a, @field(v, name));
+            }
+            return out;
+        },
+        .pointer => |info| {
+            if (info.size != .slice) @compileError("no value copy for " ++ @typeName(T));
+            const out = try a.alloc(info.child, v.len);
+            for (out, v) |*o, x| o.* = try dupeByValue(info.child, a, x);
+            return out;
+        },
+        else => @compileError("no value copy for " ++ @typeName(T)),
+    }
 }
 
 /// Whether `a` and `b` hold the same values, slices compared by their contents. A type it
@@ -1036,8 +1098,8 @@ pub const Client = struct {
     /// attempt (it has no deadline of its own, and it can't be canceled), so the client's
     /// runtime is then kept with it in a pool of the process, as `close` describes, and a
     /// later `connect` with the same options (address, TLS, API key, headers, identity,
-    /// logger, `core_log_level`, and the other connection and runtime options; never with
-    /// `Options.metrics`) waits on that attempt, under its own deadline, instead of starting
+    /// logger, `core_log_level`, `Options.metrics`, and the other connection and runtime
+    /// options; never with a custom metrics handler) waits on that attempt, under its own deadline, instead of starting
     /// another. While 4 runtimes that gave up so are kept there and none matches, `connect`
     /// fails at once with `error.ConnectFailed`, logged, without creating a runtime; connects
     /// still in progress don't count, so they never stop another.
@@ -6909,6 +6971,64 @@ test "a connect to a server that answers succeeds while other connects are still
 
     var c = try Client.connect(testing.allocator, testing.io, server.clientOptions());
     c.close();
+}
+
+test "connects with OpenTelemetry metrics share a parked runtime only when every metrics setting is equal" {
+    testing.log_level = .err;
+    try drainParkedConnects(testing.io);
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var silent_open = true;
+    defer if (silent_open) silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_connect_failure_log = &logged.writer;
+    defer test_connect_failure_log = null;
+
+    // Each connect builds its options in memory of its own, so equal values aren't the same
+    // slices: they must be compared by content.
+    const Otel = struct {
+        fn connect(host: []const u8, url: []const u8, tag_value: []const u8) !void {
+            var url_buf: [64]u8 = undefined;
+            var tag_buf: [16]u8 = undefined;
+            const tags = [_]metrics_mod.Tag{.{ .key = "env", .value = tag_buf[0..tag_value.len] }};
+            @memcpy(tag_buf[0..tag_value.len], tag_value);
+            @memcpy(url_buf[0..url.len], url);
+            const options: Options = .{
+                .host_port = host,
+                .core_log_level = null,
+                .tls = .{},
+                .rpc_timeout = .fromMilliseconds(20),
+                .metrics = .{
+                    .exporter = .{ .opentelemetry = .{ .url = url_buf[0..url.len], .periodicity = .fromSeconds(3600) } },
+                    .global_tags = &tags,
+                },
+            };
+            if (Client.connect(testing.allocator, testing.io, options)) |connected| {
+                var c = connected;
+                c.close();
+                return error.TestUnexpectedResult;
+            } else |err| try testing.expectEqual(error.ConnectFailed, err);
+        }
+    };
+    // An address nothing listens on: the exporter never gets to send.
+    for (0..3) |_| {
+        try Otel.connect(host_port, "http://127.0.0.1:9", "blue");
+        try testing.expectEqual(@as(usize, 1), parkedConnectCount(testing.io));
+    }
+    // A different collector or a different tag makes a different runtime.
+    try Otel.connect(host_port, "http://127.0.0.1:10", "blue");
+    try testing.expectEqual(@as(usize, 2), parkedConnectCount(testing.io));
+    try Otel.connect(host_port, "http://127.0.0.1:9", "green");
+    try testing.expectEqual(@as(usize, 3), parkedConnectCount(testing.io));
+
+    silent.deinit(testing.io);
+    silent_open = false;
+    try drainParkedConnects(testing.io);
+    try testing.expectEqual(@as(usize, 0), parkedConnectCount(testing.io));
 }
 
 /// A failed ExecuteMultiOperation's status: `code` and `message`, with a
