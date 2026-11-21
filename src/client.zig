@@ -6552,6 +6552,117 @@ test "connect fails at once when every parked runtime waits on a different serve
     try testing.expectEqual(@as(usize, 0), parkedConnectCount(testing.io));
 }
 
+fn ignoreCoreLog(_: *anyopaque, _: *const bridge.Runtime.LogRecord) void {}
+
+/// For tests: how many more runtimes that forward sdk-core's logs the process can create now,
+/// found by creating them until `error.TooManyLogForwarders` and freeing them.
+fn freeLogForwardSlots() !usize {
+    var runtimes: [bridge.Runtime.max_forwarders]bridge.Runtime = undefined;
+    var n: usize = 0;
+    defer for (runtimes[0..n]) |r| r.deinit();
+    var ctx: u8 = 0;
+    while (n < runtimes.len) {
+        runtimes[n] = bridge.Runtime.init(testing.allocator, .{ .logging = .{ .forward = .{ .ctx = &ctx, .func = ignoreCoreLog } } }, null) catch |err| switch (err) {
+            error.TooManyLogForwarders => break,
+            else => |e| return e,
+        };
+        n += 1;
+    }
+    return n;
+}
+
+test "a client from init closed after giving up on a server that never answers gives back its log forwarding once the attempt ends" {
+    // With the default `Options.core_log_level`, the runtime holds one of
+    // `bridge.Runtime.max_forwarders` slots. A process that makes a lazy client, finds the
+    // server hung in the TLS handshake and closes the client must get the slot back once the
+    // attempt ends, or after 32 such clients every new client fails with
+    // `error.RuntimeInitFailed` for the rest of the process.
+    testing.log_level = .err;
+    try drainParkedConnects(testing.io);
+    const before = try freeLogForwardSlots();
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var silent_open = true;
+    defer if (silent_open) silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .tls = .{}, .rpc_timeout = .fromMilliseconds(20) });
+    {
+        errdefer c.close();
+        try testing.expectError(error.RpcFailed, c.checkHealth());
+    }
+    c.close();
+
+    // Closing the listener ends the attempt.
+    silent.deinit(testing.io);
+    silent_open = false;
+    try drainParkedConnects(testing.io);
+    try testing.expectEqual(before, try freeLogForwardSlots());
+}
+
+/// For the test below: a log line sink that, the first time `connect` logs a timeout, makes
+/// `Client.max_connect_attempts_in_flight` other connects that time out and park, as threads
+/// connecting at the same time would while the first one waits.
+const FillPoolWhileConnecting = struct {
+    writer: Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+    host_port: []const u8,
+    filled: bool = false,
+    nested_result: ?anyerror = null,
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *FillPoolWhileConnecting = @alignCast(@fieldParentPtr("writer", w));
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        n += data[data.len - 1].len * splat;
+        if (self.filled) return n;
+        self.filled = true;
+        const identities = [_][]const u8{ "a", "b", "c", "d" };
+        comptime std.debug.assert(identities.len == Client.max_connect_attempts_in_flight);
+        for (identities) |identity| {
+            if (Client.connect(testing.allocator, testing.io, .{ .host_port = self.host_port, .identity = identity, .tls = .{}, .rpc_timeout = .fromMilliseconds(20) })) |connected| {
+                var c = connected;
+                c.close();
+                self.nested_result = error.TestUnexpectedResult;
+            } else |err| if (err != error.ConnectFailed) {
+                self.nested_result = err;
+            }
+        }
+        return n;
+    }
+};
+
+test "a connect that gives up while other connects fill the pool gives back its log forwarding once the attempt ends" {
+    // Connects made together each start a runtime while the pool has room, and then find it
+    // full when they give up. Each such runtime holds one of `bridge.Runtime.max_forwarders`
+    // slots: left to the core for good, a few rounds of threads connecting to a hung server
+    // use them up, and every later client in the process fails with
+    // `error.RuntimeInitFailed`.
+    testing.log_level = .err;
+    try drainParkedConnects(testing.io);
+    const before = try freeLogForwardSlots();
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var silent_open = true;
+    defer if (silent_open) silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+
+    var sink: FillPoolWhileConnecting = .{ .host_port = host_port };
+    test_connect_failure_log = &sink.writer;
+    defer test_connect_failure_log = null;
+    try testing.expectError(error.ConnectFailed, Client.connect(testing.allocator, testing.io, .{ .host_port = host_port, .identity = "first", .tls = .{}, .rpc_timeout = .fromMilliseconds(20) }));
+    try testing.expect(sink.filled);
+    if (sink.nested_result) |err| return err;
+
+    // Closing the listener ends every attempt.
+    silent.deinit(testing.io);
+    silent_open = false;
+    try drainParkedConnects(testing.io);
+    try testing.expectEqual(@as(usize, 0), parkedConnectCount(testing.io));
+    try testing.expectEqual(before, try freeLogForwardSlots());
+}
+
 /// A failed ExecuteMultiOperation's status: `code` and `message`, with a
 /// MultiOperationExecutionFailure detail holding `statuses` unless it's null.
 fn multiOperationStatus(arena: Allocator, code: u32, message: []const u8, statuses: ?[]const proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure.OperationStatus) !Client.RpcStatus {
