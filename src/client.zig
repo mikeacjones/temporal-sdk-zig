@@ -1066,8 +1066,11 @@ pub const Client = struct {
     /// `worker.Worker.run` `error.ConnectFailed`. A client keeps at most 4 connection
     /// attempts in flight, the one in progress and those every call gave up on while
     /// sdk-core still makes them. Once 4 are, a call that would start another waits instead,
-    /// until its own deadline, for the one abandoned longest ago. Close with `close`,
-    /// connected or not, once no call is running.
+    /// until its own deadline, for the one abandoned longest ago. A client closed with
+    /// attempts still in flight leaves its runtime in a pool of the process (see `close`): a
+    /// later `init` with the same options takes that runtime, and its first connection waits
+    /// on the oldest of those attempts. Close with `close`, connected or not, once no call is
+    /// running.
     pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Client {
         _ = try checkClientOptions(options, .first_use);
         const taken = takeParkedConnect(io, options, .first_use) catch |err| switch (err) {
@@ -6744,6 +6747,36 @@ test "a connect that gives up while other connects fill the pool gives back its 
     try drainParkedConnects(testing.io);
     try testing.expectEqual(@as(usize, 0), parkedConnectCount(testing.io));
     try testing.expectEqual(before, try freeLogForwardSlots());
+}
+
+test "clients from init closed after giving up on one server that never answers share one parked runtime" {
+    // The failed first calls are logged as warnings.
+    testing.log_level = .err;
+    try drainParkedConnects(testing.io);
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var silent_open = true;
+    defer if (silent_open) silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+
+    for (0..3) |round| {
+        var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .tls = .{}, .rpc_timeout = .fromMilliseconds(20) });
+        {
+            errdefer c.close();
+            // From the second client on, it took the runtime the one before parked, with
+            // its attempt as the first connection.
+            try testing.expectEqual(round > 0, c.shared.connecting != null);
+            try testing.expectError(error.RpcFailed, c.checkHealth());
+        }
+        c.close();
+        try testing.expectEqual(@as(usize, 1), parkedConnectCount(testing.io));
+    }
+
+    silent.deinit(testing.io);
+    silent_open = false;
+    try drainParkedConnects(testing.io);
+    try testing.expectEqual(@as(usize, 0), parkedConnectCount(testing.io));
 }
 
 /// A failed ExecuteMultiOperation's status: `code` and `message`, with a
