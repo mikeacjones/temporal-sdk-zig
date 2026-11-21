@@ -1873,11 +1873,10 @@ fn activityLoop(w: *Worker, core: bridge.Worker, task_queue: []const u8) void {
         const run = receiveActivityTask(w, &running, polled, task_queue) orelse continue;
         // Each activity gets its own thread: `async` would run it inline in this loop once the
         // Io has as many busy threads as CPUs, running activities one at a time. The core's
-        // activity slots bound how many run at once.
-        group.concurrent(w.io, superviseActivity, .{ w, core, &running, run }) catch {
-            log.warn("no thread available for an activity; running it on the polling thread", .{});
-            superviseActivity(w, core, &running, run);
-        };
+        // activity slots bound how many run at once. Never run on this thread: the cancel for
+        // an activity arrives in a later poll of this loop, as do other activities' tasks.
+        group.concurrent(w.io, superviseActivity, .{ w, core, &running, run }) catch
+            finishActivity(w, core, &running, run, noThreadForActivity(run));
     }
     group.await(w.io) catch {};
 }
@@ -1902,8 +1901,8 @@ const RunningActivity = struct {
     task_token: []const u8,
     start: task_pb.Start,
     ctx: activity.Context,
-    /// What the codecs see for this activity's payloads: its identity, and once its header is
-    /// decoded, `ctx.propagated_`.
+    /// What the codecs see for this activity's payloads: its identity, set when the Start task
+    /// is received, and once its header is decoded, `ctx.propagated_`.
     codec_context: converter.Context = .{},
     /// Set when the activity returns or a cancel arrives; wakes the supervisor.
     wake: Io.Event = .unset,
@@ -1945,6 +1944,16 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
         .start => |s| {
             run.task_token = task.task_token;
             run.start = s;
+            // Set before anything can report the attempt: a failure the worker reports without
+            // running the activity (no thread for it) is encoded in the activity's context too.
+            const execution = s.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
+            run.codec_context = .{
+                .namespace = w.client.namespace,
+                .workflow_id = execution.workflow_id,
+                .workflow_type = s.workflow_type,
+                .activity_type = s.activity_type,
+                .activity_id = s.activity_id,
+            };
             running.mutex.lockUncancelable(w.io);
             defer running.mutex.unlock(w.io);
             running.map.put(w.gpa, run.task_token, run) catch
@@ -1985,19 +1994,12 @@ fn cancelReason(reason: task_pb.ActivityCancelReason) activity.CancelReason {
 
 /// Runs an activity on a task of its own, waits for it to return or for a cancel, cancels the
 /// task through its `std.Io` on a cancel, and reports the result. Reporting happens here, not
-/// on the activity's task, so a cancel arriving late can't interrupt the report.
+/// on the activity's task, so a cancel arriving late can't interrupt the report. Without a
+/// thread for the activity the attempt fails with a retryable failure: run here, the activity
+/// couldn't be canceled.
 fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivities, run: *RunningActivity) void {
-    defer {
-        running.mutex.lockUncancelable(w.io);
-        _ = running.map.remove(run.task_token);
-        running.mutex.unlock(w.io);
-        run.destroy(w.gpa);
-    }
     const outcome = blk: {
-        var task = w.io.concurrent(callActivity, .{ w, core, run }) catch {
-            log.warn("no thread available for activity {s}; running it here, where cancels can't reach it", .{run.start.activity_id});
-            break :blk callActivity(w, core, run);
-        };
+        var task = w.io.concurrent(callActivity, .{ w, core, run }) catch break :blk noThreadForActivity(run);
         run.wake.waitUncancelable(w.io);
         const reason = run.ctx.cancelReason() orelse break :blk task.await(w.io);
         log.debug("activity {s}: canceling its task ({t})", .{ run.start.activity_id, reason });
@@ -2005,6 +2007,33 @@ fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivitie
         log.debug("activity {s}: its task returned after the cancel", .{run.start.activity_id});
         break :blk outcome;
     };
+    finishActivity(w, core, running, run, outcome);
+}
+
+/// The `failure.Application.type` of an activity attempt the worker had no thread for, so a
+/// retry policy's non-retryable types can name it.
+const no_thread_failure_type = "NoThreadAvailable";
+
+/// The result of an activity attempt the worker's Io has no thread for: a retryable failure,
+/// so the activity's retry policy runs it again.
+fn noThreadForActivity(run: *RunningActivity) error{OutOfMemory}!result_pb.ActivityExecutionResult {
+    log.warn("no thread available for activity {s}; failing the attempt so it is retried", .{run.start.activity_id});
+    const a = run.arena.allocator();
+    return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
+        .message = try std.fmt.allocPrint(a, "the worker's Io has no thread free to run activity {s}", .{run.start.activity_id}),
+        .type = no_thread_failure_type,
+    }) } } };
+}
+
+/// Reports an activity's result to the core, then forgets and frees the run. Every run
+/// `receiveActivityTask` returns ends here exactly once.
+fn finishActivity(w: *Worker, core: bridge.Worker, running: *RunningActivities, run: *RunningActivity, outcome: error{OutOfMemory}!result_pb.ActivityExecutionResult) void {
+    defer {
+        running.mutex.lockUncancelable(w.io);
+        _ = running.map.remove(run.task_token);
+        running.mutex.unlock(w.io);
+        run.destroy(w.gpa);
+    }
     const a = run.arena.allocator();
     var result = outcome catch return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
     if (w.client.encode_failure_attributes) failure_mod.encodeAttributes(result_pb.ActivityExecutionResult, &result, a) catch
@@ -2117,13 +2146,6 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     const a = run.arena.allocator();
     const start = &run.start;
     const execution = start.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
-    run.codec_context = .{
-        .namespace = w.client.namespace,
-        .workflow_id = execution.workflow_id,
-        .workflow_type = start.workflow_type,
-        .activity_type = start.activity_type,
-        .activity_id = start.activity_id,
-    };
     const ctx = &run.ctx;
     ctx.propagated_ = .init(a);
     decodeActivityStart(w, run) catch |err| switch (err) {
@@ -4010,6 +4032,242 @@ const ScarceConcurrency = struct {
         return inner.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
     }
 };
+
+/// An Io whose `concurrent` and `groupConcurrent` succeed until the test sets the matching
+/// flag, then fail, standing in for a machine that runs out of threads while the worker's
+/// poll loops run.
+const RefusingConcurrency = struct {
+    var inner: Io = undefined;
+    var vtable: Io.VTable = undefined;
+    var refuse_concurrent: std.atomic.Value(bool) = .init(false);
+    var refuse_group: std.atomic.Value(bool) = .init(false);
+    var refused: std.atomic.Value(usize) = .init(0);
+
+    fn io(base: Io) Io {
+        inner = base;
+        refuse_concurrent.store(false, .release);
+        refuse_group.store(false, .release);
+        refused.store(0, .release);
+        vtable = base.vtable.*;
+        vtable.concurrent = concurrent;
+        vtable.groupConcurrent = groupConcurrent;
+        return .{ .userdata = base.userdata, .vtable = &vtable };
+    }
+
+    fn concurrent(
+        userdata: ?*anyopaque,
+        result_len: usize,
+        result_alignment: std.mem.Alignment,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    ) Io.ConcurrentError!*Io.AnyFuture {
+        if (refuse_concurrent.load(.acquire)) {
+            _ = refused.fetchAdd(1, .acq_rel);
+            return error.ConcurrencyUnavailable;
+        }
+        return inner.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
+    }
+
+    fn groupConcurrent(
+        userdata: ?*anyopaque,
+        group: *Io.Group,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque) void,
+    ) Io.ConcurrentError!void {
+        if (refuse_group.load(.acquire)) {
+            _ = refused.fetchAdd(1, .acq_rel);
+            return error.ConcurrencyUnavailable;
+        }
+        return inner.vtable.groupConcurrent(userdata, group, context, context_alignment, start);
+    }
+};
+
+const NoThreadTest = struct {
+    /// How many times `record` ran.
+    var calls: std.atomic.Value(u32) = .init(0);
+    var last_attempt: std.atomic.Value(u32) = .init(0);
+
+    fn record(ctx: *activity.Context) !u32 {
+        _ = calls.fetchAdd(1, .acq_rel);
+        const attempt = ctx.info().attempt;
+        last_attempt.store(attempt, .release);
+        return attempt;
+    }
+    const Record = activity.Def("RecordAttempt", record);
+
+    fn once(ctx: *workflow.Context) !u32 {
+        return ctx.executeActivity(Record, .{
+            .start_to_close_timeout = .fromSeconds(30),
+            .retry_policy = .{ .initial_interval = .fromMilliseconds(100), .backoff_coefficient = 1, .maximum_attempts = 0 },
+        }, .{}).get();
+    }
+    const Once = workflow.Def("NoThreadOnce", once);
+
+    /// Whether the run's activity has failed an attempt for want of a thread, retryably.
+    fn refusedAttemptSeen(client: *client_mod.Client, arena: Allocator, id: []const u8, run_id: []const u8) !bool {
+        const d = try client.describeWorkflow(arena, id, run_id);
+        for (d.raw.pending_activities.items) |p| {
+            const f = p.last_failure orelse continue;
+            if (std.mem.indexOf(u8, f.message, "no thread") == null) continue;
+            const info = f.failure_info orelse continue;
+            switch (info) {
+                .application_failure_info => |app| if (std.mem.eql(u8, app.type, no_thread_failure_type) and !app.non_retryable) return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+};
+
+// Both places an activity can be refused a thread: the poll loop's group (no supervisor) and the
+// supervisor's `concurrent` (no task for the activity). Neither may run the activity where a
+// cancel can't reach it, nor stop the poll loop; the attempt fails retryably instead.
+test "an activity the worker has no thread for fails its attempt as retryable, from the poll loop and from its supervisor, and a later attempt runs" {
+    // Each refusal is logged as a warning.
+    testing.log_level = .err;
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, RefusingConcurrency.io(testing.io), &client, "no-thread", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    try w.registerWorkflow(NoThreadTest.Once);
+    try w.registerActivity(NoThreadTest.Record);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    var stopped = false;
+    defer if (!stopped) {
+        RefusingConcurrency.refuse_group.store(false, .release);
+        RefusingConcurrency.refuse_concurrent.store(false, .release);
+        w.stop();
+        running.await(testing.io) catch {};
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A completed workflow and activity show both poll loops are polling.
+    var warm = try client.executeWorkflow(HelloTest.Hello, .{ .id = "no-thread-warm-up", .task_queue = "no-thread" }, .{"Temporal"});
+    defer warm.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try warm.get(a));
+
+    const flags = [_]*std.atomic.Value(bool){ &RefusingConcurrency.refuse_group, &RefusingConcurrency.refuse_concurrent };
+    for (flags, 0..) |flag, i| {
+        NoThreadTest.calls.store(0, .release);
+        RefusingConcurrency.refused.store(0, .release);
+        flag.store(true, .release);
+        const id = try std.fmt.allocPrint(a, "no-thread-{d}", .{i});
+        var run = try client.executeWorkflow(NoThreadTest.Once, .{ .id = id, .task_queue = "no-thread", .execution_timeout = .fromSeconds(60) }, .{});
+        defer run.deinit();
+
+        const deadline = Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(30));
+        while (!try NoThreadTest.refusedAttemptSeen(&client, a, run.id, run.run_id)) {
+            if (deadline.durationTo(Io.Clock.awake.now(testing.io)).nanoseconds > 0) return error.TestNoRefusedAttempt;
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+        try testing.expectEqual(0, NoThreadTest.calls.load(.acquire));
+        try testing.expect(RefusingConcurrency.refused.load(.acquire) > 0);
+
+        flag.store(false, .release);
+        const attempt = try run.get(a);
+        try testing.expect(attempt >= 2);
+        try testing.expectEqual(attempt, NoThreadTest.last_attempt.load(.acquire));
+        try testing.expectEqual(1, NoThreadTest.calls.load(.acquire));
+    }
+
+    // Nothing left behind holds up shutdown.
+    stopped = true;
+    w.stop();
+    try running.await(testing.io);
+}
+
+/// Records the context the codecs encode the no-thread failure's attributes with. The worker
+/// encodes from several threads, so it records once, under an atomic flag.
+const NoThreadContextCodec = struct {
+    var claimed: std.atomic.Value(bool) = .init(false);
+    var seen: std.atomic.Value(bool) = .init(false);
+    var buf: [256]u8 = undefined;
+    var recorded: []const u8 = "";
+
+    fn codec() converter.PayloadCodec {
+        return .{ .ptr = &buf, .vtable = &.{ .encode = plain, .decode = plain, .encodeWithContext = encode } };
+    }
+
+    fn plain(_: *anyopaque, arena: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn encode(_: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        for (payloads) |p| if (std.mem.indexOf(u8, p.data, "no thread") != null and claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            recorded = std.fmt.bufPrint(&buf, "{s}/{s}/{s}/{s}", .{ context.namespace, context.workflow_id, context.activity_type, context.activity_id }) catch "too long";
+            seen.store(true, .release);
+        };
+        return arena.dupe(converter.Payload, payloads);
+    }
+};
+
+// The no-thread failure is an activity's failure, so a context-aware codec (one picking its
+// encryption key per workflow, say) must see the activity's identity when it encodes it, as it
+// does for every other failure of the activity.
+test "the codecs encode an activity's no-thread failure in the activity's context" {
+    testing.log_level = .err;
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    NoThreadContextCodec.claimed.store(false, .release);
+    NoThreadContextCodec.seen.store(false, .release);
+    const codecs = [_]converter.PayloadCodec{NoThreadContextCodec.codec()};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target, .codecs = &codecs, .encode_failure_attributes = true });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, RefusingConcurrency.io(testing.io), &client, "no-thread-context", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    try w.registerWorkflow(NoThreadTest.Once);
+    try w.registerActivity(NoThreadTest.Record);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    var stopped = false;
+    defer if (!stopped) {
+        RefusingConcurrency.refuse_concurrent.store(false, .release);
+        w.stop();
+        running.await(testing.io) catch {};
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var warm = try client.executeWorkflow(HelloTest.Hello, .{ .id = "no-thread-context-warm-up", .task_queue = "no-thread-context" }, .{"Temporal"});
+    defer warm.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try warm.get(a));
+
+    RefusingConcurrency.refuse_concurrent.store(true, .release);
+    var run = try client.executeWorkflow(NoThreadTest.Once, .{ .id = "no-thread-context", .task_queue = "no-thread-context", .execution_timeout = .fromSeconds(60) }, .{});
+    defer run.deinit();
+    const deadline = Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(30));
+    while (!NoThreadContextCodec.seen.load(.acquire)) {
+        if (deadline.durationTo(Io.Clock.awake.now(testing.io)).nanoseconds > 0) return error.TestNoRefusedAttempt;
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    RefusingConcurrency.refuse_concurrent.store(false, .release);
+    _ = try run.get(a);
+    const expected = try std.fmt.allocPrint(a, "{s}/{s}/RecordAttempt/", .{ client.namespace, run.id });
+    try testing.expectStringStartsWith(NoThreadContextCodec.recorded, expected);
+    try testing.expect(NoThreadContextCodec.recorded.len > expected.len);
+
+    stopped = true;
+    w.stop();
+    try running.await(testing.io);
+}
 
 // The workflow loop is already polling the core worker when the activity loop can't start, so
 // `run` must drain it before freeing the core worker.
