@@ -6602,6 +6602,55 @@ test "connects that give up on one server that never answers park one runtime be
     try testing.expectEqual(@as(usize, 0), parkedConnectCount(testing.io));
 }
 
+test "connects with Prometheus metrics that give up on one server that never answers park one runtime between them" {
+    // A process that exports Prometheus metrics on a fixed address and retries `connect` while
+    // its server hangs. The runtime of a timed-out `connect` is parked with the attempt and
+    // keeps serving its scrape endpoint, so a retry that makes a runtime of its own can't bind
+    // the address and fails with `error.RuntimeInitFailed`. A retry with the same options,
+    // metrics included, must wait on the parked attempt instead.
+    testing.log_level = .err;
+    try drainParkedConnects(testing.io);
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var silent_open = true;
+    defer if (silent_open) silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    // A port free a moment ago, for the scrape endpoint.
+    var bind_buf: [32]u8 = undefined;
+    const bind_address = blk: {
+        var probe = try any.listen(testing.io, .{});
+        defer probe.deinit(testing.io);
+        break :blk try std.fmt.bufPrint(&bind_buf, "127.0.0.1:{d}", .{probe.socket.address.getPort()});
+    };
+
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_connect_failure_log = &logged.writer;
+    defer test_connect_failure_log = null;
+
+    const options: Options = .{
+        .host_port = host_port,
+        .core_log_level = null,
+        .tls = .{},
+        .rpc_timeout = .fromMilliseconds(20),
+        .metrics = .{ .exporter = .{ .prometheus = .{ .bind_address = bind_address } } },
+    };
+    for (0..3) |_| {
+        if (Client.connect(testing.allocator, testing.io, options)) |connected| {
+            var c = connected;
+            c.close();
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.ConnectFailed, err);
+        try testing.expectEqual(@as(usize, 1), parkedConnectCount(testing.io));
+    }
+
+    silent.deinit(testing.io);
+    silent_open = false;
+    try drainParkedConnects(testing.io);
+    try testing.expectEqual(@as(usize, 0), parkedConnectCount(testing.io));
+}
+
 test "connect fails at once when every parked runtime waits on a different server" {
     testing.log_level = .err;
     try drainParkedConnects(testing.io);
