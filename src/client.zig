@@ -132,8 +132,8 @@ pub const Options = struct {
     /// waiting for a workflow's result or an update's outcome, aren't limited by it, and
     /// workers' own calls aren't affected. It also bounds `Client.connect`, and the first
     /// connection of a client from `Client.init`, which a call makes. `RpcOptions.timeout`
-    /// replaces it for the calls of a view from `Client.withRpcOptions`. Null keeps sdk-core's default of 30 s. Must be
-    /// positive; under 1 ms counts as 1 ms.
+    /// replaces it for the calls of a view from `Client.withRpcOptions`. Null keeps sdk-core's
+    /// default of 30 s. Must be positive; under 1 ms counts as 1 ms.
     rpc_timeout: ?Duration = null,
 
     pub const KeepAlive = struct {
@@ -707,11 +707,11 @@ pub const Client = struct {
     /// for it, and what they change is sent on the new connection. A client keeps at most 4
     /// connection attempts in flight, the one in progress and those every call gave up on
     /// while sdk-core still makes them. Once 4 are, a call that would start another waits
-    /// instead, until its own deadline, for the one abandoned longest ago. A connection that fails or
-    /// doesn't answer in time is logged as a warning with the reason and leaves the client
-    /// unconnected, so a later call tries again: `ensureConnected` and `currentConnection`
-    /// return the `ConnectError`, the client's other calls `error.RpcFailed`, and
-    /// `worker.Worker.run` `error.ConnectFailed`. Close with `close`, connected or not, once
+    /// instead, until its own deadline, for the one abandoned longest ago. A connection that
+    /// fails or doesn't answer in time is logged as a warning with the reason and leaves the
+    /// client unconnected, so a later call tries again: `ensureConnected` and
+    /// `currentConnection` return the `ConnectError`, the client's other calls
+    /// `error.RpcFailed`, and `worker.Worker.run` `error.ConnectFailed`. Close with `close`, connected or not, once
     /// no call is running.
     pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Client {
         return create(gpa, io, options, .first_use);
@@ -1114,8 +1114,7 @@ pub const Client = struct {
     /// without either.
     fn firstConnection(c: *Client, comptime attempt: Attempt, stop: ?*const std.atomic.Value(bool)) (ConnectError || error{Stopped})!bridge.Connection {
         // sdk-core's connect has no deadline of its own: a first connection made by a call
-        // gets the call's, counted from now.
-        // `Client.connect` gets the same.
+        // gets the call's, counted from now, and so does `Client.connect`.
         const deadline: ?Io.Clock.Timestamp = switch (attempt) {
             .first_use, .connect => .fromNow(c.io, .{ .raw = .fromMilliseconds(if (c.callDeadlineMs() > 0) c.callDeadlineMs() else default_rpc_timeout_ms), .clock = .awake }),
             .reconnect => null,
