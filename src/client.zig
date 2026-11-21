@@ -6070,6 +6070,34 @@ test "a client from init keeps at most max_connect_attempts_in_flight connection
     for (c.shared.abandoned_attempts.items) |p| try testing.expect(!p.calledBack());
 }
 
+test "connect keeps failing with ConnectFailed however many times it gives up on a server that never answers the TLS handshake" {
+    // A process that retries `connect` while its server hangs. With the default
+    // `Options.core_log_level`, each client's runtime forwards sdk-core's logs through one of
+    // `bridge.Runtime.max_forwarders` slots, and a timed-out `connect` leaves its runtime to
+    // the attempt sdk-core is still making: that must not use up the slots, or every later
+    // client in the process fails with `error.RuntimeInitFailed`.
+    testing.log_level = .err;
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    // Resets the connections the core's abandoned attempts made, which then end.
+    defer silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_connect_failure_log = &logged.writer;
+    defer test_connect_failure_log = null;
+
+    for (0..bridge.Runtime.max_forwarders + 1) |_| {
+        if (Client.connect(testing.allocator, testing.io, .{ .host_port = host_port, .tls = .{}, .rpc_timeout = .fromMilliseconds(20) })) |connected| {
+            var c = connected;
+            c.close();
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.ConnectFailed, err);
+    }
+}
+
 /// A failed ExecuteMultiOperation's status: `code` and `message`, with a
 /// MultiOperationExecutionFailure detail holding `statuses` unless it's null.
 fn multiOperationStatus(arena: Allocator, code: u32, message: []const u8, statuses: ?[]const proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure.OperationStatus) !Client.RpcStatus {
