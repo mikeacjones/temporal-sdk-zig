@@ -908,8 +908,15 @@ pub const Client = struct {
     /// when an option is rejected or the server can't be reached. Waits for the server until
     /// `Options.rpc_timeout` (30 s without one), without cancellation; a server that hasn't
     /// answered by then fails it with `error.ConnectFailed`. sdk-core may still be making that
-    /// attempt (it has no deadline of its own), and the client's runtime is then left to it
-    /// as `close` describes.
+    /// attempt (it has no deadline of its own, and it can't be canceled), so the client's
+    /// runtime is then kept with it in a pool of the process, and a later `connect` with the
+    /// same options (address, TLS, API key, headers, identity, logger, `core_log_level`, and
+    /// the other connection and runtime options; never with `Options.metrics`) waits on that
+    /// attempt, under its own deadline, instead of starting another. The pool frees a runtime
+    /// once its attempt ends. It holds at most 4 runtimes in the process; while 4 are kept
+    /// and none matches, `connect` fails at once with `error.ConnectFailed`, logged. A client
+    /// with `Options.metrics` isn't kept: its runtime is left to the attempt as `close`
+    /// describes.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
         _ = try checkClientOptions(options, .connect);
         const parked = try takeParkedConnect(io, options);
