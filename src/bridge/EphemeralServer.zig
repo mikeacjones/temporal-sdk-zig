@@ -149,8 +149,9 @@ pub fn deinit(s: *EphemeralServer) void {
 ///
 /// Starts that overlap in one process share one redirect. The first start's mode applies until
 /// the last overlapping start finishes, and then fds 1 and 2 are restored to what they were
-/// before the first start (an fd that was closed then is closed again). An `.inherit` start that overlaps a redirected one inherits the
-/// redirected fds. Other threads' output is redirected for as long as any start is running.
+/// before the first start (an fd that was closed then is closed again). An `.inherit` start
+/// that overlaps a redirected one inherits the redirected fds. Other threads' output is
+/// redirected for as long as any start is running.
 pub const ServerOutput = enum {
     /// Drop it. A server that outlives this process (if the process crashes) then holds no
     /// pipe of its parent's open; `zig build` waits for a test's output pipes to close, so an
@@ -650,6 +651,16 @@ test "download failures are recognized behind the bridge's prefix" {
 /// on Linux (std goes through statx there), so Linux asks statx for the same two fields.
 const FdId = struct { dev: u64, ino: u64 };
 
+/// A device number as FdId's u64 field: its bits read as an unsigned integer of the same
+/// width, then widened. macOS's dev_t is i32, and devfs device numbers (/dev/null's) often
+/// have the high bit set, so a range-checked cast would panic on them; reading the bits
+/// gives every device number one distinct value.
+fn devBits(dev: anytype) u64 {
+    const T = @TypeOf(dev);
+    const U = @Int(.unsigned, @bitSizeOf(T));
+    return @as(U, @bitCast(dev));
+}
+
 fn fdId(fd: c_int) ?FdId {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
@@ -660,12 +671,33 @@ fn fdId(fd: c_int) ?FdId {
     }
     var st: std.c.Stat = undefined;
     if (std.c.fstat(fd, &st) != 0) return null;
-    return .{ .dev = @intCast(st.dev), .ino = @intCast(st.ino) };
+    return .{ .dev = devBits(st.dev), .ino = @intCast(st.ino) };
 }
 
 fn fdIs(fd: c_int, want: FdId) bool {
     const got = fdId(fd) orelse return false;
     return std.meta.eql(got, want);
+}
+
+test "a device number with the high bit set maps to one distinct id without a range check" {
+    // macOS's dev_t is i32 and devfs numbers can be negative (CI run 44890622640 panicked here).
+    const min = devBits(@as(i32, std.math.minInt(i32)));
+    const neg_one = devBits(@as(i32, -1));
+    const max = devBits(@as(i32, std.math.maxInt(i32)));
+    const zero = devBits(@as(i32, 0));
+    try testing.expectEqual(@as(u64, 0x8000_0000), min);
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF), neg_one);
+    try testing.expectEqual(@as(u64, 0x7FFF_FFFF), max);
+    try testing.expectEqual(@as(u64, 0), zero);
+    try testing.expectEqual(@as(u64, 5), devBits(@as(i32, 5)));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), devBits(@as(u64, std.math.maxInt(u64))));
+    const ids = [_]u64{ min, neg_one, max, zero };
+    for (ids, 0..) |a, i| for (ids[i + 1 ..]) |b| try testing.expect(a != b);
+    if (builtin.os.tag == .macos) {
+        // The values fdId actually sees: std.c.dev_t itself, with the high bit set.
+        try testing.expectEqual(@as(u64, 0x8000_0000), devBits(@as(std.c.dev_t, std.math.minInt(std.c.dev_t))));
+        try testing.expectEqual(@as(u64, 0xFFFF_FFFF), devBits(@as(std.c.dev_t, -1)));
+    }
 }
 
 test "overlapping output redirects restore fds 1 and 2 in either order" {
