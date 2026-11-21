@@ -891,10 +891,58 @@ test "traceText names the source of each frame of an error return trace, or is e
         } else {
             try testing.expect(std.mem.indexOf(u8, text, "failure.zig:") != null);
             try testing.expect(std.mem.indexOf(u8, text, "traceLeaf") != null);
-            try testing.expect(std.mem.indexOf(u8, text, "0x") == null);
+            try testing.expect(isSourceFrameLines(text));
         }
     };
     try testing.expectEqualStrings("", try traceText(testing.allocator, null));
+}
+
+/// Whether every line of `text` is a source frame as `addressesText` prints it,
+/// `<file>:<line>:<col>: in <name>`, and so not a raw address such as std's trace printers
+/// write (`<file>:<line>:<col>: 0x<addr> in <name> (<module>)`, or `0x<addr> in ??? (???)`
+/// without a source location). It parses from the right of each line, so it ignores what the
+/// file path holds: a checkout path may itself contain "0x", or a drive letter's colon.
+fn isSourceFrameLines(text: []const u8) bool {
+    if (text.len == 0) return true;
+    if (text[text.len - 1] != '\n') return false;
+    var lines = std.mem.splitScalar(u8, text[0 .. text.len - 1], '\n');
+    while (lines.next()) |line| {
+        const sep = std.mem.lastIndexOf(u8, line, ": in ") orelse return false;
+        const name = line[sep + ": in ".len ..];
+        // A symbol name never looks like an address; std prints an unknown one as "???".
+        if (name.len == 0 or std.mem.startsWith(u8, name, "0x")) return false;
+        const loc = line[0..sep];
+        const col_colon = std.mem.lastIndexOfScalar(u8, loc, ':') orelse return false;
+        if (!isDecimal(loc[col_colon + 1 ..])) return false;
+        const line_colon = std.mem.lastIndexOfScalar(u8, loc[0..col_colon], ':') orelse return false;
+        if (line_colon == 0 or !isDecimal(loc[line_colon + 1 .. col_colon])) return false;
+    }
+    return true;
+}
+
+fn isDecimal(digits: []const u8) bool {
+    if (digits.len == 0) return false;
+    for (digits) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+test "the source frame check accepts a path containing 0x and refuses a raw address" {
+    try testing.expect(isSourceFrameLines(""));
+    try testing.expect(isSourceFrameLines("/tmp/0xcheck/src/failure.zig:862:5: in failure.traceLeaf\n" ++
+        "/tmp/0xcheck/src/failure.zig:866:5: in failure.traceMiddle\n"));
+    try testing.expect(isSourceFrameLines("C:\\0x1f\\src\\failure.zig:1:2: in main\n"));
+
+    const raw = [_][]const u8{
+        // std's own trace line, which carries the address beside the location.
+        "/tmp/0xcheck/src/failure.zig:862:5: 0x100a3f4c8 in traceLeaf (test)\n",
+        // An address with no source location.
+        "0x100a3f4c8 in ??? (???)\n",
+        "0x100a3f4c8\n",
+        "/src/failure.zig:862:5: in 0x100a3f4c8\n",
+        "/src/failure.zig:0x1f:5: in traceLeaf\n",
+        "/src/failure.zig:862:5: in traceLeaf",
+    };
+    for (raw) |text| try testing.expect(!isSourceFrameLines(text));
 }
 
 test "encoding attributes keeps a failure whose attributes are already encoded as it was received" {
