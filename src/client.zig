@@ -6779,6 +6779,81 @@ test "clients from init closed after giving up on one server that never answers 
     try testing.expectEqual(@as(usize, 0), parkedConnectCount(testing.io));
 }
 
+/// For the test below: a log line sink several threads can write to at once.
+const LockedLog = struct {
+    writer: Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+    mutex: Io.Mutex = .init,
+    lines: std.ArrayList(u8) = .empty,
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *LockedLog = @alignCast(@fieldParentPtr("writer", w));
+        self.mutex.lockUncancelable(testing.io);
+        defer self.mutex.unlock(testing.io);
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            self.lines.appendSlice(testing.allocator, d) catch return error.WriteFailed;
+            n += d.len;
+        }
+        for (0..splat) |_| self.lines.appendSlice(testing.allocator, data[data.len - 1]) catch return error.WriteFailed;
+        return n + data[data.len - 1].len * splat;
+    }
+
+    fn connectSilent(host_port: []const u8, identity: []const u8, result: *?anyerror) void {
+        if (Client.connect(testing.allocator, testing.io, .{ .host_port = host_port, .identity = identity, .core_log_level = null, .tls = .{}, .rpc_timeout = .fromSeconds(30) })) |connected| {
+            var c = connected;
+            c.close();
+            result.* = error.TestUnexpectedResult;
+        } else |err| result.* = err;
+    }
+};
+
+test "a connect to a server that answers succeeds while other connects are still waiting on a slow one" {
+    // A process connecting several clients at once, while one server is slow to answer: the
+    // connects still in progress have parked nothing, and must not stop a connect to a server
+    // that answers.
+    testing.log_level = .err;
+    try drainParkedConnects(testing.io);
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var silent_open = true;
+    defer if (silent_open) silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+
+    var logged: LockedLog = .{};
+    defer logged.lines.deinit(testing.allocator);
+    test_connect_failure_log = &logged.writer;
+    defer test_connect_failure_log = null;
+
+    const identities = [_][]const u8{ "a", "b", "c", "d" };
+    comptime std.debug.assert(identities.len == Client.max_connect_attempts_in_flight);
+    var results: [identities.len]?anyerror = @splat(null);
+    var threads: [identities.len]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        // Closing the listener resets the connections it never accepted: the waiting
+        // connects fail at once.
+        if (silent_open) silent.deinit(testing.io);
+        silent_open = false;
+        for (threads[0..spawned]) |t| t.join();
+    }
+    for (identities, &results) |identity, *r| {
+        threads[spawned] = try std.Thread.spawn(.{}, LockedLog.connectSilent, .{ host_port, identity, r });
+        spawned += 1;
+    }
+    // Every one of them is waiting on the silent server.
+    const deadline: Io.Clock.Timestamp = .fromNow(testing.io, .{ .raw = .fromSeconds(20), .clock = .awake });
+    while (parkedConnectCount(testing.io) < identities.len) {
+        if (deadline.durationFromNow(testing.io).raw.nanoseconds <= 0) return error.Timeout;
+        std.Thread.yield() catch {};
+    }
+
+    var c = try Client.connect(testing.allocator, testing.io, server.clientOptions());
+    c.close();
+}
+
 /// A failed ExecuteMultiOperation's status: `code` and `message`, with a
 /// MultiOperationExecutionFailure detail holding `statuses` unless it's null.
 fn multiOperationStatus(arena: Allocator, code: u32, message: []const u8, statuses: ?[]const proto.temporal.api.errordetails.v1.MultiOperationExecutionFailure.OperationStatus) !Client.RpcStatus {
