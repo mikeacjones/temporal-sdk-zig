@@ -31,6 +31,7 @@ const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const nexus = @import("nexus.zig");
+const CancelBlockingAllocator = @import("CancelBlockingAllocator.zig");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -1117,7 +1118,8 @@ pub const ActivityEnvironment = struct {
     /// on a task of its own while this call waits for it; canceling the calling task cancels
     /// the activity, which sees `error.Canceled` with no `cancelReason`. Without a thread for
     /// that task it runs on the calling one, where `cancel` only sets the reason and wakes
-    /// `waitForWorkerStop`.
+    /// `waitForWorkerStop`. Allocations through `ctx.allocator()` reach `arena` with cancels
+    /// blocked, as under a worker.
     pub fn executeActivityWith(env: *ActivityEnvironment, comptime Activity: type, receiver: ?*Activity.Receiver, args: Activity.Args, arena: Allocator) !Activity.Result {
         var info = env.info;
         info.activity_type = Activity.activity_name;
@@ -1137,8 +1139,12 @@ pub const ActivityEnvironment = struct {
             // As a worker does for a standalone activity, which has no workflow.
             .context = if (info.workflow_id.len > 0) &context else context[0..3],
         } else .{};
+        // Blocks cancels around each of the activity's allocations, as a worker does, so an
+        // allocation cannot consume a cancel meant for the activity's next wait. On this
+        // frame, which outlives the activity; memory from it may be freed through `arena`.
+        var task_gpa: CancelBlockingAllocator = .{ .io = env.io, .backing = arena };
         var ctx: activity.Context = .{
-            .arena = arena,
+            .arena = task_gpa.allocator(),
             .io_ = env.io,
             .info_ = info,
             .logger_ = logger,
@@ -3235,6 +3241,77 @@ const EnvironmentStopFixtures = struct {
         return env.executeActivity(Drain, .{}, arena);
     }
 };
+
+/// Forwards to `backing` and counts the calls made while cancels were not blocked on `io`'s
+/// current task.
+const CancelProbeAllocator = struct {
+    io: Io,
+    backing: Allocator,
+    calls: std.atomic.Value(usize) = .init(0),
+    unblocked: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(p: *CancelProbeAllocator) Allocator {
+        return .{ .ptr = p, .vtable = &vtable };
+    }
+
+    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn record(p: *CancelProbeAllocator) void {
+        const prev = p.io.swapCancelProtection(.blocked);
+        _ = p.io.swapCancelProtection(prev);
+        _ = p.calls.fetchAdd(1, .monotonic);
+        if (prev == .unblocked) _ = p.unblocked.fetchAdd(1, .monotonic);
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const p: *CancelProbeAllocator = @ptrCast(@alignCast(ptr));
+        p.record();
+        return p.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const p: *CancelProbeAllocator = @ptrCast(@alignCast(ptr));
+        p.record();
+        return p.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const p: *CancelProbeAllocator = @ptrCast(@alignCast(ptr));
+        p.record();
+        return p.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const p: *CancelProbeAllocator = @ptrCast(@alignCast(ptr));
+        p.record();
+        p.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+const CancelProbeFixtures = struct {
+    /// Allocates, grows and frees a slice, then returns one allocated from the context.
+    fn allocates(ctx: *activity.Context) ![]const u8 {
+        const gpa = ctx.allocator();
+        var scratch = try gpa.alloc(u8, 16);
+        scratch = try gpa.realloc(scratch, 4096);
+        gpa.free(scratch);
+        return gpa.dupe(u8, "allocated");
+    }
+    const Allocates = activity.Def("ProbeAllocates", allocates);
+};
+
+test "ActivityEnvironment blocks cancels around each allocation the activity makes" {
+    var probe: CancelProbeAllocator = .{ .io = testing.io, .backing = testing.allocator };
+    var env: ActivityEnvironment = .init(testing.io);
+    const result = try env.executeActivity(CancelProbeFixtures.Allocates, .{}, probe.allocator());
+    // The wrapper passes memory through unchanged, so the result is freed straight through
+    // the backing allocator, outside the probe: only the activity's calls are counted.
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("allocated", result);
+    // alloc, resize or remap (or an alloc and a free if neither grows in place), free, alloc.
+    try testing.expect(probe.calls.load(.monotonic) >= 3);
+    try testing.expectEqual(@as(usize, 0), probe.unblocked.load(.monotonic));
+}
 
 test "ActivityEnvironment.cancel cancels the running activity with the reason" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
