@@ -1,0 +1,2 @@
+`Client.connect` now gives up on a server that doesn't answer, such as one that accepts the connection but never completes the TLS handshake, after `Options.rpc_timeout` (30 s without one), returning `error.ConnectFailed` with the reason logged; it used to wait forever.
+A client from `Client.init` keeps at most 4 connection attempts in flight against such a server, where it used to start another with every call.
