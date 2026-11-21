@@ -170,7 +170,8 @@ const RedirectState = struct {
     /// Starts between `begin` and `end` that take part (every mode but `.inherit`).
     active: u32 = 0,
     /// Copies of fds 1 and 2 taken by the first start, or -1 when that fd was not
-    /// redirected.
+    /// redirected. They and the /dev/null fd are close-on-exec, so a server child inherits
+    /// only fds 1 and 2.
     saved_out: c_int = -1,
     saved_err: c_int = -1,
 };
@@ -226,7 +227,7 @@ const OutputRedirect = struct {
         switch (mode) {
             .inherit => return .{ .out = -1, .err = -1 },
             .stderr => {
-                const saved = std.c.dup(1);
+                const saved = dupCloexec(1);
                 if (saved < 0) return .{ .out = -1, .err = -1 };
                 if (std.c.dup2(2, 1) < 0) {
                     _ = std.c.close(saved);
@@ -235,11 +236,11 @@ const OutputRedirect = struct {
                 return .{ .out = saved, .err = -1 };
             },
             .discard => {
-                const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+                const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
                 if (null_fd < 0) return redirectLocked(.stderr);
                 defer _ = std.c.close(null_fd);
-                const out = std.c.dup(1);
-                const err = std.c.dup(2);
+                const out = dupCloexec(1);
+                const err = dupCloexec(2);
                 if (out < 0 or err < 0 or std.c.dup2(null_fd, 1) < 0 or std.c.dup2(null_fd, 2) < 0) {
                     restore(out, err);
                     return redirectLocked(.stderr);
@@ -247,6 +248,13 @@ const OutputRedirect = struct {
                 return .{ .out = out, .err = err };
             },
         }
+    }
+
+    /// A close-on-exec copy of `fd`, made in one call. A plain dup survives exec, so a server
+    /// child would keep the test runner's stdout and stderr pipes open after the test process
+    /// dies; a dup followed by a separate fcntl leaves a window for another thread's spawn.
+    fn dupCloexec(fd: c_int) c_int {
+        return std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
     }
 
     /// Puts saved copies back on fds 1 and 2 and closes them. -1 skips that fd.
@@ -640,6 +648,38 @@ test "overlapping output redirects restore fds 1 and 2 in either order" {
         }
         const ok = first_mode_held and fdIs(1, before_out) and fdIs(2, before_err) and redirect_state.active == 0 and
             redirect_state.saved_out == -1 and redirect_state.saved_err == -1;
+        if (!ok) {
+            _ = std.c.dup2(repair_out, 1);
+            _ = std.c.dup2(repair_err, 2);
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "every fd an output redirect saves is close-on-exec" {
+    // Repair copies, so the runner's stdout protocol and stderr survive a failed check.
+    const repair_out = std.c.dup(1);
+    try testing.expect(repair_out >= 0);
+    defer _ = std.c.close(repair_out);
+    const repair_err = std.c.dup(2);
+    try testing.expect(repair_err >= 0);
+    defer _ = std.c.close(repair_err);
+    const before_out = fdId(1) orelse return error.TestUnexpectedResult;
+    const before_err = fdId(2) orelse return error.TestUnexpectedResult;
+
+    for ([_]ServerOutput{ .discard, .stderr }) |mode| {
+        const r: OutputRedirect = .begin(mode);
+        const saved_out = redirect_state.saved_out;
+        const saved_err = redirect_state.saved_err;
+        // A `.discard` start that fell back to `.stderr` saves no copy of fd 2 and fails here.
+        var ok = saved_out >= 0 and (if (mode == .discard) saved_err >= 0 else saved_err == -1);
+        for ([_]c_int{ saved_out, saved_err }) |fd| {
+            if (fd < 0) continue;
+            const flags = std.c.fcntl(fd, std.c.F.GETFD);
+            ok = ok and flags >= 0 and flags & std.c.FD_CLOEXEC != 0;
+        }
+        r.end();
+        ok = ok and fdIs(1, before_out) and fdIs(2, before_err);
         if (!ok) {
             _ = std.c.dup2(repair_out, 1);
             _ = std.c.dup2(repair_err, 2);
