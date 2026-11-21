@@ -146,6 +146,11 @@ pub fn deinit(s: *EphemeralServer) void {
 /// output is chosen by pointing this process's fds 1 and 2 elsewhere while it starts (the
 /// server inherits them) and restoring them once startup finishes. Other threads writing to
 /// stdout or stderr during that window are redirected too.
+///
+/// Starts that overlap in one process share one redirect. The first start's mode applies until
+/// the last overlapping start finishes, and then fds 1 and 2 are restored to what they were
+/// before the first start. An `.inherit` start that overlaps a redirected one inherits the
+/// redirected fds. Other threads' output is redirected for as long as any start is running.
 pub const ServerOutput = enum {
     /// Drop it. A server that outlives this process (if the process crashes) then holds no
     /// pipe of its parent's open; `zig build` waits for a test's output pipes to close, so an
@@ -159,44 +164,100 @@ pub const ServerOutput = enum {
     inherit,
 };
 
-const OutputRedirect = struct {
+/// Process-wide state of the fd 1/2 redirect shared by overlapping starts.
+/// Guarded by `redirect_mutex`.
+const RedirectState = struct {
+    /// Starts between `begin` and `end` that take part (every mode but `.inherit`).
+    active: u32 = 0,
+    /// Copies of fds 1 and 2 taken by the first start, or -1 when that fd was not
+    /// redirected.
     saved_out: c_int = -1,
     saved_err: c_int = -1,
+};
+/// Held only inside `OutputRedirect.begin` and `end`, never across the core call or the wait
+/// for its callback, so it is safe with any `Io` and with several in one process.
+var redirect_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var redirect_state: RedirectState = .{};
 
+const OutputRedirect = struct {
+    /// True when this start holds a count in `redirect_state`. `end` then releases it.
+    counted: bool = false,
+
+    /// `.inherit` takes no part. Any other mode joins the redirect: the first start of an
+    /// overlap points fds 1 and 2 by its mode, and later ones only count themselves in.
     fn begin(mode: ServerOutput) OutputRedirect {
+        if (mode == .inherit) return .{};
+        lock();
+        defer unlock();
+        if (redirect_state.active == 0) {
+            const saved = redirectLocked(mode);
+            redirect_state = .{ .active = 1, .saved_out = saved.out, .saved_err = saved.err };
+        } else {
+            redirect_state.active += 1;
+        }
+        return .{ .counted = true };
+    }
+
+    /// The last start of an overlap to end restores fds 1 and 2 to what they were before the
+    /// first one began.
+    fn end(r: OutputRedirect) void {
+        if (!r.counted) return;
+        lock();
+        defer unlock();
+        std.debug.assert(redirect_state.active > 0);
+        redirect_state.active -= 1;
+        if (redirect_state.active > 0) return;
+        restore(redirect_state.saved_out, redirect_state.saved_err);
+        redirect_state = .{};
+    }
+
+    fn lock() void {
+        std.debug.assert(std.c.pthread_mutex_lock(&redirect_mutex) == .SUCCESS);
+    }
+
+    fn unlock() void {
+        std.debug.assert(std.c.pthread_mutex_unlock(&redirect_mutex) == .SUCCESS);
+    }
+
+    /// Points fds 1 and 2 by `mode` and returns copies of the fds it replaced (-1 for one it
+    /// left alone). On failure it falls back from `.discard` to `.stderr` to nothing, closing
+    /// what it opened. Writes to no global; the caller holds `redirect_mutex`.
+    fn redirectLocked(mode: ServerOutput) struct { out: c_int, err: c_int } {
         switch (mode) {
-            .inherit => return .{},
+            .inherit => return .{ .out = -1, .err = -1 },
             .stderr => {
                 const saved = std.c.dup(1);
-                if (saved < 0) return .{};
+                if (saved < 0) return .{ .out = -1, .err = -1 };
                 if (std.c.dup2(2, 1) < 0) {
                     _ = std.c.close(saved);
-                    return .{};
+                    return .{ .out = -1, .err = -1 };
                 }
-                return .{ .saved_out = saved };
+                return .{ .out = saved, .err = -1 };
             },
             .discard => {
                 const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
-                if (null_fd < 0) return begin(.stderr);
+                if (null_fd < 0) return redirectLocked(.stderr);
                 defer _ = std.c.close(null_fd);
-                var r: OutputRedirect = .{ .saved_out = std.c.dup(1), .saved_err = std.c.dup(2) };
-                if (r.saved_out < 0 or r.saved_err < 0 or std.c.dup2(null_fd, 1) < 0 or std.c.dup2(null_fd, 2) < 0) {
-                    r.end();
-                    return begin(.stderr);
+                const out = std.c.dup(1);
+                const err = std.c.dup(2);
+                if (out < 0 or err < 0 or std.c.dup2(null_fd, 1) < 0 or std.c.dup2(null_fd, 2) < 0) {
+                    restore(out, err);
+                    return redirectLocked(.stderr);
                 }
-                return r;
+                return .{ .out = out, .err = err };
             },
         }
     }
 
-    fn end(r: OutputRedirect) void {
-        if (r.saved_out >= 0) {
-            _ = std.c.dup2(r.saved_out, 1);
-            _ = std.c.close(r.saved_out);
+    /// Puts saved copies back on fds 1 and 2 and closes them. -1 skips that fd.
+    fn restore(saved_out: c_int, saved_err: c_int) void {
+        if (saved_out >= 0) {
+            _ = std.c.dup2(saved_out, 1);
+            _ = std.c.close(saved_out);
         }
-        if (r.saved_err >= 0) {
-            _ = std.c.dup2(r.saved_err, 2);
-            _ = std.c.close(r.saved_err);
+        if (saved_err >= 0) {
+            _ = std.c.dup2(saved_err, 2);
+            _ = std.c.close(saved_err);
         }
     }
 };
@@ -525,4 +586,64 @@ test "download failures are recognized behind the bridge's prefix" {
     try testing.expect(!isDownloadFailure("Connection failed: failed to start server: No such file or directory"));
     try testing.expect(!isDownloadFailure("server says: invalid ephemeral server download"));
     try testing.expect(!isDownloadFailure(""));
+}
+
+/// What an fd points at, by its device and inode. Zig 0.17.1's std.c has no `fstat` or `Stat`
+/// on Linux (std goes through statx there), so Linux asks statx for the same two fields.
+const FdId = struct { dev: u64, ino: u64 };
+
+fn fdId(fd: c_int) ?FdId {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var stx: linux.Statx = undefined;
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &stx)) != .SUCCESS) return null;
+        if (!stx.mask.INO) return null;
+        return .{ .dev = (@as(u64, stx.dev_major) << 32) | stx.dev_minor, .ino = stx.ino };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return null;
+    return .{ .dev = @intCast(st.dev), .ino = @intCast(st.ino) };
+}
+
+fn fdIs(fd: c_int, want: FdId) bool {
+    const got = fdId(fd) orelse return false;
+    return std.meta.eql(got, want);
+}
+
+test "overlapping output redirects restore fds 1 and 2 in either order" {
+    // Repair copies, so the runner's stdout protocol and stderr survive a failed check.
+    const repair_out = std.c.dup(1);
+    try testing.expect(repair_out >= 0);
+    defer _ = std.c.close(repair_out);
+    const repair_err = std.c.dup(2);
+    try testing.expect(repair_err >= 0);
+    defer _ = std.c.close(repair_err);
+    const before_out = fdId(1) orelse return error.TestUnexpectedResult;
+    const before_err = fdId(2) orelse return error.TestUnexpectedResult;
+
+    const orders = [_]struct { first: ServerOutput, second: ServerOutput, first_ends_first: bool }{
+        .{ .first = .discard, .second = .discard, .first_ends_first = true },
+        .{ .first = .discard, .second = .discard, .first_ends_first = false },
+        // The first start's mode wins: `.stderr` leaves fd 2 alone while `.discard` overlaps.
+        .{ .first = .stderr, .second = .discard, .first_ends_first = true },
+    };
+    for (orders) |o| {
+        const a: OutputRedirect = .begin(o.first);
+        const b: OutputRedirect = .begin(o.second);
+        const first_mode_held = o.first != .stderr or (fdIs(1, before_err) and fdIs(2, before_err));
+        if (o.first_ends_first) {
+            a.end();
+            b.end();
+        } else {
+            b.end();
+            a.end();
+        }
+        const ok = first_mode_held and fdIs(1, before_out) and fdIs(2, before_err) and redirect_state.active == 0 and
+            redirect_state.saved_out == -1 and redirect_state.saved_err == -1;
+        if (!ok) {
+            _ = std.c.dup2(repair_out, 1);
+            _ = std.c.dup2(repair_err, 2);
+            return error.TestUnexpectedResult;
+        }
+    }
 }
