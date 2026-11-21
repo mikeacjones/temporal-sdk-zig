@@ -3778,22 +3778,77 @@ pub fn ActivityHandle(comptime T: type) type {
             }, a, &status) catch |err| return h.pauseError(err, status, "unpausing");
         }
 
-        /// Deletes the activity and its record; a running activity is terminated first.
-        /// Afterwards `describe` and `get` return `error.NotFound`, and visibility queries
-        /// stop listing it once they catch up. Returns `error.NotFound` for no such activity
-        /// and `error.RpcFailed` (logging the server's reason) for anything else the server
-        /// refuses.
+        /// Deletes the activity and its record; a running activity is terminated first. The
+        /// server removes the record in a task of its own after it accepts the request, and
+        /// `delete` waits for that: it returns once the server reports the deleted run as not
+        /// found, so afterwards `describe` and `get` return `error.NotFound`. Visibility
+        /// queries stop listing it once they catch up. A handle with no run ID deletes the
+        /// latest run. Returns `error.NotFound` for no such activity, `error.Canceled` if
+        /// canceled before the record is gone (the server may still delete it), and
+        /// `error.RpcFailed` (logging the server's reason) for anything else the server
+        /// refuses, or if checking that the record is gone fails.
         pub fn delete(h: *const Self) ActivityError!void {
             const c = h.client;
             var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
             defer arena_state.deinit();
             const a = arena_state.allocator();
+            // The wait needs a fixed run: describing the latest run could see one started
+            // under the same ID after the delete.
+            const run_id = if (h.run_id.len > 0) h.run_id else run_id: {
+                const response = c.rpc(wfs.DescribeActivityExecutionResponse, "DescribeActivityExecution", wfs.DescribeActivityExecutionRequest{
+                    .namespace = c.namespace,
+                    .activity_id = h.id,
+                }, a) catch |err| switch (err) {
+                    error.AlreadyExists => return error.InvalidResponse,
+                    else => |e| return e,
+                };
+                const latest = if (response.run_id.len > 0) response.run_id else if (response.info) |info| info.run_id else "";
+                if (latest.len == 0) {
+                    log.err("DescribeActivityExecution for activity {s} returned no run ID, so deleting it cannot wait for its record to go", .{h.id});
+                    return error.InvalidResponse;
+                }
+                break :run_id latest;
+            };
             var status: ?Client.RpcStatus = null;
             _ = c.rpcWithStatus(wfs.DeleteActivityExecutionResponse, "DeleteActivityExecution", wfs.DeleteActivityExecutionRequest{
                 .namespace = c.namespace,
                 .activity_id = h.id,
-                .run_id = h.run_id,
+                .run_id = run_id,
             }, a, &status) catch |err| return h.controlError(err, status, "deleting");
+            try h.waitUntilDeleted(run_id);
+        }
+
+        /// Describes run `run_id` until the server reports it not found, with backoff.
+        fn waitUntilDeleted(h: *const Self, run_id: []const u8) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            // Doubling from 10 ms; the cap keeps a long wait under the namespace's rate limit.
+            var delay: Io.Duration = .fromMilliseconds(10);
+            const max_delay: Io.Duration = .fromMilliseconds(500);
+            while (true) {
+                _ = arena_state.reset(.retain_capacity);
+                var status: ?Client.RpcStatus = null;
+                _ = c.rpcWithStatus(wfs.DescribeActivityExecutionResponse, "DescribeActivityExecution", wfs.DescribeActivityExecutionRequest{
+                    .namespace = c.namespace,
+                    .activity_id = h.id,
+                    .run_id = run_id,
+                }, arena_state.allocator(), &status) catch |err| switch (err) {
+                    error.NotFound => return,
+                    error.AlreadyExists => return error.InvalidResponse,
+                    error.RpcFailed => {
+                        if (status) |s| {
+                            log.err("the server accepted deleting activity {s} run {s}, but checking that its record is gone failed: {s} (gRPC status {d})", .{ h.id, run_id, s.message, s.code });
+                        } else {
+                            log.err("the server accepted deleting activity {s} run {s}, but checking that its record is gone failed", .{ h.id, run_id });
+                        }
+                        return error.RpcFailed;
+                    },
+                    else => |e| return e,
+                };
+                try c.io.sleep(delay, .awake);
+                delay = .fromNanoseconds(@min(delay.nanoseconds * 2, max_delay.nanoseconds));
+            }
         }
     };
 }
