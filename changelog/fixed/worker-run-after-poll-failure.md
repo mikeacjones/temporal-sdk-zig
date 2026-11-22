@@ -1,0 +1,1 @@
+`Worker.run` called again after it returned `error.PollFailed` now polls and runs tasks; it used to shut down at once, as if `stop` had been called. A Worker that `stop` was called on stays stopped: a later `run` returns at once.
