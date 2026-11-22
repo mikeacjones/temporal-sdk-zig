@@ -407,3 +407,30 @@ test "a schedule description's id stays valid after its handle is freed" {
     try testing.expectEqualStrings("token-1", description.raw.conflict_token);
     try testing.expectEqual(@as(usize, 1), server.callCount());
 }
+
+// ---------------------------------------------------------------- reconnect
+
+test "reconnect of a connected client gives up within rpc_timeout and keeps its connection" {
+    // The failed reconnect is logged as a warning.
+    testing.log_level = .err;
+    // A listener that never accepts: the core's TLS handshake waits for a server hello that
+    // never comes.
+    const any: std.Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .rpc_timeout = .fromMilliseconds(100) });
+    defer c.close();
+    // Before `close`: resets the connection the abandoned attempt made, which then ends.
+    defer silent.deinit(testing.io);
+    var server: Server = .{ .answers = &.{} };
+    try connectToServer(&c, &server);
+    const before = c.shared.connection.?.ptr;
+
+    const start = std.Io.Clock.awake.now(testing.io);
+    try testing.expectError(error.ConnectFailed, c.reconnect(.{ .host_port = host_port, .tls = .{} }));
+    try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).nanoseconds < 10 * std.time.ns_per_s);
+    try testing.expectEqual(before, c.shared.connection.?.ptr);
+    try testing.expectEqual(@as(usize, 1), c.shared.abandoned_reconnects.items.len);
+    try testing.expectEqual(@as(u32, 0), c.shared.reconnecting);
+}

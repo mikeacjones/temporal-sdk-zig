@@ -316,7 +316,7 @@ fn rpcTimeoutMs(timeout: ?Duration, rejection: *Rejection) error{InvalidOptions}
     return std.math.cast(u32, durationMs(d)) orelse std.math.maxInt(u32);
 }
 
-/// Why `openConnection` connects, for its log message on failure.
+/// Why a client connects, for its log message on failure.
 const Attempt = enum {
     /// `Client.connect`, which then fails.
     connect,
@@ -341,21 +341,6 @@ fn startConnecting(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []
         // The headers were checked above; the core rejects what else contains a newline.
         if (err == error.InvalidOptions) logConnectFailure(attempt, options.host_port, "an option contains a newline");
         return err;
-    };
-}
-
-/// Connects as `startConnecting` does and waits, without cancellation, for the connection.
-/// Logs why on failure: as an error for `Client.connect`, or as a warning when the client
-/// still works after it (a first connection on use, or a `reconnect`).
-fn openConnection(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []const u8, options: ConnectionOptions, comptime attempt: Attempt) ConnectError!bridge.Connection {
-    const connecting = try startConnecting(gpa, io, runtime, identity, options, attempt);
-    // Done once the wait returns (nothing supersedes an attempt that isn't shared), so the
-    // last reference frees it here rather than orphaning it.
-    defer std.debug.assert(connecting.unref() != .orphaned);
-    connecting.waitUncancelable();
-    return connecting.take() orelse {
-        logConnectFailure(attempt, options.host_port, connecting.failureMessage());
-        return error.ConnectFailed;
     };
 }
 
@@ -399,7 +384,7 @@ fn logConnectFailure(comptime attempt: Attempt, host_port: []const u8, reason: [
     }
 }
 
-/// Rejects, as `openConnection` would, connection options that are wrong whatever the
+/// Rejects, as connecting would, connection options that are wrong whatever the
 /// server: everything but the TLS files' contents, which are read when the client connects.
 /// Fills `rejection` when it returns `error.InvalidOptions`.
 fn checkConnectionOptions(options: ConnectionOptions, rejection: *Rejection) error{InvalidOptions}!void {
@@ -566,8 +551,8 @@ pub const InitError = error{ OutOfMemory, InvalidOptions, RuntimeInitFailed };
 
 /// What `Client.connect`, `Client.ensureConnected` and `Client.reconnect` return:
 /// `InitError`, or `ConnectFailed` when the server couldn't be reached or refused the
-/// connection, or didn't answer within its deadline (`Options.rpc_timeout` for `connect` and
-/// for a first connection on use), logged with the reason.
+/// connection, or didn't answer within its deadline (`Options.rpc_timeout` for `connect`,
+/// `reconnect` and a first connection on use), logged with the reason.
 /// `InvalidOptions` also covers a TLS file that couldn't be read when connecting.
 /// `Canceled` comes only from a call that makes a first connection on use
 /// (`ensureConnected`, `currentConnection`) when its task is canceled. The attempt goes on
@@ -616,12 +601,22 @@ const Shared = struct {
     /// Locked exactly while `connecting` is set, by the call that sets it and unlocked by the
     /// call that clears it; nothing waits on it.
     connect_mutex: Io.Mutex = .init,
-    /// Cleared attempts whose callback hadn't run when they were cleared, each with a
-    /// reference, oldest abandoned first. Together with `connecting`, at most
-    /// `Client.max_connect_attempts_in_flight`: at that limit `firstConnection` rejoins the
-    /// first instead of starting another. `destroy` frees those called back since, and
-    /// leaves the runtime to the rest.
+    /// Cleared first connections whose callback hadn't run when they were cleared, each with
+    /// a reference, oldest abandoned first. Together with `connecting`, `reconnecting` and
+    /// `abandoned_reconnects`, at most `Client.max_connect_attempts_in_flight` (see
+    /// `attemptsInFlight`); its capacity is always at least that, so an attempt given up on
+    /// always fits. At that limit `firstConnection` rejoins the first instead of starting
+    /// another. `destroy` frees those called back since, and leaves the runtime to the rest.
     abandoned_attempts: std.ArrayList(*bridge.Connection.Connecting) = .empty,
+    /// The `reconnect` calls that have started an attempt and are still waiting for it;
+    /// they count toward `Client.max_connect_attempts_in_flight`.
+    reconnecting: u32 = 0,
+    /// `reconnect` attempts that timed out before the core called back, each with a
+    /// reference, kept apart from `abandoned_attempts` because they were made with the
+    /// reconnect's own options (another server, TLS, API key or headers): `firstConnection`
+    /// never rejoins one. They count toward `Client.max_connect_attempts_in_flight`, and the
+    /// capacity is always at least that. `destroy` treats them as `abandoned_attempts`.
+    abandoned_reconnects: std.ArrayList(*bridge.Connection.Connecting) = .empty,
     /// Connections `reconnect` replaced, freed by `destroy`: calls already sent on one may
     /// still be using it.
     retired_connections: std.ArrayList(bridge.Connection) = .empty,
@@ -631,6 +626,8 @@ const Shared = struct {
 
     /// Frees the connections, the runtime and `s`. Called by the last client to close.
     fn destroy(s: *Shared) void {
+        // `close` must not race a `reconnect`.
+        std.debug.assert(s.reconnecting == 0);
         const gpa = s.gpa;
         s.running_workers.deinit(gpa);
         for (s.retired_connections.items) |conn| conn.deinit();
@@ -648,10 +645,34 @@ const Shared = struct {
             if (p.unref() == .orphaned) in_flight = true;
         }
         s.abandoned_attempts.deinit(gpa);
+        for (s.abandoned_reconnects.items) |p| {
+            if (p.unref() == .orphaned) in_flight = true;
+        }
+        s.abandoned_reconnects.deinit(gpa);
         if (s.meter) |m| m.destroy();
         if (in_flight) s.runtime.abandon() else s.runtime.deinit();
         if (s.core_log_sink) |sink| gpa.destroy(sink);
         gpa.destroy(s);
+    }
+
+    /// Drops the abandoned attempts whose callback has run. Call with `connection_mutex` held.
+    fn dropCalledBack(s: *Shared) void {
+        inline for (.{ &s.abandoned_attempts, &s.abandoned_reconnects }) |list| {
+            var i: usize = 0;
+            while (i < list.items.len) {
+                const p = list.items[i];
+                if (p.calledBack()) {
+                    _ = p.unref();
+                    _ = list.orderedRemove(i);
+                } else i += 1;
+            }
+        }
+    }
+
+    /// The connection attempts in flight, which `Client.max_connect_attempts_in_flight`
+    /// bounds. Call with `connection_mutex` held.
+    fn attemptsInFlight(s: *const Shared) usize {
+        return s.abandoned_attempts.items.len + s.abandoned_reconnects.items.len + @intFromBool(s.connecting != null) + s.reconnecting;
     }
 };
 
@@ -1083,8 +1104,8 @@ pub const Client = struct {
     /// handlers `metrics` returned on the closed one; sdk-core's logs keep reaching the
     /// first client's `Options.logger`.
     ///
-    /// A first connection attempt that every call gave up on (see `init`) may
-    /// still be running in sdk-core, which has no deadline of its own for it (a server that
+    /// A first connection attempt that every call gave up on (see `init`), or one a
+    /// `reconnect` gave up on at its deadline, may still be running in sdk-core, which has no deadline of its own for it (a server that
     /// never answers a TLS handshake keeps it running for good). sdk-core's task uses the
     /// client's runtime until the attempt ends, so `close` then leaves the runtime to it
     /// instead of freeing it: the runtime, its threads, and the attempt stay allocated for
@@ -1142,9 +1163,9 @@ pub const Client = struct {
     fn firstConnection(c: *Client, comptime attempt: Attempt, stop: ?*const std.atomic.Value(bool)) (ConnectError || error{Stopped})!bridge.Connection {
         // sdk-core's connect has no deadline of its own: a first connection made by a call
         // gets the call's, counted from now, and so does `Client.connect`.
-        const deadline: ?Io.Clock.Timestamp = switch (attempt) {
-            .first_use, .connect => .fromNow(c.io, .{ .raw = .fromMilliseconds(if (c.callDeadlineMs() > 0) c.callDeadlineMs() else default_rpc_timeout_ms), .clock = .awake }),
-            .reconnect => null,
+        const deadline: Io.Clock.Timestamp = switch (attempt) {
+            .first_use, .connect => c.connectDeadline(),
+            .reconnect => unreachable,
         };
         const connecting = blk: {
             c.shared.connection_mutex.lockUncancelable(c.io);
@@ -1154,16 +1175,15 @@ pub const Client = struct {
             if (c.shared.connecting == null) {
                 // Make room to keep the attempt for `close` if it is cleared before the core
                 // calls back, dropping those whose callback has run.
-                var i: usize = 0;
-                while (i < c.shared.abandoned_attempts.items.len) {
-                    const p = c.shared.abandoned_attempts.items[i];
-                    if (p.calledBack()) {
-                        _ = p.unref();
-                        _ = c.shared.abandoned_attempts.orderedRemove(i);
-                    } else i += 1;
-                }
-                try c.shared.abandoned_attempts.ensureUnusedCapacity(c.gpa, 1);
-                if (c.shared.abandoned_attempts.items.len >= max_connect_attempts_in_flight) {
+                c.shared.dropCalledBack();
+                try c.shared.abandoned_attempts.ensureTotalCapacity(c.gpa, max_connect_attempts_in_flight);
+                if (c.shared.attemptsInFlight() >= max_connect_attempts_in_flight) {
+                    // Every slot is a `reconnect`'s, made with its own options: nothing this
+                    // client may rejoin.
+                    if (c.shared.abandoned_attempts.items.len == 0) {
+                        logConnectFailure(attempt, c.shared.pending_connection.?.options.host_port, attempts_in_flight_reason);
+                        return error.ConnectFailed;
+                    }
                     // At the limit: wait on the attempt abandoned longest ago instead of
                     // starting another. Its reference moves from the list to `connecting`,
                     // and the slot it frees keeps room for it if it is abandoned again.
@@ -1258,10 +1278,75 @@ pub const Client = struct {
     /// sdk-core's deadline for a call, which `Options.rpc_timeout` replaces.
     const default_rpc_timeout_ms = 30_000;
 
-    /// The most connection attempts a client keeps in flight: `connecting` and those in
-    /// `Shared.abandoned_attempts`. sdk-core's attempts can't be canceled, so this bounds the
+    /// The most connection attempts a client keeps in flight: `Shared.connecting`, those in
+    /// `Shared.abandoned_attempts` and `Shared.abandoned_reconnects`, and the `reconnect`
+    /// calls still waiting (`Shared.reconnecting`). sdk-core's attempts can't be canceled, so this bounds the
     /// sockets and core tasks a server that never answers holds.
     const max_connect_attempts_in_flight = 4;
+
+    /// Why a connection attempt fails at once at `max_connect_attempts_in_flight`.
+    const attempts_in_flight_reason = "Client.max_connect_attempts_in_flight earlier connection attempts the server hasn't answered are still in flight, and sdk-core can't cancel them";
+
+    /// When a connection attempt started now gives up: `Options.rpc_timeout` from now, or
+    /// sdk-core's 30 s without one, since sdk-core's connect has no deadline of its own.
+    fn connectDeadline(c: *const Client) Io.Clock.Timestamp {
+        return .fromNow(c.io, .{ .raw = .fromMilliseconds(if (c.callDeadlineMs() > 0) c.callDeadlineMs() else default_rpc_timeout_ms), .clock = .awake });
+    }
+
+    /// Connects with `options` for `reconnect`, waiting without cancellation until
+    /// `connectDeadline`. Logs why on failure, as a warning. An attempt the server hasn't
+    /// answered by then goes to `Shared.abandoned_reconnects`, which `close` leaves the runtime
+    /// to; with `max_connect_attempts_in_flight` attempts already in flight it fails at once
+    /// (`error.InvalidOptions` instead for options it can reject without connecting).
+    fn reconnectAttempt(c: *Client, options: ConnectionOptions, comptime attempt: Attempt) ConnectError!bridge.Connection {
+        const deadline = c.connectDeadline();
+        const connecting = blk: {
+            c.shared.connection_mutex.lockUncancelable(c.io);
+            defer c.shared.connection_mutex.unlock(c.io);
+            c.shared.dropCalledBack();
+            // Room to keep the attempt if the server doesn't answer in time.
+            try c.shared.abandoned_reconnects.ensureTotalCapacity(c.gpa, max_connect_attempts_in_flight);
+            if (c.shared.attemptsInFlight() >= max_connect_attempts_in_flight) {
+                // Wrong options are still reported as such.
+                var rejection: Rejection = .{};
+                checkConnectionOptions(options, &rejection) catch |err| {
+                    logConnectFailure(attempt, options.host_port, rejection.message);
+                    return err;
+                };
+                logConnectFailure(attempt, options.host_port, attempts_in_flight_reason);
+                return error.ConnectFailed;
+            }
+            // Starting doesn't wait on the network: the core connects on its own threads.
+            const connecting = try startConnecting(c.gpa, c.io, c.shared.runtime, c.identity, options, attempt);
+            c.shared.reconnecting += 1;
+            break :blk connecting;
+        };
+        {
+            const prev = c.io.swapCancelProtection(.blocked);
+            defer _ = c.io.swapCancelProtection(prev);
+            // Nothing supersedes an attempt that isn't shared: it returns once done or timed out.
+            connecting.wait(deadline, null) catch |err| switch (err) {
+                error.Canceled, error.Stopped => unreachable,
+                error.Timeout => {},
+            };
+        }
+        c.shared.connection_mutex.lockUncancelable(c.io);
+        defer c.shared.connection_mutex.unlock(c.io);
+        c.shared.reconnecting -= 1;
+        if (!connecting.isDone()) {
+            // The core's attempt goes on and holds the runtime until it calls back: keep its
+            // reference for `close`. Room was made for it before it started.
+            c.shared.abandoned_reconnects.appendAssumeCapacity(connecting);
+            logConnectFailure(attempt, options.host_port, "the server didn't answer within Options.rpc_timeout (30 s without one)");
+            return error.ConnectFailed;
+        }
+        // Done, so the last reference frees it here rather than orphaning it.
+        defer std.debug.assert(connecting.unref() != .orphaned);
+        return connecting.take() orelse {
+            logConnectFailure(attempt, options.host_port, connecting.failureMessage());
+            return error.ConnectFailed;
+        };
+    }
 
     fn connectionIfAny(c: *Client) ?bridge.Connection {
         c.shared.connection_mutex.lockUncancelable(c.io);
@@ -1333,13 +1418,18 @@ pub const Client = struct {
     /// the first connection with `options` in place of those the client was created with;
     /// if that fails (logged as a warning), the client stays unconnected and keeps its own
     /// options for its next call. Calls waiting for a first connection in progress then get
-    /// this one. Like a reconnect, it waits without a deadline or cancellation, but other
-    /// calls don't wait for it. Thread-safe.
+    /// this one. It waits for the new connection until `Options.rpc_timeout` (30 s without
+    /// one), without cancellation: a server that hasn't answered by then fails it with
+    /// `error.ConnectFailed`, logged as a warning, and the client keeps its current connection
+    /// (or stays unconnected). sdk-core may still be making that attempt: it counts against
+    /// `max_connect_attempts_in_flight` (4), and the runtime is left to it as `close`
+    /// describes. With that many attempts already in flight, it fails at once with
+    /// `error.ConnectFailed`, logged. Other calls don't wait for it. Thread-safe.
     pub fn reconnect(c: *Client, options: ConnectionOptions) ConnectError!void {
         const next = if (c.connectionIfAny() == null)
-            try openConnection(c.gpa, c.io, c.shared.runtime, c.identity, options, .first_use)
+            try c.reconnectAttempt(options, .first_use)
         else
-            try openConnection(c.gpa, c.io, c.shared.runtime, c.identity, options, .reconnect);
+            try c.reconnectAttempt(options, .reconnect);
         c.shared.connection_mutex.lockUncancelable(c.io);
         defer c.shared.connection_mutex.unlock(c.io);
         if (c.shared.connection == null) {
@@ -6769,6 +6859,209 @@ test "connect gives up within rpc_timeout on a server that never answers the TLS
     const line = logged.written();
     try testing.expect(std.mem.indexOf(u8, line, "didn't answer within Options.rpc_timeout") != null);
     try testing.expect(std.mem.indexOf(u8, line, host_port) != null);
+}
+
+test "reconnect gives up within rpc_timeout on a server that never answers the TLS handshake" {
+    // A listener that never accepts: the kernel completes the TCP handshake, and the core's
+    // TLS handshake then waits for a server hello that never comes.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port_for_tests, .core_log_level = null, .rpc_timeout = .fromMilliseconds(100) });
+    defer c.close();
+    // Before `close`: resets the connection the abandoned attempt made, which then ends.
+    defer silent.deinit(testing.io);
+
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_connect_failure_log = &logged.writer;
+    defer test_connect_failure_log = null;
+
+    const start = Io.Clock.awake.now(testing.io);
+    try testing.expectError(error.ConnectFailed, c.reconnect(.{ .host_port = host_port, .tls = .{} }));
+    const waited = start.durationTo(Io.Clock.awake.now(testing.io));
+    try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
+    const line = logged.written();
+    try testing.expect(std.mem.indexOf(u8, line, "didn't answer within Options.rpc_timeout") != null);
+    try testing.expect(std.mem.indexOf(u8, line, host_port) != null);
+    // The client stays unconnected with its own options, and keeps the attempt for `close`.
+    try testing.expect(c.shared.connection == null);
+    try testing.expectEqualStrings(closed_port_for_tests, c.shared.pending_connection.?.options.host_port);
+    try testing.expectEqual(@as(usize, 1), c.shared.abandoned_reconnects.items.len);
+    try testing.expectEqual(@as(usize, 0), c.shared.abandoned_attempts.items.len);
+    try testing.expectEqual(@as(u32, 0), c.shared.reconnecting);
+}
+
+/// An address nothing listens on, for a client whose own connection options aren't used.
+const closed_port_for_tests = "127.0.0.1:1";
+
+test "repeated reconnects keep at most max_connect_attempts_in_flight connection attempts" {
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port_for_tests, .core_log_level = null, .rpc_timeout = .fromMilliseconds(20) });
+    defer c.close();
+    // Before `close`: closing the listener resets the connections it never accepted, so the
+    // core's attempts end soon.
+    defer silent.deinit(testing.io);
+
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_connect_failure_log = &logged.writer;
+    defer test_connect_failure_log = null;
+
+    for (0..3 * Client.max_connect_attempts_in_flight) |_| {
+        logged.clearRetainingCapacity();
+        try testing.expectError(error.ConnectFailed, c.reconnect(.{ .host_port = host_port, .tls = .{} }));
+        try testing.expect(c.shared.attemptsInFlight() <= Client.max_connect_attempts_in_flight);
+    }
+    try testing.expectEqual(@as(u32, 0), c.shared.reconnecting);
+    try testing.expectEqual(@as(usize, Client.max_connect_attempts_in_flight), c.shared.abandoned_reconnects.items.len);
+    try testing.expect(std.mem.indexOf(u8, logged.written(), "still in flight") != null);
+
+    // Options wrong whatever the server are still reported as such at the limit.
+    logged.clearRetainingCapacity();
+    try testing.expectError(error.InvalidOptions, c.reconnect(.{ .host_port = host_port, .headers = &.{.{ .key = "bad header", .value = "v" }} }));
+    try testing.expect(std.mem.indexOf(u8, logged.written(), "still in flight") == null);
+
+    // A first connection on use, with every slot taken by a reconnect's attempt made with
+    // other options, fails at once instead of rejoining one.
+    logged.clearRetainingCapacity();
+    testing.log_level = .err;
+    try testing.expectError(error.ConnectFailed, c.ensureConnected());
+    try testing.expect(std.mem.indexOf(u8, logged.written(), "still in flight") != null);
+    try testing.expect(c.shared.connecting == null);
+    try testing.expect(c.shared.attemptsInFlight() <= Client.max_connect_attempts_in_flight);
+}
+
+test "a first connection on use fails at once while reconnects hold every attempt in flight" {
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .tls = .{}, .rpc_timeout = .fromSeconds(60) });
+    defer c.close();
+    defer silent.deinit(testing.io);
+
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_connect_failure_log = &logged.writer;
+    defer test_connect_failure_log = null;
+
+    // As if every slot were a `reconnect` still waiting.
+    c.shared.connection_mutex.lockUncancelable(testing.io);
+    c.shared.reconnecting = Client.max_connect_attempts_in_flight;
+    c.shared.connection_mutex.unlock(testing.io);
+    defer c.shared.reconnecting = 0;
+
+    const start = Io.Clock.awake.now(testing.io);
+    try testing.expectError(error.ConnectFailed, c.ensureConnected());
+    try testing.expect(start.durationTo(Io.Clock.awake.now(testing.io)).nanoseconds < 10 * std.time.ns_per_s);
+    try testing.expect(std.mem.indexOf(u8, logged.written(), "still in flight") != null);
+    try testing.expect(c.shared.connecting == null);
+    try testing.expectEqual(@as(usize, 0), c.shared.abandoned_attempts.items.len);
+    try testing.expectError(error.ConnectFailed, c.reconnect(.{ .host_port = host_port, .tls = .{} }));
+}
+
+/// Answers every gRPC call on one plaintext HTTP/2 connection with an empty message and
+/// status OK, enough for sdk-core's connect (GetSystemInfo) to succeed. Ends when the
+/// connection closes or is shut down.
+const H2AnswerTest = struct {
+    fn serve(stream: Io.net.Stream) void {
+        serveOrFail(stream) catch {};
+    }
+
+    fn serveOrFail(stream: Io.net.Stream) !void {
+        var rbuf: [16 * 1024]u8 = undefined;
+        var wbuf: [1024]u8 = undefined;
+        var r = stream.reader(testing.io, &rbuf);
+        var w = stream.writer(testing.io, &wbuf);
+        const in = &r.interface;
+        const out = &w.interface;
+        _ = try in.take(24); // The client preface.
+        try frame(out, 4, 0, 0, "");
+        try out.flush();
+        while (true) {
+            const head = try in.takeArray(9);
+            const len = (@as(usize, head[0]) << 16) | (@as(usize, head[1]) << 8) | head[2];
+            const kind = head[3];
+            const flags = head[4];
+            const id = std.mem.readInt(u32, head[5..9], .big) & 0x7fff_ffff;
+            const payload = try in.take(len);
+            switch (kind) {
+                4 => if (flags & 1 == 0) try frame(out, 4, 1, 0, ""),
+                6 => if (flags & 1 == 0) try frame(out, 6, 1, 0, payload),
+                7 => return,
+                0, 1 => if (flags & 1 != 0 and id != 0) {
+                    // :status 200, content-type application/grpc.
+                    try frame(out, 1, 4, id, "\x88\x0f\x10\x10application/grpc");
+                    try frame(out, 0, 0, id, "\x00\x00\x00\x00\x00");
+                    try frame(out, 1, 5, id, "\x00\x0bgrpc-status\x010");
+                },
+                else => {},
+            }
+            try out.flush();
+        }
+    }
+
+    fn frame(out: *Io.Writer, kind: u8, flags: u8, id: u32, payload: []const u8) !void {
+        var head: [9]u8 = undefined;
+        head[0] = @intCast(payload.len >> 16);
+        head[1] = @intCast((payload.len >> 8) & 0xff);
+        head[2] = @intCast(payload.len & 0xff);
+        head[3] = kind;
+        head[4] = flags;
+        std.mem.writeInt(u32, head[5..9], id, .big);
+        try out.writeAll(&head);
+        try out.writeAll(payload);
+    }
+};
+
+test "a first connection on use doesn't take over an attempt a timed-out reconnect made to another server" {
+    // The failed calls are logged as warnings.
+    testing.log_level = .err;
+    // Server B: a listener that doesn't accept until the reconnects to it have timed out.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var server_b = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    const host_port_b = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{server_b.socket.address.getPort()});
+    // The client's own server, A, refuses every connection.
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port_for_tests, .core_log_level = null, .rpc_timeout = .fromMilliseconds(20) });
+    defer c.close();
+
+    var streams: [Client.max_connect_attempts_in_flight]Io.net.Stream = undefined;
+    var threads: [Client.max_connect_attempts_in_flight]std.Thread = undefined;
+    var accepted: usize = 0;
+    defer {
+        for (streams[0..accepted]) |s| s.shutdown(testing.io, .both) catch {};
+        for (threads[0..accepted]) |t| t.join();
+        for (streams[0..accepted]) |s| s.close(testing.io);
+        server_b.deinit(testing.io);
+    }
+
+    // The application tries to move to B, which is slow to answer: every reconnect gives up,
+    // and the client stays unconnected with its own options, A.
+    for (0..Client.max_connect_attempts_in_flight) |_|
+        try testing.expectError(error.ConnectFailed, c.reconnect(.{ .host_port = host_port_b }));
+    try testing.expect(c.shared.connection == null);
+    try testing.expectEqualStrings(closed_port_for_tests, c.shared.pending_connection.?.options.host_port);
+
+    // B starts answering the connections those reconnects left behind.
+    while (accepted < streams.len) : (accepted += 1) {
+        streams[accepted] = try server_b.accept(testing.io);
+        threads[accepted] = std.Thread.spawn(.{}, H2AnswerTest.serve, .{streams[accepted]}) catch |err| {
+            streams[accepted].close(testing.io);
+            return err;
+        };
+    }
+
+    // The client's next call connects to its own server, A, which refuses it. It must not
+    // end up connected to B, a server the application was told it failed to reach.
+    c.rpc_timeout_ms = 10_000;
+    try testing.expectError(error.ConnectFailed, c.ensureConnected());
+    try testing.expect(c.shared.connection == null);
 }
 
 test "a client from init keeps at most max_connect_attempts_in_flight connection attempts however many calls give up" {
