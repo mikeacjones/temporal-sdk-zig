@@ -135,8 +135,10 @@ pub fn shutdown(s: *EphemeralServer, io: Io, failure: ?*?[]u8) error{ OutOfMemor
 }
 
 /// Frees the server without stopping it first. Prefer `shutdown`.
+/// The server is freed through `Runtime.release`, which keeps it until the runtime is freed if
+/// the runtime forwards logs.
 pub fn deinit(s: *EphemeralServer) void {
-    c.temporal_core_ephemeral_server_free(s.ptr);
+    s.runtime.release(.{ .ephemeral_server = s.ptr });
     s.gpa.free(s.target);
     s.* = undefined;
 }
@@ -205,11 +207,12 @@ const StartResult = struct {
     server: ?*c.TemporalCoreEphemeralServer,
     target: ?bytes.Owned,
     fail: ?bytes.Owned,
+    runtime: Runtime,
 
     fn free(r: StartResult) void {
         if (r.target) |t| t.deinit();
         if (r.fail) |f| f.deinit();
-        if (r.server) |s| c.temporal_core_ephemeral_server_free(s);
+        if (r.server) |s| r.runtime.release(.{ .ephemeral_server = s });
     }
 };
 
@@ -223,7 +226,7 @@ fn onStart(
     const done: *Completion(StartResult) = @ptrCast(@alignCast(user_data.?));
     // The arrays come from the runtime's pool; freeing without the runtime pointer is allowed
     // and only skips recycling the buffer.
-    done.complete(.{ .server = server, .target = bytes.Owned.take(null, target), .fail = bytes.Owned.take(null, fail) });
+    done.complete(.{ .server = server, .target = bytes.Owned.take(null, target), .fail = bytes.Owned.take(null, fail), .runtime = done.result.runtime });
 }
 
 fn onShutdown(user_data: ?*anyopaque, fail: ?*const c.TemporalCoreByteArray) callconv(.c) void {
@@ -244,7 +247,7 @@ fn finishStart(gpa: Allocator, runtime: Runtime, result: StartResult, failure: ?
         return error.StartFailed;
     };
     const target = gpa.dupe(u8, if (result.target) |t| t.bytes() else "") catch {
-        c.temporal_core_ephemeral_server_free(server);
+        runtime.release(.{ .ephemeral_server = server });
         return error.OutOfMemory;
     };
     return .{ .ptr = server, .runtime = runtime, .target = target, .gpa = gpa };
@@ -281,6 +284,8 @@ const Start = union(enum) {
 /// Makes one start through the core and waits for its callback.
 fn startOnce(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput, start: Start) error{OutOfMemory}!StartResult {
     const done = try Completion(StartResult).create(gpa, io, StartResult.free);
+    // `onStart` carries the runtime over into its result, for `StartResult.free`.
+    done.result = .{ .server = null, .target = null, .fail = null, .runtime = runtime };
     const redirect: OutputRedirect = .begin(output);
     defer redirect.end();
     handToCore(done);

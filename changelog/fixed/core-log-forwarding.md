@@ -1,0 +1,1 @@
+sdk-core's logs now keep reaching `Options.logger` after a `worker.Worker` built on the client, or a first connection nobody took, is freed; freeing either turned the client's core log forwarding off for good. Those core objects are now kept until the last `Client.close` of the clients sharing the runtime frees it.

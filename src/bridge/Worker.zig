@@ -123,7 +123,7 @@ pub fn init(gpa: Allocator, connection: Connection, options: Options, failure: ?
     const result = c.temporal_core_worker_new(connection.ptr, &core);
     if (bytes.Owned.take(connection.runtime.ptr, result.fail)) |fail| {
         defer fail.deinit();
-        if (result.worker) |w| c.temporal_core_worker_free(w);
+        if (result.worker) |w| connection.runtime.release(.{ .worker = w });
         if (failure) |f| f.* = fail.dupe(gpa) catch null;
         return error.WorkerInitFailed;
     }
@@ -161,7 +161,7 @@ pub fn initReplayer(gpa: Allocator, runtime: Runtime, options: Options, failure:
     const result = c.temporal_core_worker_replayer_new(runtime.ptr, &core);
     if (bytes.Owned.take(runtime.ptr, result.fail)) |fail| {
         defer fail.deinit();
-        if (result.worker) |w| c.temporal_core_worker_free(w);
+        if (result.worker) |w| runtime.release(.{ .worker = w });
         if (result.worker_replay_pusher) |p| c.temporal_core_worker_replay_pusher_free(p);
         if (failure) |f| f.* = fail.dupe(gpa) catch null;
         return error.WorkerInitFailed;
@@ -229,9 +229,11 @@ fn coreOptions(arena: Allocator, options: Options) error{OutOfMemory}!c.Temporal
     return core;
 }
 
-/// Frees the worker. Call `finalizeShutdown` first if it was used.
+/// Frees the worker through `Runtime.release`, which keeps it until the runtime is freed if
+/// the runtime forwards logs. Call `finalizeShutdown` first if it was used: a kept worker
+/// that wasn't shut down stays registered with its client.
 pub fn deinit(w: Worker) void {
-    c.temporal_core_worker_free(w.ptr);
+    w.runtime.release(.{ .worker = w.ptr });
 }
 
 /// Checks the namespace and task queue with the server. On `error.ValidationFailed`,

@@ -661,15 +661,19 @@ pub const Worker = struct {
                 },
             };
         };
+        // Set once the finalizing below has run. A return before it frees cores that never
+        // polled: they are shut down first, because `bridge.Runtime.release` may keep a freed
+        // core worker, and one not shut down stays registered with the client.
+        var finalized = false;
         const core = try w.createCore(created_on, core_options, &message);
-        defer core.deinit();
+        defer if (finalized) core.deinit() else w.freeUnpolledCore(core, w.task_queue, core_options.task_types);
 
         // Polled even without registered activities: a workflow's side effects run as local
         // activities.
         var activity_cores: [3]ActivityCore = undefined;
         activity_cores[0] = .{ .core = core, .task_queue = w.task_queue };
         var core_count: usize = 1;
-        defer for (activity_cores[1..core_count]) |c| c.core.deinit();
+        defer for (activity_cores[1..core_count]) |c| if (finalized) c.core.deinit() else w.freeUnpolledCore(c.core, c.task_queue, session_task_types);
         var host: ?SessionHost = null;
         defer if (host) |*h| h.deinit();
         if (w.options.sessions) |o| {
@@ -768,6 +772,7 @@ pub const Worker = struct {
                 message = null;
             };
         }
+        finalized = true;
         const poll_failed = poll_failed: {
             w.stop_mutex.lockUncancelable(w.io);
             defer w.stop_mutex.unlock(w.io);
@@ -948,6 +953,9 @@ pub const Worker = struct {
     /// The core options of a session queue: activities only, unversioned so a rollout can't
     /// strand a host's sessions, with `slots` activity slots. The heartbeat throttling of the
     /// worker's own queue applies; its per-second limits don't.
+    /// A session queue's core polls only remote activities.
+    const session_task_types: bridge.Worker.Options.TaskTypes = .{ .workflows = false, .remote_activities = true, .local_activities = false, .nexus = false };
+
     fn sessionCoreOptions(main: bridge.Worker.Options, task_queue: []const u8, slots: usize) bridge.Worker.Options {
         return .{
             .namespace = main.namespace,
@@ -955,7 +963,7 @@ pub const Worker = struct {
             .identity_override = main.identity_override,
             .max_cached_workflows = main.max_cached_workflows,
             .tuner = .{ .activity = .{ .fixed = slots } },
-            .task_types = .{ .workflows = false, .remote_activities = true, .local_activities = false, .nexus = false },
+            .task_types = session_task_types,
             .default_heartbeat_throttle_interval_ms = main.default_heartbeat_throttle_interval_ms,
             .max_heartbeat_throttle_interval_ms = main.max_heartbeat_throttle_interval_ms,
             .activity_task_pollers = main.activity_task_pollers,
@@ -975,12 +983,33 @@ pub const Worker = struct {
             log.err("creating the worker for task queue {s} failed: {s}", .{ options.task_queue, message.* orelse @errorName(err) });
             return err;
         };
-        errdefer core.deinit();
+        errdefer w.freeUnpolledCore(core, options.task_queue, options.task_types);
         core.validate(w.gpa, w.io, message) catch |err| {
             log.err("worker validation for task queue {s} failed: {s}", .{ options.task_queue, message.* orelse @errorName(err) });
             return err;
         };
         return core;
+    }
+
+    /// Shuts down and frees a core worker nothing polls, nor will. As for any core worker,
+    /// each task type it polls (`task_types`) is polled until it returns null before
+    /// finalizing: a core polling activities otherwise waits in `finalizeShutdown` forever
+    /// for its activity poller to see the shutdown.
+    fn freeUnpolledCore(w: *Worker, core: bridge.Worker, task_queue: []const u8, task_types: bridge.Worker.Options.TaskTypes) void {
+        core.initiateShutdown();
+        var message: ?[]u8 = null;
+        defer if (message) |m| w.gpa.free(m);
+        // Nothing was polled, so no task is outstanding; a poll returns null, or fails.
+        const polls = [_]struct { bool, *const fn (bridge.Worker, Allocator, Io, ?*?[]u8) bridge.Worker.PollError!?bridge.Worker.Polled }{
+            .{ task_types.workflows, bridge.Worker.pollWorkflowActivation },
+            .{ task_types.local_activities or task_types.remote_activities, bridge.Worker.pollActivityTask },
+            .{ task_types.nexus, bridge.Worker.pollNexusTask },
+        };
+        for (polls) |p| if (p[0]) while (p[1](core, w.gpa, w.io, null) catch null) |polled| polled.deinit();
+        core.finalizeShutdown(w.gpa, w.io, &message) catch |err| {
+            log.warn("shutting down the unstarted worker for task queue {s} failed: {s}", .{ task_queue, message orelse @errorName(err) });
+        };
+        core.deinit();
     }
 
     /// The core's versioning strategy for `options`, or `error.InvalidOptions` (logged) for
@@ -3989,6 +4018,54 @@ test "run shuts down the started workflow loop when the activity loop can't star
     try testing.expectEqual(0, ScarceConcurrency.allowed.load(.acquire));
 }
 
+// No loop polls the core worker when the first loop can't start, so `run` frees a core worker
+// that was created and validated but never polled. One that polls activities must not wait,
+// while it is freed, for pollers that never ran: `run` returns the error. A worker whose
+// validation fails (a namespace that doesn't exist) is freed the same way. Freeing it must
+// not end the client's core log forwarding either: sdk-core turns forwarding off for the
+// whole runtime when any core worker's runtime clone is dropped.
+test "run returns when the Io of a worker with activities can't start its first poll loop" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client_sink: RecordingSink = .{};
+    defer client_sink.deinit();
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{
+        .host_port = server.target,
+        .logger = client_sink.sink(),
+        .core_log_level = .debug,
+    });
+    defer client.close();
+
+    {
+        var w = try Worker.init(testing.allocator, ScarceConcurrency.io(testing.io, 0), &client, "no-concurrency", .{});
+        defer w.deinit();
+        try w.registerWorkflow(HelloTest.Hello);
+        try w.registerActivity(HelloTest.Greet);
+        try testing.expectError(error.ConcurrencyUnavailable, w.run());
+    }
+
+    // The unpolled core worker is freed: a core record while another worker runs shows
+    // forwarding went on.
+    const seen = client_sink.coreRecords();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var w = try Worker.init(testing.allocator, testing.io, &client, "after-no-concurrency", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    var run = try client.executeWorkflow(HelloTest.Hello, .{ .id = "after-no-concurrency", .task_queue = "after-no-concurrency" }, .{"Temporal"});
+    defer run.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try run.get(arena.allocator()));
+    try client_sink.waitForCoreRecordsPast(seen, .fromSeconds(30));
+}
+
 const CancelTest = struct {
     const Env = @import("testing.zig").WorkflowEnvironment;
     const EventType = proto.temporal.api.enums.v1.EventType;
@@ -4854,6 +4931,7 @@ const RecordingSink = struct {
         defer r.mutex.unlock(testing.io);
         for (fields) |f| if (std.mem.eql(u8, f.key, "target")) {
             r.core_records += 1;
+            r.changed.broadcast(testing.io);
             return;
         };
         const a = r.arena.allocator();
@@ -4905,6 +4983,14 @@ const RecordingSink = struct {
         r.mutex.lockUncancelable(testing.io);
         defer r.mutex.unlock(testing.io);
         return r.core_records;
+    }
+
+    /// Waits up to `timeout` for more than `seen` core records.
+    fn waitForCoreRecordsPast(r: *RecordingSink, seen: usize, timeout: Io.Duration) !void {
+        const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = timeout, .clock = .awake });
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        while (r.core_records <= seen) try r.changed.waitTimeout(testing.io, &r.mutex, .{ .deadline = deadline });
     }
 };
 
