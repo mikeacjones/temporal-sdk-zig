@@ -596,8 +596,6 @@ test "bucket overrides are encoded as the core expects" {
     try testing.expectEqualStrings("a\n1,2.5\nb\n100", bytes.slice(r));
 }
 
-fn ignoreLog(_: *anyopaque, _: *const LogRecord) void {}
-
 test "release keeps a forwarding runtime's core objects until deinit, and frees a quiet runtime's at once" {
     const Worker = @import("Worker.zig");
     const worker_options: Worker.Options = .{
