@@ -45,8 +45,15 @@ pub const Options = struct {
     identity: []const u8 = "",
     api_key: []const u8 = "",
     tls: ?Tls = null,
-    /// gRPC headers sent with every call. A view from `Client.withRpcOptions` sends its own
-    /// `RpcOptions.metadata` in place of these for the same name.
+    /// gRPC headers sent with every call. Names are gRPC header names (letters, digits and the
+    /// symbols of an HTTP/2 header name), which gRPC sends in lower case. A name ending in
+    /// "-bin" (any case) is a binary header: its value may be any bytes, and gRPC sends it
+    /// base64-encoded. Any other is an ASCII header, whose value may hold only visible ASCII,
+    /// space and tab. `connect`, `init` and `reconnect` return `error.InvalidOptions`, logged
+    /// with the header's name, for anything else, and for two names that differ only in case;
+    /// a name repeated exactly sends its last value. Headers from `loadOptions`
+    /// (`TEMPORAL_GRPC_META_*`, a profile's `grpc_meta`) follow the same rules. A view from `Client.withRpcOptions`
+    /// sends its own `RpcOptions.metadata` in place of these for the same name.
     headers: []const bridge.bytes.MetadataEntry = &.{},
     /// Payload codecs, such as `converter.ZlibCodec` or encryption, applied in order to every
     /// payload this client sends and in reverse to every payload it receives (results,
@@ -353,7 +360,7 @@ fn openConnection(gpa: Allocator, io: Io, runtime: bridge.Runtime, identity: []c
 
 /// The bridge's options for `options`, with the TLS files read into `arena`.
 fn connectionBridgeOptions(arena: Allocator, io: Io, identity: []const u8, options: ConnectionOptions, rejection: *Rejection) error{ OutOfMemory, InvalidOptions }!bridge.Connection.Options {
-    for (options.headers) |h| try headerRejection(h, rejection);
+    try headersRejection(options.headers, rejection);
     var tls: ?bridge.Connection.Options.Tls = null;
     if (options.tls) |t| tls = .{
         .server_root_ca_cert = try tlsFile(arena, io, t.server_root_ca_cert, t.server_root_ca_cert_path, "server_root_ca_cert", rejection),
@@ -363,7 +370,11 @@ fn connectionBridgeOptions(arena: Allocator, io: Io, identity: []const u8, optio
     };
     const scheme = if (options.tls != null) "https" else "http";
     const url = try std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, options.host_port });
-    return bridgeConnectionOptions(url, identity, options, tls, rejection);
+    var bridge_options = try bridgeConnectionOptions(url, identity, options, tls, rejection);
+    const split: SplitHeaders = try .init(arena, options.headers);
+    bridge_options.metadata = split.ascii;
+    bridge_options.binary_metadata = split.binary;
+    return bridge_options;
 }
 
 fn logConnectFailure(comptime attempt: Attempt, host_port: []const u8, reason: []const u8) void {
@@ -383,7 +394,7 @@ fn checkConnectionOptions(options: ConnectionOptions, rejection: *Rejection) err
         if (path.len > 0 and @field(t, field).len > 0)
             return rejection.reject("set Options.tls." ++ field ++ " or Options.tls." ++ field ++ "_path ({s}), not both", .{path});
     };
-    for (options.headers) |h| try headerRejection(h, rejection);
+    try headersRejection(options.headers, rejection);
     _ = try bridgeConnectionOptions("", "", options, null, rejection);
 }
 
@@ -1176,13 +1187,9 @@ pub const Client = struct {
         if (c.shared.pending_updates != updates) {
             const latest = c.shared.pending_connection.?.options;
             conn.setApiKey(latest.api_key);
-            conn.setMetadata(c.gpa, latest.headers) catch |err| {
+            setConnectionHeaders(conn, c.gpa, latest.headers) catch |err| {
                 conn.deinit();
-                return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    // The headers were checked when they were set.
-                    error.NewlineInKey, error.NewlineInValue => unreachable,
-                };
+                return err;
             };
         }
         c.connected(conn);
@@ -1233,21 +1240,17 @@ pub const Client = struct {
 
     /// Replaces the gRPC headers (`Options.headers`) sent with every call from now on, by
     /// this client and every worker on it, and by the clients sharing its connection (see
-    /// `forNamespace`) and their workers. Returns `error.InvalidOptions` (logged) for a key
-    /// that isn't a valid header name or ends in "-bin" (binary headers aren't supported), or
-    /// a value with characters other than visible ASCII, space and tab; the headers are then
-    /// unchanged. On a client that hasn't connected yet (see `init`), they are the headers
+    /// `forNamespace`) and their workers: the ASCII and the binary ones (names ending in
+    /// "-bin") alike. Returns `error.InvalidOptions` (logged) for a key that isn't a valid
+    /// header name, or an ASCII header's value with characters other than visible ASCII, space
+    /// and tab; the headers are then unchanged. On a client that hasn't connected yet (see `init`), they are the headers
     /// the client connects with. A later `reconnect` sends its own `ConnectionOptions.headers`
     /// instead. Thread-safe.
     pub fn updateHeaders(c: *Client, headers: []const bridge.bytes.MetadataEntry) error{ OutOfMemory, InvalidOptions }!void {
-        for (headers) |h| try validateHeader(h);
+        try validateHeaders(headers);
         c.shared.connection_mutex.lockUncancelable(c.io);
         defer c.shared.connection_mutex.unlock(c.io);
-        if (c.shared.connection) |conn| return conn.setMetadata(c.gpa, headers) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            // validateHeader already rejects newlines.
-            error.NewlineInKey, error.NewlineInValue => unreachable,
-        };
+        if (c.shared.connection) |conn| return setConnectionHeaders(conn, c.gpa, headers);
         var options = c.shared.pending_connection.?.options;
         options.headers = headers;
         try c.replacePending(options);
@@ -3204,7 +3207,7 @@ pub const RpcOptions = struct {
             return rejection.reject("RpcOptions.timeout must be positive, not {f}; set it to null for the client's Options.rpc_timeout", .{t});
         for (o.metadata) |h| {
             var header: Rejection = .{};
-            headerRejection(h, &header) catch return rejection.reject("RpcOptions.metadata: {s}", .{header.message});
+            asciiHeaderRejection(h, &header) catch return rejection.reject("RpcOptions.metadata: {s}", .{header.message});
         }
         for (o.binary_metadata) |h| {
             if (!std.ascii.endsWithIgnoreCase(h.key, "-bin") or !isHeaderName(h.key))
@@ -5065,8 +5068,12 @@ pub const LoadError = error{ OutOfMemory, InvalidConfig };
 /// paths (`Options.Tls.client_cert_path`, ...) and read when the client connects. A config
 /// that can't be read or parsed, a missing named profile, a key `strict` rejects, `path`
 /// and `data` both set for one certificate, or a TEMPORAL_TLS other than `true`, `false`,
-/// `1` or `0` (in any case; the empty string included) return `error.InvalidConfig`, with
-/// the reason logged. Strings are allocated from `arena`.
+/// `1` or `0` (in any case; the empty string included), or another TEMPORAL_ variable that
+/// isn't UTF-8, return `error.InvalidConfig`, with the reason logged. Each
+/// TEMPORAL_GRPC_META_<NAME> becomes a header named <name> in lower case with `_` as `-`
+/// (an empty value removes the profile's header), its value kept as bytes, so it is checked
+/// with the other `Options.headers` when the client is created. Strings are allocated from
+/// `arena`.
 pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
     if (!options.disable_env) {
         const tls_env: ?[]const u8 = if (options.env) |env|
@@ -5080,13 +5087,26 @@ pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
             return error.InvalidConfig;
         };
     }
+    // sdk-core always gets a map, never the process environment: its own reading panics, and
+    // aborts the process, on any variable that isn't UTF-8. The map holds the TEMPORAL_
+    // variables, the only ones it reads, except the headers, which are read here so that a
+    // binary header can carry any bytes.
+    const env = try envEntries(arena, options.env);
     var env_json: Io.Writer.Allocating = .init(arena);
-    if (options.env) |env| {
+    {
         var json: std.json.Stringify = .{ .writer = &env_json.writer };
         json.beginObject() catch return error.OutOfMemory;
-        for (env.keys(), env.values()) |k, v| {
-            json.objectField(k) catch return error.OutOfMemory;
-            json.write(v) catch return error.OutOfMemory;
+        for (env) |e| {
+            if (std.mem.startsWith(u8, e.key, grpc_meta_prefix)) continue;
+            if (!std.unicode.utf8ValidateSlice(e.key) or !std.unicode.utf8ValidateSlice(e.value)) {
+                // As sdk-core does with the process environment: an error only for a
+                // variable it reads.
+                if (!sdkCoreReadsEnv(e.key, options)) continue;
+                log.warn("loading client configuration failed: the environment variable {s} is not valid UTF-8", .{e.key});
+                return error.InvalidConfig;
+            }
+            json.objectField(e.key) catch return error.OutOfMemory;
+            json.write(e.value) catch return error.OutOfMemory;
         }
         json.endObject() catch return error.OutOfMemory;
     }
@@ -5104,9 +5124,79 @@ pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
         log.warn("loading client configuration failed: {s}", .{fail.bytes()});
         return error.InvalidConfig;
     }
-    const json = bridge.bytes.Owned.take(null, result.success) orelse return .{};
-    defer json.deinit();
-    return profileOptions(arena, json.bytes());
+    var loaded: Options = .{};
+    if (bridge.bytes.Owned.take(null, result.success)) |json| {
+        defer json.deinit();
+        loaded = try profileOptions(arena, json.bytes());
+    }
+    if (!options.disable_env) loaded.headers = try grpcMetaHeaders(arena, loaded.headers, env);
+    return loaded;
+}
+
+const grpc_meta_prefix = "TEMPORAL_GRPC_META_";
+
+/// The TEMPORAL_ variables `loadOptions` reads, from `env` or else the process environment,
+/// copied into `arena`: what `loadOptions` returns may come from them, and must not borrow
+/// from the caller's map or from the environment, which can change after it returns.
+fn envEntries(arena: Allocator, env: ?*const std.process.Environ.Map) error{OutOfMemory}![]const bridge.bytes.MetadataEntry {
+    var entries: std.ArrayList(bridge.bytes.MetadataEntry) = .empty;
+    if (env) |map| {
+        for (map.keys(), map.values()) |k, v| try appendEnvEntry(arena, &entries, k, v);
+        return entries.items;
+    }
+    var i: usize = 0;
+    while (std.c.environ[i]) |line| : (i += 1) {
+        const kv = std.mem.span(line);
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        try appendEnvEntry(arena, &entries, kv[0..eq], kv[eq + 1 ..]);
+    }
+    return entries.items;
+}
+
+fn appendEnvEntry(arena: Allocator, entries: *std.ArrayList(bridge.bytes.MetadataEntry), key: []const u8, value: []const u8) error{OutOfMemory}!void {
+    if (!std.mem.startsWith(u8, key, "TEMPORAL_")) return;
+    try entries.append(arena, .{ .key = try arena.dupe(u8, key), .value = try arena.dupe(u8, value) });
+}
+
+/// Whether sdk-core's `envconfig.rs` reads the variable `name` under `options`: with
+/// `disable_env`, only TEMPORAL_CONFIG_FILE, to find the config file. TEMPORAL_GRPC_META_*
+/// are read in Zig.
+fn sdkCoreReadsEnv(name: []const u8, options: LoadOptions) bool {
+    if (options.disable_env) return std.mem.eql(u8, name, "TEMPORAL_CONFIG_FILE");
+    const read = [_][]const u8{
+        "TEMPORAL_ADDRESS",                 "TEMPORAL_NAMESPACE",                     "TEMPORAL_API_KEY",
+        "TEMPORAL_CONFIG_FILE",             "TEMPORAL_PROFILE",                       "TEMPORAL_TLS",
+        "TEMPORAL_TLS_SERVER_NAME",         "TEMPORAL_TLS_DISABLE_HOST_VERIFICATION", "TEMPORAL_TLS_SERVER_CA_CERT_PATH",
+        "TEMPORAL_TLS_SERVER_CA_CERT_DATA", "TEMPORAL_TLS_CLIENT_CERT_PATH",          "TEMPORAL_TLS_CLIENT_CERT_DATA",
+        "TEMPORAL_TLS_CLIENT_KEY_PATH",     "TEMPORAL_TLS_CLIENT_KEY_DATA",           "TEMPORAL_CODEC_ENDPOINT",
+        "TEMPORAL_CODEC_AUTH",
+    };
+    for (read) |r| if (std.mem.eql(u8, name, r)) return true;
+    return false;
+}
+
+/// `headers` (a profile's `grpc_meta`) with each TEMPORAL_GRPC_META_<NAME> of `env` applied
+/// as sdk-core applies it: the name in lower case with `_` as `-`, set to the value, or
+/// removed by an empty value. Values are kept as bytes, so a binary header may carry any.
+fn grpcMetaHeaders(arena: Allocator, headers: []const bridge.bytes.MetadataEntry, env: []const bridge.bytes.MetadataEntry) error{OutOfMemory}![]const bridge.bytes.MetadataEntry {
+    var list: std.ArrayList(bridge.bytes.MetadataEntry) = .empty;
+    try list.appendSlice(arena, headers);
+    for (env) |e| {
+        if (!std.mem.startsWith(u8, e.key, grpc_meta_prefix)) continue;
+        const name = try arena.dupe(u8, e.key[grpc_meta_prefix.len..]);
+        for (name) |*ch| ch.* = if (ch.* == '_') '-' else std.ascii.toLower(ch.*);
+        const found = for (list.items, 0..) |h, i| {
+            if (std.mem.eql(u8, h.key, name)) break i;
+        } else null;
+        if (e.value.len == 0) {
+            if (found) |i| _ = list.orderedRemove(i);
+        } else if (found) |i| {
+            list.items[i].value = e.value;
+        } else {
+            try list.append(arena, .{ .key = name, .value = e.value });
+        }
+    }
+    return list.items;
 }
 
 /// TEMPORAL_TLS's value as a bool: `true`, `false`, `1` or `0` in any case, the spellings
@@ -5182,19 +5272,47 @@ fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
     return options;
 }
 
-/// Rejects what sdk-core would silently drop from `Client.updateHeaders`: gRPC ASCII headers
-/// only. Logs why as a warning.
+/// Rejects what sdk-core would silently drop from `Client.updateHeaders`. Logs why as a
+/// warning.
 fn validateHeader(h: bridge.bytes.MetadataEntry) error{InvalidOptions}!void {
+    return validateHeaders(&.{h});
+}
+
+/// `validateHeader` for each of `headers`, and `headersRejection`'s check for a name given
+/// twice.
+fn validateHeaders(headers: []const bridge.bytes.MetadataEntry) error{InvalidOptions}!void {
     var rejection: Rejection = .{};
-    headerRejection(h, &rejection) catch |err| {
+    headersRejection(headers, &rejection) catch |err| {
         log.warn("updating the client's headers failed: {s}", .{rejection.message});
         return err;
     };
 }
 
-/// `validateHeader` without the log: fills `rejection` instead.
+/// `headerRejection` for each of `headers`, and a rejection of two names that differ only in
+/// case: gRPC sends names in lower case, and sdk-core keeps one value for them, chosen at
+/// random. A name repeated exactly is not rejected: sdk-core sends its last value.
+fn headersRejection(headers: []const bridge.bytes.MetadataEntry, rejection: *Rejection) error{InvalidOptions}!void {
+    for (headers, 0..) |h, i| {
+        try headerRejection(h, rejection);
+        for (headers[0..i]) |earlier| if (std.ascii.eqlIgnoreCase(earlier.key, h.key) and !std.mem.eql(u8, earlier.key, h.key))
+            return rejection.reject("header {s} is given twice, also as {s}; gRPC sends names in lower case, so spell each name one way", .{ h.key, earlier.key });
+    }
+}
+
+/// `validateHeader` without the log: fills `rejection` instead. A name ending in "-bin" is a
+/// gRPC binary header, whose value may be any bytes (sdk-core splits each entry at its first
+/// newline, so even a newline reaches the server); any other is an ASCII header.
 fn headerRejection(h: bridge.bytes.MetadataEntry, rejection: *Rejection) error{InvalidOptions}!void {
-    if (std.ascii.endsWithIgnoreCase(h.key, "-bin") or !isHeaderName(h.key))
+    if (!isHeaderName(h.key))
+        return rejection.reject("\"{s}\" is not a valid header name (letters, digits and {s})", .{ h.key, header_name_symbols });
+    if (isBinaryHeader(h.key)) return;
+    return asciiHeaderRejection(h, rejection);
+}
+
+/// Rejects what isn't a gRPC ASCII header (`RpcOptions.metadata`): a name ending in "-bin"
+/// included. Fills `rejection`.
+fn asciiHeaderRejection(h: bridge.bytes.MetadataEntry, rejection: *Rejection) error{InvalidOptions}!void {
+    if (isBinaryHeader(h.key) or !isHeaderName(h.key))
         return rejection.reject("\"{s}\" is not a valid header name (letters, digits and {s}, not ending in -bin)", .{ h.key, header_name_symbols });
     for (h.value) |ch| if (ch != '\t' and (ch < ' ' or ch > '~'))
         return rejection.reject("the value of header {s} has a byte (0x{x:0>2}) other than visible ASCII, space or tab", .{ h.key, ch });
@@ -5202,6 +5320,57 @@ fn headerRejection(h: bridge.bytes.MetadataEntry, rejection: *Rejection) error{I
 
 /// The symbols an HTTP/2 header name may hold besides letters and digits.
 const header_name_symbols = "!#$%&'*+-.^_`|~";
+
+fn isBinaryHeader(key: []const u8) bool {
+    return std.ascii.endsWithIgnoreCase(key, "-bin");
+}
+
+/// `headers` split into sdk-core's ASCII metadata and binary metadata (names ending in "-bin"),
+/// in `arena`.
+const SplitHeaders = struct {
+    ascii: []const bridge.bytes.MetadataEntry,
+    binary: []const bridge.bytes.MetadataEntry,
+
+    fn init(arena: Allocator, headers: []const bridge.bytes.MetadataEntry) error{OutOfMemory}!SplitHeaders {
+        var binary_count: usize = 0;
+        for (headers) |h| binary_count += @intFromBool(isBinaryHeader(h.key));
+        const ascii = try arena.alloc(bridge.bytes.MetadataEntry, headers.len - binary_count);
+        const binary = try arena.alloc(bridge.bytes.MetadataEntry, binary_count);
+        var a: usize = 0;
+        var b: usize = 0;
+        for (headers) |h| if (isBinaryHeader(h.key)) {
+            binary[b] = h;
+            b += 1;
+        } else {
+            ascii[a] = h;
+            a += 1;
+        };
+        return .{ .ascii = ascii, .binary = binary };
+    }
+};
+
+/// Replaces both the ASCII and the binary headers `conn` sends with `headers`, which were
+/// checked with `headerRejection`. Both are encoded before either is set, so a failure
+/// leaves the connection's headers as they were.
+fn setConnectionHeaders(conn: bridge.Connection, gpa: Allocator, headers: []const bridge.bytes.MetadataEntry) error{OutOfMemory}!void {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const split: SplitHeaders = try .init(arena, headers);
+    const ascii = bridge.bytes.metadata(arena, split.ascii) catch |err| return metadataError(err);
+    const binary = bridge.bytes.metadata(arena, split.binary) catch |err| return metadataError(err);
+    bridge.c.temporal_core_client_update_metadata(conn.ptr, ascii);
+    bridge.c.temporal_core_client_update_binary_metadata(conn.ptr, binary);
+}
+
+fn metadataError(err: bridge.bytes.EncodeError) error{OutOfMemory} {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        // `headerRejection` accepts no newline in a name, and none in an ASCII header's
+        // value; a binary header's value may hold one.
+        error.NewlineInKey, error.NewlineInValue => unreachable,
+    };
+}
 
 fn isHeaderName(key: []const u8) bool {
     if (key.len == 0) return false;
@@ -5458,13 +5627,274 @@ test "TLS PEM is read from the paths when connecting" {
     try testing.expectEqualStrings("inline", try tlsFile(arena.allocator(), testing.io, "inline", "", "server_root_ca_cert", &r));
 }
 
-test "header updates accept gRPC ASCII headers only" {
+test "header updates accept ASCII headers, and binary headers with any bytes" {
     try validateHeader(.{ .key = "X-Tenant_ID", .value = "a b\tc~" });
+    try validateHeader(.{ .key = "blob-bin", .value = "v" });
+    try validateHeader(.{ .key = "Trace-BIN", .value = "\x00\xff\n\x7f caf\xc3\xa9" });
     try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "", .value = "v" }));
     try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "bad key", .value = "v" }));
-    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "blob-bin", .value = "v" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "bad key-bin", .value = "v" }));
     try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k", .value = "caf\xc3\xa9" }));
     try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k", .value = "a\nb" }));
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k", .value = "\x7f" }));
+    // A name that only looks binary is ASCII.
+    try testing.expectError(error.InvalidOptions, validateHeader(.{ .key = "k-binary", .value = "\xff" }));
+}
+
+test "a non-ASCII value is accepted on a binary header and rejected on an ASCII one, naming it, from options, the environment and a profile" {
+    const rejected = "value of header x has a byte (0xc3)";
+    var r: Rejection = .{};
+    try checkConnectionOptions(.{ .headers = &.{.{ .key = "x-bin", .value = "\xc3\xa9" }} }, &r);
+    try expectRejected(checkConnectionOptions(.{ .headers = &.{ .{ .key = "x-bin", .value = "\xc3\xa9" }, .{ .key = "x", .value = "\xc3\xa9" } } }, &r), &r, rejected);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_GRPC_META_X_BIN", "\xc3\xa9");
+    const binary_env = try loadOptions(arena.allocator(), .{ .env = &env, .disable_file = true });
+    try checkConnectionOptions(binary_env.connectionOptions(), &r);
+    try env.put("TEMPORAL_GRPC_META_X", "\xc3\xa9");
+    const both_env = try loadOptions(arena.allocator(), .{ .env = &env, .disable_file = true });
+    try expectRejected(checkConnectionOptions(both_env.connectionOptions(), &r), &r, rejected);
+
+    const binary_profile = try loadOptions(arena.allocator(), .{ .disable_env = true, .config_data =
+        \\[profile.default.grpc_meta]
+        \\x-bin = "é"
+    });
+    try checkConnectionOptions(binary_profile.connectionOptions(), &r);
+    const both_profile = try loadOptions(arena.allocator(), .{ .disable_env = true, .config_data =
+        \\[profile.default.grpc_meta]
+        \\x-bin = "é"
+        \\x = "é"
+    });
+    try expectRejected(checkConnectionOptions(both_profile.connectionOptions(), &r), &r, rejected);
+}
+
+test "binary headers from options, the environment and a profile go to sdk-core's binary metadata" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var r: Rejection = .{};
+    const headers = [_]bridge.bytes.MetadataEntry{
+        .{ .key = "x-tenant", .value = "blue" },
+        .{ .key = "Trace-Bin", .value = "\x00\xff\n" },
+        .{ .key = "x-region", .value = "eu" },
+    };
+    try checkConnectionOptions(.{ .headers = &headers }, &r);
+    const b = try connectionBridgeOptions(arena, testing.io, "id", .{ .headers = &headers }, &r);
+    try testing.expectEqual(@as(usize, 2), b.metadata.len);
+    try testing.expectEqualStrings("x-tenant", b.metadata[0].key);
+    try testing.expectEqualStrings("x-region", b.metadata[1].key);
+    try testing.expectEqual(@as(usize, 1), b.binary_metadata.len);
+    try testing.expectEqualStrings("Trace-Bin", b.binary_metadata[0].key);
+    try testing.expectEqualStrings("\x00\xff\n", b.binary_metadata[0].value);
+
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_GRPC_META_TRACE_BIN", "caf\xc3\xa9");
+    const from_env = try loadOptions(arena, .{ .env = &env, .disable_file = true });
+    try checkConnectionOptions(from_env.connectionOptions(), &r);
+    const env_b = try connectionBridgeOptions(arena, testing.io, "id", from_env.connectionOptions(), &r);
+    try testing.expectEqual(@as(usize, 0), env_b.metadata.len);
+    try testing.expectEqualStrings("trace-bin", env_b.binary_metadata[0].key);
+    try testing.expectEqualStrings("caf\xc3\xa9", env_b.binary_metadata[0].value);
+
+    const from_profile = try loadOptions(arena, .{ .disable_env = true, .config_data =
+        \\[profile.default.grpc_meta]
+        \\trace-bin = "\u00e9"
+    });
+    try checkConnectionOptions(from_profile.connectionOptions(), &r);
+    const profile_b = try connectionBridgeOptions(arena, testing.io, "id", from_profile.connectionOptions(), &r);
+    try testing.expectEqualStrings("trace-bin", profile_b.binary_metadata[0].key);
+    try testing.expectEqualStrings("\xc3\xa9", profile_b.binary_metadata[0].value);
+}
+
+test "Options.headers send a binary header's bytes to the server" {
+    const Recorder = struct {
+        mutex: Io.Mutex = .init,
+        trace: ?[]u8 = null,
+        tenant: ?[]u8 = null,
+        override: bridge.Connection.GrpcOverride = .{ .handle = handle },
+
+        fn handle(ctx: ?*anyopaque, req: bridge.Connection.GrpcRequest) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (!std.mem.eql(u8, req.rpc(), "GetSystemInfo")) {
+                r.mutex.lockUncancelable(testing.io);
+                defer r.mutex.unlock(testing.io);
+                inline for (.{ .{ "trace", "trace-bin" }, .{ "tenant", "x-tenant" } }) |f| {
+                    if (@field(r, f[0])) |v| testing.allocator.free(v);
+                    @field(r, f[0]) = if (req.header(f[1])) |v| testing.allocator.dupe(u8, v) catch null else null;
+                }
+            }
+            req.respond(testing.allocator, .{});
+        }
+    };
+    var recorder: Recorder = .{};
+    defer inline for (.{ "trace", "tenant" }) |f| if (@field(recorder, f)) |v| testing.allocator.free(v);
+    recorder.override.ctx = &recorder;
+
+    const options: Options = .{
+        .host_port = "127.0.0.1:1",
+        .core_log_level = null,
+        .headers = &.{ .{ .key = "x-tenant", .value = "blue" }, .{ .key = "Trace-BIN", .value = "\x00\xff\n" } },
+    };
+    var c = try Client.init(testing.allocator, testing.io, options);
+    defer c.close();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The options `Client.connect` would connect with, answered by the recorder.
+    var r: Rejection = .{};
+    var bridge_options = try connectionBridgeOptions(arena, testing.io, c.identity, options.connectionOptions(), &r);
+    bridge_options.grpc_override = &recorder.override;
+    const conn = try bridge.Connection.connect(testing.allocator, testing.io, c.shared.runtime, bridge_options, null);
+    c.shared.connection_mutex.lockUncancelable(testing.io);
+    c.shared.connection = conn;
+    c.shared.connection_mutex.unlock(testing.io);
+
+    _ = try c.callService(.workflow, "GetClusterInfo", arena, .{}, null);
+    recorder.mutex.lockUncancelable(testing.io);
+    defer recorder.mutex.unlock(testing.io);
+    try testing.expectEqualStrings("blue", recorder.tenant.?);
+    var buf: [8]u8 = undefined;
+    const sent = std.mem.trimEnd(u8, recorder.trace.?, "=");
+    const decoded = buf[0..try std.base64.standard_no_pad.Decoder.calcSizeForSlice(sent)];
+    try std.base64.standard_no_pad.Decoder.decode(decoded, sent);
+    try testing.expectEqualStrings("\x00\xff\n", decoded);
+}
+
+test "a binary header from TEMPORAL_GRPC_META_<NAME> in an env map keeps bytes that aren't UTF-8" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_GRPC_META_TRACE_BIN", "\x00\xff");
+    const loaded = try loadOptions(arena.allocator(), .{ .env = &env, .disable_file = true });
+    try testing.expectEqual(@as(usize, 1), loaded.headers.len);
+    try testing.expectEqualStrings("trace-bin", loaded.headers[0].key);
+    try testing.expectEqualStrings("\x00\xff", loaded.headers[0].value);
+    var r: Rejection = .{};
+    try checkConnectionOptions(loaded.connectionOptions(), &r);
+}
+
+test "a TEMPORAL_GRPC_META_<NAME> in the process environment that isn't UTF-8 is rejected, not a crash" {
+    const posix = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    // "é" as a Latin-1 terminal sends it: one byte, 0xe9.
+    try testing.expectEqual(@as(c_int, 0), posix.setenv("TEMPORAL_GRPC_META_X", "\xe9", 1));
+    defer _ = posix.unsetenv("TEMPORAL_GRPC_META_X");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    if (loadOptions(arena.allocator(), .{ .disable_file = true })) |loaded| {
+        var r: Rejection = .{};
+        try expectRejected(checkConnectionOptions(loaded.connectionOptions(), &r), &r, "header x");
+    } else |err| try testing.expectEqual(error.InvalidConfig, err);
+}
+
+test "two header names that differ only in case are rejected naming both; an exact repeat is not" {
+    var r: Rejection = .{};
+    try expectRejected(checkConnectionOptions(.{ .headers = &.{ .{ .key = "trace-bin", .value = "A" }, .{ .key = "Trace-Bin", .value = "B" } } }, &r), &r, "header Trace-Bin is given twice, also as trace-bin");
+    try expectRejected(checkConnectionOptions(.{ .headers = &.{ .{ .key = "x", .value = "1" }, .{ .key = "y", .value = "2" }, .{ .key = "X", .value = "3" } } }, &r), &r, "header X is given twice, also as x");
+    // sdk-core sends the last value of a name repeated exactly, as it did before.
+    try checkConnectionOptions(.{ .headers = &.{ .{ .key = "x", .value = "1" }, .{ .key = "y", .value = "2" }, .{ .key = "x", .value = "3" } } }, &r);
+    try validateHeaders(&.{ .{ .key = "x", .value = "1" }, .{ .key = "x", .value = "2" } });
+    try testing.expectError(error.InvalidOptions, validateHeaders(&.{ .{ .key = "x-a", .value = "1" }, .{ .key = "X-A", .value = "2" } }));
+    try validateHeaders(&.{ .{ .key = "x-a", .value = "1" }, .{ .key = "x-a-bin", .value = "2" } });
+}
+
+test "TEMPORAL_GRPC_META_<NAME> sets, replaces and removes a profile's headers, and other variables must be UTF-8" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const toml =
+        \\[profile.default.grpc_meta]
+        \\keep = "file"
+        \\replace = "file"
+        \\remove = "file"
+    ;
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_GRPC_META_REPLACE", "env");
+    try env.put("TEMPORAL_GRPC_META_REMOVE", "");
+    try env.put("TEMPORAL_GRPC_META_NEW_ONE", "env");
+    // Not a variable sdk-core reads, so its bytes don't matter.
+    try env.put("OTHER", "\xe9");
+    const loaded = try loadOptions(arena.allocator(), .{ .env = &env, .config_data = toml });
+    try testing.expectEqual(@as(usize, 3), loaded.headers.len);
+    var seen: usize = 0;
+    for (loaded.headers) |h| {
+        if (std.mem.eql(u8, h.key, "keep")) try testing.expectEqualStrings("file", h.value);
+        if (std.mem.eql(u8, h.key, "replace")) try testing.expectEqualStrings("env", h.value);
+        if (std.mem.eql(u8, h.key, "new-one")) try testing.expectEqualStrings("env", h.value);
+        try testing.expect(!std.mem.eql(u8, h.key, "remove"));
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+
+    // With disable_env, the headers are the profile's alone.
+    const file_only = try loadOptions(arena.allocator(), .{ .env = &env, .config_data = toml, .disable_env = true });
+    try testing.expectEqual(@as(usize, 3), file_only.headers.len);
+
+    // A variable sdk-core reads that isn't UTF-8 is named, not an opaque JSON error.
+    try env.put("TEMPORAL_ADDRESS", "\xe9:7233");
+    try testing.expectError(error.InvalidConfig, loadOptions(arena.allocator(), .{ .env = &env, .disable_file = true }));
+}
+
+test "loadOptions keeps no slice of an env map whose bytes replaced a profile's binary header or added a header" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const toml =
+        \\[profile.default.grpc_meta]
+        \\trace-bin = "file"
+    ;
+    const loaded = load: {
+        var env: std.process.Environ.Map = .init(testing.allocator);
+        defer env.deinit();
+        // Not UTF-8, so only a header read in Zig can carry it, and only a copy outlives
+        // the map.
+        try env.put("TEMPORAL_GRPC_META_TRACE_BIN", "\x00\xff");
+        // A header the profile doesn't have, added from the map.
+        try env.put("TEMPORAL_GRPC_META_TENANT", "blue");
+        try env.put("TEMPORAL_ADDRESS", "from-env:7233");
+        break :load try loadOptions(arena.allocator(), .{ .env = &env, .config_data = toml });
+    };
+    // The map is gone; the options must not borrow from it.
+    try testing.expectEqual(@as(usize, 2), loaded.headers.len);
+    var found: usize = 0;
+    for (loaded.headers) |h| {
+        if (std.mem.eql(u8, h.key, "trace-bin")) {
+            try testing.expectEqualStrings("\x00\xff", h.value);
+            found += 1;
+        } else if (std.mem.eql(u8, h.key, "tenant")) {
+            try testing.expectEqualStrings("blue", h.value);
+            found += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), found);
+    try testing.expectEqualStrings("from-env:7233", loaded.host_port);
+    var r: Rejection = .{};
+    try checkConnectionOptions(loaded.connectionOptions(), &r);
+}
+
+test "a TEMPORAL_ variable that isn't UTF-8 fails loadOptions only when sdk-core reads it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    // No configuration reads TEMPORAL_FOO.
+    try env.put("TEMPORAL_FOO", "\xe9");
+    _ = try loadOptions(arena.allocator(), .{ .env = &env, .disable_file = true });
+    _ = try loadOptions(arena.allocator(), .{ .env = &env, .config_data = "", .disable_env = true });
+    // With disable_env, sdk-core reads only TEMPORAL_CONFIG_FILE.
+    try env.put("TEMPORAL_ADDRESS", "\xe9:7233");
+    const file_only = try loadOptions(arena.allocator(), .{ .env = &env, .config_data = "", .disable_env = true });
+    try testing.expectEqualStrings("localhost:7233", file_only.host_port);
+    try testing.expectError(error.InvalidConfig, loadOptions(arena.allocator(), .{ .env = &env, .disable_file = true }));
+    _ = env.swapRemove("TEMPORAL_ADDRESS");
+    try env.put("TEMPORAL_CONFIG_FILE", "/no/such/\xe9.toml");
+    try testing.expectError(error.InvalidConfig, loadOptions(arena.allocator(), .{ .env = &env, .disable_env = true }));
 }
 
 test "default options send what the client always sent" {
@@ -6227,5 +6657,25 @@ test "a failed update-with-start names the operation that failed" {
         defer line.deinit();
         try testing.expectEqual(error.RpcFailed, Client.multiOperationFailure(&line.writer, case.status, a, "cart-1", "set"));
         try testing.expectEqualStrings(case.line, line.written());
+    }
+}
+
+test "loadOptions copies TEMPORAL_GRPC_META_<NAME> values from an env map into the arena" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const loaded = load: {
+        var env: std.process.Environ.Map = .init(testing.allocator);
+        defer env.deinit();
+        try env.put("TEMPORAL_GRPC_META_TENANT", "blue");
+        // Bytes that aren't UTF-8: before binary headers were read in Zig, loadOptions
+        // couldn't load them at all.
+        try env.put("TEMPORAL_GRPC_META_TRACE_BIN", "\x00\xff");
+        break :load try loadOptions(arena.allocator(), .{ .env = &env, .disable_file = true });
+    };
+    // The map is gone; the options must not borrow from it.
+    try testing.expectEqual(@as(usize, 2), loaded.headers.len);
+    for (loaded.headers) |h| {
+        if (std.mem.eql(u8, h.key, "tenant")) try testing.expectEqualStrings("blue", h.value);
+        if (std.mem.eql(u8, h.key, "trace-bin")) try testing.expectEqualStrings("\x00\xff", h.value);
     }
 }

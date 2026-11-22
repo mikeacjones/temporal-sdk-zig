@@ -166,6 +166,61 @@ test "a service call through a view sends the view's metadata with the client's 
     try testing.expectEqualStrings("AP96", server.value("trace-bin").?);
 }
 
+/// Decodes a binary header's value as gRPC sends it, base64 with or without padding.
+fn decodeBinaryHeader(buf: []u8, sent: []const u8) ![]const u8 {
+    const unpadded = std.mem.trimEnd(u8, sent, "=");
+    const decoder = std.base64.standard_no_pad.Decoder;
+    const out = buf[0..try decoder.calcSizeForSlice(unpadded)];
+    try decoder.decode(out, unpadded);
+    return out;
+}
+
+test "binary headers from updateHeaders and loadOptions reach the server, and each update replaces them" {
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null });
+    defer c.close();
+    var server: Server = .{};
+    defer server.deinit();
+    try connectToServer(&c, &server);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [64]u8 = undefined;
+
+    try c.updateHeaders(&.{ .{ .key = "x-shared", .value = "client" }, .{ .key = "trace-bin", .value = "\x00\xff\n" } });
+    try testing.expectError(error.NotFound, c.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "default" }, null));
+    try testing.expectEqualStrings("\x00\xff\n", try decodeBinaryHeader(&buf, server.value("trace-bin").?));
+    try testing.expectEqualStrings("client", server.value("x-shared").?);
+
+    // A non-ASCII value of an ASCII header is rejected, and the headers stay as they were.
+    try testing.expectError(error.InvalidOptions, c.updateHeaders(&.{.{ .key = "x-shared", .value = "\xc3\xa9" }}));
+    try testing.expectError(error.NotFound, c.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "default" }, null));
+    try testing.expectEqualStrings("\x00\xff\n", try decodeBinaryHeader(&buf, server.value("trace-bin").?));
+    try testing.expectEqualStrings("client", server.value("x-shared").?);
+
+    // Headers from the environment, through loadOptions: the binary one replaces the one
+    // above, and the ASCII headers are replaced with none.
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_GRPC_META_TRACE_BIN", "caf\xc3\xa9");
+    const loaded = try client_mod.loadOptions(arena, .{ .env = &env, .disable_file = true });
+    try c.updateHeaders(loaded.headers);
+    try testing.expectError(error.NotFound, c.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "default" }, null));
+    try testing.expectEqualStrings("caf\xc3\xa9", try decodeBinaryHeader(&buf, server.value("trace-bin").?));
+    try testing.expect(server.value("x-shared") == null);
+
+    var bad_env: std.process.Environ.Map = .init(testing.allocator);
+    defer bad_env.deinit();
+    try bad_env.put("TEMPORAL_GRPC_META_X_SHARED", "\xc3\xa9");
+    const bad = try client_mod.loadOptions(arena, .{ .env = &bad_env, .disable_file = true });
+    try testing.expectError(error.InvalidOptions, c.updateHeaders(bad.headers));
+
+    // An update without a binary header stops sending the old one.
+    try c.updateHeaders(&.{.{ .key = "x-shared", .value = "again" }});
+    try testing.expectError(error.NotFound, c.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "default" }, null));
+    try testing.expect(server.value("trace-bin") == null);
+    try testing.expectEqualStrings("again", server.value("x-shared").?);
+}
+
 test "every gRPC status returns its error, and the failure carries the status" {
     var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null });
     defer c.close();
