@@ -82,7 +82,12 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn expect(result: WorkflowReplayer.ReplayResult, err: ?WorkflowReplayer.ReplayError, message_part: []const u8) bool {
-    const matches = result.err == err and std.mem.indexOf(u8, result.message, message_part) != null;
+    // Not `result.err == err`: Zig 0.17.1's own x86_64 backend, its default for Debug on
+    // x86_64 Linux, compiles `==` between two optional error sets to read a "has a value"
+    // byte past each 2-byte operand, which is stack garbage, so equal errors can compare
+    // unequal. Comparing the unwrapped errors is compiled correctly.
+    const err_matches = if (err) |e| (if (result.err) |got| got == e else false) else result.err == null;
+    const matches = err_matches and std.mem.indexOf(u8, result.message, message_part) != null;
     if (!matches) std.debug.print("replay-malformed: {s}: expected {?t} with a message naming \"{s}\", got {?t}: {s}\n", .{ result.workflow_id, err, message_part, result.err, result.message });
     return matches;
 }
