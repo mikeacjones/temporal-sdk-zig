@@ -10,8 +10,10 @@ const fuzz_limits = @import("src/fuzz/limits.zig");
 const core_header_name = "temporal-sdk-core-c-bridge.h";
 const core_header = "deps/sdk-core/crates/sdk-core-c-bridge/include/" ++ core_header_name;
 const core_lib_name = "libtemporalio_sdk_core_c_bridge.a";
-/// The time-skipping test server release this repository's tests pass with.
-const verified_test_server_version = "v1.40.0";
+/// The newest time-skipping test server release this repository's tests pass with, and the
+/// one `testing.TestServer` downloads unless `-Dtest-server-version` says otherwise. Move it
+/// forward when a newer release passes `zig build test` on Linux and macOS.
+const verified_test_server_version = "v1.41.1";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -30,15 +32,16 @@ pub fn build(b: *std.Build) void {
     const protoc_opt = b.option([]const u8, "protoc", "Path to protoc used by the cargo build (default: pinned download)");
     const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
     const hang_report = b.option(u32, "test-hang-report", "Print the name, elapsed time and every thread's stack of a test still running after this many seconds, without ending it (default: 300; 0 turns the report off)") orelse 300;
-    // A checkout tests against the test server release its tests were last verified with: a
-    // new release reaches every machine without a cached copy at once, and one has broken
-    // updates (sdk-java 1.41.0's never delivers a workflow task that carries one). A project
-    // that depends on the SDK gets sdk-core's default unless it passes the option.
+    // Tests run against the test server release this repository's tests were last verified
+    // with, in a checkout and in a project that depends on the SDK alike: a new release reaches
+    // every machine without a cached copy at once, and one has broken updates (sdk-java
+    // 1.41.0's never delivers a workflow task that carries one). "default" restores
+    // sdk-core's choice.
     const test_server_version = b.option(
         []const u8,
         "test-server-version",
-        "Time-skipping test server release testing.TestServer downloads by default: \"default\" (sdk-core's choice) or a tag such as \"v1.40.0\" (default in a checkout: " ++ verified_test_server_version ++ ")",
-    ) orelse if (b.isRoot()) verified_test_server_version else "default";
+        "Time-skipping test server release testing.TestServer downloads by default: \"default\" (sdk-core's choice, usually the newest) or a tag such as \"" ++ verified_test_server_version ++ "\" (default: " ++ verified_test_server_version ++ ", the newest release the SDK's tests pass with)",
+    ) orelse verified_test_server_version;
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "test_server_version", test_server_version);
     build_options.addOption([]const u8, "version", manifest.version);
@@ -425,6 +428,16 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         unknown_ref.addArgs(&.{ "base", "refs/heads/api-diff-test-no-such-ref" });
         _ = unknown_ref.addOutputDirectoryArg2("tree", .{});
         unknown_ref.expectStdErrMatch("-Dbase=refs/heads/api-diff-test-no-such-ref");
+    }
+
+    // The b.dependency argument the docs give for the test server release names a declared
+    // option (tools/checks/test_server_version_option.zig reads build.zig and the docs).
+    {
+        const tool = checkTool(b, "test-server-version-option", "tools/checks/test_server_version_option.zig");
+        const run = b.addRunArtifact(b.addTest(.{ .name = "test-server-version-option", .root_module = tool.root_module, .filters = in.test_filters }));
+        run.setCwd(b.path("."));
+        run.has_side_effects = true;
+        in.test_step.dependOn(&run.step);
     }
 
     // zig build dupes

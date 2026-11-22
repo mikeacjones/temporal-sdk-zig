@@ -122,9 +122,11 @@ pub const TestServer = struct {
         /// Path to a temporal-test-server binary; empty downloads one (cached).
         existing_path: []const u8 = "",
         /// Release to download when `existing_path` is empty: "default" (the one sdk-core
-        /// picks, usually the newest) or a release tag with its `v`, such as "v1.40.0".
-        /// Defaults to the build's `-Dtest-server-version`, "default" in a project that
-        /// depends on the SDK.
+        /// picks, usually the newest) or a release tag with its `v`, such as "v1.41.1".
+        /// Defaults to the build's `-Dtest-server-version`, which is the newest release the
+        /// SDK's own tests pass with unless the build says otherwise; a project that depends
+        /// on the SDK gets sdk-core's choice back with `.@"test-server-version" = "default"`
+        /// in its `b.dependency` arguments.
         version: []const u8 = build_options.test_server_version,
         /// 0 picks a free port.
         port: u16 = 0,

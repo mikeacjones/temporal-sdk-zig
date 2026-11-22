@@ -2244,7 +2244,7 @@ Notes:
 - Time moves at wall-clock speed except during `executeWorkflow`, `getResult`, and `env.sleep`.
 - Signals, queries, and updates leave time locked, so a workflow waiting for one doesn't skip to its timeout.
 - `env.now()` is the server's time, skipped time included.
-- The test server is downloaded once and cached; by default it's the release sdk-core picks, usually the newest. Pin one with `.test_server_version = "v1.40.0"` in the SDK's `b.dependency` arguments, or for a single server with `testing.TestServer.Options.version`. The 1.41.0 release never delivers a workflow task that carries an update, so a test that sends one waits forever.
+- The test server is downloaded once and cached. By default it's the newest release the SDK's own tests pass with (v1.41.1 in this release), not sdk-core's choice, because a new release reaches every machine without a cached copy at once: v1.41.0 never delivers a workflow task that carries an update, so a test that sends one, or uses update-with-start, waits forever. Choose another with `.@"test-server-version" = "v1.40.0"` in the SDK's `b.dependency` arguments (spelled as the build option is: Zig only logs an argument the SDK doesn't declare, such as `.test_server_version`, and builds on without it) (`"default"` for the release sdk-core picks, usually the newest), or for a single server with `testing.TestServer.Options.version`.
 
 `WorkflowEnvironment.startTimeSkippingWithOptions` takes the options `startWithOptions` takes: codecs, the failure attribute encoding, a logger, propagators, worker and client interceptors, and metrics, which the worker and the replay of each finished run use too:
 
