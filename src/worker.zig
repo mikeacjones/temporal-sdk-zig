@@ -1955,49 +1955,6 @@ const RunningActivity = struct {
     }
 };
 
-<<<<<<< HEAD
-/// `w.gpa` with cancels blocked around each call: the memory behind an activity's or a Nexus
-/// request's arena (`activity.Context.allocator`, and the SDK's decoding into it). The worker
-/// cancels such a task once, and an allocation can wait on the task's `std.Io` without
-/// returning the error (in Debug, std's stack capture waits for its debug info lock and drops
-/// a cancel), which would leave the task running for good. Blocked, the cancel reaches the
-/// task's next wait. Valid while `w` is: arenas made with it are freed before `run` returns.
-fn taskAllocator(w: *Worker) Allocator {
-    return .{ .ptr = w, .vtable = &TaskAllocator.vtable };
-}
-
-const TaskAllocator = struct {
-    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
-
-    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        return w.gpa.rawAlloc(len, alignment, ret_addr);
-    }
-
-    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        return w.gpa.rawResize(memory, alignment, new_len, ret_addr);
-    }
-
-    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        return w.gpa.rawRemap(memory, alignment, new_len, ret_addr);
-    }
-
-    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        w.gpa.rawFree(memory, alignment, ret_addr);
-    }
-};
-
 /// An activity task's token and kind, read from its bytes without decoding or allocating.
 /// Borrows `bytes`.
 const ActivityTaskHead = struct {
@@ -2103,11 +2060,6 @@ fn receiveActivityTask(w: *Worker, core: bridge.Worker, running: *RunningActivit
         },
         .start => {},
     }
-=======
-/// Decodes a polled activity task. Returns a new run for a Start task; delivers a Cancel
-/// task to its run and returns null.
-fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.Worker.Polled, task_queue: []const u8) ?*RunningActivity {
->>>>>>> 706fe8a4315012972f59a8fd226f88dfdf93eabb
     const run = w.gpa.create(RunningActivity) catch {
         w.logger().err("Out of memory receiving an activity task; failing it as retryable so the server retries it", .{ .TaskQueue = task_queue });
         failActivityTask(w, core, head.token, .{ .message = "the worker ran out of memory receiving the activity task", .type = @errorName(error.OutOfMemory) });
@@ -2140,7 +2092,6 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
         }
         return null;
     };
-<<<<<<< HEAD
     const start: ?task_pb.Start = if (task.variant) |v| switch (v) {
         .start => |s| s,
         .cancel => null,
@@ -2149,6 +2100,16 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
         w.logger().err("An activity task read as a Start decoded as something else; failing it as non-retryable", .{ .TaskQueue = task_queue });
         failActivityTask(w, core, head.token, .{ .message = "the worker couldn't decode the activity task: it holds no Start", .type = "ActivityTaskDecodeFailed", .non_retryable = true });
         return null;
+    };
+    // Set before anything can report the attempt: a failure the worker reports without
+    // running the activity (no thread for it) is encoded in the activity's context too.
+    const execution = run.start.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
+    run.codec_context = .{
+        .namespace = w.client.namespace,
+        .workflow_id = execution.workflow_id,
+        .workflow_type = run.start.workflow_type,
+        .activity_type = run.start.activity_type,
+        .activity_id = run.start.activity_id,
     };
     const tracked = tracked: {
         running.mutex.lockUncancelable(w.io);
@@ -2160,45 +2121,6 @@ fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.W
     if (tracked) {
         keep = true;
         return run;
-=======
-    switch (task.variant orelse return null) {
-        .start => |s| {
-            run.task_token = task.task_token;
-            run.start = s;
-            // Set before anything can report the attempt: a failure the worker reports without
-            // running the activity (no thread for it) is encoded in the activity's context too.
-            const execution = s.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
-            run.codec_context = .{
-                .namespace = w.client.namespace,
-                .workflow_id = execution.workflow_id,
-                .workflow_type = s.workflow_type,
-                .activity_type = s.activity_type,
-                .activity_id = s.activity_id,
-            };
-            running.mutex.lockUncancelable(w.io);
-            defer running.mutex.unlock(w.io);
-            running.map.put(w.gpa, run.task_token, run) catch
-                log.warn("out of memory tracking activity {s}; it runs, but cancels won't reach it", .{s.activity_id});
-            if (w.stopping.load(.acquire)) run.ctx.notifyWorkerStop();
-            keep = true;
-            return run;
-        },
-        .cancel => |c| {
-            running.mutex.lockUncancelable(w.io);
-            defer running.mutex.unlock(w.io);
-            const reason = cancelReason(c.reason);
-            // A run that already finished has nothing to cancel.
-            const target = running.map.get(task.task_token) orelse {
-                log.debug("a cancel task ({t}) arrived for an activity this worker is not running; ignoring it", .{reason});
-                return null;
-            };
-            if (target.ctx.setCancelReason(reason)) {
-                log.debug("activity {s}: cancel task received ({t}); waking its supervisor", .{ target.start.activity_id, reason });
-                target.wake.set(w.io);
-            } else log.debug("activity {s}: cancel task received ({t}) after an earlier cancel ({t}); nothing to do", .{ target.start.activity_id, reason, target.ctx.cancelReason().? });
-            return null;
-        },
->>>>>>> 706fe8a4315012972f59a8fd226f88dfdf93eabb
     }
     // Untracked, the run couldn't be interrupted by a cancel or the worker's shutdown, so it
     // doesn't run at all.
