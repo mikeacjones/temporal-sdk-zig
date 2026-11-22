@@ -5035,7 +5035,8 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
 /// TEMPORAL_NAMESPACE, TEMPORAL_API_KEY, TEMPORAL_TLS, TEMPORAL_TLS_SERVER_NAME,
 /// TEMPORAL_TLS_SERVER_CA_CERT_PATH (or `_DATA`), TEMPORAL_TLS_CLIENT_CERT_PATH (or `_DATA`),
 /// TEMPORAL_TLS_CLIENT_KEY_PATH (or `_DATA`) and TEMPORAL_GRPC_META_<NAME> override the
-/// profile's values.
+/// profile's values. TEMPORAL_TLS must be `true`, `false`, `1` or `0`, in any case:
+/// `loadOptions` returns `error.InvalidConfig` for any other value instead of guessing.
 pub const LoadOptions = struct {
     /// The profile to read from the config file. Empty uses TEMPORAL_PROFILE, then "default";
     /// a profile named here or by TEMPORAL_PROFILE must exist, "default" need not.
@@ -5062,10 +5063,23 @@ pub const LoadError = error{ OutOfMemory, InvalidConfig };
 /// says (see `LoadOptions`). A profile with an API key, or with TLS settings, uses TLS unless
 /// its `tls.disabled` (or TEMPORAL_TLS=false) says not to. Certificate paths are kept as
 /// paths (`Options.Tls.client_cert_path`, ...) and read when the client connects. A config
-/// that can't be read or parsed, a missing named profile, a key `strict` rejects, or `path`
-/// and `data` both set for one certificate return `error.InvalidConfig`, with the reason
-/// logged. Strings are allocated from `arena`.
+/// that can't be read or parsed, a missing named profile, a key `strict` rejects, `path`
+/// and `data` both set for one certificate, or a TEMPORAL_TLS other than `true`, `false`,
+/// `1` or `0` (in any case; the empty string included) return `error.InvalidConfig`, with
+/// the reason logged. Strings are allocated from `arena`.
 pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
+    if (!options.disable_env) {
+        const tls_env: ?[]const u8 = if (options.env) |env|
+            env.get("TEMPORAL_TLS")
+        else if (std.c.getenv("TEMPORAL_TLS")) |v|
+            std.mem.span(v)
+        else
+            null;
+        if (tls_env) |v| if (tlsEnvBool(v) == null) {
+            log.warn("loading client configuration failed: TEMPORAL_TLS is \"{s}\"; use true, false, 1 or 0", .{v});
+            return error.InvalidConfig;
+        };
+    }
     var env_json: Io.Writer.Allocating = .init(arena);
     if (options.env) |env| {
         var json: std.json.Stringify = .{ .writer = &env_json.writer };
@@ -5093,6 +5107,14 @@ pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
     const json = bridge.bytes.Owned.take(null, result.success) orelse return .{};
     defer json.deinit();
     return profileOptions(arena, json.bytes());
+}
+
+/// TEMPORAL_TLS's value as a bool: `true`, `false`, `1` or `0` in any case, the spellings
+/// sdk-core's `env_var_to_bool` and Go's `envVarToBool` accept; null for any other value.
+fn tlsEnvBool(value: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "false") or std.mem.eql(u8, value, "0")) return false;
+    return null;
 }
 
 /// `loadOptions` with the default `LoadOptions`: the process's environment and the config
