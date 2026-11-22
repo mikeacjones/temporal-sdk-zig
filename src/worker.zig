@@ -393,8 +393,10 @@ pub const Worker = struct {
     /// couldn't be allocated). See `fatalMessage`.
     fatal: ?PollError = null,
     fatal_message: ?[]u8 = null,
-    /// How many times `run` has been called; the current or last run's number. Guarded by
-    /// `stop_mutex`.
+    /// The current or last run's number: `run` raises it when it starts. Guarded by
+    /// `stop_mutex`. `testing.WorkflowEnvironment` also raises it, and settles it if the spawn
+    /// fails, before it spawns `run` on another task, so its `waitUntilRunning` can't report
+    /// the previous run; it is never lowered, and a run settles the number it ends at.
     run_generation: u64 = 0,
     /// The number of the last run that settled its start (`settleStart`): it registered the
     /// worker with its client and started polling, or it failed before getting there
@@ -645,7 +647,10 @@ pub const Worker = struct {
     ///
     /// `waitUntilRunning` reports this run while it is active and until the next `run` begins;
     /// a waiter blocked across a run boundary reports the run it sees when it is woken (see
-    /// `waitUntilRunning`).
+    /// `waitUntilRunning`). A run begins only when its task enters `run`, so on a reused Worker,
+    /// `waitUntilRunning` called right after `io.concurrent(run)` may report the previous
+    /// run's outcome, such as its failed start. To retry a start that failed, make a new
+    /// Worker and run that.
     pub fn run(w: *Worker) RunError!void {
         {
             w.stop_mutex.lockUncancelable(w.io);
@@ -1219,6 +1224,10 @@ pub const Worker = struct {
     /// whichever run it sees once it is woken: the run that ended if it was woken before the
     /// next began, otherwise the new one. A run after `stop` polls nothing, so it reports
     /// `error.WorkerFailedToStart`.
+    ///
+    /// On a reused Worker, calling it right after `io.concurrent(run)` may report the previous
+    /// run's outcome: the new task may not have entered `run` yet. To retry a start that
+    /// failed, make a new Worker, start its `run`, and wait on that.
     pub fn waitUntilRunning(w: *Worker) error{ Canceled, WorkerFailedToStart }!void {
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);

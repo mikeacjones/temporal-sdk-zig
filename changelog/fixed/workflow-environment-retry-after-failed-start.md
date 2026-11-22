@@ -1,0 +1,1 @@
+`testing.WorkflowEnvironment` no longer hangs when it starts its worker again after a first start that failed, for example with `error.NothingRegistered` before a workflow was registered. It could see the previous run's failed start, then wait for a run that was polling.
