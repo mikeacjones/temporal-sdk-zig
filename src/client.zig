@@ -14,6 +14,7 @@
 //! (`Options.codecs`) fails.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
 const proto_time = @import("proto_time.zig");
@@ -137,10 +138,10 @@ pub const Options = struct {
     /// gRPC status 1 (CANCELLED, "Timeout expired"), or 4 (DEADLINE_EXCEEDED) when the server
     /// gives up first, and isn't retried. Calls that wait on the server, such as
     /// waiting for a workflow's result or an update's outcome, aren't limited by it, and
-    /// workers' own calls aren't affected. It also bounds the first connection of a client
-    /// from `Client.init`, which a call makes. `RpcOptions.timeout` replaces it for the calls
-    /// of a view from `Client.withRpcOptions`. Null keeps sdk-core's default of 30 s. Must be
-    /// positive; under 1 ms counts as 1 ms.
+    /// workers' own calls aren't affected. It also bounds `Client.connect`, and the first
+    /// connection of a client from `Client.init`, which a call makes. `RpcOptions.timeout`
+    /// replaces it for the calls of a view from `Client.withRpcOptions`. Null keeps sdk-core's
+    /// default of 30 s. Must be positive; under 1 ms counts as 1 ms.
     rpc_timeout: ?Duration = null,
 
     pub const KeepAlive = struct {
@@ -377,11 +378,24 @@ fn connectionBridgeOptions(arena: Allocator, io: Io, identity: []const u8, optio
     return bridge_options;
 }
 
+// Test hook, read only when builtin.is_test. Tests that set it reset it.
+/// When set, `logConnectFailure` writes its line here, with a newline, instead of logging it.
+var test_connect_failure_log: ?*Io.Writer = null;
+
 fn logConnectFailure(comptime attempt: Attempt, host_port: []const u8, reason: []const u8) void {
+    const format = switch (attempt) {
+        .connect => "connecting to {s} failed: {s}",
+        .first_use => "connecting to {s} failed; the client stays unconnected and its next call tries again: {s}",
+        .reconnect => "reconnecting to {s} failed, keeping the current connection: {s}",
+    };
+    const args = .{ host_port, reason };
+    if (builtin.is_test) if (test_connect_failure_log) |w| {
+        w.print(format ++ "\n", args) catch {};
+        return;
+    };
     switch (attempt) {
-        .connect => log.err("connecting to {s} failed: {s}", .{ host_port, reason }),
-        .first_use => log.warn("connecting to {s} failed; the client stays unconnected and its next call tries again: {s}", .{ host_port, reason }),
-        .reconnect => log.warn("reconnecting to {s} failed, keeping the current connection: {s}", .{ host_port, reason }),
+        .connect => log.err(format, args),
+        .first_use, .reconnect => log.warn(format, args),
     }
 }
 
@@ -552,7 +566,8 @@ pub const InitError = error{ OutOfMemory, InvalidOptions, RuntimeInitFailed };
 
 /// What `Client.connect`, `Client.ensureConnected` and `Client.reconnect` return:
 /// `InitError`, or `ConnectFailed` when the server couldn't be reached or refused the
-/// connection, or didn't answer within the call's deadline (logged with the reason).
+/// connection, or didn't answer within its deadline (`Options.rpc_timeout` for `connect` and
+/// for a first connection on use), logged with the reason.
 /// `InvalidOptions` also covers a TLS file that couldn't be read when connecting.
 /// `Canceled` comes only from a call that makes a first connection on use
 /// (`ensureConnected`, `currentConnection`) when its task is canceled. The attempt goes on
@@ -595,14 +610,17 @@ const Shared = struct {
     /// The calls waiting for `connecting`; calls still waiting for an attempt that was
     /// cleared aren't counted.
     connecting_waiters: u32 = 0,
-    /// `pending_updates` when `connecting` started.
-    connecting_updates: u64 = 0,
+    /// `pending_updates` when `connecting` started; null when it was rejoined after being
+    /// abandoned, so `finishConnecting` applies the latest `api_key` and `headers` to it.
+    connecting_updates: ?u64 = null,
     /// Locked exactly while `connecting` is set, by the call that sets it and unlocked by the
     /// call that clears it; nothing waits on it.
     connect_mutex: Io.Mutex = .init,
     /// Cleared attempts whose callback hadn't run when they were cleared, each with a
-    /// reference: `destroy` frees those called back since, and leaves the runtime to the
-    /// rest.
+    /// reference, oldest abandoned first. Together with `connecting`, at most
+    /// `Client.max_connect_attempts_in_flight`: at that limit `firstConnection` rejoins the
+    /// first instead of starting another. `destroy` frees those called back since, and
+    /// leaves the runtime to the rest.
     abandoned_attempts: std.ArrayList(*bridge.Connection.Connecting) = .empty,
     /// Connections `reconnect` replaced, freed by `destroy`: calls already sent on one may
     /// still be using it.
@@ -676,6 +694,10 @@ pub const Client = struct {
 
     /// Connects and checks the server. Close with `close`. Fails, with the reason logged,
     /// when an option is rejected or the server can't be reached.
+    /// Waits for the server until `Options.rpc_timeout` (30 s without one), without
+    /// cancellation; a server that hasn't answered by then fails it with
+    /// `error.ConnectFailed`. sdk-core may still be making that attempt (it has no deadline of
+    /// its own), and the client's runtime is then left to it as `close` describes.
     pub fn connect(gpa: Allocator, io: Io, options: Options) ConnectError!Client {
         var c = try create(gpa, io, options, .connect);
         errdefer c.close();
@@ -694,11 +716,14 @@ pub const Client = struct {
     /// (30 s without one) from when the call began; canceling a call's task returns
     /// `error.Canceled` from it. The attempt goes on for the calls still waiting, and once
     /// none is, a later call starts another. `updateApiKey` and `updateHeaders` don't wait
-    /// for it, and what they change is sent on the new connection. A connection that fails or
-    /// doesn't answer in time is logged as a warning with the reason and leaves the client
-    /// unconnected, so a later call tries again: `ensureConnected` and `currentConnection`
-    /// return the `ConnectError`, the client's other calls `error.RpcFailed`, and
-    /// `worker.Worker.run` `error.ConnectFailed`. Close with `close`, connected or not, once
+    /// for it, and what they change is sent on the new connection. A client keeps at most 4
+    /// connection attempts in flight, the one in progress and those every call gave up on
+    /// while sdk-core still makes them. Once 4 are, a call that would start another waits
+    /// instead, until its own deadline, for the one abandoned longest ago. A connection that
+    /// fails or doesn't answer in time is logged as a warning with the reason and leaves the
+    /// client unconnected, so a later call tries again: `ensureConnected` and
+    /// `currentConnection` return the `ConnectError`, the client's other calls
+    /// `error.RpcFailed`, and `worker.Worker.run` `error.ConnectFailed`. Close with `close`, connected or not, once
     /// no call is running.
     pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Client {
         return create(gpa, io, options, .first_use);
@@ -1109,13 +1134,14 @@ pub const Client = struct {
 
     /// The connection, connecting first if there is none: every call shares one attempt and
     /// waits for it until its own deadline (`Options.rpc_timeout` from now), its `stop` flag,
-    /// or a cancel of its task, whichever comes first. A `.connect` waits without either.
+    /// or a cancel of its task, whichever comes first. A `.connect` waits until its deadline,
+    /// without either.
     fn firstConnection(c: *Client, comptime attempt: Attempt, stop: ?*const std.atomic.Value(bool)) (ConnectError || error{Stopped})!bridge.Connection {
         // sdk-core's connect has no deadline of its own: a first connection made by a call
-        // gets the call's, counted from now.
+        // gets the call's, counted from now, and so does `Client.connect`.
         const deadline: ?Io.Clock.Timestamp = switch (attempt) {
-            .first_use => .fromNow(c.io, .{ .raw = .fromMilliseconds(if (c.callDeadlineMs() > 0) c.callDeadlineMs() else default_rpc_timeout_ms), .clock = .awake }),
-            else => null,
+            .first_use, .connect => .fromNow(c.io, .{ .raw = .fromMilliseconds(if (c.callDeadlineMs() > 0) c.callDeadlineMs() else default_rpc_timeout_ms), .clock = .awake }),
+            .reconnect => null,
         };
         const connecting = blk: {
             c.shared.connection_mutex.lockUncancelable(c.io);
@@ -1130,13 +1156,21 @@ pub const Client = struct {
                     const p = c.shared.abandoned_attempts.items[i];
                     if (p.calledBack()) {
                         _ = p.unref();
-                        _ = c.shared.abandoned_attempts.swapRemove(i);
+                        _ = c.shared.abandoned_attempts.orderedRemove(i);
                     } else i += 1;
                 }
                 try c.shared.abandoned_attempts.ensureUnusedCapacity(c.gpa, 1);
-                // Starting doesn't wait on the network: the core connects on its own threads.
-                c.shared.connecting = try startConnecting(c.gpa, c.io, c.shared.runtime, c.identity, c.shared.pending_connection.?.options, attempt);
-                c.shared.connecting_updates = c.shared.pending_updates;
+                if (c.shared.abandoned_attempts.items.len >= max_connect_attempts_in_flight) {
+                    // At the limit: wait on the attempt abandoned longest ago instead of
+                    // starting another. Its reference moves from the list to `connecting`,
+                    // and the slot it frees keeps room for it if it is abandoned again.
+                    c.shared.connecting = c.shared.abandoned_attempts.orderedRemove(0);
+                    c.shared.connecting_updates = null;
+                } else {
+                    // Starting doesn't wait on the network: the core connects on its own threads.
+                    c.shared.connecting = try startConnecting(c.gpa, c.io, c.shared.runtime, c.identity, c.shared.pending_connection.?.options, attempt);
+                    c.shared.connecting_updates = c.shared.pending_updates;
+                }
                 c.shared.connect_mutex.lockUncancelable(c.io);
             }
             const connecting = c.shared.connecting.?;
@@ -1147,7 +1181,14 @@ pub const Client = struct {
         // Never the reference that orphans it: `connecting` or `abandoned_attempts` holds one
         // until the callback has finished.
         defer _ = connecting.unref();
-        const waited: error{ Timeout, Canceled, Stopped }!void = if (attempt == .connect) connecting.waitUncancelable() else connecting.wait(deadline, stop);
+        const waited: error{ Timeout, Canceled, Stopped }!void = if (attempt == .connect) blk: {
+            const prev = c.io.swapCancelProtection(.blocked);
+            defer _ = c.io.swapCancelProtection(prev);
+            break :blk connecting.wait(deadline, null) catch |err| switch (err) {
+                error.Canceled, error.Stopped => unreachable,
+                error.Timeout => error.Timeout,
+            };
+        } else connecting.wait(deadline, stop);
 
         c.shared.connection_mutex.lockUncancelable(c.io);
         defer c.shared.connection_mutex.unlock(c.io);
@@ -1160,7 +1201,11 @@ pub const Client = struct {
             error.Canceled => return error.Canceled,
             error.Stopped => return error.Stopped,
             error.Timeout => {
-                logConnectFailure(attempt, c.shared.pending_connection.?.options.host_port, "the server didn't answer within the call's deadline (Options.rpc_timeout)");
+                const host_port = c.shared.pending_connection.?.options.host_port;
+                switch (attempt) {
+                    .connect => logConnectFailure(.connect, host_port, "the server didn't answer within Options.rpc_timeout (30 s without one)"),
+                    else => logConnectFailure(attempt, host_port, "the server didn't answer within the call's deadline (Options.rpc_timeout)"),
+                }
                 return error.ConnectFailed;
             },
         };
@@ -1184,7 +1229,7 @@ pub const Client = struct {
             logConnectFailure(attempt, c.shared.pending_connection.?.options.host_port, connecting.failureMessage());
             return error.ConnectFailed;
         };
-        if (c.shared.pending_updates != updates) {
+        if (updates == null or c.shared.pending_updates != updates.?) {
             const latest = c.shared.pending_connection.?.options;
             conn.setApiKey(latest.api_key);
             setConnectionHeaders(conn, c.gpa, latest.headers) catch |err| {
@@ -1209,6 +1254,11 @@ pub const Client = struct {
 
     /// sdk-core's deadline for a call, which `Options.rpc_timeout` replaces.
     const default_rpc_timeout_ms = 30_000;
+
+    /// The most connection attempts a client keeps in flight: `connecting` and those in
+    /// `Shared.abandoned_attempts`. sdk-core's attempts can't be canceled, so this bounds the
+    /// sockets and core tasks a server that never answers holds.
+    const max_connect_attempts_in_flight = 4;
 
     fn connectionIfAny(c: *Client) ?bridge.Connection {
         c.shared.connection_mutex.lockUncancelable(c.io);
@@ -4011,22 +4061,77 @@ pub fn ActivityHandle(comptime T: type) type {
             }, a, &status) catch |err| return h.pauseError(err, status, "unpausing");
         }
 
-        /// Deletes the activity and its record; a running activity is terminated first.
-        /// Afterwards `describe` and `get` return `error.NotFound`, and visibility queries
-        /// stop listing it once they catch up. Returns `error.NotFound` for no such activity
-        /// and `error.RpcFailed` (logging the server's reason) for anything else the server
-        /// refuses.
+        /// Deletes the activity and its record; a running activity is terminated first. The
+        /// server removes the record in a task of its own after it accepts the request, and
+        /// `delete` waits for that: it returns once the server reports the deleted run as not
+        /// found, so afterwards `describe` and `get` return `error.NotFound`. Visibility
+        /// queries stop listing it once they catch up. A handle with no run ID deletes the
+        /// latest run. Returns `error.NotFound` for no such activity, `error.Canceled` if
+        /// canceled before the record is gone (the server may still delete it), and
+        /// `error.RpcFailed` (logging the server's reason) for anything else the server
+        /// refuses, or if checking that the record is gone fails.
         pub fn delete(h: *const Self) ActivityError!void {
             const c = h.client;
             var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
             defer arena_state.deinit();
             const a = arena_state.allocator();
+            // The wait needs a fixed run: describing the latest run could see one started
+            // under the same ID after the delete.
+            const run_id = if (h.run_id.len > 0) h.run_id else run_id: {
+                const response = c.rpc(wfs.DescribeActivityExecutionResponse, "DescribeActivityExecution", wfs.DescribeActivityExecutionRequest{
+                    .namespace = c.namespace,
+                    .activity_id = h.id,
+                }, a) catch |err| switch (err) {
+                    error.AlreadyExists => return error.InvalidResponse,
+                    else => |e| return e,
+                };
+                const latest = if (response.run_id.len > 0) response.run_id else if (response.info) |info| info.run_id else "";
+                if (latest.len == 0) {
+                    log.err("DescribeActivityExecution for activity {s} returned no run ID, so deleting it cannot wait for its record to go", .{h.id});
+                    return error.InvalidResponse;
+                }
+                break :run_id latest;
+            };
             var status: ?Client.RpcStatus = null;
             _ = c.rpcWithStatus(wfs.DeleteActivityExecutionResponse, "DeleteActivityExecution", wfs.DeleteActivityExecutionRequest{
                 .namespace = c.namespace,
                 .activity_id = h.id,
-                .run_id = h.run_id,
+                .run_id = run_id,
             }, a, &status) catch |err| return h.controlError(err, status, "deleting");
+            try h.waitUntilDeleted(run_id);
+        }
+
+        /// Describes run `run_id` until the server reports it not found, with backoff.
+        fn waitUntilDeleted(h: *const Self, run_id: []const u8) ActivityError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            // Doubling from 10 ms; the cap keeps a long wait under the namespace's rate limit.
+            var delay: Io.Duration = .fromMilliseconds(10);
+            const max_delay: Io.Duration = .fromMilliseconds(500);
+            while (true) {
+                _ = arena_state.reset(.retain_capacity);
+                var status: ?Client.RpcStatus = null;
+                _ = c.rpcWithStatus(wfs.DescribeActivityExecutionResponse, "DescribeActivityExecution", wfs.DescribeActivityExecutionRequest{
+                    .namespace = c.namespace,
+                    .activity_id = h.id,
+                    .run_id = run_id,
+                }, arena_state.allocator(), &status) catch |err| switch (err) {
+                    error.NotFound => return,
+                    error.AlreadyExists => return error.InvalidResponse,
+                    error.RpcFailed => {
+                        if (status) |s| {
+                            log.err("the server accepted deleting activity {s} run {s}, but checking that its record is gone failed: {s} (gRPC status {d})", .{ h.id, run_id, s.message, s.code });
+                        } else {
+                            log.err("the server accepted deleting activity {s} run {s}, but checking that its record is gone failed", .{ h.id, run_id });
+                        }
+                        return error.RpcFailed;
+                    },
+                    else => |e| return e,
+                };
+                try c.io.sleep(delay, .awake);
+                delay = .fromNanoseconds(@min(delay.nanoseconds * 2, max_delay.nanoseconds));
+            }
         }
     };
 }
@@ -6592,6 +6697,55 @@ test "closing a client from init returns while a first connection it gave up on 
     silent.deinit(testing.io);
     thread.join();
     try testing.expect(returned);
+}
+
+test "connect gives up within rpc_timeout on a server that never answers the TLS handshake" {
+    // A listener that never accepts: the kernel completes the TCP handshake, and the core's
+    // TLS handshake then waits for a server hello that never comes.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    // Resets the connection the core's abandoned attempt made, which then ends.
+    defer silent.deinit(testing.io);
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+
+    // `connect` logs its failure as an error, which would fail the test: capture it.
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_connect_failure_log = &logged.writer;
+    defer test_connect_failure_log = null;
+
+    const start = Io.Clock.awake.now(testing.io);
+    try testing.expectError(error.ConnectFailed, Client.connect(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .tls = .{}, .rpc_timeout = .fromMilliseconds(100) }));
+    const waited = start.durationTo(Io.Clock.awake.now(testing.io));
+    try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
+    const line = logged.written();
+    try testing.expect(std.mem.indexOf(u8, line, "didn't answer within Options.rpc_timeout") != null);
+    try testing.expect(std.mem.indexOf(u8, line, host_port) != null);
+}
+
+test "a client from init keeps at most max_connect_attempts_in_flight connection attempts however many calls give up" {
+    // The failed first calls are logged as warnings.
+    testing.log_level = .err;
+    // A listener that never accepts: every attempt is stuck in the TLS handshake.
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var silent = try any.listen(testing.io, .{});
+    var buf: [32]u8 = undefined;
+    const host_port = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{silent.socket.address.getPort()});
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = host_port, .core_log_level = null, .tls = .{}, .rpc_timeout = .fromMilliseconds(20) });
+    defer c.close();
+    // Before `close`: closing the listener resets the connections it never accepted, so the
+    // core's attempts end soon.
+    defer silent.deinit(testing.io);
+
+    for (0..3 * Client.max_connect_attempts_in_flight) |_| {
+        try testing.expectError(error.RpcFailed, c.checkHealth());
+        const in_flight = c.shared.abandoned_attempts.items.len + @intFromBool(c.shared.connecting != null);
+        try testing.expect(in_flight <= Client.max_connect_attempts_in_flight);
+    }
+    try testing.expect(c.shared.connecting == null);
+    try testing.expectEqual(@as(usize, Client.max_connect_attempts_in_flight), c.shared.abandoned_attempts.items.len);
+    for (c.shared.abandoned_attempts.items) |p| try testing.expect(!p.calledBack());
 }
 
 /// A failed ExecuteMultiOperation's status: `code` and `message`, with a

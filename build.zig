@@ -112,6 +112,34 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{ .root_module = test_module, .filters = test_filters, .test_runner = testRunner(b) });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&runTests(b, unit_tests, hang_report).step);
+    // CI runs the unit tests on Linux too, so on another host compile EphemeralServer's tests
+    // for Linux (no binary, so no Linux core library is needed): a std.c name that is void
+    // there, such as std.c.Stat or std.c.fstat, fails here instead of only in CI.
+    if (target.result.os.tag != .linux) {
+        const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu });
+        const linux_core_c = b.addTranslateC(.{
+            .root_source_file = core.header,
+            .target = linux_target,
+            .optimize = optimize,
+        }).createModule();
+        const linux_module = b.createModule(.{
+            .root_source_file = b.path("src/temporal.zig"),
+            .target = linux_target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
+                .{ .name = "core_c", .module = linux_core_c },
+            },
+        });
+        linux_module.addOptions("build_options", build_options);
+        const linux_tests = b.addTest(.{
+            .name = "unit-tests-ephemeral-server-linux-compile",
+            .root_module = linux_module,
+            .filters = if (test_filters.len > 0) test_filters else &.{"bridge.EphemeralServer.test."},
+        });
+        test_step.dependOn(&linux_tests.step);
+    }
 
     if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance);
     if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters, hang_report);
@@ -771,6 +799,23 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         });
         late.addArtifactArg(symbol_lock_late);
         late.addArg("--hang-report=1");
+
+        // A thread may keep taking and releasing std.debug's symbol lock, so that no single wait
+        // of the report's symbol helper lasts long; the report must still give up on symbols once
+        // the helper's waits add up to 1 s and reach its end line. The churner also shows that
+        // the waiting helper is named hang-report-sym, which on macOS only the thread itself can do.
+        const symbol_lock_churn = Fixture.build(b, "symbol-lock-churn", "symbol_lock_churn.zig", runner);
+        const churn = addCheckCase(b, in.test_step, tool, "hang report finishes while another thread keeps taking and releasing the symbol lock", 0);
+        churn.addArgs(&.{
+            "60",
+            "'symbol_lock_churn.test.waits while another thread keeps taking and releasing the symbol lock' is still running after ",
+            "symbol_lock_churn: a thread named hang-report-sym waits while this thread holds std.debug's symbol lock",
+            "another thread holds std.debug's symbol lock; the stacks that follow are bare addresses",
+            "end of the report for 'symbol_lock_churn.test.waits while another thread keeps taking and releasing the symbol lock'",
+            "--",
+        });
+        churn.addArtifactArg(symbol_lock_churn);
+        churn.addArg("--hang-report=1");
     }
 
     // zig build tsan

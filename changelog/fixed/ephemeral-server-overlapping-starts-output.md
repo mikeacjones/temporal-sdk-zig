@@ -1,0 +1,1 @@
+`bridge.EphemeralServer.startDevServer` and `startTestServer`, and so `testing.DevServer.start` and `testing.TestServer.start`, no longer leave the process's stdout and stderr pointing at /dev/null when two starts overlap in one process.

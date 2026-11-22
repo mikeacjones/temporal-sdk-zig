@@ -1,0 +1,1 @@
+`bridge.EphemeralServer.startDevServer` and `startTestServer`, and so `testing.DevServer.start` and `testing.TestServer.start`, no longer let the server process inherit the copies of this process's stdout and stderr they keep while redirecting its output, so a test process that crashes while a server runs no longer leaves `zig build test` waiting on its output pipe.

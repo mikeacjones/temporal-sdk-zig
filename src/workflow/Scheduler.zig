@@ -53,6 +53,9 @@ switches: std.atomic.Value(u64) = .init(0),
 /// longer than the deadlock limit and isn't workflow code: reading debug info to answer the
 /// stack trace query or to write a failure's stack trace. Never set while a fiber runs. Only the scheduler's thread writes it.
 sdk_work: std.atomic.Value(bool) = .init(false),
+/// Tests only: while non-zero, takeStack fails as Stack.map would and counts it down, before
+/// looking at the pool.
+fail_stack_maps: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
 
 pub const Options = struct {
     /// Usable stack bytes per fiber. Memory is reserved virtually and only touched pages
@@ -98,6 +101,30 @@ pub fn deinit(s: *Scheduler) void {
     for (s.free_stacks.items) |stack| stack.unmap();
     s.free_stacks.deinit(s.gpa);
     s.* = undefined;
+}
+
+/// Unmaps the stacks of every unfinished fiber, as if each had finished, and returns how many
+/// there were. Only for fibers that can never be resumed or woken again: none may be ready,
+/// and the caller must free, without following them, every pointer into those stacks (the
+/// Fiber headers and anything the fibers' frames held), since no defer of theirs runs.
+pub fn abandonLive(s: *Scheduler) usize {
+    assert(s.current == null);
+    assert(s.ready_head == null);
+    const count = s.live;
+    var it = s.live_head;
+    while (it) |f| {
+        // The header lives on the stack it describes: read it before unmapping.
+        const next = f.live_next;
+        const stack = f.stack;
+        assert(f.state == .blocked);
+        tsan.destroy(f.tsan_fiber);
+        stack.unmap();
+        it = next;
+    }
+    s.live = 0;
+    s.live_head = null;
+    s.live_tail = null;
+    return count;
 }
 
 /// Like `deinit`, for fibers that refuse to exit: frees the pooled stacks and the pool's
@@ -492,6 +519,10 @@ fn initialStack(f: *Fiber) usize {
 }
 
 fn takeStack(s: *Scheduler) !Stack {
+    if (builtin.is_test and s.fail_stack_maps > 0) {
+        s.fail_stack_maps -= 1;
+        return error.OutOfMemory;
+    }
     if (s.free_stacks.pop()) |stack| return stack;
     return Stack.map(s.options.stack_size);
 }
@@ -600,6 +631,44 @@ test "a blocked fiber resumes after wake on the next run" {
     s.run();
     try testing.expectEqualSlices(u32, &.{ 1, 2 }, log.items());
     try testing.expectEqual(@as(usize, 0), s.live);
+}
+
+test "spawn fails without touching the stack pool while fail_stack_maps is set" {
+    var s: Scheduler = .init(testing.allocator, .{});
+    defer s.deinit();
+    var log: Log = .{};
+    _ = try s.spawn("y", yielder, .{ &s, &log, 1, 0 });
+    s.run();
+    try testing.expectEqual(@as(usize, 1), s.free_stacks.items.len);
+
+    s.fail_stack_maps = 1;
+    try testing.expectError(error.OutOfMemory, s.spawn("y", yielder, .{ &s, &log, 2, 0 }));
+    try testing.expectEqual(@as(u32, 0), s.fail_stack_maps);
+    try testing.expectEqual(@as(usize, 1), s.free_stacks.items.len);
+    try testing.expectEqual(@as(usize, 0), s.live);
+
+    _ = try s.spawn("y", yielder, .{ &s, &log, 3, 0 });
+    try testing.expectEqual(@as(usize, 0), s.free_stacks.items.len);
+    s.run();
+    try testing.expectEqualSlices(u32, &.{ 101, 103 }, log.items());
+}
+
+test "abandonLive unmaps blocked fibers so deinit sees none live" {
+    var s: Scheduler = .init(testing.allocator, .{});
+    defer s.deinit();
+    var log: Log = .{};
+    var first: Gate = .{ .log = &log };
+    var second: Gate = .{ .log = &log };
+    _ = try s.spawn("waiter", waitOnGate, .{ &s, &first });
+    _ = try s.spawn("waiter", waitOnGate, .{ &s, &second });
+    _ = try s.spawn("y", yielder, .{ &s, &log, 7, 0 });
+    s.run();
+    try testing.expectEqual(@as(usize, 2), s.live);
+    try testing.expectEqual(@as(usize, 2), s.abandonLive());
+    try testing.expectEqual(@as(usize, 0), s.live);
+    try testing.expectEqual(@as(?*Fiber, null), s.firstLive());
+    try testing.expectEqual(@as(usize, 1), s.stackCount());
+    try testing.expectEqualSlices(u32, &.{ 1, 1, 107 }, log.items());
 }
 
 test "switches counts each return of a fiber to the scheduler" {

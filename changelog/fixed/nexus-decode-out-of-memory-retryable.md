@@ -1,0 +1,1 @@
+A Nexus worker that runs out of memory while decoding a Nexus task fails the request as a retryable internal error, and logs that it ran out of memory, instead of failing the caller's operation as a non-retryable bad request. A task that is malformed is still a non-retryable bad request.

@@ -38,6 +38,7 @@ const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const Instance = @import("workflow/Instance.zig");
+const CancelBlockingAllocator = @import("CancelBlockingAllocator.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -197,7 +198,10 @@ pub const Options = struct {
     /// `.error_tracing = true` on the executable's root module and the module with the
     /// workflows and activities), and only one whose debug info the worker can read;
     /// otherwise the stack trace is empty. A failure passed on unchanged (a future's failure,
-    /// `ctx.failWith`) keeps its own.
+    /// `ctx.failWith`) keeps its own. The first worker of a process reads the executable's
+    /// debug info before it starts polling, so its start takes that read's time (in a large
+    /// Debug build, seconds) and a failed activity's completion doesn't. `stop` doesn't wait
+    /// for the read; `Worker.deinit` does.
     failure_stack_traces: bool = true,
     /// Errors that fail the workflow task instead of the workflow when a workflow function,
     /// signal handler, or update handler returns them, for every workflow of this worker. A
@@ -385,12 +389,19 @@ pub const Worker = struct {
     interceptors: []const interceptor.Worker = &.{},
     /// The sessions this worker holds, while `run` is active with `options.sessions`.
     session_host: ?*SessionHost = null,
+    /// The process's first read of the executable's debug info, when this worker started it
+    /// (`warmDebugInfo`). `deinit` joins it; `run` doesn't, so that `stop` ends `run` at once.
+    debug_info_read: ?Io.Future(void) = null,
+    /// Set when `debug_info_read` ends and by `stop`: wakes `run`'s wait for the read. Never
+    /// reset (`awaitDebugInfo`).
+    debug_info_wake: Io.Event = .unset,
 
     pub fn init(gpa: Allocator, io: Io, client: *client_mod.Client, task_queue: []const u8, options: Options) error{OutOfMemory}!Worker {
         return .{ .gpa = gpa, .io = io, .client = client, .task_queue = try gpa.dupe(u8, task_queue), .options = options };
     }
 
     pub fn deinit(w: *Worker) void {
+        if (w.debug_info_read) |*f| f.await(w.io);
         w.workflows.deinit(w.gpa);
         w.activities.deinit(w.gpa);
         w.nexus_services.deinit(w.gpa);
@@ -618,6 +629,10 @@ pub const Worker = struct {
         const registered: Registered = .{ .workflows = w.hasWorkflows(), .activities = w.hasActivities(), .nexus = w.hasNexusServices() };
         try checkOptions(w.options, w.task_queue, registered);
         const strategy = try w.versioningStrategy();
+        // Read while the worker connects and creates its core; `awaitDebugInfo` waits for it
+        // before the worker polls, so no activity fails before it is done.
+        if (w.readsDebugInfo() and w.debug_info_read == null and !debug_info_warm.load(.acquire))
+            w.debug_info_read = w.io.concurrent(warmDebugInfo, .{w}) catch null;
         var core_options = coreOptions(w.options, w.client.namespace, w.task_queue, strategy, registered);
         const nondeterminism_types = try w.nondeterminismFailTypes();
         defer w.gpa.free(nondeterminism_types);
@@ -707,10 +722,16 @@ pub const Worker = struct {
             w.core_ptrs = @splat(null);
             w.stop_mutex.unlock(w.io);
         }
-        log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
-        if (host) |h| log.info("Worker hosts sessions TaskQueue={s} SessionTaskQueue={s} HostTaskQueue={s}", .{ w.task_queue, h.creation_queue, h.host_queue });
-        running = true;
-        w.started.set(w.io);
+        // Stopped first, the worker has started nothing (`waitUntilRunning` says so), but
+        // its loops still run: a core is finalized only after each of its pollers has seen
+        // the shutdown `stop` began, and one finalized without ever being polled for
+        // activities never finishes. They return at once.
+        if (w.awaitDebugInfo()) {
+            log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
+            if (host) |h| log.info("Worker hosts sessions TaskQueue={s} SessionTaskQueue={s} HostTaskQueue={s}", .{ w.task_queue, h.creation_queue, h.host_queue });
+            running = true;
+            w.started.set(w.io);
+        } else log.info("Worker stopped before it polled TaskQueue={s}", .{w.task_queue});
 
         var workflows_done = if (w.hasWorkflows()) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
         // Once a loop polls a core, returning early would free the core worker under it: shut
@@ -782,6 +803,29 @@ pub const Worker = struct {
         if (start_failed) |err| return err;
         if (poll_failed) |err| return err;
         if (shutdown_failed) |err| return err;
+    }
+
+    /// Whether this worker puts stack traces in failures, which read the executable's debug
+    /// info (`warmDebugInfo`).
+    fn readsDebugInfo(w: *const Worker) bool {
+        return w.options.failure_stack_traces and @errorReturnTrace() != null;
+    }
+
+    /// Waits until the executable's debug info is read (`warmDebugInfo`), or until `stop`;
+    /// false when stopped first. `run` calls it before it polls, so no failed activity's
+    /// completion waits for the read (bead temporal-sdk-zig-d51.1.34), and `stop` still ends
+    /// `run` at once. Reads it here when it couldn't start beside the worker.
+    fn awaitDebugInfo(w: *Worker) bool {
+        if (!w.readsDebugInfo()) return true;
+        if (w.debug_info_read == null and !debug_info_warm.load(.acquire)) warmDebugInfo(w);
+        // Never reset: both conditions only turn true, and each is stored before the event is
+        // set (`warmDebugInfo`, `stop`), so a set event means one of them holds. A reset here
+        // could be ordered after a set and lose it (store buffering on x86-TSO).
+        while (true) {
+            if (debug_info_warm.load(.acquire)) return true;
+            if (w.stopping.load(.acquire)) return false;
+            w.debug_info_wake.waitUncancelable(w.io);
+        }
     }
 
     /// Reports a poll loop that couldn't start while others already poll, and shuts every
@@ -1057,8 +1101,10 @@ pub const Worker = struct {
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
         w.stop_requested = true;
-        // Sets `stopping`, which a wait for the client's first connection checks once woken.
+        // Sets `stopping`, which a wait for the client's first connection or for the debug
+        // info (`awaitDebugInfo`) checks once woken.
         w.notifyActivitiesOfStop();
+        w.debug_info_wake.set(w.io);
         if (w.waiting_for_connection) w.client.wakeConnecting();
         for (w.core_ptrs) |p| if (p) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
     }
@@ -1123,6 +1169,11 @@ pub const Worker = struct {
     /// The sink this worker's workflow and activity loggers write to.
     fn logSink(w: *const Worker) log_mod.Sink {
         return w.options.logger orelse w.client.logger;
+    }
+
+    /// A logger with no context fields on `logSink`, for the worker's own records.
+    fn logger(w: *const Worker) log_mod.Logger {
+        return .{ .sink = w.logSink() };
     }
 
     /// Runs until the process receives SIGINT or SIGTERM. One signal stops every worker in
@@ -1768,23 +1819,59 @@ pub const WorkflowRunner = struct {
 /// The run ID of a serialized WorkflowActivation (field 1), read without decoding or
 /// allocating; null if it is missing, empty, or the bytes are malformed.
 fn runId(bytes: []const u8) ?[]const u8 {
+    const id = bytesField(bytes, 1) orelse return null;
+    return if (id.len > 0) id else null;
+}
+
+/// The first length-delimited field `number` of serialized protobuf `bytes`, read without
+/// decoding or allocating. A field that is present but empty gives an empty slice; a missing
+/// field, or malformed bytes before it, gives null.
+fn bytesField(bytes: []const u8, number: u64) ?[]const u8 {
     var i: usize = 0;
     while (i < bytes.len) {
-        const tag = readVarint(bytes, &i) orelse return null;
-        switch (tag & 7) {
-            0 => _ = readVarint(bytes, &i) orelse return null,
-            1 => i = std.math.add(usize, i, 8) catch return null,
-            2 => {
-                const len = std.math.cast(usize, readVarint(bytes, &i) orelse return null) orelse return null;
-                if (len > bytes.len - i) return null;
-                if (tag >> 3 == 1) return if (len > 0) bytes[i..][0..len] else null;
-                i += len;
-            },
-            5 => i = std.math.add(usize, i, 4) catch return null,
-            else => return null,
-        }
+        const field = nextField(bytes, &i) orelse return null;
+        if (field.number == number) switch (field.value) {
+            .bytes => |b| return b,
+            else => {},
+        };
     }
     return null;
+}
+
+/// The first varint field `number` of serialized protobuf `bytes`, read as `bytesField` reads
+/// its field; null if it is missing or the bytes before it are malformed.
+fn varintField(bytes: []const u8, number: u64) ?u64 {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const field = nextField(bytes, &i) orelse return null;
+        if (field.number == number) switch (field.value) {
+            .varint => |v| return v,
+            else => {},
+        };
+    }
+    return null;
+}
+
+/// The protobuf field at `i.*`, which is moved past it; null for malformed bytes.
+fn nextField(bytes: []const u8, i: *usize) ?struct { number: u64, value: union(enum) { varint: u64, bytes: []const u8, fixed } } {
+    const tag = readVarint(bytes, i) orelse return null;
+    const number = tag >> 3;
+    switch (tag & 7) {
+        0 => return .{ .number = number, .value = .{ .varint = readVarint(bytes, i) orelse return null } },
+        2 => {
+            const len = std.math.cast(usize, readVarint(bytes, i) orelse return null) orelse return null;
+            if (len > bytes.len - i.*) return null;
+            defer i.* += len;
+            return .{ .number = number, .value = .{ .bytes = bytes[i.*..][0..len] } };
+        },
+        1, 5 => |t| {
+            const size: usize = if (t == 1) 8 else 4;
+            if (size > bytes.len - i.*) return null;
+            i.* += size;
+            return .{ .number = number, .value = .fixed };
+        },
+        else => return null,
+    }
 }
 
 fn readVarint(bytes: []const u8, i: *usize) ?u64 {
@@ -1853,14 +1940,13 @@ fn activityLoop(w: *Worker, core: bridge.Worker, task_queue: []const u8) void {
             w.pollFailed(.activity, task_queue, err, message);
             continue;
         } orelse break;
-        const run = receiveActivityTask(w, &running, polled, task_queue) orelse continue;
+        const run = receiveActivityTask(w, core, &running, polled, task_queue) orelse continue;
         // Each activity gets its own thread: `async` would run it inline in this loop once the
         // Io has as many busy threads as CPUs, running activities one at a time. The core's
-        // activity slots bound how many run at once.
-        group.concurrent(w.io, superviseActivity, .{ w, core, &running, run }) catch {
-            log.warn("no thread available for an activity; running it on the polling thread", .{});
-            superviseActivity(w, core, &running, run);
-        };
+        // activity slots bound how many run at once. Never run on this thread: the cancel for
+        // an activity arrives in a later poll of this loop, as do other activities' tasks.
+        group.concurrent(w.io, superviseActivity, .{ w, core, &running, run }) catch
+            finishActivity(w, core, &running, run, noThreadForActivity(run));
     }
     group.await(w.io) catch {};
 }
@@ -1876,6 +1962,8 @@ const RunningActivities = struct {
 
 /// One activity, from its Start task until its result is reported.
 const RunningActivity = struct {
+    /// w.gpa with cancels blocked around each call; backs arena.
+    task_gpa: CancelBlockingAllocator,
     arena: std.heap.ArenaAllocator,
     polled: bridge.Worker.Polled,
     /// The task queue of the core that polled the activity; outlives the run.
@@ -1883,8 +1971,8 @@ const RunningActivity = struct {
     task_token: []const u8,
     start: task_pb.Start,
     ctx: activity.Context,
-    /// What the codecs see for this activity's payloads: its identity, and once its header is
-    /// decoded, `ctx.propagated_`.
+    /// What the codecs see for this activity's payloads: its identity, set when the Start task
+    /// is received, and once its header is decoded, `ctx.propagated_`.
     codec_context: converter.Context = .{},
     /// Set when the activity returns or a cancel arrives; wakes the supervisor.
     wake: Io.Event = .unset,
@@ -1896,100 +1984,178 @@ const RunningActivity = struct {
     }
 };
 
-/// `w.gpa` with cancels blocked around each call: the memory behind an activity's or a Nexus
-/// request's arena (`activity.Context.allocator`, and the SDK's decoding into it). The worker
-/// cancels such a task once, and an allocation can wait on the task's `std.Io` without
-/// returning the error (in Debug, std's stack capture waits for its debug info lock and drops
-/// a cancel), which would leave the task running for good. Blocked, the cancel reaches the
-/// task's next wait. Valid while `w` is: arenas made with it are freed before `run` returns.
-fn taskAllocator(w: *Worker) Allocator {
-    return .{ .ptr = w, .vtable = &TaskAllocator.vtable };
-}
+/// An activity task's token and kind, read from its bytes without decoding or allocating.
+/// Borrows `bytes`.
+const ActivityTaskHead = struct {
+    token: []const u8,
+    kind: union(enum) { start, cancel: task_pb.ActivityCancelReason },
 
-const TaskAllocator = struct {
-    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
-
-    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        return w.gpa.rawAlloc(len, alignment, ret_addr);
-    }
-
-    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        return w.gpa.rawResize(memory, alignment, new_len, ret_addr);
-    }
-
-    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        return w.gpa.rawRemap(memory, alignment, new_len, ret_addr);
-    }
-
-    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const w: *Worker = @ptrCast(@alignCast(ptr));
-        const prev = w.io.swapCancelProtection(.blocked);
-        defer _ = w.io.swapCancelProtection(prev);
-        w.gpa.rawFree(memory, alignment, ret_addr);
+    /// Null without a token or a variant, or for malformed bytes.
+    fn read(bytes: []const u8) ?ActivityTaskHead {
+        const token = bytesField(bytes, 1) orelse return null;
+        if (token.len == 0) return null;
+        if (bytesField(bytes, 3) != null) return .{ .token = token, .kind = .start };
+        // A Cancel with reason NOT_FOUND (0) and no details is empty on the wire.
+        const cancel = bytesField(bytes, 4) orelse return null;
+        const reason = varintField(cancel, 1) orelse 0;
+        return .{ .token = token, .kind = .{ .cancel = @fromBackingInt(@as(i32, @bitCast(@as(u32, @truncate(reason))))) } };
     }
 };
 
-/// Decodes a polled activity task. Returns a new run for a Start task; delivers a Cancel
-/// task to its run and returns null.
-fn receiveActivityTask(w: *Worker, running: *RunningActivities, polled: bridge.Worker.Polled, task_queue: []const u8) ?*RunningActivity {
+/// Room for `encodeFailedActivityCompletion`: the first 4 KiB build the failure, the rest
+/// hold its encoding.
+const failed_activity_completion_len = 3 * 4096;
+
+/// A failed ActivityTaskCompletion for `token`, built and encoded in `buffer` without the
+/// heap, for a worker out of memory. Null when it doesn't fit (a token or message longer than
+/// about 7 KiB).
+fn encodeFailedActivityCompletion(buffer: *[failed_activity_completion_len]u8, token: []const u8, failure: failure_mod.Application) ?[]const u8 {
+    var fba: std.heap.FixedBufferAllocator = .init(buffer[0..4096]);
+    const fa = fba.allocator();
+    const f = failure_mod.application(fa, failure) catch return null;
+    const completion: proto.coresdk.self.ActivityTaskCompletion = .{ .task_token = token, .result = .{ .status = .{ .failed = .{ .failure = f } } } };
+    var writer: Io.Writer = .fixed(buffer[4096..]);
+    completion.encode(&writer, fa) catch return null;
+    return writer.buffered();
+}
+
+/// Completes the activity task `token` as failed with `failure`, without the heap: the core
+/// keeps a task's slot until it is completed, and the likeliest reason to need this is
+/// running out of memory. `token` must stay valid during the call.
+fn failActivityTask(w: *Worker, core: bridge.Worker, token: []const u8, failure: failure_mod.Application) void {
+    var buffer: [failed_activity_completion_len]u8 = undefined;
+    const completion = encodeFailedActivityCompletion(&buffer, token, failure) orelse
+        return w.logger().err("Activity task token is too long to fail without memory; its slot stays held until the worker stops", .{ .TaskTokenLength = token.len });
+    sendActivityCompletion(w, core, completion);
+}
+
+/// Hands an encoded ActivityTaskCompletion to the core. The bridge allocates the cell it waits
+/// in before the core sees the completion, so on `error.OutOfMemory` it is sent again with
+/// the cell on the stack (safe for the reason `WorkflowRunner.sendCompletion` gives).
+fn sendActivityCompletion(w: *Worker, core: bridge.Worker, completion: []const u8) void {
+    var message: ?[]u8 = null;
+    defer if (message) |m| w.gpa.free(m);
+    core.completeActivityTask(w.gpa, w.io, completion, &message) catch |err| switch (err) {
+        error.OutOfMemory => {
+            var cell: [256]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&cell);
+            core.completeActivityTask(fba.allocator(), w.io, completion, null) catch |e|
+                log.err("completing an activity task failed: {t}", .{e});
+        },
+        error.CompletionFailed => log.err("completing an activity task failed: {s}", .{message orelse @errorName(err)}),
+    };
+}
+
+/// Fails the activity task `token` as retryable after running out of memory, with
+/// `message_fmt` formatted on the stack (the plain text of `fallback` if it doesn't fit).
+fn failActivityOutOfMemory(w: *Worker, core: bridge.Worker, token: []const u8, comptime message_fmt: []const u8, args: anytype, fallback: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const message = std.fmt.bufPrint(&buf, message_fmt, args) catch fallback;
+    failActivityTask(w, core, token, .{ .message = message, .type = @errorName(error.OutOfMemory) });
+}
+
+/// Delivers a Cancel task to the run it names, if this worker is running it. Allocates
+/// nothing, so a cancel reaches its activity however short of memory the worker is.
+fn deliverActivityCancel(w: *Worker, running: *RunningActivities, token: []const u8, reason: task_pb.ActivityCancelReason) void {
+    running.mutex.lockUncancelable(w.io);
+    defer running.mutex.unlock(w.io);
+    const r = cancelReason(reason);
+    // A run that already finished has nothing to cancel.
+    const target = running.map.get(token) orelse {
+        log.debug("a cancel task ({t}) arrived for an activity this worker is not running; ignoring it", .{r});
+        return;
+    };
+    if (target.ctx.setCancelReason(r)) {
+        log.debug("activity {s}: cancel task received ({t}); waking its supervisor", .{ target.start.activity_id, r });
+        target.wake.set(w.io);
+    } else log.debug("activity {s}: cancel task received ({t}) after an earlier cancel ({t}); nothing to do", .{ target.start.activity_id, r, target.ctx.cancelReason().? });
+}
+
+/// Takes a polled activity task. Returns a new run for a Start task, tracked in `running` so
+/// cancels reach it; delivers a Cancel task to its run and returns null. A Start task that
+/// can't be decoded or tracked is failed, so the core releases its slot, and never runs.
+fn receiveActivityTask(w: *Worker, core: bridge.Worker, running: *RunningActivities, polled: bridge.Worker.Polled, task_queue: []const u8) ?*RunningActivity {
+    // `head.token` borrows `polled`: every failure below that uses it comes before the free.
+    const head = ActivityTaskHead.read(polled.bytes()) orelse {
+        w.logger().err("An activity task with no task token; it can't be completed", .{ .TaskQueue = task_queue });
+        polled.deinit();
+        return null;
+    };
+    switch (head.kind) {
+        .cancel => |reason| {
+            deliverActivityCancel(w, running, head.token, reason);
+            polled.deinit();
+            return null;
+        },
+        .start => {},
+    }
     const run = w.gpa.create(RunningActivity) catch {
-        log.err("out of memory receiving an activity task; the core will time it out", .{});
+        w.logger().err("Out of memory receiving an activity task; failing it as retryable so the server retries it", .{ .TaskQueue = task_queue });
+        failActivityTask(w, core, head.token, .{ .message = "the worker ran out of memory receiving the activity task", .type = @errorName(error.OutOfMemory) });
         polled.deinit();
         return null;
     };
     run.* = .{
-        .arena = .init(taskAllocator(w)),
+        .task_gpa = .{ .io = w.io, .backing = w.gpa },
+        .arena = undefined,
         .polled = polled,
         .task_queue = task_queue,
-        .task_token = &.{},
+        .task_token = head.token,
         .start = .{},
         .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = undefined, .logger_ = .{}, .client_ = w.client },
     };
+    run.arena = .init(run.task_gpa.allocator());
     var keep = false;
     defer if (!keep) run.destroy(w.gpa);
 
     var reader: Io.Reader = .fixed(polled.bytes());
     const task = task_pb.ActivityTask.decode(&reader, run.arena.allocator()) catch |err| {
-        log.err("decoding an activity task failed: {t}", .{err});
+        if (err == error.OutOfMemory) {
+            w.logger().err("Out of memory decoding an activity task; failing it as retryable so the server retries it", .{ .TaskQueue = task_queue });
+            failActivityTask(w, core, head.token, .{ .message = "the worker ran out of memory decoding the activity task", .type = @errorName(error.OutOfMemory) });
+        } else {
+            w.logger().err("Decoding an activity task failed; failing it as non-retryable", .{ .TaskQueue = task_queue, .Error = @errorName(err) });
+            var buf: [256]u8 = undefined;
+            const message = std.fmt.bufPrint(&buf, "the worker couldn't decode the activity task: {t}", .{err}) catch "the worker couldn't decode the activity task";
+            failActivityTask(w, core, head.token, .{ .message = message, .type = "ActivityTaskDecodeFailed", .non_retryable = true });
+        }
         return null;
     };
-    switch (task.variant orelse return null) {
-        .start => |s| {
-            run.task_token = task.task_token;
-            run.start = s;
-            running.mutex.lockUncancelable(w.io);
-            defer running.mutex.unlock(w.io);
-            running.map.put(w.gpa, run.task_token, run) catch
-                log.warn("out of memory tracking activity {s}; it runs, but cancels won't reach it", .{s.activity_id});
-            if (w.stopping.load(.acquire)) run.ctx.notifyWorkerStop();
-            keep = true;
-            return run;
-        },
-        .cancel => |c| {
-            running.mutex.lockUncancelable(w.io);
-            defer running.mutex.unlock(w.io);
-            const reason = cancelReason(c.reason);
-            // A run that already finished has nothing to cancel.
-            const target = running.map.get(task.task_token) orelse {
-                log.debug("a cancel task ({t}) arrived for an activity this worker is not running; ignoring it", .{reason});
-                return null;
-            };
-            if (target.ctx.setCancelReason(reason)) {
-                log.debug("activity {s}: cancel task received ({t}); waking its supervisor", .{ target.start.activity_id, reason });
-                target.wake.set(w.io);
-            } else log.debug("activity {s}: cancel task received ({t}) after an earlier cancel ({t}); nothing to do", .{ target.start.activity_id, reason, target.ctx.cancelReason().? });
-            return null;
-        },
+    const start: ?task_pb.Start = if (task.variant) |v| switch (v) {
+        .start => |s| s,
+        .cancel => null,
+    } else null;
+    run.start = start orelse {
+        w.logger().err("An activity task read as a Start decoded as something else; failing it as non-retryable", .{ .TaskQueue = task_queue });
+        failActivityTask(w, core, head.token, .{ .message = "the worker couldn't decode the activity task: it holds no Start", .type = "ActivityTaskDecodeFailed", .non_retryable = true });
+        return null;
+    };
+    // Set before anything can report the attempt: a failure the worker reports without
+    // running the activity (no thread for it) is encoded in the activity's context too.
+    const execution = run.start.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
+    run.codec_context = .{
+        .namespace = w.client.namespace,
+        .workflow_id = execution.workflow_id,
+        .workflow_type = run.start.workflow_type,
+        .activity_type = run.start.activity_type,
+        .activity_id = run.start.activity_id,
+    };
+    const tracked = tracked: {
+        running.mutex.lockUncancelable(w.io);
+        defer running.mutex.unlock(w.io);
+        running.map.put(w.gpa, run.task_token, run) catch break :tracked false;
+        if (w.stopping.load(.acquire)) run.ctx.notifyWorkerStop();
+        break :tracked true;
+    };
+    if (tracked) {
+        keep = true;
+        return run;
     }
+    // Untracked, the run couldn't be interrupted by a cancel or the worker's shutdown, so it
+    // doesn't run at all.
+    w.logger().err("Out of memory tracking an activity for cancellation; failing it as retryable so the server retries it", .{ .ActivityID = run.start.activity_id });
+    failActivityOutOfMemory(w, core, head.token, "the worker ran out of memory tracking activity {s} for cancellation", .{run.start.activity_id}, "the worker ran out of memory tracking the activity for cancellation");
+    return null;
 }
 
 fn cancelReason(reason: task_pb.ActivityCancelReason) activity.CancelReason {
@@ -2006,19 +2172,12 @@ fn cancelReason(reason: task_pb.ActivityCancelReason) activity.CancelReason {
 
 /// Runs an activity on a task of its own, waits for it to return or for a cancel, cancels the
 /// task through its `std.Io` on a cancel, and reports the result. Reporting happens here, not
-/// on the activity's task, so a cancel arriving late can't interrupt the report.
+/// on the activity's task, so a cancel arriving late can't interrupt the report. Without a
+/// thread for the activity the attempt fails with a retryable failure: run here, the activity
+/// couldn't be canceled.
 fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivities, run: *RunningActivity) void {
-    defer {
-        running.mutex.lockUncancelable(w.io);
-        _ = running.map.remove(run.task_token);
-        running.mutex.unlock(w.io);
-        run.destroy(w.gpa);
-    }
     const outcome = blk: {
-        var task = w.io.concurrent(callActivity, .{ w, core, run }) catch {
-            log.warn("no thread available for activity {s}; running it here, where cancels can't reach it", .{run.start.activity_id});
-            break :blk callActivity(w, core, run);
-        };
+        var task = w.io.concurrent(callActivity, .{ w, core, run }) catch break :blk noThreadForActivity(run);
         run.wake.waitUncancelable(w.io);
         const reason = run.ctx.cancelReason() orelse break :blk task.await(w.io);
         log.debug("activity {s}: canceling its task ({t})", .{ run.start.activity_id, reason });
@@ -2026,25 +2185,58 @@ fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivitie
         log.debug("activity {s}: its task returned after the cancel", .{run.start.activity_id});
         break :blk outcome;
     };
+    finishActivity(w, core, running, run, outcome);
+}
+
+/// The `failure.Application.type` of an activity attempt the worker had no thread for, so a
+/// retry policy's non-retryable types can name it.
+const no_thread_failure_type = "NoThreadAvailable";
+
+/// The result of an activity attempt the worker's Io has no thread for: a retryable failure,
+/// so the activity's retry policy runs it again.
+fn noThreadForActivity(run: *RunningActivity) error{OutOfMemory}!result_pb.ActivityExecutionResult {
+    log.warn("no thread available for activity {s}; failing the attempt so it is retried", .{run.start.activity_id});
     const a = run.arena.allocator();
-    var result = outcome catch return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
+    return .{ .status = .{ .failed = .{ .failure = try failure_mod.application(a, .{
+        .message = try std.fmt.allocPrint(a, "the worker's Io has no thread free to run activity {s}", .{run.start.activity_id}),
+        .type = no_thread_failure_type,
+    }) } } };
+}
+
+/// Reports an activity's result to the core, then forgets and frees the run. Every run
+/// `receiveActivityTask` returns ends here exactly once.
+fn finishActivity(w: *Worker, core: bridge.Worker, running: *RunningActivities, run: *RunningActivity, outcome: error{OutOfMemory}!result_pb.ActivityExecutionResult) void {
+    defer {
+        running.mutex.lockUncancelable(w.io);
+        _ = running.map.remove(run.task_token);
+        running.mutex.unlock(w.io);
+        run.destroy(w.gpa);
+    }
+    const a = run.arena.allocator();
+    // Out of memory anywhere below, the task is still completed, as a retryable failure from
+    // stack memory: the core holds its slot until it is. The defer above frees `run` after.
+    var result = outcome catch return reportOutOfMemory(w, core, run);
     if (w.client.encode_failure_attributes) failure_mod.encodeAttributes(result_pb.ActivityExecutionResult, &result, a) catch
-        return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
+        return reportOutOfMemory(w, core, run);
     converter.encodeMessage(result_pb.ActivityExecutionResult, &result, w.client.codecs, a, w.io, &run.codec_context) catch |err| {
-        if (err == error.OutOfMemory) return log.err("out of memory reporting activity {s}; the core will time it out", .{run.start.activity_id});
+        if (err == error.OutOfMemory) return reportOutOfMemory(w, core, run);
         // Report a failure without the payloads that couldn't be encoded.
         result = .{ .status = .{ .failed = .{ .failure = failure_mod.application(a, .{
-            .message = std.fmt.allocPrint(a, "encoding the result of activity {s} with the client's codecs failed: {t}", .{ run.start.activity_id, err }) catch return,
+            .message = std.fmt.allocPrint(a, "encoding the result of activity {s} with the client's codecs failed: {t}", .{ run.start.activity_id, err }) catch
+                return reportOutOfMemory(w, core, run),
             .type = "PayloadCodecFailed",
-        }) catch return } } };
+        }) catch return reportOutOfMemory(w, core, run) } } };
     };
     var encoded: Io.Writer.Allocating = .init(a);
-    (proto.coresdk.self.ActivityTaskCompletion{ .task_token = run.task_token, .result = result }).encode(&encoded.writer, a) catch return;
-    var message: ?[]u8 = null;
-    defer if (message) |m| w.gpa.free(m);
-    core.completeActivityTask(w.gpa, w.io, encoded.written(), &message) catch |err| {
-        log.err("completing an activity task failed: {s}", .{message orelse @errorName(err)});
-    };
+    (proto.coresdk.self.ActivityTaskCompletion{ .task_token = run.task_token, .result = result }).encode(&encoded.writer, a) catch
+        return reportOutOfMemory(w, core, run);
+    sendActivityCompletion(w, core, encoded.written());
+}
+
+/// Fails `run`'s task as retryable after running out of memory reporting its result.
+fn reportOutOfMemory(w: *Worker, core: bridge.Worker, run: *const RunningActivity) void {
+    w.logger().err("Out of memory reporting an activity; failing it as retryable so the server retries it", .{ .ActivityID = run.start.activity_id });
+    failActivityOutOfMemory(w, core, run.task_token, "the worker ran out of memory reporting activity {s}", .{run.start.activity_id}, "the worker ran out of memory reporting the activity");
 }
 
 // `std.Io.Threaded` futures overrun their allocation for results aligned above 8; see `runNexusRequest`.
@@ -2138,13 +2330,6 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     const a = run.arena.allocator();
     const start = &run.start;
     const execution = start.workflow_execution orelse proto.temporal.api.common.v1.WorkflowExecution{};
-    run.codec_context = .{
-        .namespace = w.client.namespace,
-        .workflow_id = execution.workflow_id,
-        .workflow_type = start.workflow_type,
-        .activity_type = start.activity_type,
-        .activity_id = start.activity_id,
-    };
     const ctx = &run.ctx;
     ctx.propagated_ = .init(a);
     decodeActivityStart(w, run) catch |err| switch (err) {
@@ -2241,9 +2426,12 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
             .source = failure_mod.source,
             .failure_info = .{ .canceled_failure_info = .{} },
         } } } };
-        const trace = if (w.options.failure_stack_traces) @errorReturnTrace() else null;
+        // Copied before anything else can return an error and add to the trace.
+        const trace = if (w.options.failure_stack_traces) try failure_mod.captureTrace(a, @errorReturnTrace()) else &.{};
         var f = if (ctx.pending_failure) |p| try failure_mod.application(a, p) else try failure_mod.fromError(a, err);
-        f.stack_trace = try failure_mod.traceText(a, trace);
+        // The worker read the debug info before it polled (`warmDebugInfo`): this only looks
+        // the addresses up.
+        f.stack_trace = try failure_mod.addressesText(a, trace);
         if (failure_mod.applicationCategory(f) == .benign)
             ctx.logger_.debug("Activity failed", .{ .Error = f.message })
         else
@@ -2252,6 +2440,31 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };
+}
+
+/// Set once `warmDebugInfo` has read the executable's debug info, the first time in the
+/// process; stack traces resolve without loading it from then on.
+var debug_info_warm: std.atomic.Value(bool) = .init(false);
+
+/// Reads the executable's debug info for stack traces (`failure.addressesText`), so a failed
+/// activity doesn't, then wakes `w`'s `run` (`Worker.awaitDebugInfo`). The first read loads
+/// and parses the debug info, and its time grows with the executable: bead
+/// temporal-sdk-zig-d51.1.34 measured 0.6 s alone and 2.1 s within the unit tests on an
+/// Apple-silicon Mac in Debug, all of it on the failed activity's thread before its
+/// completion, and on an x86_64 macOS runner the activity's 10 s StartToClose timeout ran
+/// out first. `Worker.run` starts it while the worker connects and doesn't poll before it
+/// ends; `Worker.deinit` joins it.
+noinline fn warmDebugInfo(w: *Worker) void {
+    defer w.debug_info_wake.set(w.io);
+    defer debug_info_warm.store(true, .release);
+    // Scratch that belongs to no worker or activity, freed here.
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    // An address in the SDK's code and one in std's: where a build has a compile unit per
+    // module, each unit's line table is parsed on its first lookup. `addressesText` looks up
+    // the byte before each address.
+    const addresses = [_]usize{ @intFromPtr(&warmDebugInfo) + 1, @intFromPtr(std.heap.page_allocator.vtable.alloc) + 1 };
+    _ = failure_mod.addressesText(scratch.allocator(), &addresses) catch {};
 }
 
 /// An activity's info from its Start task; borrows `start`'s memory.
@@ -2383,6 +2596,8 @@ const RunningNexusRequests = struct {
 /// One Nexus request, from its task until its completion has been sent. Everything it holds
 /// lives in `arena` or `polled`, which the handler's context borrows.
 const NexusRequest = struct {
+    /// w.gpa with cancels blocked around each call; backs arena.
+    task_gpa: CancelBlockingAllocator,
     arena: std.heap.ArenaAllocator,
     polled: bridge.Worker.Polled,
     task_token: []const u8 = &.{},
@@ -2409,22 +2624,82 @@ const NexusOutcome = union(enum) {
     failed: nexus.HandlerError,
 };
 
-/// Decodes a polled Nexus task. Returns a new request for a server request; delivers a cancel
-/// from the core to its request and returns null.
+/// A Nexus task's token and kind, read from its bytes without decoding or allocating.
+/// Borrows `bytes`.
+const NexusTaskHead = struct {
+    token: []const u8,
+    kind: union(enum) { task, cancel: nexus_pb.NexusTaskCancelReason },
+
+    /// Null without a token or a variant, or for malformed bytes.
+    fn read(bytes: []const u8) ?NexusTaskHead {
+        if (bytesField(bytes, 1)) |task| {
+            const token = bytesField(task, 1) orelse return null;
+            return if (token.len > 0) .{ .token = token, .kind = .task } else null;
+        }
+        // A cancel with reason TIMED_OUT (0) has only its token on the wire.
+        const cancel = bytesField(bytes, 2) orelse return null;
+        const token = bytesField(cancel, 1) orelse return null;
+        if (token.len == 0) return null;
+        const reason = varintField(cancel, 2) orelse 0;
+        return .{ .token = token, .kind = .{ .cancel = @fromBackingInt(@as(i32, @bitCast(@as(u32, @truncate(reason))))) } };
+    }
+};
+
+/// Delivers a cancel from the core to the request it names, if it is still running.
+/// Allocates nothing, so a cancel reaches its handler however short of memory the worker is.
+fn deliverNexusCancel(w: *Worker, running: *RunningNexusRequests, token: []const u8, reason: nexus_pb.NexusTaskCancelReason) void {
+    running.mutex.lockUncancelable(w.io);
+    defer running.mutex.unlock(w.io);
+    // A request that already finished has nothing to cancel.
+    const target = running.map.get(token) orelse return;
+    const r: nexus.CancelReason = switch (reason) {
+        .WORKER_SHUTDOWN => .worker_shutdown,
+        else => .timed_out,
+    };
+    if (target.ctx.setCancelReason(r)) target.wake.set(w.io);
+}
+
+/// Completes the Nexus task `token` as failed with `e`, without the heap: the likeliest reason
+/// to need this is running out of memory. A token too long for the stack buffer falls back to
+/// `dropNexusTask`. `token` must stay valid during the call.
+fn failNexusTask(w: *Worker, core: bridge.Worker, token: []const u8, e: nexus.HandlerError, logger: log_mod.Logger) void {
+    var buffer: [wire.failed_completion_buffer_len]u8 = undefined;
+    const completion = wire.encodeFailedCompletion(&buffer, token, e) orelse return dropNexusTask(w, core, token, logger);
+    completeNexusTask(w, core, completion, logger);
+}
+
+/// Takes a polled Nexus task. Returns a new request for a server request, tracked in `running`
+/// so the core's cancels reach it; delivers a cancel from the core to its request and returns
+/// null. A request that can't be decoded or tracked is failed and never runs.
 fn receiveNexusTask(w: *Worker, core: bridge.Worker, running: *RunningNexusRequests, polled: bridge.Worker.Polled) ?*NexusRequest {
     const sink_logger: log_mod.Logger = .{ .sink = w.logSink() };
+    // `head.token` borrows `polled`: every failure below that uses it comes before the free.
+    const head = NexusTaskHead.read(polled.bytes()) orelse {
+        log.err("a Nexus task on task queue {s} with no task token; it can't be completed", .{w.task_queue});
+        polled.deinit();
+        return null;
+    };
+    switch (head.kind) {
+        .cancel => |reason| {
+            deliverNexusCancel(w, running, head.token, reason);
+            polled.deinit();
+            return null;
+        },
+        .task => {},
+    }
     const req = w.gpa.create(NexusRequest) catch {
-        defer polled.deinit();
-        log.err("out of memory receiving a Nexus task on task queue {s}", .{w.task_queue});
-        const response = runId(polled.bytes()) orelse return null;
-        dropNexusTask(w, core, runId(response) orelse return null, sink_logger);
+        log.err("out of memory receiving a Nexus task on task queue {s}; failing the request as retryable", .{w.task_queue});
+        failNexusTask(w, core, head.token, .{ .type = .internal, .retry = .retryable, .message = "the worker ran out of memory receiving the Nexus request" }, sink_logger);
+        polled.deinit();
         return null;
     };
     req.* = .{
-        .arena = .init(taskAllocator(w)),
+        .task_gpa = .{ .io = w.io, .backing = w.gpa },
+        .arena = undefined,
         .polled = polled,
         .ctx = .{ .arena = undefined, .io_ = w.io, .info_ = .{ .service = "", .operation = "" }, .logger_ = sink_logger, .client_ = w.client, .codecs = w.client.codecs },
     };
+    req.arena = .init(req.task_gpa.allocator());
     var keep = false;
     defer if (!keep) req.destroy(w.gpa);
 
@@ -2433,64 +2708,82 @@ fn receiveNexusTask(w: *Worker, core: bridge.Worker, running: *RunningNexusReque
         failUndecodableNexusTask(w, core, polled.bytes(), err);
         return null;
     };
-    switch (task.variant orelse {
-        log.warn("a Nexus task on task queue {s} carries neither a request nor a cancel; ignoring it", .{w.task_queue});
+    const request_task = if (task.variant) |v| switch (v) {
+        .task => |t| t,
+        .cancel_task => null,
+    } else null;
+    const polled_task = request_task orelse {
+        log.err("a Nexus task on task queue {s} read as a request decoded as something else; failing it as a bad request", .{w.task_queue});
+        failNexusTask(w, core, head.token, .{ .type = .bad_request, .retry = .non_retryable, .message = "the worker couldn't decode the Nexus request: it holds no request" }, sink_logger);
         return null;
-    }) {
-        .task => |t| {
-            req.task_token = t.task_token;
-            req.request = t.request orelse .{};
-            req.endpoint = if (task.endpoint.len > 0) task.endpoint else req.request.endpoint;
-            req.deadline = proto_time.timestampFromProto(task.request_deadline);
-            // Named here, before anything can fail the request, so every failure's log names
-            // them; without memory for the fields it logs to the worker's sink without them.
-            const info = &req.ctx.info_;
-            if (req.request.variant) |v| switch (v) {
-                .start_operation => |s| info.* = .{ .service = s.service, .operation = s.operation },
-                .cancel_operation => |c| info.* = .{ .service = c.service, .operation = c.operation },
-            };
-            req.ctx.logger_ = sink_logger.with(req.arena.allocator(), .{
-                .NexusService = info.service,
-                .NexusOperation = info.operation,
-                .NexusEndpoint = req.endpoint,
-                .TaskQueue = w.task_queue,
-            }) catch sink_logger;
-            running.mutex.lockUncancelable(w.io);
-            defer running.mutex.unlock(w.io);
-            running.map.put(w.gpa, req.task_token, req) catch
-                log.warn("out of memory tracking a Nexus request on task queue {s}; it runs, but cancels won't reach it", .{w.task_queue});
-            keep = true;
-            return req;
-        },
-        .cancel_task => |c| {
-            running.mutex.lockUncancelable(w.io);
-            defer running.mutex.unlock(w.io);
-            // A request that already finished has nothing to cancel.
-            const target = running.map.get(c.task_token) orelse return null;
-            const reason: nexus.CancelReason = switch (c.reason) {
-                .WORKER_SHUTDOWN => .worker_shutdown,
-                else => .timed_out,
-            };
-            if (target.ctx.setCancelReason(reason)) target.wake.set(w.io);
-            return null;
-        },
+    };
+    req.task_token = polled_task.task_token;
+    req.request = polled_task.request orelse .{};
+    req.endpoint = if (task.endpoint.len > 0) task.endpoint else req.request.endpoint;
+    req.deadline = proto_time.timestampFromProto(task.request_deadline);
+    // Named here, before anything can fail the request, so every failure's log names
+    // them; without memory for the fields it logs to the worker's sink without them.
+    const info = &req.ctx.info_;
+    if (req.request.variant) |v| switch (v) {
+        .start_operation => |s| info.* = .{ .service = s.service, .operation = s.operation },
+        .cancel_operation => |c| info.* = .{ .service = c.service, .operation = c.operation },
+    };
+    req.ctx.logger_ = sink_logger.with(req.arena.allocator(), .{
+        .NexusService = info.service,
+        .NexusOperation = info.operation,
+        .NexusEndpoint = req.endpoint,
+        .TaskQueue = w.task_queue,
+    }) catch sink_logger;
+    const tracked = tracked: {
+        running.mutex.lockUncancelable(w.io);
+        defer running.mutex.unlock(w.io);
+        running.map.put(w.gpa, req.task_token, req) catch break :tracked false;
+        break :tracked true;
+    };
+    if (tracked) {
+        keep = true;
+        return req;
     }
+    // Untracked, the request couldn't be reached by a cancel from the core or the worker's
+    // shutdown, so it doesn't run at all.
+    log.err("out of memory tracking a Nexus request on task queue {s} for cancellation; failing it as retryable", .{w.task_queue});
+    failNexusTask(w, core, head.token, .{ .type = .internal, .retry = .retryable, .message = "the worker ran out of memory tracking the Nexus request for cancellation" }, req.ctx.logger_);
+    return null;
 }
 
-/// Fails a request whose task doesn't decode (for example a header that isn't UTF-8), so the
-/// core doesn't wait for it forever: its task token is read from the raw bytes (the token is
-/// field 1 of the poll response, itself field 1 of the task).
+/// Fails a request whose task doesn't decode, so the core doesn't wait for it forever: its
+/// task token is read from the raw bytes (the token is field 1 of the poll response, itself
+/// field 1 of the task). A malformed task (for example a header that isn't UTF-8) fails as a
+/// non-retryable bad request; one that ran out of memory decoding fails as a retryable
+/// internal error, so the caller retries it. Uses no heap, since it may run out of memory.
 fn failUndecodableNexusTask(w: *Worker, core: bridge.Worker, bytes: []const u8, err: anyerror) void {
     const token = if (runId(bytes)) |response| runId(response) else null;
     const t = token orelse return log.err("decoding a Nexus task on task queue {s} failed: {t}; it has no task token to complete it with", .{ w.task_queue, err });
-    log.warn("decoding a Nexus task on task queue {s} failed: {t}; failing the request as a bad request", .{ w.task_queue, err });
-    var arena: std.heap.ArenaAllocator = .init(w.gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const message = std.fmt.allocPrint(a, "the worker on task queue {s} couldn't decode the Nexus request: {t}", .{ w.task_queue, err }) catch "the worker couldn't decode the Nexus request";
-    const completion = wire.failedCompletion(a, t, .{ .type = .bad_request, .message = message, .retry = .non_retryable }) catch
-        return log.err("out of memory failing an undecodable Nexus task on task queue {s}", .{w.task_queue});
-    sendNexusCompletion(w, core, a, completion, .{ .sink = w.logSink() });
+    if (err == error.OutOfMemory)
+        log.err("out of memory decoding a Nexus task on task queue {s}; failing the request as retryable", .{w.task_queue})
+    else
+        log.warn("decoding a Nexus task on task queue {s} failed: {t}; failing the request as a bad request", .{ w.task_queue, err });
+    var message_buf: [512]u8 = undefined;
+    const e = undecodableNexusError(err, w.task_queue, &message_buf);
+    failNexusTask(w, core, t, e, .{ .sink = w.logSink() });
+}
+
+/// The handler error a Nexus task that failed to decode with `err` is failed with: retryable
+/// for running out of memory, a non-retryable bad request otherwise. Its message is formatted
+/// into `message_buf`, or left without the task queue when that doesn't fit.
+fn undecodableNexusError(err: anyerror, task_queue: []const u8, message_buf: []u8) nexus.HandlerError {
+    if (err == error.OutOfMemory) return .{
+        .type = .internal,
+        .retry = .retryable,
+        .message = std.fmt.bufPrint(message_buf, "the worker on task queue {s} ran out of memory decoding the Nexus request", .{task_queue}) catch
+            "the worker ran out of memory decoding the Nexus request",
+    };
+    return .{
+        .type = .bad_request,
+        .retry = .non_retryable,
+        .message = std.fmt.bufPrint(message_buf, "the worker on task queue {s} couldn't decode the Nexus request: {t}", .{ task_queue, err }) catch
+            "the worker couldn't decode the Nexus request",
+    };
 }
 
 /// Runs a request's handler on a task of its own, waits for it to return or for a cancel,
@@ -2745,15 +3038,21 @@ fn dropNexusTask(w: *Worker, core: bridge.Worker, token: []const u8, logger: log
     completeNexusTask(w, core, completion, logger);
 }
 
-/// Hands an encoded completion to the core. The core forgets a task whose completion it
-/// receives, even one it then fails to deliver; only running out of memory before the call
-/// leaves the task with the core, which then can't finish shutting down.
+/// Hands an encoded completion to the core, which forgets a task whose completion it
+/// receives, even one it then fails to deliver. The bridge allocates the cell it waits in
+/// before the core sees the completion, so on `error.OutOfMemory` it is sent again with the
+/// cell on the stack (safe for the reason `WorkflowRunner.sendCompletion` gives).
 fn completeNexusTask(w: *Worker, core: bridge.Worker, completion: []const u8, logger: log_mod.Logger) void {
     var message: ?[]u8 = null;
     defer if (message) |m| w.gpa.free(m);
     core.completeNexusTask(w.gpa, w.io, completion, &message) catch |err| switch (err) {
-        error.OutOfMemory => logger.err("Out of memory completing a Nexus task; the core keeps the task, so the worker can't finish stopping", .{}),
-        else => logger.err("Completing a Nexus task failed", .{ .Error = message orelse @errorName(err) }),
+        error.OutOfMemory => {
+            var cell: [256]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&cell);
+            core.completeNexusTask(fba.allocator(), w.io, completion, null) catch |e|
+                logger.err("Completing a Nexus task failed", .{ .Error = @errorName(e) });
+        },
+        error.CompletionFailed => logger.err("Completing a Nexus task failed", .{ .Error = message orelse @errorName(err) }),
     };
 }
 
@@ -3933,6 +4232,194 @@ test "activities run concurrently and the worker stops when async work can't get
     try testing.expect(elapsed.nanoseconds < 4 * std.time.ns_per_s);
 }
 
+// An activity task that ran out of memory must still be completed: the core holds its slot
+// until it is, and doesn't time it out.
+const OutOfMemoryTest = struct {
+    /// A result large enough that encoding it needs memory of its own.
+    fn fill(ctx: *activity.Context, len: u32) ![]const u8 {
+        const result = try ctx.allocator().alloc(u8, len);
+        @memset(result, 'x');
+        return result;
+    }
+    const Fill = activity.Def("OutOfMemoryFill", fill);
+    const result_len = 64 * 1024;
+
+    const task_queue = "out-of-memory-activities";
+
+    fn start(client: *client_mod.Client, id: []const u8) !client_mod.ActivityHandle([]const u8) {
+        return client.executeActivity(Fill, .{
+            .id = id,
+            .task_queue = task_queue,
+            .start_to_close_timeout = .fromSeconds(30),
+            .retry_policy = .{ .maximum_attempts = 1 },
+        }, .{result_len});
+    }
+
+    /// A poll of `core` that the test gives up on after 10 s, shutting the core down, so a
+    /// slot that is never released fails the test instead of hanging it.
+    const BoundedPoll = struct {
+        core: bridge.Worker,
+        polled: ?bridge.Worker.Polled = null,
+        done: Io.Event = .unset,
+
+        fn run(p: *BoundedPoll) void {
+            defer p.done.set(testing.io);
+            p.polled = p.core.pollActivityTask(testing.allocator, testing.io, null) catch null;
+        }
+    };
+
+    fn poll(core: bridge.Worker, shut_down: *bool) !bridge.Worker.Polled {
+        var p: BoundedPoll = .{ .core = core };
+        var future = try testing.io.concurrent(BoundedPoll.run, .{&p});
+        p.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } }) catch {
+            std.debug.print("no activity task within 10 s: a slot was never released\n", .{});
+            core.initiateShutdown();
+            shut_down.* = true;
+            future.await(testing.io);
+            if (p.polled) |polled| complete(core, polled);
+            return error.TestUnexpectedResult;
+        };
+        future.await(testing.io);
+        return p.polled orelse error.TestUnexpectedResult;
+    }
+
+    /// A `FailingAllocator` that also counts the allocations it refused. The sweep can't tell
+    /// which allocation fails from its index alone: how many allocations a task takes varies
+    /// from one iteration to the next (the running map keeps the capacity an earlier task gave
+    /// it, and the server's IDs, timestamps and token move arena chunk boundaries). Once the
+    /// failure is induced every later allocation fails too, so one refusal means the induced
+    /// failure was the last allocation the task tried.
+    const CountingFailures = struct {
+        failing: std.testing.FailingAllocator,
+        refused: std.atomic.Value(usize) = .init(0),
+
+        fn allocator(c: *CountingFailures) std.mem.Allocator {
+            return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const c: *CountingFailures = @ptrCast(@alignCast(ctx));
+            const ptr = c.failing.allocator().rawAlloc(len, alignment, ra);
+            if (ptr == null) _ = c.refused.fetchAdd(1, .monotonic);
+            return ptr;
+        }
+
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const c: *CountingFailures = @ptrCast(@alignCast(ctx));
+            return c.failing.allocator().rawResize(memory, alignment, new_len, ra);
+        }
+
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const c: *CountingFailures = @ptrCast(@alignCast(ctx));
+            return c.failing.allocator().rawRemap(memory, alignment, new_len, ra);
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const c: *CountingFailures = @ptrCast(@alignCast(ctx));
+            c.failing.allocator().rawFree(memory, alignment, ra);
+        }
+    };
+
+    /// Completes a task the test holds, as a failure, and frees it.
+    fn complete(core: bridge.Worker, polled: bridge.Worker.Polled) void {
+        defer polled.deinit();
+        const head = ActivityTaskHead.read(polled.bytes()) orelse return;
+        var buffer: [failed_activity_completion_len]u8 = undefined;
+        const completion = encodeFailedActivityCompletion(&buffer, head.token, .{ .message = "released by the test" }) orelse return;
+        core.completeActivityTask(testing.allocator, testing.io, completion, null) catch {};
+    }
+};
+
+test "an activity task that runs out of memory anywhere before its completion is failed retryably and its slot released" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{ .extra_args = &@import("testing.zig").DevServer.standalone_activity_args }, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+    var message: ?[]u8 = null;
+    defer if (message) |m| testing.allocator.free(m);
+    const core = try bridge.Worker.init(testing.allocator, try client.currentConnection(), .{
+        .namespace = "default",
+        .task_queue = OutOfMemoryTest.task_queue,
+        .task_types = .{ .workflows = false, .remote_activities = true, .local_activities = false, .nexus = false },
+        .tuner = .{ .activity = .{ .fixed = 2 } },
+    }, &message);
+    defer core.deinit();
+    var shut_down = false;
+    defer {
+        if (!shut_down) core.initiateShutdown();
+        // The core cancels each task still outstanding; completing them lets it finish.
+        while (core.pollActivityTask(testing.allocator, testing.io, null) catch null) |polled| OutOfMemoryTest.complete(core, polled);
+        core.finalizeShutdown(testing.allocator, testing.io, null) catch {};
+    }
+    // The out-of-memory paths log errors; they go to this sink, not to std.log.
+    var sink: RecordingSink = .{};
+    defer sink.deinit();
+    var w = try Worker.init(testing.allocator, testing.io, &client, OutOfMemoryTest.task_queue, .{ .logger = sink.sink() });
+    defer w.deinit();
+    try w.registerActivity(OutOfMemoryTest.Fill);
+    var running: RunningActivities = .{};
+    defer running.map.deinit(testing.allocator);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Each allocation from the poll to the completion fails in turn (with every one after it).
+    var sent_from_stack: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        const id = try std.fmt.allocPrint(a, "out-of-memory-{d}", .{fail_index});
+        var handle = try OutOfMemoryTest.start(&client, id);
+        defer handle.deinit();
+        const polled = try OutOfMemoryTest.poll(core, &shut_down);
+        var counting: OutOfMemoryTest.CountingFailures = .{ .failing = .init(testing.allocator, .{ .fail_index = fail_index }) };
+        w.gpa = counting.allocator();
+        defer w.gpa = testing.allocator;
+        if (receiveActivityTask(&w, core, &running, polled, OutOfMemoryTest.task_queue)) |run| superviseActivity(&w, core, &running, run);
+        w.gpa = testing.allocator;
+        try testing.expectEqual(0, running.map.count());
+        const result = handle.get(a);
+        if (!counting.failing.has_induced_failure) {
+            try testing.expectEqual(OutOfMemoryTest.result_len, (try result).len);
+            break;
+        }
+        if (result) |r| {
+            // Only the bridge's cell for the completion failed, the last allocation: the
+            // completion was sent again with the cell on the stack. An allocation failure
+            // swallowed before it would show as a second refusal, the cell's.
+            try testing.expectEqual(OutOfMemoryTest.result_len, r.len);
+            try testing.expectEqual(1, counting.refused.load(.monotonic));
+            sent_from_stack += 1;
+            continue;
+        } else |err| try testing.expectEqual(error.ActivityFailed, err);
+        // Failed retryably, as an activity returning error.OutOfMemory is, wherever the
+        // failure hit; never run untracked to a result. The retry policy allows no second
+        // attempt, so the server reports the failure.
+        const f = handle.failure().?;
+        if (fail_index == 0) try testing.expectEqualStrings("the worker ran out of memory receiving the activity task", f.message);
+        const info = f.failure_info.?.application_failure_info;
+        try testing.expectEqualStrings("OutOfMemory", info.type);
+        try testing.expect(!info.non_retryable);
+    }
+    // The sweep reached the last allocation, the bridge's cell, at least once.
+    try testing.expect(sent_from_stack > 0);
+    // Each path that runs out of memory was reached.
+    inline for (.{ "receiving an activity task", "decoding an activity task", "tracking an activity for cancellation", "reporting an activity" }) |what|
+        try testing.expect(sink.countAt(.err, "Out of memory " ++ what ++ "; failing it as retryable so the server retries it", &.{}) > 0);
+
+    // Both slots are free: two activities run at once.
+    var first = try OutOfMemoryTest.start(&client, "out-of-memory-held-1");
+    defer first.deinit();
+    var second = try OutOfMemoryTest.start(&client, "out-of-memory-held-2");
+    defer second.deinit();
+    const held = try OutOfMemoryTest.poll(core, &shut_down);
+    defer OutOfMemoryTest.complete(core, held);
+    const also_held = try OutOfMemoryTest.poll(core, &shut_down);
+    OutOfMemoryTest.complete(core, also_held);
+}
+
 const StopHammer = struct {
     w: *Worker,
     done: std.atomic.Value(bool) = .init(false),
@@ -3999,6 +4486,242 @@ const ScarceConcurrency = struct {
         return inner.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
     }
 };
+
+/// An Io whose `concurrent` and `groupConcurrent` succeed until the test sets the matching
+/// flag, then fail, standing in for a machine that runs out of threads while the worker's
+/// poll loops run.
+const RefusingConcurrency = struct {
+    var inner: Io = undefined;
+    var vtable: Io.VTable = undefined;
+    var refuse_concurrent: std.atomic.Value(bool) = .init(false);
+    var refuse_group: std.atomic.Value(bool) = .init(false);
+    var refused: std.atomic.Value(usize) = .init(0);
+
+    fn io(base: Io) Io {
+        inner = base;
+        refuse_concurrent.store(false, .release);
+        refuse_group.store(false, .release);
+        refused.store(0, .release);
+        vtable = base.vtable.*;
+        vtable.concurrent = concurrent;
+        vtable.groupConcurrent = groupConcurrent;
+        return .{ .userdata = base.userdata, .vtable = &vtable };
+    }
+
+    fn concurrent(
+        userdata: ?*anyopaque,
+        result_len: usize,
+        result_alignment: std.mem.Alignment,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    ) Io.ConcurrentError!*Io.AnyFuture {
+        if (refuse_concurrent.load(.acquire)) {
+            _ = refused.fetchAdd(1, .acq_rel);
+            return error.ConcurrencyUnavailable;
+        }
+        return inner.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
+    }
+
+    fn groupConcurrent(
+        userdata: ?*anyopaque,
+        group: *Io.Group,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque) void,
+    ) Io.ConcurrentError!void {
+        if (refuse_group.load(.acquire)) {
+            _ = refused.fetchAdd(1, .acq_rel);
+            return error.ConcurrencyUnavailable;
+        }
+        return inner.vtable.groupConcurrent(userdata, group, context, context_alignment, start);
+    }
+};
+
+const NoThreadTest = struct {
+    /// How many times `record` ran.
+    var calls: std.atomic.Value(u32) = .init(0);
+    var last_attempt: std.atomic.Value(u32) = .init(0);
+
+    fn record(ctx: *activity.Context) !u32 {
+        _ = calls.fetchAdd(1, .acq_rel);
+        const attempt = ctx.info().attempt;
+        last_attempt.store(attempt, .release);
+        return attempt;
+    }
+    const Record = activity.Def("RecordAttempt", record);
+
+    fn once(ctx: *workflow.Context) !u32 {
+        return ctx.executeActivity(Record, .{
+            .start_to_close_timeout = .fromSeconds(30),
+            .retry_policy = .{ .initial_interval = .fromMilliseconds(100), .backoff_coefficient = 1, .maximum_attempts = 0 },
+        }, .{}).get();
+    }
+    const Once = workflow.Def("NoThreadOnce", once);
+
+    /// Whether the run's activity has failed an attempt for want of a thread, retryably.
+    fn refusedAttemptSeen(client: *client_mod.Client, arena: Allocator, id: []const u8, run_id: []const u8) !bool {
+        const d = try client.describeWorkflow(arena, id, run_id);
+        for (d.raw.pending_activities.items) |p| {
+            const f = p.last_failure orelse continue;
+            if (std.mem.indexOf(u8, f.message, "no thread") == null) continue;
+            const info = f.failure_info orelse continue;
+            switch (info) {
+                .application_failure_info => |app| if (std.mem.eql(u8, app.type, no_thread_failure_type) and !app.non_retryable) return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+};
+
+// Both places an activity can be refused a thread: the poll loop's group (no supervisor) and the
+// supervisor's `concurrent` (no task for the activity). Neither may run the activity where a
+// cancel can't reach it, nor stop the poll loop; the attempt fails retryably instead.
+test "an activity the worker has no thread for fails its attempt as retryable, from the poll loop and from its supervisor, and a later attempt runs" {
+    // Each refusal is logged as a warning.
+    testing.log_level = .err;
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, RefusingConcurrency.io(testing.io), &client, "no-thread", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    try w.registerWorkflow(NoThreadTest.Once);
+    try w.registerActivity(NoThreadTest.Record);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    var stopped = false;
+    defer if (!stopped) {
+        RefusingConcurrency.refuse_group.store(false, .release);
+        RefusingConcurrency.refuse_concurrent.store(false, .release);
+        w.stop();
+        running.await(testing.io) catch {};
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A completed workflow and activity show both poll loops are polling.
+    var warm = try client.executeWorkflow(HelloTest.Hello, .{ .id = "no-thread-warm-up", .task_queue = "no-thread" }, .{"Temporal"});
+    defer warm.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try warm.get(a));
+
+    const flags = [_]*std.atomic.Value(bool){ &RefusingConcurrency.refuse_group, &RefusingConcurrency.refuse_concurrent };
+    for (flags, 0..) |flag, i| {
+        NoThreadTest.calls.store(0, .release);
+        RefusingConcurrency.refused.store(0, .release);
+        flag.store(true, .release);
+        const id = try std.fmt.allocPrint(a, "no-thread-{d}", .{i});
+        var run = try client.executeWorkflow(NoThreadTest.Once, .{ .id = id, .task_queue = "no-thread", .execution_timeout = .fromSeconds(60) }, .{});
+        defer run.deinit();
+
+        const deadline = Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(30));
+        while (!try NoThreadTest.refusedAttemptSeen(&client, a, run.id, run.run_id)) {
+            if (deadline.durationTo(Io.Clock.awake.now(testing.io)).nanoseconds > 0) return error.TestNoRefusedAttempt;
+            try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+        try testing.expectEqual(0, NoThreadTest.calls.load(.acquire));
+        try testing.expect(RefusingConcurrency.refused.load(.acquire) > 0);
+
+        flag.store(false, .release);
+        const attempt = try run.get(a);
+        try testing.expect(attempt >= 2);
+        try testing.expectEqual(attempt, NoThreadTest.last_attempt.load(.acquire));
+        try testing.expectEqual(1, NoThreadTest.calls.load(.acquire));
+    }
+
+    // Nothing left behind holds up shutdown.
+    stopped = true;
+    w.stop();
+    try running.await(testing.io);
+}
+
+/// Records the context the codecs encode the no-thread failure's attributes with. The worker
+/// encodes from several threads, so it records once, under an atomic flag.
+const NoThreadContextCodec = struct {
+    var claimed: std.atomic.Value(bool) = .init(false);
+    var seen: std.atomic.Value(bool) = .init(false);
+    var buf: [256]u8 = undefined;
+    var recorded: []const u8 = "";
+
+    fn codec() converter.PayloadCodec {
+        return .{ .ptr = &buf, .vtable = &.{ .encode = plain, .decode = plain, .encodeWithContext = encode } };
+    }
+
+    fn plain(_: *anyopaque, arena: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn encode(_: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        for (payloads) |p| if (std.mem.indexOf(u8, p.data, "no thread") != null and claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            recorded = std.fmt.bufPrint(&buf, "{s}/{s}/{s}/{s}", .{ context.namespace, context.workflow_id, context.activity_type, context.activity_id }) catch "too long";
+            seen.store(true, .release);
+        };
+        return arena.dupe(converter.Payload, payloads);
+    }
+};
+
+// The no-thread failure is an activity's failure, so a context-aware codec (one picking its
+// encryption key per workflow, say) must see the activity's identity when it encodes it, as it
+// does for every other failure of the activity.
+test "the codecs encode an activity's no-thread failure in the activity's context" {
+    testing.log_level = .err;
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    NoThreadContextCodec.claimed.store(false, .release);
+    NoThreadContextCodec.seen.store(false, .release);
+    const codecs = [_]converter.PayloadCodec{NoThreadContextCodec.codec()};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target, .codecs = &codecs, .encode_failure_attributes = true });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, RefusingConcurrency.io(testing.io), &client, "no-thread-context", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    try w.registerWorkflow(NoThreadTest.Once);
+    try w.registerActivity(NoThreadTest.Record);
+    var running = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    var stopped = false;
+    defer if (!stopped) {
+        RefusingConcurrency.refuse_concurrent.store(false, .release);
+        w.stop();
+        running.await(testing.io) catch {};
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var warm = try client.executeWorkflow(HelloTest.Hello, .{ .id = "no-thread-context-warm-up", .task_queue = "no-thread-context" }, .{"Temporal"});
+    defer warm.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try warm.get(a));
+
+    RefusingConcurrency.refuse_concurrent.store(true, .release);
+    var run = try client.executeWorkflow(NoThreadTest.Once, .{ .id = "no-thread-context", .task_queue = "no-thread-context", .execution_timeout = .fromSeconds(60) }, .{});
+    defer run.deinit();
+    const deadline = Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(30));
+    while (!NoThreadContextCodec.seen.load(.acquire)) {
+        if (deadline.durationTo(Io.Clock.awake.now(testing.io)).nanoseconds > 0) return error.TestNoRefusedAttempt;
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    RefusingConcurrency.refuse_concurrent.store(false, .release);
+    _ = try run.get(a);
+    const expected = try std.fmt.allocPrint(a, "{s}/{s}/RecordAttempt/", .{ client.namespace, run.id });
+    try testing.expectStringStartsWith(NoThreadContextCodec.recorded, expected);
+    try testing.expect(NoThreadContextCodec.recorded.len > expected.len);
+
+    stopped = true;
+    w.stop();
+    try running.await(testing.io);
+}
 
 // The workflow loop is already polling the core worker when the activity loop can't start, so
 // `run` must drain it before freeing the core worker.
@@ -4486,6 +5209,103 @@ test "a cancel pending while a heartbeat waits for std's debug info lock still r
     try CancelTest.waitFor(&CancelTest.observed, "BeatWhenTold to see error.Canceled after its heartbeat waited for the debug info lock");
     try CancelTest.awaitWorker(env);
     try testing.expectEqual(@as(?activity.CancelReason, .worker_shutdown), CancelTest.seen_reason);
+}
+
+// Bead temporal-sdk-zig-d51.1.34: an activity's failure resolves its stack trace before the
+// worker completes it, and that read used std's debug info, whose one lock every Debug
+// allocation's stack capture takes and whose first read holds it for seconds. A failed
+// activity then waited on whatever held the lock, past its StartToClose timeout on a slow
+// runner.
+test "a failed activity's completion doesn't wait for std's debug info lock, and its stack trace still resolves" {
+    const SelfInfo = std.debug.SelfInfo;
+    if (comptime builtin.mode != .debug or !std.debug.sys_can_stack_trace or SelfInfo == void or !@hasField(SelfInfo, "mutex"))
+        return error.SkipZigTest;
+    // An activity that fails while the test holds std's debug info lock, on a worker whose
+    // allocations and threads never take that lock: `testing.allocator` captures a stack trace
+    // on each allocation, and on macOS that takes the lock, so neither it nor `testing.io`
+    // (which spawns threads with it) is used here.
+    const TraceLockTest = struct {
+        /// How long the test holds the lock at most; the activity's failure must arrive well
+        /// within it.
+        const hold_limit: Io.Duration = .fromSeconds(20);
+        const arrival_limit: Io.Duration = .fromSeconds(5);
+
+        var io: Io = undefined;
+        var go: Io.Event = .unset;
+        var seen: Io.Event = .unset;
+        var trace_resolved: bool = false;
+
+        fn charge(ctx: *activity.Context) !void {
+            go.waitUncancelable(ctx.io());
+            return ctx.fail(.{ .message = "card declined", .type = "Declined", .non_retryable = true });
+        }
+        const Charge = activity.Def("TraceLockCharge", charge);
+
+        fn order(ctx: *workflow.Context) ![]const u8 {
+            const charged = ctx.executeActivity(Charge, .{ .start_to_close_timeout = .fromSeconds(60), .retry_policy = .{ .maximum_attempts = 1 } }, .{});
+            charged.get() catch |err| switch (err) {
+                error.ActivityFailed => {
+                    trace_resolved = std.mem.indexOf(u8, failure_mod.rootCause(charged.failure().?).stack_trace, "worker.zig:") != null;
+                    seen.set(io);
+                    return "failed";
+                },
+                else => return err,
+            };
+            return "completed";
+        }
+        const Order = workflow.Def("TraceLockOrder", order);
+
+        /// Runs `Order` and holds std's debug info lock from `Charge`'s start until its failure
+        /// reaches the workflow, or `hold_limit`. Returns how long that took.
+        fn run(trace_was_resolved: *bool) !Io.Duration {
+            go = .unset;
+            seen = .unset;
+            trace_resolved = false;
+            // No stack traces: capturing one takes the lock this test holds.
+            var gpa_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+            defer if (gpa_state.deinit() == .leak) @panic("TraceLockTest leaked");
+            const gpa = gpa_state.allocator();
+            var threaded: Io.Threaded = .init(gpa, .{ .environ = testing.environ });
+            defer threaded.deinit();
+            io = threaded.io();
+
+            const env = try CancelTest.Env.start(gpa, io);
+            defer env.deinit();
+            // Before the environment's teardown, whatever the test did.
+            defer go.set(io);
+            try env.registerWorkflow(Order);
+            try env.registerActivity(Charge);
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            var started = try env.startWorkflow(Order, .{ .task_queue = "", .execution_timeout = .fromSeconds(60) }, .{});
+            defer started.deinit();
+            // Reads the executable's debug info the way stack traces do, before the hold, so the
+            // time measured is the activity's and not the first read's.
+            _ = try failure_mod.addressesText(arena.allocator(), &.{@returnAddress()});
+
+            const si = try std.debug.getSelfDebugInfo();
+            const elapsed = hold: {
+                // Nothing here may allocate or log.
+                si.mutex.lockUncancelable(io);
+                defer si.mutex.unlock(io);
+                const begin = Io.Clock.awake.now(io);
+                go.set(io);
+                seen.waitTimeout(io, .{ .duration = .{ .raw = hold_limit, .clock = .awake } }) catch {};
+                break :hold begin.durationTo(Io.Clock.awake.now(io));
+            };
+            try testing.expectEqualStrings("failed", try env.getResult(Order, &started, arena.allocator(), null));
+            trace_was_resolved.* = trace_resolved;
+            return elapsed;
+        }
+    };
+
+    var trace_resolved = false;
+    const elapsed = try TraceLockTest.run(&trace_resolved);
+    if (elapsed.nanoseconds >= TraceLockTest.arrival_limit.nanoseconds) {
+        log.err("the activity's failure took {d} ms to reach its workflow while std's debug info lock was held", .{elapsed.toMilliseconds()});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(trace_resolved);
 }
 
 /// Holds an activity attempt in `interceptActivity`, before the SDK decodes the activity's
@@ -5757,6 +6577,166 @@ test "a run ID is read from an activation's bytes without decoding it" {
     try testing.expect(runId(&.{ 0x0a, 0 }) == null);
     try testing.expect(runId(&.{ 0x0a, 9, 'r' }) == null);
     try testing.expect(runId(&.{ 0x10, 0xff }) == null);
+}
+
+test "an activity task's token and kind are read from its bytes without decoding it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var encoded: Io.Writer.Allocating = .init(a);
+    try (task_pb.ActivityTask{ .task_token = "token-1", .variant = .{ .start = .{ .activity_id = "act-1", .activity_type = "Echo" } } }).encode(&encoded.writer, a);
+    const start = encoded.written();
+    const head = ActivityTaskHead.read(start).?;
+    try testing.expectEqualStrings("token-1", head.token);
+    try testing.expect(head.kind == .start);
+    // Truncated anywhere, the bytes don't read.
+    for (0..start.len) |n| try testing.expect(ActivityTaskHead.read(start[0..n]) == null);
+
+    for ([_]task_pb.ActivityCancelReason{ .CANCELLED, .TIMED_OUT, .WORKER_SHUTDOWN, .PAUSED, .RESET, @fromBackingInt(42), @fromBackingInt(-1) }) |reason| {
+        var out: Io.Writer.Allocating = .init(a);
+        try (task_pb.ActivityTask{ .task_token = "token-2", .variant = .{ .cancel = .{ .reason = reason } } }).encode(&out.writer, a);
+        const cancel = ActivityTaskHead.read(out.written()).?;
+        try testing.expectEqualStrings("token-2", cancel.token);
+        try testing.expectEqual(reason, cancel.kind.cancel);
+    }
+    // A Cancel with reason NOT_FOUND and no details is an empty submessage.
+    const not_found = ActivityTaskHead.read(&.{ 0x0a, 3, 't', 'o', 'k', 0x22, 0 }).?;
+    try testing.expectEqualStrings("tok", not_found.token);
+    try testing.expectEqual(task_pb.ActivityCancelReason.NOT_FOUND, not_found.kind.cancel);
+    // No token, an empty one, or no variant.
+    try testing.expect(ActivityTaskHead.read(&.{ 0x22, 0 }) == null);
+    try testing.expect(ActivityTaskHead.read(&.{ 0x0a, 0, 0x22, 0 }) == null);
+    try testing.expect(ActivityTaskHead.read(&.{ 0x0a, 3, 't', 'o', 'k' }) == null);
+}
+
+test "a Nexus task's token and kind are read from its bytes without decoding it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var encoded: Io.Writer.Allocating = .init(a);
+    try (nexus_pb.NexusTask{ .endpoint = "endpoint", .variant = .{ .task = .{
+        .task_token = "token-1",
+        .request = .{ .variant = .{ .start_operation = .{ .service = "svc", .operation = "op" } } },
+    } } }).encode(&encoded.writer, a);
+    const task = encoded.written();
+    const head = NexusTaskHead.read(task).?;
+    try testing.expectEqualStrings("token-1", head.token);
+    try testing.expect(head.kind == .task);
+    for (0..task.len) |n| try testing.expect(NexusTaskHead.read(task[0..n]) == null);
+
+    for ([_]nexus_pb.NexusTaskCancelReason{ .TIMED_OUT, .WORKER_SHUTDOWN, @fromBackingInt(7) }) |reason| {
+        var out: Io.Writer.Allocating = .init(a);
+        try (nexus_pb.NexusTask{ .variant = .{ .cancel_task = .{ .task_token = "token-2", .reason = reason } } }).encode(&out.writer, a);
+        const cancel = NexusTaskHead.read(out.written()).?;
+        try testing.expectEqualStrings("token-2", cancel.token);
+        try testing.expectEqual(reason, cancel.kind.cancel);
+    }
+    // A cancel without a token, or a task with neither variant.
+    try testing.expect(NexusTaskHead.read(&.{ 0x12, 2, 0x10, 1 }) == null);
+    try testing.expect(NexusTaskHead.read(&.{ 0x22, 1, 'e' }) == null);
+}
+
+test "a failed activity completion is built and encoded without the heap" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buffer: [failed_activity_completion_len]u8 = undefined;
+    const encoded = encodeFailedActivityCompletion(&buffer, "task-token", .{ .message = "the worker ran out of memory", .type = "OutOfMemory" }).?;
+    var reader: Io.Reader = .fixed(encoded);
+    const completion = try proto.coresdk.self.ActivityTaskCompletion.decode(&reader, arena.allocator());
+    try testing.expectEqualStrings("task-token", completion.task_token);
+    const failure = completion.result.?.status.?.failed.failure.?;
+    try testing.expectEqualStrings("the worker ran out of memory", failure.message);
+    const info = failure.failure_info.?.application_failure_info;
+    try testing.expectEqualStrings("OutOfMemory", info.type);
+    try testing.expect(!info.non_retryable);
+
+    const long: [8 * 1024]u8 = @splat('t');
+    try testing.expect(encodeFailedActivityCompletion(&buffer, &long, .{ .message = "m" }) == null);
+}
+
+test "a cancel task reaches its running activity without allocating" {
+    var client: client_mod.Client = undefined;
+    var w = try Worker.init(testing.allocator, testing.io, &client, "cancels", .{});
+    defer w.deinit();
+    var running: RunningActivities = .{};
+    defer running.map.deinit(testing.allocator);
+    var run: RunningActivity = .{
+        .task_gpa = .{ .io = testing.io, .backing = testing.allocator },
+        .arena = .init(testing.allocator),
+        .polled = undefined,
+        .task_queue = "cancels",
+        .task_token = "token-1",
+        .start = .{ .activity_id = "act-1" },
+        .ctx = .{ .arena = undefined, .io_ = testing.io, .info_ = undefined, .logger_ = .{} },
+    };
+    defer run.arena.deinit();
+    try running.map.put(testing.allocator, run.task_token, &run);
+
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    w.gpa = failing.allocator();
+    defer w.gpa = testing.allocator;
+    deliverActivityCancel(&w, &running, "token-1", .CANCELLED);
+    try testing.expectEqual(activity.CancelReason.canceled, run.ctx.cancelReason().?);
+    try testing.expect(run.wake.isSet());
+    // A later cancel keeps the first reason; one for an activity not running is ignored.
+    deliverActivityCancel(&w, &running, "token-1", .TIMED_OUT);
+    deliverActivityCancel(&w, &running, "token-2", .TIMED_OUT);
+    try testing.expectEqual(activity.CancelReason.canceled, run.ctx.cancelReason().?);
+    try testing.expectEqual(0, failing.allocations);
+    try testing.expect(!failing.has_induced_failure);
+}
+
+test "a Nexus task that ran out of memory decoding fails retryably, a malformed one as a bad request" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var header = [_]proto.temporal.api.nexus.v1.Request.HeaderEntry{.{ .key = "request-id", .value = "r-1" }};
+    const task: nexus_pb.NexusTask = .{ .endpoint = "endpoint", .variant = .{ .task = .{
+        .task_token = "task-token",
+        .request = .{ .header = .fromOwnedSlice(&header), .variant = .{ .start_operation = .{ .service = "svc", .operation = "op" } } },
+    } } };
+    var encoded: Io.Writer.Allocating = .init(a);
+    try task.encode(&encoded.writer, a);
+    const valid = encoded.written();
+
+    // The completion `failUndecodableNexusTask` sends for a decode that failed with `err`.
+    const Sent = struct {
+        fn failure(arena_a: Allocator, bytes: []const u8, err: anyerror) !proto.temporal.api.failure.v1.Failure {
+            const token = runId(runId(bytes).?).?;
+            var message_buf: [512]u8 = undefined;
+            var buffer: [wire.failed_completion_buffer_len]u8 = undefined;
+            const completion = wire.encodeFailedCompletion(&buffer, token, undecodableNexusError(err, "queue", &message_buf)).?;
+            var reader: Io.Reader = .fixed(completion);
+            const decoded = try wire.Completion.decode(&reader, arena_a);
+            try testing.expectEqualStrings("task-token", decoded.task_token);
+            return decoded.status.?.failure;
+        }
+    };
+
+    // A one-time allocation failure while decoding a valid task.
+    var failing: std.testing.FailingAllocator = .init(a, .{ .fail_index = 0 });
+    var reader: Io.Reader = .fixed(valid);
+    const oom = if (nexus_pb.NexusTask.decode(&reader, failing.allocator())) |_| return error.TestUnexpectedResult else |err| err;
+    try testing.expectEqual(error.OutOfMemory, oom);
+    const retryable = try Sent.failure(a, valid, oom);
+    try testing.expectEqualStrings("the worker on task queue queue ran out of memory decoding the Nexus request", retryable.message);
+    try testing.expectEqualStrings("INTERNAL", retryable.failure_info.?.nexus_handler_failure_info.type);
+    try testing.expectEqual(.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE, retryable.failure_info.?.nexus_handler_failure_info.retry_behavior);
+
+    // The same task with an endpoint that isn't UTF-8 appended (field 4; the last one read wins).
+    const malformed = try std.mem.concat(a, u8, &.{ valid, &.{ 0x22, 2, 0xff, 0xfe } });
+    reader = .fixed(malformed);
+    const bad = if (nexus_pb.NexusTask.decode(&reader, a)) |_| return error.TestUnexpectedResult else |err| err;
+    try testing.expect(bad != error.OutOfMemory);
+    const refused = try Sent.failure(a, malformed, bad);
+    try testing.expect(std.mem.startsWith(u8, refused.message, "the worker on task queue queue couldn't decode the Nexus request: "));
+    try testing.expectEqualStrings("BAD_REQUEST", refused.failure_info.?.nexus_handler_failure_info.type);
+    try testing.expectEqual(.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE, refused.failure_info.?.nexus_handler_failure_info.retry_behavior);
+
+    // Without room for the task queue, the message leaves it out.
+    var small: [8]u8 = undefined;
+    try testing.expectEqualStrings("the worker ran out of memory decoding the Nexus request", undecodableNexusError(error.OutOfMemory, "queue", &small).message);
+    try testing.expectEqualStrings("the worker couldn't decode the Nexus request", undecodableNexusError(error.InvalidInput, "queue", &small).message);
 }
 
 test "evictions are logged by reason unless a callback takes them" {
