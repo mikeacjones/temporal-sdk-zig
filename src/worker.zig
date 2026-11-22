@@ -4254,6 +4254,43 @@ const OutOfMemoryTest = struct {
         return p.polled orelse error.TestUnexpectedResult;
     }
 
+    /// A `FailingAllocator` that also counts the allocations it refused. The sweep can't tell
+    /// which allocation fails from its index alone: how many allocations a task takes varies
+    /// from one iteration to the next (the running map keeps the capacity an earlier task gave
+    /// it, and the server's IDs, timestamps and token move arena chunk boundaries). Once the
+    /// failure is induced every later allocation fails too, so one refusal means the induced
+    /// failure was the last allocation the task tried.
+    const CountingFailures = struct {
+        failing: std.testing.FailingAllocator,
+        refused: std.atomic.Value(usize) = .init(0),
+
+        fn allocator(c: *CountingFailures) std.mem.Allocator {
+            return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const c: *CountingFailures = @ptrCast(@alignCast(ctx));
+            const ptr = c.failing.allocator().rawAlloc(len, alignment, ra);
+            if (ptr == null) _ = c.refused.fetchAdd(1, .monotonic);
+            return ptr;
+        }
+
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const c: *CountingFailures = @ptrCast(@alignCast(ctx));
+            return c.failing.allocator().rawResize(memory, alignment, new_len, ra);
+        }
+
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const c: *CountingFailures = @ptrCast(@alignCast(ctx));
+            return c.failing.allocator().rawRemap(memory, alignment, new_len, ra);
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const c: *CountingFailures = @ptrCast(@alignCast(ctx));
+            c.failing.allocator().rawFree(memory, alignment, ra);
+        }
+    };
+
     /// Completes a task the test holds, as a failure, and frees it.
     fn complete(core: bridge.Worker, polled: bridge.Worker.Polled) void {
         defer polled.deinit();
@@ -4301,32 +4338,31 @@ test "an activity task that runs out of memory anywhere before its completion is
     const a = arena.allocator();
 
     // Each allocation from the poll to the completion fails in turn (with every one after it).
-    var induced: usize = 0;
-    var sent_from_stack: ?usize = null;
+    var sent_from_stack: usize = 0;
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         const id = try std.fmt.allocPrint(a, "out-of-memory-{d}", .{fail_index});
         var handle = try OutOfMemoryTest.start(&client, id);
         defer handle.deinit();
         const polled = try OutOfMemoryTest.poll(core, &shut_down);
-        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = fail_index });
-        w.gpa = failing.allocator();
+        var counting: OutOfMemoryTest.CountingFailures = .{ .failing = .init(testing.allocator, .{ .fail_index = fail_index }) };
+        w.gpa = counting.allocator();
         defer w.gpa = testing.allocator;
         if (receiveActivityTask(&w, core, &running, polled, OutOfMemoryTest.task_queue)) |run| superviseActivity(&w, core, &running, run);
         w.gpa = testing.allocator;
         try testing.expectEqual(0, running.map.count());
         const result = handle.get(a);
-        if (!failing.has_induced_failure) {
+        if (!counting.failing.has_induced_failure) {
             try testing.expectEqual(OutOfMemoryTest.result_len, (try result).len);
             break;
         }
-        induced += 1;
         if (result) |r| {
             // Only the bridge's cell for the completion failed, the last allocation: the
-            // completion was sent again with the cell on the stack.
+            // completion was sent again with the cell on the stack. An allocation failure
+            // swallowed before it would show as a second refusal, the cell's.
             try testing.expectEqual(OutOfMemoryTest.result_len, r.len);
-            try testing.expect(sent_from_stack == null);
-            sent_from_stack = fail_index;
+            try testing.expectEqual(1, counting.refused.load(.monotonic));
+            sent_from_stack += 1;
             continue;
         } else |err| try testing.expectEqual(error.ActivityFailed, err);
         // Failed retryably, as an activity returning error.OutOfMemory is, wherever the
@@ -4338,7 +4374,8 @@ test "an activity task that runs out of memory anywhere before its completion is
         try testing.expectEqualStrings("OutOfMemory", info.type);
         try testing.expect(!info.non_retryable);
     }
-    try testing.expectEqual(fail_index - 1, sent_from_stack.?);
+    // The sweep reached the last allocation, the bridge's cell, at least once.
+    try testing.expect(sent_from_stack > 0);
     // Each path that runs out of memory was reached.
     inline for (.{ "receiving an activity task", "decoding an activity task", "tracking an activity for cancellation", "reporting an activity" }) |what|
         try testing.expect(sink.countAt(.err, "Out of memory " ++ what ++ "; failing it as retryable so the server retries it", &.{}) > 0);
