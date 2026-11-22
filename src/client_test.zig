@@ -1,7 +1,8 @@
 //! The client's typed operations against answers served in process: a connection whose calls
 //! an RPC override answers with preset responses, so a test can give the client a response a
 //! dev server won't send. Covers history pages sent as raw history (`fetchHistory`,
-//! `historyIterator`, `WorkflowRun.get`).
+//! `historyIterator`, `WorkflowRun.get`) and a schedule description that outlives its
+//! handle (`ScheduleHandle.describe`).
 
 const std = @import("std");
 const client_mod = @import("client.zig");
@@ -9,6 +10,7 @@ const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
 const converter = @import("converter.zig");
 const protojson = @import("protojson.zig");
+const schedule = @import("schedule.zig");
 const Client = client_mod.Client;
 const GrpcRequest = bridge.Connection.GrpcRequest;
 
@@ -322,4 +324,33 @@ test "callService returns GetWorkflowExecutionHistory's raw history as the serve
     const response = try c.callService(.workflow, history_rpc, arena, .{ .namespace = "default", .execution = .{ .workflow_id = "wf-raw" } }, null);
     try testing.expect(response.history == null);
     try testing.expectEqual(@as(usize, 2), response.raw_history.items.len);
+}
+
+// ---------------------------------------------------------------- schedules
+
+test "a schedule description's id stays valid after its handle is freed" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const action = try schedule.startWorkflowByName(arena, "Report", .{}, .{ .id = "report", .task_queue = "reports" });
+    const response: wfs.DescribeScheduleResponse = .{
+        .schedule = try (schedule.Schedule{ .action = action, .spec = .{} }).toProto(arena, null),
+        .conflict_token = "token-1",
+    };
+    const answers = [_]Answer{.{ .rpc = "DescribeSchedule", .proto = try encodeMessage(arena, response) }};
+    var c = try initClient();
+    defer c.close();
+    var server: Server = .{ .answers = &answers };
+    try connectToServer(&c, &server);
+
+    var handle = try c.getScheduleHandle("nightly-report");
+    const description = handle.describe(arena) catch |err| {
+        handle.deinit();
+        return err;
+    };
+    handle.deinit();
+    // The description and every slice in it live in `arena`, not in the handle.
+    try testing.expectEqualStrings("nightly-report", description.id);
+    try testing.expectEqualStrings("token-1", description.raw.conflict_token);
+    try testing.expectEqual(@as(usize, 1), server.callCount());
 }
