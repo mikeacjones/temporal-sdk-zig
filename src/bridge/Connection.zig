@@ -216,6 +216,8 @@ pub fn connect(gpa: Allocator, io: Io, runtime: Runtime, options: Options, failu
     try core.init(arena_state.allocator(), options);
 
     const done = try Completion(ConnectResult).create(gpa, io, ConnectResult.free);
+    // `onConnect` carries the runtime over into its result, for `ConnectResult.free`.
+    done.result = .{ .conn = null, .fail = null, .runtime = runtime };
     handToCore(done);
     c.temporal_core_client_connect(runtime.ptr, &core.connection, done, onConnect);
     const result = done.waitUncancelable();
@@ -315,7 +317,7 @@ pub const Connecting = struct {
     }
 
     fn free(self: *Connecting) void {
-        if (self.conn) |p| if (!self.taken) c.temporal_core_client_free(p);
+        if (self.conn) |p| if (!self.taken) self.runtime.release(.{ .connection = p });
         if (self.fail) |f| f.deinit();
         allocator.destroy(self);
     }
@@ -391,7 +393,7 @@ pub const Connecting = struct {
         if (self.word.fetchOr(calling, .acq_rel) & orphaned != 0) {
             // Nobody holds the attempt, and its runtime is never freed: the connection can't
             // hold the last reference to the core.
-            if (conn) |p| c.temporal_core_client_free(p);
+            if (conn) |p| self.runtime.release(.{ .connection = p });
             if (fail_bytes) |f| f.deinit();
             allocator.destroy(self);
             return;
@@ -472,8 +474,10 @@ const CoreOptions = struct {
     }
 };
 
+/// Frees the connection through `Runtime.release`, which keeps it until the runtime is freed
+/// if the runtime forwards logs.
 pub fn deinit(conn: Connection) void {
-    c.temporal_core_client_free(conn.ptr);
+    conn.runtime.release(.{ .connection = conn.ptr });
 }
 
 /// Replaces the gRPC headers sent with every call.
@@ -604,17 +608,18 @@ fn encodeError(err: bytes.EncodeError) error{ OutOfMemory, InvalidOptions } {
 const ConnectResult = struct {
     conn: ?*c.TemporalCoreConnection,
     fail: ?bytes.Owned,
+    runtime: Runtime,
 
     fn free(r: ConnectResult) void {
         if (r.fail) |f| f.deinit();
-        if (r.conn) |p| c.temporal_core_client_free(p);
+        if (r.conn) |p| r.runtime.release(.{ .connection = p });
     }
 };
 
 fn onConnect(user_data: ?*anyopaque, conn: ?*c.TemporalCoreConnection, fail: ?*const c.TemporalCoreByteArray) callconv(.c) void {
     takeFromCore(user_data.?);
     const done: *Completion(ConnectResult) = @ptrCast(@alignCast(user_data.?));
-    done.complete(.{ .conn = conn, .fail = bytes.Owned.take(null, fail) });
+    done.complete(.{ .conn = conn, .fail = bytes.Owned.take(null, fail), .runtime = done.result.runtime });
 }
 
 const CallResult = struct {

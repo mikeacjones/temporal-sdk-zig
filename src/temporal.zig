@@ -49,6 +49,7 @@ test {
     _ = @import("client_namespace_test.zig");
     _ = @import("client_rpc_options_test.zig");
     _ = @import("client_service_test.zig");
+    _ = @import("client_test.zig");
     _ = @import("nexus_test.zig");
     _ = @import("failure_test.zig");
     _ = @import("converter_context_test.zig");

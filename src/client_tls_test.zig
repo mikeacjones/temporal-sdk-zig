@@ -362,3 +362,103 @@ fn base64Url(a: Allocator, bytes: []const u8) ![]const u8 {
     const encoder = std.base64.url_safe_no_pad.Encoder;
     return encoder.encode(try a.alloc(u8, encoder.calcSize(bytes.len)), bytes);
 }
+
+test "loadOptions reads TEMPORAL_TLS's true and false spellings and rejects any other value" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_ADDRESS", "localhost:7233");
+
+    for ([_][]const u8{ "true", "TRUE", "True", "1" }) |on| {
+        try env.put("TEMPORAL_TLS", on);
+        const options = try client_mod.loadOptions(a, .{ .env = &env, .disable_file = true });
+        testing.expect(options.tls != null) catch |err| {
+            std.debug.print("TEMPORAL_TLS={s} left TLS off\n", .{on});
+            return err;
+        };
+    }
+    // An API key turns TLS on unless TEMPORAL_TLS's false spelling turns it off.
+    try env.put("TEMPORAL_API_KEY", "secret");
+    for ([_][]const u8{ "false", "FALSE", "False", "0" }) |off| {
+        try env.put("TEMPORAL_TLS", off);
+        const options = try client_mod.loadOptions(a, .{ .env = &env, .disable_file = true });
+        testing.expect(options.tls == null) catch |err| {
+            std.debug.print("TEMPORAL_TLS={s} left TLS on\n", .{off});
+            return err;
+        };
+    }
+    _ = env.swapRemove("TEMPORAL_API_KEY");
+
+    for ([_][]const u8{ "garbage", "", "yes", "no", "on", "off", "2", " true", "true ", "tru" }) |bad| {
+        try env.put("TEMPORAL_TLS", bad);
+        testing.expectError(error.InvalidConfig, client_mod.loadOptions(a, .{ .env = &env, .disable_file = true })) catch |err| {
+            std.debug.print("TEMPORAL_TLS=\"{s}\" was accepted\n", .{bad});
+            return err;
+        };
+        // With a config file too, the variable is still checked.
+        try testing.expectError(error.InvalidConfig, client_mod.loadOptions(a, .{ .env = &env, .config_data =
+            \\[profile.default]
+            \\address = "localhost:7233"
+        }));
+        // With the environment disabled, the variable isn't read at all.
+        const file_only = try client_mod.loadOptions(a, .{ .env = &env, .disable_env = true, .config_data =
+            \\[profile.default]
+            \\address = "file:7233"
+        });
+        try testing.expectEqualStrings("file:7233", file_only.host_port);
+        try testing.expect(file_only.tls == null);
+    }
+}
+
+test "loadOptions reads the config file's tls.disabled bool, rejects a non-bool, and still checks TEMPORAL_TLS over it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const off = try client_mod.loadOptions(a, .{ .disable_env = true, .config_data =
+        \\[profile.default]
+        \\api_key = "secret"
+        \\tls = { disabled = true }
+    });
+    try testing.expect(off.tls == null);
+
+    const on = try client_mod.loadOptions(a, .{ .disable_env = true, .config_data =
+        \\[profile.default]
+        \\tls = { disabled = false }
+    });
+    try testing.expect(on.tls != null);
+
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(a, .{ .disable_env = true, .config_data =
+        \\[profile.default]
+        \\tls = { disabled = "garbage" }
+    }));
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(a, .{ .disable_env = true, .config_data =
+        \\[profile.default]
+        \\tls = { disabled = 1 }
+    }));
+
+    // The file's bool doesn't excuse a bad TEMPORAL_TLS: before the check, sdk-core skipped
+    // the unparseable value and loaded the profile with TLS off, hiding the typo.
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_TLS", "garbage");
+    for ([_][]const u8{ "true", "false" }) |disabled| {
+        const config = try std.fmt.allocPrint(a, "[profile.default]\ntls = {{ disabled = {s} }}\n", .{disabled});
+        try testing.expectError(error.InvalidConfig, client_mod.loadOptions(a, .{ .env = &env, .config_data = config }));
+    }
+    // A good TEMPORAL_TLS overrides the file's bool either way.
+    try env.put("TEMPORAL_TLS", "1");
+    const env_on = try client_mod.loadOptions(a, .{ .env = &env, .config_data =
+        \\[profile.default]
+        \\tls = { disabled = true }
+    });
+    try testing.expect(env_on.tls != null);
+    try env.put("TEMPORAL_TLS", "0");
+    const env_off = try client_mod.loadOptions(a, .{ .env = &env, .config_data =
+        \\[profile.default]
+        \\tls = { disabled = false }
+    });
+    try testing.expect(env_off.tls == null);
+}

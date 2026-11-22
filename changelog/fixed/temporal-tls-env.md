@@ -1,0 +1,1 @@
+`client.loadOptions` now returns `error.InvalidConfig`, logging the value, when `TEMPORAL_TLS` is not `true`, `false`, `1` or `0` (in any case); before, a value such as `garbage` or an empty one silently turned TLS on.

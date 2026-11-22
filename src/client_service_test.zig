@@ -166,6 +166,61 @@ test "a service call through a view sends the view's metadata with the client's 
     try testing.expectEqualStrings("AP96", server.value("trace-bin").?);
 }
 
+/// Decodes a binary header's value as gRPC sends it, base64 with or without padding.
+fn decodeBinaryHeader(buf: []u8, sent: []const u8) ![]const u8 {
+    const unpadded = std.mem.trimEnd(u8, sent, "=");
+    const decoder = std.base64.standard_no_pad.Decoder;
+    const out = buf[0..try decoder.calcSizeForSlice(unpadded)];
+    try decoder.decode(out, unpadded);
+    return out;
+}
+
+test "binary headers from updateHeaders and loadOptions reach the server, and each update replaces them" {
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null });
+    defer c.close();
+    var server: Server = .{};
+    defer server.deinit();
+    try connectToServer(&c, &server);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [64]u8 = undefined;
+
+    try c.updateHeaders(&.{ .{ .key = "x-shared", .value = "client" }, .{ .key = "trace-bin", .value = "\x00\xff\n" } });
+    try testing.expectError(error.NotFound, c.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "default" }, null));
+    try testing.expectEqualStrings("\x00\xff\n", try decodeBinaryHeader(&buf, server.value("trace-bin").?));
+    try testing.expectEqualStrings("client", server.value("x-shared").?);
+
+    // A non-ASCII value of an ASCII header is rejected, and the headers stay as they were.
+    try testing.expectError(error.InvalidOptions, c.updateHeaders(&.{.{ .key = "x-shared", .value = "\xc3\xa9" }}));
+    try testing.expectError(error.NotFound, c.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "default" }, null));
+    try testing.expectEqualStrings("\x00\xff\n", try decodeBinaryHeader(&buf, server.value("trace-bin").?));
+    try testing.expectEqualStrings("client", server.value("x-shared").?);
+
+    // Headers from the environment, through loadOptions: the binary one replaces the one
+    // above, and the ASCII headers are replaced with none.
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_GRPC_META_TRACE_BIN", "caf\xc3\xa9");
+    const loaded = try client_mod.loadOptions(arena, .{ .env = &env, .disable_file = true });
+    try c.updateHeaders(loaded.headers);
+    try testing.expectError(error.NotFound, c.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "default" }, null));
+    try testing.expectEqualStrings("caf\xc3\xa9", try decodeBinaryHeader(&buf, server.value("trace-bin").?));
+    try testing.expect(server.value("x-shared") == null);
+
+    var bad_env: std.process.Environ.Map = .init(testing.allocator);
+    defer bad_env.deinit();
+    try bad_env.put("TEMPORAL_GRPC_META_X_SHARED", "\xc3\xa9");
+    const bad = try client_mod.loadOptions(arena, .{ .env = &bad_env, .disable_file = true });
+    try testing.expectError(error.InvalidOptions, c.updateHeaders(bad.headers));
+
+    // An update without a binary header stops sending the old one.
+    try c.updateHeaders(&.{.{ .key = "x-shared", .value = "again" }});
+    try testing.expectError(error.NotFound, c.callService(.operator, "ListSearchAttributes", arena, .{ .namespace = "default" }, null));
+    try testing.expect(server.value("trace-bin") == null);
+    try testing.expectEqualStrings("again", server.value("x-shared").?);
+}
+
 test "every gRPC status returns its error, and the failure carries the status" {
     var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null });
     defer c.close();
@@ -408,4 +463,91 @@ test "a test service call against the time-skipping server" {
 
     const now = try c.callService(.test_service, "GetCurrentTime", arena_state.allocator(), .{}, null);
     try testing.expect(now.time.?.seconds > 0);
+}
+
+test "a request string field that is not valid UTF-8 returns InvalidArgument, naming the field, without a call" {
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null });
+    defer c.close();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const describe: wfs.DescribeWorkflowExecutionRequest = .{ .namespace = "default", .execution = .{ .workflow_id = "bad\xff" } };
+    var failure: ?client_mod.RpcFailure = null;
+
+    // Unconnected, the client doesn't connect for it: nothing listens on the port.
+    try testing.expectError(error.InvalidArgument, c.callService(.workflow, "DescribeWorkflowExecution", arena, describe, &failure));
+    try testing.expect(c.shared.connection == null);
+
+    var server: Server = .{};
+    defer server.deinit();
+    try connectToServer(&c, &server);
+
+    failure = null;
+    try testing.expectError(error.InvalidArgument, c.callService(.workflow, "DescribeWorkflowExecution", arena, describe, &failure));
+    try testing.expectEqual(client_mod.RpcCode.invalid_argument, failure.?.code.?);
+    try testing.expectEqualStrings("the request's field execution.workflow_id is not valid UTF-8; no call was made", failure.?.message);
+    try testing.expectEqualStrings("", failure.?.details);
+    // Without `failure`, the same message is logged as a warning.
+    try testing.expectError(error.InvalidArgument, c.callService(.workflow, "DescribeWorkflowExecution", arena, describe, null));
+
+    // A typed call fails as for a server's INVALID_ARGUMENT, also without a call.
+    try testing.expectError(error.RpcFailed, c.signalWorkflowByName("go", "bad\xff", "", .{}));
+    try testing.expectEqual(@as(usize, 0), server.callCount());
+
+    // Valid UTF-8 beyond ASCII goes through.
+    try testing.expectError(error.NotFound, c.callService(.workflow, "DescribeWorkflowExecution", arena, .{ .namespace = "default", .execution = .{ .workflow_id = "wf-\xc3\xa9" } }, &failure));
+    try testing.expectEqual(@as(usize, 1), server.callCount());
+    try testing.expectError(error.NotFound, c.signalWorkflowByName("go", "wf-\xc3\xa9", "", .{}));
+    try testing.expectEqual(@as(usize, 2), server.callCount());
+}
+
+test "the UTF-8 check names repeated elements, map keys and values, and oneof members" {
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null });
+    defer c.close();
+    var server: Server = .{};
+    defer server.deinit();
+    try connectToServer(&c, &server);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var failure: ?client_mod.RpcFailure = null;
+
+    // A oneof member inside a repeated field, by the member's name.
+    var multi: wfs.ExecuteMultiOperationRequest = .{ .namespace = "default" };
+    try multi.operations.append(arena, .{ .operation = .{ .start_workflow = .{ .workflow_id = "ok" } } });
+    try multi.operations.append(arena, .{ .operation = .{ .update_workflow = .{ .request = .{ .meta = .{ .update_id = "u\xc0" } } } } });
+    try testing.expectError(error.InvalidArgument, c.callService(.workflow, "ExecuteMultiOperation", arena, multi, &failure));
+    try testing.expectEqualStrings("the request's field operations[1].update_workflow.request.meta.update_id is not valid UTF-8; no call was made", failure.?.message);
+
+    // A repeated string.
+    var options: wfs.UpdateWorkflowExecutionOptionsRequest = .{ .namespace = "default", .update_mask = .{} };
+    try options.update_mask.?.paths.append(arena, "versioning_override");
+    try options.update_mask.?.paths.append(arena, "\xed\xa0\x80");
+    try testing.expectError(error.InvalidArgument, c.callService(.workflow, "UpdateWorkflowExecutionOptions", arena, options, &failure));
+    try testing.expectEqualStrings("the request's field update_mask.paths[1] is not valid UTF-8; no call was made", failure.?.message);
+
+    // A map value, by its key, and a map key.
+    var register: wfs.RegisterNamespaceRequest = .{ .namespace = "n" };
+    try register.data.append(arena, .{ .key = "owner", .value = "\xff" });
+    try testing.expectError(error.InvalidArgument, c.callService(.workflow, "RegisterNamespace", arena, register, &failure));
+    try testing.expectEqualStrings("the request's field data[\"owner\"] is not valid UTF-8; no call was made", failure.?.message);
+    register.data.items[0] = .{ .key = "own\xfe", .value = "x" };
+    try testing.expectError(error.InvalidArgument, c.callService(.workflow, "RegisterNamespace", arena, register, &failure));
+    try testing.expectEqualStrings("the request's field data (a key) is not valid UTF-8; no call was made", failure.?.message);
+
+    // A path longer than 200 bytes is cut, on a code point boundary.
+    const key = try arena.alloc(u8, 300);
+    for (0..150) |i| @memcpy(key[2 * i ..][0..2], "\xc3\xa9");
+    register.data.items[0] = .{ .key = key, .value = "\xff" };
+    try testing.expectError(error.InvalidArgument, c.callService(.workflow, "RegisterNamespace", arena, register, &failure));
+    const message = failure.?.message;
+    const path = message["the request's field ".len..std.mem.indexOf(u8, message, " is not valid").?];
+    try testing.expect(path.len <= 200);
+    try testing.expect(std.mem.startsWith(u8, path, "data[\"\xc3\xa9"));
+    try testing.expect(std.mem.endsWith(u8, path, "\xc3\xa9..."));
+    try testing.expect(std.unicode.utf8ValidateSlice(message));
+
+    // Bytes fields may hold any bytes.
+    try testing.expectError(error.NotFound, c.callService(.workflow, "RespondActivityTaskCompleted", arena, .{ .namespace = "default", .task_token = "\xff\x00" }, &failure));
+    try testing.expectEqual(@as(usize, 1), server.callCount());
 }
