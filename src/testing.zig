@@ -32,6 +32,7 @@ const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const nexus = @import("nexus.zig");
 const CancelBlockingAllocator = @import("CancelBlockingAllocator.zig");
+const io_tasks = @import("io_tasks.zig");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -696,7 +697,7 @@ pub const WorkflowEnvironment = struct {
     /// reaches it). A worker that fails to start returns its error here.
     fn ensureWorker(env: *WorkflowEnvironment) !void {
         if (env.running != null) return;
-        env.running = try env.io.concurrent(runWorker, .{&env.worker});
+        env.running = try io_tasks.concurrent(env.io, runWorker, .{&env.worker});
         env.worker.waitUntilRunning() catch |err| switch (err) {
             error.WorkerFailedToStart => {
                 const result = env.running.?.await(env.io);
@@ -1176,16 +1177,25 @@ pub const ActivityEnvironment = struct {
             while (link.*.? != &run) link = &link.*.?.next;
             link.* = run.next;
         }
+        const Ret = @typeInfo(@TypeOf(Activity.call)).@"fn".return_type.?;
+        // The task hands its result back through `ret`, on this frame, which awaits or
+        // cancels the task before it returns: a result aligned above 8 (an error union holding
+        // `std.Io.Duration`, say) would overrun its future's allocation (see io_tasks.zig).
         const S = struct {
-            fn call(r: ?*Activity.Receiver, c: *activity.Context, a: Activity.Args, wake: *Io.Event) @typeInfo(@TypeOf(Activity.call)).@"fn".return_type.? {
+            fn call(r: ?*Activity.Receiver, c: *activity.Context, a: Activity.Args, wake: *Io.Event, out: *Ret) void {
                 defer wake.set(c.io_);
-                return Activity.call(r, c, a);
+                out.* = Activity.call(r, c, a);
             }
         };
-        var task = env.io.concurrent(S.call, .{ receiver, &ctx, args, &run.wake }) catch
+        var ret: Ret = undefined;
+        var task = io_tasks.concurrent(env.io, S.call, .{ receiver, &ctx, args, &run.wake, &ret }) catch
             return Activity.call(receiver, &ctx, args);
-        run.wake.wait(env.io) catch return task.cancel(env.io);
-        return if (ctx.cancelReason() != null) task.cancel(env.io) else task.await(env.io);
+        run.wake.wait(env.io) catch {
+            task.cancel(env.io);
+            return ret;
+        };
+        if (ctx.cancelReason() != null) task.cancel(env.io) else task.await(env.io);
+        return ret;
     }
 
     /// Cancels the activities this environment is running, as a worker does: each sees

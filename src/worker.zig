@@ -40,6 +40,7 @@ const metrics_mod = @import("metrics.zig");
 const Instance = @import("workflow/Instance.zig");
 const Scheduler = @import("workflow/Scheduler.zig");
 const CancelBlockingAllocator = @import("CancelBlockingAllocator.zig");
+const io_tasks = @import("io_tasks.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -669,7 +670,7 @@ pub const Worker = struct {
         // Read while the worker connects and creates its core; `awaitDebugInfo` waits for it
         // before the worker polls, so no activity fails before it is done.
         if (w.readsDebugInfo() and w.debug_info_read == null and !debug_info_warm.load(.acquire))
-            w.debug_info_read = w.io.concurrent(warmDebugInfo, .{w}) catch null;
+            w.debug_info_read = io_tasks.concurrent(w.io, warmDebugInfo, .{w}) catch null;
         var core_options = coreOptions(w.options, w.client.namespace, w.task_queue, strategy, registered);
         const nondeterminism_types = try w.nondeterminismFailTypes();
         defer w.gpa.free(nondeterminism_types);
@@ -768,7 +769,7 @@ pub const Worker = struct {
             w.settleStart(false);
         } else log.info("Worker stopped before it polled TaskQueue={s}", .{w.task_queue});
 
-        var workflows_done = if (w.hasWorkflows()) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
+        var workflows_done = if (w.hasWorkflows()) try io_tasks.concurrent(w.io, workflowLoop, .{ w, core }) else null;
         // Once a loop polls a core, returning early would free the core worker under it: shut
         // down like a normal stop, drain every poller (finalizing waits for each to return
         // null), finalize, then return the error.
@@ -776,7 +777,7 @@ pub const Worker = struct {
         var polling = workflows_done != null;
         var nexus_done: ?Io.Future(void) = null;
         if (w.hasNexusServices()) {
-            if (w.io.concurrent(nexusLoop, .{ w, core })) |f| {
+            if (io_tasks.concurrent(w.io, nexusLoop, .{ w, core })) |f| {
                 nexus_done = f;
                 polling = true;
             } else |err| {
@@ -792,7 +793,7 @@ pub const Worker = struct {
         var activity_loops: [3]?Io.Future(void) = @splat(null);
         for (cores[first_activity_core..], activity_loops[first_activity_core..core_count]) |c, *loop| {
             if (start_failed == null) {
-                if (w.io.concurrent(activityLoop, .{ w, c.core, c.task_queue })) |f| {
+                if (io_tasks.concurrent(w.io, activityLoop, .{ w, c.core, c.task_queue })) |f| {
                     loop.* = f;
                     polling = true;
                     continue;
@@ -1659,7 +1660,7 @@ pub const WorkflowRunner = struct {
             .sdk_work = &inst.sched.sdk_work,
             .sender = sender orelse return .{ .returned = inst.activate(act, a) },
         };
-        var watchdog = io.concurrent(Watch.run, .{&watch}) catch {
+        var watchdog = io_tasks.concurrent(io, Watch.run, .{&watch}) catch {
             r.logger.log(.warn, "no concurrent task available for the deadlock watchdog; this workflow activation runs unwatched", &.{.{ .key = "run_id", .value = act.run_id }});
             return .{ .returned = inst.activate(act, a) };
         };
@@ -2237,7 +2238,7 @@ fn cancelReason(reason: task_pb.ActivityCancelReason) activity.CancelReason {
 /// couldn't be canceled.
 fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivities, run: *RunningActivity) void {
     const outcome = blk: {
-        var task = w.io.concurrent(callActivity, .{ w, core, run }) catch break :blk noThreadForActivity(run);
+        var task = io_tasks.concurrent(w.io, callActivity, .{ w, core, run }) catch break :blk noThreadForActivity(run);
         run.wake.waitUncancelable(w.io);
         const reason = run.ctx.cancelReason() orelse break :blk task.await(w.io);
         log.debug("activity {s}: canceling its task ({t})", .{ run.start.activity_id, reason });
@@ -2852,7 +2853,7 @@ fn undecodableNexusError(err: anyerror, task_queue: []const u8, message_buf: []u
 /// thread for the handler the request fails as `resource_exhausted`, which the server
 /// retries: run here, the handler couldn't be canceled.
 fn superviseNexusRequest(w: *Worker, core: bridge.Worker, running: *RunningNexusRequests, req: *NexusRequest) void {
-    if (w.io.concurrent(runNexusRequest, .{ w, req })) |started| {
+    if (io_tasks.concurrent(w.io, runNexusRequest, .{ w, req })) |started| {
         var task = started;
         req.wake.waitUncancelable(w.io);
         if (req.ctx.cancelReason() != null) task.cancel(w.io) else task.await(w.io);
@@ -7531,4 +7532,87 @@ test "nondeterminism fails the workflow with the worker's or the definition's op
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
     try testing.expect((try client.describeWorkflow(scratch.allocator(), "nd-plain", plain.run_id)).status == .running);
+}
+
+test {
+    _ = io_tasks;
+}
+
+test "io_tasks.resultFits refuses results aligned above 8 and accepts the worker's own" {
+    try testing.expect(!io_tasks.resultFits(Io.Duration));
+    try testing.expect(!io_tasks.resultFits(failure_mod.Application));
+    try testing.expect(!io_tasks.resultFits(@Vector(4, u32)));
+    try testing.expect(!io_tasks.resultFits(NexusOutcome));
+    // An activity's outcome, as `callActivity` returns it, and a worker run's.
+    try testing.expect(io_tasks.resultFits(@typeInfo(@TypeOf(callActivity)).@"fn".return_type.?));
+    try testing.expect(io_tasks.resultFits(Worker.RunError!void));
+}
+
+/// Hands out every allocation aligned to 8 or less at an address that is 8 mod 16, as a
+/// general-purpose allocator may, with canary bytes after the requested length that `free`
+/// checks. Thread-safe as its child is.
+const OffsetCanaryAllocator = struct {
+    child: Allocator,
+    overruns: std.atomic.Value(u32) = .init(0),
+
+    const canary_len = 16;
+    const canary_byte = 0xa5;
+
+    fn allocator(self: *OffsetCanaryAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+
+    fn lead(alignment: std.mem.Alignment) usize {
+        return if (alignment.toByteUnits() <= 8) 8 else 0;
+    }
+
+    fn outer(alignment: std.mem.Alignment) std.mem.Alignment {
+        return alignment.max(.@"16");
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *OffsetCanaryAllocator = @ptrCast(@alignCast(ctx));
+        const pad = lead(alignment);
+        const base = self.child.rawAlloc(pad + len + canary_len, outer(alignment), ret_addr) orelse return null;
+        @memset(base[pad + len ..][0..canary_len], canary_byte);
+        return base + pad;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *OffsetCanaryAllocator = @ptrCast(@alignCast(ctx));
+        const pad = lead(alignment);
+        const base = memory.ptr - pad;
+        for (base[pad + memory.len ..][0..canary_len]) |b| {
+            if (b != canary_byte) {
+                _ = self.overruns.fetchAdd(1, .monotonic);
+                break;
+            }
+        }
+        self.child.rawFree(base[0 .. pad + memory.len + canary_len], outer(alignment), ret_addr);
+    }
+};
+
+test "ActivityEnvironment returns 16-aligned activity results without overrunning a Threaded future" {
+    const Fixtures = struct {
+        fn none(_: *activity.Context) Io.Duration {
+            return .fromNanoseconds(-1);
+        }
+        fn one(_: *activity.Context, x: u64) Io.Duration {
+            return .fromNanoseconds(-@as(i96, x));
+        }
+        const None = activity.Def("AlignedNone", none);
+        const One = activity.Def("AlignedOne", one);
+    };
+    comptime std.debug.assert(@alignOf(Io.Duration) > 8);
+    var checking: OffsetCanaryAllocator = .{ .child = testing.allocator };
+    var threaded: Io.Threaded = .init(checking.allocator(), .{ .environ = testing.environ });
+    defer threaded.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: @import("testing.zig").ActivityEnvironment = .init(threaded.io());
+    // The two argument tuples differ by 8 bytes, so one of the two futures starts 8 mod 16
+    // from where its result would need to be, whatever `@sizeOf` the future has.
+    try testing.expectEqual(@as(i96, -1), (try env.executeActivity(Fixtures.None, .{}, arena.allocator())).toNanoseconds());
+    try testing.expectEqual(@as(i96, -2), (try env.executeActivity(Fixtures.One, .{2}, arena.allocator())).toNanoseconds());
+    try testing.expectEqual(@as(u32, 0), checking.overruns.load(.monotonic));
 }

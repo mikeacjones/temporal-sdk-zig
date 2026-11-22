@@ -1527,6 +1527,7 @@ pub const CopyFiles = activity.Def("copy_files", copyFiles);
 
 Notes:
 - Run `waitForWorkerStop` as a coroutine beside the work, with `io.concurrent` or as a `std.Io.Select` case started with `select.concurrent`. Not with `async`: when the Io has no thread to spare (always on a one-CPU host, and on any host once enough activities run), `async` runs the wait at once on the activity's own task, which then blocks until the worker stops. It returns `error.Canceled` when the activity is canceled first, or when its own task is canceled.
+- On Zig 0.17.1, a function started with `io.concurrent` or `io.async` that returns `failure.Application`, `std.Io.Duration`, or any other type aligned above 8 bytes (an `i96` or `u128` field, a vector) can corrupt memory under `std.Io.Threaded`: its future places such a result up to 8 bytes past the memory it allocated. Have the function write its result through a pointer to memory the caller owns, read it after `await` or `cancel`, and return `void`. `std.Io.Group` and `std.Io.Select` tasks are not affected, and neither are coroutines in workflow code.
 - With the default `graceful_shutdown_period` of zero, the cancel follows the stop at once, so set a period to give activities time to react.
 - Regular activities, local activities and activities in sessions all see the signal. There is no "am I in an activity" check: code that holds an `*activity.Context` is in one.
 
