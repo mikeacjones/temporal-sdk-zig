@@ -240,6 +240,10 @@ pub fn toPayload(arena: Allocator, value: anytype) error{OutOfMemory}!Payload {
 /// Encodes one value for the call `context` describes, which a type's
 /// `toPayloadWithContext` hook receives; every other encoding ignores it. Memory comes from
 /// `arena`; `context` is borrowed for the call.
+///
+/// A `proto.google.protobuf.Timestamp` inside a plain value, directly or in a
+/// `std.json.ArrayHashMap`, is written as RFC 3339 text; one outside protobuf's range makes
+/// the call fail. A type with its own `jsonStringify` writes what it holds itself.
 pub fn toPayloadWithContext(arena: Allocator, context: *const Context, value: anytype) error{OutOfMemory}!Payload {
     const T = @TypeOf(value);
     if (T == Payload) return value;
@@ -252,7 +256,12 @@ pub fn toPayloadWithContext(arena: Allocator, context: *const Context, value: an
     if (comptime hasPayloadHooks(T)) return value.toPayload(arena);
     if (T == Bytes) return payloadWith(arena, .binary, value.data);
     if (comptime isProtoMessage(T)) return Proto(T, .{}).encode(arena, value);
-    const json = try std.json.Stringify.valueAlloc(arena, value, .{});
+    // zig-protobuf's own Timestamp writer panics on 29 February, so a type that reaches one
+    // is written through `writeJson`; every other type keeps std.json's output as it is.
+    const json = if (comptime holdsTimestamp(T))
+        try std.json.Stringify.valueAlloc(arena, TimestampJson(T){ .value = &value }, .{})
+    else
+        try std.json.Stringify.valueAlloc(arena, value, .{});
     return payloadWith(arena, .json, json);
 }
 
@@ -409,6 +418,152 @@ fn jsonUnconvertible(comptime Root: type, comptime direction: Direction) ?type {
         }
         return null;
     }
+}
+
+// Whether std.json, writing `T`, reaches `proto.google.protobuf.Timestamp`. Walks the type
+// as `jsonUnconvertible` does, stopping at any other type that writes itself.
+fn holdsTimestamp(comptime Root: type) bool {
+    comptime {
+        var visited: []const type = &.{};
+        var stack: []const type = &.{Root};
+        var work: usize = 0;
+        while (stack.len > 0) {
+            work += visited.len + 8;
+            @setEvalBranchQuota(100_000 + 8 * work);
+            const T = stack[stack.len - 1];
+            stack = stack[0 .. stack.len - 1];
+            if (T == proto.google.protobuf.Timestamp) return true;
+            if (std.mem.indexOfScalar(type, visited, T) != null) continue;
+            visited = visited ++ .{T};
+            var children: []const type = &.{};
+            switch (@typeInfo(T)) {
+                .optional => |o| children = &.{o.child},
+                .array => |a| children = &.{a.child},
+                .vector => |v| children = &.{v.child},
+                .pointer => |p| switch (p.size) {
+                    .one, .slice => children = &.{p.child},
+                    .many => if (p.sentinel_ptr != null) {
+                        children = &.{p.child};
+                    },
+                    .c => {},
+                },
+                .@"union" => |u| if (u.tag_type != null and !std.meta.hasFn(T, "jsonStringify")) {
+                    children = u.field_types;
+                },
+                .@"struct" => |s| if (jsonMapValue(T)) |V| {
+                    children = &.{V};
+                } else if (!std.meta.hasFn(T, "jsonStringify")) {
+                    children = s.field_types;
+                },
+                else => {},
+            }
+            work += children.len;
+            var i = children.len;
+            while (i > 0) {
+                i -= 1;
+                stack = stack ++ .{children[i]};
+            }
+        }
+        return false;
+    }
+}
+
+// The value type `V` when `T` is `std.json.ArrayHashMap(V)`, else null. That map writes its
+// values with `jws.write`, so a Timestamp in it would reach the dependency's writer; it is
+// the one self-writing type in std or zig-protobuf that can hold a Timestamp.
+fn jsonMapValue(comptime T: type) ?type {
+    if (@typeInfo(T) != .@"struct" or !@hasField(T, "map")) return null;
+    const M = @FieldType(T, "map");
+    if (@typeInfo(M) != .@"struct" or !@hasDecl(M, "Data")) return null;
+    if (@typeInfo(M.Data) != .@"struct" or !@hasField(M.Data, "value")) return null;
+    const V = @FieldType(M.Data, "value");
+    return if (T == std.json.ArrayHashMap(V)) V else null;
+}
+
+// Passed to std.json in place of a value of `T` that holds a Timestamp.
+fn TimestampJson(comptime T: type) type {
+    return struct {
+        value: *const T,
+
+        pub fn jsonStringify(self: @This(), jws: *std.json.Stringify) std.json.Stringify.Error!void {
+            return writeJson(T, self.value, jws);
+        }
+    };
+}
+
+// Writes `v` as std.json.Stringify.write does with the default options, except that each
+// Timestamp is written by `proto_time.formatTimestamp`, as `protojson` writes one. The error
+// set is explicit because the function recurses.
+fn writeJson(comptime T: type, v: *const T, jws: *std.json.Stringify) std.json.Stringify.Error!void {
+    if (T == proto.google.protobuf.Timestamp) {
+        var buf: [proto_time.timestamp_text_max]u8 = undefined;
+        const text = proto_time.formatTimestamp(v.*, &buf) catch |err| switch (err) {
+            error.OutOfRange => return error.WriteFailed,
+        };
+        return jws.write(text);
+    }
+    if (comptime !holdsTimestamp(T)) return jws.write(v.*);
+    if (comptime jsonMapValue(T)) |V| {
+        // As std.json.ArrayHashMap's own jsonStringify, with each value written here.
+        try jws.beginObject();
+        for (v.map.keys(), v.map.values()) |key, *item| {
+            try jws.objectField(key);
+            try writeJson(V, item, jws);
+        }
+        return jws.endObject();
+    }
+    switch (@typeInfo(T)) {
+        .optional => |o| return if (v.*) |*payload| writeJson(o.child, payload, jws) else jws.write(null),
+        .@"union" => {
+            try jws.beginObject();
+            switch (v.*) {
+                inline else => |*payload, tag| {
+                    try jws.objectField(@tagName(tag));
+                    const F = @TypeOf(payload.*);
+                    if (F == void) {
+                        try jws.beginObject();
+                        try jws.endObject();
+                    } else try writeJson(F, payload, jws);
+                },
+            }
+            return jws.endObject();
+        },
+        .@"struct" => |s| {
+            if (s.is_tuple) try jws.beginArray() else try jws.beginObject();
+            inline for (s.field_names, s.field_types, s.field_attrs) |name, F, attrs| {
+                if (F == void) continue;
+                if (!s.is_tuple) try jws.objectField(name);
+                if (comptime !holdsTimestamp(F)) {
+                    try jws.write(@field(v.*, name));
+                } else if (attrs.@"comptime") {
+                    // A comptime field (any comptime-known field of an anonymous struct
+                    // literal) has no runtime address, so write a runtime copy.
+                    var copy: F = @field(v.*, name);
+                    _ = &copy;
+                    try writeJson(F, &copy, jws);
+                } else try writeJson(F, &@field(v.*, name), jws);
+            }
+            return if (s.is_tuple) jws.endArray() else jws.endObject();
+        },
+        .array => |a| return writeElements(a.child, v, jws),
+        .vector => |info| {
+            const array: [info.len]info.child = v.*;
+            return writeElements(info.child, &array, jws);
+        },
+        .pointer => |p| switch (p.size) {
+            .one => return writeJson(p.child, v.*, jws),
+            .slice => return writeElements(p.child, v.*, jws),
+            .many => return writeElements(p.child, std.mem.span(v.*), jws),
+            .c => comptime unreachable,
+        },
+        else => comptime unreachable,
+    }
+}
+
+fn writeElements(comptime E: type, elements: []const E, jws: *std.json.Stringify) std.json.Stringify.Error!void {
+    try jws.beginArray();
+    for (elements) |*e| try writeJson(E, e, jws);
+    return jws.endArray();
 }
 
 /// Arguments not yet decoded, as a dynamic workflow, activity, or signal handler receives
@@ -746,7 +901,8 @@ pub const Time = struct {
     /// Nanoseconds since the Unix epoch.
     unix_ns: i96,
 
-    /// The longest text `format` writes: "-YYYYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ" fits easily.
+    /// Room for the longest text `format` writes, "9999-12-31T23:59:59.999999999Z" (30 bytes):
+    /// `format` clamps to the years 0000 to 9999.
     pub const max_len = 40;
 
     /// Any `std.Io.Timestamp` is accepted. `format` and `jsonStringify` (and so `toPayload`)
@@ -1477,6 +1633,176 @@ test "a json/protobuf message holding a Timestamp on 29 February round-trips" {
     const back = try fromPayload(HistoryEvent, a, p);
     try testing.expectEqual(event.event_time.?.seconds, back.event_time.?.seconds);
     try testing.expectEqual(event.event_time.?.nanos, back.event_time.?.nanos);
+}
+
+test "a plain struct holding a protobuf Timestamp on 29 February writes it as std.json would write any other day" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Timestamp = proto.google.protobuf.Timestamp;
+    const Choice = union(enum) { at: Timestamp, none };
+    const Node = struct { at: Timestamp, next: ?*const @This() = null };
+    const Plain = struct {
+        name: []const u8 = "order",
+        at: Timestamp,
+        maybe: ?Timestamp,
+        list: []const Timestamp = &.{},
+        pair: struct { Timestamp, u8 } = .{ .{}, 7 },
+        choice: Choice = .none,
+        node: Node = .{ .at = .{} },
+        skipped: void = {},
+    };
+    const leap_2024: Timestamp = .{ .seconds = 1_709_208_000 }; // 2024-02-29T12:00:00Z
+    const leap_2000: Timestamp = .{ .seconds = 951_782_400 }; // 2000-02-29T00:00:00Z
+
+    for ([_]struct { Timestamp, []const u8 }{
+        .{ leap_2024, "\"2024-02-29T12:00:00Z\"" },
+        .{ leap_2000, "\"2000-02-29T00:00:00Z\"" },
+    }) |case| {
+        const ts, const text = case;
+        const tail: Node = .{ .at = ts };
+        const value: Plain = .{
+            .at = ts,
+            .maybe = ts,
+            .list = &.{ ts, ts },
+            .pair = .{ ts, 1 },
+            .choice = .{ .at = ts },
+            .node = .{ .at = ts, .next = &tail },
+        };
+        const p = try toPayload(a, value);
+        try testing.expectEqualStrings("json/plain", encodingOf(p).?);
+        try testing.expectEqual(@as(usize, 8), std.mem.count(u8, p.data, text));
+        try testing.expect(std.mem.indexOf(u8, p.data, "-03-01") == null);
+        const back = try fromPayload(struct { at: Timestamp, maybe: ?Timestamp }, a, p);
+        try testing.expectEqual(ts, back.at);
+        try testing.expectEqual(ts, back.maybe.?);
+    }
+
+    // Every other day is written as the dependency writes it, and the rest of the value as
+    // std.json writes it.
+    const day = std.time.s_per_day;
+    for ([_]Timestamp{
+        .{},
+        .{ .seconds = 1_700_000_000, .nanos = 123_000_000 },
+        .{ .seconds = 1_700_000_000, .nanos = 123_456_000 },
+        .{ .seconds = 1_700_000_000, .nanos = 123_456_789 },
+        .{ .seconds = proto_time.min_timestamp_seconds },
+        .{ .seconds = proto_time.max_timestamp_seconds },
+        .{ .seconds = proto_time.daysFromCivil(2023, 2, 28) * day + 3_661 },
+        .{ .seconds = proto_time.daysFromCivil(2024, 3, 1) * day },
+        .{ .seconds = proto_time.daysFromCivil(2024, 2, 28) * day + 86_399 },
+    }) |ts| {
+        try testing.expectEqualStrings(
+            try std.json.Stringify.valueAlloc(a, ts, .{}),
+            (try toPayload(a, ts)).data,
+        );
+        const tail: Node = .{ .at = ts };
+        const value: Plain = .{
+            .at = ts,
+            .maybe = if (ts.nanos == 0) null else ts,
+            .list = &.{ts},
+            .pair = .{ ts, 2 },
+            .choice = if (ts.seconds == 0) .none else .{ .at = ts },
+            .node = .{ .at = ts, .next = &tail },
+        };
+        try testing.expectEqualStrings(
+            try std.json.Stringify.valueAlloc(a, value, .{}),
+            (try toPayload(a, value)).data,
+        );
+    }
+
+    // Outside protobuf's range the write fails, as the dependency's does, without a panic.
+    try testing.expectError(error.OutOfMemory, toPayload(a, Plain{ .at = .{ .seconds = proto_time.max_timestamp_seconds + 1 }, .maybe = null }));
+    try testing.expectError(error.OutOfMemory, toPayload(a, Plain{ .at = .{}, .maybe = .{ .nanos = -1 } }));
+
+    // A comptime-known Timestamp in an anonymous literal is a comptime field, nested or not.
+    const comptime_known = try toPayload(a, .{ .at = leap_2000, .inner = .{ .at = leap_2024, .n = 1 }, .list = [_]Timestamp{leap_2000} });
+    try testing.expectEqualStrings(
+        "{\"at\":\"2000-02-29T00:00:00Z\",\"inner\":{\"at\":\"2024-02-29T12:00:00Z\",\"n\":1},\"list\":[\"2000-02-29T00:00:00Z\"]}",
+        comptime_known.data,
+    );
+
+    // A std.json.ArrayHashMap writes itself; its values are written here, nested or not.
+    const Step = struct { due: Timestamp, notes: std.json.ArrayHashMap(?Timestamp) = .{} };
+    const Plan = struct {
+        steps: std.json.ArrayHashMap(Step) = .{},
+        maybe: ?std.json.ArrayHashMap(Timestamp) = null,
+        empty: std.json.ArrayHashMap(Timestamp) = .{},
+        plain: std.json.ArrayHashMap(u8) = .{},
+    };
+    for ([_]struct { Timestamp, bool }{
+        .{ leap_2024, true },                                      .{ leap_2000, true },
+        .{ .{ .seconds = 1_700_000_000, .nanos = 1_000 }, false }, .{ .{}, false },
+    }) |case| {
+        const ts, const leap = case;
+        var step: Step = .{ .due = ts };
+        try step.notes.map.put(a, "set", ts);
+        try step.notes.map.put(a, "unset", null);
+        var plan: Plan = .{ .maybe = .{} };
+        try plan.steps.map.put(a, "ship", step);
+        try plan.maybe.?.map.put(a, "audit", ts);
+        try plan.plain.map.put(a, "n", 1);
+        const p = try toPayload(a, plan);
+        if (leap) {
+            var buf: [proto_time.timestamp_text_max]u8 = undefined;
+            const text = try proto_time.formatTimestamp(ts, &buf);
+            const want = try std.fmt.allocPrint(a,
+                \\{{"steps":{{"ship":{{"due":"{0s}","notes":{{"set":"{0s}","unset":null}}}}}},"maybe":{{"audit":"{0s}"}},"empty":{{}},"plain":{{"n":1}}}}
+            , .{text});
+            try testing.expectEqualStrings(want, p.data);
+        } else {
+            try testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, plan, .{}), p.data);
+        }
+        const back = try fromPayload(Plan, a, p);
+        try testing.expectEqual(ts, back.steps.map.get("ship").?.notes.map.get("set").?.?);
+        try testing.expectEqual(ts, back.maybe.?.map.get("audit").?);
+    }
+
+    // A generated message inside a plain struct is walked field by field, as std.json does.
+    const HistoryEvent = proto.temporal.api.history.v1.HistoryEvent;
+    const Wrapped = struct { event: HistoryEvent };
+    const wrapped = try toPayload(a, Wrapped{ .event = .{ .event_id = 1, .event_time = leap_2024 } });
+    try testing.expect(std.mem.indexOf(u8, wrapped.data, "\"event_time\":\"2024-02-29T12:00:00Z\"") != null);
+}
+
+test "a value holding a protobuf Timestamp beside comptime fields still encodes as std.json writes it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Timestamp = proto.google.protobuf.Timestamp;
+    var at: Timestamp = .{ .seconds = 1_709_208_000 }; // 2024-02-29T12:00:00Z
+    _ = &at;
+
+    // An anonymous struct literal makes each comptime-known field a comptime field, as in
+    // `client.startWorkflow(..., .{ .{ .at = at, .note = "rush" } })`.
+    const literal = try toPayload(a, .{ .at = at, .note = "rush", .attempt = 3 });
+    try testing.expectEqualStrings("{\"at\":\"2024-02-29T12:00:00Z\",\"note\":\"rush\",\"attempt\":3}", literal.data);
+
+    const Versioned = struct { comptime version: u8 = 2, at: Timestamp };
+    const versioned = try toPayload(a, Versioned{ .at = at });
+    try testing.expectEqualStrings("{\"version\":2,\"at\":\"2024-02-29T12:00:00Z\"}", versioned.data);
+}
+
+test "a std.json.ArrayHashMap of protobuf Timestamps on 29 February encodes without a panic" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Timestamp = proto.google.protobuf.Timestamp;
+    // The map type the samples use for workflow state (samples/shoppingcart), holding Timestamps.
+    const Deadlines = struct { by_step: std.json.ArrayHashMap(Timestamp) = .{} };
+    try testing.expect(unconvertibleType(Deadlines, .encode) == null);
+
+    var value: Deadlines = .{};
+    try value.by_step.map.put(a, "ship", .{ .seconds = 1_709_208_000 }); // 2024-02-29T12:00:00Z
+    try value.by_step.map.put(a, "audit", .{ .seconds = 951_782_400 }); // 2000-02-29T00:00:00Z
+    const p = try toPayload(a, value);
+    try testing.expectEqualStrings(
+        "{\"by_step\":{\"ship\":\"2024-02-29T12:00:00Z\",\"audit\":\"2000-02-29T00:00:00Z\"}}",
+        p.data,
+    );
+    const back = try fromPayload(Deadlines, a, p);
+    try testing.expectEqual(value.by_step.map.get("ship").?, back.by_step.map.get("ship").?);
+    try testing.expectEqual(value.by_step.map.get("audit").?, back.by_step.map.get("audit").?);
 }
 
 test "a json/protobuf message that holds a binary Payload round-trips" {

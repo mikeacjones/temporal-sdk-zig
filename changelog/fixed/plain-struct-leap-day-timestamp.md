@@ -1,0 +1,1 @@
+`converter.toPayload` no longer panics with an integer overflow, and no longer writes 1 March, when a plain struct it encodes as JSON holds a `proto.google.protobuf.Timestamp` on 29 February; such values, used as workflow and activity arguments and results, signals, queries and memos, now hold the right date, and every other Timestamp is written as before.
