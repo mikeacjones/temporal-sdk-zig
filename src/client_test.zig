@@ -272,7 +272,14 @@ test "raw history the client can't read is error.InvalidResponse from fetchHisto
     }
 }
 
-test "WorkflowRun.get fails at once on a page with no events and no token, and waits on one with a token" {
+/// A DescribeWorkflowExecution answer for a run in `status`.
+fn describeAnswer(arena: Allocator, status: enums.WorkflowExecutionStatus) !Answer {
+    return .{ .rpc = "DescribeWorkflowExecution", .proto = try encodeMessage(arena, wfs.DescribeWorkflowExecutionResponse{
+        .workflow_execution_info = .{ .execution = .{ .workflow_id = "wf-raw", .run_id = "run-1" }, .status = status },
+    }) };
+}
+
+test "WorkflowRun.get fails on a page with no events and no token for a closed run, and waits on one with a token" {
     testing.log_level = .err; // Each failure is logged as a warning.
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -285,15 +292,21 @@ test "WorkflowRun.get fails at once on a page with no events and no token, and w
     for (empty_pages) |page| {
         var c = try initClient();
         defer c.close();
-        // A second answer the fixed client never asks for; the loop that asked again at once
-        // would get it.
-        const answers: [2]Answer = @splat(.{ .rpc = history_rpc, .proto = page });
+        // The run has closed, and a look without waiting finds no close event either. The
+        // last answer is one the fixed client never asks for; a loop that asked again at
+        // once would get it.
+        const answers = [_]Answer{
+            .{ .rpc = history_rpc, .proto = page },
+            try describeAnswer(arena, .WORKFLOW_EXECUTION_STATUS_COMPLETED),
+            .{ .rpc = history_rpc, .proto = page },
+            .{ .rpc = history_rpc, .proto = page },
+        };
         var server: Server = .{ .answers = &answers };
         try connectToServer(&c, &server);
         var run = try c.getWorkflow([]const u8, "wf-raw", "run-1");
         defer run.deinit();
         try testing.expectError(error.InvalidResponse, run.get(arena));
-        try testing.expectEqual(@as(usize, 1), server.callCount());
+        try testing.expectEqual(@as(usize, 3), server.callCount());
     }
 
     // A long poll that ended before the run closed: an empty page with a token.
@@ -309,6 +322,55 @@ test "WorkflowRun.get fails at once on a page with no events and no token, and w
     defer run.deinit();
     try testing.expectEqualStrings("done", try run.get(arena));
     try testing.expectEqual(@as(usize, 2), server.callCount());
+}
+
+// The time-skipping test server ends a close-event long poll that saw nothing after 20
+// seconds with an empty page and no token (TestWorkflowService.getWorkflowExecutionHistory),
+// so a run that takes longer than that, as on a loaded machine, must still be waited for.
+test "WorkflowRun.get waits again after a page with no events and no token while the run is open" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const events = try closedRunEvents(arena);
+    const empty = try encodeMessage(arena, wfs.GetWorkflowExecutionHistoryResponse{});
+    const closed = try historyPage(arena, events[4..], "");
+
+    // Still running twice, then closed.
+    {
+        var c = try initClient();
+        defer c.close();
+        const answers = [_]Answer{
+            .{ .rpc = history_rpc, .proto = empty },
+            try describeAnswer(arena, .WORKFLOW_EXECUTION_STATUS_RUNNING),
+            .{ .rpc = history_rpc, .proto = empty },
+            try describeAnswer(arena, .WORKFLOW_EXECUTION_STATUS_RUNNING),
+            .{ .rpc = history_rpc, .proto = closed },
+        };
+        var server: Server = .{ .answers = &answers };
+        try connectToServer(&c, &server);
+        var run = try c.getWorkflow([]const u8, "wf-raw", "run-1");
+        defer run.deinit();
+        try testing.expectEqualStrings("done", try run.get(arena));
+        try testing.expectEqual(answers.len, server.callCount());
+    }
+
+    // The run closed between the empty page and the description: the look without waiting
+    // finds its close event.
+    {
+        var c = try initClient();
+        defer c.close();
+        const answers = [_]Answer{
+            .{ .rpc = history_rpc, .proto = empty },
+            try describeAnswer(arena, .WORKFLOW_EXECUTION_STATUS_COMPLETED),
+            .{ .rpc = history_rpc, .proto = closed },
+        };
+        var server: Server = .{ .answers = &answers };
+        try connectToServer(&c, &server);
+        var run = try c.getWorkflow([]const u8, "wf-raw", "run-1");
+        defer run.deinit();
+        try testing.expectEqualStrings("done", try run.get(arena));
+        try testing.expectEqual(answers.len, server.callCount());
+    }
 }
 
 test "callService returns GetWorkflowExecutionHistory's raw history as the server sent it" {

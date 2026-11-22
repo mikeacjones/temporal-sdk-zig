@@ -10,8 +10,10 @@ const fuzz_limits = @import("src/fuzz/limits.zig");
 const core_header_name = "temporal-sdk-core-c-bridge.h";
 const core_header = "deps/sdk-core/crates/sdk-core-c-bridge/include/" ++ core_header_name;
 const core_lib_name = "libtemporalio_sdk_core_c_bridge.a";
-/// The time-skipping test server release this repository's tests pass with.
-const verified_test_server_version = "v1.40.0";
+/// The newest time-skipping test server release this repository's tests pass with, and the
+/// one `testing.TestServer` downloads unless `-Dtest-server-version` says otherwise. Move it
+/// forward when a newer release passes `zig build test` on Linux and macOS.
+const verified_test_server_version = "v1.41.1";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -30,15 +32,16 @@ pub fn build(b: *std.Build) void {
     const protoc_opt = b.option([]const u8, "protoc", "Path to protoc used by the cargo build (default: pinned download)");
     const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
     const hang_report = b.option(u32, "test-hang-report", "Print the name, elapsed time and every thread's stack of a test still running after this many seconds, without ending it (default: 300; 0 turns the report off)") orelse 300;
-    // A checkout tests against the test server release its tests were last verified with: a
-    // new release reaches every machine without a cached copy at once, and one has broken
-    // updates (sdk-java 1.41.0's never delivers a workflow task that carries one). A project
-    // that depends on the SDK gets sdk-core's default unless it passes the option.
+    // Tests run against the test server release this repository's tests were last verified
+    // with, in a checkout and in a project that depends on the SDK alike: a new release reaches
+    // every machine without a cached copy at once, and one has broken updates (sdk-java
+    // 1.41.0's never delivers a workflow task that carries one). "default" restores
+    // sdk-core's choice.
     const test_server_version = b.option(
         []const u8,
         "test-server-version",
-        "Time-skipping test server release testing.TestServer downloads by default: \"default\" (sdk-core's choice) or a tag such as \"v1.40.0\" (default in a checkout: " ++ verified_test_server_version ++ ")",
-    ) orelse if (b.isRoot()) verified_test_server_version else "default";
+        "Time-skipping test server release testing.TestServer downloads by default: \"default\" (sdk-core's choice, usually the newest) or a tag such as \"" ++ verified_test_server_version ++ "\" (default: " ++ verified_test_server_version ++ ", the newest release the SDK's tests pass with)",
+    ) orelse verified_test_server_version;
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "test_server_version", test_server_version);
     build_options.addOption([]const u8, "version", manifest.version);
@@ -218,7 +221,7 @@ fn addReadmeSteps(
     const tool = b.addExecutable(.{ .name = "readme-examples", .root_module = tool_module });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "readme-examples-tool", .root_module = tool_module, .filters = test_filters })).step);
 
-    inline for (.{ .{ "readme-check", "check", "Check that README.md's code blocks equal their regions in examples/readme, and PARITY.md's feature table" }, .{ "readme", "update", "Rewrite README.md's code blocks from their regions in examples/readme" } }) |s| {
+    inline for (.{ .{ "readme-check", "check", "Check that README.md's code blocks equal their regions in examples/readme, PARITY.md's feature table, and the default test server release README.md names" }, .{ "readme", "update", "Rewrite README.md's code blocks from their regions in examples/readme" } }) |s| {
         const run = b.addRunArtifact(tool);
         run.addArg(s[1]);
         run.addDirectoryArg(b.path("."));
@@ -230,9 +233,16 @@ fn addReadmeSteps(
         step.dependOn(&run.step);
         if (std.mem.eql(u8, s[1], "check")) {
             test_step.dependOn(&run.step);
-            // PARITY.md's feature table links README.md's sections, so the same check covers it.
-            // Only readme-check runs it (CI does), as it needs a POSIX shell.
-            inline for (.{ "scripts/parity-check-test.sh", "scripts/parity-check.sh" }) |script| {
+            // PARITY.md's feature table links README.md's sections, so the same check covers it,
+            // as it covers the test server release README.md names as the default, which must be
+            // `verified_test_server_version`. Only readme-check runs these (CI does), as they
+            // need a POSIX shell.
+            inline for (.{
+                "scripts/parity-check-test.sh",
+                "scripts/parity-check.sh",
+                "scripts/test-server-version-check-test.sh",
+                "scripts/test-server-version-check.sh",
+            }) |script| {
                 const parity = b.addSystemCommand(&.{ "sh", script });
                 parity.setCwd(b.path("."));
                 parity.has_side_effects = true;
@@ -261,6 +271,37 @@ const CheckInputs = struct {
 
 /// Correctness commands (see AGENTS.md). A fetched package has no tools/checks.
 fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
+    // A case that runs its program through time-limit (tools/checks/time_limit.zig), which
+    // fails the case, naming it, with exit 124 when the program has not ended within
+    // `limit` seconds, instead of hanging `zig build test`. Pass the program next.
+    const limit_tool = checkTool(b, "time-limit", "tools/checks/time_limit.zig");
+    in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "time-limit", .root_module = limit_tool.root_module, .filters = in.test_filters })).step);
+    const Limited = struct {
+        /// Ample for a fixture and the symbolizer, even on a loaded machine.
+        const seconds = 120;
+
+        fn case(b2: *std.Build, test_step: *std.Build.Step, tool: *std.Build.Step.Compile, name: []const u8, limit: u32, exit_code: u8) *std.Build.Step.Run {
+            const r = addCheckCase(b2, test_step, tool, name, exit_code);
+            r.setCwd(b2.path("."));
+            r.addArgs(&.{ b2.fmt("{d}", .{limit}), r.step.name });
+            return r;
+        }
+    };
+
+    // The core's replay poller panics on some malformed histories, and a panic there hung
+    // the replayer, so this runs in its own process under a time limit.
+    {
+        const program = b.addExecutable(.{ .name = "replay-malformed", .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/checks/replay_malformed.zig"),
+            .target = in.target,
+            .optimize = in.optimize,
+            .imports = &.{.{ .name = "temporal", .module = in.temporal }},
+        }) });
+        const run = Limited.case(b, in.test_step, limit_tool, "replay malformed histories", Limited.seconds, 0);
+        run.addArtifactArg(program);
+        run.addFileArg(b.path("src/testdata/helloworld_history.json"));
+    }
+
     // zig build alloc-failures
     {
         const helper = struct {
@@ -425,6 +466,16 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         unknown_ref.addArgs(&.{ "base", "refs/heads/api-diff-test-no-such-ref" });
         _ = unknown_ref.addOutputDirectoryArg2("tree", .{});
         unknown_ref.expectStdErrMatch("-Dbase=refs/heads/api-diff-test-no-such-ref");
+    }
+
+    // The b.dependency argument the docs give for the test server release names a declared
+    // option (tools/checks/test_server_version_option.zig reads build.zig and the docs).
+    {
+        const tool = checkTool(b, "test-server-version-option", "tools/checks/test_server_version_option.zig");
+        const run = b.addRunArtifact(b.addTest(.{ .name = "test-server-version-option", .root_module = tool.root_module, .filters = in.test_filters }));
+        run.setCwd(b.path("."));
+        run.has_side_effects = true;
+        in.test_step.dependOn(&run.step);
     }
 
     // zig build dupes
@@ -880,24 +931,11 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         // the host's atos: tools/checks/symbolizer.zig, built under the file name
         // llvm-symbolizer, the name that makes the runtime speak llvm-symbolizer's protocol
         // to it, which names the binary's file and an address in it, not the live process.
-        const limit_tool = checkTool(b, "time-limit", "tools/checks/time_limit.zig");
-        in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "time-limit", .root_module = limit_tool.root_module, .filters = in.test_filters })).step);
+        // (time-limit and `Limited` are at the top of this function.)
         const symbolizer_tool = checkTool(b, "llvm-symbolizer", "tools/checks/symbolizer.zig");
         in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "symbolizer", .root_module = symbolizer_tool.root_module, .filters = in.test_filters })).step);
         // Linux keeps the runtime's own choice.
         const own_symbolizer: ?*std.Build.Step.Compile = if (b.graph.host.result.os.tag.isDarwin()) symbolizer_tool else null;
-        const Limited = struct {
-            /// Ample for a fixture and the symbolizer, even on a loaded machine.
-            const seconds = 120;
-
-            fn case(b2: *std.Build, test_step: *std.Build.Step, tool: *std.Build.Step.Compile, name: []const u8, limit: u32, exit_code: u8) *std.Build.Step.Run {
-                const r = addCheckCase(b2, test_step, tool, name, exit_code);
-                r.setCwd(b2.path("."));
-                r.addArgs(&.{ b2.fmt("{d}", .{limit}), r.step.name });
-                return r;
-            }
-        };
-
         // Libc, so that threads come from pthreads, which the sanitizer intercepts.
         const race_tool = checkTool(b, "tsan-race-fixture", "tools/checks/fixtures/tsan/race.zig");
         race_tool.root_module.sanitize_thread = true;

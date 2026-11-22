@@ -4905,8 +4905,11 @@ pub fn WorkflowRun(comptime T: type) type {
 
         /// Waits for the workflow to close and returns its result, following continue-as-new
         /// (and cron and retry runs). The result and any failure are allocated from `arena`.
-        /// A history page with no event and no page token, which leaves nothing to wait
-        /// for, returns `error.InvalidResponse`, logged.
+        /// A history page with no event and no page token for a run the server describes
+        /// as open is a long poll that ended (the time-skipping test server ends them so
+        /// after 20 seconds), and `get` waits again. For a closed run whose close event a
+        /// further look without waiting doesn't find either, which leaves nothing to wait
+        /// for, it returns `error.InvalidResponse`, logged.
         pub fn get(run: *Self, arena: Allocator) ResultError!T {
             return run.getWithOptions(arena, .{});
         }
@@ -4922,11 +4925,14 @@ pub fn WorkflowRun(comptime T: type) type {
         pub fn getWithOptions(run: *Self, arena: Allocator, options: GetOptions) ResultError!T {
             const c = run.client;
             var token: []const u8 = "";
+            // False only for the one look, after an empty page without a token, at whether a
+            // run the server says has closed has a close event.
+            var wait = true;
             while (true) {
                 const response = c.rpc(wfs.GetWorkflowExecutionHistoryResponse, "GetWorkflowExecutionHistory", wfs.GetWorkflowExecutionHistoryRequest{
                     .namespace = c.namespace,
                     .execution = .{ .workflow_id = run.id, .run_id = run.run_id },
-                    .wait_new_event = true,
+                    .wait_new_event = wait,
                     .history_event_filter_type = .HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT,
                     .skip_archival = true,
                     .next_page_token = token,
@@ -4937,13 +4943,28 @@ pub fn WorkflowRun(comptime T: type) type {
                 const events: []const HistoryEvent = if (response.history) |h| h.events.items else &.{};
                 if (events.len == 0) {
                     // An empty page with a token is a long poll that ended before the run
-                    // closed; one without a token has nothing more to ask for.
-                    if (response.next_page_token.len == 0) {
-                        log.warn("GetWorkflowExecutionHistory for workflow {s} (run {s}) returned no close event and no page token", .{ run.id, run.run_id });
-                        return error.InvalidResponse;
+                    // closed.
+                    if (response.next_page_token.len > 0) {
+                        token = response.next_page_token;
+                        wait = true;
+                        continue;
                     }
-                    token = response.next_page_token;
-                    continue;
+                    // The time-skipping test server ends a long poll that saw no close event
+                    // after 20 seconds with an empty page and no token. If the run is still
+                    // open, that is all it was: wait again. A closed run gets one look
+                    // without waiting, which a run that closed just now passes; a server that
+                    // has no close event for a closed run has nothing more to give.
+                    if (wait and try run.isRunning(arena)) {
+                        token = "";
+                        continue;
+                    }
+                    if (wait) {
+                        token = "";
+                        wait = false;
+                        continue;
+                    }
+                    log.warn("GetWorkflowExecutionHistory for workflow {s} (run {s}) returned no close event and no page token for a closed run", .{ run.id, run.run_id });
+                    return error.InvalidResponse;
                 }
                 const event = events[events.len - 1];
                 const attrs = event.attributes orelse return error.InvalidResponse;
@@ -4962,6 +4983,7 @@ pub fn WorkflowRun(comptime T: type) type {
                     c.gpa.free(run.run_id);
                     run.run_id = new_run;
                     token = "";
+                    wait = true;
                     continue;
                 }
                 switch (attrs) {
@@ -4986,6 +5008,20 @@ pub fn WorkflowRun(comptime T: type) type {
         /// The workflow's failure after `get` returned `error.WorkflowFailed`.
         pub fn failure(run: *const Self) ?*const failure_mod.Failure {
             return if (run.failure_) |*f| f else null;
+        }
+
+        /// Whether the server describes this run as still running.
+        fn isRunning(run: *Self, arena: Allocator) !bool {
+            const c = run.client;
+            const response = c.rpc(wfs.DescribeWorkflowExecutionResponse, "DescribeWorkflowExecution", wfs.DescribeWorkflowExecutionRequest{
+                .namespace = c.namespace,
+                .execution = .{ .workflow_id = run.id, .run_id = run.run_id },
+            }, arena) catch |err| switch (err) {
+                error.AlreadyExists => return error.InvalidResponse,
+                else => |e| return e,
+            };
+            const info = response.workflow_execution_info orelse return false;
+            return info.status == .WORKFLOW_EXECUTION_STATUS_RUNNING;
         }
     };
 }

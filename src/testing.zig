@@ -123,9 +123,11 @@ pub const TestServer = struct {
         /// Path to a temporal-test-server binary; empty downloads one (cached).
         existing_path: []const u8 = "",
         /// Release to download when `existing_path` is empty: "default" (the one sdk-core
-        /// picks, usually the newest) or a release tag with its `v`, such as "v1.40.0".
-        /// Defaults to the build's `-Dtest-server-version`, "default" in a project that
-        /// depends on the SDK.
+        /// picks, usually the newest) or a release tag with its `v`, such as "v1.41.1".
+        /// Defaults to the build's `-Dtest-server-version`, which is the newest release the
+        /// SDK's own tests pass with unless the build says otherwise; a project that depends
+        /// on the SDK gets sdk-core's choice back with `.@"test-server-version" = "default"`
+        /// in its `b.dependency` arguments.
         version: []const u8 = build_options.test_server_version,
         /// 0 picks a free port.
         port: u16 = 0,
@@ -1323,8 +1325,12 @@ pub const WorkflowReplayer = struct {
     pub const ReplayError = error{
         OutOfMemory,
         InvalidHistoryJson,
-        /// The history doesn't start with a WorkflowExecutionStarted event naming a workflow
-        /// type, or isn't a serialized history.
+        /// The history is not one the core can replay: it doesn't start with a
+        /// WorkflowExecutionStarted event naming a workflow type and a task queue, a workflow
+        /// task started event is followed by something other than its completion, failure or
+        /// timeout, two workflow tasks share a started event ID, its first event ID is above
+        /// 1, it ends before its last workflow task started event, or it isn't a serialized
+        /// history.
         InvalidHistory,
         /// Replay couldn't run or finish the history, for example because its workflow type
         /// isn't registered.
@@ -1589,12 +1595,13 @@ pub const WorkflowReplayer = struct {
         fn replay(s: *Session, arena: Allocator, workflow_id: []const u8, history: history_mod.History) error{OutOfMemory}!ReplayResult {
             const gpa = s.r.gpa;
             var result: ReplayResult = .{ .workflow_id = try arena.dupe(u8, workflow_id), .run_id = "" };
-            // The core can't report these: it panics on a history without them.
-            const started = startedEvent(history) orelse {
+            // Checked before the session is touched, so a rejected history leaves it as it was.
+            if (try replayProblem(arena, history)) |problem| {
                 result.err = error.InvalidHistory;
-                result.message = "the history's first event must be a WorkflowExecutionStarted event naming the workflow type";
+                result.message = problem;
                 return result;
-            };
+            }
+            const started = startedEvent(history) orelse unreachable; // replayProblem checked it.
             result.run_id = try arena.dupe(u8, started.original_execution_run_id);
             // A run with no workflow task scheduled yet (a cron run waiting for its next fire,
             // a delayed start) has run no workflow code, so it has nothing to check; the core
@@ -1655,9 +1662,62 @@ pub const WorkflowReplayer = struct {
         if (history.events.items.len == 0) return null;
         const attrs = history.events.items[0].attributes orelse return null;
         return switch (attrs) {
-            .workflow_execution_started_event_attributes => |started| if (started.workflow_type != null) started else null,
+            .workflow_execution_started_event_attributes => |started| started,
             else => null,
         };
+    }
+
+    /// Why the core can't replay `history`, or null when it can. The core doesn't report
+    /// these: its replay poller panics or stalls on them, and the replay then never ends.
+    /// This mirrors, at sdk-core c675c32 (recheck it when the submodule moves):
+    /// - `HistoryInfo::new_from_history(h, None)` and `as_poll_wft_response` in
+    ///   deps/sdk-core/crates/sdk-core/src/replay/history_info.rs. As there, the first event
+    ///   is judged by its attributes and the others by their `event_type`, and an empty task
+    ///   queue name is accepted.
+    /// - `PreparedWFT::is_incremental` (worker/workflow/mod.rs): a first event ID above 1
+    ///   makes the task a sticky-queue one, whose full history the core then fetches from the
+    ///   replay worker's mocked client, which panics.
+    /// - `HistoryPaginator::extract_next_update` (worker/workflow/history_update.rs): a last
+    ///   event ID below the task's started event ID fails the poll, and the run is never
+    ///   activated or evicted.
+    fn replayProblem(arena: Allocator, history: history_mod.History) error{OutOfMemory}!?[]const u8 {
+        const events = history.events.items;
+        if (events.len == 0) return "the history has no events";
+        const started = startedEvent(history) orelse
+            return "the history's first event must be a WorkflowExecutionStarted event";
+        if (started.workflow_type == null) return "the history's WorkflowExecutionStarted event names no workflow type";
+        if (started.task_queue == null) return "the history's WorkflowExecutionStarted event names no task queue";
+        if (events[0].event_id > 1) return try std.fmt.allocPrint(arena, "the history's first event has event ID {d}; a full history starts at event 1", .{events[0].event_id});
+
+        var previous_started: i64 = 0;
+        for (events, 0..) |event, i| {
+            if (event.event_type != .EVENT_TYPE_WORKFLOW_TASK_STARTED) continue;
+            const next: ?EventType = if (i + 1 < events.len) events[i + 1].event_type else null;
+            if (next == null or next.? == .EVENT_TYPE_WORKFLOW_TASK_COMPLETED) {
+                if (event.event_id == previous_started) {
+                    if (previous_started == 0) return try std.fmt.allocPrint(arena, "the workflow task started event at position {d} has event ID 0", .{i + 1});
+                    return try std.fmt.allocPrint(arena, "two workflow task started events have event ID {d}", .{event.event_id});
+                }
+                previous_started = event.event_id;
+            } else switch (next.?) {
+                .EVENT_TYPE_WORKFLOW_TASK_FAILED,
+                .EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT,
+                .EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED,
+                .EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT,
+                => {},
+                else => {
+                    const following = events[i + 1];
+                    var unknown: [32]u8 = undefined;
+                    const type_name = std.enums.tagName(EventType, following.event_type) orelse
+                        std.fmt.bufPrint(&unknown, "event type {d}", .{@backingInt(following.event_type)}) catch unreachable;
+                    return try std.fmt.allocPrint(arena, "workflow task started event {d} is followed by event {d} ({s}), not the task's completion, failure or timeout or the run's termination or timeout", .{ event.event_id, following.event_id, type_name });
+                },
+            }
+        }
+        // The core's task asks for events up to the last such started event.
+        const last = events[events.len - 1].event_id;
+        if (last < previous_started) return try std.fmt.allocPrint(arena, "the history ends at event ID {d}, before its last workflow task started event, {d}", .{ last, previous_started });
+        return null;
     }
 
     const Outcome = struct {
@@ -4143,6 +4203,131 @@ test "WorkflowReplayer replays a batch of histories through one worker and repor
     try testing.expectEqualStrings(hello_run_id, waiting[0].run_id);
     try testing.expectEqual(@as(?WorkflowReplayer.ReplayError, null), waiting[1].err);
     try r.replayHistory(started_only);
+}
+
+// The checks Session.replay makes before the core sees a history, which the core would panic
+// on. tools/checks/replay_malformed.zig replays such histories through the core.
+test "WorkflowReplayer rejects histories the core can't build a workflow task from, naming the problem" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const problem = WorkflowReplayer.replayProblem;
+
+    try testing.expectEqual(@as(?[]const u8, null), try problem(a, try history_mod.fromJson(a, hello_history)));
+
+    // (a) No events.
+    try testing.expectEqualStrings("the history has no events", (try problem(a, .{})).?);
+
+    // (b) The first event isn't a WorkflowExecutionStarted event.
+    var no_start = try history_mod.fromJson(a, hello_history);
+    _ = no_start.events.orderedRemove(0);
+    try testing.expectEqualStrings("the history's first event must be a WorkflowExecutionStarted event", (try problem(a, no_start)).?);
+
+    // (c) No workflow type.
+    var no_type = try history_mod.fromJson(a, hello_history);
+    no_type.events.items[0].attributes.?.workflow_execution_started_event_attributes.workflow_type = null;
+    try testing.expectEqualStrings("the history's WorkflowExecutionStarted event names no workflow type", (try problem(a, no_type)).?);
+
+    // (d) No task queue; an empty name is accepted, as the core accepts it.
+    var no_queue = try history_mod.fromJson(a, hello_history);
+    const queue = &no_queue.events.items[0].attributes.?.workflow_execution_started_event_attributes.task_queue;
+    queue.* = null;
+    try testing.expectEqualStrings("the history's WorkflowExecutionStarted event names no task queue", (try problem(a, no_queue)).?);
+    queue.* = .{ .name = "" };
+    try testing.expectEqual(@as(?[]const u8, null), try problem(a, no_queue));
+
+    // (e) A workflow task started event (3) followed by something other than its
+    // completion, failure or timeout, or the run's termination or timeout.
+    var unfinished = try history_mod.fromJson(a, hello_history);
+    _ = unfinished.events.orderedRemove(3);
+    try testing.expectEqualStrings(
+        "workflow task started event 3 is followed by event 5 (EVENT_TYPE_ACTIVITY_TASK_SCHEDULED), not the task's completion, failure or timeout or the run's termination or timeout",
+        (try problem(a, unfinished)).?,
+    );
+    // Only event_type is read, as the core reads it, not the attributes the event carries.
+    var relabeled = try history_mod.fromJson(a, hello_history);
+    const completed = &relabeled.events.items[3];
+    for ([_]EventType{
+        .EVENT_TYPE_WORKFLOW_TASK_FAILED,
+        .EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT,
+        .EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED,
+        .EVENT_TYPE_WORKFLOW_EXECUTION_TIMED_OUT,
+    }) |accepted| {
+        completed.event_type = accepted;
+        try testing.expectEqual(@as(?[]const u8, null), try problem(a, relabeled));
+    }
+    completed.event_type = .EVENT_TYPE_TIMER_STARTED;
+    try testing.expectEqualStrings(
+        "workflow task started event 3 is followed by event 4 (EVENT_TYPE_TIMER_STARTED), not the task's completion, failure or timeout or the run's termination or timeout",
+        (try problem(a, relabeled)).?,
+    );
+    completed.event_type = @fromBackingInt(-7);
+    try testing.expectEqualStrings(
+        "workflow task started event 3 is followed by event 4 (event type -7), not the task's completion, failure or timeout or the run's termination or timeout",
+        (try problem(a, relabeled)).?,
+    );
+    // A history that ends on a workflow task started event is complete to the core.
+    var open_task = try history_mod.fromJson(a, hello_history);
+    open_task.events.shrinkRetainingCapacity(3);
+    try testing.expectEqual(@as(?[]const u8, null), try problem(a, open_task));
+
+    // (f) Completed (or last) workflow task started events with the same event ID as the
+    // previous one, or 0 for the first.
+    var repeated = try history_mod.fromJson(a, hello_history);
+    repeated.events.items[8].event_id = 3;
+    try testing.expectEqualStrings("two workflow task started events have event ID 3", (try problem(a, repeated)).?);
+    var last_repeated = try history_mod.fromJson(a, hello_history);
+    last_repeated.events.shrinkRetainingCapacity(9);
+    last_repeated.events.items[8].event_id = 3;
+    try testing.expectEqualStrings("two workflow task started events have event ID 3", (try problem(a, last_repeated)).?);
+    var zero = try history_mod.fromJson(a, hello_history);
+    zero.events.items[2].event_id = 0;
+    try testing.expectEqualStrings("the workflow task started event at position 3 has event ID 0", (try problem(a, zero)).?);
+    // A started event whose task failed doesn't count as the previous one.
+    var failed_task = try history_mod.fromJson(a, hello_history);
+    failed_task.events.items[3].event_type = .EVENT_TYPE_WORKFLOW_TASK_FAILED;
+    failed_task.events.items[8].event_id = 3;
+    try testing.expectEqual(@as(?[]const u8, null), try problem(a, failed_task));
+    failed_task.events.items[8].event_id = 0;
+    try testing.expectEqualStrings("the workflow task started event at position 9 has event ID 0", (try problem(a, failed_task)).?);
+
+    // (g) A first event ID above 1.
+    var shifted = try history_mod.fromJson(a, hello_history);
+    shifted.events.items[0].event_id = 2;
+    try testing.expectEqualStrings("the history's first event has event ID 2; a full history starts at event 1", (try problem(a, shifted)).?);
+
+    // (h) A history ending before its last workflow task started event; ending on it is fine.
+    var short = try history_mod.fromJson(a, hello_history);
+    short.events.items[8].event_id = 12;
+    try testing.expectEqualStrings("the history ends at event ID 11, before its last workflow task started event, 12", (try problem(a, short)).?);
+    short.events.items[8].event_id = 11;
+    try testing.expectEqual(@as(?[]const u8, null), try problem(a, short));
+}
+
+// A history whose first event ID is above 1 looks to the core like a sticky-queue task for a
+// run it hasn't cached, so it fetches the full history from the replay worker's mocked client,
+// which panics ("No matching expectation found" for get_workflow_execution_history), and
+// replayHistory/replayHistories then never return, not even for the valid histories after it.
+test "WorkflowReplayer rejects a history whose first event ID isn't 1" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var shifted = try history_mod.fromJson(a, hello_history);
+    shifted.events.items[0].event_id = 2;
+    try testing.expect(try WorkflowReplayer.replayProblem(a, shifted) != null);
+}
+
+// When the last event's ID is below the final workflow task started event's ID, the core's
+// HistoryPaginator expects more history than the poll gave it and fails the poll with "We
+// expected to be able to fetch more events but server says there are none"; the run is never
+// activated or evicted, so replayHistory/replayHistories never return.
+test "WorkflowReplayer rejects a history whose last workflow task started event ID is past its last event" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ahead = try history_mod.fromJson(a, hello_history);
+    ahead.events.items[8].event_id = 12; // The second workflow task's started event; the last event is 11.
+    try testing.expect(try WorkflowReplayer.replayProblem(a, ahead) != null);
 }
 
 test "WorkflowReplayer replays a run fetched through a client, seeing the options' task queue" {
