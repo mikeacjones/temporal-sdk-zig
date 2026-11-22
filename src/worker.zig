@@ -6538,6 +6538,7 @@ test "a cancel task reaches its running activity without allocating" {
     var running: RunningActivities = .{};
     defer running.map.deinit(testing.allocator);
     var run: RunningActivity = .{
+        .task_gpa = .{ .io = testing.io, .backing = testing.allocator },
         .arena = .init(testing.allocator),
         .polled = undefined,
         .task_queue = "cancels",
