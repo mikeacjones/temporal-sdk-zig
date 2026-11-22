@@ -1,0 +1,1 @@
+An activity attempt the worker's `std.Io` has no thread for now fails with a retryable failure of type `NoThreadAvailable`, which its retry policy retries, instead of running on the worker's polling thread, where a cancel couldn't reach it, other activities' tasks waited behind it, and worker shutdown waited for it.

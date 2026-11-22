@@ -1,0 +1,1 @@
+`client.ActivityHandle.delete` now returns only once the server has removed the activity's record, so `describe` and `get` right after it return `error.NotFound` as documented. The server deletes asynchronously, and before, a describe could still read the terminated activity.
