@@ -221,7 +221,7 @@ fn addReadmeSteps(
     const tool = b.addExecutable(.{ .name = "readme-examples", .root_module = tool_module });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "readme-examples-tool", .root_module = tool_module, .filters = test_filters })).step);
 
-    inline for (.{ .{ "readme-check", "check", "Check that README.md's code blocks equal their regions in examples/readme, and PARITY.md's feature table" }, .{ "readme", "update", "Rewrite README.md's code blocks from their regions in examples/readme" } }) |s| {
+    inline for (.{ .{ "readme-check", "check", "Check that README.md's code blocks equal their regions in examples/readme, PARITY.md's feature table, and the default test server release README.md names" }, .{ "readme", "update", "Rewrite README.md's code blocks from their regions in examples/readme" } }) |s| {
         const run = b.addRunArtifact(tool);
         run.addArg(s[1]);
         run.addDirectoryArg(b.path("."));
@@ -233,9 +233,16 @@ fn addReadmeSteps(
         step.dependOn(&run.step);
         if (std.mem.eql(u8, s[1], "check")) {
             test_step.dependOn(&run.step);
-            // PARITY.md's feature table links README.md's sections, so the same check covers it.
-            // Only readme-check runs it (CI does), as it needs a POSIX shell.
-            inline for (.{ "scripts/parity-check-test.sh", "scripts/parity-check.sh" }) |script| {
+            // PARITY.md's feature table links README.md's sections, so the same check covers it,
+            // as it covers the test server release README.md names as the default, which must be
+            // `verified_test_server_version`. Only readme-check runs these (CI does), as they
+            // need a POSIX shell.
+            inline for (.{
+                "scripts/parity-check-test.sh",
+                "scripts/parity-check.sh",
+                "scripts/test-server-version-check-test.sh",
+                "scripts/test-server-version-check.sh",
+            }) |script| {
                 const parity = b.addSystemCommand(&.{ "sh", script });
                 parity.setCwd(b.path("."));
                 parity.has_side_effects = true;
