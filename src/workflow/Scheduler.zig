@@ -155,10 +155,13 @@ pub fn stackCount(s: *const Scheduler) usize {
 
 /// Creates a fiber that will call `func` with `args` and puts it at the back of the ready
 /// queue. `func` must return `void`. Can be called from `run`'s caller or from a fiber.
+/// Returns `error.StackTooSmall`, before it takes a stack, when `options.stack_size` can't
+/// hold the arguments, the Fiber header and the first frame it writes at the stack's top.
 pub fn spawn(s: *Scheduler, name: []const u8, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !*Fiber {
     const Args = @TypeOf(args);
     if (@typeInfo(@TypeOf(func)).@"fn".return_type.? != void)
         @compileError("fiber functions must return void");
+    if (s.options.stack_size < spawnBytes(Args)) return error.StackTooSmall;
 
     const Trampoline = struct {
         fn start(p: *anyopaque) void {
@@ -488,6 +491,18 @@ const tsan = struct {
     }
 };
 
+/// The most bytes `spawn` writes at the top of a stack for arguments of type `Args`: the
+/// arguments and their alignment, the Fiber header and its alignment, and the first frame
+/// `initialStack` builds below the header.
+fn spawnBytes(comptime Args: type) usize {
+    const first_frame = switch (builtin.cpu.arch) {
+        .aarch64 => aarch64_frame_size,
+        .x86_64 => 72,
+        else => unreachable,
+    };
+    return @sizeOf(Args) + (@max(@alignOf(Args), 16) - 1) + @sizeOf(Fiber) + 15 + first_frame;
+}
+
 /// Builds the frame `switchStack` restores the first time it switches to `f`: a saved
 /// register set whose return address is `fiberEntry` and whose first callee-saved register
 /// holds `f`. Returns the stack pointer to save in `f.sp`.
@@ -534,6 +549,14 @@ fn releaseStack(s: *Scheduler, stack: Stack) void {
     stack.unmap();
 }
 
+/// The length of the mapping for a stack of `usable_size` bytes: rounded up to whole pages,
+/// plus the guard page. Null when that overflows `usize`.
+pub fn stackMappingLen(usable_size: usize) ?usize {
+    const page = std.heap.pageSize();
+    const rounded = std.math.add(usize, usable_size, page - 1) catch return null;
+    return std.math.add(usize, std.mem.alignBackward(usize, rounded, page), page) catch null;
+}
+
 /// A fiber stack: an anonymous mapping whose lowest page is inaccessible, so overflowing
 /// the stack faults immediately instead of corrupting the neighboring memory.
 const Stack = struct {
@@ -541,7 +564,7 @@ const Stack = struct {
 
     fn map(usable_size: usize) !Stack {
         const page = std.heap.pageSize();
-        const len = std.mem.alignForward(usize, usable_size, page) + page;
+        const len = stackMappingLen(usable_size) orelse return error.OutOfMemory;
         const memory = try std.posix.mmap(
             null,
             len,
@@ -715,6 +738,51 @@ fn checkOnStack(s: *const Scheduler, heap_addr: usize, out: *[2]bool) void {
     var local: u8 = 0;
     std.mem.doNotOptimizeAway(&local);
     out.* = .{ s.onCurrentStack(@intFromPtr(&local)), s.onCurrentStack(heap_addr) };
+}
+
+test "spawn returns StackTooSmall for a zero stack size" {
+    var s: Scheduler = .init(testing.allocator, .{ .stack_size = 0 });
+    defer s.deinit();
+    var out: usize = 0;
+    try testing.expectError(error.StackTooSmall, s.spawn("a", recordStack, .{&out}));
+    try testing.expectEqual(@as(usize, 0), s.stackCount());
+    try testing.expectEqual(@as(usize, 0), s.live);
+}
+
+fn takeBig(big: [8192]u8, out: *u8) void {
+    out.* = big[8191];
+}
+
+test "spawn returns StackTooSmall for arguments larger than the stack, and holds no stack" {
+    var s: Scheduler = .init(testing.allocator, .{ .stack_size = 4096 });
+    defer s.deinit();
+    var out: u8 = 0;
+    const big: [8192]u8 = @splat(7);
+    try testing.expectError(error.StackTooSmall, s.spawn("big", takeBig, .{ big, &out }));
+    try testing.expectEqual(@as(usize, 0), s.stackCount());
+    try testing.expectEqual(@as(usize, 0), s.live);
+}
+
+test "spawn returns OutOfMemory for a stack size too large to map" {
+    var s: Scheduler = .init(testing.allocator, .{ .stack_size = std.math.maxInt(usize) });
+    defer s.deinit();
+    var out: usize = 0;
+    try testing.expectError(error.OutOfMemory, s.spawn("a", recordStack, .{&out}));
+    try testing.expectEqual(@as(usize, 0), s.stackCount());
+}
+
+test "stackMappingLen rounds up to whole pages plus a guard page, or is null on overflow" {
+    const page = std.heap.pageSize();
+    try testing.expectEqual(@as(?usize, null), stackMappingLen(std.math.maxInt(usize)));
+    try testing.expectEqual(@as(?usize, page), stackMappingLen(0));
+    try testing.expectEqual(@as(?usize, 2 * page), stackMappingLen(1));
+    try testing.expectEqual(@as(?usize, 2 * page), stackMappingLen(page));
+    try testing.expectEqual(@as(?usize, 3 * page), stackMappingLen(page + 1));
+    // The largest whole-page length is maxInt - page + 1: one guard page below it leaves
+    // maxInt - 2 * page + 1 usable bytes, and one byte more no longer fits.
+    const largest_len = std.math.maxInt(usize) - page + 1;
+    try testing.expectEqual(@as(?usize, largest_len), stackMappingLen(largest_len - page));
+    try testing.expectEqual(@as(?usize, null), stackMappingLen(largest_len - page + 1));
 }
 
 test "onCurrentStack tells the running fiber's stack from other memory" {

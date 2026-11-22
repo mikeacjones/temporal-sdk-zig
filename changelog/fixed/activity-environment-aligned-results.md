@@ -1,0 +1,1 @@
+`testing.ActivityEnvironment.executeActivity` no longer corrupts memory when the activity returns a type aligned above 8 bytes, such as `std.Io.Duration`, on a `std.Io.Threaded`; README.md now warns about the same hazard in user code that returns such types from `io.concurrent` or `io.async` on Zig 0.17.1.

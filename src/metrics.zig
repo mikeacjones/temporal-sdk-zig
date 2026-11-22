@@ -111,6 +111,9 @@ pub const Options = struct {
     };
 
     /// The bucket boundaries (`buckets`) of one histogram, by metric name (`metric`).
+    /// `buckets` must be finite (no NaN or infinity) and strictly increasing (sorted, no
+    /// duplicates); an empty list keeps the exporter's default buckets. `Client.init` and
+    /// `Client.connect` return `error.InvalidOptions`, logged with the metric's name, otherwise.
     pub const BucketOverride = bridge.Runtime.Metrics.BucketOverride;
 };
 

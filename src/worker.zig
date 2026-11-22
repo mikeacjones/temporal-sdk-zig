@@ -38,7 +38,9 @@ const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const Instance = @import("workflow/Instance.zig");
+const Scheduler = @import("workflow/Scheduler.zig");
 const CancelBlockingAllocator = @import("CancelBlockingAllocator.zig");
+const io_tasks = @import("io_tasks.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -48,6 +50,10 @@ const task_pb = proto.coresdk.activity_task;
 const result_pb = proto.coresdk.activity_result;
 const builtin = @import("builtin");
 const log = std.log.scoped(.temporal);
+
+/// The smallest `Options.workflow_stack_size`: 64 KiB. `Worker.run` returns
+/// `error.InvalidOptions` (logged) for less.
+pub const min_workflow_stack_size: usize = 64 * 1024;
 
 pub const Options = struct {
     /// How many workflow runs the worker keeps in memory between workflow tasks. Over the
@@ -137,7 +143,9 @@ pub const Options = struct {
     /// registered, and can't be combined with `sessions`; `run` returns
     /// `error.InvalidOptions` otherwise.
     poll_activity_tasks: bool = true,
-    /// Stack size for each workflow coroutine.
+    /// Stack size for each workflow coroutine. At least `min_workflow_stack_size` (64 KiB),
+    /// and small enough to round up to whole pages plus a guard page; `run` returns
+    /// `error.InvalidOptions` otherwise.
     workflow_stack_size: usize = 256 * 1024,
     /// The most memory, in bytes, one cached workflow run may hold. Null (the default): no
     /// limit.
@@ -363,16 +371,20 @@ pub const Worker = struct {
     nexus_services: std.StringHashMapUnmanaged(nexus.Registered) = .empty,
     /// The core workers while `run` is active, for `stop` on other threads: the task queue's,
     /// then with sessions, the session queue's and the host queue's.
-    /// Guards `core_ptrs`, `stop_requested`, `fatal` and `fatal_message`, which `stop` (any
-    /// thread), the poll loops and `run` share.
+    /// Guards `core_ptrs`, `stop_requested`, `fatal`, `fatal_message` and the start outcome
+    /// (`run_generation`, `started_generation`, `start_failed`), which `stop` (any thread), the
+    /// poll loops, `waitUntilRunning` and `run` share.
     stop_mutex: Io.Mutex = .init,
     core_ptrs: [3]?*bridge.c.TemporalCoreWorker = @splat(null),
+    /// Set by `stop` only, and never cleared: a Worker the user stopped stays stopped.
     stop_requested: bool = false,
     /// The activities of each running activity loop, so `stop` can tell them the worker is
     /// stopping (`activity.Context.isWorkerStopping`). Guarded by `stop_mutex`.
     activity_runs: [3]?*RunningActivities = @splat(null),
-    /// Set by `stop` before it notifies `activity_runs`; an activity starting later reads it,
-    /// and so does `run` while its client makes its first connection.
+    /// Set before `activity_runs` are notified, by `stop`, by a poll failure (`shutDownRun`) and
+    /// by a poll loop that couldn't start (`startFailed`); an activity starting later reads it,
+    /// and so does `run` while its client makes its first connection. `run` resets it to
+    /// `stop_requested` when it starts, so only a user's stop carries over to the next run.
     stopping: std.atomic.Value(bool) = .init(false),
     /// Whether `run` is waiting for its client's first connection, which `stop` then wakes.
     /// Guarded by `stop_mutex`.
@@ -381,10 +393,22 @@ pub const Worker = struct {
     /// couldn't be allocated). See `fatalMessage`.
     fatal: ?PollError = null,
     fatal_message: ?[]u8 = null,
-    /// Set once `run` has registered the worker with its client and started polling, or has
-    /// failed before getting there (`start_failed`). See `waitUntilRunning`.
-    started: Io.Event = .unset,
+    /// The current or last run's number: `run` raises it when it starts. Guarded by
+    /// `stop_mutex`. `testing.WorkflowEnvironment` also raises it, and settles it if the spawn
+    /// fails, before it spawns `run` on another task, so its `waitUntilRunning` can't report
+    /// the previous run; it is never lowered, and a run settles the number it ends at.
+    run_generation: u64 = 0,
+    /// The number of the last run that settled its start (`settleStart`): it registered the
+    /// worker with its client and started polling, or it failed before getting there
+    /// (`start_failed`). A run settles once, so this equals `run_generation` once the current
+    /// run has settled. Guarded by `stop_mutex`; see `waitUntilRunning`.
+    started_generation: u64 = 0,
+    /// Whether run `started_generation` failed to start. Guarded by `stop_mutex`.
     start_failed: bool = false,
+    /// Broadcast, with `stop_mutex` held, whenever `run_generation` or `started_generation`
+    /// changes.
+    /// `waitUntilRunning` waits on it and re-checks the generations when woken.
+    start_changed: Io.Condition = .init,
     /// The client's worker interceptors, then `options.interceptors`, while `run` is active.
     interceptors: []const interceptor.Worker = &.{},
     /// The sessions this worker holds, while `run` is active with `options.sessions`.
@@ -609,9 +633,24 @@ pub const Worker = struct {
     ///   connection, and nothing has started (`waitUntilRunning` returns
     ///   `error.WorkerFailedToStart`);
     /// - `error.PollFailed` (or `error.OutOfMemory`) when the core gave up polling, after
-    ///   shutting down as `stop` does; `fatalMessage` has the task queue and the core's text;
+    ///   shutting down its core workers (this is not a `stop`: `run` can be called again);
+    ///   `fatalMessage` has the task queue and the core's text;
     /// - an error from starting the worker or from shutting it down. A loop that couldn't
     ///   start is returned before a poll failure, and a poll failure before a failed shutdown.
+    ///
+    /// A Worker can run again after `run` returned, including after `error.PollFailed` or an
+    /// error from starting. Only one `run` of a Worker may be active at a time.
+    ///
+    /// A Worker that `stop` was called on stays stopped. Every later `run` returns without
+    /// error once it has shut down the cores it created, and it polls nothing (`waitUntilRunning`
+    /// reports it as failed to start). To poll again, make a new Worker.
+    ///
+    /// `waitUntilRunning` reports this run while it is active and until the next `run` begins;
+    /// a waiter blocked across a run boundary reports the run it sees when it is woken (see
+    /// `waitUntilRunning`). A run begins only when its task enters `run`, so on a reused Worker,
+    /// `waitUntilRunning` called right after `io.concurrent(run)` may report the previous
+    /// run's outcome, such as its failed start. To retry a start that failed, make a new
+    /// Worker and run that.
     pub fn run(w: *Worker) RunError!void {
         {
             w.stop_mutex.lockUncancelable(w.io);
@@ -619,12 +658,16 @@ pub const Worker = struct {
             if (w.fatal_message) |m| w.gpa.free(m);
             w.fatal_message = null;
             w.fatal = null;
+            // The last run's poll failure or failed loop start shut that run down; it doesn't
+            // stop this one. Everything that run started has ended, and runs don't overlap. A
+            // `stop` racing with this takes the same mutex, so it is kept either way.
+            w.stopping.store(w.stop_requested, .release);
+            // A new run: `waitUntilRunning` now waits for this one to settle.
+            w.run_generation += 1;
+            w.start_changed.broadcast(w.io);
         }
         var running = false;
-        defer if (!running) {
-            w.start_failed = true;
-            w.started.set(w.io);
-        };
+        defer if (!running) w.settleStart(true);
         if (!w.hasWorkflows() and !w.hasActivities() and !w.hasNexusServices()) return error.NothingRegistered;
         const registered: Registered = .{ .workflows = w.hasWorkflows(), .activities = w.hasActivities(), .nexus = w.hasNexusServices() };
         try checkOptions(w.options, w.task_queue, registered);
@@ -632,7 +675,7 @@ pub const Worker = struct {
         // Read while the worker connects and creates its core; `awaitDebugInfo` waits for it
         // before the worker polls, so no activity fails before it is done.
         if (w.readsDebugInfo() and w.debug_info_read == null and !debug_info_warm.load(.acquire))
-            w.debug_info_read = w.io.concurrent(warmDebugInfo, .{w}) catch null;
+            w.debug_info_read = io_tasks.concurrent(w.io, warmDebugInfo, .{w}) catch null;
         var core_options = coreOptions(w.options, w.client.namespace, w.task_queue, strategy, registered);
         const nondeterminism_types = try w.nondeterminismFailTypes();
         defer w.gpa.free(nondeterminism_types);
@@ -726,14 +769,16 @@ pub const Worker = struct {
         // its loops still run: a core is finalized only after each of its pollers has seen
         // the shutdown `stop` began, and one finalized without ever being polled for
         // activities never finishes. They return at once.
-        if (w.awaitDebugInfo()) {
+        // `awaitDebugInfo` checks `stopping` only while it waits for the read: check it here too,
+        // so a run after `stop` never reports that it started.
+        if (w.awaitDebugInfo() and !w.stopping.load(.acquire)) {
             log.info("Started Worker Namespace={s} TaskQueue={s}", .{ w.client.namespace, w.task_queue });
             if (host) |h| log.info("Worker hosts sessions TaskQueue={s} SessionTaskQueue={s} HostTaskQueue={s}", .{ w.task_queue, h.creation_queue, h.host_queue });
             running = true;
-            w.started.set(w.io);
+            w.settleStart(false);
         } else log.info("Worker stopped before it polled TaskQueue={s}", .{w.task_queue});
 
-        var workflows_done = if (w.hasWorkflows()) try w.io.concurrent(workflowLoop, .{ w, core }) else null;
+        var workflows_done = if (w.hasWorkflows()) try io_tasks.concurrent(w.io, workflowLoop, .{ w, core }) else null;
         // Once a loop polls a core, returning early would free the core worker under it: shut
         // down like a normal stop, drain every poller (finalizing waits for each to return
         // null), finalize, then return the error.
@@ -741,7 +786,7 @@ pub const Worker = struct {
         var polling = workflows_done != null;
         var nexus_done: ?Io.Future(void) = null;
         if (w.hasNexusServices()) {
-            if (w.io.concurrent(nexusLoop, .{ w, core })) |f| {
+            if (io_tasks.concurrent(w.io, nexusLoop, .{ w, core })) |f| {
                 nexus_done = f;
                 polling = true;
             } else |err| {
@@ -757,7 +802,7 @@ pub const Worker = struct {
         var activity_loops: [3]?Io.Future(void) = @splat(null);
         for (cores[first_activity_core..], activity_loops[first_activity_core..core_count]) |c, *loop| {
             if (start_failed == null) {
-                if (w.io.concurrent(activityLoop, .{ w, c.core, c.task_queue })) |f| {
+                if (io_tasks.concurrent(w.io, activityLoop, .{ w, c.core, c.task_queue })) |f| {
                     loop.* = f;
                     polling = true;
                     continue;
@@ -803,6 +848,16 @@ pub const Worker = struct {
         if (start_failed) |err| return err;
         if (poll_failed) |err| return err;
         if (shutdown_failed) |err| return err;
+    }
+
+    /// Records how the current run's start ended, for `waitUntilRunning`, and wakes its waiters.
+    /// Called once per run: when it starts polling, or when it returns without having done so.
+    fn settleStart(w: *Worker, failed: bool) void {
+        w.stop_mutex.lockUncancelable(w.io);
+        defer w.stop_mutex.unlock(w.io);
+        w.started_generation = w.run_generation;
+        w.start_failed = failed;
+        w.start_changed.broadcast(w.io);
     }
 
     /// Whether this worker puts stack traces in failures, which read the executable's debug
@@ -851,6 +906,16 @@ pub const Worker = struct {
     /// Returns `error.InvalidOptions`, logging the option and why, for options the core
     /// would reject or misread, or that contradict each other. `coreOptions` relies on it.
     fn checkOptions(o: Options, task_queue: []const u8, registered: Registered) error{InvalidOptions}!void {
+        // A coroutine's arguments and header go at the top of its stack; a stack too small
+        // for them would be written outside its mapping.
+        if (o.workflow_stack_size < min_workflow_stack_size) {
+            log.warn("worker for task queue {s}: workflow_stack_size is {d}; it must be at least {d} (worker.min_workflow_stack_size)", .{ task_queue, o.workflow_stack_size, min_workflow_stack_size });
+            return error.InvalidOptions;
+        }
+        if (Scheduler.stackMappingLen(o.workflow_stack_size) == null) {
+            log.warn("worker for task queue {s}: workflow_stack_size is {d}; it is too large to round up to whole pages plus a guard page", .{ task_queue, o.workflow_stack_size });
+            return error.InvalidOptions;
+        }
         if (o.sessions) |s| {
             if (s.max_concurrent_sessions == 0) {
                 log.warn("worker for task queue {s}: sessions.max_concurrent_sessions must be positive", .{task_queue});
@@ -1096,17 +1161,35 @@ pub const Worker = struct {
 
     /// Asks `run` to stop: polling ends, in-flight work finishes, then `run` returns. Running
     /// activities are canceled (reason `worker_shutdown`) once `graceful_shutdown_period`
-    /// has passed. Safe to call from any thread, before or during `run`.
+    /// has passed. Safe to call from any thread, before or during `run`. The stop is
+    /// permanent: `run` called afterwards returns at once (see `run`). A poll failure does not
+    /// count as a stop.
     pub fn stop(w: *Worker) void {
         w.stop_mutex.lockUncancelable(w.io);
         defer w.stop_mutex.unlock(w.io);
         w.stop_requested = true;
         // Sets `stopping`, which a wait for the client's first connection or for the debug
         // info (`awaitDebugInfo`) checks once woken.
-        w.notifyActivitiesOfStop();
+        w.shutDownLocked();
         w.debug_info_wake.set(w.io);
         if (w.waiting_for_connection) w.client.wakeConnecting();
+    }
+
+    /// Shuts the current run's core workers down and tells its activities the worker is
+    /// stopping. Called with `stop_mutex` held.
+    fn shutDownLocked(w: *Worker) void {
+        w.notifyActivitiesOfStop();
         for (w.core_ptrs) |p| if (p) |ptr| bridge.c.temporal_core_worker_initiate_shutdown(ptr);
+    }
+
+    /// Ends the current run without stopping the Worker: a later `run` polls again. Sets
+    /// neither `stop_requested` nor `debug_info_wake` (with `stopping` reset by the next run,
+    /// a set event would make `awaitDebugInfo` spin); it runs only once polling has started,
+    /// after `awaitDebugInfo` returned.
+    fn shutDownRun(w: *Worker) void {
+        w.stop_mutex.lockUncancelable(w.io);
+        defer w.stop_mutex.unlock(w.io);
+        w.shutDownLocked();
     }
 
     /// Tells every running activity, and those that start later, that the worker is
@@ -1136,14 +1219,15 @@ pub const Worker = struct {
     const PollKind = enum { workflow, activity, nexus };
 
     /// Reports a failed poll from a poll loop: the core has already retried what it considers
-    /// transient, so the worker logs it, records it for `run` to return, and stops.
+    /// transient, so the worker logs it, records it for `run` to return, and shuts the run down.
     fn pollFailed(w: *Worker, kind: PollKind, task_queue: []const u8, err: PollError, detail: ?[]const u8) void {
         log.err("polling for {t} tasks on task queue {s} failed: {s}; stopping the worker", .{ kind, task_queue, detail orelse @errorName(err) });
         w.recordPollFailure(kind, task_queue, err, detail);
     }
 
     /// `pollFailed` without the log line (the test runner fails any test that logs an error):
-    /// keeps the run's first failure and its text, and stops the worker.
+    /// keeps the run's first failure and its text, and shuts the run's core workers down
+    /// (`shutDownRun`; not a `stop`, so the Worker can run again).
     fn recordPollFailure(w: *Worker, kind: PollKind, task_queue: []const u8, err: PollError, detail: ?[]const u8) void {
         const text = std.fmt.allocPrint(w.gpa, "polling for {t} tasks on task queue {s} failed: {s}", .{ kind, task_queue, detail orelse @errorName(err) }) catch null;
         {
@@ -1154,15 +1238,30 @@ pub const Worker = struct {
                 w.fatal_message = text;
             } else if (text) |t| w.gpa.free(t);
         }
-        w.stop();
+        w.shutDownRun();
     }
 
     /// Waits until `run` (on another task) has registered the worker with its client and
     /// started polling, for example before an eager workflow start, which only reaches a worker
     /// the client already knows. Returns `error.WorkerFailedToStart` if `run` returned before
     /// getting there (its error says why).
+    ///
+    /// It reports the run that is active when it is called, or else the most recent run;
+    /// before any run, it waits for the first. So once a run has returned, it reports that run
+    /// (a failed start, even when an earlier run polled) until the next `run` begins, and then
+    /// waits for the new one. A waiter blocked when one run ends and the next begins reports
+    /// whichever run it sees once it is woken: the run that ended if it was woken before the
+    /// next began, otherwise the new one. A run after `stop` polls nothing, so it reports
+    /// `error.WorkerFailedToStart`.
+    ///
+    /// On a reused Worker, calling it right after `io.concurrent(run)` may report the previous
+    /// run's outcome: the new task may not have entered `run` yet. To retry a start that
+    /// failed, make a new Worker, start its `run`, and wait on that.
     pub fn waitUntilRunning(w: *Worker) error{ Canceled, WorkerFailedToStart }!void {
-        try w.started.wait(w.io);
+        w.stop_mutex.lockUncancelable(w.io);
+        defer w.stop_mutex.unlock(w.io);
+        // `wait` relocks the mutex before it returns, canceled or not.
+        while (w.started_generation < @max(w.run_generation, 1)) try w.start_changed.wait(w.io, &w.stop_mutex);
         if (w.start_failed) return error.WorkerFailedToStart;
     }
 
@@ -1599,7 +1698,7 @@ pub const WorkflowRunner = struct {
             .sdk_work = &inst.sched.sdk_work,
             .sender = sender orelse return .{ .returned = inst.activate(act, a) },
         };
-        var watchdog = io.concurrent(Watch.run, .{&watch}) catch {
+        var watchdog = io_tasks.concurrent(io, Watch.run, .{&watch}) catch {
             r.logger.log(.warn, "no concurrent task available for the deadlock watchdog; this workflow activation runs unwatched", &.{.{ .key = "run_id", .value = act.run_id }});
             return .{ .returned = inst.activate(act, a) };
         };
@@ -2177,7 +2276,7 @@ fn cancelReason(reason: task_pb.ActivityCancelReason) activity.CancelReason {
 /// couldn't be canceled.
 fn superviseActivity(w: *Worker, core: bridge.Worker, running: *RunningActivities, run: *RunningActivity) void {
     const outcome = blk: {
-        var task = w.io.concurrent(callActivity, .{ w, core, run }) catch break :blk noThreadForActivity(run);
+        var task = io_tasks.concurrent(w.io, callActivity, .{ w, core, run }) catch break :blk noThreadForActivity(run);
         run.wake.waitUncancelable(w.io);
         const reason = run.ctx.cancelReason() orelse break :blk task.await(w.io);
         log.debug("activity {s}: canceling its task ({t})", .{ run.start.activity_id, reason });
@@ -2792,7 +2891,7 @@ fn undecodableNexusError(err: anyerror, task_queue: []const u8, message_buf: []u
 /// thread for the handler the request fails as `resource_exhausted`, which the server
 /// retries: run here, the handler couldn't be canceled.
 fn superviseNexusRequest(w: *Worker, core: bridge.Worker, running: *RunningNexusRequests, req: *NexusRequest) void {
-    if (w.io.concurrent(runNexusRequest, .{ w, req })) |started| {
+    if (io_tasks.concurrent(w.io, runNexusRequest, .{ w, req })) |started| {
         var task = started;
         req.wake.waitUncancelable(w.io);
         if (req.ctx.cancelReason() != null) task.cancel(w.io) else task.await(w.io);
@@ -3891,6 +3990,9 @@ test "invalid worker options are rejected before the worker starts" {
         .{ .default_heartbeat_throttle_interval = .fromSeconds(61) },
         .{ .default_heartbeat_throttle_interval = .fromSeconds(5), .max_heartbeat_throttle_interval = .fromSeconds(4) },
         .{ .poll_activity_tasks = false, .sessions = .{} },
+        .{ .workflow_stack_size = 0 },
+        .{ .workflow_stack_size = min_workflow_stack_size - 1 },
+        .{ .workflow_stack_size = std.math.maxInt(usize) },
     };
     for (invalid) |options| try testing.expectError(error.InvalidOptions, Worker.checkOptions(options, "q", all));
     // Activities that could run only as local activities need a workflow to call them.
@@ -3903,6 +4005,7 @@ test "invalid worker options are rejected before the worker starts" {
         .{ .sticky_schedule_to_start_timeout = .zero, .default_heartbeat_throttle_interval = .zero, .max_heartbeat_throttle_interval = .zero },
         .{ .default_heartbeat_throttle_interval = .fromSeconds(60) },
         .{ .poll_activity_tasks = false },
+        .{ .workflow_stack_size = min_workflow_stack_size },
     };
     for (valid) |options| try Worker.checkOptions(options, "q", all);
     try Worker.checkOptions(.{ .poll_activity_tasks = false }, "q", .{ .workflows = false, .activities = false, .nexus = true });
@@ -3918,6 +4021,7 @@ test "run returns InvalidOptions for an invalid option, before it uses the clien
         .{ .activity_task_poller_behavior = .{ .autoscaling = .{ .minimum = 3, .maximum = 2, .initial = 2 } } },
         .{ .nexus_task_poller_behavior = .{ .autoscaling = .{ .initial = 101 } } },
         .{ .nonsticky_to_sticky_poll_ratio = std.math.nan(f32) },
+        .{ .workflow_stack_size = 0 },
     };
     for (invalid) |options| {
         var w = try Worker.init(testing.allocator, testing.io, &client, "invalid", options);
@@ -5683,6 +5787,100 @@ test "run returns a poll failure after shutting down" {
     try expectPollFailureReturned(HelloTest.runWorker, "poll-failure");
 }
 
+test "a worker runs again after a poll failure, and stays stopped after stop" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, testing.io, &client, "run-after-poll-failure", .{});
+    defer w.deinit();
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+
+    // Run 1 ends with a poll failure.
+    var first = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    try w.waitUntilRunning();
+    w.recordPollFailure(.activity, w.task_queue, error.PollFailed, "boom");
+    try testing.expectError(error.PollFailed, first.await(testing.io));
+
+    // Run 2 polls again and runs a workflow and its activity; the workflow's result is what
+    // shows run 2 polls.
+    var second = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    var second_done = false;
+    defer if (!second_done) {
+        w.stop();
+        second.await(testing.io) catch {};
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try client.executeWorkflow(HelloTest.Hello, .{ .id = "run_after_poll_failure", .task_queue = "run-after-poll-failure", .execution_timeout = .fromSeconds(20) }, .{"Temporal"});
+    defer run.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try run.get(arena.allocator()));
+    w.stop();
+    second_done = true;
+    try second.await(testing.io);
+    try testing.expectEqual(@as(?[]const u8, null), w.fatalMessage());
+
+    // A user's stop is permanent: run 3 shuts down what it created and returns at once.
+    try w.run();
+    // It polled nothing, so `waitUntilRunning` reports it as failed to start, not run 2.
+    try testing.expectError(error.WorkerFailedToStart, w.waitUntilRunning());
+    try testing.expectEqual(@as(?[]const u8, null), w.fatalMessage());
+    w.stop_mutex.lockUncancelable(testing.io);
+    defer w.stop_mutex.unlock(testing.io);
+    try testing.expect(w.stop_requested);
+    try testing.expectEqual(@as(?*bridge.c.TemporalCoreWorker, null), w.core_ptrs[0]);
+}
+
+test "waitUntilRunning reports the current run, not a first run that failed to start" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var w = try Worker.init(testing.allocator, testing.io, &client, "wait-until-running-current", .{});
+    defer w.deinit();
+
+    // Before any run, a waiter blocks for the first, until it is canceled.
+    var canceled = try testing.io.concurrent(Worker.waitUntilRunning, .{&w});
+    try testing.expectError(error.Canceled, canceled.cancel(testing.io));
+
+    // Run 1 fails to start.
+    try testing.expectError(error.NothingRegistered, w.run());
+    try testing.expectError(error.WorkerFailedToStart, w.waitUntilRunning());
+
+    // Run 2 polls: the workflow's result shows it, and `waitUntilRunning` then reports run 2.
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    var second = try testing.io.concurrent(HelloTest.runWorker, .{&w});
+    var second_done = false;
+    defer if (!second_done) {
+        w.stop();
+        second.await(testing.io) catch {};
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try client.executeWorkflow(HelloTest.Hello, .{ .id = "wait_until_running_current", .task_queue = "wait-until-running-current", .execution_timeout = .fromSeconds(20) }, .{"Temporal"});
+    defer run.deinit();
+    try testing.expectEqualStrings("Hello Temporal!", try run.get(arena.allocator()));
+    try w.waitUntilRunning();
+
+    // After it returns, it is still the most recent run.
+    w.stop();
+    second_done = true;
+    try second.await(testing.io);
+    try w.waitUntilRunning();
+
+    // A run after `stop` polls nothing, so it failed to start.
+    try w.run();
+    try testing.expectError(error.WorkerFailedToStart, w.waitUntilRunning());
+}
+
 test "runUntilSignal returns a poll failure after shutting down" {
     try expectPollFailureReturned(HelloTest.runWorkerUntilSignal, "poll-failure-signal");
     SignalWatcher.mutex.lockUncancelable(testing.io);
@@ -7429,4 +7627,87 @@ test "nondeterminism fails the workflow with the worker's or the definition's op
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
     try testing.expect((try client.describeWorkflow(scratch.allocator(), "nd-plain", plain.run_id)).status == .running);
+}
+
+test {
+    _ = io_tasks;
+}
+
+test "io_tasks.resultFits refuses results aligned above 8 and accepts the worker's own" {
+    try testing.expect(!io_tasks.resultFits(Io.Duration));
+    try testing.expect(!io_tasks.resultFits(failure_mod.Application));
+    try testing.expect(!io_tasks.resultFits(@Vector(4, u32)));
+    try testing.expect(!io_tasks.resultFits(NexusOutcome));
+    // An activity's outcome, as `callActivity` returns it, and a worker run's.
+    try testing.expect(io_tasks.resultFits(@typeInfo(@TypeOf(callActivity)).@"fn".return_type.?));
+    try testing.expect(io_tasks.resultFits(Worker.RunError!void));
+}
+
+/// Hands out every allocation aligned to 8 or less at an address that is 8 mod 16, as a
+/// general-purpose allocator may, with canary bytes after the requested length that `free`
+/// checks. Thread-safe as its child is.
+const OffsetCanaryAllocator = struct {
+    child: Allocator,
+    overruns: std.atomic.Value(u32) = .init(0),
+
+    const canary_len = 16;
+    const canary_byte = 0xa5;
+
+    fn allocator(self: *OffsetCanaryAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+
+    fn lead(alignment: std.mem.Alignment) usize {
+        return if (alignment.toByteUnits() <= 8) 8 else 0;
+    }
+
+    fn outer(alignment: std.mem.Alignment) std.mem.Alignment {
+        return alignment.max(.@"16");
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *OffsetCanaryAllocator = @ptrCast(@alignCast(ctx));
+        const pad = lead(alignment);
+        const base = self.child.rawAlloc(pad + len + canary_len, outer(alignment), ret_addr) orelse return null;
+        @memset(base[pad + len ..][0..canary_len], canary_byte);
+        return base + pad;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *OffsetCanaryAllocator = @ptrCast(@alignCast(ctx));
+        const pad = lead(alignment);
+        const base = memory.ptr - pad;
+        for (base[pad + memory.len ..][0..canary_len]) |b| {
+            if (b != canary_byte) {
+                _ = self.overruns.fetchAdd(1, .monotonic);
+                break;
+            }
+        }
+        self.child.rawFree(base[0 .. pad + memory.len + canary_len], outer(alignment), ret_addr);
+    }
+};
+
+test "ActivityEnvironment returns 16-aligned activity results without overrunning a Threaded future" {
+    const Fixtures = struct {
+        fn none(_: *activity.Context) Io.Duration {
+            return .fromNanoseconds(-1);
+        }
+        fn one(_: *activity.Context, x: u64) Io.Duration {
+            return .fromNanoseconds(-@as(i96, x));
+        }
+        const None = activity.Def("AlignedNone", none);
+        const One = activity.Def("AlignedOne", one);
+    };
+    comptime std.debug.assert(@alignOf(Io.Duration) > 8);
+    var checking: OffsetCanaryAllocator = .{ .child = testing.allocator };
+    var threaded: Io.Threaded = .init(checking.allocator(), .{ .environ = testing.environ });
+    defer threaded.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: @import("testing.zig").ActivityEnvironment = .init(threaded.io());
+    // The two argument tuples differ by 8 bytes, so one of the two futures starts 8 mod 16
+    // from where its result would need to be, whatever `@sizeOf` the future has.
+    try testing.expectEqual(@as(i96, -1), (try env.executeActivity(Fixtures.None, .{}, arena.allocator())).toNanoseconds());
+    try testing.expectEqual(@as(i96, -2), (try env.executeActivity(Fixtures.One, .{2}, arena.allocator())).toNanoseconds());
+    try testing.expectEqual(@as(u32, 0), checking.overruns.load(.monotonic));
 }
