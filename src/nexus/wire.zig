@@ -28,7 +28,9 @@ pub const LinkError = error{ OutOfMemory, InvalidLink };
 /// percent-encoded and the reference either `referenceType=EventReference` with `eventType`
 /// and an optional `eventID`, or `referenceType=RequestIdReference` with `eventType` and an
 /// optional `requestID`. Event types may be named in PascalCase (`NexusOperationScheduled`)
-/// or as the enum constant (`EVENT_TYPE_NEXUS_OPERATION_SCHEDULED`). On
+/// or as the enum constant (`EVENT_TYPE_NEXUS_OPERATION_SCHEDULED`). A link whose namespace,
+/// workflow ID, run ID or query parameter is not valid UTF-8 once percent-decoded is
+/// `error.InvalidLink`, since protobuf string fields must hold UTF-8. On
 /// `error.InvalidLink`, `why` says what is wrong. Memory comes from `a`.
 pub fn fromNexusLink(a: Allocator, link: nexus_pb.Link, why: *[]const u8) LinkError!common.Link {
     if (!std.mem.eql(u8, link.type, workflow_event_link_type))
@@ -64,8 +66,8 @@ pub fn fromNexusLink(a: Allocator, link: nexus_pb.Link, why: *[]const u8) LinkEr
     while (params.next()) |param| {
         if (param.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, param, '=') orelse param.len;
-        const key = try decodeComponent(a, param[0..eq], true, why);
-        const value = try decodeComponent(a, if (eq < param.len) param[eq + 1 ..] else "", true, why);
+        const key = try decodeComponent(a, param[0..eq], true, "query parameter name", why);
+        const value = try decodeComponent(a, if (eq < param.len) param[eq + 1 ..] else "", true, key, why);
         const slot: *?[]const u8 = if (std.mem.eql(u8, key, "referenceType"))
             &reference_type
         else if (std.mem.eql(u8, key, "eventType"))
@@ -84,9 +86,9 @@ pub fn fromNexusLink(a: Allocator, link: nexus_pb.Link, why: *[]const u8) LinkEr
     }
 
     var event: common.Link.WorkflowEvent = .{
-        .namespace = try decodeComponent(a, segments[2], false, why),
-        .workflow_id = try decodeComponent(a, segments[4], false, why),
-        .run_id = try decodeComponent(a, segments[5], false, why),
+        .namespace = try decodeComponent(a, segments[2], false, "namespace", why),
+        .workflow_id = try decodeComponent(a, segments[4], false, "workflow ID", why),
+        .run_id = try decodeComponent(a, segments[5], false, "run ID", why),
     };
     const ref = reference_type orelse return invalid(why, "its query has no referenceType");
     const type_name = event_type orelse return invalid(why, "its query has no eventType");
@@ -183,26 +185,33 @@ fn encodeComponent(w: *std.Io.Writer, text: []const u8, query: bool) std.Io.Writ
     }
 }
 
-/// Percent-decodes `text`; in a query, `+` is a space.
-fn decodeComponent(a: Allocator, text: []const u8, query: bool, why: *[]const u8) LinkError![]const u8 {
-    if (std.mem.indexOfAny(u8, text, if (query) "%+" else "%") == null) return text;
-    const out = try a.alloc(u8, text.len);
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        const c = text[i];
-        if (c == '%') {
-            if (i + 2 >= text.len) return invalid(why, "it holds a truncated percent-encoding");
-            const high = std.fmt.charToDigit(text[i + 1], 16) catch return invalid(why, "it holds an invalid percent-encoding");
-            const low = std.fmt.charToDigit(text[i + 2], 16) catch return invalid(why, "it holds an invalid percent-encoding");
-            out[n] = high << 4 | low;
-            i += 2;
-        } else {
-            out[n] = if (query and c == '+') ' ' else c;
+/// Percent-decodes `text`; in a query, `+` is a space. The result must be UTF-8, whether it
+/// was percent-encoded or not; otherwise `why` names `component`.
+fn decodeComponent(a: Allocator, text: []const u8, query: bool, component: []const u8, why: *[]const u8) LinkError![]const u8 {
+    const result = if (std.mem.indexOfAny(u8, text, if (query) "%+" else "%") == null) text else decoded: {
+        const out = try a.alloc(u8, text.len);
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            const c = text[i];
+            if (c == '%') {
+                if (i + 2 >= text.len) return invalid(why, "it holds a truncated percent-encoding");
+                const high = std.fmt.charToDigit(text[i + 1], 16) catch return invalid(why, "it holds an invalid percent-encoding");
+                const low = std.fmt.charToDigit(text[i + 2], 16) catch return invalid(why, "it holds an invalid percent-encoding");
+                out[n] = high << 4 | low;
+                i += 2;
+            } else {
+                out[n] = if (query and c == '+') ' ' else c;
+            }
+            n += 1;
         }
-        n += 1;
+        break :decoded out[0..n];
+    };
+    if (!std.unicode.utf8ValidateSlice(result)) {
+        why.* = try std.fmt.allocPrint(a, "its {s} is not valid UTF-8 once percent-decoded", .{component});
+        return error.InvalidLink;
     }
-    return out[0..n];
+    return result;
 }
 
 /// `t` as a link names it: `EVENT_TYPE_NEXUS_OPERATION_SCHEDULED` is `NexusOperationScheduled`.
@@ -484,6 +493,46 @@ test "Nexus links in other spellings parse, and malformed ones are rejected with
     try testing.expect(std.mem.indexOf(u8, why, "workflow link") != null);
     try testing.expectError(error.InvalidLink, toNexusLink(a, .{}, &why));
     try testing.expectError(error.InvalidLink, toNexusLink(a, eventLink("ns", "w", "r", .{ .event_ref = .{ .event_type = @fromBackingInt(@intCast(9999)) } }), &why));
+}
+
+test "a Nexus link whose components aren't UTF-8 once percent-decoded is rejected, naming the component" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const query = "?referenceType=EventReference&eventType=WorkflowExecutionStarted";
+    const cases = [_]struct { url: []const u8, component: []const u8 }{
+        // A lone %FF.
+        .{ .url = "temporal:///namespaces/ns%FF/workflows/w/r/history" ++ query, .component = "namespace" },
+        // A truncated multi-byte sequence.
+        .{ .url = "temporal:///namespaces/ns/workflows/w%E2%82/r/history" ++ query, .component = "workflow ID" },
+        // An overlong encoding of '/' and a surrogate.
+        .{ .url = "temporal:///namespaces/ns/workflows/w/r%C0%AF/history" ++ query, .component = "run ID" },
+        .{ .url = "temporal:///namespaces/ns/workflows/w/r%ED%A0%80/history" ++ query, .component = "run ID" },
+        // Raw bytes that aren't UTF-8, with no percent-encoding at all.
+        .{ .url = "temporal:///namespaces/ns\xff/workflows/w/r/history" ++ query, .component = "namespace" },
+        .{ .url = "temporal:///namespaces/ns/workflows/w/r/history?referenceType=RequestIdReference&requestID=a%FFb&eventType=WorkflowExecutionStarted", .component = "requestID" },
+        .{ .url = "temporal:///namespaces/ns/workflows/w/r/history?referenceType=RequestIdReference&requestID=a\xc3&eventType=WorkflowExecutionStarted", .component = "requestID" },
+        .{ .url = "temporal:///namespaces/ns/workflows/w/r/history" ++ query ++ "&x%FF=1", .component = "query parameter name" },
+    };
+    for (cases) |case| {
+        var why: []const u8 = "";
+        try testing.expectError(error.InvalidLink, fromNexusLink(a, .{ .url = case.url, .type = workflow_event_link_type }, &why));
+        const want = try std.fmt.allocPrint(a, "its {s} is not valid UTF-8 once percent-decoded", .{case.component});
+        try testing.expectEqualStrings(want, why);
+    }
+
+    // Percent-encoded text that is UTF-8 still parses, and round-trips.
+    var why: []const u8 = "";
+    const url = "temporal:///namespaces/caf%C3%A9/workflows/%E2%82%AC/r%F0%9F%98%80/history?referenceType=RequestIdReference&requestID=%C3%BC&eventType=WorkflowExecutionStarted";
+    const link = try fromNexusLink(a, .{ .url = url, .type = workflow_event_link_type }, &why);
+    const event = link.variant.?.workflow_event;
+    try testing.expectEqualStrings("caf\u{e9}", event.namespace);
+    try testing.expectEqualStrings("\u{20ac}", event.workflow_id);
+    try testing.expectEqualStrings("r\u{1f600}", event.run_id);
+    try testing.expectEqualStrings("\u{fc}", event.reference.?.request_id_ref.request_id);
+    const back = try toNexusLink(a, link, &why);
+    try testing.expectEqualStrings(url, back.url);
+    try testing.expectEqualDeep(link, try fromNexusLink(a, back, &why));
 }
 
 test "every start result maps to the completion the core expects" {
