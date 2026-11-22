@@ -38,6 +38,7 @@ const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const Instance = @import("workflow/Instance.zig");
+const Scheduler = @import("workflow/Scheduler.zig");
 const CancelBlockingAllocator = @import("CancelBlockingAllocator.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -48,6 +49,10 @@ const task_pb = proto.coresdk.activity_task;
 const result_pb = proto.coresdk.activity_result;
 const builtin = @import("builtin");
 const log = std.log.scoped(.temporal);
+
+/// The smallest `Options.workflow_stack_size`: 64 KiB. `Worker.run` returns
+/// `error.InvalidOptions` (logged) for less.
+pub const min_workflow_stack_size: usize = 64 * 1024;
 
 pub const Options = struct {
     /// How many workflow runs the worker keeps in memory between workflow tasks. Over the
@@ -137,7 +142,9 @@ pub const Options = struct {
     /// registered, and can't be combined with `sessions`; `run` returns
     /// `error.InvalidOptions` otherwise.
     poll_activity_tasks: bool = true,
-    /// Stack size for each workflow coroutine.
+    /// Stack size for each workflow coroutine. At least `min_workflow_stack_size` (64 KiB),
+    /// and small enough to round up to whole pages plus a guard page; `run` returns
+    /// `error.InvalidOptions` otherwise.
     workflow_stack_size: usize = 256 * 1024,
     /// The most memory, in bytes, one cached workflow run may hold. Null (the default): no
     /// limit.
@@ -846,6 +853,16 @@ pub const Worker = struct {
     /// Returns `error.InvalidOptions`, logging the option and why, for options the core
     /// would reject or misread, or that contradict each other. `coreOptions` relies on it.
     fn checkOptions(o: Options, task_queue: []const u8, registered: Registered) error{InvalidOptions}!void {
+        // A coroutine's arguments and header go at the top of its stack; a stack too small
+        // for them would be written outside its mapping.
+        if (o.workflow_stack_size < min_workflow_stack_size) {
+            log.warn("worker for task queue {s}: workflow_stack_size is {d}; it must be at least {d} (worker.min_workflow_stack_size)", .{ task_queue, o.workflow_stack_size, min_workflow_stack_size });
+            return error.InvalidOptions;
+        }
+        if (Scheduler.stackMappingLen(o.workflow_stack_size) == null) {
+            log.warn("worker for task queue {s}: workflow_stack_size is {d}; it is too large to round up to whole pages plus a guard page", .{ task_queue, o.workflow_stack_size });
+            return error.InvalidOptions;
+        }
         if (o.sessions) |s| {
             if (s.max_concurrent_sessions == 0) {
                 log.warn("worker for task queue {s}: sessions.max_concurrent_sessions must be positive", .{task_queue});
@@ -3862,6 +3879,9 @@ test "invalid worker options are rejected before the worker starts" {
         .{ .default_heartbeat_throttle_interval = .fromSeconds(61) },
         .{ .default_heartbeat_throttle_interval = .fromSeconds(5), .max_heartbeat_throttle_interval = .fromSeconds(4) },
         .{ .poll_activity_tasks = false, .sessions = .{} },
+        .{ .workflow_stack_size = 0 },
+        .{ .workflow_stack_size = min_workflow_stack_size - 1 },
+        .{ .workflow_stack_size = std.math.maxInt(usize) },
     };
     for (invalid) |options| try testing.expectError(error.InvalidOptions, Worker.checkOptions(options, "q", all));
     // Activities that could run only as local activities need a workflow to call them.
@@ -3874,6 +3894,7 @@ test "invalid worker options are rejected before the worker starts" {
         .{ .sticky_schedule_to_start_timeout = .zero, .default_heartbeat_throttle_interval = .zero, .max_heartbeat_throttle_interval = .zero },
         .{ .default_heartbeat_throttle_interval = .fromSeconds(60) },
         .{ .poll_activity_tasks = false },
+        .{ .workflow_stack_size = min_workflow_stack_size },
     };
     for (valid) |options| try Worker.checkOptions(options, "q", all);
     try Worker.checkOptions(.{ .poll_activity_tasks = false }, "q", .{ .workflows = false, .activities = false, .nexus = true });
@@ -3889,6 +3910,7 @@ test "run returns InvalidOptions for an invalid option, before it uses the clien
         .{ .activity_task_poller_behavior = .{ .autoscaling = .{ .minimum = 3, .maximum = 2, .initial = 2 } } },
         .{ .nexus_task_poller_behavior = .{ .autoscaling = .{ .initial = 101 } } },
         .{ .nonsticky_to_sticky_poll_ratio = std.math.nan(f32) },
+        .{ .workflow_stack_size = 0 },
     };
     for (invalid) |options| {
         var w = try Worker.init(testing.allocator, testing.io, &client, "invalid", options);
