@@ -279,6 +279,10 @@ pub fn fromPayloadWithContext(comptime T: type, arena: Allocator, context: *cons
         const Child = @typeInfo(T).optional.child;
         if (comptime hasContextHooks(Child) or hasPayloadHooks(Child) or isProtoMessage(Child))
             return try fromPayloadWithContext(Child, arena, context, p);
+        // std.json parses an optional itself, so a JSON `null` decodes to null. Any other
+        // encoding holds a value of the child, such as `binary/plain` for `?Bytes`.
+        if (!std.mem.eql(u8, enc, Encoding.json.text()))
+            return try fromPayloadWithContext(Child, arena, context, p);
     }
     if (comptime isProtoMessage(T)) return Proto(T, .{}).decode(arena, p);
     if (std.mem.eql(u8, enc, Encoding.binary.text())) {
@@ -921,6 +925,36 @@ test "null, void and raw bytes use the binary encodings" {
     try testing.expectEqualStrings("binary/plain", encodingOf(b).?);
     try testing.expectEqualSlices(u8, "\x00\x01", (try fromPayload(Bytes, a, b)).data);
     try testing.expectEqualSlices(u8, "\x00\x01", try fromPayload([]const u8, a, b));
+}
+
+test "an optional decodes a binary/plain payload as its child, and JSON into the optional itself" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const full = try toPayload(a, @as(?Bytes, .{ .data = "\x00\xff" }));
+    try testing.expectEqualStrings("binary/plain", encodingOf(full).?);
+    try testing.expectEqualSlices(u8, "\x00\xff", (try fromPayload(?Bytes, a, full)).?.data);
+    try testing.expectEqualSlices(u8, "\x00\xff", (try fromPayload(?[]const u8, a, full)).?);
+    try testing.expectEqualSlices(u8, "\x00\xff", (try fromPayload(?[]u8, a, full)).?);
+    try testing.expectError(error.InvalidPayload, fromPayload(?u32, a, full));
+
+    const empty = try toPayload(a, @as(?Bytes, null));
+    try testing.expectEqualStrings("binary/null", encodingOf(empty).?);
+    try testing.expectEqual(@as(?Bytes, null), try fromPayload(?Bytes, a, empty));
+    try testing.expectEqual(@as(?[]const u8, null), try fromPayload(?[]const u8, a, empty));
+
+    const json_null = try payloadWith(a, .json, "null");
+    try testing.expectEqual(@as(?u32, null), try fromPayload(?u32, a, json_null));
+    try testing.expectEqual(@as(?[]const u8, null), try fromPayload(?[]const u8, a, json_null));
+    try testing.expectEqual(@as(?u32, 7), try fromPayload(?u32, a, try toPayload(a, @as(?u32, 7))));
+    try testing.expectEqualStrings("x", (try fromPayload(?[]const u8, a, try toPayload(a, @as(?[]const u8, "x")))).?);
+    try testing.expectError(error.InvalidPayload, fromPayload(?u32, a, try payloadWith(a, .json, "{not json")));
+
+    const ps = try toPayloads(a, .{ @as(?Bytes, .{ .data = "\x00\xff" }), @as(?Bytes, null) });
+    const args = try fromPayloads(struct { ?Bytes, ?Bytes }, a, ps.items);
+    try testing.expectEqualSlices(u8, "\x00\xff", args[0].?.data);
+    try testing.expectEqual(@as(?Bytes, null), args[1]);
 }
 
 test "argument tuples round-trip, with optional trailing arguments" {

@@ -1,0 +1,1 @@
+A workflow or activity argument or result of type `?converter.Bytes`, `?[]const u8` or `?[]u8` that holds a value now decodes: `converter.fromPayload` and `fromPayloads` read its `binary/plain` payload as the optional's child, where they returned `error.InvalidPayload`. A `json/plain` payload still decodes into an optional as before, so JSON `null` decodes to null.
