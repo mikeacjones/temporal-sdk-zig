@@ -264,6 +264,37 @@ const CheckInputs = struct {
 
 /// Correctness commands (see AGENTS.md). A fetched package has no tools/checks.
 fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
+    // A case that runs its program through time-limit (tools/checks/time_limit.zig), which
+    // fails the case, naming it, with exit 124 when the program has not ended within
+    // `limit` seconds, instead of hanging `zig build test`. Pass the program next.
+    const limit_tool = checkTool(b, "time-limit", "tools/checks/time_limit.zig");
+    in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "time-limit", .root_module = limit_tool.root_module, .filters = in.test_filters })).step);
+    const Limited = struct {
+        /// Ample for a fixture and the symbolizer, even on a loaded machine.
+        const seconds = 120;
+
+        fn case(b2: *std.Build, test_step: *std.Build.Step, tool: *std.Build.Step.Compile, name: []const u8, limit: u32, exit_code: u8) *std.Build.Step.Run {
+            const r = addCheckCase(b2, test_step, tool, name, exit_code);
+            r.setCwd(b2.path("."));
+            r.addArgs(&.{ b2.fmt("{d}", .{limit}), r.step.name });
+            return r;
+        }
+    };
+
+    // The core's replay poller panics on some malformed histories, and a panic there hung
+    // the replayer, so this runs in its own process under a time limit.
+    {
+        const program = b.addExecutable(.{ .name = "replay-malformed", .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/checks/replay_malformed.zig"),
+            .target = in.target,
+            .optimize = in.optimize,
+            .imports = &.{.{ .name = "temporal", .module = in.temporal }},
+        }) });
+        const run = Limited.case(b, in.test_step, limit_tool, "replay malformed histories", Limited.seconds, 0);
+        run.addArtifactArg(program);
+        run.addFileArg(b.path("src/testdata/helloworld_history.json"));
+    }
+
     // zig build alloc-failures
     {
         const helper = struct {
@@ -893,24 +924,11 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         // the host's atos: tools/checks/symbolizer.zig, built under the file name
         // llvm-symbolizer, the name that makes the runtime speak llvm-symbolizer's protocol
         // to it, which names the binary's file and an address in it, not the live process.
-        const limit_tool = checkTool(b, "time-limit", "tools/checks/time_limit.zig");
-        in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "time-limit", .root_module = limit_tool.root_module, .filters = in.test_filters })).step);
+        // (time-limit and `Limited` are at the top of this function.)
         const symbolizer_tool = checkTool(b, "llvm-symbolizer", "tools/checks/symbolizer.zig");
         in.test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "symbolizer", .root_module = symbolizer_tool.root_module, .filters = in.test_filters })).step);
         // Linux keeps the runtime's own choice.
         const own_symbolizer: ?*std.Build.Step.Compile = if (b.graph.host.result.os.tag.isDarwin()) symbolizer_tool else null;
-        const Limited = struct {
-            /// Ample for a fixture and the symbolizer, even on a loaded machine.
-            const seconds = 120;
-
-            fn case(b2: *std.Build, test_step: *std.Build.Step, tool: *std.Build.Step.Compile, name: []const u8, limit: u32, exit_code: u8) *std.Build.Step.Run {
-                const r = addCheckCase(b2, test_step, tool, name, exit_code);
-                r.setCwd(b2.path("."));
-                r.addArgs(&.{ b2.fmt("{d}", .{limit}), r.step.name });
-                return r;
-            }
-        };
-
         // Libc, so that threads come from pthreads, which the sanitizer intercepts.
         const race_tool = checkTool(b, "tsan-race-fixture", "tools/checks/fixtures/tsan/race.zig");
         race_tool.root_module.sanitize_thread = true;
