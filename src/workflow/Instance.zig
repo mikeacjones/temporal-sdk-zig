@@ -184,6 +184,8 @@ evicting: bool = false,
 task_failure: ?[]const u8 = null,
 /// The application failure type of `task_failure`.
 task_failure_type: []const u8 = "UnsupportedJob",
+/// Whether `failCoroutineStart` has logged `wio.start_failure`, which it does once per run.
+logged_start_failure: bool = false,
 /// Query handlers by query type, in registration order (the order an unknown query's failure
 /// lists them in). Arena memory; they outlive the workflow function.
 queries: std.array_hash_map.String(QueryHandler) = .empty,
@@ -660,6 +662,7 @@ pub const Options = struct {
 /// InitializeWorkflow job.
 pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*Instance {
     const inst = try gpa.create(Instance);
+    errdefer gpa.destroy(inst);
     inst.* = .{
         .gpa = gpa,
         .arena_state = .init(gpa),
@@ -674,6 +677,9 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
         .task_failure_errors = options.task_failure_errors,
         .failure_converter = options.failure_converter,
     };
+    // `destroy` can't run on a half-built instance; free what's been taken so far instead.
+    // `Scheduler.init` and `WorkflowIo.init` allocate nothing.
+    errdefer inst.arena_state.deinit();
     inst.wio = .init(inst.arena(), &inst.sched, .{ .ctx = inst, .vtable = &host_vtable }, 0);
     inst.ctx = .{ .instance = inst };
     inst.task_queue = try inst.arena().dupe(u8, options.task_queue);
@@ -688,8 +694,9 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
 }
 
 /// Tears the run down: cancels its coroutines, lets them exit, and frees everything. A
-/// coroutine that refuses to exit keeps its stack mapped (it is never resumed); the rest of
-/// the run, including that coroutine's Task block, is freed.
+/// coroutine that refuses to exit keeps its stack mapped (it is never resumed), unless a
+/// coroutine start of the run failed (see `teardown`); the rest of the run, including that
+/// coroutine's Task block, is freed.
 pub fn destroy(inst: *Instance) void {
     const stuck = inst.teardown();
     const gpa = inst.gpa;
@@ -712,7 +719,8 @@ pub fn destroy(inst: *Instance) void {
 /// The first half of `destroy`: marks the run evicting, so `emit` drops every command from
 /// here on, cancels the root and handler coroutines, wakes waits that ignore cancellation,
 /// and runs the scheduler so they exit and their defers run. Returns how many coroutines are
-/// still alive. Calling it again returns that count without doing anything else.
+/// still alive, which is always 0 for a run whose coroutine start failed (see the end). Calling
+/// it again returns that count without doing anything else.
 pub fn teardown(inst: *Instance) usize {
     if (inst.evicting) return inst.sched.live;
     inst.evicting = true;
@@ -738,6 +746,16 @@ pub fn teardown(inst: *Instance) usize {
     while (externals.next()) |state| state.*.waiters.wakeAll(&inst.wio);
     inst.wio.run();
     std.debug.assert(inst.commands.items.len == 0);
+    if (inst.wio.start_failure != null and inst.sched.live > 0) {
+        // A failed coroutine start ran its function inline in the coroutine that started it,
+        // which can leave that coroutine waiting, uncancelably, on itself: a Select case's
+        // result put into a full queue that only the caller drains. No cancel reaches such a
+        // wait, and leaking its stack would hold the mappings whose lack failed the start.
+        // The run is never resumed, and everything that points into these stacks is the
+        // run's own state, which `destroy` frees without following, so the stacks go now.
+        const abandoned = inst.sched.abandonLive();
+        inst.logger.warn("workflow coroutines of a run whose coroutine start failed did not exit on eviction; freeing their stacks without running their defers", .{ .count = abandoned });
+    }
     return inst.sched.live;
 }
 
@@ -832,7 +850,10 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     // Query answers go to `out`, not the run's arena, so answering doesn't grow the run.
     var answers: std.ArrayList(cmd_pb.WorkflowCommand) = .empty;
 
-    for (act.jobs.items) |job| {
+    // A run whose coroutine start failed in an earlier activation, and that wasn't evicted,
+    // has state no replay would produce: it never runs or answers again.
+    const jobs = if (inst.wio.start_failure != null) act.jobs.items[0..0] else act.jobs.items;
+    for (jobs) |job| {
         const variant = job.variant orelse {
             // A job of a kind this SDK's protos don't know, from a newer core.
             if (job._unknown_fields.len > 0) inst.task_failure = "workflow activation has a job of a kind this SDK version doesn't know; upgrade the SDK";
@@ -879,14 +900,19 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     // rejects anything but rejections from it).
     // The memory check, too, runs only when coroutines ran: an activation that only rejected
     // updates is not in history either, so failing it would fail the task on this worker only.
-    if (inst.task_failure == null and !query_only and !inst.finished) {
+    if (inst.task_failure == null and inst.wio.start_failure == null and !query_only and !inst.finished) {
         const ran = !update_only or inst.accepted_update;
         if (ran) inst.runUntilQuiet();
-        try inst.fillUpdateTraces(out);
-        try inst.rejectUnhandledUpdates();
-        try inst.finishIfDone(out);
-        if (ran and !inst.finished and inst.task_failure == null) try inst.checkMemoryLimit(out);
+        if (inst.wio.start_failure == null) {
+            try inst.fillUpdateTraces(out);
+            try inst.rejectUnhandledUpdates();
+            try inst.finishIfDone(out);
+            if (ran and !inst.finished and inst.task_failure == null) try inst.checkMemoryLimit(out);
+        }
     }
+    // The root cause: another failure (such as "out of memory starting a timer") is usually
+    // its consequence.
+    if (inst.wio.start_failure) |f| inst.failCoroutineStart(out, f);
 
     var completion: done_pb.WorkflowActivationCompletion = .{ .run_id = act.run_id };
     if (inst.task_failure) |message| {
@@ -899,6 +925,20 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         completion.status = .{ .successful = success };
     }
     return completion;
+}
+
+/// Fails the activation for a coroutine `io.async` or `Group.async` couldn't start. The run
+/// went on with the function run inline, which no replay would do, so the activation's
+/// commands are dropped; the core evicts the run and a later task replays it from history.
+fn failCoroutineStart(inst: *Instance, out: Allocator, f: WorkflowIo.StartFailure) void {
+    inst.task_failure = std.fmt.allocPrint(out, "{f}; the workflow task fails, and the run is evicted and replayed from history on a later task", .{f}) catch
+        "a workflow coroutine could not be started; the workflow task fails";
+    inst.task_failure_type = "WorkflowCoroutineStartFailed";
+    if (inst.logged_start_failure) return;
+    inst.logged_start_failure = true;
+    // A warning, as for other failed workflow tasks: the server records the failure and the
+    // run is retried from history.
+    inst.logger.log(.warn, inst.task_failure.?, .{ .operation = f.operation, .cause = @tagName(f.cause) });
 }
 
 /// Fails the workflow task when the run holds more than `memory_limit`. Called once per
@@ -3578,6 +3618,18 @@ test "hello world: schedule the activity, then complete with its result" {
     try testing.expectEqualStrings("\"Hello Temporal!\"", done[0].variant.?.complete_workflow_execution.result.?.data);
 }
 
+fn createAndDestroy(gpa: Allocator, task_queue: []const u8, namespace: []const u8) !void {
+    const inst = try create(gpa, Hello.registered, .{ .task_queue = task_queue, .namespace = namespace });
+    inst.destroy();
+}
+
+test "Instance.create frees everything it acquired when an allocation fails" {
+    // Longer than the arena's first chunk, so each copy takes a chunk of its own.
+    const task_queue: [4096]u8 = @splat('q');
+    const namespace: [4096]u8 = @splat('n');
+    try testing.checkAllAllocationFailures(testing.allocator, createAndDestroy, .{ &task_queue, &namespace });
+}
+
 test "a failed activity fails the workflow with the activity's failure" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
@@ -3741,6 +3793,49 @@ test "durations beyond protobuf's range are clamped in workflow commands, and ne
     defer neg_inst.destroy();
     const negative = (try longTimesCommands(neg_inst, a, "negative"))[0].variant.?.schedule_activity;
     try testing.expectEqual(proto.google.protobuf.Duration{ .seconds = -1, .nanos = -500_000_000 }, negative.heartbeat_timeout.?);
+}
+
+/// Waits with a deadline at an end of i96, through `sleep` or a futex wait; the mode picks which.
+const FarDeadline = struct {
+    fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        const ns: i96 = if (std.mem.endsWith(u8, mode, "min")) std.math.minInt(i96) else std.math.maxInt(i96);
+        const timeout: std.Io.Timeout = .{ .deadline = .{ .raw = .fromNanoseconds(ns), .clock = .awake } };
+        if (std.mem.startsWith(u8, mode, "sleep")) {
+            try timeout.sleep(ctx.io());
+        } else {
+            // `Io.Event.waitTimeout` would reach the same wait, but recomputes the remaining
+            // time itself with std's unchecked `durationFromNow` after the wait returns.
+            const word: u32 = 0;
+            try ctx.io().futexWaitTimeout(u32, &word, 0, timeout);
+        }
+        return "done";
+    }
+    const Def = workflow.Def("FarDeadline", run);
+};
+
+test "a wait whose deadline is at either end of i96 doesn't overflow: the past one has expired, the future one starts the longest timer" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    for ([_][]const u8{ "sleep-min", "futex-min" }) |mode| {
+        const inst = try create(testing.allocator, FarDeadline.Def.registered, .{});
+        defer inst.destroy();
+        const cmds = commandsOf(try inst.activate(&try initActivation(a, "FarDeadline", .{mode}), a));
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqualStrings("\"done\"", cmds[0].variant.?.complete_workflow_execution.result.?.data);
+    }
+
+    // With workflow time before 1970, maxInt(i96) minus now doesn't fit in i96.
+    for ([_][]const u8{ "sleep-max", "futex-max" }) |mode| {
+        const inst = try create(testing.allocator, FarDeadline.Def.registered, .{});
+        defer inst.destroy();
+        var act = try initActivation(a, "FarDeadline", .{mode});
+        act.timestamp = .{ .seconds = -1 };
+        const cmds = commandsOf(try inst.activate(&act, a));
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqual(proto_time.durationToProto(proto_time.max_duration).?, cmds[0].variant.?.start_timer.start_to_fire_timeout.?);
+    }
 }
 
 test "workflow cancellation cancels the pending activity and the workflow" {
@@ -5860,6 +5955,162 @@ test "eviction while awaiting a condition frees everything" {
     const inst = try create(testing.allocator, GoroutinesWf.registered, .{});
     _ = try inst.activate(&try initActivation(a, "Goroutines", .{@as(usize, 2)}), a);
     inst.destroy();
+}
+
+/// Sleeps, then starts a coroutine that sleeps again, through io.async (mode 0), Group.async
+/// (1) or a Select case (2), and waits for it.
+const CoroutineStart = struct {
+    const Picked = union(enum) { nap: std.Io.Cancelable!void };
+
+    fn run(ctx: *workflow.Context, mode: u8) ![]const u8 {
+        const io = ctx.io();
+        try io.sleep(.fromSeconds(10), .awake);
+        switch (mode) {
+            0 => {
+                var f = io.async(std.Io.sleep, .{ io, .fromSeconds(5), .awake });
+                try f.await(io);
+            },
+            1 => {
+                var g: std.Io.Group = .init;
+                g.async(io, std.Io.sleep, .{ io, .fromSeconds(5), .awake });
+                try g.await(io);
+            },
+            else => {
+                var buf: [1]Picked = undefined;
+                var select: std.Io.Select(Picked) = .init(io, &buf);
+                defer select.cancelDiscard();
+                select.async(.nap, std.Io.sleep, .{ io, .fromSeconds(5), .awake });
+                switch (try select.await()) {
+                    .nap => |r| try r,
+                }
+            },
+        }
+        return "done";
+    }
+};
+const CoroutineStartWf = workflow.Def("CoroutineStart", CoroutineStart.run);
+
+const coroutine_start_operations = [_][]const u8{ "io.async", "Group.async", "Group.async" };
+
+fn expectCoroutineStartFailed(c: done_pb.WorkflowActivationCompletion, mode: u8, cause: WorkflowIo.StartFailure.Cause) !void {
+    const f = c.status.?.failed.failure.?;
+    try testing.expectEqualStrings("WorkflowCoroutineStartFailed", failure_mod.applicationType(f).?);
+    var buf: [512]u8 = undefined;
+    const want = try std.fmt.bufPrint(&buf, "{f}", .{WorkflowIo.StartFailure{ .operation = coroutine_start_operations[mode], .cause = cause }});
+    try testing.expect(std.mem.startsWith(u8, f.message, want));
+    try testing.expect(std.mem.endsWith(u8, f.message, "; the workflow task fails, and the run is evicted and replayed from history on a later task"));
+}
+
+test "a coroutine that can't start fails the workflow task, and replay without the fault completes" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    for (0..3) |m| for ([_]WorkflowIo.StartFailure.Cause{ .task_block, .stack }) |cause| {
+        const mode: u8 = @intCast(m);
+        const init = try initActivation(a, "CoroutineStart", .{mode});
+        const fire_first = try oneJob(a, .{ .fire_timer = .{ .seq = 1 } });
+        const fire_second = try oneJob(a, .{ .fire_timer = .{ .seq = 2 } });
+
+        {
+            var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+            defer recorder.arena.deinit();
+            const inst = try create(testing.allocator, CoroutineStartWf.registered, .{ .logger = recorder.sink() });
+            defer inst.destroy();
+            const first = commandsOf(try inst.activate(&init, a));
+            try testing.expectEqual(@as(u32, 1), first[0].variant.?.start_timer.seq);
+
+            // The second activation's start is the run's first block of its size class, so
+            // the pool can't serve it.
+            var failing: std.testing.FailingAllocator = .init(inst.arena(), .{ .fail_index = 0 });
+            switch (cause) {
+                .task_block => inst.wio.memory = failing.allocator(),
+                .stack => inst.sched.fail_stack_maps = 1,
+            }
+            const failed = try inst.activate(&fire_first, a);
+            inst.wio.memory = inst.arena();
+            try testing.expectEqual(@as(u32, 0), inst.sched.fail_stack_maps);
+            try expectCoroutineStartFailed(failed, mode, cause);
+            try testing.expectEqual(@as(usize, 1), recorder.count);
+            try testing.expectEqualStrings(failed.status.?.failed.failure.?.message, recorder.message);
+            try testing.expectEqualStrings(coroutine_start_operations[mode], recorder.get("operation").?);
+            try testing.expectEqualStrings(@tagName(cause), recorder.get("cause").?);
+
+            // Sticky until the run is evicted, whatever the activation holds.
+            try expectCoroutineStartFailed(try inst.activate(&fire_second, a), mode, cause);
+            try testing.expectEqual(@as(usize, 1), recorder.count);
+            // Eviction ends every coroutine, the inline run's caller included.
+            try testing.expectEqual(@as(usize, 0), inst.teardown());
+        }
+
+        const inst = try create(testing.allocator, CoroutineStartWf.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&init, a);
+        const second = commandsOf(try inst.activate(&fire_first, a));
+        try testing.expectEqual(@as(usize, 1), second.len);
+        try testing.expectEqual(@as(u32, 2), second[0].variant.?.start_timer.seq);
+        try testing.expectEqual(@as(i64, 5), second[0].variant.?.start_timer.start_to_fire_timeout.?.seconds);
+        const done = commandsOf(try inst.activate(&fire_second, a));
+        try testing.expectEqualStrings("\"done\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+        try testing.expectEqual(@as(?WorkflowIo.StartFailure, null), inst.wio.start_failure);
+    };
+}
+
+/// Races a case that is ready at once against a timeout, with room in the select's buffer for
+/// one result (the usual first-wins race). With `fail_timeout_start`, the timeout's coroutine
+/// can't get a stack, so its sleep runs inline in the workflow coroutine.
+const RaceReadyAgainstTimeout = struct {
+    const U = union(enum) { ready: u32, timeout: std.Io.Cancelable!void };
+    var fail_timeout_start = false;
+
+    fn ready() u32 {
+        return 7;
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        try io.sleep(.fromSeconds(10), .awake);
+        var buf: [1]U = undefined;
+        var sel: std.Io.Select(U) = .init(io, &buf);
+        defer sel.cancelDiscard();
+        sel.async(.ready, ready, .{});
+        if (fail_timeout_start) ctx.instance.sched.fail_stack_maps = 1;
+        sel.async(.timeout, std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+        return switch (try sel.await()) {
+            .ready => "ready",
+            .timeout => "timeout",
+        };
+    }
+};
+const RaceReadyAgainstTimeoutWf = workflow.Def("RaceReadyAgainstTimeout", RaceReadyAgainstTimeout.run);
+
+test "eviction after a Select case failed to start frees every coroutine" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const init = try initActivation(a, "RaceReadyAgainstTimeout", .{});
+    const fire_first = try oneJob(a, .{ .fire_timer = .{ .seq = 1 } });
+
+    // Undisturbed, the ready case wins and the run completes.
+    {
+        const inst = try create(testing.allocator, RaceReadyAgainstTimeoutWf.registered, .{});
+        defer inst.destroy();
+        _ = try inst.activate(&init, a);
+        const done = commandsOf(try inst.activate(&fire_first, a));
+        try testing.expectEqualStrings("\"ready\"", done[done.len - 1].variant.?.complete_workflow_execution.result.?.data);
+        try testing.expectEqual(@as(usize, 0), inst.teardown());
+    }
+
+    RaceReadyAgainstTimeout.fail_timeout_start = true;
+    defer RaceReadyAgainstTimeout.fail_timeout_start = false;
+    const inst = try create(testing.allocator, RaceReadyAgainstTimeoutWf.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&init, a);
+    const failed = try inst.activate(&fire_first, a);
+    try testing.expectEqualStrings("WorkflowCoroutineStartFailed", failure_mod.applicationType(failed.status.?.failed.failure.?).?);
+    // The core evicts the failed run. Every coroutine must exit, or its stack stays mapped:
+    // the resource whose exhaustion failed the start in the first place.
+    try testing.expectEqual(@as(usize, 0), inst.teardown());
 }
 
 // The workflow function and a coroutine it starts with io.async name themselves; the child

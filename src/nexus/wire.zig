@@ -352,6 +352,21 @@ pub fn encodeAckCancel(buffer: *[max_ack_cancel_len]u8, token: []const u8) ?[]co
     return writer.buffered();
 }
 
+/// Room for `encodeFailedCompletion`: the first `max_ack_cancel_len` bytes build the failure,
+/// the rest hold its encoding.
+pub const failed_completion_buffer_len = 3 * max_ack_cancel_len;
+
+/// `failedCompletion(token, e)` built and encoded in `buffer` without the heap, for a worker
+/// out of memory. Null when it doesn't fit (a token longer than about 7 KiB).
+pub fn encodeFailedCompletion(buffer: *[failed_completion_buffer_len]u8, token: []const u8, e: nexus.HandlerError) ?[]const u8 {
+    var fba: std.heap.FixedBufferAllocator = .init(buffer[0..max_ack_cancel_len]);
+    const fa = fba.allocator();
+    const completion = failedCompletion(fa, token, e) catch return null;
+    var writer: std.Io.Writer = .fixed(buffer[max_ack_cancel_len..]);
+    completion.encode(&writer, fa) catch return null;
+    return writer.buffered();
+}
+
 /// Whether a request that came to `e` was abandoned because of the cancel `ctx` records: the
 /// handler returned `error.Canceled`, or an error whose cause it is, after the worker canceled it.
 pub fn canceledByWorker(ctx: *const nexus.Context, e: nexus.HandlerError) bool {
@@ -578,4 +593,24 @@ test "an acknowledged cancel encodes without allocating, unless its token doesn'
 
     const long: [max_ack_cancel_len]u8 = @splat('t');
     try testing.expectEqual(null, encodeAckCancel(&buffer, &long));
+}
+
+test "a failed completion encodes without the heap, unless its token doesn't fit" {
+    var buffer: [failed_completion_buffer_len]u8 = undefined;
+    const e: nexus.HandlerError = .{ .type = .internal, .message = "out of memory", .retry = .retryable, .cause = .{ .message = "cause", .type = "Cause" } };
+    const encoded = encodeFailedCompletion(&buffer, "task-token", e).?;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var reader: std.Io.Reader = .fixed(encoded);
+    const decoded = try Completion.decode(&reader, arena.allocator());
+    try testing.expectEqualStrings("task-token", decoded.task_token);
+    const failure = decoded.status.?.failure;
+    try testing.expectEqualStrings("out of memory", failure.message);
+    const info = failure.failure_info.?.nexus_handler_failure_info;
+    try testing.expectEqualStrings("INTERNAL", info.type);
+    try testing.expectEqual(.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE, info.retry_behavior);
+    try testing.expectEqualStrings("Cause", failure.cause.?.failure_info.?.application_failure_info.type);
+
+    const long: [2 * max_ack_cancel_len]u8 = @splat('t');
+    try testing.expectEqual(null, encodeFailedCompletion(&buffer, &long, e));
 }
