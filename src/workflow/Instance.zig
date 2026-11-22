@@ -936,9 +936,10 @@ fn failCoroutineStart(inst: *Instance, out: Allocator, f: WorkflowIo.StartFailur
     inst.task_failure_type = "WorkflowCoroutineStartFailed";
     if (inst.logged_start_failure) return;
     inst.logged_start_failure = true;
-    // A warning, as for other failed workflow tasks: the server records the failure and the
-    // run is retried from history.
-    inst.logger.log(.warn, inst.task_failure.?, .{ .operation = f.operation, .cause = @tagName(f.cause) });
+    // An error, as for WorkflowMemoryLimitExceeded: the worker ran out of memory or stack
+    // space, which an operator needs to see. Once per run, since every later activation of
+    // the run fails the same way until it is evicted.
+    inst.logger.log(.err, inst.task_failure.?, .{ .operation = f.operation, .cause = @tagName(f.cause) });
 }
 
 /// Fails the workflow task when the run holds more than `memory_limit`. Called once per
@@ -6013,7 +6014,7 @@ test "a coroutine that can't start fails the workflow task, and replay without t
         const fire_second = try oneJob(a, .{ .fire_timer = .{ .seq = 2 } });
 
         {
-            var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+            var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
             defer recorder.arena.deinit();
             const inst = try create(testing.allocator, CoroutineStartWf.registered, .{ .logger = recorder.sink() });
             defer inst.destroy();
@@ -6103,11 +6104,15 @@ test "eviction after a Select case failed to start frees every coroutine" {
 
     RaceReadyAgainstTimeout.fail_timeout_start = true;
     defer RaceReadyAgainstTimeout.fail_timeout_start = false;
-    const inst = try create(testing.allocator, RaceReadyAgainstTimeoutWf.registered, .{});
+    // The failed start is logged at .err; the recorder keeps it from the test runner.
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .err };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, RaceReadyAgainstTimeoutWf.registered, .{ .logger = recorder.sink() });
     defer inst.destroy();
     _ = try inst.activate(&init, a);
     const failed = try inst.activate(&fire_first, a);
     try testing.expectEqualStrings("WorkflowCoroutineStartFailed", failure_mod.applicationType(failed.status.?.failed.failure.?).?);
+    try testing.expectEqual(@as(usize, 1), recorder.count);
     // The core evicts the failed run. Every coroutine must exit, or its stack stays mapped:
     // the resource whose exhaustion failed the start in the first place.
     try testing.expectEqual(@as(usize, 0), inst.teardown());
