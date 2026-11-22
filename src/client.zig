@@ -28,6 +28,7 @@ const log_mod = @import("log.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
+const protobuf = @import("protobuf");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Duration = Io.Duration;
@@ -952,6 +953,11 @@ pub const Client = struct {
     /// `RpcOptions.retry`, and sends a view's metadata with the client's headers and API key.
     /// Canceling the calling task cancels the call and returns `error.Canceled`.
     ///
+    /// A request with a protobuf `string` field, at any depth, that is not valid UTF-8 is not
+    /// sent: the call returns `error.InvalidArgument`, and the failure (code
+    /// `.invalid_argument`) or the warning names the field by its proto path, such as
+    /// `execution.workflow_id`, and says no call was made. The client doesn't connect for it.
+    ///
     /// A call the server refuses returns the error of its gRPC status (see
     /// `CallServiceError`); `error.RpcFailed` means a failure without one. When `failure` is
     /// given, it is set to null first, then to the failure for `error.RpcFailed` (with a null
@@ -969,6 +975,13 @@ pub const Client = struct {
         const Response = ServiceResponse(service, method);
         const what = @tagName(service) ++ " service call " ++ method;
         if (failure) |out| out.* = null;
+        var path: FieldPath = .{};
+        if (invalidUtf8Path(@TypeOf(request), &request, &path)) {
+            if (failure) |out| {
+                out.* = .{ .code = .invalid_argument, .message = try std.fmt.allocPrint(arena, invalid_utf8_message, .{path}), .details = "" };
+            } else log.warn(what ++ " failed: " ++ invalid_utf8_message, .{path});
+            return error.InvalidArgument;
+        }
         var encoded: Io.Writer.Allocating = .init(arena);
         request.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         const connection = c.currentConnection() catch |err| switch (err) {
@@ -2661,7 +2674,8 @@ pub const Client = struct {
     /// caller to report instead of being logged; ALREADY_EXISTS still returns
     /// `error.AlreadyExists`. The codecs encode the
     /// request and decode the response with `values` and the workflow or activity the request
-    /// names.
+    /// names. A request with a string field that is not valid UTF-8, as coded, is not sent:
+    /// it fails as a server's INVALID_ARGUMENT (status 3) naming the field would.
     fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values) RpcError!Response {
         var codec_context: converter.Context = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
         requestIdentity(@TypeOf(request), &request, &codec_context);
@@ -2690,6 +2704,14 @@ pub const Client = struct {
             if (err == error.CodecFailed) log.warn("{s} failed: encoding its payloads with the client's codecs failed", .{method});
             return err;
         };
+        // As for a server's INVALID_ARGUMENT: sdk-core would refuse the request unnamed.
+        var path: FieldPath = .{};
+        if (invalidUtf8Path(@TypeOf(coded), &coded, &path)) {
+            if (status) |out| {
+                out.* = .{ .code = 3, .message = try std.fmt.allocPrint(arena, invalid_utf8_message, .{path}), .details = "" };
+            } else log.warn("{s} failed: " ++ invalid_utf8_message, .{ method, path });
+            return error.RpcFailed;
+        }
         var encoded: Io.Writer.Allocating = .init(arena);
         coded.encode(&encoded.writer, arena) catch return error.OutOfMemory;
         var failure: ?bridge.Connection.RpcFailure = null;
@@ -2933,6 +2955,9 @@ pub const CallServiceError = error{
     InvalidResponse,
     RpcCanceled,
     Unknown,
+    /// The server refused an argument (INVALID_ARGUMENT), or the client found a string field
+    /// of the request that is not valid UTF-8 and made no call; `RpcFailure.message` names
+    /// the field.
     InvalidArgument,
     DeadlineExceeded,
     NotFound,
@@ -2970,6 +2995,153 @@ fn statusError(code: u32, message: []const u8) CallServiceError {
         16 => error.Unauthenticated,
         else => error.Unknown,
     };
+}
+
+/// The message of a request `invalidUtf8Path` refuses, given its `FieldPath`.
+const invalid_utf8_message = "the request's field {f} is not valid UTF-8; no call was made";
+
+/// The proto path of a request's field, as `invalidUtf8Path` builds it: in a fixed buffer, so
+/// the check allocates nothing. Bytes past the buffer are dropped; `format` writes at most
+/// `max_shown` bytes, cutting a longer path with "...".
+const FieldPath = struct {
+    buf: [256]u8 = undefined,
+    /// The path's length, which may exceed `buf`.
+    len: usize = 0,
+
+    const max_shown = 200;
+
+    /// Appends `bytes` and returns the length to `pop` back to.
+    fn push(p: *FieldPath, bytes: []const u8) usize {
+        const mark = p.len;
+        p.append(bytes);
+        return mark;
+    }
+
+    /// Appends the field `name`, after a `.` unless the path is empty.
+    fn pushField(p: *FieldPath, name: []const u8) usize {
+        const mark = p.len;
+        if (p.len > 0) p.append(".");
+        p.append(name);
+        return mark;
+    }
+
+    fn append(p: *FieldPath, bytes: []const u8) void {
+        for (bytes) |b| {
+            if (p.len < p.buf.len) p.buf[p.len] = b;
+            p.len += 1;
+        }
+    }
+
+    fn pop(p: *FieldPath, mark: usize) void {
+        p.len = mark;
+    }
+
+    pub fn format(p: FieldPath, w: *Io.Writer) Io.Writer.Error!void {
+        if (p.len <= max_shown) return w.writeAll(p.buf[0..p.len]);
+        // Cut on a code point boundary: a map key in the path may be any valid UTF-8.
+        var cut: usize = max_shown - "...".len;
+        while (cut > 0 and p.buf[cut] & 0xc0 == 0x80) cut -= 1;
+        try w.writeAll(p.buf[0..cut]);
+        try w.writeAll("...");
+    }
+};
+
+/// Whether a protobuf `string` field of the generated message `m`, at any depth (nested
+/// messages, repeated fields, map keys and values, oneof members), holds bytes that are not
+/// valid UTF-8. sdk-core refuses to send such a request without saying which field it was, so
+/// the client checks first. On true, `path` holds the first such field's proto path
+/// (`execution.workflow_id`, `items[2].name`, `fields["key"]`, `fields (a key)`). Every
+/// string is checked, whatever its `utf8_validation` feature, because sdk-core rejects any
+/// invalid string; `bytes` fields are not. Pure and thread-safe.
+fn invalidUtf8Path(comptime M: type, m: *const M, path: *FieldPath) bool {
+    @setEvalBranchQuota(comptime protobuf.evalBranchQuotaFor(M));
+    if (comptime !@hasDecl(M, "_desc_table")) return false;
+    const info = @typeInfo(M).@"struct";
+    inline for (info.field_names) |name| {
+        if (comptime !@hasField(@TypeOf(M._desc_table), name)) continue;
+        if (invalidUtf8Field(@field(m, name), @field(M._desc_table, name).ftype, name, path)) return true;
+    }
+    return false;
+}
+
+fn invalidUtf8Field(field: anytype, comptime ftype: protobuf.FieldType, comptime name: []const u8, path: *FieldPath) bool {
+    const value = switch (@typeInfo(@TypeOf(field))) {
+        .optional => field orelse return false,
+        else => field,
+    };
+    switch (ftype) {
+        .scalar, .@"enum", .submessage => {
+            const mark = path.pushField(name);
+            if (invalidUtf8Value(value, ftype, path)) return true;
+            path.pop(mark);
+        },
+        .repeated, .packed_repeated => |repeated| {
+            const Elem = std.meta.Elem(@TypeOf(value.items));
+            const is_map = comptime @typeInfo(Elem) == .@"struct" and @hasDecl(Elem, "_desc_table") and
+                @hasField(@TypeOf(Elem._desc_table), "key") and @hasField(@TypeOf(Elem._desc_table), "value") and
+                @typeInfo(Elem).@"struct".field_names.len == 2;
+            for (value.items, 0..) |*element, i| {
+                const mark = path.pushField(name);
+                if (is_map) {
+                    const key = element.key;
+                    if (comptime @TypeOf(key) == []const u8) {
+                        if (!std.unicode.utf8ValidateSlice(key)) {
+                            _ = path.push(" (a key)");
+                            return true;
+                        }
+                        path.append("[\"");
+                        path.append(key);
+                        path.append("\"]");
+                    } else {
+                        var buf: [24]u8 = undefined;
+                        path.append(std.fmt.bufPrint(&buf, "[{any}]", .{key}) catch unreachable);
+                    }
+                    if (invalidUtf8Value(element.value, Elem._desc_table.value.ftype, path)) return true;
+                } else {
+                    var buf: [24]u8 = undefined;
+                    path.append(std.fmt.bufPrint(&buf, "[{d}]", .{i}) catch unreachable);
+                    const singular: protobuf.FieldType = switch (repeated) {
+                        .scalar => |s| .{ .scalar = s },
+                        .@"enum" => .@"enum",
+                        .submessage => .submessage,
+                    };
+                    if (invalidUtf8Value(element.*, singular, path)) return true;
+                }
+                path.pop(mark);
+            }
+        },
+        .oneof => |Oneof| switch (value) {
+            inline else => |member, tag| {
+                const member_name = @tagName(tag);
+                const mark = path.pushField(member_name);
+                if (invalidUtf8Value(member, @field(Oneof._desc_table, member_name).ftype, path)) return true;
+                path.pop(mark);
+            },
+        },
+    }
+    return false;
+}
+
+/// Whether the singular `value` (a string, or a message held by value, pointer or optional)
+/// holds invalid UTF-8; `path` already names it.
+fn invalidUtf8Value(value: anytype, comptime ftype: protobuf.FieldType, path: *FieldPath) bool {
+    const V = @TypeOf(value);
+    switch (@typeInfo(V)) {
+        .optional => return invalidUtf8Value(value orelse return false, ftype, path),
+        else => {},
+    }
+    switch (ftype) {
+        .scalar => |scalar| {
+            if (comptime scalar != .string) return false;
+            return !std.unicode.utf8ValidateSlice(value);
+        },
+        .submessage => {
+            if (comptime @typeInfo(V) == .pointer) return invalidUtf8Path(@typeInfo(V).pointer.child, value, path);
+            return invalidUtf8Path(V, &value, path);
+        },
+        .@"enum" => return false,
+        .repeated, .packed_repeated, .oneof => comptime unreachable,
+    }
 }
 
 /// Why a `Client.callService` call failed. The slices borrow the arena passed to the call.
