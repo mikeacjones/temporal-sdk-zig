@@ -1,0 +1,1 @@
+The `id` of a `schedule.Description` from `ScheduleHandle.describe` now lives in the arena passed to `describe`, as the rest of the description does; it pointed into the `ScheduleHandle` and was freed with it.

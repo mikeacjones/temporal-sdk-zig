@@ -1,7 +1,9 @@
 //! Clients for several namespaces over one connection (`Client.forNamespace`): the clients
 //! share the sdk-core runtime and the connection, and are closed in any order;
 //! `reconnect`, `updateApiKey` and `updateHeaders` on any of them apply to all and move every
-//! worker; and against a dev server with a second namespace, each client works in its own.
+//! worker; against a dev server with a second namespace, each client works in its own; and the
+//! core's logs keep reaching the client's logger after core objects built on its runtime are
+//! freed.
 
 const std = @import("std");
 const client_mod = @import("client.zig");
@@ -356,4 +358,99 @@ test "reconnect on either client sharing a connection moves the workers running 
     defer workers.stop();
     try first.reconnect(one.clientOptions().connectionOptions());
     try expectBothRun(&first, &second, arena, "moved-by-first");
+}
+
+/// Counts the core's records (those with a `target` field) that a client's logger receives.
+const CoreLogCounter = struct {
+    mutex: Io.Mutex = .init,
+    /// Broadcast for each record counted.
+    changed: Io.Condition = .init,
+    count: usize = 0,
+
+    fn sink(r: *CoreLogCounter) log_mod.Sink {
+        return .{ .ptr = r, .vtable = &.{ .log = record } };
+    }
+
+    fn record(ptr: ?*anyopaque, _: log_mod.Level, _: []const u8, fields: []const log_mod.Field) void {
+        const r: *CoreLogCounter = @ptrCast(@alignCast(ptr.?));
+        for (fields) |f| if (std.mem.eql(u8, f.key, "target")) {
+            r.mutex.lockUncancelable(testing.io);
+            defer r.mutex.unlock(testing.io);
+            r.count += 1;
+            r.changed.broadcast(testing.io);
+            return;
+        };
+    }
+
+    fn current(r: *CoreLogCounter) usize {
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        return r.count;
+    }
+
+    /// Waits up to 30 s for more than `seen` core records.
+    fn waitPast(r: *CoreLogCounter, seen: usize) !void {
+        const deadline = Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = .fromSeconds(30), .clock = .awake });
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        while (r.count <= seen) try r.changed.waitTimeout(testing.io, &r.mutex, .{ .deadline = deadline });
+    }
+};
+
+/// Runs a workflow on a new worker of `client` for `task_queue`. With `counter`, it then waits,
+/// with the worker still polling, for a core record past `seen`. The worker is freed on return.
+fn runOnNewWorker(client: *Client, task_queue: []const u8, counter: ?*CoreLogCounter, seen: usize) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var w = try worker_mod.Worker.init(testing.allocator, testing.io, client, task_queue, .{});
+    defer w.deinit();
+    try w.registerWorkflow(Fixtures.NamespaceOf);
+    var running = try testing.io.concurrent(Fixtures.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    try w.waitUntilRunning();
+    var run = try client.executeWorkflow(Fixtures.NamespaceOf, .{ .id = task_queue, .task_queue = task_queue }, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("default", try run.get(arena_state.allocator()));
+    if (counter) |r| try r.waitPast(seen);
+}
+
+// Every worker and connection sdk-core builds holds a clone of the client's runtime, and
+// sdk-core turns log forwarding off for every clone when any one is dropped.
+test "core logs still reach the client's logger after a worker that ran, or a first connection nobody took, is freed" {
+    var server = try startDevServer();
+    defer server.stop(testing.io);
+
+    {
+        var counter: CoreLogCounter = .{};
+        var options = server.clientOptions();
+        options.logger = counter.sink();
+        options.core_log_level = .debug;
+        var c = try Client.connect(testing.allocator, testing.io, options);
+        defer c.close();
+        try runOnNewWorker(&c, "core-logs-freed-worker", null, 0);
+        // The first worker is freed: a record after this shows forwarding went on.
+        try runOnNewWorker(&c, "core-logs-after-worker", &counter, counter.current());
+    }
+    {
+        var counter: CoreLogCounter = .{};
+        var options = server.clientOptions();
+        options.logger = counter.sink();
+        options.core_log_level = .debug;
+        var c = try Client.connect(testing.allocator, testing.io, options);
+        defer c.close();
+        const url = try std.fmt.allocPrint(testing.allocator, "http://{s}", .{server.server.target});
+        defer testing.allocator.free(url);
+        const connecting = try bridge.Connection.Connecting.start(testing.allocator, testing.io, c.shared.runtime, .{
+            .target_url = url,
+            .identity = "core-logs-untaken",
+        });
+        connecting.waitUncancelable();
+        // Connected, and the connection is left for `unref` to free.
+        try testing.expect(connecting.conn != null);
+        try testing.expectEqual(bridge.Connection.Connecting.Released.freed, connecting.unref());
+        try runOnNewWorker(&c, "core-logs-after-connection", &counter, counter.current());
+    }
 }

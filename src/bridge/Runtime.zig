@@ -64,10 +64,15 @@ pub const max_forwarders = 32;
 const ForwardSlot = struct {
     forward: Forward = undefined,
     claimed: std.atomic.Value(bool) = .init(false),
-    /// Set while the slot's runtime may forward; `release` clears it, then waits for `busy`
-    /// (callbacks in progress) to drain before the slot's context may be freed.
+    /// Set while the slot's runtime may forward; `releaseForwardSlot` clears it, then waits
+    /// for `busy` (callbacks in progress) to drain before the slot's context may be freed.
     live: std.atomic.Value(bool) = .init(false),
     busy: std.atomic.Value(u32) = .init(0),
+    /// The core objects `release` keeps for the slot's runtime. A spin mutex, because
+    /// `release` runs on the core's threads, which have no `Io`; it is held only to check
+    /// `live` and append, or to take the list.
+    kept_mutex: std.atomic.Mutex = .unlocked,
+    kept: std.ArrayList(CoreObject) = .empty,
 };
 
 var forward_slots: [max_forwarders]ForwardSlot = @splat(.{});
@@ -284,17 +289,89 @@ pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtim
     return .{ .ptr = ptr, .forward_slot = forward_slot };
 }
 
-/// Frees the runtime. Once this returns, its log forwarding callback is no longer running and
-/// won't be called again.
+/// A core object sdk-core built holding a clone of a runtime.
+pub const CoreObject = union(enum) {
+    connection: *c.TemporalCoreConnection,
+    worker: *c.TemporalCoreWorker,
+    ephemeral_server: *c.TemporalCoreEphemeralServer,
+
+    fn free(object: CoreObject) void {
+        switch (object) {
+            .connection => |p| c.temporal_core_client_free(p),
+            .worker => |p| c.temporal_core_worker_free(p),
+            .ephemeral_server => |p| c.temporal_core_ephemeral_server_free(p),
+        }
+    }
+};
+
+// Each connection, worker and ephemeral server holds a clone of the core runtime, and
+// sdk-core's `Drop for Runtime` turns log forwarding off for every clone when any one is
+// dropped: freeing one such object would end forwarding for the whole runtime. So
+// `release` keeps those objects of a forwarding runtime until `deinit` or `abandon`.
+// Known limits, inside sdk-core, where a clone is dropped that no Zig object holds, so
+// forwarding ends then:
+// - a connection with a gRPC override drops one for each call through the override and when
+//   its connect fails (only tests use overrides);
+// - a worker call that fails drops a temporary one to allocate its failure message: a failed
+//   `validate`, poll, completion, `finalizeShutdown` or `replaceClient`, and an activity
+//   heartbeat that doesn't decode.
+const kept_allocator = std.heap.smp_allocator;
+
+/// Frees `object`, one of this runtime's: at once when the runtime forwards no logs or has
+/// stopped forwarding (`abandon`), otherwise when `deinit` or `abandon` runs, so that its
+/// runtime clone isn't dropped while forwarding goes on. A kept connection holds its socket
+/// until then. A worker must have been shut down (`Worker.finalizeShutdown`) first, or it
+/// stays registered with its client while kept. If keeping `object` fails for lack of
+/// memory, it is freed at once and forwarding ends: the only way this loses forwarding.
+/// Callable from any thread, the core's included.
+pub fn release(r: Runtime, object: CoreObject) void {
+    const i = r.forward_slot orelse return object.free();
+    const slot = &forward_slots[i];
+    const kept = keep: {
+        while (!slot.kept_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer slot.kept_mutex.unlock();
+        if (!slot.live.load(.seq_cst)) break :keep false;
+        slot.kept.append(kept_allocator, object) catch break :keep false;
+        break :keep true;
+    };
+    if (!kept) object.free();
+}
+
+/// Stops keeping objects for the slot's runtime (`live` must be clear) and frees the kept
+/// ones: workers, then ephemeral servers, then connections.
+fn freeKept(i: usize) void {
+    const slot = &forward_slots[i];
+    var list = list: {
+        while (!slot.kept_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer slot.kept_mutex.unlock();
+        std.debug.assert(!slot.live.load(.seq_cst));
+        const list = slot.kept;
+        slot.kept = .empty;
+        break :list list;
+    };
+    defer list.deinit(kept_allocator);
+    for ([_]std.meta.Tag(CoreObject){ .worker, .ephemeral_server, .connection }) |tag| {
+        for (list.items) |object| if (object == tag) object.free();
+    }
+}
+
+/// Frees the objects `release` kept, then the runtime. Once this returns, its log forwarding
+/// callback is no longer running and won't be called again.
 pub fn deinit(r: Runtime) void {
+    if (r.forward_slot) |i| {
+        // Freeing the first kept object ends forwarding anyway; this stops `release` keeping
+        // more.
+        forward_slots[i].live.store(false, .seq_cst);
+        freeKept(i);
+    }
     c.temporal_core_runtime_free(r.ptr);
     if (r.forward_slot) |i| releaseForwardSlot(i);
 }
 
 /// Gives up the runtime without freeing it, for an owner that can't free it because a core
 /// task still uses it: its log forwarding stops (once this returns, the forwarding callback
-/// isn't running and forwards nothing more), and the runtime, its threads and its forwarding
-/// slot stay in use for the rest of the process.
+/// isn't running and forwards nothing more), the objects `release` kept are freed, and the
+/// runtime, its threads and its forwarding slot stay in use for the rest of the process.
 pub fn abandon(r: Runtime) void {
     const i = r.forward_slot orelse return;
     const slot = &forward_slots[i];
@@ -302,6 +379,7 @@ pub fn abandon(r: Runtime) void {
     while (slot.busy.load(.seq_cst) != 0) std.atomic.spinLoopHint();
     // Still claimed: the core may still call this slot's callback, which must not reach
     // another runtime's sink.
+    freeKept(i);
 }
 
 fn mapEncodeError(err: bytes.EncodeError) InitError {
@@ -516,4 +594,38 @@ test "bucket overrides are encoded as the core expects" {
         .{ .metric = "b", .buckets = &.{100} },
     }, null);
     try testing.expectEqualStrings("a\n1,2.5\nb\n100", bytes.slice(r));
+}
+
+fn ignoreLog(_: *anyopaque, _: *const LogRecord) void {}
+
+test "release keeps a forwarding runtime's core objects until deinit, and frees a quiet runtime's at once" {
+    const Worker = @import("Worker.zig");
+    const worker_options: Worker.Options = .{
+        .namespace = "default",
+        .task_queue = "runtime-release",
+        .task_types = .{ .local_activities = false, .remote_activities = false, .nexus = false },
+        .max_cached_workflows = 1,
+    };
+    var ctx: u8 = 0;
+    for ([_]bool{ true, false }) |forwarding| {
+        const rt = try Runtime.init(testing.allocator, .{
+            .logging = .{ .forward = if (forwarding) .{ .ctx = &ctx, .func = ignoreLog } else null },
+            .worker_heartbeat_interval_ms = 0,
+        }, null);
+        var replayer = try Worker.initReplayer(testing.allocator, rt, worker_options, null);
+        replayer.finishPushing();
+        replayer.worker.initiateShutdown();
+        while (try replayer.worker.pollWorkflowActivation(testing.allocator, testing.io, null)) |polled| polled.deinit();
+        try replayer.worker.finalizeShutdown(testing.allocator, testing.io, null);
+        replayer.worker.deinit();
+        if (forwarding) {
+            const slot = &forward_slots[rt.forward_slot.?];
+            try testing.expectEqual(1, slot.kept.items.len);
+            rt.deinit();
+            try testing.expectEqual(0, slot.kept.items.len);
+        } else {
+            try testing.expectEqual(null, rt.forward_slot);
+            rt.deinit();
+        }
+    }
 }

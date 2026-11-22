@@ -431,13 +431,14 @@ pub const Description = struct {
     /// The full server response, for anything not lifted into the fields above.
     raw: wfs.DescribeScheduleResponse,
 
-    /// Lifts a describe response into a description that borrows it.
+    /// Lifts a describe response into a description that borrows it. `id` is copied into
+    /// `arena`, so the description doesn't borrow the caller's ID.
     pub fn fromProto(arena: Allocator, id: []const u8, response: wfs.DescribeScheduleResponse) error{ OutOfMemory, InvalidResponse }!Description {
         const info = response.info orelse pb.ScheduleInfo{};
         const running = try arena.alloc(Execution, info.running_workflows.items.len);
         for (info.running_workflows.items, running) |e, *o| o.* = .{ .workflow_id = e.workflow_id, .run_id = e.run_id };
         return .{
-            .id = id,
+            .id = try arena.dupe(u8, id),
             .schedule = try .fromProto(arena, response.schedule orelse .{}),
             .info = .{
                 .action_count = info.action_count,
