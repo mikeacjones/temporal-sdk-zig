@@ -1633,6 +1633,7 @@ Notes:
 - `run` returns `error.NothingRegistered`, `error.InvalidOptions`, `error.WorkerInitFailed`, or `error.ValidationFailed` before polling starts (the last three logged with the reason); `Worker.RunError` lists every error.
 - When sdk-core gives up polling for tasks, the worker logs it, shuts down its core workers, and `run` (or `runUntilSignal`) returns `error.PollFailed`, or `error.OutOfMemory` when the poll itself ran out of memory. `Worker.fatalMessage` then has `polling for <workflow|activity|nexus> tasks on task queue <queue> failed: <reason>`, owned by the worker until the next `run` or `deinit`; it is null if that text couldn't be allocated.
 - `stop` is safe from any thread, before or during `run`, and the stop is permanent: a later `run` returns at once. `waitUntilRunning` returns `error.WorkerFailedToStart` when `run` failed first.
+- `waitUntilRunning` reports the run that is active, or else the most recent one, and before any run it waits for the first. After a run that failed to start, it returns `error.WorkerFailedToStart` until the next `run` begins, then waits for that run.
 - Several workers can share a process and a client, one per task queue; one signal stops every worker in `runUntilSignal`.
 
 #### Options
