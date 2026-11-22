@@ -1,0 +1,1 @@
+`Worker.waitUntilRunning` now reports the run that is active, or else the most recent one. It used to keep the outcome of the Worker's first run, so after a `run` that failed to start, it returned `error.WorkerFailedToStart` at once even while a later `run` was polling.

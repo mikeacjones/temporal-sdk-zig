@@ -32,6 +32,7 @@ const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const nexus = @import("nexus.zig");
 const CancelBlockingAllocator = @import("CancelBlockingAllocator.zig");
+const io_tasks = @import("io_tasks.zig");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -696,7 +697,27 @@ pub const WorkflowEnvironment = struct {
     /// reaches it). A worker that fails to start returns its error here.
     fn ensureWorker(env: *WorkflowEnvironment) !void {
         if (env.running != null) return;
-        env.running = try env.io.concurrent(runWorker, .{&env.worker});
+        const w = &env.worker;
+        // Begin the run's generation before spawning it: the task may not have entered `run`
+        // when `waitUntilRunning` below takes the mutex, and on a reused worker (a first
+        // `ensureWorker` that returned NothingRegistered) it would then report the previous
+        // run's failed start, and the `await` below would wait for a run that polls. `run`
+        // raises the generation again and settles the one it ends at, which this waits for.
+        {
+            w.stop_mutex.lockUncancelable(env.io);
+            defer w.stop_mutex.unlock(env.io);
+            w.run_generation += 1;
+            w.start_changed.broadcast(env.io);
+        }
+        env.running = io_tasks.concurrent(env.io, runWorker, .{w}) catch |err| {
+            // No run will settle the generation begun above; settle it so no waiter blocks.
+            w.stop_mutex.lockUncancelable(env.io);
+            defer w.stop_mutex.unlock(env.io);
+            w.started_generation = w.run_generation;
+            w.start_failed = true;
+            w.start_changed.broadcast(env.io);
+            return err;
+        };
         env.worker.waitUntilRunning() catch |err| switch (err) {
             error.WorkerFailedToStart => {
                 const result = env.running.?.await(env.io);
@@ -1176,16 +1197,25 @@ pub const ActivityEnvironment = struct {
             while (link.*.? != &run) link = &link.*.?.next;
             link.* = run.next;
         }
+        const Ret = @typeInfo(@TypeOf(Activity.call)).@"fn".return_type.?;
+        // The task hands its result back through `ret`, on this frame, which awaits or
+        // cancels the task before it returns: a result aligned above 8 (an error union holding
+        // `std.Io.Duration`, say) would overrun its future's allocation (see io_tasks.zig).
         const S = struct {
-            fn call(r: ?*Activity.Receiver, c: *activity.Context, a: Activity.Args, wake: *Io.Event) @typeInfo(@TypeOf(Activity.call)).@"fn".return_type.? {
+            fn call(r: ?*Activity.Receiver, c: *activity.Context, a: Activity.Args, wake: *Io.Event, out: *Ret) void {
                 defer wake.set(c.io_);
-                return Activity.call(r, c, a);
+                out.* = Activity.call(r, c, a);
             }
         };
-        var task = env.io.concurrent(S.call, .{ receiver, &ctx, args, &run.wake }) catch
+        var ret: Ret = undefined;
+        var task = io_tasks.concurrent(env.io, S.call, .{ receiver, &ctx, args, &run.wake, &ret }) catch
             return Activity.call(receiver, &ctx, args);
-        run.wake.wait(env.io) catch return task.cancel(env.io);
-        return if (ctx.cancelReason() != null) task.cancel(env.io) else task.await(env.io);
+        run.wake.wait(env.io) catch {
+            task.cancel(env.io);
+            return ret;
+        };
+        if (ctx.cancelReason() != null) task.cancel(env.io) else task.await(env.io);
+        return ret;
     }
 
     /// Cancels the activities this environment is running, as a worker does: each sees
@@ -3047,6 +3077,29 @@ test "WorkflowEnvironment runs a workflow with a test double for its activity" {
     defer arena.deinit();
     const result = try env.executeWorkflow(Fixtures.Hello, .{"Temporal"}, arena.allocator(), null);
     try testing.expectEqualStrings("Hello from the test double!", result);
+}
+
+test "WorkflowEnvironment runs a workflow after its first start failed with NothingRegistered" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try testing.expectError(error.NothingRegistered, env.ensureWorker());
+    try testing.expect(env.running == null);
+    // Without the generation begun before the spawn, `ensureWorker` saw the first run's failed
+    // start and then awaited the new run, which polls until stopped. The bound stops the
+    // worker, so that shows as `error.WorkerFailedToStart` here rather than a hung suite.
+    const Bound = struct {
+        fn stopAfter(w: *worker_mod.Worker, after: Io.Duration) void {
+            testing.io.sleep(after, .awake) catch return;
+            w.stop();
+        }
+    };
+    var bound = try io_tasks.concurrent(testing.io, Bound.stopAfter, .{ &env.worker, Io.Duration.fromSeconds(60) });
+    defer bound.cancel(testing.io);
+    try env.registerWorkflow(Fixtures.Different);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(Fixtures.Different, .{"Temporal"}, arena.allocator(), null);
+    try testing.expectEqualStrings("no activity here", result);
 }
 
 test "WorkflowEnvironment.fromClient runs a workflow on the test's own server and leaves it and the client running" {
