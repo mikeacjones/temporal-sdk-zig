@@ -24,10 +24,13 @@ const enums = proto.temporal.api.enums.v1;
 /// Nothing listens here: the server below answers the client's calls itself.
 const closed_port = "127.0.0.1:1";
 
-/// One call's preset answer: the method it answers and its encoded response.
+/// One call's preset answer: the method it answers and its encoded response, or, with a
+/// nonzero `status_code`, the gRPC status it fails with.
 const Answer = struct {
     rpc: []const u8,
     proto: []const u8,
+    status_code: u32 = 0,
+    message: []const u8 = "",
 };
 
 /// Serves a connection's calls in Zig: answers GetSystemInfo, and every other call with the
@@ -49,6 +52,7 @@ const Server = struct {
         if (index >= s.answers.len) return req.respond(testing.allocator, .{ .status_code = 9, .message = "the test has no answer left" });
         const answer = s.answers[index];
         if (!std.mem.eql(u8, req.rpc(), answer.rpc)) return req.respond(testing.allocator, .{ .status_code = 9, .message = "the test expected another method" });
+        if (answer.status_code != 0) return req.respond(testing.allocator, .{ .status_code = answer.status_code, .message = answer.message });
         req.respond(testing.allocator, .{ .proto = answer.proto });
     }
 
@@ -86,6 +90,15 @@ fn encodeMessage(arena: Allocator, message: anytype) ![]const u8 {
 // ---------------------------------------------------------------- raw history
 
 const history_rpc = "GetWorkflowExecutionHistory";
+const describe_rpc = "DescribeWorkflowExecution";
+
+/// A DescribeWorkflowExecution response for run-1 of wf-raw in `status`.
+fn describePage(arena: Allocator, status: enums.WorkflowExecutionStatus) ![]const u8 {
+    return encodeMessage(arena, wfs.DescribeWorkflowExecutionResponse{ .workflow_execution_info = .{
+        .execution = .{ .workflow_id = "wf-raw", .run_id = "run-1" },
+        .status = status,
+    } });
+}
 
 /// A closed run's history: started, three workflow-task events, and completed with the
 /// result "done".
@@ -272,28 +285,28 @@ test "raw history the client can't read is error.InvalidResponse from fetchHisto
     }
 }
 
-test "WorkflowRun.get fails at once on a page with no events and no token, and waits on one with a token" {
-    testing.log_level = .err; // Each failure is logged as a warning.
+test "WorkflowRun.get asks again after a page with no events and no token while the run is open, and waits on one with a token" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const events = try closedRunEvents(arena);
-    const empty_pages = [_][]const u8{
-        try encodeMessage(arena, wfs.GetWorkflowExecutionHistoryResponse{}),
-        try historyPage(arena, &.{}, ""),
-    };
-    for (empty_pages) |page| {
+    {
+        // The time-skipping server ends a long poll with such a page, the run still open.
         var c = try initClient();
         defer c.close();
-        // A second answer the fixed client never asks for; the loop that asked again at once
-        // would get it.
-        const answers: [2]Answer = @splat(.{ .rpc = history_rpc, .proto = page });
+        const answers = [_]Answer{
+            .{ .rpc = history_rpc, .proto = try encodeMessage(arena, wfs.GetWorkflowExecutionHistoryResponse{}) },
+            .{ .rpc = describe_rpc, .proto = try describePage(arena, .WORKFLOW_EXECUTION_STATUS_RUNNING) },
+            .{ .rpc = history_rpc, .proto = try historyPage(arena, &.{}, "") },
+            .{ .rpc = describe_rpc, .proto = try describePage(arena, .WORKFLOW_EXECUTION_STATUS_RUNNING) },
+            .{ .rpc = history_rpc, .proto = try rawPage(arena, &.{.{ .events = events[4..] }}, "") },
+        };
         var server: Server = .{ .answers = &answers };
         try connectToServer(&c, &server);
         var run = try c.getWorkflow([]const u8, "wf-raw", "run-1");
         defer run.deinit();
-        try testing.expectError(error.InvalidResponse, run.get(arena));
-        try testing.expectEqual(@as(usize, 1), server.callCount());
+        try testing.expectEqualStrings("done", try run.get(arena));
+        try testing.expectEqual(@as(usize, 5), server.callCount());
     }
 
     // A long poll that ended before the run closed: an empty page with a token.
@@ -308,6 +321,46 @@ test "WorkflowRun.get fails at once on a page with no events and no token, and w
     var run = try c.getWorkflow([]const u8, "wf-raw", "run-1");
     defer run.deinit();
     try testing.expectEqualStrings("done", try run.get(arena));
+    try testing.expectEqual(@as(usize, 2), server.callCount());
+}
+
+test "WorkflowRun.get returns error.InvalidResponse when a closed run's pages keep coming back without a close event" {
+    testing.log_level = .err; // The failure is logged as a warning.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pair = [_]Answer{
+        .{ .rpc = history_rpc, .proto = try encodeMessage(arena, wfs.GetWorkflowExecutionHistoryResponse{}) },
+        .{ .rpc = describe_rpc, .proto = try describePage(arena, .WORKFLOW_EXECUTION_STATUS_COMPLETED) },
+    };
+    // A fourth pair the bounded loop never asks for.
+    const answers = try std.mem.concat(arena, Answer, &.{ &pair, &pair, &pair, &pair });
+    var c = try initClient();
+    defer c.close();
+    var server: Server = .{ .answers = answers };
+    try connectToServer(&c, &server);
+    var run = try c.getWorkflow([]const u8, "wf-raw", "run-1");
+    defer run.deinit();
+    try testing.expectError(error.InvalidResponse, run.get(arena));
+    try testing.expectEqual(@as(usize, 6), server.callCount());
+}
+
+test "WorkflowRun.get returns error.NotFound for a run that is gone after a page with no events and no token" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const answers = [_]Answer{
+        .{ .rpc = history_rpc, .proto = try encodeMessage(arena, wfs.GetWorkflowExecutionHistoryResponse{}) },
+        .{ .rpc = describe_rpc, .proto = "", .status_code = 5, .message = "workflow not found" },
+        .{ .rpc = history_rpc, .proto = try encodeMessage(arena, wfs.GetWorkflowExecutionHistoryResponse{}) },
+    };
+    var c = try initClient();
+    defer c.close();
+    var server: Server = .{ .answers = &answers };
+    try connectToServer(&c, &server);
+    var run = try c.getWorkflow([]const u8, "wf-raw", "run-1");
+    defer run.deinit();
+    try testing.expectError(error.NotFound, run.get(arena));
     try testing.expectEqual(@as(usize, 2), server.callCount());
 }
 

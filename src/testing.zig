@@ -4488,7 +4488,40 @@ const ChainFixtures = struct {
         return ctx.continueAsNew(SleepThenContinue, .{}, .{ seconds, true });
     }
     const SleepThenContinue = workflow.Def("SleepThenContinue", sleepThenContinue);
+
+    /// Continues as new once; the second run returns what `HoldPastLongPoll` returns.
+    fn continueThenHold(ctx: *workflow.Context, continued: bool) ![]const u8 {
+        if (!continued) return ctx.continueAsNew(ContinueThenHold, .{}, .{true});
+        return ctx.executeActivity(HoldPastLongPoll, .{ .start_to_close_timeout = .fromSeconds(120) }, .{}).get();
+    }
+    const ContinueThenHold = workflow.Def("ContinueThenHold", continueThenHold);
+
+    /// Takes 21 s of wall-clock time, longer than the time-skipping server's 20 s history
+    /// long poll. A scheduled activity locks time skipping, so the run stays open meanwhile.
+    fn holdPastLongPoll(ctx: *activity.Context) ![]const u8 {
+        try ctx.io().sleep(.fromSeconds(21), .awake);
+        return "held";
+    }
+    const HoldPastLongPoll = activity.Def("HoldPastLongPoll", holdPastLongPoll);
 };
+
+test "getResult keeps waiting after the time-skipping server's history long poll ends with an empty page" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(ChainFixtures.ContinueThenHold);
+    try env.registerActivity(ChainFixtures.HoldPastLongPoll);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The server ends a history long poll after 20 s of wall-clock time with a page that has
+    // no events and no token; the second run is still open then.
+    var run = try env.startWorkflow(ChainFixtures.ContinueThenHold, .{ .task_queue = "" }, .{false});
+    defer run.deinit();
+    const first_run_id = try a.dupe(u8, run.run_id);
+    try testing.expectEqualStrings("held", try env.getResult(ChainFixtures.ContinueThenHold, &run, a, null));
+    try testing.expect(!std.mem.eql(u8, first_run_id, run.run_id));
+}
 
 test "WorkflowEnvironment.getResultWithOptions: without following runs it stops at a run that continued as new and replays that run" {
     for (env_kinds) |kind| {

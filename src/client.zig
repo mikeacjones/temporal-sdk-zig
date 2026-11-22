@@ -4883,10 +4883,37 @@ pub const ResultError = error{
     WorkflowContinuedAsNew,
 };
 
+/// Whether the run is still open (running or paused), from DescribeWorkflowExecution. The
+/// response lives in a scratch arena freed before it returns, so a long wait in
+/// `WorkflowRun.getWithOptions` doesn't grow the caller's arena with each check.
+fn runIsOpen(c: *Client, workflow_id: []const u8, run_id: []const u8) ResultError!bool {
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const response = c.rpc(wfs.DescribeWorkflowExecutionResponse, "DescribeWorkflowExecution", wfs.DescribeWorkflowExecutionRequest{
+        .namespace = c.namespace,
+        .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+    }, scratch.allocator()) catch |err| switch (err) {
+        error.AlreadyExists => return error.InvalidResponse,
+        else => |e| return e,
+    };
+    const info = response.workflow_execution_info orelse {
+        log.err("DescribeWorkflowExecution for workflow {s} returned no execution info", .{workflow_id});
+        return error.InvalidResponse;
+    };
+    return switch (info.status) {
+        .WORKFLOW_EXECUTION_STATUS_RUNNING, .WORKFLOW_EXECUTION_STATUS_PAUSED => true,
+        else => false,
+    };
+}
+
 /// A started workflow run.
 pub fn WorkflowRun(comptime T: type) type {
     return struct {
         const Self = @This();
+
+        /// Empty pages with no token, in a row, for a run DescribeWorkflowExecution reports
+        /// closed, before `getWithOptions` gives up on it.
+        const max_empty_pages_after_close = 3;
 
         client: *Client,
         id: []u8,
@@ -4905,8 +4932,11 @@ pub fn WorkflowRun(comptime T: type) type {
 
         /// Waits for the workflow to close and returns its result, following continue-as-new
         /// (and cron and retry runs). The result and any failure are allocated from `arena`.
-        /// A history page with no event and no page token, which leaves nothing to wait
-        /// for, returns `error.InvalidResponse`, logged.
+        /// A history page with no event and no page token, which a server sends when its long
+        /// poll ends before the run closes, makes it check that the run is still open and ask
+        /// again. A run that has closed but whose history keeps coming back without a close
+        /// event returns `error.InvalidResponse` after `max_empty_pages_after_close` such
+        /// pages, logged. A run that no longer exists returns `error.NotFound`.
         pub fn get(run: *Self, arena: Allocator) ResultError!T {
             return run.getWithOptions(arena, .{});
         }
@@ -4922,6 +4952,7 @@ pub fn WorkflowRun(comptime T: type) type {
         pub fn getWithOptions(run: *Self, arena: Allocator, options: GetOptions) ResultError!T {
             const c = run.client;
             var token: []const u8 = "";
+            var closed_empty_pages: u32 = 0;
             while (true) {
                 const response = c.rpc(wfs.GetWorkflowExecutionHistoryResponse, "GetWorkflowExecutionHistory", wfs.GetWorkflowExecutionHistoryRequest{
                     .namespace = c.namespace,
@@ -4936,13 +4967,25 @@ pub fn WorkflowRun(comptime T: type) type {
                 };
                 const events: []const HistoryEvent = if (response.history) |h| h.events.items else &.{};
                 if (events.len == 0) {
-                    // An empty page with a token is a long poll that ended before the run
-                    // closed; one without a token has nothing more to ask for.
-                    if (response.next_page_token.len == 0) {
-                        log.warn("GetWorkflowExecutionHistory for workflow {s} (run {s}) returned no close event and no page token", .{ run.id, run.run_id });
+                    // An empty page is a long poll that ended before the run closed. With a
+                    // token the server says where to go on; without one (the time-skipping
+                    // server's answer after its 20 s poll) it says nothing, so the run's
+                    // status decides: an open run is asked again from the start, and a closed
+                    // one whose close event keeps not coming is given up on.
+                    if (response.next_page_token.len > 0) {
+                        token = response.next_page_token;
+                        continue;
+                    }
+                    token = "";
+                    if (try runIsOpen(c, run.id, run.run_id)) {
+                        closed_empty_pages = 0;
+                        continue;
+                    }
+                    closed_empty_pages += 1;
+                    if (closed_empty_pages >= max_empty_pages_after_close) {
+                        log.warn("GetWorkflowExecutionHistory for workflow {s} (run {s}) returned no close event {d} times for a run that has closed", .{ run.id, run.run_id, closed_empty_pages });
                         return error.InvalidResponse;
                     }
-                    token = response.next_page_token;
                     continue;
                 }
                 const event = events[events.len - 1];
@@ -4962,6 +5005,7 @@ pub fn WorkflowRun(comptime T: type) type {
                     c.gpa.free(run.run_id);
                     run.run_id = new_run;
                     token = "";
+                    closed_empty_pages = 0;
                     continue;
                 }
                 switch (attrs) {
