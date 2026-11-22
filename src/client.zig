@@ -1974,7 +1974,9 @@ pub const Client = struct {
     }
 
     /// Returns the full event history of a workflow run (all pages). An empty `run_id` reads
-    /// the latest run. Memory comes from `arena`.
+    /// the latest run. Pages the server sends as raw history are decoded into the same
+    /// events; a raw blob the client can't read returns `error.InvalidResponse`, logged.
+    /// Memory comes from `arena`.
     pub fn fetchHistory(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8) HistoryError!History {
         var it = try c.historyIterator(workflow_id, run_id, .{});
         defer it.deinit();
@@ -2722,12 +2724,68 @@ pub const Client = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidResponse,
         };
+        if (comptime Response == wfs.GetWorkflowExecutionHistoryResponse) try liftRawHistory(arena, &coded, &response);
         converter.decodeMessage(Response, &response, c.codecs, arena, c.io, codec_context) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: decoding the response's payloads with the client's codecs failed", .{method});
             return err;
         };
         try failure_mod.decodeAttributes(Response, &response, arena);
         return response;
+    }
+
+    /// A server set to send raw history for the namespace answers GetWorkflowExecutionHistory
+    /// with `raw_history`, a list of blobs that each hold an encoded `History`, instead of
+    /// `history`. This decodes the blobs by their encoding (PROTO3 or JSON) into
+    /// `response.history` and clears `raw_history`, so every reader of the response sees the
+    /// events, and the codecs that run after it decode their payloads. With the close-event
+    /// filter only the last event is kept, as the server would send it. A blob of another
+    /// encoding, one that doesn't decode, or one without events returns
+    /// `error.InvalidResponse`, logged at warn. Memory comes from `arena`.
+    fn liftRawHistory(arena: Allocator, request: *const wfs.GetWorkflowExecutionHistoryRequest, response: *wfs.GetWorkflowExecutionHistoryResponse) error{ OutOfMemory, InvalidResponse }!void {
+        const blobs = response.raw_history.items;
+        if (blobs.len == 0) return;
+        const workflow_id = if (request.execution) |e| e.workflow_id else "";
+        const fmt = "GetWorkflowExecutionHistory for workflow {s} returned raw history that the client can't read: blob {d} ";
+        var events: std.ArrayList(HistoryEvent) = .empty;
+        for (blobs, 0..) |blob, i| {
+            const history: History = switch (blob.encoding_type) {
+                .ENCODING_TYPE_PROTO3 => decoded: {
+                    var reader: Io.Reader = .fixed(blob.data);
+                    break :decoded History.decode(&reader, arena) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => {
+                            log.warn(fmt ++ "doesn't decode as PROTO3 ({s})", .{ workflow_id, i, @errorName(err) });
+                            return error.InvalidResponse;
+                        },
+                    };
+                },
+                .ENCODING_TYPE_JSON => history_mod.fromJson(arena, blob.data) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidHistoryJson => {
+                        log.warn(fmt ++ "doesn't decode as JSON ({s})", .{ workflow_id, i, @errorName(err) });
+                        return error.InvalidResponse;
+                    },
+                },
+                else => |encoding| {
+                    var number: [12]u8 = undefined;
+                    const name = std.enums.tagName(proto.temporal.api.enums.v1.EncodingType, encoding) orelse
+                        std.fmt.bufPrint(&number, "{d}", .{@backingInt(encoding)}) catch unreachable;
+                    log.warn(fmt ++ "has encoding {s}", .{ workflow_id, i, name });
+                    return error.InvalidResponse;
+                },
+            };
+            if (history.events.items.len == 0) {
+                log.warn(fmt ++ "holds no events", .{ workflow_id, i });
+                return error.InvalidResponse;
+            }
+            try events.appendSlice(arena, history.events.items);
+        }
+        if (request.history_event_filter_type == .HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT) {
+            events.items[0] = events.items[events.items.len - 1];
+            events.shrinkRetainingCapacity(1);
+        }
+        response.history = .{ .events = events };
+        response.raw_history = .empty;
     }
 };
 
@@ -4564,6 +4622,8 @@ pub fn WorkflowRun(comptime T: type) type {
 
         /// Waits for the workflow to close and returns its result, following continue-as-new
         /// (and cron and retry runs). The result and any failure are allocated from `arena`.
+        /// A history page with no event and no page token, which leaves nothing to wait
+        /// for, returns `error.InvalidResponse`, logged.
         pub fn get(run: *Self, arena: Allocator) ResultError!T {
             return run.getWithOptions(arena, .{});
         }
@@ -4591,15 +4651,18 @@ pub fn WorkflowRun(comptime T: type) type {
                     error.AlreadyExists => return error.InvalidResponse,
                     else => |e| return e,
                 };
-                const history = response.history orelse {
-                    token = response.next_page_token;
-                    continue;
-                };
-                if (history.events.items.len == 0) {
+                const events: []const HistoryEvent = if (response.history) |h| h.events.items else &.{};
+                if (events.len == 0) {
+                    // An empty page with a token is a long poll that ended before the run
+                    // closed; one without a token has nothing more to ask for.
+                    if (response.next_page_token.len == 0) {
+                        log.warn("GetWorkflowExecutionHistory for workflow {s} (run {s}) returned no close event and no page token", .{ run.id, run.run_id });
+                        return error.InvalidResponse;
+                    }
                     token = response.next_page_token;
                     continue;
                 }
-                const event = history.events.items[history.events.items.len - 1];
+                const event = events[events.len - 1];
                 const attrs = event.attributes orelse return error.InvalidResponse;
                 // A cron or retry run that closes names the run it started; follow it.
                 const next_run: []const u8 = switch (attrs) {
