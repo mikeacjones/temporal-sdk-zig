@@ -762,7 +762,10 @@ pub const Client = struct {
             },
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidOptions => {
-                log.err("creating the core runtime failed: an option is out of range, or a metrics global tag, OpenTelemetry header, or histogram bucket override contains a newline", .{});
+                if (message) |m|
+                    log.err("creating the core runtime failed: {s}", .{m})
+                else
+                    log.err("creating the core runtime failed: an option is out of range, a metrics global tag, OpenTelemetry header, or histogram bucket override contains a newline, or histogram buckets are not finite and strictly increasing", .{});
                 return error.InvalidOptions;
             },
             error.RuntimeInitFailed => {

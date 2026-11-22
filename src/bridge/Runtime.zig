@@ -162,6 +162,9 @@ pub const Metrics = struct {
         histogram_bucket_overrides: []const BucketOverride = &.{},
     };
 
+    /// `buckets` must be finite (no NaN or infinity) and strictly increasing (sorted, no
+    /// duplicates); an empty list keeps the exporter's default buckets. `init` returns
+    /// `error.InvalidOptions` otherwise.
     pub const BucketOverride = struct {
         metric: []const u8,
         buckets: []const f64,
@@ -177,7 +180,9 @@ pub const InitError = error{
 };
 
 /// Creates a runtime. On `error.RuntimeInitFailed`, `failure` (if given) receives the core's
-/// message, allocated with `gpa`; the caller frees it.
+/// message, allocated with `gpa`; the caller frees it. On `error.InvalidOptions` from a histogram
+/// bucket override, `failure` (if given) receives a message naming the metric, allocated with
+/// `gpa`.
 pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtime {
     var custom_meter: ?*const c.TemporalCoreCustomMetricMeter = if (options.metrics) |m| switch (m.exporter) {
         .custom => |meter| meter,
@@ -225,7 +230,7 @@ pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtim
                     .counters_total_suffix = p.counters_total_suffix,
                     .unit_suffix = p.unit_suffix,
                     .durations_as_seconds = p.durations_as_seconds,
-                    .histogram_bucket_overrides = try bucketOverrides(arena, p.histogram_bucket_overrides),
+                    .histogram_bucket_overrides = try bucketOverrides(gpa, arena, p.histogram_bucket_overrides, failure),
                 };
                 metrics.prometheus = &prometheus;
             },
@@ -243,7 +248,7 @@ pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtim
                     .http => c.TemporalCoreOpenTelemetryProtocol_Http,
                 };
                 otel.durations_as_seconds = o.durations_as_seconds;
-                otel.histogram_bucket_overrides = try bucketOverrides(arena, o.histogram_bucket_overrides);
+                otel.histogram_bucket_overrides = try bucketOverrides(gpa, arena, o.histogram_bucket_overrides, failure);
                 otel.exponential_histogram_name_suffix = bytes.ref("");
                 metrics.opentelemetry = &otel;
             },
@@ -310,10 +315,26 @@ fn newlineMap(arena: Allocator, entries: []const bytes.MetadataEntry) bytes.Enco
     return bytes.newlineMap(arena, entries);
 }
 
-/// `metric1\n1,2,3\nmetric2\n4,5` as the core expects.
-fn bucketOverrides(arena: Allocator, overrides: []const Metrics.BucketOverride) InitError!bytes.Ref {
+/// `metric1\n1,2,3\nmetric2\n4,5` as the core expects. Every override is checked first: the
+/// core panics (aborting the process) on buckets that aren't finite and strictly increasing.
+/// On `error.InvalidOptions`, `failure` (if given) receives a message naming the metric,
+/// allocated with `gpa`, or stays null when that allocation fails.
+fn bucketOverrides(gpa: Allocator, arena: Allocator, overrides: []const Metrics.BucketOverride, failure: ?*?[]u8) InitError!bytes.Ref {
+    for (overrides) |o| {
+        for (o.buckets, 0..) |b, i| {
+            if (!std.math.isFinite(b)) return rejectBuckets(gpa, failure, "histogram bucket override for metric \"{s}\": bucket {d} is {d}; buckets must be finite and strictly increasing", .{ o.metric, i, b });
+            // -0.0 after 0.0 compares equal, so it counts as a duplicate.
+            if (i > 0 and b <= o.buckets[i - 1]) return rejectBuckets(gpa, failure, "histogram bucket override for metric \"{s}\": bucket {d} ({d}) is not above bucket {d} ({d}); buckets must be finite and strictly increasing", .{ o.metric, i, b, i - 1, o.buckets[i - 1] });
+        }
+    }
+    // An empty list keeps the exporter's default buckets; the core can't parse one, so it is
+    // left out.
     const entries = try arena.alloc(bytes.MetadataEntry, overrides.len);
-    for (overrides, entries) |o, *e| {
+    var n: usize = 0;
+    for (overrides) |o| {
+        if (o.buckets.len == 0) continue;
+        const e = &entries[n];
+        n += 1;
         var buckets: std.Io.Writer.Allocating = .init(arena);
         for (o.buckets, 0..) |b, i| {
             if (i > 0) buckets.writer.writeByte(',') catch return error.OutOfMemory;
@@ -321,7 +342,12 @@ fn bucketOverrides(arena: Allocator, overrides: []const Metrics.BucketOverride) 
         }
         e.* = .{ .key = o.metric, .value = buckets.written() };
     }
-    return newlineMap(arena, entries) catch |err| mapEncodeError(err);
+    return newlineMap(arena, entries[0..n]) catch |err| mapEncodeError(err);
+}
+
+fn rejectBuckets(gpa: Allocator, failure: ?*?[]u8, comptime fmt: []const u8, args: anytype) InitError {
+    if (failure) |f| f.* = std.fmt.allocPrint(gpa, fmt, args) catch null;
+    return error.InvalidOptions;
 }
 
 // ---------------------------------------------------------------- tests
@@ -367,12 +393,127 @@ test "option errors are caught before reaching the core" {
     }, null));
 }
 
+fn expectBucketsRejected(exporter: Metrics.Exporter, buckets: []const f64) !void {
+    var message: ?[]u8 = null;
+    defer if (message) |m| testing.allocator.free(m);
+    var with_buckets = exporter;
+    const overrides: []const Metrics.BucketOverride = &.{
+        .{ .metric = "fine_metric", .buckets = &.{ 1, 2 } },
+        .{ .metric = "bad_metric", .buckets = buckets },
+    };
+    switch (with_buckets) {
+        .prometheus => |*p| p.histogram_bucket_overrides = overrides,
+        .opentelemetry => |*o| o.histogram_bucket_overrides = overrides,
+        .custom => unreachable,
+    }
+    try testing.expectError(error.InvalidOptions, Runtime.init(testing.allocator, .{
+        .logging = .{ .filter = "temporalio_sdk_core=WARN", .forward = .{ .ctx = @ptrCast(&ignore_log_ctx), .func = ignoreLog } },
+        .metrics = .{ .exporter = with_buckets },
+    }, &message));
+    const m = message orelse return error.TestExpectedMessage;
+    try testing.expect(std.mem.indexOf(u8, m, "\"bad_metric\"") != null);
+    try testing.expect(std.mem.indexOf(u8, m, "finite and strictly increasing") != null);
+}
+
+var ignore_log_ctx: u8 = 0;
+
+fn ignoreLog(_: *anyopaque, _: *const LogRecord) void {}
+
+test "histogram bucket overrides that aren't finite and strictly increasing are rejected before the core" {
+    const exporters = [_]Metrics.Exporter{
+        .{ .prometheus = .{ .bind_address = "127.0.0.1:0" } },
+        .{ .opentelemetry = .{ .url = "http://localhost:4317" } },
+    };
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const shapes = [_][]const f64{
+        &.{ 2, 1 },
+        &.{ 1, 1 },
+        &.{ 0.0, -0.0 },
+        &.{nan},
+        &.{inf},
+        &.{-inf},
+        &.{ 1, nan },
+        &.{ 1, 2, inf },
+    };
+    // More rejections than there are log forwarding slots: each must release its slot.
+    comptime std.debug.assert(3 * exporters.len * shapes.len > max_forwarders);
+    for (0..3) |_| for (exporters) |e| for (shapes) |b| try expectBucketsRejected(e, b);
+}
+
+test "a rejected bucket override names the metric and the offending buckets" {
+    var message: ?[]u8 = null;
+    defer if (message) |m| testing.allocator.free(m);
+    try testing.expectError(error.InvalidOptions, Runtime.init(testing.allocator, .{
+        .metrics = .{ .exporter = .{ .opentelemetry = .{
+            .url = "http://localhost:4317",
+            .histogram_bucket_overrides = &.{.{ .metric = "workflow_task_latency", .buckets = &.{ 1, 5, 3 } }},
+        } } },
+    }, &message));
+    try testing.expectEqualStrings(
+        "histogram bucket override for metric \"workflow_task_latency\": bucket 2 (3) is not above bucket 1 (5); buckets must be finite and strictly increasing",
+        message.?,
+    );
+    testing.allocator.free(message.?);
+    message = null;
+    try testing.expectError(error.InvalidOptions, Runtime.init(testing.allocator, .{
+        .metrics = .{ .exporter = .{ .prometheus = .{
+            .bind_address = "127.0.0.1:0",
+            .histogram_bucket_overrides = &.{.{ .metric = "m", .buckets = &.{std.math.nan(f64)} }},
+        } } },
+    }, &message));
+    try testing.expectEqualStrings(
+        "histogram bucket override for metric \"m\": bucket 0 is nan; buckets must be finite and strictly increasing",
+        message.?,
+    );
+}
+
+test "a rejected bucket override without a failure slot still returns InvalidOptions" {
+    try testing.expectError(error.InvalidOptions, Runtime.init(testing.allocator, .{
+        .metrics = .{ .exporter = .{ .prometheus = .{
+            .bind_address = "127.0.0.1:0",
+            .histogram_bucket_overrides = &.{.{ .metric = "m", .buckets = &.{ 2, 1 } }},
+        } } },
+    }, null));
+    // When allocating the message fails, the error is still InvalidOptions and nothing leaks.
+    var message: ?[]u8 = null;
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.InvalidOptions, bucketOverrides(failing.allocator(), arena.allocator(), &.{
+        .{ .metric = "m", .buckets = &.{ 2, 1 } },
+    }, &message));
+    try testing.expect(message == null);
+}
+
+test "valid and empty bucket overrides are accepted by both exporters" {
+    const overrides: []const Metrics.BucketOverride = &.{
+        .{ .metric = "workflow_task_latency", .buckets = &.{ 1, 5, 25.5 } },
+        .{ .metric = "activity_latency", .buckets = &.{} },
+        .{ .metric = "negative_start", .buckets = &.{ -1, 0, 1 } },
+    };
+    var message: ?[]u8 = null;
+    defer if (message) |m| testing.allocator.free(m);
+    const prom = try Runtime.init(testing.allocator, .{ .metrics = .{ .exporter = .{ .prometheus = .{
+        .bind_address = "127.0.0.1:0",
+        .histogram_bucket_overrides = overrides,
+    } } } }, &message);
+    prom.deinit();
+    const otel = try Runtime.init(testing.allocator, .{ .metrics = .{ .exporter = .{ .opentelemetry = .{
+        .url = "http://localhost:4317",
+        .histogram_bucket_overrides = overrides,
+    } } } }, &message);
+    otel.deinit();
+    try testing.expect(message == null);
+}
+
 test "bucket overrides are encoded as the core expects" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const r = try bucketOverrides(arena.allocator(), &.{
+    const r = try bucketOverrides(testing.allocator, arena.allocator(), &.{
         .{ .metric = "a", .buckets = &.{ 1, 2.5 } },
+        .{ .metric = "empty", .buckets = &.{} },
         .{ .metric = "b", .buckets = &.{100} },
-    });
+    }, null);
     try testing.expectEqualStrings("a\n1,2.5\nb\n100", bytes.slice(r));
 }
