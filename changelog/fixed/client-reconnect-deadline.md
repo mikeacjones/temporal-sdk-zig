@@ -1,0 +1,2 @@
+`Client.reconnect` now gives up on a server that doesn't answer, such as one that accepts the connection but never completes the TLS handshake, after `Options.rpc_timeout` (30 s without one), returning `error.ConnectFailed` with the reason logged and keeping the client's current connection; it used to wait forever.
+An attempt it gives up on counts toward the client's 4 connection attempts in flight, and a `reconnect` beyond them fails at once with `error.ConnectFailed`, logged.

@@ -1,1 +1,0 @@
-`WorkflowRun.get`, and `testing.WorkflowEnvironment.getResult` and `executeWorkflow` with it, now keep waiting on the time-skipping test server for a run that takes longer than 20 seconds; they returned `error.InvalidResponse` once the server ended its long poll with an empty page.
