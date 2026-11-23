@@ -803,6 +803,17 @@ pub const WorkflowEnvironment = struct {
     /// return `error.TimeLockLost` without reaching the server, and only `deinit` remains;
     /// start a new environment. A failed unlock counts as lost even if it never reached the
     /// server. The re-lock runs even when the task is canceled during the wait.
+    ///
+    /// On the time-skipping server, time may keep skipping between the run's close and the
+    /// re-lock: once the run closes, nothing holds the server's time lock until the re-lock
+    /// arrives, so the server skips ahead to its next pending timer, which may be years later.
+    /// That includes timers the closed run itself left behind, such as an `awaitTimeout`
+    /// timeout canceled when its condition came true, or a workflow task timeout, as well as
+    /// the timers and default run timeouts of other open runs, which may then time out. The
+    /// server has no call that locks together with the run's close. So `env.now()` afterwards
+    /// is only guaranteed to be no earlier than the close. For the close time, use
+    /// `close_time` from `env.client.describeWorkflow(arena, run.id, run.run_id)`, or
+    /// `ctx.now()` inside the workflow.
     pub fn getResult(
         env: *WorkflowEnvironment,
         comptime Workflow: type,
@@ -1084,7 +1095,9 @@ pub const WorkflowEnvironment = struct {
     }
 
     /// The server's current time: skipped time included on the time-skipping server, the
-    /// wall clock on the dev server.
+    /// wall clock on the dev server. After `getResult` on the time-skipping server it is only
+    /// no earlier than the run's close, since time may skip on to a pending timer first, even
+    /// a canceled one of the closed run itself; `getResult` says how to get the close time.
     pub fn now(env: *WorkflowEnvironment) !Io.Timestamp {
         try env.checkTimeLock();
         switch (env.server) {
@@ -9189,6 +9202,70 @@ test "WorkflowEnvironment marks itself unusable when getResult cannot re-lock ti
     var run = try env.client.getWorkflow([]const u8, "any-id", "");
     defer run.deinit();
     try testing.expectError(error.TimeLockLost, env.getResultByName([]const u8, &run, a, null));
+}
+
+const CloseTimeFixtures = struct {
+    const timeout_s = 5 * 365 * std.time.s_per_day;
+    const Go = workflow.SignalDef("go", fn () void);
+
+    const State = struct {
+        go: bool = false,
+
+        fn onGo(st: *State) void {
+            st.go = true;
+        }
+        fn received(st: *State) bool {
+            return st.go;
+        }
+    };
+
+    /// Waits up to five years for a signal, as samples/await-signals waits for its signals,
+    /// then sleeps an hour.
+    fn signaledThenHour(ctx: *workflow.Context) !void {
+        const st = try ctx.allocator().create(State);
+        st.* = .{};
+        try ctx.setSignalHandler(Go, st, State.onGo);
+        if (!try ctx.awaitTimeout(.fromSeconds(timeout_s), st, State.received)) return error.NoSignal;
+        try ctx.io().sleep(.fromSeconds(std.time.s_per_hour), .awake);
+    }
+    const SignaledThenHour = workflow.Def("SignaledThenHour", signaledThenHour);
+};
+
+test "time-skipping env.now() after getResult is no earlier than the run's close time" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(CloseTimeFixtures.SignaledThenHour);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // One run, no other run and no cron schedule. The signal arrives while time is locked,
+    // so the run's five-year await timeout is canceled before any time skips; the run then
+    // sleeps an hour and closes. The server still holds the canceled timer, and once the run
+    // closes nothing holds its time lock until `getResult` takes it back, so it skips to that
+    // timer in between.
+    const start = try env.now();
+    var run = try env.startWorkflow(CloseTimeFixtures.SignaledThenHour, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try env.signalWorkflow(CloseTimeFixtures.Go, run.id, .{});
+    try env.getResult(CloseTimeFixtures.SignaledThenHour, &run, a, null);
+    const after = try env.now();
+
+    // The documented alternative: the run's close time is an hour after its start.
+    const described = try env.client.describeWorkflow(a, run.id, run.run_id);
+    const close = described.close_time.?;
+    const to_close = start.durationTo(close).nanoseconds;
+    try testing.expect(to_close >= std.time.ns_per_hour);
+    try testing.expect(to_close < std.time.ns_per_hour + std.time.ns_per_min);
+    // The documented limit: env.now() is no earlier than the close, and may be much later.
+    // When it is (as on nearly every run with test server v1.41.1), the server skipped to a
+    // pending timer at least five years past the start: the closed run's own canceled await
+    // timeout, the only timer that far ahead and nearer than the server's default run timeout.
+    const gap = close.durationTo(after).nanoseconds;
+    try testing.expect(gap >= 0);
+    if (gap > std.time.ns_per_min) {
+        try testing.expect(start.durationTo(after).nanoseconds >= CloseTimeFixtures.timeout_s * std.time.ns_per_s);
+    }
 }
 
 test "startTimeSkippingWithOptions refuses the dev server's extra arguments" {
