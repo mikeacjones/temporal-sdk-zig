@@ -485,6 +485,7 @@ fn jsonMapValue(comptime T: type) ?type {
     if (@typeInfo(T) != .@"struct" or !@hasField(T, "map")) return null;
     const M = @FieldType(T, "map");
     if (@typeInfo(M) != .@"struct" or !@hasDecl(M, "Data")) return null;
+    if (@TypeOf(M.Data) != type) return null;
     if (@typeInfo(M.Data) != .@"struct" or !@hasField(M.Data, "value")) return null;
     const V = @FieldType(M.Data, "value");
     return if (T == std.json.ArrayHashMap(V)) V else null;
@@ -533,7 +534,7 @@ fn writeJson(comptime T: type, v: *const T, jws: *std.json.Stringify) std.json.S
                     if (F == void) {
                         try jws.beginObject();
                         try jws.endObject();
-                    } else try writeJson(F, payload, jws);
+                    } else try writeAt(F, payload, jws);
                 },
             }
             return jws.endObject();
@@ -551,7 +552,7 @@ fn writeJson(comptime T: type, v: *const T, jws: *std.json.Stringify) std.json.S
                     var copy: F = @field(v.*, name);
                     _ = &copy;
                     try writeJson(F, &copy, jws);
-                } else try writeJson(F, &@field(v.*, name), jws);
+                } else try writeAt(F, &@field(v.*, name), jws);
             }
             return if (s.is_tuple) jws.endArray() else jws.endObject();
         },
@@ -560,14 +561,66 @@ fn writeJson(comptime T: type, v: *const T, jws: *std.json.Stringify) std.json.S
             const array: [info.len]info.child = v.*;
             return writeElements(info.child, &array, jws);
         },
-        .pointer => |p| switch (p.size) {
-            .one => return writeJson(p.child, v.*, jws),
-            .slice => return writeElements(p.child, v.*, jws),
-            .many => return writeElements(p.child, std.mem.span(v.*), jws),
-            .c => comptime unreachable,
+        .pointer => |p| {
+            if (comptime coercesToConst(p)) switch (p.size) {
+                .one => return writeJson(p.child, v.*, jws),
+                .slice => return writeElements(p.child, v.*, jws),
+                .many => return writeElements(p.child, std.mem.span(v.*), jws),
+                .c => comptime unreachable,
+            };
+            switch (p.size) {
+                .one => return writeAt(p.child, v.*, jws),
+                .slice => {
+                    try jws.beginArray();
+                    for (0..v.*.len) |i| try writeAt(p.child, &v.*[i], jws);
+                    return jws.endArray();
+                },
+                // holdsTimestamp reaches a many-item pointer only when it has a sentinel.
+                .many => {
+                    try jws.beginArray();
+                    var i: usize = 0;
+                    while (true) : (i += 1) {
+                        const e: p.child = v.*[i];
+                        if (e == comptime p.sentinel().?) break;
+                        try writeJson(p.child, &e, jws);
+                    }
+                    return jws.endArray();
+                },
+                .c => comptime unreachable,
+            }
         },
         else => comptime unreachable,
     }
+}
+
+// Whether a pointer of this type coerces to `*const p.child`. A volatile, allowzero,
+// under-aligned or non-generic address-space pointer does not.
+fn coercesToConst(comptime p: std.lang.Type.Pointer) bool {
+    return !p.attrs.@"volatile" and !p.attrs.@"allowzero" and
+        (p.attrs.@"addrspace" == null or p.attrs.@"addrspace".? == .generic) and
+        (p.attrs.@"align" == null or p.attrs.@"align".? >= @alignOf(p.child));
+}
+
+// Writes the `T` at `ptr`, any single-item pointer to a `T`: a pointer value, or the address
+// of an align(1) struct field or union payload, which is `*align(1) T`. One that coerces to
+// `*const T` is written in place; any other is copied into an aligned local first, element by
+// element for an array so that a large one is not copied whole onto the stack. Every address
+// `writeJson` takes from a value it is writing comes through here.
+fn writeAt(comptime T: type, ptr: anytype, jws: *std.json.Stringify) std.json.Stringify.Error!void {
+    const p = @typeInfo(@TypeOf(ptr)).pointer;
+    comptime std.debug.assert(p.size == .one and p.child == T);
+    if (comptime coercesToConst(p)) return writeJson(T, ptr, jws);
+    switch (@typeInfo(T)) {
+        // As writeJson's own `.array` arm, which writes each element of such an array.
+        .array => |a| if (comptime holdsTimestamp(T)) {
+            try jws.beginArray();
+            for (0..a.len) |i| try writeAt(a.child, &ptr[i], jws);
+            return jws.endArray();
+        },
+        else => {},
+    }
+    const copy: T = ptr.*;
+    return writeJson(T, &copy, jws);
 }
 
 fn writeElements(comptime E: type, elements: []const E, jws: *std.json.Stringify) std.json.Stringify.Error!void {
@@ -1813,6 +1866,138 @@ test "a std.json.ArrayHashMap of protobuf Timestamps on 29 February encodes with
     const back = try fromPayload(Deadlines, a, p);
     try testing.expectEqual(value.by_step.map.get("ship").?, back.by_step.map.get("ship").?);
     try testing.expectEqual(value.by_step.map.get("audit").?, back.by_step.map.get("audit").?);
+}
+
+test "a field named map whose type has a non-type Data declaration encodes as std.json writes it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Only std.json.ArrayHashMap is walked as a map; any other `map` field is a plain field,
+    // even when its type declares a `Data` that is not a type.
+    const NotAMap = struct {
+        pub const Data = 5;
+        x: u8,
+    };
+    const Holder = struct { map: NotAMap, at: proto.google.protobuf.Timestamp = .{} };
+    const value: Holder = .{ .map = .{ .x = 9 } };
+    try testing.expectEqualStrings(
+        try std.json.Stringify.valueAlloc(a, value, .{}),
+        (try toPayload(a, value)).data,
+    );
+    const Plain = struct { map: NotAMap };
+    const plain: Plain = .{ .map = .{ .x = 4 } };
+    try testing.expectEqualStrings(
+        try std.json.Stringify.valueAlloc(a, plain, .{}),
+        (try toPayload(a, plain)).data,
+    );
+}
+
+test "under-aligned and volatile pointers to a protobuf Timestamp on 29 February encode it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Timestamp = proto.google.protobuf.Timestamp;
+    var at: Timestamp = .{ .seconds = 1_709_208_000 }; // 2024-02-29T12:00:00Z
+    var list = [_]Timestamp{ at, .{ .seconds = 951_782_400 } }; // and 2000-02-29T00:00:00Z
+    var refs = [_:null]?*const Timestamp{ &at, &list[1] };
+    _ = .{ &at, &list, &refs };
+
+    const Pointers = struct {
+        under: *align(1) const Timestamp,
+        vol: *const volatile Timestamp,
+        nested: *align(1) const struct { at: Timestamp },
+        slice: []align(1) const Timestamp,
+        vol_slice: []const volatile Timestamp,
+        many: [*:null]const volatile ?*const Timestamp,
+    };
+    const nested: struct { at: Timestamp } = .{ .at = at };
+    const value: Pointers = .{
+        .under = &at,
+        .vol = &at,
+        .nested = @ptrCast(&nested),
+        .slice = &list,
+        .vol_slice = &list,
+        .many = &refs,
+    };
+    const p = try toPayload(a, value);
+    const leap = "\"2024-02-29T12:00:00Z\"";
+    const leap_2000 = "\"2000-02-29T00:00:00Z\"";
+    try testing.expectEqualStrings(
+        "{\"under\":" ++ leap ++ ",\"vol\":" ++ leap ++ ",\"nested\":{\"at\":" ++ leap ++
+            "},\"slice\":[" ++ leap ++ "," ++ leap_2000 ++ "],\"vol_slice\":[" ++ leap ++ "," ++ leap_2000 ++
+            "],\"many\":[" ++ leap ++ "," ++ leap_2000 ++ "]}",
+        p.data,
+    );
+    try testing.expect(std.mem.indexOf(u8, p.data, "-03-01") == null);
+
+    // Every other day is written as through an ordinary pointer.
+    var other: Timestamp = .{ .seconds = 1_700_000_000, .nanos = 123_000_000 };
+    _ = &other;
+    const Ordinary = struct { under: *const Timestamp, vol: *const Timestamp };
+    const Unusual = struct { under: *align(1) const Timestamp, vol: *const volatile Timestamp };
+    try testing.expectEqualStrings(
+        (try toPayload(a, Ordinary{ .under = &other, .vol = &other })).data,
+        (try toPayload(a, Unusual{ .under = &other, .vol = &other })).data,
+    );
+}
+
+test "under-aligned struct fields and union payloads holding a protobuf Timestamp on 29 February encode it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Timestamp = proto.google.protobuf.Timestamp;
+    const at: Timestamp = .{ .seconds = 1_709_208_000 }; // 2024-02-29T12:00:00Z
+    // `&value.at` of an align(1) field is a `*align(1) Timestamp`, as an align(1) pointer is.
+    const Choice = union(enum) { at: Timestamp align(1), none: void };
+    const Fields = struct {
+        tag: u8,
+        at: Timestamp align(1),
+        maybe: ?Timestamp align(1),
+        choice: Choice,
+    };
+    const value: Fields = .{ .tag = 1, .at = at, .maybe = at, .choice = .{ .at = at } };
+    const leap = "\"2024-02-29T12:00:00Z\"";
+    try testing.expectEqualStrings(
+        "{\"tag\":1,\"at\":" ++ leap ++ ",\"maybe\":" ++ leap ++ ",\"choice\":{\"at\":" ++ leap ++ "}}",
+        (try toPayload(a, value)).data,
+    );
+}
+
+test "under-aligned and volatile pointers to arrays and fields of protobuf Timestamps encode each one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Timestamp = proto.google.protobuf.Timestamp;
+    const at: Timestamp = .{ .seconds = 1_709_208_000 }; // 2024-02-29T12:00:00Z
+    const old: Timestamp = .{ .seconds = 951_782_400 }; // 2000-02-29T00:00:00Z
+    const Inner = struct { at: Timestamp align(1), n: u8 };
+    const Choice = union(enum) { inner: Inner align(1), list: [2]Timestamp align(1) };
+    var list = [_]Timestamp{ at, old };
+    var inner: Inner = .{ .at = old, .n = 2 };
+    _ = .{ &list, &inner };
+    const Holder = struct {
+        under: *align(1) const [2]Timestamp,
+        vol: *const volatile [2]Timestamp,
+        inner: *const volatile Inner,
+        choice: Choice,
+        list: [2]Timestamp align(1),
+    };
+    const value: Holder = .{
+        .under = &list,
+        .vol = &list,
+        .inner = &inner,
+        .choice = .{ .inner = inner },
+        .list = list,
+    };
+    const leap = "\"2024-02-29T12:00:00Z\"";
+    const leap_2000 = "\"2000-02-29T00:00:00Z\"";
+    const pair = "[" ++ leap ++ "," ++ leap_2000 ++ "]";
+    const inner_text = "{\"at\":" ++ leap_2000 ++ ",\"n\":2}";
+    try testing.expectEqualStrings(
+        "{\"under\":" ++ pair ++ ",\"vol\":" ++ pair ++ ",\"inner\":" ++ inner_text ++
+            ",\"choice\":{\"inner\":" ++ inner_text ++ "},\"list\":" ++ pair ++ "}",
+        (try toPayload(a, value)).data,
+    );
 }
 
 test "a json/protobuf message that holds a binary Payload round-trips" {

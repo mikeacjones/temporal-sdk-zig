@@ -2179,6 +2179,26 @@ pub const Client = struct {
         return d;
     }
 
+    /// For `testing.WorkflowEnvironment.getResult`: the run ID of the latest run of
+    /// `workflow_id`, from DescribeWorkflowExecution. Only the run ID is read, so the response
+    /// is not decoded by the codecs: a payload in it they can't decode (a memo, a pending
+    /// activity's heartbeat details) doesn't fail the call, as it does `describeWorkflow`.
+    /// Returns `error.NotFound` if no such workflow exists. The ID's memory comes from `arena`.
+    pub fn latestRunId(c: *Client, arena: Allocator, workflow_id: []const u8) DescribeError![]const u8 {
+        const response = c.rpcUndecoded(wfs.DescribeWorkflowExecutionResponse, "DescribeWorkflowExecution", wfs.DescribeWorkflowExecutionRequest{
+            .namespace = c.namespace,
+            .execution = .{ .workflow_id = workflow_id, .run_id = "" },
+        }, arena) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+        const info = response.workflow_execution_info orelse {
+            log.err("DescribeWorkflowExecution for workflow {s} returned no execution info", .{workflow_id});
+            return error.InvalidResponse;
+        };
+        return (info.execution orelse proto.temporal.api.common.v1.WorkflowExecution{}).run_id;
+    }
+
     /// Lists the workflow executions matching the visibility `query`, such as
     /// `WorkflowType = 'Greet' AND ExecutionStatus = 'Running'` or a condition on a search
     /// attribute (`CustomerId = 'c-42'`); an empty query lists them all. Visibility is

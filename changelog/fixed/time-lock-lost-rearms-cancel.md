@@ -1,0 +1,1 @@
+`testing.WorkflowEnvironment.getResult` on a time-skipping environment now re-arms a cancel it consumed when it returns `error.TimeLockLost`, so a caller that canceled the task, or wrapped the call in its own timeout, still sees `error.Canceled` at its next cancellation point.

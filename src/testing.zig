@@ -874,8 +874,8 @@ pub const WorkflowEnvironment = struct {
         if (run.run_id.len == 0) {
             var scratch: std.heap.ArenaAllocator = .init(env.gpa);
             defer scratch.deinit();
-            const latest = try env.client.describeWorkflow(scratch.allocator(), run.id, "");
-            const pinned = try run.client.gpa.dupe(u8, latest.run_id);
+            const latest_run_id = try env.client.latestRunId(scratch.allocator(), run.id);
+            const pinned = try run.client.gpa.dupe(u8, latest_run_id);
             run.client.gpa.free(run.run_id);
             run.run_id = pinned;
         }
@@ -908,7 +908,9 @@ pub const WorkflowEnvironment = struct {
     /// `time_lock_lost` and returns `error.TimeLockLost` in place of the wait's outcome:
     /// neither call is retried, since the server counts them and a failed call may still have
     /// reached it. A failed unlock counts as lost even when it failed before sending, as its
-    /// delivery can't be told apart.
+    /// delivery can't be told apart. A cancel that the unlock or the wait consumed is re-armed
+    /// before `error.TimeLockLost` is returned, so the caller's next cancellation point still
+    /// returns `error.Canceled`.
     fn unlockedWait(
         env: *WorkflowEnvironment,
         comptime Result: type,
@@ -919,6 +921,8 @@ pub const WorkflowEnvironment = struct {
         _ = env.testService(ts.UnlockTimeSkippingResponse, "UnlockTimeSkipping", ts.UnlockTimeSkippingRequest{}, arena) catch |err| {
             env.time_lock_lost = true;
             logTimeLockLost("UnlockTimeSkipping", err);
+            // The cancel this consumed is the caller's: re-arm it, as TimeLockLost replaces it.
+            if (err == error.Canceled) env.io.recancel();
             return error.TimeLockLost;
         };
         const result = run.getWithOptions(arena, options);
@@ -933,6 +937,11 @@ pub const WorkflowEnvironment = struct {
         _ = locked catch |err| {
             env.time_lock_lost = true;
             logTimeLockLost("LockTimeSkipping", err);
+            // The re-lock can't be canceled (protection is blocked), but a canceled wait
+            // consumed the caller's cancel: re-arm it, as TimeLockLost replaces it. The
+            // deferred swap restores protection, so the caller's next cancellation point
+            // sees it.
+            if (result) |_| {} else |wait_err| if (wait_err == error.Canceled) env.io.recancel();
             return error.TimeLockLost;
         };
         return result;
@@ -9024,6 +9033,128 @@ const ReversingCodec = struct {
     }
 };
 
+/// A codec whose decode fails with `error.CodecFailed` on a payload of encoding
+/// `binary/poison` and passes every other payload through, as does its encode.
+const PoisonCodec = struct {
+    const encoding = "binary/poison";
+    const vtable: converter.PayloadCodec.VTable = .{ .encode = pass, .decode = decode };
+
+    fn codec() converter.PayloadCodec {
+        return .{ .ptr = @ptrCast(@constCast(&vtable)), .vtable = &vtable };
+    }
+
+    fn pass(_: *anyopaque, _: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return @constCast(payloads);
+    }
+
+    fn decode(_: *anyopaque, _: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        for (payloads) |p| if (std.mem.eql(u8, converter.encodingOf(p) orelse "", encoding)) return error.CodecFailed;
+        return @constCast(payloads);
+    }
+};
+
+const PoisonFixtures = struct {
+    /// Set once getResult has described the run, which lets `Hold` return.
+    var release: Io.Event = .unset;
+
+    /// Heartbeats a payload the codec can't decode, which only the run's description holds
+    /// (no history event or activation carries a successful attempt's heartbeat details),
+    /// then waits for `release`.
+    fn hold(ctx: *activity.Context) ![]const u8 {
+        ctx.heartbeat(try converter.payloadWithEncoding(ctx.allocator(), PoisonCodec.encoding, "written by another codec"));
+        try release.wait(ctx.io());
+        return "done";
+    }
+    const Hold = activity.Def("PoisonHold", hold);
+
+    fn holding(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(Hold, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const Holding = workflow.Def("PoisonHolding", holding);
+
+    /// Sets `release` once a DescribeWorkflowExecution call returns after `armed` is set.
+    const ReleaseOnDescribe = struct {
+        armed: std.atomic.Value(bool) = .init(false),
+
+        pub fn call(_: *ReleaseOnDescribe, input: *interceptor.ClientCall, next: interceptor.Client.Next) interceptor.ClientError!void {
+            defer if (input.request(proto.temporal.api.workflowservice.v1.DescribeWorkflowExecutionRequest) != null and release_on_describe.armed.load(.acquire)) release.set(testing.io);
+            return next.call(input);
+        }
+    };
+    var release_on_describe: ReleaseOnDescribe = .{};
+
+    /// Waits until `Hold`'s heartbeat reaches the server: until then the run's description
+    /// decodes, and after it the public describe fails with `error.CodecFailed`, as it must.
+    fn waitForPoisonedDescription(env: *WorkflowEnvironment, id: []const u8) !void {
+        for (0..500) |_| {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            _ = env.client.describeWorkflow(scratch.allocator(), id, "") catch |err| switch (err) {
+                error.CodecFailed => return,
+                else => |e| return e,
+            };
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        return error.HeartbeatNeverDescribed;
+    }
+};
+
+test "WorkflowEnvironment.getResult pins a handle with no run ID when the run's description holds a payload the codecs can't decode" {
+    testing.log_level = .err; // describeWorkflow's codec failure is logged as a warning.
+    PoisonFixtures.release.reset();
+    PoisonFixtures.release_on_describe.armed.store(false, .release);
+    const codecs = [_]converter.PayloadCodec{PoisonCodec.codec()};
+    const interceptors = [_]interceptor.Client{interceptor.Client.from(PoisonFixtures.ReleaseOnDescribe, &PoisonFixtures.release_on_describe)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs, .interceptors = &interceptors });
+    defer env.deinit();
+    // Whatever happens, the activity must not keep the worker from stopping.
+    defer PoisonFixtures.release.set(testing.io);
+    try env.registerWorkflow(PoisonFixtures.Holding);
+    try env.registerActivity(PoisonFixtures.Hold);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var started = try env.startWorkflow(PoisonFixtures.Holding, .{ .task_queue = "" }, .{});
+    defer started.deinit();
+    try PoisonFixtures.waitForPoisonedDescription(env, started.id);
+
+    // The pin's describe is the first after arming, and the activity returns once it is done.
+    PoisonFixtures.release_on_describe.armed.store(true, .release);
+    var latest = try env.client.getWorkflow([]const u8, started.id, "");
+    defer latest.deinit();
+    try testing.expectEqualStrings("done", try env.getResult(PoisonFixtures.Holding, &latest, a, null));
+    try testing.expectEqualStrings(started.run_id, latest.run_id);
+}
+
+test "WorkflowEnvironment.getResultByNameWithOptions pins a handle with no run ID without decoding the run's description" {
+    testing.log_level = .err; // describeWorkflow's codec failure is logged as a warning.
+    PoisonFixtures.release.reset();
+    PoisonFixtures.release_on_describe.armed.store(false, .release);
+    const codecs = [_]converter.PayloadCodec{PoisonCodec.codec()};
+    const interceptors = [_]interceptor.Client{interceptor.Client.from(PoisonFixtures.ReleaseOnDescribe, &PoisonFixtures.release_on_describe)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs, .interceptors = &interceptors });
+    defer env.deinit();
+    defer PoisonFixtures.release.set(testing.io);
+    try env.registerWorkflow(PoisonFixtures.Holding);
+    try env.registerActivity(PoisonFixtures.Hold);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var started = try env.startWorkflowByName([]const u8, "PoisonHolding", .{ .task_queue = "" }, .{});
+    defer started.deinit();
+    try PoisonFixtures.waitForPoisonedDescription(env, started.id);
+
+    PoisonFixtures.release_on_describe.armed.store(true, .release);
+    var latest = try env.client.getWorkflow([]const u8, started.id, "");
+    defer latest.deinit();
+    try testing.expectEqualStrings("done", try env.getResultByNameWithOptions([]const u8, &latest, .{ .follow_runs = false }, a, null));
+    try testing.expectEqualStrings(started.run_id, latest.run_id);
+    // The run is closed and its activity gone, so the description decodes again.
+    _ = try env.client.describeWorkflow(a, started.id, "");
+}
+
 const CodecFixtures = struct {
     const Note = workflow.SignalDef("note", fn (text: []const u8) void);
     const Notes = workflow.QueryDef("notes", fn () []const u8);
@@ -9235,6 +9366,79 @@ test "WorkflowEnvironment marks itself unusable when getResult cannot re-lock ti
     var run = try env.client.getWorkflow([]const u8, "any-id", "");
     defer run.deinit();
     try testing.expectError(error.TimeLockLost, env.getResultByName([]const u8, &run, a, null));
+}
+
+const CanceledRelockFixtures = struct {
+    var started: Io.Event = .unset;
+    var release: Io.Event = .unset;
+
+    /// Sleeps a day, which passes only while time skipping is unlocked, then runs `Hold`.
+    fn dayThenHold(ctx: *workflow.Context) !void {
+        try ctx.io().sleep(.fromSeconds(std.time.s_per_day), .awake);
+        try ctx.executeLocalActivity(Hold, .{ .start_to_close_timeout = .fromSeconds(600) }, .{}).get();
+    }
+    const DayThenHold = workflow.Def("DayThenHold", dayThenHold);
+
+    /// Sets `started`, then waits for `release`. The workflow task stays open while it runs,
+    /// which keeps the server from skipping time to the run's timeout, so the run stays open.
+    fn hold(ctx: *activity.Context) !void {
+        started.set(ctx.io());
+        release.wait(ctx.io()) catch {};
+    }
+    const Hold = activity.Def("Hold", hold);
+
+    const Seen = struct {
+        result: anyerror!void = {},
+        after: Io.Cancelable!void = {},
+    };
+
+    /// Waits for `run` through `getResult` and records what it returned and what the next
+    /// cancellation point returned after it.
+    fn wait(env: *WorkflowEnvironment, run: *client_mod.WorkflowRun(void), arena: Allocator) Seen {
+        var seen: Seen = .{};
+        seen.result = env.getResult(DayThenHold, run, arena, null);
+        seen.after = testing.io.checkCancel();
+        return seen;
+    }
+};
+
+test "WorkflowEnvironment.getResult re-arms a cancel it consumed when it loses the time lock" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(CanceledRelockFixtures.DayThenHold);
+    try env.registerActivity(CanceledRelockFixtures.Hold);
+    CanceledRelockFixtures.started = .unset;
+    CanceledRelockFixtures.release = .unset;
+    // Before the worker stops, so the activity ends.
+    defer CanceledRelockFixtures.release.set(testing.io);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var run = try env.startWorkflow(CanceledRelockFixtures.DayThenHold, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+
+    test_relock_failures.store(1, .monotonic);
+    defer test_relock_failures.store(0, .monotonic);
+    // The lost lock is logged as an error, which would fail the test: capture it.
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_time_lock_log = &logged.writer;
+    defer test_time_lock_log = null;
+
+    var waiting = try testing.io.concurrent(CanceledRelockFixtures.wait, .{ env, &run, arena.allocator() });
+    // The day passes only once getResult has unlocked time skipping, so the activity starting
+    // means getResult is in its wait, which the open run keeps going until the cancel.
+    // Bounded, so a getResult that ends before its wait fails the test rather than hanging it.
+    const began = CanceledRelockFixtures.started.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } });
+    const seen = waiting.cancel(testing.io);
+    try began;
+
+    try testing.expectError(error.TimeLockLost, seen.result);
+    try testing.expect(env.time_lock_lost);
+    try testing.expectEqual(@as(u32, 0), test_relock_failures.load(.monotonic));
+    try testing.expect(std.mem.indexOf(u8, logged.written(), "LockTimeSkipping failed (RpcFailed)") != null);
+    // The wait consumed the cancel and TimeLockLost replaced it, so it was re-armed.
+    try testing.expectError(error.Canceled, seen.after);
 }
 
 const CloseTimeFixtures = struct {
