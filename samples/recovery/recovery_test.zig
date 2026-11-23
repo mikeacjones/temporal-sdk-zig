@@ -269,6 +269,118 @@ test "a trip recorded between the read and the terminate reaches the replacement
     try env.client.terminateWorkflow(run.id, "", "test finished");
 }
 
+/// A client interceptor that, once armed, fails the second SignalWorkflowExecution call it
+/// sees, once, as if the RPC had been lost.
+const FailSecondSignal = struct {
+    armed: std.atomic.Value(bool) = .init(false),
+    signals: std.atomic.Value(usize) = .init(0),
+
+    pub fn call(c: *FailSecondSignal, input: *interceptor.ClientCall, next: interceptor.Client.Next) interceptor.ClientError!void {
+        if (c.armed.load(.acquire) and std.mem.eql(u8, input.method, "SignalWorkflowExecution")) {
+            if (c.signals.fetchAdd(1, .acq_rel) == 1) return error.RpcFailed;
+        }
+        return next.call(input);
+    }
+};
+
+test "a trip signal that fails during recovery is retried and arrives exactly once" {
+    var fail_second: FailSecondSignal = .{};
+    const interceptors = [_]interceptor.Client{.from(FailSecondSignal, &fail_second)};
+    var e: Env = undefined;
+    try e.startWith(.{ .interceptors = &interceptors });
+    defer e.deinit();
+    const env = e.env;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(TripWorkflow, .{ .task_queue = "" }, .{.{}});
+    defer run.deinit();
+    try signalTrips(env, run.id, 3);
+    try waitForCounter(env, a, run.id, 3);
+    fail_second.armed.store(true, .release);
+
+    try waitForRunningTrips(env, 1);
+    try env.executeWorkflow(recovery_workflow.RecoverWorkflow, .{.{ .workflow_type = "TripWorkflow" }}, a, null);
+    // The first signal, the failed second, and its retry and the third.
+    try testing.expectEqual(4, fail_second.signals.load(.acquire));
+
+    const closed = try waitForClose(env, a, run.id, run.run_id);
+    try testing.expect(closed.attributes.? == .workflow_execution_terminated_event_attributes);
+
+    // The replacement got each of the source's three trips once.
+    const latest = try env.client.describeWorkflow(a, run.id, "");
+    try testing.expect(!std.mem.eql(u8, latest.run_id, run.run_id));
+    try waitForCounter(env, a, run.id, 3);
+    const history = try env.client.fetchHistory(a, run.id, latest.run_id);
+    var trips: usize = 0;
+    for (history.events.items) |event| switch (event.attributes.?) {
+        .workflow_execution_signaled_event_attributes => |signaled| {
+            if (std.mem.eql(u8, signaled.signal_name, trip_workflow.TripSignal.signal_name)) trips += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(3, trips);
+    try env.client.terminateWorkflow(run.id, "", "test finished");
+}
+
+/// A client interceptor that, once armed, lets the second SignalWorkflowExecution call it
+/// sees reach the server and then fails it, once, as if the response had been lost (a
+/// deadline that expired after the server recorded the signal).
+const LoseSecondSignalResponse = struct {
+    armed: std.atomic.Value(bool) = .init(false),
+    signals: std.atomic.Value(usize) = .init(0),
+
+    pub fn call(c: *LoseSecondSignalResponse, input: *interceptor.ClientCall, next: interceptor.Client.Next) interceptor.ClientError!void {
+        if (c.armed.load(.acquire) and std.mem.eql(u8, input.method, "SignalWorkflowExecution")) {
+            if (c.signals.fetchAdd(1, .acq_rel) == 1) {
+                try next.call(input);
+                return error.RpcFailed;
+            }
+        }
+        return next.call(input);
+    }
+};
+
+test "a trip signal whose response is lost during recovery arrives exactly once" {
+    var lose_second: LoseSecondSignalResponse = .{};
+    const interceptors = [_]interceptor.Client{.from(LoseSecondSignalResponse, &lose_second)};
+    var e: Env = undefined;
+    try e.startWith(.{ .interceptors = &interceptors });
+    defer e.deinit();
+    const env = e.env;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(TripWorkflow, .{ .task_queue = "" }, .{.{}});
+    defer run.deinit();
+    try signalTrips(env, run.id, 3);
+    try waitForCounter(env, a, run.id, 3);
+    lose_second.armed.store(true, .release);
+
+    try waitForRunningTrips(env, 1);
+    try env.executeWorkflow(recovery_workflow.RecoverWorkflow, .{.{ .workflow_type = "TripWorkflow" }}, a, null);
+
+    const closed = try waitForClose(env, a, run.id, run.run_id);
+    try testing.expect(closed.attributes.? == .workflow_execution_terminated_event_attributes);
+
+    // The server recorded the second trip although its response was lost, so the retry must
+    // not send it again: the replacement holds each of the source's three trips once.
+    const latest = try env.client.describeWorkflow(a, run.id, "");
+    try testing.expect(!std.mem.eql(u8, latest.run_id, run.run_id));
+    const history = try env.client.fetchHistory(a, run.id, latest.run_id);
+    var trips: usize = 0;
+    for (history.events.items) |event| switch (event.attributes.?) {
+        .workflow_execution_signaled_event_attributes => |signaled| {
+            if (std.mem.eql(u8, signaled.signal_name, trip_workflow.TripSignal.signal_name)) trips += 1;
+        },
+        else => {},
+    };
+    try env.client.terminateWorkflow(run.id, "", "test finished");
+    try testing.expectEqual(3, trips);
+}
+
 test "a run that ended by continuing as new counts as completed" {
     const continued: temporal.history.HistoryEvent = .{
         .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW,
@@ -309,9 +421,29 @@ test "recovering a batch carries on after the last heartbeat" {
     // A previous attempt recovered both executions of the batch, so there is nothing left to
     // do (and no client is needed to do it).
     var env: temporal.testing.ActivityEnvironment = .init(testing.io);
-    const details = [_]temporal.converter.Payload{try temporal.converter.toPayload(a, @as(usize, 1))};
+    const details = [_]temporal.converter.Payload{try temporal.converter.toPayload(a, recovery_workflow.RecoveryProgress{ .next = 2 })};
     env.heartbeat_details = &details;
     try env.executeActivityWith(recovery_workflow.RecoverExecutions, &activities, .{ "key", 0, 2 }, a);
+}
+
+test "recovering a batch starts over on heartbeat details it can't decode" {
+    var cache: recovery_workflow.ExecutionsCache = .init(testing.allocator, testing.io, 10);
+    defer cache.deinit();
+    var activities: recovery_workflow.Activities = .{ .cache = &cache, .host_id = "recovery_test" };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ids = try testing.allocator.alloc([]const u8, 1);
+    ids[0] = try testing.allocator.dupe(u8, "trip-a");
+    try cache.put("key", .{ .workflow_ids = ids });
+
+    // An older build's bare index is ignored, so the batch recovers its execution again; it
+    // needs a client for that, and this environment has none.
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    const details = [_]temporal.converter.Payload{try temporal.converter.toPayload(a, @as(usize, 0))};
+    env.heartbeat_details = &details;
+    try testing.expectError(error.NoClient, env.executeActivityWith(recovery_workflow.RecoverExecutions, &activities, .{ "key", 0, 1 }, a));
 }
 
 test "recovering a batch fails without retrying when its executions aren't cached" {
