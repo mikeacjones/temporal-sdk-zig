@@ -56,6 +56,41 @@ test "requester signals a request and polls for its response" {
     try testing.expectError(error.WorkflowCanceled, env.getResult(UppercaseDouble, &run, a, null));
 }
 
+test "the response to the request that makes the workflow continue as new reaches the requester" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    const Uppercase = uppercase.UppercaseWorkflowWithLimit(3).Def;
+    try env.registerWorkflow(Uppercase);
+    try env.registerActivity(uppercase.UppercaseActivity);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(Uppercase, .{ .id = "continuing-workflow", .task_queue = "" }, .{});
+    defer run.deinit();
+
+    // Two requests before the one that reaches the limit, answered before it is sent.
+    for ([_][]const u8{ "request0", "request1" }, [_][]const u8{ "foo0", "foo1" }) |id, input| {
+        try env.signalWorkflow(uppercase.RequestSignal, run.id, .{.{ .id = id, .input = input }});
+    }
+    for ([_][]const u8{ "request0", "request1" }) |id| {
+        while (try env.queryWorkflow(uppercase.ResponseQuery, a, run.id, .{id}) == null) {
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+    }
+
+    // The third request's response is stored in the workflow task that continues as new.
+    const requester = try Requester.init(&env.client, testing.io, .{ .target_workflow_id = run.id });
+    try testing.expectEqualStrings("FOO2", try requester.requestUppercase(a, "foo2"));
+    try testing.expectError(error.WorkflowContinuedAsNew, run.getWithOptions(a, .{ .follow_runs = false }));
+
+    try env.client.cancelWorkflow(run.id, "", "test finished");
+    var latest = try env.client.getWorkflow(void, run.id, "");
+    defer latest.deinit();
+    try testing.expectError(error.WorkflowCanceled, env.getResult(Uppercase, &latest, a, null));
+}
+
 test "requester requires a target workflow" {
     // init checks its options without using the client.
     var client: temporal.client.Client = undefined;
