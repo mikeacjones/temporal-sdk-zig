@@ -908,7 +908,9 @@ pub const WorkflowEnvironment = struct {
     /// `time_lock_lost` and returns `error.TimeLockLost` in place of the wait's outcome:
     /// neither call is retried, since the server counts them and a failed call may still have
     /// reached it. A failed unlock counts as lost even when it failed before sending, as its
-    /// delivery can't be told apart.
+    /// delivery can't be told apart. A cancel that the unlock or the wait consumed is re-armed
+    /// before `error.TimeLockLost` is returned, so the caller's next cancellation point still
+    /// returns `error.Canceled`.
     fn unlockedWait(
         env: *WorkflowEnvironment,
         comptime Result: type,
@@ -919,6 +921,8 @@ pub const WorkflowEnvironment = struct {
         _ = env.testService(ts.UnlockTimeSkippingResponse, "UnlockTimeSkipping", ts.UnlockTimeSkippingRequest{}, arena) catch |err| {
             env.time_lock_lost = true;
             logTimeLockLost("UnlockTimeSkipping", err);
+            // The cancel this consumed is the caller's: re-arm it, as TimeLockLost replaces it.
+            if (err == error.Canceled) env.io.recancel();
             return error.TimeLockLost;
         };
         const result = run.getWithOptions(arena, options);
@@ -933,6 +937,11 @@ pub const WorkflowEnvironment = struct {
         _ = locked catch |err| {
             env.time_lock_lost = true;
             logTimeLockLost("LockTimeSkipping", err);
+            // The re-lock can't be canceled (protection is blocked), but a canceled wait
+            // consumed the caller's cancel: re-arm it, as TimeLockLost replaces it. The
+            // deferred swap restores protection, so the caller's next cancellation point
+            // sees it.
+            if (result) |_| {} else |wait_err| if (wait_err == error.Canceled) env.io.recancel();
             return error.TimeLockLost;
         };
         return result;
@@ -9357,6 +9366,79 @@ test "WorkflowEnvironment marks itself unusable when getResult cannot re-lock ti
     var run = try env.client.getWorkflow([]const u8, "any-id", "");
     defer run.deinit();
     try testing.expectError(error.TimeLockLost, env.getResultByName([]const u8, &run, a, null));
+}
+
+const CanceledRelockFixtures = struct {
+    var started: Io.Event = .unset;
+    var release: Io.Event = .unset;
+
+    /// Sleeps a day, which passes only while time skipping is unlocked, then runs `Hold`.
+    fn dayThenHold(ctx: *workflow.Context) !void {
+        try ctx.io().sleep(.fromSeconds(std.time.s_per_day), .awake);
+        try ctx.executeLocalActivity(Hold, .{ .start_to_close_timeout = .fromSeconds(600) }, .{}).get();
+    }
+    const DayThenHold = workflow.Def("DayThenHold", dayThenHold);
+
+    /// Sets `started`, then waits for `release`. The workflow task stays open while it runs,
+    /// which keeps the server from skipping time to the run's timeout, so the run stays open.
+    fn hold(ctx: *activity.Context) !void {
+        started.set(ctx.io());
+        release.wait(ctx.io()) catch {};
+    }
+    const Hold = activity.Def("Hold", hold);
+
+    const Seen = struct {
+        result: anyerror!void = {},
+        after: Io.Cancelable!void = {},
+    };
+
+    /// Waits for `run` through `getResult` and records what it returned and what the next
+    /// cancellation point returned after it.
+    fn wait(env: *WorkflowEnvironment, run: *client_mod.WorkflowRun(void), arena: Allocator) Seen {
+        var seen: Seen = .{};
+        seen.result = env.getResult(DayThenHold, run, arena, null);
+        seen.after = testing.io.checkCancel();
+        return seen;
+    }
+};
+
+test "WorkflowEnvironment.getResult re-arms a cancel it consumed when it loses the time lock" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(CanceledRelockFixtures.DayThenHold);
+    try env.registerActivity(CanceledRelockFixtures.Hold);
+    CanceledRelockFixtures.started = .unset;
+    CanceledRelockFixtures.release = .unset;
+    // Before the worker stops, so the activity ends.
+    defer CanceledRelockFixtures.release.set(testing.io);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var run = try env.startWorkflow(CanceledRelockFixtures.DayThenHold, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+
+    test_relock_failures.store(1, .monotonic);
+    defer test_relock_failures.store(0, .monotonic);
+    // The lost lock is logged as an error, which would fail the test: capture it.
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_time_lock_log = &logged.writer;
+    defer test_time_lock_log = null;
+
+    var waiting = try testing.io.concurrent(CanceledRelockFixtures.wait, .{ env, &run, arena.allocator() });
+    // The day passes only once getResult has unlocked time skipping, so the activity starting
+    // means getResult is in its wait, which the open run keeps going until the cancel.
+    // Bounded, so a getResult that ends before its wait fails the test rather than hanging it.
+    const began = CanceledRelockFixtures.started.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } });
+    const seen = waiting.cancel(testing.io);
+    try began;
+
+    try testing.expectError(error.TimeLockLost, seen.result);
+    try testing.expect(env.time_lock_lost);
+    try testing.expectEqual(@as(u32, 0), test_relock_failures.load(.monotonic));
+    try testing.expect(std.mem.indexOf(u8, logged.written(), "LockTimeSkipping failed (RpcFailed)") != null);
+    // The wait consumed the cancel and TimeLockLost replaced it, so it was re-armed.
+    try testing.expectError(error.Canceled, seen.after);
 }
 
 const CloseTimeFixtures = struct {
