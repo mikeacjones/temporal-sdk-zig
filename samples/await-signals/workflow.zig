@@ -1,10 +1,13 @@
 //! Handles three signals, Signal1, Signal2 and Signal3, that must be processed in that order
 //! but can arrive in any order, and fails if one doesn't arrive in time. Two timeouts apply:
-//! the time between signals, and the total time since the first signal arrived.
+//! the time between signals, and the total time since the first signal arrived, whichever it
+//! was. Until a first signal arrives the workflow waits without a limit.
 //!
-//! The signal handlers only record which signals have arrived. The workflow function then waits
-//! for each signal in turn with `ctx.awaitTimeout`, on a condition over that state, so the order
-//! and timeout rules read as straight-line code rather than being spread across the handlers.
+//! The signal handlers only record which signals have arrived. The workflow function waits for
+//! any first signal, then for each signal in turn with `ctx.awaitTimeout`, on a condition over
+//! that state, so the order and timeout rules read as straight-line code rather than being
+//! spread across the handlers. Every wait after the first signal is bounded by what is left of
+//! the total timeout, including the wait for Signal1 when another signal came first.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -46,6 +49,9 @@ const AwaitSignals = struct {
         a.received("Signal3", &a.signal3_received);
     }
 
+    fn hasAnySignal(a: *AwaitSignals) bool {
+        return a.first_signal_time != null;
+    }
     fn hasSignal1(a: *AwaitSignals) bool {
         return a.signal1_received;
     }
@@ -56,14 +62,20 @@ const AwaitSignals = struct {
         return a.signal3_received;
     }
 
-    /// The longest to wait for the next signal: the signal-to-signal timeout, or what is left
-    /// of the total timeout if that is shorter. Fails the workflow once no time is left.
-    fn nextTimeout(a: *AwaitSignals) error{ApplicationFailure}!Duration {
-        // Only called once Signal1 has been received, so a first signal time is set.
+    /// What is left of `from_first_signal_timeout`; fails the workflow with
+    /// "FromFirstSignalTimeout" (type "timeout") once nothing is left.
+    fn totalLeft(a: *AwaitSignals) error{ApplicationFailure}!Duration {
+        // Only called once a signal has been received, so a first signal time is set.
         const total = a.first_signal_time.?.durationTo(a.ctx.now());
         const total_left = from_first_signal_timeout.nanoseconds - total.nanoseconds;
         if (total_left <= 0) return a.ctx.fail(.{ .message = "FromFirstSignalTimeout", .type = "timeout" });
-        return .{ .nanoseconds = @min(signal_to_signal_timeout.nanoseconds, total_left) };
+        return .{ .nanoseconds = total_left };
+    }
+
+    /// The longest to wait for the next signal: the signal-to-signal timeout, or what is left
+    /// of the total timeout if that is shorter. Fails the workflow once no time is left.
+    fn nextTimeout(a: *AwaitSignals) error{ApplicationFailure}!Duration {
+        return .{ .nanoseconds = @min(signal_to_signal_timeout.nanoseconds, (try a.totalLeft()).nanoseconds) };
     }
 };
 
@@ -75,8 +87,12 @@ fn awaitSignalsWorkflow(ctx: *workflow.Context) !void {
     try ctx.setSignalHandler(Signal2, a, AwaitSignals.onSignal2);
     try ctx.setSignalHandler(Signal3, a, AwaitSignals.onSignal3);
 
-    // Returns error.Canceled if the workflow is canceled, which ends it as canceled.
-    try ctx.await(a, AwaitSignals.hasSignal1);
+    // No limit applies until a first signal arrives. Returns error.Canceled if the workflow is
+    // canceled, which ends it as canceled.
+    try ctx.await(a, AwaitSignals.hasAnySignal);
+    // Whichever signal came first, the wait for Signal1 is bounded by the total timeout.
+    if (!a.signal1_received and !try ctx.awaitTimeout(try a.totalLeft(), a, AwaitSignals.hasSignal1))
+        return ctx.fail(.{ .message = "FromFirstSignalTimeout", .type = "timeout" });
     logger.info("Signal1 Processed", .{});
 
     if (!try ctx.awaitTimeout(try a.nextTimeout(), a, AwaitSignals.hasSignal2))

@@ -27,6 +27,10 @@ pub const Requester = struct {
         target_workflow_id: []const u8,
         /// How long to wait for the response.
         response_timeout: Duration = .fromSeconds(10),
+        /// For tests: how long the requester's worker task sleeps before it calls `Worker.run`.
+        /// It stands in for a worker that is slow to start (connecting, reading debug info,
+        /// creating its core). `init` waits through it.
+        worker_start_delay: Duration = .zero,
     };
 
     pub const Error = error{
@@ -52,9 +56,13 @@ pub const Requester = struct {
     pub const response_activity_name = "responseActivity";
     pub const ResponseActivity = temporal.activity.Def(response_activity_name, respond);
 
-    /// Starts the requester's worker in the background of `io`. `client` must outlive the
-    /// requester, as must the strings in `options`, and `gpa` must be safe to use from several
-    /// threads: response activities run on the worker's tasks. Call `deinit` to stop the worker.
+    /// Starts the requester's worker and returns once that worker is polling, so the response
+    /// to the first request can be taken as soon as the workflow sends it: the response
+    /// activity must start within 5 s of being scheduled (`uppercase.response_options`), and a
+    /// worker can take longer than that to start (the first worker of a Debug build reads the
+    /// executable's debug info first). `client` must outlive the requester, as must the
+    /// strings in `options`, and `gpa` must be safe to use from several threads: response
+    /// activities run on the worker's tasks. Call `deinit` to stop the worker.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *temporal.client.Client, options: Options) !*Requester {
         if (options.target_workflow_id.len == 0) return error.MissingTargetWorkflowId;
 
@@ -75,7 +83,13 @@ pub const Requester = struct {
         };
         errdefer r.worker.deinit();
         try r.worker.registerActivityWith(ResponseActivity, r);
-        r.running = io.concurrent(runWorker, .{&r.worker}) catch |err| {
+        r.running = io.concurrent(runWorker, .{ &r.worker, options.worker_start_delay }) catch |err| {
+            std.log.err("Starting the requester's worker on task queue {s} failed: {t}", .{ task_queue, err });
+            return err;
+        };
+        r.worker.waitUntilRunning() catch |wait_err| {
+            r.worker.stop();
+            const err = if (r.running.await(io)) wait_err else |run_err| run_err;
             std.log.err("Starting the requester's worker on task queue {s} failed: {t}", .{ task_queue, err });
             return err;
         };
@@ -94,7 +108,11 @@ pub const Requester = struct {
         r.gpa.destroy(r);
     }
 
-    fn runWorker(w: *temporal.worker.Worker) temporal.worker.Worker.RunError!void {
+    fn runWorker(w: *temporal.worker.Worker, delay: Duration) temporal.worker.Worker.RunError!void {
+        if (delay.nanoseconds != 0) std.Io.sleep(w.io, delay, .awake) catch {
+            w.io.recancel();
+            return;
+        };
         return w.run();
     }
 

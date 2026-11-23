@@ -422,7 +422,7 @@ Notes:
 - Options, wait stages, and errors are the typed calls'. A rejected update is `error.UpdateFailed` from the handle's `get`; client interceptors, propagators, and codecs see the calls as they see the typed ones.
 - `signalWorkflowByNameWithOptions` and `queryWorkflowByNameWithOptions` take `SignalOptions` and `QueryOptions` last.
 
-`updateWorkflow`, `updateWithStartWorkflow`, and the handle's `get` wait on the server for as long as the update takes: `Options.rpc_timeout` doesn't limit them. To bound the wait, cancel the task that waits, here by racing it against a timeout. The wait ends with `error.Canceled` and the update goes on in the workflow; `getWorkflowUpdateHandle` with the same update ID reads its result later. The handle from `updateWithStartWorkflow` carries the workflow ID and the run it started or found, so `getWorkflow` waits for that workflow's result without another call.
+`updateWorkflow`, `updateWithStartWorkflow`, and the handle's `get` wait on the server for as long as the update takes: `Options.rpc_timeout` doesn't limit them. To bound the wait, cancel the task that waits, here by racing it against a timeout. The wait ends with `error.Canceled`, and what that leaves depends on how far the call had come. The cancel can land before the server has the update: while a client interceptor or a codec runs, while the client makes its first connection, or while the RPC is still connecting or retrying (with an unreachable server, the timeout is the only bound). Then nothing was delivered. Only once the server had the update does it go on in the workflow, and `getWorkflowUpdateHandle` with the same update ID reads its result later. So a timeout leaves delivery unknown; calling again with the same update ID is safe, because the server runs an update ID once per workflow run: the call returns the result of the update already delivered, or delivers it now. The handle from `updateWithStartWorkflow` carries the workflow ID and the run it started or found, so `getWorkflow` waits for that workflow's result without another call.
 
 <!-- example: client-update-wait -->
 ```zig
@@ -438,8 +438,10 @@ fn setGreeting(client: *temporal.client.Client, arena: Allocator, workflow_id: [
     return update.get(arena);
 }
 
-/// The previous greeting, or null when the update didn't complete within `timeout`. The
-/// update goes on in the workflow either way.
+/// The previous greeting, or null when no reply came within `timeout`. A null leaves
+/// delivery unknown: the timeout can end the call before the server has the update. Calling
+/// again is safe: it sends the same update ID, which the server runs once per workflow run,
+/// so the call returns the result of the update already delivered, or delivers it now.
 pub fn setGreetingWithin(client: *temporal.client.Client, io: Io, arena: Allocator, workflow_id: []const u8, timeout: Io.Duration) !?[]const u8 {
     var buffer: [2]Reply = undefined;
     var select: Io.Select(Reply) = .init(io, &buffer);

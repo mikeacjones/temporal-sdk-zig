@@ -247,8 +247,10 @@ fn setGreeting(client: *temporal.client.Client, arena: Allocator, workflow_id: [
     return update.get(arena);
 }
 
-/// The previous greeting, or null when the update didn't complete within `timeout`. The
-/// update goes on in the workflow either way.
+/// The previous greeting, or null when no reply came within `timeout`. A null leaves
+/// delivery unknown: the timeout can end the call before the server has the update. Calling
+/// again is safe: it sends the same update ID, which the server runs once per workflow run,
+/// so the call returns the result of the update already delivered, or delivers it now.
 pub fn setGreetingWithin(client: *temporal.client.Client, io: Io, arena: Allocator, workflow_id: []const u8, timeout: Io.Duration) !?[]const u8 {
     var buffer: [2]Reply = undefined;
     var select: Io.Select(Reply) = .init(io, &buffer);
@@ -427,6 +429,82 @@ test "client: connecting compiles" {
     _ = &transportExample;
 }
 
+/// A client interceptor that holds every UpdateWorkflowExecution request until the call is
+/// canceled, so no update is ever sent.
+const UpdateBlocker = struct {
+    io: Io,
+    never: Io.Event = .unset,
+    /// How many requests it held.
+    held: std.atomic.Value(u32) = .init(0),
+
+    pub fn call(b: *UpdateBlocker, input: *temporal.interceptor.ClientCall, next: temporal.interceptor.Client.Next) temporal.interceptor.ClientError!void {
+        if (std.mem.eql(u8, input.method, "UpdateWorkflowExecution")) {
+            _ = b.held.fetchAdd(1, .monotonic);
+            try b.never.wait(b.io);
+        }
+        return next.call(input);
+    }
+};
+
+pub const Proceed = workflow.SignalDef("proceed", fn () void);
+pub const UpdateCount = workflow.QueryDef("update_count", fn () u32);
+/// Like `GreeterWorkflow`, but its `SetGreeting` handler sets the greeting, counts the
+/// update, and then waits for `Proceed` before it returns.
+pub const SlowGreeterWorkflow = workflow.Def("slow_greeter", slowGreeter);
+
+const SlowGreeter = struct {
+    ctx: *workflow.Context,
+    greeting: []const u8 = "Hello",
+    updates: u32 = 0,
+    proceeded: bool = false,
+    done: bool = false,
+
+    fn current(s: *SlowGreeter) []const u8 {
+        return s.greeting;
+    }
+
+    fn updateCount(s: *SlowGreeter) u32 {
+        return s.updates;
+    }
+
+    fn proceed(s: *SlowGreeter) void {
+        s.proceeded = true;
+    }
+
+    fn finish(s: *SlowGreeter) void {
+        s.done = true;
+    }
+
+    fn setGreeting(s: *SlowGreeter, greeting: []const u8) ![]const u8 {
+        const previous = s.greeting;
+        s.greeting = greeting;
+        s.updates += 1;
+        try s.ctx.await(s, hasProceeded);
+        return previous;
+    }
+
+    fn hasProceeded(s: *SlowGreeter) bool {
+        return s.proceeded;
+    }
+
+    fn isDone(s: *SlowGreeter) bool {
+        return s.done;
+    }
+};
+
+fn slowGreeter(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    const s = try ctx.allocator().create(SlowGreeter);
+    s.* = .{ .ctx = ctx };
+    try ctx.setQueryHandler(CurrentGreeting, s, SlowGreeter.current);
+    try ctx.setQueryHandler(UpdateCount, s, SlowGreeter.updateCount);
+    try ctx.setSignalHandler(Proceed, s, SlowGreeter.proceed);
+    try ctx.setSignalHandler(Finish, s, SlowGreeter.finish);
+    try ctx.setUpdateHandler(SetGreeting, s, SlowGreeter.setGreeting);
+    try ctx.await(s, SlowGreeter.isDone);
+    try ctx.await(ctx, workflow.Context.allHandlersFinished);
+    return std.fmt.allocPrint(ctx.allocator(), "{s}, {s}!", .{ s.greeting, name });
+}
+
 test "client: examples against a dev server" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -453,6 +531,7 @@ test "client: examples against a dev server" {
     defer w.deinit();
     try w.registerWorkflow(Greeting);
     try w.registerWorkflow(GreeterWorkflow);
+    try w.registerWorkflow(SlowGreeterWorkflow);
     try w.registerWorkflow(GreetLaterWorkflow);
     try w.registerActivity(Greet);
     try w.registerActivityWith(GreetLater, &outbox);
@@ -489,9 +568,37 @@ test "client: examples against a dev server" {
     try std.testing.expectEqualStrings("Hello, Ivy!", try signaled_by_name.get(arena));
     var bounded = try client.executeWorkflow(GreeterWorkflow, .{ .id = "greeter-5", .task_queue = "greetings" }, .{"Mo"});
     defer bounded.deinit();
+    {
+        // The timeout fires before the update is sent: the interceptor holds the request
+        // until the call is canceled, so the workflow never sees it.
+        var blocker: UpdateBlocker = .{ .io = io };
+        const interceptors = [_]temporal.interceptor.Client{.from(UpdateBlocker, &blocker)};
+        var options = server.clientOptions();
+        options.interceptors = &interceptors;
+        var blocking_client = try temporal.client.Client.connect(gpa, io, options);
+        defer blocking_client.close();
+        try std.testing.expectEqual(null, try setGreetingWithin(&blocking_client, io, arena, bounded.id, .fromSeconds(1)));
+        try std.testing.expectEqual(1, blocker.held.load(.monotonic));
+    }
+    try std.testing.expectEqualStrings("Hello", try client.queryWorkflow(CurrentGreeting, arena, bounded.id, "", .{}));
+    // Calling again delivers it.
     try std.testing.expectEqualStrings("Hello", (try setGreetingWithin(&client, io, arena, bounded.id, .fromSeconds(30))).?);
+    try std.testing.expectEqualStrings("Hey", try client.queryWorkflow(CurrentGreeting, arena, bounded.id, "", .{}));
     try client.signalWorkflow(Finish, bounded.id, "", .{});
     try std.testing.expectEqualStrings("Hey, Mo!", try bounded.get(arena));
+
+    // The timeout fires after the server accepted the update: its handler waits for
+    // `Proceed`. The workflow saw the update, and calling again with the same update ID
+    // returns its result without running it twice.
+    var slow = try client.executeWorkflow(SlowGreeterWorkflow, .{ .id = "greeter-slow", .task_queue = "greetings" }, .{"Mo"});
+    defer slow.deinit();
+    try std.testing.expectEqual(null, try setGreetingWithin(&client, io, arena, slow.id, .fromSeconds(5)));
+    try std.testing.expectEqualStrings("Hey", try client.queryWorkflow(CurrentGreeting, arena, slow.id, "", .{}));
+    try client.signalWorkflow(Proceed, slow.id, "", .{});
+    try std.testing.expectEqualStrings("Hello", (try setGreetingWithin(&client, io, arena, slow.id, .fromSeconds(30))).?);
+    try std.testing.expectEqual(1, try client.queryWorkflow(UpdateCount, arena, slow.id, "", .{}));
+    try client.signalWorkflow(Finish, slow.id, "", .{});
+    try std.testing.expectEqualStrings("Hey, Mo!", try slow.get(arena));
 
     try manageWorkflows(&client, arena);
 

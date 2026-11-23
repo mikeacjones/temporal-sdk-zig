@@ -144,35 +144,43 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, program, "worker")) sample.worker = exe else sample.starter = exe;
     }
 
+    const selected = selectSamples(arena, samples.items, only) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnknownSample => {
+            var names: std.ArrayList(u8) = .empty;
+            for (samples.items, 0..) |sample, i| {
+                if (i > 0) try names.appendSlice(arena, ", ");
+                try names.appendSlice(arena, sample.name);
+            }
+            std.log.err("--only {s}: no sample has that name; the samples are: {s}", .{ only.?, names.items });
+            std.process.exit(1);
+        },
+    };
+
     const root = try Io.Dir.cwd().openDir(io, root_path, .{});
     const work = try Io.Dir.cwd().openDir(io, work_path, .{});
     // Docker mounts need absolute paths.
     const root_abs = try Io.Dir.cwd().realPathFileAlloc(io, root_path, arena);
     const work_abs = try Io.Dir.cwd().realPathFileAlloc(io, work_path, arena);
 
-    var selected: std.ArrayList(Sample) = .empty;
-    for (samples.items) |sample| {
-        if (only) |o| if (!std.mem.eql(u8, o, sample.name)) continue;
-        try selected.append(arena, sample);
-    }
-    const results = try arena.alloc(Result, selected.items.len);
-    const arenas = try arena.alloc(std.heap.ArenaAllocator, selected.items.len);
+    const results = try arena.alloc(Result, selected.len);
+    const arenas = try arena.alloc(std.heap.ArenaAllocator, selected.len);
     for (arenas) |*a| a.* = .init(gpa);
     defer for (arenas) |*a| a.deinit();
     var needs_docker = false;
-    for (selected.items, arenas) |*sample, *a| {
+    for (selected, arenas) |*sample, *a| {
         sample.manifest = readManifest(gpa, io, a.allocator(), root, sample.name);
         const m = sample.manifest orelse continue;
         if (m.docker_server != null) needs_docker = true;
         sample.setup_failure = checkManifest(a.allocator(), m);
     }
-    for (selected.items, arenas, 0..) |*sample, *a, i| {
-        if (sample.setup_failure == null) sample.setup_failure = endpointConflict(a.allocator(), selected.items, i);
+    for (selected, arenas, 0..) |*sample, *a, i| {
+        if (sample.setup_failure == null) sample.setup_failure = endpointConflict(a.allocator(), selected, i);
     }
 
-    var server = try startDevServer(gpa, io, arena, selected.items);
+    var server = try startDevServer(gpa, io, arena, selected);
     errdefer server.stop(io);
-    createNexusEndpoints(gpa, io, &server, selected.items, arenas);
+    createNexusEndpoints(gpa, io, &server, selected, arenas);
 
     // An empty config file: the children read only TEMPORAL_ADDRESS and TEMPORAL_NAMESPACE.
     try work.writeFile(io, .{ .sub_path = "empty-temporal-config.toml", .data = "" });
@@ -186,9 +194,9 @@ pub fn main(init: std.process.Init) !void {
     try env.put("TEMPORAL_CONFIG_FILE", config_path);
 
     const docker: Docker = if (needs_docker) prepareDocker(gpa, io, arena) else .unused;
-    var queue: Queue = .{ .samples = selected.items, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env, .docker = docker, .root_abs = root_abs, .work_abs = work_abs };
+    var queue: Queue = .{ .samples = selected, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env, .docker = docker, .root_abs = root_abs, .work_abs = work_abs };
     var lanes: Io.Group = .init;
-    for (0..@min(jobs, selected.items.len)) |_| lanes.concurrent(io, runLane, .{ gpa, io, &queue }) catch {
+    for (0..@min(jobs, selected.len)) |_| lanes.concurrent(io, runLane, .{ gpa, io, &queue }) catch {
         // No thread for another lane: this one and any started before it share the queue.
         runLane(gpa, io, &queue);
         break;
@@ -251,6 +259,18 @@ fn runLane(gpa: Allocator, io: Io, queue: *Queue) void {
             .fail, .skip => |detail| detail,
         }, .seconds = seconds };
     }
+}
+
+/// The samples `only` names (all of them when it is null). `only` naming no sample is an
+/// error rather than an empty selection, which would run nothing and pass.
+fn selectSamples(arena: Allocator, samples: []const Sample, only: ?[]const u8) error{ OutOfMemory, UnknownSample }![]Sample {
+    var selected: std.ArrayList(Sample) = .empty;
+    for (samples) |sample| {
+        if (only) |o| if (!std.mem.eql(u8, o, sample.name)) continue;
+        try selected.append(arena, sample);
+    }
+    if (only != null and selected.items.len == 0) return error.UnknownSample;
+    return selected.toOwnedSlice(arena);
 }
 
 fn usage() noreturn {
@@ -429,20 +449,29 @@ fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path
     var argv: std.ArrayList([]const u8) = .empty;
     argv.append(arena, starter_exe) catch return "out of memory";
     argv.appendSlice(arena, manifest.starter_args) catch return "out of memory";
-    const starter = std.process.run(gpa, io, .{
-        .argv = argv.items,
-        .environ_map = &starter_env,
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(manifest.timeout_seconds), .clock = .awake } },
-    }) catch |err| {
-        std.log.err("{s}: starter did not finish: {t}", .{ sample.name, err });
-        showLog(io, arena, work, work_path, log_name);
-        return "starter did not finish in time";
+    const starter = runBounded(gpa, io, argv.items, &starter_env, .fromSeconds(manifest.timeout_seconds)) catch |err| switch (err) {
+        error.SpawnFailed => {
+            std.log.err("{s}: starter failed to start", .{sample.name});
+            return "starter failed to start";
+        },
+        error.OutOfMemory => return "out of memory",
+        error.ReadFailed => {
+            std.log.err("{s}: reading the starter's output failed", .{sample.name});
+            showLog(io, arena, work, work_path, log_name);
+            return "reading the starter's output failed";
+        },
     };
     defer gpa.free(starter.stdout);
     defer gpa.free(starter.stderr);
 
     const output = std.mem.concat(arena, u8, &.{ starter.stdout, starter.stderr }) catch return "out of memory";
-    const starter_ok = switch (starter.term) {
+    const starter_term = starter.term orelse {
+        std.log.err("{s}: starter did not finish within {d}s; killed it", .{ sample.name, manifest.timeout_seconds });
+        std.log.err("{s}: starter output:\n{s}", .{ sample.name, output });
+        showLog(io, arena, work, work_path, log_name);
+        return "starter did not finish in time";
+    };
+    const starter_ok = switch (starter_term) {
         .exited => |code| code == 0,
         else => false,
     };
@@ -467,6 +496,111 @@ fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path
     if (worker_code == null) return "worker did not stop within 20s of SIGTERM";
     if (worker_code.? != 0) return std.fmt.allocPrint(arena, "worker exited with status {d} after SIGTERM", .{worker_code.?}) catch "worker exited with an error";
     return null;
+}
+
+/// What `runBounded` saw of a program it ran.
+const Bounded = struct {
+    /// How it ended, or null when `limit` passed and it was killed.
+    term: ?std.process.Child.Term,
+    /// Everything it wrote before it ended or was killed; the caller frees both with `gpa`.
+    stdout: []u8,
+    stderr: []u8,
+};
+
+const BoundedError = error{ OutOfMemory, SpawnFailed, ReadFailed };
+
+/// Runs `argv`, collecting its output, for at most `limit` counted from the start, however
+/// much it prints; it also limits the wait for the exit after the output closes. At the
+/// deadline it sends SIGKILL and reaps the process.
+///
+/// `std.process.run` can't do this: it passes its timeout to every read as a fresh duration,
+/// so it limits only silence, and it waits for the exit with no limit at all.
+fn runBounded(gpa: Allocator, io: Io, argv: []const []const u8, environ_map: ?*const std.process.Environ.Map, limit: Io.Duration) BoundedError!Bounded {
+    const deadline = (Io.Timeout{ .duration = .{ .raw = limit, .clock = .awake } }).toDeadline(io);
+    const deadline_ts = deadline.deadline;
+
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .environ_map = environ_map,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return error.SpawnFailed;
+    // Runs after the reader below is torn down, so no read is pending on the pipes it closes.
+    // `Child.kill` sends SIGTERM and then blocks until the process exits, so SIGKILL goes
+    // first: a program that handles SIGTERM must not hang the runner. Does nothing once the
+    // child has been reaped (`id` is then null), so a reaped PID is never signaled.
+    defer if (child.id) |pid| {
+        std.posix.kill(pid, .KILL) catch {};
+        child.kill(io);
+    };
+
+    var buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var reader: Io.File.MultiReader = undefined;
+    reader.init(gpa, io, buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer reader.deinit();
+
+    const timed_out = while (true) {
+        // A program that writes without pause could keep `fill` returning data; the deadline
+        // still ends the run.
+        if (pastDeadline(io, deadline_ts)) break true;
+        reader.fill(1024, deadline) catch |err| switch (err) {
+            error.EndOfStream => break false,
+            error.Timeout => break true,
+            error.Canceled, error.ConcurrencyUnavailable => return error.ReadFailed,
+        };
+    };
+
+    if (timed_out) {
+        // The deferred kill stops and reaps the child. Reads may still be pending into the space after the buffered bytes, so copy what is
+        // buffered rather than taking the buffers.
+        const stdout = try gpa.dupe(u8, reader.reader(0).buffered());
+        errdefer gpa.free(stdout);
+        const stderr = try gpa.dupe(u8, reader.reader(1).buffered());
+        return .{ .term = null, .stdout = stdout, .stderr = stderr };
+    }
+
+    reader.checkAnyError() catch return error.ReadFailed;
+    const stdout = try reader.toOwnedSlice(0);
+    errdefer gpa.free(stdout);
+    const stderr = try reader.toOwnedSlice(1);
+    errdefer gpa.free(stderr);
+
+    // Both pipes are closed; wait for the exit until the same deadline.
+    const pid = child.id.?;
+    while (true) {
+        var status: c_int = 0;
+        const r = std.c.waitpid(pid, &status, 1); // WNOHANG
+        if (r == pid) {
+            reaped(io, &child);
+            return .{ .term = std.Io.Threaded.statusToTerm(@bitCast(status)), .stdout = stdout, .stderr = stderr };
+        }
+        if (r < 0 and std.posix.errno(r) != .INTR) {
+            // Only this function reaps the child, so this is not expected; the child can't be
+            // waited for, and must not be signaled.
+            reaped(io, &child);
+            return .{ .term = .{ .unknown = 0 }, .stdout = stdout, .stderr = stderr };
+        }
+        const left = deadline_ts.durationFromNow(io).raw;
+        if (left.nanoseconds <= 0) break;
+        const step: Io.Duration = .fromNanoseconds(@min(left.nanoseconds, Io.Duration.fromMilliseconds(50).nanoseconds));
+        io.sleep(step, .awake) catch return error.ReadFailed;
+    }
+    // The deferred kill sends SIGKILL and reaps it.
+    return .{ .term = null, .stdout = stdout, .stderr = stderr };
+}
+
+fn pastDeadline(io: Io, deadline: Io.Clock.Timestamp) bool {
+    return deadline.durationFromNow(io).raw.nanoseconds <= 0;
+}
+
+/// Leaves `child`, which `waitpid` has reaped, as `Child.wait` would: pipes closed, no ID.
+fn reaped(io: Io, child: *std.process.Child) void {
+    inline for (.{ "stdin", "stdout", "stderr" }) |name| if (@field(child, name)) |file| {
+        file.close(io);
+        @field(child, name) = null;
+    };
+    child.id = null;
 }
 
 /// Waits up to `seconds` for `pid` to exit. Returns its exit status (128 + signal number if
@@ -870,4 +1004,72 @@ test "a program whose module has no error tracing decodes the SDK's protobuf mes
     var reader: std.Io.Reader = .fixed(encoded.written());
     const received = try temporal.Failure.decode(&reader, a);
     try std.testing.expectEqualStrings("card declined", received.message);
+}
+
+fn expectKilledWithin(io: Io, started: Io.Timestamp, bound: Io.Duration) !void {
+    const elapsed = started.durationTo(Io.Timestamp.now(io, .awake));
+    if (elapsed.nanoseconds >= bound.nanoseconds) {
+        std.debug.print("killed after {d} ms\n", .{elapsed.toMilliseconds()});
+        return error.TestKilledTooLate;
+    }
+}
+
+test "a starter is killed at its deadline however much it prints" {
+    const io = testing.io;
+    const started = Io.Timestamp.now(io, .awake);
+    const result = try runBounded(testing.allocator, io, &.{ "/bin/sh", "-c", "while :; do echo tick; sleep 0.05; done" }, null, .fromSeconds(1));
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try expectKilledWithin(io, started, .fromSeconds(5));
+    try testing.expectEqual(null, result.term);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "tick") != null);
+}
+
+test "a starter that closes its output and keeps running is killed at its deadline" {
+    const io = testing.io;
+    const started = Io.Timestamp.now(io, .awake);
+    const result = try runBounded(testing.allocator, io, &.{ "/bin/sh", "-c", "exec >&- 2>&-; exec sleep 30" }, null, .fromSeconds(1));
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try expectKilledWithin(io, started, .fromSeconds(5));
+    try testing.expectEqual(null, result.term);
+}
+
+test "a starter that ignores SIGTERM is still killed at its deadline" {
+    const io = testing.io;
+    const started = Io.Timestamp.now(io, .awake);
+    const result = try runBounded(testing.allocator, io, &.{ "/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.05; done" }, null, .fromSeconds(1));
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try expectKilledWithin(io, started, .fromSeconds(5));
+    try testing.expectEqual(null, result.term);
+}
+
+test "a starter that exits reports its status and output" {
+    const io = testing.io;
+    const result = try runBounded(testing.allocator, io, &.{ "/bin/sh", "-c", "echo out; echo err >&2; exit 3" }, null, .fromSeconds(10));
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 3 }, result.term.?);
+    try testing.expectEqualStrings("out\n", result.stdout);
+    try testing.expectEqualStrings("err\n", result.stderr);
+}
+
+test "a program that can't be started is reported as such" {
+    try testing.expectError(error.SpawnFailed, runBounded(testing.allocator, testing.io, &.{"/nonexistent/samples-runner-test"}, null, .fromSeconds(1)));
+}
+
+test "--only selects a known sample and rejects an unknown one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const samples = [_]Sample{ .{ .name = "helloworld" }, .{ .name = "timer" }, .{ .name = "mutex" } };
+    try testing.expectError(error.UnknownSample, selectSamples(a, &samples, "helloworl"));
+    try testing.expectError(error.UnknownSample, selectSamples(a, &samples, ""));
+    const one = try selectSamples(a, &samples, "timer");
+    try testing.expectEqual(1, one.len);
+    try testing.expectEqualStrings("timer", one[0].name);
+    const all = try selectSamples(a, &samples, null);
+    try testing.expectEqual(3, all.len);
+    try testing.expectEqualStrings("mutex", all[2].name);
 }
