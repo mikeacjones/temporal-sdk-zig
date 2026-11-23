@@ -874,8 +874,8 @@ pub const WorkflowEnvironment = struct {
         if (run.run_id.len == 0) {
             var scratch: std.heap.ArenaAllocator = .init(env.gpa);
             defer scratch.deinit();
-            const latest = try env.client.describeWorkflow(scratch.allocator(), run.id, "");
-            const pinned = try run.client.gpa.dupe(u8, latest.run_id);
+            const latest_run_id = try env.client.latestRunId(scratch.allocator(), run.id);
+            const pinned = try run.client.gpa.dupe(u8, latest_run_id);
             run.client.gpa.free(run.run_id);
             run.run_id = pinned;
         }
@@ -9023,6 +9023,128 @@ const ReversingCodec = struct {
         return out;
     }
 };
+
+/// A codec whose decode fails with `error.CodecFailed` on a payload of encoding
+/// `binary/poison` and passes every other payload through, as does its encode.
+const PoisonCodec = struct {
+    const encoding = "binary/poison";
+    const vtable: converter.PayloadCodec.VTable = .{ .encode = pass, .decode = decode };
+
+    fn codec() converter.PayloadCodec {
+        return .{ .ptr = @ptrCast(@constCast(&vtable)), .vtable = &vtable };
+    }
+
+    fn pass(_: *anyopaque, _: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return @constCast(payloads);
+    }
+
+    fn decode(_: *anyopaque, _: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        for (payloads) |p| if (std.mem.eql(u8, converter.encodingOf(p) orelse "", encoding)) return error.CodecFailed;
+        return @constCast(payloads);
+    }
+};
+
+const PoisonFixtures = struct {
+    /// Set once getResult has described the run, which lets `Hold` return.
+    var release: Io.Event = .unset;
+
+    /// Heartbeats a payload the codec can't decode, which only the run's description holds
+    /// (no history event or activation carries a successful attempt's heartbeat details),
+    /// then waits for `release`.
+    fn hold(ctx: *activity.Context) ![]const u8 {
+        ctx.heartbeat(try converter.payloadWithEncoding(ctx.allocator(), PoisonCodec.encoding, "written by another codec"));
+        try release.wait(ctx.io());
+        return "done";
+    }
+    const Hold = activity.Def("PoisonHold", hold);
+
+    fn holding(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeActivity(Hold, .{ .start_to_close_timeout = .fromSeconds(60) }, .{}).get();
+    }
+    const Holding = workflow.Def("PoisonHolding", holding);
+
+    /// Sets `release` once a DescribeWorkflowExecution call returns after `armed` is set.
+    const ReleaseOnDescribe = struct {
+        armed: std.atomic.Value(bool) = .init(false),
+
+        pub fn call(_: *ReleaseOnDescribe, input: *interceptor.ClientCall, next: interceptor.Client.Next) interceptor.ClientError!void {
+            defer if (input.request(proto.temporal.api.workflowservice.v1.DescribeWorkflowExecutionRequest) != null and release_on_describe.armed.load(.acquire)) release.set(testing.io);
+            return next.call(input);
+        }
+    };
+    var release_on_describe: ReleaseOnDescribe = .{};
+
+    /// Waits until `Hold`'s heartbeat reaches the server: until then the run's description
+    /// decodes, and after it the public describe fails with `error.CodecFailed`, as it must.
+    fn waitForPoisonedDescription(env: *WorkflowEnvironment, id: []const u8) !void {
+        for (0..500) |_| {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            _ = env.client.describeWorkflow(scratch.allocator(), id, "") catch |err| switch (err) {
+                error.CodecFailed => return,
+                else => |e| return e,
+            };
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        return error.HeartbeatNeverDescribed;
+    }
+};
+
+test "WorkflowEnvironment.getResult pins a handle with no run ID when the run's description holds a payload the codecs can't decode" {
+    testing.log_level = .err; // describeWorkflow's codec failure is logged as a warning.
+    PoisonFixtures.release.reset();
+    PoisonFixtures.release_on_describe.armed.store(false, .release);
+    const codecs = [_]converter.PayloadCodec{PoisonCodec.codec()};
+    const interceptors = [_]interceptor.Client{interceptor.Client.from(PoisonFixtures.ReleaseOnDescribe, &PoisonFixtures.release_on_describe)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs, .interceptors = &interceptors });
+    defer env.deinit();
+    // Whatever happens, the activity must not keep the worker from stopping.
+    defer PoisonFixtures.release.set(testing.io);
+    try env.registerWorkflow(PoisonFixtures.Holding);
+    try env.registerActivity(PoisonFixtures.Hold);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var started = try env.startWorkflow(PoisonFixtures.Holding, .{ .task_queue = "" }, .{});
+    defer started.deinit();
+    try PoisonFixtures.waitForPoisonedDescription(env, started.id);
+
+    // The pin's describe is the first after arming, and the activity returns once it is done.
+    PoisonFixtures.release_on_describe.armed.store(true, .release);
+    var latest = try env.client.getWorkflow([]const u8, started.id, "");
+    defer latest.deinit();
+    try testing.expectEqualStrings("done", try env.getResult(PoisonFixtures.Holding, &latest, a, null));
+    try testing.expectEqualStrings(started.run_id, latest.run_id);
+}
+
+test "WorkflowEnvironment.getResultByNameWithOptions pins a handle with no run ID without decoding the run's description" {
+    testing.log_level = .err; // describeWorkflow's codec failure is logged as a warning.
+    PoisonFixtures.release.reset();
+    PoisonFixtures.release_on_describe.armed.store(false, .release);
+    const codecs = [_]converter.PayloadCodec{PoisonCodec.codec()};
+    const interceptors = [_]interceptor.Client{interceptor.Client.from(PoisonFixtures.ReleaseOnDescribe, &PoisonFixtures.release_on_describe)};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs, .interceptors = &interceptors });
+    defer env.deinit();
+    defer PoisonFixtures.release.set(testing.io);
+    try env.registerWorkflow(PoisonFixtures.Holding);
+    try env.registerActivity(PoisonFixtures.Hold);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var started = try env.startWorkflowByName([]const u8, "PoisonHolding", .{ .task_queue = "" }, .{});
+    defer started.deinit();
+    try PoisonFixtures.waitForPoisonedDescription(env, started.id);
+
+    PoisonFixtures.release_on_describe.armed.store(true, .release);
+    var latest = try env.client.getWorkflow([]const u8, started.id, "");
+    defer latest.deinit();
+    try testing.expectEqualStrings("done", try env.getResultByNameWithOptions([]const u8, &latest, .{ .follow_runs = false }, a, null));
+    try testing.expectEqualStrings(started.run_id, latest.run_id);
+    // The run is closed and its activity gone, so the description decodes again.
+    _ = try env.client.describeWorkflow(a, started.id, "");
+}
 
 const CodecFixtures = struct {
     const Note = workflow.SignalDef("note", fn (text: []const u8) void);
