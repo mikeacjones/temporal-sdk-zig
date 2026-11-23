@@ -183,6 +183,105 @@ test "batch rejects a window smaller than the number of partitions" {
     try testing.expectEqualStrings("invalidInput", failure.?.failure_info.?.application_failure_info.type);
 }
 
+/// Runs `Workflow` with `args`, expects it to fail with `message` and `failure_type`, and
+/// expects its single run to have scheduled no activity, started no child and not continued as
+/// new.
+fn expectRejected(
+    env: *temporal.testing.WorkflowEnvironment,
+    comptime Workflow: type,
+    args: Workflow.Args,
+    message: []const u8,
+    failure_type: []const u8,
+) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Bounded twice, so a workflow that accepts the input fails the test instead of hanging it:
+    // the timeout ends a batch whose children never finish, and reading only the first run
+    // stops at a sliding window that continues as new.
+    var run = try env.startWorkflow(Workflow, .{ .task_queue = "", .execution_timeout = .fromSeconds(60) }, args);
+    defer run.deinit();
+    var failure: ?temporal.failure.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.getResultWithOptions(Workflow, &run, .{ .follow_runs = false }, a, &failure));
+    try testing.expectEqualStrings(message, failure.?.message);
+    try testing.expectEqualStrings(failure_type, failure.?.failure_info.?.application_failure_info.type);
+
+    const events = (try env.client.fetchHistory(a, run.id, run.run_id)).events.items;
+    try testing.expect(events[events.len - 1].attributes.? == .workflow_execution_failed_event_attributes);
+    for (events) |event| switch (event.attributes.?) {
+        .activity_task_scheduled_event_attributes,
+        .start_child_workflow_execution_initiated_event_attributes,
+        => return error.TestUnexpectedEvent,
+        else => {},
+    };
+}
+
+test "batch rejects a page size of 0 before loading anything" {
+    const env = try temporal.testing.WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    var loader: sample.RecordLoader = .{ .record_count = 10 };
+    try registerAll(env, &loader);
+
+    try expectRejected(env, sample.ProcessBatchWorkflow, .{.{ .page_size = 0, .sliding_window_size = 10, .partitions = 3 }}, "page_size must be at least 1", "invalidInput");
+    // The window check also comes before the record count is loaded.
+    try expectRejected(env, sample.ProcessBatchWorkflow, .{.{ .page_size = 5, .sliding_window_size = 2, .partitions = 3 }}, "sliding_window_size 2 cannot be less than the number of partitions 3, which must be at least 1", "invalidInput");
+}
+
+test "sliding window rejects a page size or a window size of 0" {
+    const env = try temporal.testing.WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    var loader: sample.RecordLoader = .{ .record_count = 10 };
+    try registerAll(env, &loader);
+
+    try expectRejected(env, sample.SlidingWindowWorkflow, .{.{ .page_size = 0, .sliding_window_size = 3, .offset = 0, .maximum_offset = 10 }}, "page_size must be at least 1", "invalidInput");
+    try expectRejected(env, sample.SlidingWindowWorkflow, .{.{ .page_size = 5, .sliding_window_size = 0, .offset = 0, .maximum_offset = 10 }}, "sliding_window_size must be at least 1", "invalidInput");
+}
+
+/// A `GetRecords` that finds no records, wherever it is asked to look.
+fn emptyRecords(ctx: *temporal.activity.Context, input: sample.GetRecordsInput) !sample.GetRecordsOutput {
+    _ = ctx;
+    _ = input;
+    return .{};
+}
+
+test "sliding window fails when the loader returns an empty page before the end of its range" {
+    const env = try temporal.testing.WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(sample.SlidingWindowWorkflow);
+    try env.registerWorkflow(sample.RecordProcessorWorkflow);
+    try env.registerActivityAs(sample.GetRecords, emptyRecords);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(sample.SlidingWindowWorkflow, .{ .task_queue = "" }, .{.{ .page_size = 5, .sliding_window_size = 3, .offset = 4, .maximum_offset = 10 }});
+    defer run.deinit();
+    var failure: ?temporal.failure.Failure = null;
+    // Only the first run, so one that continues as new fails the test instead of hanging it.
+    try testing.expectError(error.WorkflowFailed, env.getResultWithOptions(sample.SlidingWindowWorkflow, &run, .{ .follow_runs = false }, a, &failure));
+    try testing.expectEqualStrings("GetRecords returned no records at offset 4, before maximum_offset 10", failure.?.message);
+    try testing.expectEqualStrings("emptyPage", failure.?.failure_info.?.application_failure_info.type);
+
+    // The run started no child.
+    const events = (try env.client.fetchHistory(a, run.id, run.run_id)).events.items;
+    for (events) |event| try testing.expect(event.attributes.? != .start_child_workflow_execution_initiated_event_attributes);
+}
+
+test "sliding window over a complete, empty range returns its progress" {
+    const env = try temporal.testing.WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(sample.SlidingWindowWorkflow);
+    try env.registerWorkflow(sample.RecordProcessorWorkflow);
+    // Never called: the range is already complete.
+    try env.registerActivityAs(sample.GetRecords, emptyRecords);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(0, try env.executeWorkflow(sample.SlidingWindowWorkflow, .{.{ .page_size = 5, .sliding_window_size = 3, .offset = 0, .maximum_offset = 0 }}, arena.allocator(), null));
+}
+
 test "record loader pages through its records up to the maximum offset" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
