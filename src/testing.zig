@@ -13,6 +13,7 @@
 //!   nondeterministic changes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
 const proto_time = @import("proto_time.zig");
@@ -38,6 +39,33 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const log = std.log.scoped(.temporal);
+
+// Test hook, read only when builtin.is_test. Tests that set it reset it.
+/// The next N re-locks of time skipping in `WorkflowEnvironment.getResultByNameWithOptions`
+/// fail with `error.RpcFailed` without sending LockTimeSkipping, leaving the server unlocked.
+var test_relock_failures: std.atomic.Value(u32) = .init(0);
+
+fn takeRelockFailure() bool {
+    var n = test_relock_failures.load(.monotonic);
+    while (n > 0) {
+        n = test_relock_failures.cmpxchgWeak(n, n - 1, .monotonic, .monotonic) orelse return true;
+    }
+    return false;
+}
+
+// Test hook, read only when builtin.is_test. Tests that set it reset it.
+/// When set, `logTimeLockLost` writes its line here, with a newline, instead of logging it.
+var test_time_lock_log: ?*Io.Writer = null;
+
+/// Logs that `method` failed in `getResult`, losing the environment's time lock.
+fn logTimeLockLost(comptime method: []const u8, err: anyerror) void {
+    const format = "WorkflowEnvironment.getResult: " ++ method ++ " failed ({t}); the time-skipping server's time lock is unknown and time may keep skipping, so the environment can't be used again";
+    if (builtin.is_test) if (test_time_lock_log) |w| {
+        w.print(format ++ "\n", .{err}) catch {};
+        return;
+    };
+    log.err(format, .{err});
+}
 
 /// A local dev server for tests.
 pub const DevServer = struct {
@@ -283,6 +311,9 @@ fn serviceCall(client: *client_mod.Client, service: bridge.Connection.Service, c
 /// workflow waiting for a signal or an update would otherwise skip straight to its execution
 /// timeout. Let an update handler's sleep pass with `sleep` (see `updateWorkflow`).
 ///
+/// When `getResult` can't lock time skipping again, the environment is unusable: its calls
+/// that start, drive or wait on workflows, `sleep` and `now` return `error.TimeLockLost`.
+///
 /// Not thread-safe: use an environment from one task at a time.
 pub const WorkflowEnvironment = struct {
     gpa: Allocator,
@@ -293,6 +324,11 @@ pub const WorkflowEnvironment = struct {
     task_queue: []u8,
     running: ?Io.Future(worker_mod.Worker.RunError!void) = null,
     next_id: u32 = 0,
+    /// Set when `getResult` on the time-skipping server failed to unlock or to lock time
+    /// skipping again. Once set, the server's time lock count is unknown (time may be
+    /// skipping), so the environment can't be used for time-dependent calls: they return
+    /// `error.TimeLockLost`. Never cleared.
+    time_lock_lost: bool = false,
 
     pub const Server = union(enum) {
         dev: DevServer,
@@ -414,6 +450,7 @@ pub const WorkflowEnvironment = struct {
         env.io = io;
         env.running = null;
         env.next_id = 0;
+        env.time_lock_lost = false;
         var client_options = switch (kind) {
             .dev => blk: {
                 env.server = .{ .dev = try DevServer.start(gpa, io, .{ .search_attributes = &custom_search_attributes, .extra_args = options.dev_server_extra_args }) };
@@ -572,6 +609,7 @@ pub const WorkflowEnvironment = struct {
         options: client_mod.StartWorkflowOptions,
         args: Workflow.Args,
     ) !client_mod.WorkflowRun(Workflow.Result) {
+        try env.checkTimeLock();
         try env.ensureWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
@@ -604,6 +642,7 @@ pub const WorkflowEnvironment = struct {
         options: client_mod.StartWorkflowOptions,
         args: anytype,
     ) !client_mod.WorkflowRun(Result) {
+        try env.checkTimeLock();
         try env.ensureWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
@@ -613,6 +652,7 @@ pub const WorkflowEnvironment = struct {
     /// Sends `Signal` with `args` to the latest run of `workflow_id`. Returns once the server
     /// has recorded the signal; time stays locked on the time-skipping server.
     pub fn signalWorkflow(env: *WorkflowEnvironment, comptime Signal: type, workflow_id: []const u8, args: Signal.Args) !void {
+        try env.checkTimeLock();
         return env.client.signalWorkflow(Signal, workflow_id, "", args);
     }
 
@@ -621,6 +661,7 @@ pub const WorkflowEnvironment = struct {
     /// locked on the time-skipping server, so a workflow in the middle of a timer answers
     /// without the timer firing.
     pub fn queryWorkflow(env: *WorkflowEnvironment, comptime Query: type, arena: Allocator, workflow_id: []const u8, args: Query.Args) !Query.Result {
+        try env.checkTimeLock();
         try env.ensureWorker();
         return env.client.queryWorkflow(Query, arena, workflow_id, "", args);
     }
@@ -644,6 +685,7 @@ pub const WorkflowEnvironment = struct {
         args: Update.Args,
         failure: ?*?failure_mod.Failure,
     ) !Update.Result {
+        try env.checkTimeLock();
         try env.ensureWorker();
         var handle = try env.client.updateWorkflow(Update, workflow_id, "", args, .{});
         defer handle.deinit();
@@ -667,6 +709,7 @@ pub const WorkflowEnvironment = struct {
         comptime Signal: type,
         signal_args: Signal.Args,
     ) !client_mod.WorkflowRun(Workflow.Result) {
+        try env.checkTimeLock();
         try env.ensureWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
@@ -689,6 +732,7 @@ pub const WorkflowEnvironment = struct {
         update_args: Update.Args,
         update_options: client_mod.UpdateOptions,
     ) !client_mod.WorkflowUpdateHandle(Update.Result) {
+        try env.checkTimeLock();
         try env.ensureWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
@@ -751,6 +795,25 @@ pub const WorkflowEnvironment = struct {
     /// replays that last run. On the time-skipping server, time skipping is unlocked for the
     /// wait. On `error.WorkflowFailed`, `failure` (if given) receives the workflow's failure.
     /// The run stays owned by the caller.
+    ///
+    /// If time skipping can't be unlocked, or locked again after the wait (the call failed,
+    /// for example out of memory or on a lost connection), it returns `error.TimeLockLost` in
+    /// place of the result and `failure` isn't written. The server's lock count is then
+    /// unknown and time may keep skipping, so the environment is unusable: its later calls
+    /// return `error.TimeLockLost` without reaching the server, and only `deinit` remains;
+    /// start a new environment. A failed unlock counts as lost even if it never reached the
+    /// server. The re-lock runs even when the task is canceled during the wait.
+    ///
+    /// On the time-skipping server, time may keep skipping between the run's close and the
+    /// re-lock: once the run closes, nothing holds the server's time lock until the re-lock
+    /// arrives, so the server skips ahead to its next pending timer, which may be years later.
+    /// That includes timers the closed run itself left behind, such as an `awaitTimeout`
+    /// timeout canceled when its condition came true, or a workflow task timeout, as well as
+    /// the timers and default run timeouts of other open runs, which may then time out. The
+    /// server has no call that locks together with the run's close. So `env.now()` afterwards
+    /// is only guaranteed to be no earlier than the close. For the close time, use
+    /// `close_time` from `env.client.describeWorkflow(arena, run.id, run.run_id)`, or
+    /// `ctx.now()` inside the workflow.
     pub fn getResult(
         env: *WorkflowEnvironment,
         comptime Workflow: type,
@@ -769,7 +832,8 @@ pub const WorkflowEnvironment = struct {
     /// an empty run ID (from `Client.getWorkflow(id, "")`) is first set to the run that is
     /// latest when the call starts, and that run is waited for and replayed. With
     /// `.follow_runs = true` it is `getResult`.
-    /// Time skipping is unlocked for the wait and locked again, as in `getResult`.
+    /// Time skipping is unlocked for the wait and locked again, as in `getResult`, which also
+    /// says when it returns `error.TimeLockLost`.
     pub fn getResultWithOptions(
         env: *WorkflowEnvironment,
         comptime Workflow: type,
@@ -803,6 +867,7 @@ pub const WorkflowEnvironment = struct {
         arena: Allocator,
         failure: ?*?failure_mod.Failure,
     ) !Result {
+        try env.checkTimeLock();
         // The wait, the outcome and the replay must all be of one run. An empty run ID names
         // whichever run is latest at each call, which a continue-as-new, retry or cron run
         // changes while the wait goes on, so the handle is pinned to the latest run first.
@@ -814,10 +879,10 @@ pub const WorkflowEnvironment = struct {
             run.client.gpa.free(run.run_id);
             run.run_id = pinned;
         }
-        const skipping = env.server == .time_skipping;
-        if (skipping) _ = try env.testService(ts.UnlockTimeSkippingResponse, "UnlockTimeSkipping", ts.UnlockTimeSkippingRequest{}, arena);
-        var result = run.getWithOptions(arena, options);
-        if (skipping) _ = try env.testService(ts.LockTimeSkippingResponse, "LockTimeSkipping", ts.LockTimeSkippingRequest{}, arena);
+        var result = if (env.server == .time_skipping)
+            try env.unlockedWait(Result, run, options, arena)
+        else
+            run.getWithOptions(arena, options);
         // The close event a wait sees can say continued-as-new for a run that a retry or its
         // cron schedule followed: the dev server's close-event poll reports a retried or cron
         // run that way, and the time-skipping server ends such a run's history with that
@@ -836,6 +901,46 @@ pub const WorkflowEnvironment = struct {
         }
         if (!replayed) try env.replayRun(run.id, run.run_id);
         return result;
+    }
+
+    /// Waits for `run` with time skipping unlocked, and locks it again whatever the wait
+    /// returned, so the server's lock count ends as it began. A failed unlock or re-lock sets
+    /// `time_lock_lost` and returns `error.TimeLockLost` in place of the wait's outcome:
+    /// neither call is retried, since the server counts them and a failed call may still have
+    /// reached it. A failed unlock counts as lost even when it failed before sending, as its
+    /// delivery can't be told apart.
+    fn unlockedWait(
+        env: *WorkflowEnvironment,
+        comptime Result: type,
+        run: *client_mod.WorkflowRun(Result),
+        options: client_mod.WorkflowRun(Result).GetOptions,
+        arena: Allocator,
+    ) error{TimeLockLost}!(client_mod.ResultError!Result) {
+        _ = env.testService(ts.UnlockTimeSkippingResponse, "UnlockTimeSkipping", ts.UnlockTimeSkippingRequest{}, arena) catch |err| {
+            env.time_lock_lost = true;
+            logTimeLockLost("UnlockTimeSkipping", err);
+            return error.TimeLockLost;
+        };
+        const result = run.getWithOptions(arena, options);
+        // Blocked: a cancellation (one that also ended the wait above) must not stop the
+        // re-lock, which would leave time skipping.
+        const prev = env.io.swapCancelProtection(.blocked);
+        defer _ = env.io.swapCancelProtection(prev);
+        const locked = if (builtin.is_test and takeRelockFailure())
+            error.RpcFailed
+        else
+            env.testService(ts.LockTimeSkippingResponse, "LockTimeSkipping", ts.LockTimeSkippingRequest{}, arena);
+        _ = locked catch |err| {
+            env.time_lock_lost = true;
+            logTimeLockLost("LockTimeSkipping", err);
+            return error.TimeLockLost;
+        };
+        return result;
+    }
+
+    /// `error.TimeLockLost` once `getResult` has lost the time lock (`time_lock_lost`).
+    fn checkTimeLock(env: *const WorkflowEnvironment) error{TimeLockLost}!void {
+        if (env.time_lock_lost) return error.TimeLockLost;
     }
 
     /// Replays the run `run` names, whose close event a wait read as continued-as-new, and
@@ -978,6 +1083,7 @@ pub const WorkflowEnvironment = struct {
     /// protobuf can carry (about 10,000 years), such as `Duration.max`, skips the longest one
     /// it can.
     pub fn sleep(env: *WorkflowEnvironment, duration: Io.Duration) !void {
+        try env.checkTimeLock();
         switch (env.server) {
             .dev, .existing => try env.io.sleep(duration, .awake),
             .time_skipping => {
@@ -989,8 +1095,11 @@ pub const WorkflowEnvironment = struct {
     }
 
     /// The server's current time: skipped time included on the time-skipping server, the
-    /// wall clock on the dev server.
+    /// wall clock on the dev server. After `getResult` on the time-skipping server it is only
+    /// no earlier than the run's close, since time may skip on to a pending timer first, even
+    /// a canceled one of the closed run itself; `getResult` says how to get the close time.
     pub fn now(env: *WorkflowEnvironment) !Io.Timestamp {
+        try env.checkTimeLock();
         switch (env.server) {
             .dev, .existing => return Io.Timestamp.now(env.io, .real),
             .time_skipping => {
@@ -9088,6 +9197,108 @@ test "time-skipping WorkflowEnvironment with options: a codec and a worker inter
     try uncoded.registerWorkflow(TimeSkippingFixtures.DayLater);
     testing.log_level = .err; // The failed replay is logged as a warning.
     try testing.expectError(error.Nondeterminism, uncoded.replayHistory(raw));
+}
+
+test "WorkflowEnvironment marks itself unusable when getResult cannot re-lock time skipping" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(TimeSkippingFixtures.DayLater);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A working environment first, so the failure below is the hook's.
+    try testing.expectEqualStrings("a day later, before", try env.executeWorkflow(TimeSkippingFixtures.DayLater, .{"before"}, a, null));
+
+    test_relock_failures.store(1, .monotonic);
+    defer test_relock_failures.store(0, .monotonic);
+    // The lost lock is logged as an error, which would fail the test: capture it.
+    var logged: Io.Writer.Allocating = .init(testing.allocator);
+    defer logged.deinit();
+    test_time_lock_log = &logged.writer;
+    defer test_time_lock_log = null;
+    var why: ?failure_mod.Failure = null;
+    try testing.expectError(error.TimeLockLost, env.executeWorkflow(TimeSkippingFixtures.DayLater, .{"lost"}, a, &why));
+    try testing.expectEqual(@as(u32, 0), test_relock_failures.load(.monotonic));
+    try testing.expect(env.time_lock_lost);
+    try testing.expect(why == null);
+    try testing.expect(std.mem.indexOf(u8, logged.written(), "LockTimeSkipping failed (RpcFailed)") != null);
+
+    // Every time-dependent call now fails before reaching the server, though the hook is
+    // spent and the server would answer.
+    try testing.expectError(error.TimeLockLost, env.startWorkflow(TimeSkippingFixtures.DayLater, .{ .task_queue = "" }, .{"after"}));
+    try testing.expectError(error.TimeLockLost, env.executeWorkflow(TimeSkippingFixtures.DayLater, .{"after"}, a, null));
+    try testing.expectError(error.TimeLockLost, env.now());
+    try testing.expectError(error.TimeLockLost, env.sleep(.fromSeconds(1)));
+    const Poke = workflow.SignalDef("poke", fn () void);
+    try testing.expectError(error.TimeLockLost, env.signalWorkflow(Poke, "any-id", .{}));
+    var run = try env.client.getWorkflow([]const u8, "any-id", "");
+    defer run.deinit();
+    try testing.expectError(error.TimeLockLost, env.getResultByName([]const u8, &run, a, null));
+}
+
+const CloseTimeFixtures = struct {
+    const timeout_s = 5 * 365 * std.time.s_per_day;
+    const Go = workflow.SignalDef("go", fn () void);
+
+    const State = struct {
+        go: bool = false,
+
+        fn onGo(st: *State) void {
+            st.go = true;
+        }
+        fn received(st: *State) bool {
+            return st.go;
+        }
+    };
+
+    /// Waits up to five years for a signal, as samples/await-signals waits for its signals,
+    /// then sleeps an hour.
+    fn signaledThenHour(ctx: *workflow.Context) !void {
+        const st = try ctx.allocator().create(State);
+        st.* = .{};
+        try ctx.setSignalHandler(Go, st, State.onGo);
+        if (!try ctx.awaitTimeout(.fromSeconds(timeout_s), st, State.received)) return error.NoSignal;
+        try ctx.io().sleep(.fromSeconds(std.time.s_per_hour), .awake);
+    }
+    const SignaledThenHour = workflow.Def("SignaledThenHour", signaledThenHour);
+};
+
+test "time-skipping env.now() after getResult is no earlier than the run's close time" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(CloseTimeFixtures.SignaledThenHour);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // One run, no other run and no cron schedule. The signal arrives while time is locked,
+    // so the run's five-year await timeout is canceled before any time skips; the run then
+    // sleeps an hour and closes. The server still holds the canceled timer, and once the run
+    // closes nothing holds its time lock until `getResult` takes it back, so it skips to that
+    // timer in between.
+    const start = try env.now();
+    var run = try env.startWorkflow(CloseTimeFixtures.SignaledThenHour, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try env.signalWorkflow(CloseTimeFixtures.Go, run.id, .{});
+    try env.getResult(CloseTimeFixtures.SignaledThenHour, &run, a, null);
+    const after = try env.now();
+
+    // The documented alternative: the run's close time is an hour after its start.
+    const described = try env.client.describeWorkflow(a, run.id, run.run_id);
+    const close = described.close_time.?;
+    const to_close = start.durationTo(close).nanoseconds;
+    try testing.expect(to_close >= std.time.ns_per_hour);
+    try testing.expect(to_close < std.time.ns_per_hour + std.time.ns_per_min);
+    // The documented limit: env.now() is no earlier than the close, and may be much later.
+    // When it is (as on nearly every run with test server v1.41.1), the server skipped to a
+    // pending timer at least five years past the start: the closed run's own canceled await
+    // timeout, the only timer that far ahead and nearer than the server's default run timeout.
+    const gap = close.durationTo(after).nanoseconds;
+    try testing.expect(gap >= 0);
+    if (gap > std.time.ns_per_min) {
+        try testing.expect(start.durationTo(after).nanoseconds >= CloseTimeFixtures.timeout_s * std.time.ns_per_s);
+    }
 }
 
 test "startTimeSkippingWithOptions refuses the dev server's extra arguments" {
