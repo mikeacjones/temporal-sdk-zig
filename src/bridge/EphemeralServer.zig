@@ -111,13 +111,16 @@ pub fn startDevServer(gpa: Allocator, io: Io, runtime: Runtime, options: DevServ
     return startRetrying(gpa, io, runtime, options.output, .{ .dev = &dev }, failure);
 }
 
-/// Starts the time-skipping test server. See `startDevServer`.
+/// Starts the time-skipping test server. See `startDevServer`. With `options.port` 0 on macOS,
+/// the port is picked here rather than by sdk-core (see `pickTestServerPort`); when none can be
+/// picked, `error.StartFailed` comes back with the reason in `failure`.
 pub fn startTestServer(gpa: Allocator, io: Io, runtime: Runtime, options: TestServerOptions, failure: ?*?[]u8) StartError!EphemeralServer {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const test_server = try testServerOptions(arena, options.executable, options.port, options.extra_args, options.startup_timeout_ms);
+    const port = if (options.port != 0) options.port else try pickTestServerPort(gpa, failure);
+    const test_server = try testServerOptions(arena, options.executable, port, options.extra_args, options.startup_timeout_ms);
     return startRetrying(gpa, io, runtime, options.output, .{ .test_server = test_server }, failure);
 }
 
@@ -478,6 +481,265 @@ fn backoff(io: Io, attempt: u32) bool {
     return true;
 }
 
+/// Ports `pickTestServerPort` tries before it gives up. It moves on only while a socket holds
+/// the port it was handed, so running out takes that many held ports in a row.
+const max_port_picks = 64;
+
+/// How long a probe waits on its own loopback connection: for it to reach the listener's queue,
+/// and for the probe side's FIN to reach the listener's side before that side closes. Both
+/// arrive at once unless something is wrong; the second waits out the limit only when a server
+/// spawned meanwhile kept a copy of the probe socket, which then sends no FIN.
+const probe_wait_ms = 1000;
+
+// Test hook, read only when builtin.is_test. Tests that set it reset it.
+/// When not 0, the first try of `pickTestServerPort` takes this port instead of one from the
+/// IPv4 allocator, and the hook goes back to 0.
+var test_first_probe_port: std.atomic.Value(u16) = .init(0);
+
+/// The port for a time-skipping server asked for a free one: picked here on macOS, 0 (sdk-core
+/// picks) elsewhere.
+///
+/// sdk-core picks by binding 0.0.0.0:0, and temporal-test-server then binds [::]:<port>
+/// dual-stack. macOS's IPv4 allocator does not look at IPv6 sockets, so it can hand out a port
+/// an IPv6 socket holds, such as a system daemon's connection on a link-local address
+/// (corespeechd's and remoted's on anri0 held 55561 and 55560). The server's bind then fails
+/// with EADDRINUSE, it logs a BindException and goes on running without listening, and sdk-core,
+/// which does not watch the process, waits out its startup timeout on "connection refused".
+/// Each try takes a port from the IPv4 allocator, as sdk-core did, and then binds [::]:<port>
+/// the way the server will; a port that bind refuses is skipped.
+///
+/// Every probe socket is connected before it is closed. macOS has no SOCK_CLOEXEC and Rust's
+/// spawn passes every fd without close-on-exec to the new process, so a server another thread
+/// spawns between a probe's socket() and its fcntl() keeps a copy of it for as long as it runs.
+/// A copy left bound to the port took the IPv4 connections meant for the server given that port
+/// and never answered them (16 servers started at once failed that way 4 times in 300 runs;
+/// sdk-core's own probe has the same window). A connected copy has its own peer, so it neither
+/// blocks the server's [::] bind nor takes its connections. The probes connect to two loopback
+/// listeners of this function's own and are accepted at once. Forking a child to probe in would
+/// avoid the copies too, but fork() deadlocks under the thread sanitizer on macOS when another
+/// thread is inside the system's random number generator, as sdk-core's threads often are.
+///
+/// Linux keeps one port space for both families, so sdk-core's probe already sees IPv6 sockets
+/// there, and it leaves the port in TIME_WAIT so the allocator does not hand it out again before
+/// the server binds. The probe here leaves the same TIME_WAIT on the port: its side of the IPv4
+/// connection closes first.
+fn pickTestServerPort(gpa: Allocator, failure: ?*?[]u8) error{StartFailed}!u16 {
+    if (comptime !builtin.os.tag.isDarwin()) return 0;
+    const probe = probePorts();
+    if (probe == .free) return probe.free;
+    if (failure) |f| f.* = switch (probe) {
+        .free => unreachable,
+        .taken => |port| std.fmt.allocPrint(gpa, "no free port for the time-skipping test server: binding [::]:<port> failed with EADDRINUSE on each of the {d} ports tried, the last {d}", .{ max_port_picks, port }),
+        .failed => |call| std.fmt.allocPrint(gpa, "picking a port for the time-skipping test server failed: {s}: {t}", .{ call.name, call.err }),
+    } catch null;
+    return error.StartFailed;
+}
+
+const PortProbe = union(enum) {
+    free: u16,
+    /// The server's bind would fail on this port.
+    taken: u16,
+    failed: struct { name: []const u8, err: std.c.E },
+};
+
+/// A loopback listener the probe sockets connect to.
+const ProbePeer = struct {
+    fd: c_int,
+    addr: std.c.sockaddr.in6,
+    len: std.c.socklen_t,
+
+    /// Listens on 127.0.0.1:0 (`std.c.AF.INET`) or [::1]:0 (`std.c.AF.INET6`).
+    fn listen(domain: c_uint) union(enum) { peer: ProbePeer, failed: PortProbe } {
+        const fd = socketCloexec(domain) orelse return .{ .failed = failedCall("socket") };
+        var peer: ProbePeer = .{ .fd = fd, .addr = undefined, .len = @sizeOf(std.c.sockaddr.in6) };
+        const ok = ok: {
+            if (domain == std.c.AF.INET) {
+                const addr: std.c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+                if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) break :ok false;
+            } else {
+                var loopback: [16]u8 = @splat(0);
+                loopback[15] = 1;
+                const addr: std.c.sockaddr.in6 = .{ .port = 0, .flowinfo = 0, .addr = loopback, .scope_id = 0 };
+                if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in6)) != 0) break :ok false;
+            }
+            // Non-blocking, so an accept after poll cannot wait on a connection that went away.
+            break :ok std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true }))) >= 0 and
+                std.c.listen(fd, 8) == 0 and std.c.getsockname(fd, @ptrCast(&peer.addr), &peer.len) == 0;
+        };
+        if (!ok) {
+            const probe = failedCall("listen on loopback");
+            _ = std.c.close(fd);
+            return .{ .failed = probe };
+        }
+        return .{ .peer = peer };
+    }
+
+    /// Connects `fd` to this listener and accepts the connection, which is closed when the
+    /// returned fd is. A signal does not fail it (see `waitFor`).
+    fn connect(peer: *const ProbePeer, fd: c_int) union(enum) { accepted: c_int, failed: PortProbe } {
+        const deadline = probeDeadline();
+        if (std.c.connect(fd, @ptrCast(&peer.addr), peer.len) != 0) {
+            switch (std.c.errno(@as(c_int, -1))) {
+                // macOS's connect returns EINTR on a signal even with SA_RESTART, and the
+                // connection goes on; a repeated call says EALREADY or EISCONN. Wait for it and
+                // read its outcome instead.
+                .INTR, .ALREADY, .INPROGRESS => {
+                    const err = waitFor(fd, std.c.POLL.OUT, deadline);
+                    if (err != .SUCCESS) return .{ .failed = .{ .failed = .{ .name = "connect to the probe listener", .err = err } } };
+                    var so_error: c_int = 0;
+                    var len: std.c.socklen_t = @sizeOf(c_int);
+                    if (std.c.getsockopt(fd, std.c.SOL.SOCKET, std.c.SO.ERROR, &so_error, &len) != 0) return .{ .failed = failedCall("getsockopt(SO_ERROR)") };
+                    if (so_error != 0) return .{ .failed = .{ .failed = .{ .name = "connect to the probe listener", .err = @fromBackingInt(@intCast(@as(u16, @intCast(so_error)))) } } };
+                },
+                .ISCONN => {},
+                else => |err| return .{ .failed = .{ .failed = .{ .name = "connect to the probe listener", .err = err } } },
+            }
+        }
+        while (true) {
+            const err = waitFor(peer.fd, std.c.POLL.IN, deadline);
+            if (err != .SUCCESS) return .{ .failed = .{ .failed = .{ .name = "waiting for the probe connection", .err = err } } };
+            const accepted = std.c.accept(peer.fd, null, null);
+            if (accepted >= 0) {
+                // A copy a spawned server keeps would hold the connection open for nothing.
+                _ = std.c.fcntl(accepted, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+                return .{ .accepted = accepted };
+            }
+            switch (std.c.errno(@as(c_int, -1))) {
+                .INTR, .AGAIN, .CONNABORTED => continue,
+                else => |e| return .{ .failed = .{ .failed = .{ .name = "accept on the probe listener", .err = e } } },
+            }
+        }
+    }
+};
+
+/// The end of a probe's waits on one of its connections: `probe_wait_ms` from now.
+fn probeDeadline() i64 {
+    return monotonicMs() + probe_wait_ms;
+}
+
+fn monotonicMs() i64 {
+    var ts: std.c.timespec = undefined;
+    // Fails only for an unknown clock.
+    std.debug.assert(std.c.clock_gettime(.MONOTONIC, &ts) == 0);
+    return @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
+}
+
+/// Waits until `fd` is ready for `events` or `deadline` passes (`.TIMEDOUT`). A signal resumes
+/// the wait with the time left: poll is never restarted after a handler, and SIGCHLD, which
+/// sdk-core's runtime handles, comes whenever any child of the process exits.
+fn waitFor(fd: c_int, events: i16, deadline: i64) std.c.E {
+    while (true) {
+        const left = deadline - monotonicMs();
+        if (left <= 0) return .TIMEDOUT;
+        var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+        const n = std.c.poll(&pfd, 1, @intCast(left));
+        if (n > 0) return .SUCCESS;
+        if (n == 0) return .TIMEDOUT;
+        const err = std.c.errno(n);
+        if (err != .INTR) return err;
+    }
+}
+
+fn probePorts() PortProbe {
+    const v4 = switch (ProbePeer.listen(std.c.AF.INET)) {
+        .peer => |p| p,
+        .failed => |probe| return probe,
+    };
+    defer _ = std.c.close(v4.fd);
+    const v6 = switch (ProbePeer.listen(std.c.AF.INET6)) {
+        .peer => |p| p,
+        .failed => |probe| return probe,
+    };
+    defer _ = std.c.close(v6.fd);
+    var probe: PortProbe = undefined;
+    for (0..max_port_picks) |i| {
+        const first: u16 = if (builtin.is_test and i == 0) test_first_probe_port.swap(0, .monotonic) else 0;
+        probe = probePort(&v4, &v6, first);
+        if (probe != .taken) break;
+    }
+    return probe;
+}
+
+/// One try of `probePorts`: a port from the IPv4 allocator (or `port` when not 0), then the
+/// server's bind on it. Its sockets are connected to `v4` and `v6` and closed before it returns.
+fn probePort(v4: *const ProbePeer, v6: *const ProbePeer, port_in: u16) PortProbe {
+    // The IPv4 allocator never hands out a port an IPv4 socket holds. The IPv6 one does (it
+    // does not look at IPv4 sockets), and under load it walked through runs of ports held by
+    // loopback connections, so the port comes from the IPv4 side, as sdk-core's did: the
+    // connect binds the socket to a free port.
+    const s4 = socketCloexec(std.c.AF.INET) orelse return failedCall("socket(AF_INET)");
+    const a4 = accepted: {
+        if (port_in != 0) {
+            const addr: std.c.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port_in), .addr = 0 };
+            if (std.c.bind(s4, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return closeAfter(s4, failedCall("bind(0.0.0.0:<port>)"));
+        }
+        switch (v4.connect(s4)) {
+            .accepted => |fd| break :accepted fd,
+            .failed => |probe| return closeAfter(s4, probe),
+        }
+    };
+    defer closePair(s4, a4);
+    const port = port: {
+        var addr: std.c.sockaddr.in = undefined;
+        var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        if (std.c.getsockname(s4, @ptrCast(&addr), &len) != 0) return failedCall("getsockname");
+        break :port std.mem.bigToNative(u16, addr.port);
+    };
+    // Then the bind temporal-test-server makes: [::]:<port>, dual-stack, SO_REUSEADDR.
+    const s6 = socketCloexec(std.c.AF.INET6) orelse return failedCall("socket(AF_INET6)");
+    const off: c_int = 0;
+    const on: c_int = 1;
+    if (std.c.setsockopt(s6, std.c.IPPROTO.IPV6, std.c.IPV6.V6ONLY, &off, @sizeOf(c_int)) != 0) return closeAfter(s6, failedCall("setsockopt(IPV6_V6ONLY)"));
+    if (std.c.setsockopt(s6, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &on, @sizeOf(c_int)) != 0) return closeAfter(s6, failedCall("setsockopt(SO_REUSEADDR)"));
+    const addr: std.c.sockaddr.in6 = .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = @splat(0), .scope_id = 0 };
+    if (std.c.bind(s6, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in6)) != 0) {
+        const err = std.c.errno(@as(c_int, -1));
+        return closeAfter(s6, if (err == .ADDRINUSE) .{ .taken = port } else .{ .failed = .{ .name = "bind([::]:<port>)", .err = err } });
+    }
+    const a6 = switch (v6.connect(s6)) {
+        .accepted => |fd| fd,
+        .failed => |probe| return closeAfter(s6, probe),
+    };
+    closePair(s6, a6);
+    return .{ .free = port };
+}
+
+/// Closes a probe socket and then, once its FIN has arrived, the listener's side of its
+/// connection. Only the probe's side then goes through TIME_WAIT, on the picked port, which the
+/// server's SO_REUSEADDR bind passes and which keeps the IPv4 allocator from handing the port
+/// out again meanwhile, as sdk-core's reservation did. Closing both at once made both sides
+/// close actively, and each try then also held a listener's port for 30 s; with many servers
+/// starting, that ran the ephemeral range out (EADDRNOTAVAIL).
+fn closePair(probe_fd: c_int, accepted_fd: c_int) void {
+    _ = std.c.close(probe_fd);
+    _ = waitFor(accepted_fd, std.c.POLL.IN, probeDeadline());
+    _ = std.c.close(accepted_fd);
+}
+
+/// Closes `fd` and returns `probe`, whose errno was read before the close.
+fn closeAfter(fd: c_int, probe: PortProbe) PortProbe {
+    _ = std.c.close(fd);
+    return probe;
+}
+
+/// A TCP socket with close-on-exec set right after it is made (macOS has no SOCK_CLOEXEC).
+/// Null with errno set on failure.
+fn socketCloexec(domain: c_uint) ?c_int {
+    const fd = std.c.socket(domain, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return null;
+    if (std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) < 0) {
+        const saved = std.c._errno().*;
+        _ = std.c.close(fd);
+        std.c._errno().* = saved;
+        return null;
+    }
+    return fd;
+}
+
+fn failedCall(name: []const u8) PortProbe {
+    return .{ .failed = .{ .name = name, .err = std.c.errno(@as(c_int, -1)) } };
+}
+
 fn testServerOptions(
     arena: Allocator,
     executable: Executable,
@@ -563,6 +825,177 @@ test "a time-skipping test server starts and shuts down" {
     };
     try testing.expect(server.target.len > 0);
     try server.shutdown(testing.io, null);
+}
+
+/// One of the concurrent starts of "time-skipping servers started at once all accept connections".
+const ConcurrentStart = struct {
+    rt: Runtime,
+    server: ?EphemeralServer = null,
+    failure: ?[]u8 = null,
+    err: ?StartError = null,
+
+    fn run(s: *ConcurrentStart) void {
+        s.server = startTestServer(testing.allocator, testing.io, s.rt, .{}, &s.failure) catch |err| {
+            s.err = err;
+            return;
+        };
+    }
+};
+
+test "time-skipping servers started at once all accept connections" {
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var starts: [16]ConcurrentStart = @splat(.{ .rt = rt });
+    var threads: [starts.len]?std.Thread = @splat(null);
+    defer for (&starts) |*s| {
+        if (s.server) |*server| server.shutdown(testing.io, null) catch {};
+        if (s.failure) |f| testing.allocator.free(f);
+    };
+    for (&threads, &starts) |*t, *s| t.* = std.Thread.spawn(.{}, ConcurrentStart.run, .{s}) catch null;
+    for (&threads, &starts) |t, *s| {
+        if (t) |thread| thread.join() else s.run();
+    }
+    for (&starts, 0..) |*s, i| {
+        const server = s.server orelse {
+            std.debug.print("test server {d} failed to start: {s}\n", .{ i, s.failure orelse @errorName(s.err.?) });
+            return error.TestUnexpectedResult;
+        };
+        const address = try Io.net.IpAddress.parseLiteral(server.target);
+        const stream = try address.connect(testing.io, .{ .mode = .stream });
+        stream.close(testing.io);
+        // Two starts handed the same port would share one server.
+        for (starts[0..i]) |other| try testing.expect(!std.mem.eql(u8, other.server.?.target, server.target));
+    }
+}
+
+test "a time-skipping server starts while an IPv6-only socket holds the port the IPv4 probe picks" {
+    // macOS's IPv4 allocator does not look at IPv6 sockets, so sdk-core's 0.0.0.0:0 probe could
+    // hand out a port an IPv6 socket held, as a system daemon's did, and the server's [::] bind
+    // then failed (see pickTestServerPort). The hook hands the probe such a port first, so the
+    // test needs no guess at what the allocator gives next and takes no port another process
+    // may have just been given. Linux keeps one port space for both families.
+    if (!builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    // A port the IPv4 allocator gives, then held by an IPv6-only socket, as the daemon's was.
+    var holder: c_int = -1;
+    defer if (holder >= 0) {
+        _ = std.c.close(holder);
+    };
+    var held: u16 = 0;
+    for (0..16) |_| {
+        const v4 = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        try testing.expect(v4 >= 0);
+        var addr4: std.c.sockaddr.in = .{ .port = 0, .addr = 0 };
+        var len4: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        const got = std.c.bind(v4, @ptrCast(&addr4), len4) == 0 and std.c.getsockname(v4, @ptrCast(&addr4), &len4) == 0;
+        _ = std.c.close(v4);
+        try testing.expect(got);
+        const port = std.mem.bigToNative(u16, addr4.port);
+        const fd = std.c.socket(std.c.AF.INET6, std.c.SOCK.STREAM, 0);
+        try testing.expect(fd >= 0);
+        const on: c_int = 1;
+        const addr6: std.c.sockaddr.in6 = .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = @splat(0), .scope_id = 0 };
+        if (std.c.setsockopt(fd, std.c.IPPROTO.IPV6, std.c.IPV6.V6ONLY, &on, @sizeOf(c_int)) == 0 and
+            std.c.bind(fd, @ptrCast(&addr6), @sizeOf(std.c.sockaddr.in6)) == 0)
+        {
+            holder = fd;
+            held = port;
+            break;
+        }
+        _ = std.c.close(fd);
+    }
+    try testing.expect(holder >= 0);
+    test_first_probe_port.store(held, .monotonic);
+    defer test_first_probe_port.store(0, .monotonic);
+
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    var server = startTestServer(testing.allocator, testing.io, rt, .{}, &failure) catch |err| {
+        std.debug.print("test server failed to start: {s}\n", .{failure orelse "(no message)"});
+        return err;
+    };
+    defer server.shutdown(testing.io, null) catch {};
+    try testing.expectEqual(0, test_first_probe_port.load(.monotonic));
+    const address = try Io.net.IpAddress.parseLiteral(server.target);
+    try testing.expect(address.getPort() != held);
+    const stream = try address.connect(testing.io, .{ .mode = .stream });
+    stream.close(testing.io);
+}
+
+/// Draws random bytes until `stop` is set, as sdk-core's tokio workers do while servers start.
+fn drawRandomUntil(stop: *std.atomic.Value(bool)) void {
+    var buf: [16]u8 = undefined;
+    while (!stop.load(.monotonic)) std.c.arc4random_buf(&buf, buf.len);
+}
+
+test "a time-skipping server starts while another thread draws random bytes" {
+    // sdk-core's threads draw random bytes (through the system's locked RNG) while a server
+    // starts. Starting must not depend on that RNG lock being free: under `zig build tsan` on
+    // macOS, a fork() in the start path deadlocked with such a thread (fork's atfork handler
+    // waits for the RNG lock, which the drawing thread holds while it waits for the sanitizer
+    // lock fork took), and the start never returned.
+    if (!builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var stop: std.atomic.Value(bool) = .init(false);
+    const drawer = try std.Thread.spawn(.{}, drawRandomUntil, .{&stop});
+    defer {
+        stop.store(true, .monotonic);
+        drawer.join();
+    }
+    for (0..3) |_| {
+        var failure: ?[]u8 = null;
+        defer if (failure) |f| testing.allocator.free(f);
+        var server = startTestServer(testing.allocator, testing.io, rt, .{}, &failure) catch |err| {
+            std.debug.print("test server failed to start: {s}\n", .{failure orelse "(no message)"});
+            return err;
+        };
+        try server.shutdown(testing.io, null);
+    }
+}
+
+fn ignoreSignal(_: std.posix.SIG) callconv(.c) void {}
+
+/// Sends SIGWINCH to `target` until `stop` is set.
+fn signalUntil(target: std.c.pthread_t, stop: *std.atomic.Value(bool)) void {
+    while (!stop.load(.monotonic)) _ = std.c.pthread_kill(target, .WINCH);
+}
+
+test "a time-skipping server starts while signals interrupt the starting thread" {
+    // A signal with a handler can arrive while a server starts: sdk-core's tokio installs one
+    // for SIGCHLD (with SA_RESTART) once it has spawned a server, so any child of the process
+    // that exits sends one, and programs handle SIGWINCH, SIGALRM and others. SA_RESTART does
+    // not restart an interrupted connect() or poll(), which then fail with EINTR; a start
+    // must not fail because of that. The signals are sent in a loop so that one lands inside
+    // the start's blocking calls every time.
+    const act: std.posix.Sigaction = .{ .handler = .{ .handler = ignoreSignal }, .mask = std.posix.sigemptyset(), .flags = std.posix.SA.RESTART };
+    var old: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.WINCH, &act, &old);
+    defer std.posix.sigaction(.WINCH, &old, null);
+
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var stop: std.atomic.Value(bool) = .init(false);
+    const sender = try std.Thread.spawn(.{}, signalUntil, .{ std.c.pthread_self(), &stop });
+    var joined = false;
+    defer if (!joined) {
+        stop.store(true, .monotonic);
+        sender.join();
+    };
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    var server = startTestServer(testing.allocator, testing.io, rt, .{}, &failure) catch |err| {
+        std.debug.print("test server failed to start: {s}\n", .{failure orelse "(no message)"});
+        return err;
+    };
+    defer server.shutdown(testing.io, null) catch {};
+    stop.store(true, .monotonic);
+    sender.join();
+    joined = true;
+    const address = try Io.net.IpAddress.parseLiteral(server.target);
+    const stream = try address.connect(testing.io, .{ .mode = .stream });
+    stream.close(testing.io);
 }
 
 test "a download failure is retried and the dev server then starts" {
