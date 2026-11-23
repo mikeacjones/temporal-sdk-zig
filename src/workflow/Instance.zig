@@ -114,6 +114,13 @@ timers: std.AutoHashMapUnmanaged(u32, *WorkflowIo.Timer) = .empty,
 timer_summary: []const u8 = "",
 /// Child workflows that have not closed, by seq.
 children: std.AutoHashMapUnmanaged(u32, *ChildState) = .empty,
+/// The activities and children whose payloads the worker's codecs code with the call's own
+/// context (`activityCodecContext`, `childCodecContext`), by seq: each from its command until
+/// the core's last resolution for that seq. Kept apart from `activities` and `children`, which
+/// the SDK may leave earlier (a child whose cancellation the server recorded resolves as
+/// canceled, but the core still delivers its result).
+activity_codecs: std.AutoHashMapUnmanaged(u32, *const ActivityState) = .empty,
+child_codecs: std.AutoHashMapUnmanaged(u32, *const ChildState) = .empty,
 /// Signals and cancellation requests to other workflows that the core has not resolved, by seq.
 externals: std.AutoHashMapUnmanaged(u32, *ExternalState) = .empty,
 /// Nexus operations the core has not resolved, by seq.
@@ -493,6 +500,11 @@ pub const ActivityState = struct {
     /// activity is retried under a new ID). The run's own for a side effect and for an
     /// activity an interceptor refused.
     context: converter.Context = .{},
+    /// For a side effect, the context the worker's codecs code its schedule command and
+    /// resolution with: the run's `context` without propagated values, since the command
+    /// carries no header. That is what the worker running the internal local activity codes
+    /// the value with. Null for every other activity, whose codecs use `context`.
+    side_effect_codec_context: ?converter.Context = null,
 
     pub const CancellationType = workflow.ActivityCancellationType;
 
@@ -870,10 +882,24 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
             .update_random_seed => |s| inst.wio.setRandomSeed(s.randomness_seed),
             .signal_workflow => |s| try inst.deliverSignal(&s),
             .do_update => |u| try inst.deliverUpdate(&u),
-            .resolve_activity => |r| try inst.resolveActivity(&r),
+            .resolve_activity => |r| {
+                // The core resolves a seq once; a local activity retried after a backoff
+                // gets a new seq.
+                _ = inst.activity_codecs.remove(r.seq);
+                try inst.resolveActivity(&r);
+            },
             .notify_has_patch => |p| try inst.notified_patches.put(inst.arena(), try inst.arena().dupe(u8, p.patch_id), {}),
-            .resolve_child_workflow_execution_start => |r| try inst.resolveChildStart(&r),
-            .resolve_child_workflow_execution => |r| try inst.resolveChild(&r),
+            .resolve_child_workflow_execution_start => |r| {
+                // A child that didn't start gets no other resolution.
+                if (r.status) |status| if (status != .succeeded) {
+                    _ = inst.child_codecs.remove(r.seq);
+                };
+                try inst.resolveChildStart(&r);
+            },
+            .resolve_child_workflow_execution => |r| {
+                _ = inst.child_codecs.remove(r.seq);
+                try inst.resolveChild(&r);
+            },
             .resolve_nexus_operation_start => |r| try inst.resolveNexusOperationStart(&r),
             .resolve_nexus_operation => |r| try inst.resolveNexusOperation(&r),
             .resolve_signal_external_workflow => |r| try inst.resolveExternal(r.seq, r.failure, switch (r.cause) {
@@ -2155,6 +2181,23 @@ fn intern(inst: *Instance, name: []const u8) error{OutOfMemory}![]const u8 {
     return entry.key_ptr.*;
 }
 
+/// The converter context of the activity or local activity with sequence number `seq`, which
+/// the worker's codecs get for its schedule command and its resolution; null when no activity
+/// has that seq or the core has already resolved it. Points into the run's arena.
+pub fn activityCodecContext(inst: *const Instance, seq: u32) ?*const converter.Context {
+    const state = inst.activity_codecs.get(seq) orelse return null;
+    if (state.side_effect_codec_context) |*context| return context;
+    return &state.context;
+}
+
+/// The converter context of the child workflow with sequence number `seq`, which the
+/// worker's codecs get for its start command and its resolutions; null when no child has
+/// that seq or the core has already given its last resolution. Points into the run's arena.
+pub fn childCodecContext(inst: *const Instance, seq: u32) ?*const converter.Context {
+    const state = inst.child_codecs.get(seq) orelse return null;
+    return &state.context;
+}
+
 /// The converter context of an activity's arguments, which are encoded before the activity
 /// is scheduled: the run's, with the activity type and `activity_id`, or the ID the next
 /// activity gets when that is empty (an interceptor that schedules another activity first,
@@ -2384,6 +2427,7 @@ fn newActivity(inst: *Instance, activity_type: []const u8, cancellation_type: Ac
     const state = try a.create(ActivityState);
     state.* = .{ .seq = inst.next_activity_seq, .cancellation_type = cancellation_type, .activity_type = activity_type, .scheduled_in = inst.activations };
     try inst.activities.put(a, state.seq, state);
+    try inst.activity_codecs.put(a, state.seq, state);
     inst.next_activity_seq += 1;
     return state;
 }
@@ -2497,6 +2541,7 @@ fn retryLocalActivity(inst: *Instance, state: *ActivityState) !void {
     local.backoff_timer = null;
     state.seq = inst.next_activity_seq;
     try inst.activities.put(a, state.seq, state);
+    try inst.activity_codecs.put(a, state.seq, state);
     inst.next_activity_seq += 1;
     local.cmd.seq = state.seq;
     if (local.id_from_seq) {
@@ -2724,6 +2769,7 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
         error.InvalidSearchAttribute => return error.InvalidOptions,
     };
     try inst.children.put(a, state.seq, state);
+    try inst.child_codecs.put(a, state.seq, state);
     inst.next_child_seq += 1;
     try inst.emit(.{
         .user_metadata = if (options.static_summary.len > 0 or options.static_details.len > 0) .{
@@ -3440,8 +3486,11 @@ fn rootSideEffect(ptr: *anyopaque, input: interceptor.SideEffectInput, _: interc
     const value: [1]converter.Payload = .{input.value orelse .{}};
     const args: []const converter.Payload = if (input.value != null) &value else &.{};
     const state = inst.scheduleLocalActivity(side_effect_activity_type, options, args, .{}) catch |err| return .{ .ctx = &inst.ctx, .state = err };
-    // A side effect's value is the run's own, encoded in the workflow with its context.
+    // A side effect's value is the run's own, encoded in the workflow with its context. The
+    // worker that runs the local activity has no header to read the run's values from.
     state.context = inst.converter_context;
+    state.side_effect_codec_context = state.context;
+    state.side_effect_codec_context.?.values = &.empty;
     return .{ .ctx = &inst.ctx, .state = state };
 }
 

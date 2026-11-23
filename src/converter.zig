@@ -79,6 +79,16 @@
 //! | workflow and Nexus handler: Nexus input and result           | namespace and propagated values              |
 //! | activity: arguments, result, heartbeat details               | the activity's (`activity.Context.converterContext`) |
 //!
+//! Payload codecs on the workflow's worker get the run's context for its whole activation
+//! and completion, except an activity's, local activity's or child's payloads: the schedule
+//! or start command (arguments, header, memo, summary) and the resolutions (result and
+//! failure) get the same context as that call's hooks, with the scheduled activity type and
+//! ID, or the child's workflow ID and type. So the activity's worker and the child's own
+//! worker decode with the context the workflow's worker encoded with, and the reverse.
+//! Signals to other workflows, children included, keep the run's context for codecs. A side
+//! effect's value is the run's own although an internal local activity records it: codecs
+//! code it with the run's identity, without propagated values, on both workers.
+//!
 //! These have no context, and a context hook receives the empty one: user code calling
 //! `toPayload`, `fromPayload`, `toPayloads`, `fromPayloads`, `toFields` or `fieldValue`; an
 //! `EncodedValues` or `EncodedValue` built without one, including those from `failure.kind`;
