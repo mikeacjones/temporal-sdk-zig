@@ -1,9 +1,11 @@
 //! The recovery workflow restarts every running trip workflow from its history: useful when
 //! a bad change left workflows stuck or their state corrupted. One activity finds the running
 //! trips with a visibility query and keeps their IDs in the worker's cache; then concurrent
-//! activities recover them in batches. Recovering a trip reads the trip count it started
-//! with and the trips signaled to it from its history, terminates the run, starts a new run
-//! with that count, and signals the trips to it again.
+//! activities recover them in batches. Recovering a trip names its latest run by run ID once
+//! and works on that run only: it terminates the run if it is still open, reads the trip
+//! count the run started with and the trips signaled to it from its final history, starts a
+//! new run with that count, and signals the trips to it again. A run that continued as new
+//! is not terminated; its successor is recovered in its place.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -127,27 +129,34 @@ pub const Activities = struct {
 pub const ListOpenExecutions = activity.Def("ListOpenExecutions", Activities.listOpenExecutions);
 pub const RecoverExecutions = activity.Def("RecoverExecutions", Activities.recoverExecutions);
 
-/// A signal to send again to the new run.
-const SignalParams = struct {
-    name: []const u8,
-    data: trip_workflow.TripEvent,
+/// One run of a trip workflow as its history records it.
+const RunHistory = struct {
+    /// The run's argument.
+    state: trip_workflow.UserState,
+    /// How to start a run like it.
+    options: client_mod.StartWorkflowOptions,
+    /// Every trip signaled to the run, in history order.
+    trips: []const trip_workflow.TripEvent,
+    last_event: temporal.history.HistoryEvent,
 };
 
-fn recoverSingleExecution(ctx: *activity.Context, workflow_id: []const u8) !void {
+/// Reads the whole history of run `run_id` (never empty) of `workflow_id`, as recorded so far.
+/// Returns null for an empty history.
+fn readRun(ctx: *activity.Context, workflow_id: []const u8, run_id: []const u8) !?RunHistory {
+    std.debug.assert(run_id.len > 0);
     const logger = ctx.logger();
     const client = try ctx.client();
     const arena = ctx.allocator();
 
-    var it = try client.historyIterator(workflow_id, "", .{});
+    var it = try client.historyIterator(workflow_id, run_id, .{});
     defer it.deinit();
-    const first_event = try it.next(arena) orelse return; // Nothing to recover.
+    const first_event = try it.next(arena) orelse return null;
     var last_event = first_event;
 
-    // How to start the new run, from the run's started event.
     const started = switch (first_event.attributes orelse return error.UnknownEventType) {
         .workflow_execution_started_event_attributes => |attributes| attributes,
         else => {
-            logger.warn("The first event of a workflow's history isn't its start.", .{ .workflow_id = workflow_id, .event_type = first_event.event_type });
+            logger.warn("The first event of a workflow's history isn't its start.", .{ .workflow_id = workflow_id, .run_id = run_id, .event_type = first_event.event_type });
             return error.UnknownEventType;
         },
     };
@@ -160,8 +169,7 @@ fn recoverSingleExecution(ctx: *activity.Context, workflow_id: []const u8) !void
         .task_timeout = if (started.workflow_task_timeout) |t| .fromNanoseconds(@as(i96, t.seconds) * std.time.ns_per_s + t.nanos) else null,
     };
 
-    // Every trip signaled to the run, to signal again to the new one.
-    var signals: std.ArrayList(SignalParams) = .empty;
+    var trips: std.ArrayList(trip_workflow.TripEvent) = .empty;
     while (try it.next(arena)) |event| {
         last_event = event;
         const signaled = switch (event.attributes orelse continue) {
@@ -172,30 +180,75 @@ fn recoverSingleExecution(ctx: *activity.Context, workflow_id: []const u8) !void
         const payloads = signaled.input orelse continue;
         // Fails on a corrupted signal payload.
         const data = (try temporal.converter.fromPayloads(trip_workflow.TripSignal.Args, arena, payloads.payloads.items))[0];
-        try signals.append(arena, .{ .name = signaled.signal_name, .data = data });
+        try trips.append(arena, data);
     }
+    return .{ .state = state, .options = options, .trips = trips.items, .last_event = last_event };
+}
 
-    if (!isExecutionCompleted(last_event)) try client.terminateWorkflow(workflow_id, "", "Recover");
+/// How many runs one attempt follows through continue-as-new before it gives up and lets the
+/// activity retry.
+const max_runs_followed = 10;
 
-    var new_run = try client.executeWorkflow(trip_workflow.TripWorkflow, options, .{state});
+/// Recovers the latest run of `workflow_id`. The run is named by its ID from the start, so
+/// every read and the terminate apply to that run and never to whichever run is latest by
+/// then. A run that continued as new is not terminated: its successor is recovered instead.
+/// The replacement is built from the history read after the terminate, so a trip the server
+/// recorded while recovery ran is not lost.
+fn recoverSingleExecution(ctx: *activity.Context, workflow_id: []const u8) !void {
+    const logger = ctx.logger();
+    const client = try ctx.client();
+    const arena = ctx.allocator();
+
+    var source_run_id = (try client.describeWorkflow(arena, workflow_id, "")).run_id;
+    const source: RunHistory = for (0..max_runs_followed) |_| {
+        var run = try readRun(ctx, workflow_id, source_run_id) orelse return; // Nothing to recover.
+        if (!isExecutionCompleted(run.last_event)) {
+            client.terminateWorkflow(workflow_id, source_run_id, "Recover") catch |err| switch (err) {
+                // The run closed after it was read; its final history says how.
+                error.NotFound => {},
+                else => |e| return e,
+            };
+            run = try readRun(ctx, workflow_id, source_run_id) orelse return error.EmptyHistory;
+            if (!isExecutionCompleted(run.last_event)) {
+                logger.warn("A run is still open after it was terminated.", .{ .workflow_id = workflow_id, .run_id = source_run_id });
+                return error.RunStillOpen;
+            }
+        }
+        switch (run.last_event.attributes.?) {
+            .workflow_execution_continued_as_new_event_attributes => |continued| {
+                logger.info("The run continued as new; recovering its successor.", .{ .workflow_id = workflow_id, .run_id = source_run_id, .new_run_id = continued.new_execution_run_id });
+                if (continued.new_execution_run_id.len == 0) return error.InvalidResponse;
+                source_run_id = continued.new_execution_run_id;
+            },
+            else => break run,
+        }
+    } else {
+        logger.warn("The workflow keeps continuing as new; retrying.", .{ .workflow_id = workflow_id, .runs_followed = max_runs_followed });
+        return error.SourceKeepsContinuing;
+    };
+
+    var new_run = try client.executeWorkflow(trip_workflow.TripWorkflow, source.options, .{source.state});
     defer new_run.deinit();
 
-    for (signals.items) |s| {
-        client.signalWorkflow(trip_workflow.TripSignal, workflow_id, new_run.run_id, .{s.data}) catch |err| {
-            logger.warn("Failed to signal a trip to the new run.", .{ .workflow_id = workflow_id, .trip = s.data.id, .err = err });
+    for (source.trips) |trip| {
+        client.signalWorkflow(trip_workflow.TripSignal, workflow_id, new_run.run_id, .{trip}) catch |err| {
+            logger.warn("Failed to signal a trip to the new run.", .{ .workflow_id = workflow_id, .trip = trip.id, .err = err });
         };
     }
 
-    logger.info("Successfully restarted workflow.", .{ .workflow_id = workflow_id, .new_run_id = new_run.run_id });
+    logger.info("Successfully restarted workflow.", .{ .workflow_id = workflow_id, .run_id = source_run_id, .new_run_id = new_run.run_id });
 }
 
-fn isExecutionCompleted(event: temporal.history.HistoryEvent) bool {
+/// Whether `event` closes its run, by completing, failing, timing out, being canceled or
+/// terminated, or continuing as new.
+pub fn isExecutionCompleted(event: temporal.history.HistoryEvent) bool {
     return switch (event.attributes orelse return false) {
         .workflow_execution_completed_event_attributes,
         .workflow_execution_terminated_event_attributes,
         .workflow_execution_canceled_event_attributes,
         .workflow_execution_failed_event_attributes,
         .workflow_execution_timed_out_event_attributes,
+        .workflow_execution_continued_as_new_event_attributes,
         => true,
         else => false,
     };

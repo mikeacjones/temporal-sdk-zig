@@ -7,6 +7,7 @@ const trip_workflow = @import("trip_workflow.zig");
 const recovery_workflow = @import("recovery_workflow.zig");
 
 const testing = std.testing;
+const interceptor = temporal.interceptor;
 const Allocator = std.mem.Allocator;
 const WorkflowEnvironment = temporal.testing.WorkflowEnvironment;
 const TripWorkflow = trip_workflow.TripWorkflow;
@@ -19,7 +20,11 @@ const Env = struct {
     activities: recovery_workflow.Activities,
 
     fn start(e: *Env) !void {
-        e.env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+        return e.startWith(.{});
+    }
+
+    fn startWith(e: *Env, options: WorkflowEnvironment.Options) !void {
+        e.env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, options);
         errdefer e.env.deinit();
         e.cache = .init(testing.allocator, testing.io, 10);
         e.activities = .{ .cache = &e.cache, .host_id = "recovery_test" };
@@ -151,6 +156,131 @@ test "the recovery workflow restarts running trips with the trips signaled to th
         try env.client.terminateWorkflow(case.id, "", "test finished");
     }
     try testing.expectEqual(1, e.cache.len());
+}
+
+/// A client interceptor that, on the first TerminateWorkflowExecution call, signals `trips`
+/// trips to run `run_id` before it lets the terminate through: as if they arrived while
+/// recovery read the run. With `wait_for_continue`, it also waits for the run to continue as
+/// new.
+const SignalBeforeTerminate = struct {
+    client: ?*temporal.client.Client = null,
+    workflow_id: []const u8 = "",
+    run_id: []const u8 = "",
+    trips: usize,
+    wait_for_continue: bool,
+    fired: std.atomic.Value(bool) = .init(false),
+
+    pub fn call(c: *SignalBeforeTerminate, input: *interceptor.ClientCall, next: interceptor.Client.Next) interceptor.ClientError!void {
+        if (std.mem.eql(u8, input.method, "TerminateWorkflowExecution") and !c.fired.swap(true, .acq_rel)) {
+            c.continueRun(input.arena) catch |err| {
+                std.debug.print("signaling run {s} before its terminate failed: {t}\n", .{ c.run_id, err });
+                return error.RpcFailed;
+            };
+        }
+        return next.call(input);
+    }
+
+    fn continueRun(c: *SignalBeforeTerminate, arena: Allocator) !void {
+        const client = c.client.?;
+        for (0..c.trips) |i| {
+            var buf: [16]u8 = undefined;
+            const id = try std.fmt.bufPrint(&buf, "Late{d}", .{i + 1});
+            try client.signalWorkflow(trip_workflow.TripSignal, c.workflow_id, c.run_id, .{.{ .id = id, .total = 1 }});
+        }
+        if (!c.wait_for_continue) return;
+        var it = try client.historyIterator(c.workflow_id, c.run_id, .{ .wait_new_event = true, .filter = .close_event });
+        defer it.deinit();
+        const closed = try it.next(arena) orelse return error.TestNoCloseEvent;
+        if (closed.attributes.? != .workflow_execution_continued_as_new_event_attributes) return error.TestRunDidNotContinue;
+    }
+};
+
+test "a run that continues as new during recovery is followed, not terminated" {
+    var continue_first: SignalBeforeTerminate = .{ .trips = trip_workflow.trips_per_run - 3, .wait_for_continue = true };
+    const interceptors = [_]interceptor.Client{.from(SignalBeforeTerminate, &continue_first)};
+    var e: Env = undefined;
+    try e.startWith(.{ .interceptors = &interceptors });
+    defer e.deinit();
+    const env = e.env;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(TripWorkflow, .{ .task_queue = "" }, .{.{}});
+    defer run.deinit();
+    try signalTrips(env, run.id, 3);
+    try waitForCounter(env, a, run.id, 3);
+    continue_first.client = &env.client;
+    continue_first.workflow_id = run.id;
+    continue_first.run_id = run.run_id;
+
+    try waitForRunningTrips(env, 1);
+    try env.executeWorkflow(recovery_workflow.RecoverWorkflow, .{.{ .workflow_type = "TripWorkflow" }}, a, null);
+    try testing.expect(continue_first.fired.load(.acquire));
+
+    // The run recovery read continued as new on its own; the successor was terminated.
+    const first_closed = try waitForClose(env, a, run.id, run.run_id);
+    const successor = first_closed.attributes.?.workflow_execution_continued_as_new_event_attributes.new_execution_run_id;
+    const successor_closed = try waitForClose(env, a, run.id, successor);
+    try testing.expect(successor_closed.attributes.? == .workflow_execution_terminated_event_attributes);
+
+    // The replacement starts from the successor's count, ten, and gets no trips again.
+    const latest = try env.client.describeWorkflow(a, run.id, "");
+    try testing.expect(!std.mem.eql(u8, latest.run_id, run.run_id));
+    try testing.expect(!std.mem.eql(u8, latest.run_id, successor));
+    const history = try env.client.fetchHistory(a, run.id, latest.run_id);
+    const started = history.events.items[0].attributes.?.workflow_execution_started_event_attributes;
+    const state = (try temporal.converter.fromPayloads(struct { trip_workflow.UserState }, a, started.input.?.payloads.items))[0];
+    try testing.expectEqual(10, state.trip_counter);
+    for (history.events.items) |event| {
+        try testing.expect(event.attributes.? != .workflow_execution_signaled_event_attributes);
+    }
+    try waitForCounter(env, a, run.id, 10);
+    try env.client.terminateWorkflow(run.id, "", "test finished");
+}
+
+test "a trip recorded between the read and the terminate reaches the replacement" {
+    var late_trip: SignalBeforeTerminate = .{ .trips = 1, .wait_for_continue = false };
+    const interceptors = [_]interceptor.Client{.from(SignalBeforeTerminate, &late_trip)};
+    var e: Env = undefined;
+    try e.startWith(.{ .interceptors = &interceptors });
+    defer e.deinit();
+    const env = e.env;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(TripWorkflow, .{ .task_queue = "" }, .{.{}});
+    defer run.deinit();
+    try signalTrips(env, run.id, 3);
+    try waitForCounter(env, a, run.id, 3);
+    late_trip.client = &env.client;
+    late_trip.workflow_id = run.id;
+    late_trip.run_id = run.run_id;
+
+    try waitForRunningTrips(env, 1);
+    try env.executeWorkflow(recovery_workflow.RecoverWorkflow, .{.{ .workflow_type = "TripWorkflow" }}, a, null);
+    try testing.expect(late_trip.fired.load(.acquire));
+
+    const closed = try waitForClose(env, a, run.id, run.run_id);
+    try testing.expect(closed.attributes.? == .workflow_execution_terminated_event_attributes);
+    // The three trips recovery read, and the one recorded after that read.
+    try waitForCounter(env, a, run.id, 4);
+    try env.client.terminateWorkflow(run.id, "", "test finished");
+}
+
+test "a run that ended by continuing as new counts as completed" {
+    const continued: temporal.history.HistoryEvent = .{
+        .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW,
+        .attributes = .{ .workflow_execution_continued_as_new_event_attributes = .{ .new_execution_run_id = "next" } },
+    };
+    try testing.expect(recovery_workflow.isExecutionCompleted(continued));
+
+    const terminated: temporal.history.HistoryEvent = .{ .attributes = .{ .workflow_execution_terminated_event_attributes = .{} } };
+    try testing.expect(recovery_workflow.isExecutionCompleted(terminated));
+    const signaled: temporal.history.HistoryEvent = .{ .attributes = .{ .workflow_execution_signaled_event_attributes = .{} } };
+    try testing.expect(!recovery_workflow.isExecutionCompleted(signaled));
+    try testing.expect(!recovery_workflow.isExecutionCompleted(.{}));
 }
 
 test "the recovery workflow finishes when nothing is running" {
