@@ -2680,11 +2680,31 @@ pub const Client = struct {
         return c.rpcCall(Response, method, request, arena, status, null, null);
     }
 
+    /// Whether `send` runs the codecs and decodes failure attributes over a response.
+    const ResponseCodecs = enum {
+        decode,
+        /// Leaves the response's payloads as the server sent them (still codec-encoded, with
+        /// failure attributes not decoded), for internal calls that read no payloads.
+        skip,
+    };
+
+    /// `rpcCall` for an internal call that reads no payload of its response: the response is
+    /// not decoded by the codecs, so a payload they can't decode doesn't fail the call. The
+    /// request is still encoded and the call still goes through the interceptors.
+    fn rpcUndecoded(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator) RpcError!Response {
+        return c.rpcCallCoded(Response, method, request, arena, null, null, null, .skip);
+    }
+
     /// Passes the call through the client's interceptors, which end in `send`. `header`, for
     /// a request that carries one, replaces the request's header (null leaves it as it is).
     /// `values` are the call's propagated values (its `.context`), which `send` hands the
     /// codecs.
     fn rpcCall(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter, values: ?*const propagation.Values) RpcError!Response {
+        return c.rpcCallCoded(Response, method, request, arena, status, header, values, .decode);
+    }
+
+    /// `rpcCall`, with `response_codecs` saying whether `send` decodes the response.
+    fn rpcCallCoded(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter, values: ?*const propagation.Values, response_codecs: ResponseCodecs) RpcError!Response {
         const Request = @TypeOf(request);
         var req = request;
         var resp: Response = .{};
@@ -2701,6 +2721,7 @@ pub const Client = struct {
             client: *Client,
             status: ?*?RpcStatus,
             values: ?*const propagation.Values,
+            response_codecs: ResponseCodecs,
 
             const vtable: interceptor.Client.VTable = .{ .call = end };
 
@@ -2708,10 +2729,10 @@ pub const Client = struct {
                 const e: *@This() = @ptrCast(@alignCast(ptr));
                 const r = input.request(Request).?;
                 if (comptime carriesHeader(Request)) if (input.header) |w| setHeader(Request, r, try protoHeader(input.arena, w.*));
-                input.response(Response).?.* = try e.client.send(Response, method, r.*, input.arena, e.status, e.values);
+                input.response(Response).?.* = try e.client.send(Response, method, r.*, input.arena, e.status, e.values, e.response_codecs);
             }
         };
-        var end: End = .{ .client = c, .status = status, .values = values };
+        var end: End = .{ .client = c, .status = status, .values = values, .response_codecs = response_codecs };
         const next: interceptor.Client.Next = .{ .chain = c.interceptors, .root = .{ .ptr = &end, .vtable = &End.vtable } };
         try next.call(&call);
         return resp;
@@ -2821,11 +2842,13 @@ pub const Client = struct {
     /// `error.AlreadyExists`. The codecs encode the
     /// request and decode the response with `values` and the workflow or activity the request
     /// names. A request with a string field that is not valid UTF-8, as coded, is not sent:
-    /// it fails as a server's INVALID_ARGUMENT (status 3) naming the field would.
-    fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values) RpcError!Response {
+    /// it fails as a server's INVALID_ARGUMENT (status 3) naming the field would. With
+    /// `response_codecs` `.skip`, the response's payloads and failure attributes are left
+    /// as the server sent them.
+    fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values, response_codecs: ResponseCodecs) RpcError!Response {
         var codec_context: converter.Context = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
         requestIdentity(@TypeOf(request), &request, &codec_context);
-        return c.sendInContext(Response, method, request, arena, status, &codec_context);
+        return c.sendInContext(Response, method, request, arena, status, &codec_context, response_codecs);
     }
 
     /// For `worker.Worker`: records a heartbeat of the activity attempt `task_token` with
@@ -2840,10 +2863,10 @@ pub const Client = struct {
             try payloads.payloads.appendSlice(arena, details);
             request.details = payloads;
         }
-        return c.sendInContext(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", request, arena, null, context);
+        return c.sendInContext(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", request, arena, null, context, .decode);
     }
 
-    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.Context) RpcError!Response {
+    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.Context, response_codecs: ResponseCodecs) RpcError!Response {
         var coded = request;
         if (c.encode_failure_attributes) try failure_mod.encodeAttributes(@TypeOf(coded), &coded, arena);
         converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io, codec_context) catch |err| {
@@ -2893,6 +2916,7 @@ pub const Client = struct {
             else => return error.InvalidResponse,
         };
         if (comptime Response == wfs.GetWorkflowExecutionHistoryResponse) try liftRawHistory(arena, &coded, &response);
+        if (response_codecs == .skip) return response;
         converter.decodeMessage(Response, &response, c.codecs, arena, c.io, codec_context) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: decoding the response's payloads with the client's codecs failed", .{method});
             return err;
@@ -4975,11 +4999,13 @@ pub const ResultError = error{
 
 /// Whether the run is still open (running or paused), from DescribeWorkflowExecution. The
 /// response lives in a scratch arena freed before it returns, so a long wait in
-/// `WorkflowRun.getWithOptions` doesn't grow the caller's arena with each check.
+/// `WorkflowRun.getWithOptions` doesn't grow the caller's arena with each check. Only the
+/// status is read, so the response is not decoded by the codecs: a payload in it they can't
+/// decode (a memo, a pending activity's heartbeat details) doesn't fail the wait.
 fn runIsOpen(c: *Client, workflow_id: []const u8, run_id: []const u8) ResultError!bool {
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
-    const response = c.rpc(wfs.DescribeWorkflowExecutionResponse, "DescribeWorkflowExecution", wfs.DescribeWorkflowExecutionRequest{
+    const response = c.rpcUndecoded(wfs.DescribeWorkflowExecutionResponse, "DescribeWorkflowExecution", wfs.DescribeWorkflowExecutionRequest{
         .namespace = c.namespace,
         .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
     }, scratch.allocator()) catch |err| switch (err) {
