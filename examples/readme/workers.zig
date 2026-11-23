@@ -115,6 +115,37 @@ fn runVersionedWorker(gpa: std.mem.Allocator, io: std.Io, client: *temporal.clie
 }
 // end-example
 
+// example: worker-several
+fn runGreetingAndReportWorkers(gpa: std.mem.Allocator, io: std.Io, client: *temporal.client.Client) !void {
+    var greetings = try Worker.init(gpa, io, client, "greetings", .{});
+    defer greetings.deinit();
+    try greetings.registerWorkflow(Greeting);
+    try greetings.registerActivity(Greet);
+
+    var reports = try Worker.init(gpa, io, client, "reports", .{});
+    defer reports.deinit();
+    try reports.registerActivity(Greet);
+
+    var group: std.Io.Group = .init;
+    // Declared after the workers' `defer deinit`, so it runs before them: if a later start
+    // fails, the workers already running are stopped and joined before they are freed.
+    errdefer {
+        greetings.stop();
+        reports.stop();
+        group.await(io) catch group.cancel(io);
+    }
+    try group.concurrent(io, runWorker, .{&greetings});
+    try group.concurrent(io, runWorker, .{&reports});
+    // One SIGINT or SIGTERM stops both.
+    try group.await(io);
+}
+
+fn runWorker(w: *Worker) void {
+    w.runUntilSignal() catch |err|
+        std.log.err("worker for {s} failed: {t} {s}", .{ w.task_queue, err, w.fatalMessage() orelse "" });
+}
+// end-example
+
 test "workers: deadlock detection takes a limit, or null to turn it off" {
     var client: temporal.client.Client = undefined; // never used: the workers don't run
     const gpa = testing.allocator;
@@ -154,6 +185,10 @@ test "workers: poller behavior is a simple maximum or autoscaling, per kind of t
 
 test "workers: a versioned worker compiles" {
     _ = &runVersionedWorker;
+}
+
+test "workers: several workers in one process compile" {
+    _ = &runGreetingAndReportWorkers;
 }
 
 fn writeCard(ctx: *activity.Context, name: []const u8) ![]const u8 {

@@ -53,7 +53,11 @@ pub fn main(init: std.process.Init) !void {
     try system.waitForCallback(expense_id);
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
-    const approve_url = try std.fmt.allocPrint(arena, "http://{s}:{d}/action?type=approve&id={s}", .{ expense.expense_server_host, expense.expense_server_port, expense_id });
+    const approve_url = try std.fmt.allocPrint(arena, "http://{s}:{d}/action?type=approve&id={f}", .{
+        expense.expense_server_host,
+        expense.expense_server_port,
+        std.fmt.alt(std.Uri.Component{ .raw = expense_id }, .formatEscaped),
+    });
     const approval = http.fetch(.{ .location = .{ .url = approve_url } }) catch |err| {
         std.log.err("Unable to approve expense {s}: {t}", .{ expense_id, err });
         std.process.exit(1);

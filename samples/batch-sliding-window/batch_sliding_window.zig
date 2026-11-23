@@ -66,9 +66,9 @@ pub const GetRecords = activity.Def("GetRecords", RecordLoader.getRecords);
 const activity_options: workflow.ActivityOptions = .{ .start_to_close_timeout = .fromSeconds(5) };
 
 pub const ProcessBatchWorkflowInput = struct {
-    /// How many children one run of a sliding window workflow starts.
+    /// How many children one run of a sliding window workflow starts; at least 1.
     page_size: u32,
-    /// How many children run at once, across all partitions.
+    /// How many children run at once, across all partitions; at least `partitions`.
     sliding_window_size: u32,
     /// How many sliding window workflows run in parallel.
     partitions: u32,
@@ -78,14 +78,16 @@ pub const ProcessBatchWorkflowInput = struct {
 /// partitions, then runs a sliding window workflow for each. Returns the number of records
 /// processed.
 fn processBatchWorkflow(ctx: *workflow.Context, input: ProcessBatchWorkflowInput) !u32 {
-    const record_count = try ctx.executeActivity(GetRecordCount, activity_options, .{}).get();
-
+    // Checked before any activity runs, so bad input fails the batch at once.
+    if (input.page_size == 0) return failPageSize(ctx);
     if (input.partitions == 0 or input.sliding_window_size < input.partitions) {
         return ctx.fail(.{
             .message = try std.fmt.allocPrint(ctx.allocator(), "sliding_window_size {d} cannot be less than the number of partitions {d}, which must be at least 1", .{ input.sliding_window_size, input.partitions }),
             .type = "invalidInput",
         });
     }
+
+    const record_count = try ctx.executeActivity(GetRecordCount, activity_options, .{}).get();
     const partitions = try divideIntoPartitions(ctx.allocator(), record_count, input.partitions);
     const window_sizes = try divideIntoPartitions(ctx.allocator(), input.sliding_window_size, input.partitions);
 
@@ -119,6 +121,12 @@ fn processBatchWorkflow(ctx: *workflow.Context, input: ProcessBatchWorkflowInput
 
 pub const ProcessBatchWorkflow = workflow.Def("ProcessBatchWorkflow", processBatchWorkflow);
 
+/// Fails the workflow: with a page size of 0 a sliding window would load no records and
+/// continue as new with its offset unchanged, forever.
+fn failPageSize(ctx: *workflow.Context) error{ApplicationFailure} {
+    return ctx.fail(.{ .message = "page_size must be at least 1", .type = "invalidInput" });
+}
+
 /// Splits `number` into `n` parts that differ by at most one, larger parts first. Memory comes
 /// from `gpa`; the caller owns it.
 pub fn divideIntoPartitions(gpa: Allocator, number: u32, n: u32) error{OutOfMemory}![]u32 {
@@ -128,7 +136,9 @@ pub fn divideIntoPartitions(gpa: Allocator, number: u32, n: u32) error{OutOfMemo
 }
 
 pub const SlidingWindowWorkflowInput = struct {
+    /// At least 1.
     page_size: u32,
+    /// At least 1.
     sliding_window_size: u32,
     /// The first record of this run's range (inclusive).
     offset: u32,
@@ -200,8 +210,15 @@ const SlidingWindow = struct {
 
 /// Processes the records from `input.offset` to `input.maximum_offset` with at most
 /// `input.sliding_window_size` record processor children at once, continuing as new after
-/// each page. Returns the number of records processed over all runs.
+/// each page. Returns the number of records processed over all runs. Fails when the page size
+/// or the window is 0, or when `GetRecords` returns no records before `maximum_offset`.
 fn slidingWindowWorkflow(ctx: *workflow.Context, input: SlidingWindowWorkflowInput) !u32 {
+    if (input.page_size == 0) return failPageSize(ctx);
+    // With no room in the window, no child could ever start.
+    if (input.sliding_window_size == 0) {
+        return ctx.fail(.{ .message = "sliding_window_size must be at least 1", .type = "invalidInput" });
+    }
+
     ctx.logger().info("SlidingWindowWorkflow", .{
         .sliding_window_size = input.sliding_window_size,
         .page_size = input.page_size,
@@ -230,6 +247,13 @@ fn slidingWindowWorkflow(ctx: *workflow.Context, input: SlidingWindowWorkflowInp
             .offset = s.offset,
             .max_offset = input.maximum_offset,
         }}).get();
+        // Continuing as new with the offset unchanged would load the same empty page forever.
+        if (page.records.len == 0) {
+            return ctx.fail(.{
+                .message = try std.fmt.allocPrint(gpa, "GetRecords returned no records at offset {d}, before maximum_offset {d}", .{ s.offset, input.maximum_offset }),
+                .type = "emptyPage",
+            });
+        }
     }
 
     for (page.records) |record| {
