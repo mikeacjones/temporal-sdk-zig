@@ -1639,7 +1639,39 @@ Notes:
 - When sdk-core gives up polling for tasks, the worker logs it, shuts down its core workers, and `run` (or `runUntilSignal`) returns `error.PollFailed`, or `error.OutOfMemory` when the poll itself ran out of memory. `Worker.fatalMessage` then has `polling for <workflow|activity|nexus> tasks on task queue <queue> failed: <reason>`, owned by the worker until the next `run` or `deinit`; it is null if that text couldn't be allocated.
 - `stop` is safe from any thread, before or during `run`, and the stop is permanent: a later `run` returns at once. `waitUntilRunning` returns `error.WorkerFailedToStart` when `run` failed first.
 - `waitUntilRunning` reports the run that is active, or else the most recent one, and before any run it waits for the first. After a run that failed to start, it returns `error.WorkerFailedToStart` until the next `run` begins, then waits for that run. A run begins only when its task enters `run`, so on a reused Worker, `waitUntilRunning` called right after `io.concurrent(run)` may report the previous run's outcome, such as its failed start. To retry a start that failed, make a new Worker.
-- Several workers can share a process and a client, one per task queue; one signal stops every worker in `runUntilSignal`.
+- Several workers can share a process and a client, one per task queue; one signal stops every worker in `runUntilSignal`. Run each on an `std.Io.Group` as below, with an `errdefer` that stops and joins the workers already started, so a failed start doesn't free a worker that is still running.
+
+<!-- example: worker-several -->
+```zig
+fn runGreetingAndReportWorkers(gpa: std.mem.Allocator, io: std.Io, client: *temporal.client.Client) !void {
+    var greetings = try Worker.init(gpa, io, client, "greetings", .{});
+    defer greetings.deinit();
+    try greetings.registerWorkflow(Greeting);
+    try greetings.registerActivity(Greet);
+
+    var reports = try Worker.init(gpa, io, client, "reports", .{});
+    defer reports.deinit();
+    try reports.registerActivity(Greet);
+
+    var group: std.Io.Group = .init;
+    // Declared after the workers' `defer deinit`, so it runs before them: if a later start
+    // fails, the workers already running are stopped and joined before they are freed.
+    errdefer {
+        greetings.stop();
+        reports.stop();
+        group.await(io) catch group.cancel(io);
+    }
+    try group.concurrent(io, runWorker, .{&greetings});
+    try group.concurrent(io, runWorker, .{&reports});
+    // One SIGINT or SIGTERM stops both.
+    try group.await(io);
+}
+
+fn runWorker(w: *Worker) void {
+    w.runUntilSignal() catch |err|
+        std.log.err("worker for {s} failed: {t} {s}", .{ w.task_queue, err, w.fatalMessage() orelse "" });
+}
+```
 
 #### Options
 

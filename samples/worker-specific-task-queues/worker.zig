@@ -36,7 +36,15 @@ pub fn main(init: std.process.Init) !void {
     try unique.registerActivity(activities.ProcessFile);
     try unique.registerActivity(activities.DeleteFile);
 
+    // If starting the second worker fails, stop and join the first before the workers'
+    // `defer deinit` and `client.close()` run. Declared after those, so it runs first; a stop
+    // before `run` is harmless and permanent.
     var group: std.Io.Group = .init;
+    errdefer {
+        shared.stop();
+        unique.stop();
+        group.await(io) catch group.cancel(io);
+    }
     try group.concurrent(io, runWorker, .{&shared});
     try group.concurrent(io, runWorker, .{&unique});
     // Wait for both workers to stop.

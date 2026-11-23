@@ -44,7 +44,16 @@ pub fn main(init: std.process.Init) !void {
     try periodic_worker.registerWorkflow(periodic_sequence.PollingChildWorkflow);
     try periodic_worker.registerActivityWith(periodic_sequence.DoPoll, &periodic_activities);
 
+    // If starting a later worker fails, stop and join the ones already running before their
+    // `defer deinit` and `client.close()` run. Declared after those, so it runs first; a stop
+    // before `run` is harmless and permanent.
     var group: std.Io.Group = .init;
+    errdefer {
+        frequent_worker.stop();
+        infrequent_worker.stop();
+        periodic_worker.stop();
+        group.await(io) catch group.cancel(io);
+    }
     try group.concurrent(io, runWorker, .{&frequent_worker});
     try group.concurrent(io, runWorker, .{&infrequent_worker});
     try group.concurrent(io, runWorker, .{&periodic_worker});
