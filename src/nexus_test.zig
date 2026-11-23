@@ -850,3 +850,82 @@ test "nexus: the client's worker interceptors run outside the worker's own on a 
     try testing.expect(records.has("echo handled worker"));
     try testing.expect(records.has("echo handled client"));
 }
+
+/// Keeps the reason of each "Dropping a link of the Nexus request that doesn't parse" record.
+const DroppedLinks = struct {
+    mutex: Io.Mutex = .init,
+    arena: std.heap.ArenaAllocator = .init(testing.allocator),
+    reasons: std.ArrayList([]const u8) = .empty,
+
+    fn sink(d: *DroppedLinks) log.Sink {
+        return .{ .ptr = d, .vtable = &.{ .log = record } };
+    }
+
+    fn record(ptr: ?*anyopaque, _: log.Level, message: []const u8, fields: []const log.Field) void {
+        if (!std.mem.eql(u8, message, "Dropping a link of the Nexus request that doesn't parse")) return;
+        const d: *DroppedLinks = @ptrCast(@alignCast(ptr.?));
+        d.mutex.lockUncancelable(testing.io);
+        defer d.mutex.unlock(testing.io);
+        for (fields) |f| if (std.mem.eql(u8, f.key, "Reason")) {
+            const reason = d.arena.allocator().dupe(u8, f.value) catch return;
+            d.reasons.append(d.arena.allocator(), reason) catch {};
+        };
+    }
+
+    fn expectReasonContaining(d: *DroppedLinks, needle: []const u8) !void {
+        d.mutex.lockUncancelable(testing.io);
+        defer d.mutex.unlock(testing.io);
+        for (d.reasons.items) |r| if (std.mem.indexOf(u8, r, needle) != null) return;
+        std.debug.print("no dropped link's reason contains \"{s}\"; the reasons were {any}\n", .{ needle, d.reasons.items });
+        return error.TestExpectedDroppedLink;
+    }
+};
+
+/// A port nothing listens on now, for the dev server's HTTP API.
+fn freePort(io: Io) !u16 {
+    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var server = try any.listen(io, .{});
+    defer server.deinit(io);
+    return server.socket.address.getPort();
+}
+
+test "nexus: a request whose link isn't UTF-8 once percent-decoded starts its workflow, and the link is logged and dropped" {
+    const port = try freePort(testing.io);
+    var port_text: [8]u8 = undefined;
+    const extra_args = [_][]const u8{ "--http-port", try std.fmt.bufPrint(&port_text, "{d}", .{port}) };
+    var dropped: DroppedLinks = .{};
+    defer dropped.arena.deinit();
+    var handlers: Handlers = .{ .io = testing.io };
+    var s = try Setup.start(&handlers, .{ .dev_server_extra_args = &extra_args, .logger = dropped.sink() });
+    defer s.deinit();
+    const a = s.arena.allocator();
+    // A call through the endpoint starts the environment's worker and shows it polling for
+    // Nexus tasks, so the request below reaches it.
+    try expectContains(try s.run(CallEcho, .{ s.endpoint, "hi" }), "hi op=zig-test-service/echo");
+
+    // The server passes the request's links on to the worker as the caller sent them.
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/namespaces/default/task-queues/{s}/nexus-services/zig-test-service/greet", .{ port, s.env.task_queue });
+    var http: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer http.deinit();
+    var body: Io.Writer.Allocating = .init(a);
+    const result = try http.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = "\"Link\"",
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .extra_headers = &.{
+            .{ .name = "Nexus-Request-Id", .value = try uniqueName(a, "request") },
+            .{ .name = "Nexus-Link", .value = "<temporal:///namespaces/ns%FF/workflows/w/r/history?referenceType=EventReference&eventType=WorkflowExecutionStarted>; type=\"temporal.api.common.v1.Link.WorkflowEvent\"" },
+        },
+        .response_writer = &body.writer,
+    });
+    if (result.status.class() != .success) {
+        std.debug.print("the start answered {d}: {s}\n", .{ @backingInt(result.status), body.written() });
+        return error.TestStartFailed;
+    }
+
+    var greeted = try s.env.client.getWorkflow([]const u8, "greet-Link", "");
+    defer greeted.deinit();
+    try testing.expectEqualStrings("Hello, Link", try greeted.get(a));
+    try dropped.expectReasonContaining("its namespace is not valid UTF-8");
+}

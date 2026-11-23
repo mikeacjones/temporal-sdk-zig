@@ -1947,7 +1947,7 @@ Notes:
 
 - Codecs run in order on the way out and in reverse on the way in. Search attributes are never encoded. The codecs are borrowed and must outlive the client.
 - A codec returns as many payloads as it was given and passes through payloads it didn't encode. It runs on many threads at once, never in workflow code.
-- `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.Context`: namespace, workflow, activity, and propagated values.
+- `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.Context`: namespace, workflow, activity, and propagated values. On the workflow's worker a codec gets the run's context, except for an activity's, local activity's or child's arguments and results, which carry the activity's type and ID or the child's workflow ID and type, as on the worker that runs it; signals to other workflows carry the run's.
 - `converter.codecHandler(codecs, options)` serves `POST /encode` and `/decode` for the Temporal Web UI and CLI. It doesn't authenticate callers.
 
 #### Failures
