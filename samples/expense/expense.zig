@@ -27,13 +27,21 @@ pub const Activities = struct {
 
     pub fn createExpense(a: *Activities, ctx: *activity.Context, expense_id: []const u8) !void {
         if (expense_id.len == 0) return ctx.fail(.{ .message = "expense id is empty" });
-        const body = try a.call(ctx, try std.fmt.allocPrint(ctx.allocator(), "/create?is_api_call=true&id={s}", .{expense_id}), null);
+        // The owner makes a retry idempotent: when an earlier attempt created the expense and
+        // its answer was lost, the system answers this workflow's create again with SUCCEED.
+        const path = try requestPath(ctx.allocator(), "/create?is_api_call=true", &.{
+            .{ "id", expense_id },
+            .{ "owner", ctx.info().workflow_id },
+        });
+        const body = try a.call(ctx, path, null);
         if (!std.mem.eql(u8, body, "SUCCEED")) return ctx.fail(.{ .message = body });
         ctx.logger().info("Expense created.", .{ .expense_id = expense_id });
     }
 
     /// Registers this attempt's task token with the expense system, which completes the
-    /// activity with "APPROVED" or "REJECTED" once a person decides.
+    /// activity with "APPROVED" or "REJECTED" once a person decides. When the expense was
+    /// decided before the registration, the system answers with the decision instead, and the
+    /// activity returns it at once.
     pub fn waitForDecision(a: *Activities, ctx: *activity.Context, expense_id: []const u8) ![]const u8 {
         if (expense_id.len == 0) return ctx.fail(.{ .message = "expense id is empty" });
         const logger = ctx.logger();
@@ -42,7 +50,7 @@ pub const Activities = struct {
         try form.writer.writeAll("task_token=");
         try (std.Uri.Component{ .raw = ctx.info().task_token }).formatEscaped(&form.writer);
 
-        const path = try std.fmt.allocPrint(ctx.allocator(), "/registerCallback?id={s}", .{expense_id});
+        const path = try requestPath(ctx.allocator(), "/registerCallback?", &.{.{ "id", expense_id }});
         const status = a.call(ctx, path, form.written()) catch |err| {
             logger.info("waitForDecisionActivity failed to register callback.", .{ .err = err });
             return err;
@@ -51,6 +59,10 @@ pub const Activities = struct {
             logger.info("Successfully registered callback.", .{ .expense_id = expense_id });
             return ctx.completeAsync();
         }
+        if (std.mem.eql(u8, status, "APPROVED") or std.mem.eql(u8, status, "REJECTED")) {
+            logger.info("Expense already decided.", .{ .expense_id = expense_id, .expense_status = status });
+            return status;
+        }
 
         logger.warn("Register callback failed.", .{ .expense_status = status });
         return ctx.fail(.{ .message = try std.fmt.allocPrint(ctx.allocator(), "register callback failed status:{s}", .{status}) });
@@ -58,7 +70,8 @@ pub const Activities = struct {
 
     pub fn payment(a: *Activities, ctx: *activity.Context, expense_id: []const u8) !void {
         if (expense_id.len == 0) return ctx.fail(.{ .message = "expense id is empty" });
-        const body = try a.call(ctx, try std.fmt.allocPrint(ctx.allocator(), "/action?is_api_call=true&type=payment&id={s}", .{expense_id}), null);
+        const path = try requestPath(ctx.allocator(), "/action?is_api_call=true&type=payment", &.{.{ "id", expense_id }});
+        const body = try a.call(ctx, path, null);
         if (!std.mem.eql(u8, body, "SUCCEED")) return ctx.fail(.{ .message = body });
         ctx.logger().info("paymentActivity succeed", .{ .expense_id = expense_id });
     }
@@ -84,6 +97,20 @@ pub const Activities = struct {
         return body.written();
     }
 };
+
+/// `prefix` followed by each field as `name=value`, its value percent-encoded, joined by `&`
+/// (and preceded by one when `prefix` doesn't end in `?`). Allocated from `arena`.
+fn requestPath(arena: std.mem.Allocator, prefix: []const u8, fields: []const [2][]const u8) ![]const u8 {
+    var path: std.Io.Writer.Allocating = .init(arena);
+    const w = &path.writer;
+    try w.writeAll(prefix);
+    for (fields, 0..) |field, i| {
+        if (i > 0 or !std.mem.endsWith(u8, prefix, "?")) try w.writeByte('&');
+        try w.print("{s}=", .{field[0]});
+        try (std.Uri.Component{ .raw = field[1] }).formatEscaped(w);
+    }
+    return path.written();
+}
 
 pub const CreateExpenseActivity = activity.Def("CreateExpenseActivity", Activities.createExpense);
 pub const WaitForDecisionActivity = activity.Def("WaitForDecisionActivity", Activities.waitForDecision);

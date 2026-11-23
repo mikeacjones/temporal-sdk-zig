@@ -8,11 +8,16 @@
 //!
 //! Endpoints (all GET except registerCallback, which takes a POSTed form):
 //!   /, /list                         the expenses, with approve and reject buttons
-//!   /create?id=ID                    creates an expense
+//!   /create?id=ID[&owner=O]          creates an expense. Creating an ID that exists answers
+//!                                    "SUCCEED" when both creates name the same non-empty
+//!                                    owner (a workflow retrying its create), and
+//!                                    "ERROR:ID_ALREADY_EXISTS" otherwise.
 //!   /action?type=approve|reject|payment&id=ID
 //!   /status?id=ID                    the expense's state
 //!   /registerCallback?id=ID          form field task_token: the activity to complete with
-//!                                    the decision
+//!                                    the decision. Answers "SUCCEED" when the expense awaits
+//!                                    a decision, or the decision ("APPROVED" or "REJECTED")
+//!                                    when it already has one; then no token is kept.
 //! `is_api_call=true` makes /create and /action answer "SUCCEED" instead of the list page.
 //! Errors are answered with "ERROR:..." bodies.
 
@@ -38,6 +43,14 @@ pub const State = enum {
     }
 };
 
+/// An expense and the workflow that created it.
+pub const Expense = struct {
+    state: State,
+    /// The ID of the workflow that created the expense, owned by the system's `gpa`; empty
+    /// when a person created it.
+    owner: []const u8,
+};
+
 pub const Response = struct {
     content_type: []const u8 = "text/plain",
     body: []const u8,
@@ -53,8 +66,8 @@ pub const ExpenseSystem = struct {
     mutex: Io.Mutex = .init,
     /// Broadcast whenever a callback is registered.
     callback_registered: Io.Condition = .init,
-    /// Keys and token values are owned by `gpa`.
-    expenses: std.StringArrayHashMapUnmanaged(State) = .empty,
+    /// Keys, owners and token values are owned by `gpa`.
+    expenses: std.StringArrayHashMapUnmanaged(Expense) = .empty,
     tokens: std.StringArrayHashMapUnmanaged([]u8) = .empty,
 
     pub fn init(gpa: Allocator, io: Io, client: *temporal.client.Client) ExpenseSystem {
@@ -62,7 +75,10 @@ pub const ExpenseSystem = struct {
     }
 
     pub fn deinit(s: *ExpenseSystem) void {
-        for (s.expenses.keys()) |id| s.gpa.free(id);
+        for (s.expenses.keys(), s.expenses.values()) |id, e| {
+            s.gpa.free(id);
+            s.gpa.free(e.owner);
+        }
         s.expenses.deinit(s.gpa);
         for (s.tokens.keys(), s.tokens.values()) |id, token| {
             s.gpa.free(id);
@@ -150,12 +166,21 @@ pub const ExpenseSystem = struct {
         const ids = try arena.dupe([]const u8, s.expenses.keys());
         std.mem.sort([]const u8, ids, {}, lessThan);
         for (ids) |id| {
-            const state = s.expenses.get(id).?;
-            try w.print("<tr><td>{s}</td><td>{s}</td><td>", .{ id, state.label() });
-            if (state == .created) try w.print("<a href=\"/action?type=approve&id={s}\">" ++
-                "<button style=\"background-color:#4CAF50;\">APPROVE</button></a>" ++
-                "&nbsp;&nbsp;<a href=\"/action?type=reject&id={s}\">" ++
-                "<button style=\"background-color:#f44336;\">REJECT</button></a>", .{ id, id });
+            const state = s.expenses.get(id).?.state;
+            try w.writeAll("<tr><td>");
+            try writeHtmlEscaped(w, id);
+            try w.print("</td><td>{s}</td><td>", .{state.label()});
+            if (state == .created) {
+                // Percent-encoded with unreserved characters only, the ID is also safe in an
+                // HTML attribute; the `&` between the query's fields stays literal.
+                const component: std.Uri.Component = .{ .raw = id };
+                try w.writeAll("<a href=\"/action?type=approve&id=");
+                try component.formatEscaped(w);
+                try w.writeAll("\"><button style=\"background-color:#4CAF50;\">APPROVE</button></a>" ++
+                    "&nbsp;&nbsp;<a href=\"/action?type=reject&id=");
+                try component.formatEscaped(w);
+                try w.writeAll("\"><button style=\"background-color:#f44336;\">REJECT</button></a>");
+            }
             try w.writeAll("</td></tr>");
         }
         try w.writeAll("</table>");
@@ -168,18 +193,29 @@ pub const ExpenseSystem = struct {
 
     fn create(s: *ExpenseSystem, arena: Allocator, query: []const u8) !Response {
         const id = try formValue(arena, query, "id") orelse "";
-        {
+        const owner = try formValue(arena, query, "owner") orelse "";
+        created: {
             try s.mutex.lock(s.io);
             defer s.mutex.unlock(s.io);
             const entry = try s.expenses.getOrPut(s.gpa, id);
-            if (entry.found_existing) return .{ .body = "ERROR:ID_ALREADY_EXISTS" };
-            entry.key_ptr.* = s.gpa.dupe(u8, id) catch |err| {
+            if (entry.found_existing) {
+                // The same workflow creating again: its earlier create's answer was lost.
+                if (owner.len > 0 and std.mem.eql(u8, entry.value_ptr.owner, owner)) break :created;
+                return .{ .body = "ERROR:ID_ALREADY_EXISTS" };
+            }
+            const owned_id = s.gpa.dupe(u8, id) catch |err| {
                 s.expenses.swapRemoveAt(entry.index);
                 return err;
             };
-            entry.value_ptr.* = .created;
+            const owned_owner = s.gpa.dupe(u8, owner) catch |err| {
+                s.expenses.swapRemoveAt(entry.index);
+                s.gpa.free(owned_id);
+                return err;
+            };
+            entry.key_ptr.* = owned_id;
+            entry.value_ptr.* = .{ .state = .created, .owner = owned_owner };
+            std.log.info("Created new expense id:{s}.", .{id});
         }
-        std.log.info("Created new expense id:{s}.", .{id});
         if (try isApiCall(arena, query)) return .{ .body = "SUCCEED" };
         return s.list(arena);
     }
@@ -192,7 +228,7 @@ pub const ExpenseSystem = struct {
         {
             try s.mutex.lock(s.io);
             defer s.mutex.unlock(s.io);
-            const state = s.expenses.getPtr(id) orelse return .{ .body = "ERROR:INVALID_ID" };
+            const state = &(s.expenses.getPtr(id) orelse return .{ .body = "ERROR:INVALID_ID" }).state;
             old_state = state.*;
             if (std.mem.eql(u8, action_type, "approve")) {
                 state.* = .approved;
@@ -215,7 +251,7 @@ pub const ExpenseSystem = struct {
         const id = try formValue(arena, query, "id") orelse "";
         try s.mutex.lock(s.io);
         defer s.mutex.unlock(s.io);
-        const state = s.expenses.get(id) orelse return .{ .body = "ERROR:INVALID_ID" };
+        const state = (s.expenses.get(id) orelse return .{ .body = "ERROR:INVALID_ID" }).state;
         std.log.info("Checking status for {s}: {s}", .{ id, state.label() });
         return .{ .body = state.label() };
     }
@@ -226,8 +262,14 @@ pub const ExpenseSystem = struct {
         {
             try s.mutex.lock(s.io);
             defer s.mutex.unlock(s.io);
-            const state = s.expenses.get(id) orelse return .{ .body = "ERROR:INVALID_ID" };
-            if (state != .created) return .{ .body = "ERROR:INVALID_STATE" };
+            // Deciding under the mutex delivers a decision exactly one way: through a token
+            // stored before it (notifyExpenseStateChange), or as this answer after it.
+            switch ((s.expenses.get(id) orelse return .{ .body = "ERROR:INVALID_ID" }).state) {
+                .created => {},
+                // A paid expense was approved first.
+                .approved, .completed => return .{ .body = "APPROVED" },
+                .rejected => return .{ .body = "REJECTED" },
+            }
 
             const owned_token = try s.gpa.dupe(u8, token);
             errdefer s.gpa.free(owned_token);
@@ -248,7 +290,8 @@ pub const ExpenseSystem = struct {
     }
 
     /// Completes the activity waiting for expense `id`'s decision with `state`'s label. A
-    /// failure to complete it is logged, not returned: the decision itself is recorded.
+    /// failure to complete it is logged, not returned: the decision itself is recorded, and
+    /// the activity's next registration (a retry of it) is answered with the decision.
     fn notifyExpenseStateChange(s: *ExpenseSystem, arena: Allocator, id: []const u8, state: State) !void {
         const token = blk: {
             try s.mutex.lock(s.io);
@@ -268,6 +311,26 @@ pub const ExpenseSystem = struct {
         std.log.info("Successfully completed the activity for expense {s} with {s}", .{ id, state.label() });
     }
 };
+
+/// Writes `text` with HTML's special characters escaped, for element text and quoted
+/// attribute values.
+fn writeHtmlEscaped(w: *Io.Writer, text: []const u8) Io.Writer.Error!void {
+    var start: usize = 0;
+    for (text, 0..) |c, i| {
+        const entity = switch (c) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            else => continue,
+        };
+        try w.writeAll(text[start..i]);
+        try w.writeAll(entity);
+        start = i + 1;
+    }
+    try w.writeAll(text[start..]);
+}
 
 fn isApiCall(arena: Allocator, query: []const u8) !bool {
     const value = try formValue(arena, query, "is_api_call") orelse return false;
