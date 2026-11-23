@@ -98,3 +98,27 @@ test "the total timeout counts from the first signal, whichever it is" {
     try testing.expect(elapsed >= await_signals.from_first_signal_timeout.toSeconds());
     try testing.expect(elapsed < 40 + await_signals.signal_to_signal_timeout.toSeconds());
 }
+
+test "the total timeout runs while Signal1 is missing" {
+    const env = try startEnv();
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var run = try env.startWorkflow(AwaitSignalsWorkflow, .{ .task_queue = "" }, .{});
+    defer run.deinit();
+    try env.signalWorkflow(await_signals.Signal2, run.id, .{});
+    // Signal1 never comes; the wait for it is bounded by the total timeout from Signal2.
+    try expectTimeoutFailure(env, &run, arena.allocator(), "FromFirstSignalTimeout");
+
+    const history = try env.client.fetchHistory(arena.allocator(), run.id, run.run_id);
+    const events = history.events.items;
+    const first_signal = for (events) |event| {
+        if (event.attributes.? == .workflow_execution_signaled_event_attributes) break event;
+    } else return error.TestNoSignalInHistory;
+    const failed = events[events.len - 1];
+    try testing.expect(failed.attributes.? == .workflow_execution_failed_event_attributes);
+    const elapsed = failed.event_time.?.seconds - first_signal.event_time.?.seconds;
+    try testing.expect(elapsed >= await_signals.from_first_signal_timeout.toSeconds());
+    try env.replayRun(run.id, run.run_id);
+}
