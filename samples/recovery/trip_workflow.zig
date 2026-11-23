@@ -1,6 +1,6 @@
 //! The trip workflow keeps a user's trip count. Each `trip_event` signal is a completed trip
-//! and adds one to the count, which the `counter` query reads. After ten trips the run
-//! continues as new, carrying the count forward in its argument.
+//! and adds one to the count, which the `counter` query reads. After ten trips it counts every
+//! trip it has received, then continues as new, carrying the count forward in its argument.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -46,6 +46,13 @@ const Trips = struct {
     fn hasUncounted(t: *Trips) bool {
         return t.received.items.len > t.counted;
     }
+
+    fn countNext(t: *Trips) TripEvent {
+        const trip = t.received.items[t.counted];
+        t.counted += 1;
+        t.state.trip_counter += 1;
+        return trip;
+    }
 };
 
 fn tripWorkflow(ctx: *workflow.Context, state: UserState) !void {
@@ -62,10 +69,16 @@ fn tripWorkflow(ctx: *workflow.Context, state: UserState) !void {
 
     for (0..trips_per_run) |_| {
         try ctx.await(trips, Trips.hasUncounted);
-        const trip = trips.received.items[trips.counted];
-        trips.counted += 1;
+        const trip = trips.countNext();
         logger.info("Trip complete event received.", .{ .id = trip.id, .total = trip.total });
-        trips.state.trip_counter += 1;
+    }
+
+    // Signals delivered in the same workflow task as the tenth trip are already in `received`,
+    // and the new run would never see them, so they are counted here. A signal that arrives
+    // while the continue-as-new is in flight fails that task; the retry replays with it here.
+    while (trips.hasUncounted()) {
+        const trip = trips.countNext();
+        logger.info("Trip complete event received.", .{ .id = trip.id, .total = trip.total });
     }
 
     logger.info("Starting a new run.", .{ .trip_counter = trips.state.trip_counter });

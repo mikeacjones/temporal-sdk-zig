@@ -103,6 +103,77 @@ test "the trip workflow counts trips and continues as new after ten" {
     try env.client.terminateWorkflow(run.id, "", "test finished");
 }
 
+/// Starts a trip workflow and signals it `count` trips while no worker polls, so its first
+/// workflow task delivers them all at once. `env.client` is used directly: the environment's
+/// `startWorkflow` would start the worker first.
+fn startWithQueuedTrips(env: *WorkflowEnvironment, workflow_id: []const u8, count: usize) !temporal.client.WorkflowRun(void) {
+    var run = try env.client.executeWorkflow(TripWorkflow, .{ .id = workflow_id, .task_queue = env.task_queue }, .{.{}});
+    errdefer run.deinit();
+    for (0..count) |i| {
+        var buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buf, "Trip{d}", .{i + 1});
+        try env.client.signalWorkflow(trip_workflow.TripSignal, workflow_id, run.run_id, .{.{ .id = id, .total = @intCast(10 * (i + 1)) }});
+    }
+    return run;
+}
+
+test "trips delivered in one task beyond the tenth are counted before continuing as new" {
+    var e: Env = undefined;
+    try e.start();
+    defer e.deinit();
+    const env = e.env;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sent = trip_workflow.trips_per_run + 2;
+    var run = try startWithQueuedTrips(env, "trip-burst", sent);
+    defer run.deinit();
+
+    // The query starts the worker, whose first task holds every signal.
+    _ = try env.queryWorkflow(trip_workflow.Counter, a, run.id, .{});
+    const closed = try waitForClose(env, a, run.id, run.run_id);
+    const continued = closed.attributes.?.workflow_execution_continued_as_new_event_attributes;
+    const state = (try temporal.converter.fromPayloads(struct { trip_workflow.UserState }, a, continued.input.?.payloads.items))[0];
+    try testing.expectEqual(sent, state.trip_counter);
+    try waitForCounter(env, a, run.id, sent);
+
+    try env.replayRun(run.id, run.run_id);
+    try env.replayRun(run.id, continued.new_execution_run_id);
+    try env.client.terminateWorkflow(run.id, "", "test finished");
+}
+
+test "recovery restores a trip workflow that counted more than ten trips in one task" {
+    var e: Env = undefined;
+    try e.start();
+    defer e.deinit();
+    const env = e.env;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sent = trip_workflow.trips_per_run + 2;
+    var run = try startWithQueuedTrips(env, "trip-burst-recovered", sent);
+    defer run.deinit();
+
+    // Recovery runs while no worker polls, so the replacement's first task also holds every
+    // trip it signals.
+    const ids = try testing.allocator.alloc([]const u8, 1);
+    ids[0] = testing.allocator.dupe(u8, run.id) catch |err| {
+        testing.allocator.free(ids);
+        return err;
+    };
+    try e.cache.put("key", .{ .workflow_ids = ids });
+    var activity_env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    activity_env.client = &env.client;
+    try activity_env.executeActivityWith(recovery_workflow.RecoverExecutions, &e.activities, .{ "key", 0, 1 }, a);
+
+    const closed = try waitForClose(env, a, run.id, run.run_id);
+    try testing.expect(closed.attributes.? == .workflow_execution_terminated_event_attributes);
+    try waitForCounter(env, a, run.id, sent);
+    try env.client.terminateWorkflow(run.id, "", "test finished");
+}
+
 test "the recovery workflow restarts running trips with the trips signaled to them" {
     var e: Env = undefined;
     try e.start();
