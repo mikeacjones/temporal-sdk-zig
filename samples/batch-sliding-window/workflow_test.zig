@@ -6,13 +6,32 @@ const temporal = @import("temporal");
 const sample = @import("batch_sliding_window.zig");
 
 const testing = std.testing;
+const workflow = temporal.workflow;
 
 fn registerAll(env: *temporal.testing.WorkflowEnvironment, loader: *sample.RecordLoader) !void {
+    try registerWith(env, loader, sample.RecordProcessorWorkflow);
+}
+
+/// Registers the sample's workflows and activities, with `Processor` as the record processor.
+fn registerWith(env: *temporal.testing.WorkflowEnvironment, loader: *sample.RecordLoader, comptime Processor: type) !void {
     try env.registerWorkflow(sample.ProcessBatchWorkflow);
     try env.registerWorkflow(sample.SlidingWindowWorkflow);
-    try env.registerWorkflow(sample.RecordProcessorWorkflow);
+    try env.registerWorkflow(Processor);
     try env.registerActivitiesWith(loader, .{ sample.GetRecordCount, sample.GetRecords });
 }
+
+/// A record processor that takes a fixed 60 seconds, then reports its completion as the
+/// sample's does. Unlike the sample's random delay, which can be zero and pass without a
+/// timer, its sleep always waits on a timer, so it finishes only once 60 seconds of server time
+/// pass.
+fn gatedProcessor(ctx: *workflow.Context, record: sample.SingleRecord) !void {
+    try ctx.io().sleep(.fromSeconds(60), .awake);
+    if (ctx.info().parent) |parent| {
+        try ctx.signalExternalWorkflow(sample.ReportCompletion, parent.workflow_id, "", .{record.id}).get();
+    }
+}
+
+const GatedRecordProcessor = workflow.Def("RecordProcessorWorkflow", gatedProcessor);
 
 /// The runs of `workflow_id`, latest first, each with its started event's input; each run is
 /// replayed on the way. Memory comes from `arena`.
@@ -109,7 +128,9 @@ test "state query shows a full window waiting for room" {
     const env = try temporal.testing.WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
     defer env.deinit();
     var loader: sample.RecordLoader = .{ .record_count = 5 };
-    try registerAll(env, &loader);
+    // The sample's processor can draw a delay of zero and finish at once, letting the window
+    // move on before the query below sees it full; the gated one can't.
+    try registerWith(env, &loader, GatedRecordProcessor);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -123,8 +144,9 @@ test "state query shows a full window waiting for room" {
     }});
     defer run.deinit();
 
-    // Time stays locked until getResult, so no child's delay passes and the window stays full
-    // once two children have started.
+    // Time stays locked until getResult: it moves at wall-clock speed, so no child's 60-second
+    // sleep ends while the test queries, and the window stays full once two children have
+    // started. getResult unlocks time, which lets the sleeps pass and the children report.
     // Bounded, so a workflow that never gets there fails the test instead of hanging it.
     const state = for (0..1000) |_| {
         const s = try env.queryWorkflow(sample.State, a, run.id, .{});
