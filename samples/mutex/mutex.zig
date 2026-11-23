@@ -3,11 +3,13 @@
 //! A workflow that needs the resource calls `Mutex.lock`. A local activity signals-with-start
 //! the resource's mutex workflow ("mutex:<namespace>:<resource_id>") with
 //! "request-lock-event", carrying the caller's workflow ID. The mutex workflow takes the
-//! requests one at a time: for each it records a release signal name in a side effect,
-//! "unlock-event-<caller's workflow ID>", and hands it to the caller with
+//! requests one at a time: for each grant it records a release signal name in a side effect,
+//! "unlock-event-<caller's workflow ID>-<grant number>", and hands it to the caller with
 //! "acquire-lock-event". The caller holds the lock until it sends that signal back with
-//! `Unlock.release`, or until the unlock timeout passes. The mutex workflow ends once no
-//! request is waiting; the next request starts a new run.
+//! `Unlock.release`, or until the unlock timeout passes. A release counts only for its own
+//! grant: once a grant ends its handler is removed, so a release that arrives after the
+//! unlock timeout passed doesn't unlock the next holder's lock. The mutex workflow ends once
+//! no request is waiting; the next request starts a new run.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -105,10 +107,13 @@ const MutexState = struct {
 const UnlockChannel = struct {
     allocator: std.mem.Allocator,
     sender_workflow_id: []const u8,
+    /// The grant's index in the run (`MutexState.next_request`), so that each grant, even two
+    /// to the same workflow, has a release signal of its own.
+    grant: usize,
 
     /// Null when out of memory: a side effect returns failures as values.
     fn name(c: UnlockChannel) ?[]const u8 {
-        return std.fmt.allocPrint(c.allocator, "unlock-event-{s}", .{c.sender_workflow_id}) catch null;
+        return std.fmt.allocPrint(c.allocator, "unlock-event-{s}-{d}", .{ c.sender_workflow_id, c.grant }) catch null;
     }
 };
 
@@ -130,11 +135,15 @@ fn mutexWorkflow(ctx: *workflow.Context, namespace: []const u8, resource_id: []c
         const release_lock_channel_name = try ctx.sideEffect(?[]const u8, UnlockChannel{
             .allocator = ctx.allocator(),
             .sender_workflow_id = sender_workflow_id,
+            .grant = state.next_request,
         }, UnlockChannel.name) orelse return error.OutOfMemory;
         logger.info("generated release lock channel name", .{ .releaseLockChannelName = release_lock_channel_name });
 
         state.ack = null;
         try ctx.setSignalHandlerByName(release_lock_channel_name, struct { []const u8 }, state, MutexState.releaseLock);
+        // Once this grant ends, a late release for it is buffered instead of setting `ack`
+        // for the next grant.
+        defer ctx.removeSignalHandlerByName(release_lock_channel_name);
         // Send the release signal's name to the sender, so that it can release the lock.
         ctx.signalExternalWorkflow(AcquireLock, sender_workflow_id, "", .{release_lock_channel_name}).get() catch |err| switch (err) {
             // The sender has closed. Skip it rather than fail: failing would leave every

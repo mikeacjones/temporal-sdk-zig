@@ -45,6 +45,16 @@ fn uppercaseActivity(ctx: *activity.Context, input: []const u8) ![]const u8 {
 
 pub const UppercaseActivity = activity.Def("UppercaseActivity", uppercaseActivity);
 
+/// The response activity's options, without its task queue: schedule-to-start 5 s,
+/// schedule-to-close 10 s, at most 4 attempts. Schedule-to-start as well as schedule-to-close,
+/// because a requester whose worker is gone would otherwise leave the response activity
+/// waiting in its task queue.
+pub const response_options: workflow.ActivityOptions = .{
+    .schedule_to_start_timeout = .fromSeconds(5),
+    .schedule_to_close_timeout = .fromSeconds(10),
+    .retry_policy = .{ .maximum_attempts = 4 },
+};
+
 /// The workflow, continuing as new after `limit` requests. `UppercaseWorkflow` is the sample's
 /// version; tests use a smaller limit to reach continue-as-new quickly. Every version
 /// registers as "UppercaseWorkflow".
@@ -61,13 +71,6 @@ pub fn UppercaseWorkflowWithLimit(comptime limit: u32) type {
             const uppercase_options: workflow.ActivityOptions = .{
                 .schedule_to_close_timeout = .fromSeconds(5),
                 .retry_policy = .{ .maximum_attempts = 2 },
-            };
-            // Schedule-to-start as well as schedule-to-close, because a requester whose worker
-            // is gone would otherwise leave the response activity waiting in its task queue.
-            const response_options: workflow.ActivityOptions = .{
-                .schedule_to_start_timeout = .fromSeconds(5),
-                .schedule_to_close_timeout = .fromSeconds(10),
-                .retry_policy = .{ .maximum_attempts = 4 },
             };
 
             fn request(u: *Uppercaser, req: Request) void {

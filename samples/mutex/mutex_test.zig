@@ -112,7 +112,7 @@ fn runMutex(env: *temporal.testing.WorkflowEnvironment, a: std.mem.Allocator, re
     }, mutex.RequestLock, .{mock_sender_workflow_id});
     defer run.deinit();
 
-    try testing.expectEqualStrings("unlock-event-" ++ mock_sender_workflow_id, try env.getResult(StubSender, &sender, a, null));
+    try testing.expectEqualStrings("unlock-event-" ++ mock_sender_workflow_id ++ "-0", try env.getResult(StubSender, &sender, a, null));
     try env.getResult(mutex.MutexWorkflow, &run, a, null);
     return started.durationTo(try env.now());
 }
@@ -149,4 +149,232 @@ test "mutex workflow skips a sender that has closed" {
     }, mutex.RequestLock, .{"no-such-workflow"});
     defer run.deinit();
     try env.getResult(mutex.MutexWorkflow, &run, arena.allocator(), null);
+}
+
+/// Tells a `Holder` to release the grant with this index (0 for its first grant).
+const ReleaseNow = workflow.SignalDef("release-now", fn (grant: u32) void);
+/// How many times a `Holder` has been granted the lock.
+const Granted = workflow.QueryDef("granted", fn () u32);
+/// The release signal names a `Holder` has been granted, in order.
+const GrantNames = workflow.QueryDef("grant-names", fn () []const []const u8);
+
+/// Stands in for a workflow that holds the lock as long as the test says: it records each
+/// grant, and releases a grant when the test signals `ReleaseNow`. It ends after `releases`
+/// releases.
+const Holder = struct {
+    ctx: *workflow.Context,
+    names: std.ArrayList([]const u8) = .empty,
+    /// Grants the test asked to release, not yet released.
+    pending: std.ArrayList(u32) = .empty,
+
+    fn acquire(h: *Holder, name: []const u8) !void {
+        try h.names.append(h.ctx.allocator(), name);
+    }
+    fn releaseNow(h: *Holder, grant: u32) !void {
+        try h.pending.append(h.ctx.allocator(), grant);
+    }
+    fn hasPending(h: *Holder) bool {
+        return h.pending.items.len > 0;
+    }
+    fn granted(h: *Holder) u32 {
+        return @intCast(h.names.items.len);
+    }
+    fn grantNames(h: *Holder) []const []const u8 {
+        return h.names.items;
+    }
+
+    fn run(ctx: *workflow.Context, mutex_workflow_id: []const u8, releases: u32) !void {
+        const h = try ctx.allocator().create(Holder);
+        h.* = .{ .ctx = ctx };
+        try ctx.setSignalHandler(mutex.AcquireLock, h, Holder.acquire);
+        try ctx.setSignalHandler(ReleaseNow, h, Holder.releaseNow);
+        try ctx.setQueryHandler(Granted, h, Holder.granted);
+        try ctx.setQueryHandler(GrantNames, h, Holder.grantNames);
+        for (0..releases) |_| {
+            try ctx.await(h, Holder.hasPending);
+            const grant = h.pending.orderedRemove(0);
+            if (grant >= h.names.items.len) return error.GrantNotReceived;
+            const unlock: mutex.Unlock = .{
+                .execution = .{ .workflow_id = mutex_workflow_id, .run_id = "" },
+                .release_lock_channel_name = h.names.items[grant],
+            };
+            try unlock.release(ctx);
+        }
+    }
+};
+const HolderWorkflow = workflow.Def("Holder", Holder.run);
+
+/// Polls `holder_id` until it has been granted the lock `expected` times. Time stays locked.
+fn waitForGrants(env: *temporal.testing.WorkflowEnvironment, holder_id: []const u8, expected: u32) !void {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    var granted: u32 = 0;
+    for (0..400) |_| {
+        granted = try env.queryWorkflow(Granted, scratch.allocator(), holder_id, .{});
+        if (granted == expected) return;
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    std.debug.print("holder {s} was granted the lock {d} times, expected {d}\n", .{ holder_id, granted, expected });
+    return error.TestUnexpectedGrantCount;
+}
+
+/// Polls the history of `workflow_id` until `done` returns non-null for it, and returns
+/// that. Time stays locked, unlike with `getResult`, and the time-skipping server doesn't
+/// hold a history request open for new events, so this polls.
+fn pollHistory(
+    env: *temporal.testing.WorkflowEnvironment,
+    workflow_id: []const u8,
+    comptime T: type,
+    context: anytype,
+    comptime done: fn (@TypeOf(context), []const temporal.history.HistoryEvent) ?T,
+) !T {
+    for (0..400) |_| {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const history = try env.client.fetchHistory(scratch.allocator(), workflow_id, "");
+        if (done(context, history.events.items)) |result| return result;
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    std.debug.print("the history of {s} never reached the expected state\n", .{workflow_id});
+    return error.TestHistoryTimeout;
+}
+
+/// Waits for `workflow_id` to complete.
+fn waitForCompletion(env: *temporal.testing.WorkflowEnvironment, workflow_id: []const u8) !void {
+    _ = try pollHistory(env, workflow_id, void, {}, struct {
+        fn done(_: void, events: []const temporal.history.HistoryEvent) ?void {
+            for (events) |event| {
+                const attributes = event.attributes orelse continue;
+                if (attributes == .workflow_execution_completed_event_attributes) return {};
+            }
+            return null;
+        }
+    }.done);
+}
+
+/// Waits until the mutex workflow has completed a workflow task that started after it
+/// recorded the signal `signal_name`, so the signal's effect, if any, is in its history.
+/// Returns how many grants (signals to holders) its history records by then.
+fn waitForSignalHandled(env: *temporal.testing.WorkflowEnvironment, mutex_id: []const u8, signal_name: []const u8) !usize {
+    return pollHistory(env, mutex_id, usize, signal_name, struct {
+        fn done(name: []const u8, events: []const temporal.history.HistoryEvent) ?usize {
+            var stage: enum { signal, task_started, task_completed } = .signal;
+            var grants: usize = 0;
+            var handled = false;
+            for (events) |event| {
+                const attributes = event.attributes orelse continue;
+                if (attributes == .signal_external_workflow_execution_initiated_event_attributes) grants += 1;
+                switch (stage) {
+                    .signal => if (attributes == .workflow_execution_signaled_event_attributes and
+                        std.mem.eql(u8, attributes.workflow_execution_signaled_event_attributes.signal_name, name))
+                    {
+                        stage = .task_started;
+                    },
+                    .task_started => if (attributes == .workflow_task_started_event_attributes) {
+                        stage = .task_completed;
+                    },
+                    // The task's commands are recorded with its completion, so the grants
+                    // counted through the end of the history include any it made.
+                    .task_completed => if (attributes == .workflow_task_completed_event_attributes) {
+                        handled = true;
+                    },
+                }
+            }
+            return if (handled) grants else null;
+        }
+    }.done);
+}
+
+fn expectMutexStatus(env: *temporal.testing.WorkflowEnvironment, mutex_id: []const u8, expected: temporal.client.WorkflowExecutionStatus) !void {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const description = try env.client.describeWorkflow(scratch.allocator(), mutex_id, "");
+    try testing.expectEqual(expected, description.status);
+}
+
+test "a late release from an expired holder doesn't unlock the next holder's lock" {
+    const env = try temporal.testing.WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(mutex.MutexWorkflow);
+    try env.registerWorkflow(HolderWorkflow);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const mutex_id = "mutex:mockNamespace:late-release";
+    var holder_a = try env.startWorkflow(HolderWorkflow, .{ .id = "holder-a", .task_queue = "" }, .{ mutex_id, 1 });
+    defer holder_a.deinit();
+    var holder_b = try env.startWorkflow(HolderWorkflow, .{ .id = "holder-b", .task_queue = "" }, .{ mutex_id, 1 });
+    defer holder_b.deinit();
+    var holder_c = try env.startWorkflow(HolderWorkflow, .{ .id = "holder-c", .task_queue = "" }, .{ mutex_id, 1 });
+    defer holder_c.deinit();
+    var run = try env.signalWithStartWorkflow(mutex.MutexWorkflow, .{ .id = mutex_id, .task_queue = "" }, .{
+        "mockNamespace", mock_resource_id, unlock_timeout,
+    }, mutex.RequestLock, .{"holder-a"});
+    defer run.deinit();
+    try env.signalWorkflow(mutex.RequestLock, mutex_id, .{"holder-b"});
+    try env.signalWorkflow(mutex.RequestLock, mutex_id, .{"holder-c"});
+
+    // A holds the lock past its lease, so B gets it.
+    try waitForGrants(env, "holder-a", 1);
+    try env.sleep(.fromSeconds(10 * 60 + 1));
+    try waitForGrants(env, "holder-b", 1);
+
+    // A's release arrives while B holds the lock.
+    try env.signalWorkflow(ReleaseNow, "holder-a", .{0});
+    try waitForCompletion(env, "holder-a");
+    const a_names = try env.queryWorkflow(GrantNames, a, "holder-a", .{});
+    try testing.expectEqual(2, try waitForSignalHandled(env, mutex_id, a_names[0]));
+    try env.sleep(.fromSeconds(60));
+    try waitForGrants(env, "holder-c", 0);
+    try expectMutexStatus(env, mutex_id, .running);
+
+    // B's own release passes the lock to C.
+    try env.signalWorkflow(ReleaseNow, "holder-b", .{0});
+    try waitForGrants(env, "holder-c", 1);
+    try env.signalWorkflow(ReleaseNow, "holder-c", .{0});
+
+    try env.getResult(mutex.MutexWorkflow, &run, a, null);
+    try env.getResult(HolderWorkflow, &holder_a, a, null);
+    try env.getResult(HolderWorkflow, &holder_b, a, null);
+    try env.getResult(HolderWorkflow, &holder_c, a, null);
+    try env.replayRun(run.id, run.run_id);
+}
+
+test "two grants to the same workflow ID get different release signals" {
+    const env = try temporal.testing.WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(mutex.MutexWorkflow);
+    try env.registerWorkflow(HolderWorkflow);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const mutex_id = "mutex:mockNamespace:same-holder";
+    var holder = try env.startWorkflow(HolderWorkflow, .{ .id = "holder-x", .task_queue = "" }, .{ mutex_id, 2 });
+    defer holder.deinit();
+    var run = try env.signalWithStartWorkflow(mutex.MutexWorkflow, .{ .id = mutex_id, .task_queue = "" }, .{
+        "mockNamespace", mock_resource_id, unlock_timeout,
+    }, mutex.RequestLock, .{"holder-x"});
+    defer run.deinit();
+    try env.signalWorkflow(mutex.RequestLock, mutex_id, .{"holder-x"});
+
+    try waitForGrants(env, "holder-x", 1);
+    try env.sleep(.fromSeconds(10 * 60 + 1));
+    try waitForGrants(env, "holder-x", 2);
+    const names = try env.queryWorkflow(GrantNames, a, "holder-x", .{});
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("unlock-event-holder-x-0", names[0]);
+    try testing.expectEqualStrings("unlock-event-holder-x-1", names[1]);
+
+    // The late release of the first grant leaves the second one held.
+    try env.signalWorkflow(ReleaseNow, "holder-x", .{0});
+    try testing.expectEqual(2, try waitForSignalHandled(env, mutex_id, "unlock-event-holder-x-0"));
+    try env.sleep(.fromSeconds(60));
+    try expectMutexStatus(env, mutex_id, .running);
+
+    try env.signalWorkflow(ReleaseNow, "holder-x", .{1});
+    try env.getResult(mutex.MutexWorkflow, &run, a, null);
+    try env.getResult(HolderWorkflow, &holder, a, null);
+    try env.replayRun(run.id, run.run_id);
 }

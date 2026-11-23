@@ -5,7 +5,8 @@
 //! waits until no request is in flight first: a request signal that hasn't run its activity
 //! yet would otherwise be lost, as the new run never sees it. Requests that never stop
 //! coming, or activities that keep retrying, can delay that idle moment indefinitely, which
-//! is why the activity's retries are bounded.
+//! is why the activity's retries are bounded. Responses stay with the run that answered
+//! them, so a requester queries the run it signaled, by run ID (see requester.zig).
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -31,8 +32,9 @@ pub const Response = struct {
 /// Sends a request to the workflow.
 pub const RequestSignal = workflow.SignalDef("request", fn (request: Request) void);
 
-/// Reads the response to the request with this ID, or null while it is in flight (or if the
-/// workflow never got it, or it arrived before the current run continued as new).
+/// Reads the response to the request with this ID, or null while it is in flight or if this
+/// run never got it. A run answers only the requests it received, so ask the run that took the
+/// request: after it continues as new, the next run doesn't have its responses.
 pub const ResponseQuery = workflow.QueryDef("response", fn (request_id: []const u8) ?Response);
 
 /// How many requests a run takes before it continues as new.
@@ -44,52 +46,64 @@ fn uppercaseActivity(ctx: *activity.Context, input: []const u8) ![]const u8 {
 
 pub const UppercaseActivity = activity.Def("UppercaseActivity", uppercaseActivity);
 
-/// The run's state, shared by the workflow function and its handlers. Allocated with
-/// `ctx.allocator()` so queries can still read it after the workflow function has returned.
-const Uppercaser = struct {
-    ctx: *workflow.Context,
-    request_count: u32 = 0,
-    /// Every response of this run, by request ID. Kept for the whole run (queries can't
-    /// remove them, and a requester may ask more than once), which is bounded by
-    /// `requests_before_continue_as_new`.
-    responses: std.StringHashMapUnmanaged(Response) = .empty,
+/// The workflow, continuing as new after `limit` requests. `UppercaseWorkflow` is the sample's
+/// version; tests use a smaller limit to reach continue-as-new quickly. Every version
+/// registers as "UppercaseWorkflow".
+pub fn UppercaseWorkflowWithLimit(comptime limit: u32) type {
+    return struct {
+        /// The run's state, shared by the workflow function and its handlers. Allocated with
+        /// `ctx.allocator()` so queries can still read it after the workflow function has
+        /// returned.
+        const Uppercaser = struct {
+            ctx: *workflow.Context,
+            request_count: u32 = 0,
+            /// Every response of this run, by request ID. Kept for the whole run (queries
+            /// can't remove them, and a requester may ask more than once), which is bounded by
+            /// `limit`.
+            responses: std.StringHashMapUnmanaged(Response) = .empty,
 
-    fn request(u: *Uppercaser, req: Request) !void {
-        u.request_count += 1;
-        // The timeout and retries bound how long this request keeps the run from continuing
-        // as new.
-        const options: workflow.ActivityOptions = .{
-            .schedule_to_close_timeout = .fromSeconds(5),
-            .retry_policy = .{ .maximum_attempts = 2 },
+            fn request(u: *Uppercaser, req: Request) !void {
+                u.request_count += 1;
+                // The timeout and retries bound how long this request keeps the run from
+                // continuing as new.
+                const options: workflow.ActivityOptions = .{
+                    .schedule_to_close_timeout = .fromSeconds(5),
+                    .retry_policy = .{ .maximum_attempts = 2 },
+                };
+                var response: Response = .{ .id = req.id };
+                const future = u.ctx.executeActivity(UppercaseActivity, options, .{req.input});
+                if (future.get()) |output| {
+                    response.output = output;
+                } else |err| {
+                    response.error_message = if (future.failure()) |f| temporal.failure.rootCause(f).message else @errorName(err);
+                }
+                try u.responses.put(u.ctx.allocator(), req.id, response);
+            }
+
+            fn responseFor(u: *Uppercaser, request_id: []const u8) ?Response {
+                return u.responses.get(request_id);
+            }
+
+            fn readyToContinueAsNew(u: *Uppercaser) bool {
+                return u.request_count >= limit and u.ctx.allHandlersFinished();
+            }
         };
-        var response: Response = .{ .id = req.id };
-        const future = u.ctx.executeActivity(UppercaseActivity, options, .{req.input});
-        if (future.get()) |output| {
-            response.output = output;
-        } else |err| {
-            response.error_message = if (future.failure()) |f| temporal.failure.rootCause(f).message else @errorName(err);
+
+        fn run(ctx: *workflow.Context) !void {
+            const u = try ctx.allocator().create(Uppercaser);
+            u.* = .{ .ctx = ctx };
+            try ctx.setQueryHandler(ResponseQuery, u, Uppercaser.responseFor);
+            try ctx.setSignalHandler(RequestSignal, u, Uppercaser.request);
+
+            // Returns error.Canceled if the workflow is canceled, which ends it as canceled.
+            try ctx.await(u, Uppercaser.readyToContinueAsNew);
+            return ctx.continueAsNew(Def, .{}, .{});
         }
-        try u.responses.put(u.ctx.allocator(), req.id, response);
-    }
 
-    fn responseFor(u: *Uppercaser, request_id: []const u8) ?Response {
-        return u.responses.get(request_id);
-    }
-
-    fn readyToContinueAsNew(u: *Uppercaser) bool {
-        return u.request_count >= requests_before_continue_as_new and u.ctx.allHandlersFinished();
-    }
-};
-
-fn uppercaseWorkflow(ctx: *workflow.Context) !void {
-    const u = try ctx.allocator().create(Uppercaser);
-    u.* = .{ .ctx = ctx };
-    try ctx.setQueryHandler(ResponseQuery, u, Uppercaser.responseFor);
-    try ctx.setSignalHandler(RequestSignal, u, Uppercaser.request);
-
-    // Returns error.Canceled if the workflow is canceled, which ends it as canceled.
-    try ctx.await(u, Uppercaser.readyToContinueAsNew);
-    return ctx.continueAsNew(UppercaseWorkflow, .{}, .{});
+        pub const Def = workflow.Def("UppercaseWorkflow", run);
+    };
 }
 
-pub const UppercaseWorkflow = workflow.Def("UppercaseWorkflow", uppercaseWorkflow);
+/// Uppercases strings sent as "request" signals, answering each by the "response" query,
+/// until it continues as new or is canceled.
+pub const UppercaseWorkflow = UppercaseWorkflowWithLimit(requests_before_continue_as_new).Def;
