@@ -144,35 +144,43 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, program, "worker")) sample.worker = exe else sample.starter = exe;
     }
 
+    const selected = selectSamples(arena, samples.items, only) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnknownSample => {
+            var names: std.ArrayList(u8) = .empty;
+            for (samples.items, 0..) |sample, i| {
+                if (i > 0) try names.appendSlice(arena, ", ");
+                try names.appendSlice(arena, sample.name);
+            }
+            std.log.err("--only {s}: no sample has that name; the samples are: {s}", .{ only.?, names.items });
+            std.process.exit(1);
+        },
+    };
+
     const root = try Io.Dir.cwd().openDir(io, root_path, .{});
     const work = try Io.Dir.cwd().openDir(io, work_path, .{});
     // Docker mounts need absolute paths.
     const root_abs = try Io.Dir.cwd().realPathFileAlloc(io, root_path, arena);
     const work_abs = try Io.Dir.cwd().realPathFileAlloc(io, work_path, arena);
 
-    var selected: std.ArrayList(Sample) = .empty;
-    for (samples.items) |sample| {
-        if (only) |o| if (!std.mem.eql(u8, o, sample.name)) continue;
-        try selected.append(arena, sample);
-    }
-    const results = try arena.alloc(Result, selected.items.len);
-    const arenas = try arena.alloc(std.heap.ArenaAllocator, selected.items.len);
+    const results = try arena.alloc(Result, selected.len);
+    const arenas = try arena.alloc(std.heap.ArenaAllocator, selected.len);
     for (arenas) |*a| a.* = .init(gpa);
     defer for (arenas) |*a| a.deinit();
     var needs_docker = false;
-    for (selected.items, arenas) |*sample, *a| {
+    for (selected, arenas) |*sample, *a| {
         sample.manifest = readManifest(gpa, io, a.allocator(), root, sample.name);
         const m = sample.manifest orelse continue;
         if (m.docker_server != null) needs_docker = true;
         sample.setup_failure = checkManifest(a.allocator(), m);
     }
-    for (selected.items, arenas, 0..) |*sample, *a, i| {
-        if (sample.setup_failure == null) sample.setup_failure = endpointConflict(a.allocator(), selected.items, i);
+    for (selected, arenas, 0..) |*sample, *a, i| {
+        if (sample.setup_failure == null) sample.setup_failure = endpointConflict(a.allocator(), selected, i);
     }
 
-    var server = try startDevServer(gpa, io, arena, selected.items);
+    var server = try startDevServer(gpa, io, arena, selected);
     errdefer server.stop(io);
-    createNexusEndpoints(gpa, io, &server, selected.items, arenas);
+    createNexusEndpoints(gpa, io, &server, selected, arenas);
 
     // An empty config file: the children read only TEMPORAL_ADDRESS and TEMPORAL_NAMESPACE.
     try work.writeFile(io, .{ .sub_path = "empty-temporal-config.toml", .data = "" });
@@ -186,9 +194,9 @@ pub fn main(init: std.process.Init) !void {
     try env.put("TEMPORAL_CONFIG_FILE", config_path);
 
     const docker: Docker = if (needs_docker) prepareDocker(gpa, io, arena) else .unused;
-    var queue: Queue = .{ .samples = selected.items, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env, .docker = docker, .root_abs = root_abs, .work_abs = work_abs };
+    var queue: Queue = .{ .samples = selected, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env, .docker = docker, .root_abs = root_abs, .work_abs = work_abs };
     var lanes: Io.Group = .init;
-    for (0..@min(jobs, selected.items.len)) |_| lanes.concurrent(io, runLane, .{ gpa, io, &queue }) catch {
+    for (0..@min(jobs, selected.len)) |_| lanes.concurrent(io, runLane, .{ gpa, io, &queue }) catch {
         // No thread for another lane: this one and any started before it share the queue.
         runLane(gpa, io, &queue);
         break;
@@ -251,6 +259,18 @@ fn runLane(gpa: Allocator, io: Io, queue: *Queue) void {
             .fail, .skip => |detail| detail,
         }, .seconds = seconds };
     }
+}
+
+/// The samples `only` names (all of them when it is null). `only` naming no sample is an
+/// error rather than an empty selection, which would run nothing and pass.
+fn selectSamples(arena: Allocator, samples: []const Sample, only: ?[]const u8) error{ OutOfMemory, UnknownSample }![]Sample {
+    var selected: std.ArrayList(Sample) = .empty;
+    for (samples) |sample| {
+        if (only) |o| if (!std.mem.eql(u8, o, sample.name)) continue;
+        try selected.append(arena, sample);
+    }
+    if (only != null and selected.items.len == 0) return error.UnknownSample;
+    return selected.toOwnedSlice(arena);
 }
 
 fn usage() noreturn {
@@ -1037,4 +1057,19 @@ test "a starter that exits reports its status and output" {
 
 test "a program that can't be started is reported as such" {
     try testing.expectError(error.SpawnFailed, runBounded(testing.allocator, testing.io, &.{"/nonexistent/samples-runner-test"}, null, .fromSeconds(1)));
+}
+
+test "--only selects a known sample and rejects an unknown one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const samples = [_]Sample{ .{ .name = "helloworld" }, .{ .name = "timer" }, .{ .name = "mutex" } };
+    try testing.expectError(error.UnknownSample, selectSamples(a, &samples, "helloworl"));
+    try testing.expectError(error.UnknownSample, selectSamples(a, &samples, ""));
+    const one = try selectSamples(a, &samples, "timer");
+    try testing.expectEqual(1, one.len);
+    try testing.expectEqualStrings("timer", one[0].name);
+    const all = try selectSamples(a, &samples, null);
+    try testing.expectEqual(3, all.len);
+    try testing.expectEqualStrings("mutex", all[2].name);
 }
