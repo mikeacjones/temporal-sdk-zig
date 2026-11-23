@@ -1,0 +1,1 @@
+A Nexus request link whose namespace, workflow ID, run ID or query parameter is not valid UTF-8 once percent-decoded (such as `ns%FF`) is now logged and dropped like any other malformed link, instead of failing the workflow start of a workflow-run operation it was attached to.

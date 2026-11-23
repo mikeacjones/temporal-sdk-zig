@@ -1586,7 +1586,7 @@ pub const WorkflowRunner = struct {
 
     fn decodeActivationPayloads(r: *WorkflowRunner, act: *act_pb.WorkflowActivation, cached: ?*const Instance, a: Allocator, io: Io) converter.CodecError!void {
         if (r.codecs.len == 0) return;
-        if (cached) |inst| return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &runCodecContext(r.namespace, inst));
+        if (cached) |inst| return codeWithOwnContexts(act_pb.WorkflowActivation, act, &act.jobs, jobCodecContext, inst, r.codecs, a, io, &runCodecContext(r.namespace, inst), .decode);
         const index = for (act.jobs.items, 0..) |job, i| {
             if (job.variant) |v| if (v == .initialize_workflow) break i;
         } else return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &.{ .namespace = r.namespace });
@@ -1602,6 +1602,19 @@ pub const WorkflowRunner = struct {
         try converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &context);
         // Decoding copied the jobs; the header goes back into the copy.
         act.jobs.items[index].variant.?.initialize_workflow.headers = headers;
+    }
+
+    /// Encodes the completion's payloads: an activity's, local activity's or child's start
+    /// command with that call's context (as the payload hooks got), the rest with the run's.
+    fn encodeCompletionPayloads(r: *WorkflowRunner, completion: *done_pb.WorkflowActivationCompletion, inst: *const Instance, a: Allocator, io: Io) converter.CodecError!void {
+        if (r.codecs.len == 0) return;
+        const run_context = runCodecContext(r.namespace, inst);
+        const commands = if (completion.status) |*status| switch (status.*) {
+            .successful => |*success| &success.commands,
+            .failed => null,
+        } else null;
+        const list = commands orelse return converter.encodeMessage(done_pb.WorkflowActivationCompletion, completion, r.codecs, a, io, &run_context);
+        return codeWithOwnContexts(done_pb.WorkflowActivationCompletion, completion, list, commandCodecContext, inst, r.codecs, a, io, &run_context, .encode);
     }
 
     const Handled = struct {
@@ -1671,7 +1684,7 @@ pub const WorkflowRunner = struct {
         };
         var completion = activated catch |err| return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "workflow activation failed: {t}", .{err})) };
         if (r.encode_failure_attributes) try encodeCompletionAttributes(&completion, a);
-        converter.encodeMessage(done_pb.WorkflowActivationCompletion, &completion, r.codecs, a, io, &runCodecContext(r.namespace, inst)) catch |err| switch (err) {
+        r.encodeCompletionPayloads(&completion, inst, a, io) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled, error.CodecFailed => return .{ .completion = try taskFailure(a, act.run_id, try std.fmt.allocPrint(a, "encoding the workflow activation completion's payloads with the client's codecs failed: {t}", .{err})) },
         };
@@ -1986,6 +1999,66 @@ fn readVarint(bytes: []const u8, i: *usize) ?u64 {
     return null;
 }
 
+/// Codes `msg` (`.encode` or `.decode`) with `run_context`, except the items of `list`, a list
+/// inside `msg`, that `contextOf` gives a context of their own: each of those is coded alone
+/// with it. `list` is replaced by a copy first, so the caller's items are left as they were.
+fn codeWithOwnContexts(
+    comptime Msg: type,
+    msg: *Msg,
+    list: anytype,
+    comptime contextOf: anytype,
+    inst: *const Instance,
+    codecs: []const converter.PayloadCodec,
+    a: Allocator,
+    io: Io,
+    run_context: *const converter.Context,
+    comptime direction: enum { encode, decode },
+) converter.CodecError!void {
+    const code = switch (direction) {
+        .encode => converter.encodeMessage,
+        .decode => converter.decodeMessage,
+    };
+    const Item = @typeInfo(@TypeOf(list.items)).pointer.child;
+    const items = try a.dupe(Item, list.items);
+    list.* = .fromOwnedSlice(items);
+    var own: std.ArrayList(struct { index: usize, item: Item }) = .empty;
+    for (items, 0..) |*item, i| {
+        const context = contextOf(inst, item) orelse continue;
+        var copy = item.*;
+        try code(Item, &copy, codecs, a, io, context);
+        try own.append(a, .{ .index = i, .item = copy });
+        item.* = .{};
+    }
+    try code(Msg, msg, codecs, a, io, run_context);
+    // Coding copied the list, keeping its length and order; the items coded alone go back
+    // into the copy.
+    for (own.items) |o| list.items[o.index] = o.item;
+}
+
+/// The codec context of an activation job that resolves an activity or a child workflow:
+/// that call's, as the payload hooks get it. Null for every other job.
+fn jobCodecContext(inst: *const Instance, job: *const act_pb.WorkflowActivationJob) ?*const converter.Context {
+    const variant = job.variant orelse return null;
+    return switch (variant) {
+        .resolve_activity => |j| inst.activityCodecContext(j.seq),
+        .resolve_child_workflow_execution_start => |j| inst.childCodecContext(j.seq),
+        .resolve_child_workflow_execution => |j| inst.childCodecContext(j.seq),
+        else => null,
+    };
+}
+
+/// The codec context of a command that schedules an activity or local activity or starts a
+/// child workflow: that call's, as its payload hooks got it. Null for every other command.
+fn commandCodecContext(inst: *const Instance, cmd: *const proto.coresdk.workflow_commands.WorkflowCommand) ?*const converter.Context {
+    const variant = cmd.variant orelse return null;
+    return switch (variant) {
+        .schedule_activity => |c| inst.activityCodecContext(c.seq),
+        .schedule_local_activity => |c| inst.activityCodecContext(c.seq),
+        .start_child_workflow_execution => |c| inst.childCodecContext(c.seq),
+        else => null,
+    };
+}
+
 /// The codec context of a cached run: its identity and the values `ctx.propagated()` returns.
 fn runCodecContext(namespace: []const u8, inst: *const Instance) converter.Context {
     return .{ .values = &inst.propagated, .namespace = namespace, .workflow_id = inst.info.workflow_id, .workflow_type = inst.info.workflow_type };
@@ -2239,6 +2312,12 @@ fn receiveActivityTask(w: *Worker, core: bridge.Worker, running: *RunningActivit
         .activity_type = run.start.activity_type,
         .activity_id = run.start.activity_id,
     };
+    // A side effect's value is its workflow run's own: the workflow's worker codes it with the
+    // run's identity, which is all this worker can know of it (its command has no header).
+    if (run.start.is_local and std.mem.eql(u8, run.start.activity_type, Instance.side_effect_activity_type)) {
+        run.codec_context.activity_type = "";
+        run.codec_context.activity_id = "";
+    }
     const tracked = tracked: {
         running.mutex.lockUncancelable(w.io);
         defer running.mutex.unlock(w.io);

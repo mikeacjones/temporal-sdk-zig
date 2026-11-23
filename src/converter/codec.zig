@@ -39,14 +39,27 @@ pub const Context = struct {
     namespace: []const u8 = "",
     /// The workflow the payloads belong to: the one a client request names, the running
     /// workflow, or the workflow that scheduled an activity.
+    ///
+    /// A child workflow's payloads carry the child's ID and type on both sides: on the
+    /// parent's worker, its start command's arguments, memo and header, and its result and
+    /// failure in the resolutions; on the child's own worker, its run like any other.
+    /// Signals sent to other workflows, children included, carry the sending run's identity.
+    /// A child that continues as new under another workflow type encodes its last result with
+    /// the new type, while its parent decodes it with the type it started.
     workflow_id: []const u8 = "",
     /// The type of the workflow, when the call names it (a start, a workflow's activations,
-    /// an activity's task).
+    /// an activity's task, a child's payloads as for `workflow_id`).
     workflow_type: []const u8 = "",
-    /// For an activity's payloads (its input, result, failure, and heartbeats, or a client
-    /// call starting it), the activity type; empty otherwise.
+    /// For an activity's or local activity's payloads, the activity type; empty otherwise.
+    /// Set on both sides: on the workflow's worker, for its arguments in the schedule
+    /// command and its result and failure in the resolution; on the activity's worker, for
+    /// its input, result, failure and heartbeats; and for a client call that names an
+    /// activity. Both sides see the type and ID the activity was scheduled with. A side
+    /// effect (`workflow.Context.sideEffect`) is not an activity's payload: it carries its
+    /// run's identity, without propagated values, on both sides.
     activity_type: []const u8 = "",
-    /// For an activity's payloads, the activity ID; empty otherwise.
+    /// For an activity's or local activity's payloads, the activity ID, set as
+    /// `activity_type` is; empty otherwise.
     activity_id: []const u8 = "",
 };
 

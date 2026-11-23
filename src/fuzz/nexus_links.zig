@@ -8,7 +8,6 @@
 //! string fields, and goes through `toNexusLink` and `fromNexusLink` again to an equal link.
 
 const std = @import("std");
-const fuzz = @import("../fuzz.zig");
 const wire = @import("../nexus/wire.zig");
 const proto = @import("../proto.zig");
 const Link = proto.temporal.api.common.v1.Link;
@@ -33,7 +32,7 @@ pub fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
             return;
         },
     };
-    if (!stringsAreUtf8(first)) return fuzz.known("nexus_links", "temporal-sdk-zig-d51.10.8");
+    if (!stringsAreUtf8(first)) return error.ConvertedLinkNotUtf8;
 
     const back = try wire.toNexusLink(a, first, &why);
     try std.testing.expectEqualStrings(wire.workflow_event_link_type, back.type);

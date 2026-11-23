@@ -324,6 +324,63 @@ test "WorkflowRun.get asks again after a page with no events and no token while 
     try testing.expectEqual(@as(usize, 2), server.callCount());
 }
 
+/// A codec whose decode fails with `error.CodecFailed` on a payload of encoding
+/// `binary/poison` and passes every other payload through, as do its encode.
+const PoisonCodec = struct {
+    const vtable: converter.PayloadCodec.VTable = .{ .encode = pass, .decode = decode };
+
+    fn codec() converter.PayloadCodec {
+        return .{ .ptr = @ptrCast(@constCast(&vtable)), .vtable = &vtable };
+    }
+
+    fn pass(_: *anyopaque, _: Allocator, _: std.Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return @constCast(payloads);
+    }
+
+    fn decode(_: *anyopaque, _: Allocator, _: std.Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        for (payloads) |p| if (std.mem.eql(u8, converter.encodingOf(p) orelse "", "binary/poison")) return error.CodecFailed;
+        return @constCast(payloads);
+    }
+};
+
+test "WorkflowRun.get keeps waiting on an open run whose description holds a payload the codecs can't decode, which describeWorkflow still fails on" {
+    testing.log_level = .err; // describeWorkflow's codec failure is logged as a warning.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const events = try closedRunEvents(arena);
+
+    var poisoned: common.Payload = .{ .data = "written by another codec" };
+    try poisoned.metadata.append(arena, .{ .key = "encoding", .value = "binary/poison" });
+    var memo: common.Memo = .{};
+    try memo.fields.append(arena, .{ .key = "note", .value = poisoned });
+    const describe = try encodeMessage(arena, wfs.DescribeWorkflowExecutionResponse{ .workflow_execution_info = .{
+        .execution = .{ .workflow_id = "wf-raw", .run_id = "run-1" },
+        .status = .WORKFLOW_EXECUTION_STATUS_RUNNING,
+        .memo = memo,
+    } });
+
+    const codecs = [_]converter.PayloadCodec{PoisonCodec.codec()};
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .codecs = &codecs });
+    defer c.close();
+    const answers = [_]Answer{
+        .{ .rpc = history_rpc, .proto = try encodeMessage(arena, wfs.GetWorkflowExecutionHistoryResponse{}) },
+        .{ .rpc = describe_rpc, .proto = describe },
+        .{ .rpc = history_rpc, .proto = try historyPage(arena, events[4..], "") },
+        .{ .rpc = describe_rpc, .proto = describe },
+    };
+    var server: Server = .{ .answers = &answers };
+    try connectToServer(&c, &server);
+    var run = try c.getWorkflow([]const u8, "wf-raw", "run-1");
+    defer run.deinit();
+    try testing.expectEqualStrings("done", try run.get(arena));
+    try testing.expectEqual(@as(usize, 3), server.callCount());
+
+    // The public describe still decodes the response through the codecs.
+    try testing.expectError(error.CodecFailed, c.describeWorkflow(arena, "wf-raw", "run-1"));
+    try testing.expectEqual(@as(usize, 4), server.callCount());
+}
+
 test "WorkflowRun.get returns error.InvalidResponse when a closed run's pages keep coming back without a close event" {
     testing.log_level = .err; // The failure is logged as a warning.
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
