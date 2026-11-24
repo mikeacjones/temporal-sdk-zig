@@ -27,6 +27,14 @@ pub fn containsInOrder(history: History, event_types: []const EventType) bool {
     return remaining.len == 0;
 }
 
+/// The first event of `event_type`, or null.
+pub fn first(history: History, event_type: EventType) ?temporal.history.HistoryEvent {
+    for (history.events.items) |event| {
+        if (event.event_type == event_type) return event;
+    }
+    return null;
+}
+
 pub fn inputPayloads(history: History) []const temporal.converter.Payload {
     for (history.events.items) |event| {
         if (event.event_type != .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED) continue;
@@ -64,6 +72,21 @@ test "conformance history counts present and absent event types" {
     try std.testing.expect(contains(recorded, started));
     try std.testing.expect(!contains(recorded, .EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED));
     try std.testing.expect(!contains(.{}, started));
+}
+
+test "conformance history finds the first event of a type" {
+    const signaled: EventType = .EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED;
+    var events = [_]temporal.history.HistoryEvent{
+        .{ .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, .event_id = 1 },
+        .{ .event_type = signaled, .event_id = 2 },
+        .{ .event_type = signaled, .event_id = 3 },
+    };
+    var recorded: History = .{ .events = .initBuffer(&events) };
+    recorded.events.items = &events;
+    try std.testing.expectEqual(2, first(recorded, signaled).?.event_id);
+    try std.testing.expectEqual(1, first(recorded, .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED).?.event_id);
+    try std.testing.expectEqual(null, first(recorded, .EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED));
+    try std.testing.expectEqual(null, first(.{}, signaled));
 }
 
 test "conformance history matches ordered subsequences with gaps and duplicates" {
