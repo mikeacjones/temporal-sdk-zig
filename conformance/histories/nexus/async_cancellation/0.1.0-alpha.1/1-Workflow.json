@@ -1,0 +1,322 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-24T14:04:18.014972Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048587",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "Workflow"
+        },
+        "taskQueue": {
+          "name": "conformance-nexus/async_cancellation",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImNvbmZvcm1hbmNlLW5leHVzLWFzeW5jLWNhbmNlbGxhdGlvbiI="
+            }
+          ]
+        },
+        "workflowExecutionTimeout": "60s",
+        "workflowRunTimeout": "60s",
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a20ddf-26de-7ed0-b35b-e9de93c5a23e",
+        "identity": "conformance",
+        "firstExecutionRunId": "01a20ddf-26de-7ed0-b35b-e9de93c5a23e",
+        "attempt": 1,
+        "workflowExecutionExpirationTime": "2026-11-24T14:05:18.014Z",
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "conformance-nexus/async_cancellation"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-24T14:04:18.015047Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048588",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-nexus/async_cancellation",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-24T14:04:18.019499Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048594",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "conformance",
+        "requestId": "6055acd7-1c5c-4b1b-9a1e-5969f431127a",
+        "historySizeBytes": "383"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-24T14:04:18.024497Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048598",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "conformance",
+        "workerVersion": {},
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            1,
+            3,
+            2,
+            4
+          ],
+          "sdkName": "temporal-zig",
+          "sdkVersion": "0.1.0-alpha.1"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-11-24T14:04:18.024754Z",
+      "eventType": "EVENT_TYPE_NEXUS_OPERATION_SCHEDULED",
+      "taskId": "1048599",
+      "nexusOperationScheduledEventAttributes": {
+        "endpoint": "conformance-nexus-async-cancellation",
+        "service": "test-service",
+        "operation": "block-forever",
+        "input": {
+          "metadata": {
+            "encoding": "anNvbi9wbGFpbg=="
+          },
+          "data": "IndvcmxkIg=="
+        },
+        "scheduleToCloseTimeout": "60s",
+        "workflowTaskCompletedEventId": "4",
+        "requestId": "ab6fa3f3-d11d-458e-8e04-6ea71cb05038",
+        "endpointId": "f491b1c0-6f88-41c1-805e-cdbfdff5fecc"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-11-24T14:04:18.032373Z",
+      "eventType": "EVENT_TYPE_NEXUS_OPERATION_STARTED",
+      "taskId": "1048614",
+      "links": [
+        {
+          "workflowEvent": {
+            "namespace": "default",
+            "workflowId": "async-cancellation-world",
+            "runId": "01a20ddf-26ed-7d84-954f-f476550c7838",
+            "eventRef": {
+              "eventId": "1",
+              "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED"
+            }
+          }
+        }
+      ],
+      "nexusOperationStartedEventAttributes": {
+        "scheduledEventId": "5",
+        "operationId": "eyJ0IjoxLCJucyI6ImRlZmF1bHQiLCJ3aWQiOiJhc3luYy1jYW5jZWxsYXRpb24td29ybGQifQ",
+        "requestId": "ab6fa3f3-d11d-458e-8e04-6ea71cb05038",
+        "operationToken": "eyJ0IjoxLCJucyI6ImRlZmF1bHQiLCJ3aWQiOiJhc3luYy1jYW5jZWxsYXRpb24td29ybGQifQ"
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-11-24T14:04:18.032414Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048615",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-7e2be2d2734e45c1b65f1adab839638f",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "conformance-nexus/async_cancellation"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-11-24T14:04:18.032983Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048619",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "7",
+        "identity": "conformance",
+        "requestId": "31b33b46-4626-4df6-93a9-231d36dd5579",
+        "historySizeBytes": "1183"
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-11-24T14:04:18.035271Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048626",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "7",
+        "startedEventId": "8",
+        "identity": "conformance",
+        "workerVersion": {},
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "10",
+      "eventTime": "2026-11-24T14:04:18.035293Z",
+      "eventType": "EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUESTED",
+      "taskId": "1048627",
+      "nexusOperationCancelRequestedEventAttributes": {
+        "scheduledEventId": "5",
+        "workflowTaskCompletedEventId": "9"
+      }
+    },
+    {
+      "eventId": "11",
+      "eventTime": "2026-11-24T14:04:18.038859Z",
+      "eventType": "EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_COMPLETED",
+      "taskId": "1048640",
+      "workerMayIgnore": true,
+      "nexusOperationCancelRequestCompletedEventAttributes": {
+        "requestedEventId": "10",
+        "scheduledEventId": "5"
+      }
+    },
+    {
+      "eventId": "12",
+      "eventTime": "2026-11-24T14:04:18.038892Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048641",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-7e2be2d2734e45c1b65f1adab839638f",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "conformance-nexus/async_cancellation"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "13",
+      "eventTime": "2026-11-24T14:04:18.039348Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048645",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "12",
+        "identity": "conformance",
+        "requestId": "cb35e229-6991-46e7-8e94-88187750b6be",
+        "historySizeBytes": "1494"
+      }
+    },
+    {
+      "eventId": "14",
+      "eventTime": "2026-11-24T14:04:18.040556Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048656",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "12",
+        "startedEventId": "13",
+        "identity": "conformance",
+        "workerVersion": {},
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "15",
+      "eventTime": "2026-11-24T14:04:18.041365Z",
+      "eventType": "EVENT_TYPE_NEXUS_OPERATION_CANCELED",
+      "taskId": "1048658",
+      "nexusOperationCanceledEventAttributes": {
+        "scheduledEventId": "5",
+        "failure": {
+          "message": "nexus operation completed unsuccessfully",
+          "cause": {
+            "message": "operation canceled",
+            "canceledFailureInfo": {}
+          },
+          "nexusOperationExecutionFailureInfo": {
+            "scheduledEventId": "5",
+            "endpoint": "conformance-nexus-async-cancellation",
+            "service": "test-service",
+            "operation": "block-forever",
+            "operationId": "eyJ0IjoxLCJucyI6ImRlZmF1bHQiLCJ3aWQiOiJhc3luYy1jYW5jZWxsYXRpb24td29ybGQifQ",
+            "operationToken": "eyJ0IjoxLCJucyI6ImRlZmF1bHQiLCJ3aWQiOiJhc3luYy1jYW5jZWxsYXRpb24td29ybGQifQ"
+          }
+        },
+        "requestId": "ab6fa3f3-d11d-458e-8e04-6ea71cb05038"
+      }
+    },
+    {
+      "eventId": "16",
+      "eventTime": "2026-11-24T14:04:18.041392Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048659",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-7e2be2d2734e45c1b65f1adab839638f",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "conformance-nexus/async_cancellation"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "17",
+      "eventTime": "2026-11-24T14:04:18.042100Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048663",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "16",
+        "identity": "conformance",
+        "requestId": "c48d260c-4509-428b-b893-a3bdf6483efc",
+        "historySizeBytes": "2103"
+      }
+    },
+    {
+      "eventId": "18",
+      "eventTime": "2026-11-24T14:04:18.043661Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048667",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "16",
+        "startedEventId": "17",
+        "identity": "conformance",
+        "workerVersion": {},
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "19",
+      "eventTime": "2026-11-24T14:04:18.043689Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048668",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImNhbmNlbGVkIg=="
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "18"
+      }
+    }
+  ]
+}

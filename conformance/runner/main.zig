@@ -6,10 +6,12 @@
 //! conformance-runner feature <area>/<name> --address <host:port> --namespace <ns>
 //!                            --task-queue <queue> --result <file> [--variant <name>]
 //!                            [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
+//!                            [--http-proxy <host:port>]
 const std = @import("std");
 const temporal = @import("temporal");
 const harness = @import("harness");
 const features = @import("features");
+const connect_proxy = @import("connect_proxy.zig");
 const dynamic_config = @import("dynamic_config.zig");
 const feature_config = @import("feature_config.zig");
 const inventory = @import("inventory.zig");
@@ -27,7 +29,7 @@ const namespace = "default";
 const MapOption = enum { suite, @"not-applicable", @"parity-map" };
 const CheckOption = enum { report, @"parity-map", parity };
 const ParentOption = enum { suite, @"suite-commit", @"not-applicable", report, @"work-dir", histories, @"stdout-to" };
-const ChildOption = enum { address, namespace, @"task-queue", result, variant, @"nexus-endpoint" };
+const ChildOption = enum { address, namespace, @"task-queue", result, variant, @"nexus-endpoint", @"http-proxy" };
 const ChildResult = struct {
     status: enum { pass, fail },
     message: ?[]const u8 = null,
@@ -72,6 +74,7 @@ fn usage() error{InvalidArguments} {
         \\                         [--feature <pattern>]... [--histories <dir>] [--stdout-to stderr]
         \\  conformance-runner feature <area>/<name> --address <host:port> --namespace <ns> --task-queue <queue> --result <file>
         \\                             [--variant <name>] [--nexus-endpoint <name>] [--capability <name>=<true|false>]...
+        \\                             [--http-proxy <host:port>]
     , .{});
     return error.InvalidArguments;
 }
@@ -369,9 +372,10 @@ fn runSelected(
         const config = maybe_config orelse continue;
         const path = entry.path;
         const needs_endpoint = config.needs_nexus_endpoint or std.mem.startsWith(u8, path, "nexus/");
+        const proxy = proxyExpectation(config);
         var sets: std.ArrayList(record.Set) = .empty;
         if (usesSharedServer(entry.feature, config)) {
-            const result = try runner.runFeature(shared.?.address(), entry, i, null, needs_endpoint, null);
+            const result = try runner.runFeature(shared.?.address(), entry, i, null, needs_endpoint, proxy, null);
             outcome.* = result.outcome;
             if (result.set) |set| try sets.append(arena, set);
             if (last_shared == i) {
@@ -379,13 +383,13 @@ fn runSelected(
                 shared = null;
             }
         } else if (config.run_variants.len == 0) {
-            const result = try runner.runOwnServer(defaults, entry, i, null, needs_endpoint, null);
+            const result = try runner.runOwnServer(defaults, entry, i, null, needs_endpoint, proxy, null);
             outcome.* = result.outcome;
             if (result.set) |set| try sets.append(arena, set);
         } else {
             const variants = try arena.alloc(report.VariantOutcome, config.run_variants.len);
             for (config.run_variants, variants, 0..) |variant, *variant_outcome, j| {
-                const result = try runner.runOwnServer(defaults, entry, i, j, needs_endpoint, variant);
+                const result = try runner.runOwnServer(defaults, entry, i, j, needs_endpoint, proxy, variant);
                 variant_outcome.* = .{ .name = variant.name, .outcome = result.outcome };
                 if (result.set) |set| try sets.append(arena, set);
             }
@@ -402,6 +406,21 @@ fn refusal(arena: Allocator, entry: features.Entry, config: feature_config.Confi
     if (config.no_workflow and entry.feature.workflow_types.len != 0)
         return try std.fmt.allocPrint(arena, "{s}/config.json says noWorkflow, but the feature declares workflows", .{entry.path});
     return null;
+}
+
+/// The connections a feature must open through the runner's HTTP CONNECT proxy, or null
+/// when its config expects none and it runs without a proxy.
+fn proxyExpectation(config: feature_config.Config) ?connect_proxy.Counts {
+    if (config.expect_unauthed_proxy_count == 0 and config.expect_authed_proxy_count == 0) return null;
+    return .{ .unauthed = config.expect_unauthed_proxy_count, .authed = config.expect_authed_proxy_count };
+}
+
+/// A child that passed fails when the proxy's counts differ from the expected ones; a
+/// child that failed keeps its own message.
+fn proxyOutcome(arena: Allocator, outcome: report.Outcome, expected: connect_proxy.Counts, actual: connect_proxy.Counts) error{OutOfMemory}!report.Outcome {
+    if (outcome != .pass) return outcome;
+    if (try connect_proxy.mismatch(arena, expected, actual)) |message| return .{ .fail = message };
+    return .pass;
 }
 
 /// Run variants and `dev_server_args` each get a dev server of their own.
@@ -443,6 +462,7 @@ const Runner = struct {
         index: usize,
         variant_index: ?usize,
         needs_endpoint: bool,
+        proxy: ?connect_proxy.Counts,
         variant: ?feature_config.Variant,
     ) !FeatureResult {
         const args = try ownServerArgs(runner.arena, defaults, entry.feature, variant);
@@ -456,7 +476,7 @@ const Runner = struct {
         } else {
             std.log.info("conformance feature {s} dev server at {s}", .{ entry.path, server.address() });
         }
-        return runner.runFeature(server.address(), entry, index, variant_index, needs_endpoint, variant);
+        return runner.runFeature(server.address(), entry, index, variant_index, needs_endpoint, proxy, variant);
     }
 
     fn runFeature(
@@ -466,6 +486,7 @@ const Runner = struct {
         index: usize,
         variant_index: ?usize,
         needs_endpoint: bool,
+        expected_proxy: ?connect_proxy.Counts,
         variant: ?feature_config.Variant,
     ) !FeatureResult {
         const arena = runner.arena;
@@ -527,18 +548,31 @@ const Runner = struct {
             endpoint_name = name;
             std.log.debug("created Nexus endpoint {s} for task queue {s}", .{ name, task_queue });
         }
+        // One proxy per feature run, so its counts are this run's alone.
+        var proxy: ?*connect_proxy.Proxy = null;
+        defer if (proxy) |p| connect_proxy.stop(p);
+        if (expected_proxy != null) {
+            proxy = connect_proxy.start(runner.gpa, runner.io) catch |err|
+                return .{ .outcome = failure(arena, "cannot start HTTP CONNECT proxy: {t}", .{err}) };
+            std.log.debug("HTTP CONNECT proxy for {s} at {s}", .{ label, connect_proxy.hostPort(proxy.?) });
+        }
         const result_path = try std.fmt.allocPrint(arena, "{s}.result.json", .{stem});
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.appendSlice(arena, &.{ runner.exe, "feature", path, "--address", address, "--namespace", namespace, "--task-queue", task_queue, "--result", result_path });
         if (variant_name) |name| try argv.appendSlice(arena, &.{ "--variant", name });
         if (endpoint_name) |name| try argv.appendSlice(arena, &.{ "--nexus-endpoint", name });
+        if (proxy) |p| try argv.appendSlice(arena, &.{ "--http-proxy", connect_proxy.hostPort(p) });
         for (capabilities) |capability| {
             const arg = try std.fmt.allocPrint(arena, "{s}={}", .{ capability.name, capability.value });
             try argv.appendSlice(arena, &.{ "--capability", arg });
         }
         std.log.info("running {s} (log {s})", .{ label, log_path });
-        const outcome = runOne(arena, runner.io, argv.items, result_path, log_path) catch |err|
+        const child_outcome = runOne(arena, runner.io, argv.items, result_path, log_path) catch |err|
             failure(arena, "cannot run child (log {s}, result {s}): {t}", .{ log_path, result_path, err });
+        const outcome = if (expected_proxy) |expected|
+            try proxyOutcome(arena, child_outcome, expected, connect_proxy.counts(proxy.?))
+        else
+            child_outcome;
         if (outcome != .pass or !recording) return .{ .outcome = outcome };
         return switch (try record.collect(&client.?, arena, runner.io, namespace, task_queue, variant_name, .{})) {
             .set => |set| .{ .outcome = .pass, .set = set },
@@ -705,7 +739,7 @@ fn runChild(gpa: Allocator, io: Io, path: []const u8, args: []const [:0]const u8
     defer state.deinit();
     const arena = state.allocator();
     var capability_args: std.ArrayList([]const u8) = .empty;
-    const options = try parseOptions(ChildOption, args, arena, .{ .flag = "--capability", .values = &capability_args }, &.{ .variant, .@"nexus-endpoint" });
+    const options = try parseOptions(ChildOption, args, arena, .{ .flag = "--capability", .values = &capability_args }, &.{ .variant, .@"nexus-endpoint", .@"http-proxy" });
     const capabilities = try parseCapabilities(arena, capability_args.items);
     const feature = for (features.all) |entry| {
         if (std.mem.eql(u8, path, entry.path)) break entry.feature;
@@ -725,8 +759,10 @@ fn runChild(gpa: Allocator, io: Io, path: []const u8, args: []const [:0]const u8
         .variant = options.get(.variant),
         .nexus_endpoint = options.get(.@"nexus-endpoint"),
         .capabilities = capabilities,
+        .address = options.get(.address).?,
+        .http_proxy = options.get(.@"http-proxy"),
     };
-    const outcome = executeFeature(feature, &ctx, options.get(.address).?);
+    const outcome = executeFeature(feature, &ctx, ctx.address);
     const result: ChildResult = switch (outcome) {
         .pass => .{ .status = .pass },
         .fail => |message| .{
@@ -839,6 +875,7 @@ fn recordingFailure(arena: Allocator, reason: []const u8) report.Outcome {
 }
 
 test {
+    _ = connect_proxy;
     _ = dynamic_config;
     _ = feature_config;
     _ = inventory;
@@ -918,8 +955,10 @@ test "conformance child parses optional setup arguments and explicit false capab
         "--nexus-endpoint", "conformance-a-b-first",
         "--capability",     "workerHeartbeats=false",
         "--capability",     "eagerWorkflowStart=true",
-    }, arena, .{ .flag = "--capability", .values = &repeated }, &.{ .variant, .@"nexus-endpoint" });
+        "--http-proxy",     "127.0.0.1:5678",
+    }, arena, .{ .flag = "--capability", .values = &repeated }, &.{ .variant, .@"nexus-endpoint", .@"http-proxy" });
     try std.testing.expectEqualStrings("first", options.get(.variant).?);
+    try std.testing.expectEqualStrings("127.0.0.1:5678", options.get(.@"http-proxy").?);
     try std.testing.expectEqualStrings("conformance-a-b-first", options.get(.@"nexus-endpoint").?);
     try std.testing.expectEqualDeep(@as([]const harness.Context.Capability, &.{
         .{ .name = "workerHeartbeats", .value = false },
@@ -1103,4 +1142,19 @@ test "conformance gives a feature with dev server arguments a server of its own"
         @as([]const []const u8, &.{ "--dynamic-config-value", "a=2", "--dynamic-config-value", "extra.setting=true" }),
         try ownServerArgs(arena, defaults, &own, variants[0]),
     );
+}
+
+test "conformance starts a proxy only for a feature that expects proxy connections, and fails a passing child whose counts differ" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    try std.testing.expectEqual(null, proxyExpectation(.{}));
+    try std.testing.expectEqualDeep(connect_proxy.Counts{ .unauthed = 1 }, proxyExpectation(.{ .expect_unauthed_proxy_count = 1 }).?);
+    try std.testing.expectEqualDeep(connect_proxy.Counts{ .authed = 2 }, proxyExpectation(.{ .expect_authed_proxy_count = 2 }).?);
+
+    try std.testing.expectEqualDeep(report.Outcome.pass, try proxyOutcome(arena, .pass, .{ .authed = 1 }, .{ .authed = 1 }));
+    try std.testing.expectEqualStrings("expected 1 authed HTTP proxy connections, got 0", (try proxyOutcome(arena, .pass, .{ .authed = 1 }, .{})).fail);
+    try std.testing.expectEqualStrings("expected 0 unauthed HTTP proxy connections, got 1", (try proxyOutcome(arena, .pass, .{ .authed = 1 }, .{ .unauthed = 1, .authed = 1 })).fail);
+    // A child that failed keeps its own message.
+    try std.testing.expectEqualStrings("child failed", (try proxyOutcome(arena, .{ .fail = "child failed" }, .{ .unauthed = 1 }, .{})).fail);
 }

@@ -16,6 +16,10 @@ pub const Config = struct {
     /// The suite's `noWorkflow`: the feature runs no workflow, so it has no history.
     no_workflow: bool = false,
     run_variants: []const Variant = &.{},
+    /// The suite's expectUnauthedProxyCount and expectAuthedProxyCount: how many connections
+    /// the feature must open through the runner's proxy without and with credentials.
+    expect_unauthed_proxy_count: u32 = 0,
+    expect_authed_proxy_count: u32 = 0,
 };
 
 pub const Parsed = union(enum) { config: Config, unsupported: []const u8 };
@@ -38,6 +42,10 @@ pub fn parse(arena: Allocator, json: []const u8) error{OutOfMemory}!Parsed {
         } else if (std.mem.eql(u8, key, "noWorkflow")) {
             if (value != .bool) return .{ .unsupported = "noWorkflow must be a boolean" };
             config.no_workflow = value.bool;
+        } else if (std.mem.eql(u8, key, "expectUnauthedProxyCount")) {
+            config.expect_unauthed_proxy_count = count(value) orelse return .{ .unsupported = "expectUnauthedProxyCount must be a non-negative integer" };
+        } else if (std.mem.eql(u8, key, "expectAuthedProxyCount")) {
+            config.expect_authed_proxy_count = count(value) orelse return .{ .unsupported = "expectAuthedProxyCount must be a non-negative integer" };
         } else if (std.mem.eql(u8, key, "runVariants")) {
             if (value != .array) return .{ .unsupported = "runVariants must be an array" };
             const variants = try arena.alloc(Variant, value.array.items.len);
@@ -63,6 +71,18 @@ pub fn parse(arena: Allocator, json: []const u8) error{OutOfMemory}!Parsed {
         }
     }
     return .{ .config = config };
+}
+
+/// A JSON integer that fits u32. Numbers are parsed as strings, so "1.0", "1e0" and "-0"
+/// are refused along with fractions and negatives.
+fn count(value: std.json.Value) ?u32 {
+    const digits = switch (value) {
+        .number_string => |text| text,
+        .integer => |n| return std.math.cast(u32, n),
+        else => return null,
+    };
+    if (digits.len == 0 or !std.ascii.isDigit(digits[0])) return null;
+    return std.fmt.parseInt(u32, digits, 10) catch null;
 }
 
 fn parseVariant(arena: Allocator, object: std.json.ObjectMap, variant: *Variant) error{OutOfMemory}!?[]const u8 {
@@ -134,6 +154,22 @@ test "feature config reads noWorkflow" {
     const arena = state.allocator();
     try std.testing.expectEqualDeep(@as(Parsed, .{ .config = .{ .no_workflow = true } }), try parse(arena, "{\"noWorkflow\": true}"));
     try std.testing.expectEqualDeep(@as(Parsed, .{ .config = .{} }), try parse(arena, "{\"noWorkflow\": false}"));
+}
+
+test "feature config reads the expected HTTP proxy connection counts" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    try std.testing.expectEqualDeep(@as(Parsed, .{ .config = .{ .expect_unauthed_proxy_count = 1 } }), try parse(arena, "{\"expectUnauthedProxyCount\": 1}"));
+    try std.testing.expectEqualDeep(@as(Parsed, .{ .config = .{ .expect_authed_proxy_count = 4294967295 } }), try parse(arena, "{\"expectAuthedProxyCount\": 4294967295}"));
+    try std.testing.expectEqualDeep(@as(Parsed, .{ .config = .{} }), try parse(arena, "{\"expectUnauthedProxyCount\": 0, \"expectAuthedProxyCount\": 0}"));
+    for ([_][]const u8{ "-1", "1.5", "1.0", "1e0", "4294967296", "\"1\"", "true", "null", "[]" }) |value| {
+        for ([_][]const u8{ "expectUnauthedProxyCount", "expectAuthedProxyCount" }) |key| {
+            const json = try std.fmt.allocPrint(arena, "{{\"{s}\": {s}}}", .{ key, value });
+            const message = try std.fmt.allocPrint(arena, "{s} must be a non-negative integer", .{key});
+            try std.testing.expectEqualDeep(@as(Parsed, .{ .unsupported = message }), try parse(arena, json));
+        }
+    }
 }
 
 test "feature config rejects unsupported keys and malformed variants" {

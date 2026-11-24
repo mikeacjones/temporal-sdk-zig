@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-nexus/sync_operation_error",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-nexus/sync_operation_error"
+    }
+  ]
+}

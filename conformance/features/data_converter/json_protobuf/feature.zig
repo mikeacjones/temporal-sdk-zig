@@ -26,30 +26,12 @@ fn execute(ctx: *harness.Context) !void {
     const output = harness.history.resultPayloads(recorded);
     try ctx.expect(input.len == 1 and output.len == 1, "expected one input and output payload, got {d} and {d}", .{ input.len, output.len });
     try ctx.expectEqualStrings("json/protobuf", converter.encodingOf(output[0]) orelse "");
-    try ctx.expectEqualStrings("temporal.api.common.v1.DataBlob", metadataValue(output[0], converter.message_type_key) orelse "");
+    try ctx.expectEqualStrings("temporal.api.common.v1.DataBlob", harness.payloads.metadataValue(output[0], converter.message_type_key) orelse "");
 
     const in_history = temporal.protojson.decode(DataBlob, ctx.arena, output[0].data) catch |err|
         return ctx.fail("result payload is not a ProtoJSON DataBlob ({t}): {s}", .{ err, output[0].data });
     try ctx.expect(in_history.encoding_type == result.encoding_type, "history result encoding_type is {t}, client result's is {t}", .{ in_history.encoding_type, result.encoding_type });
     try ctx.expect(std.mem.eql(u8, result.data, in_history.data), "history result data is {x}, client result data is {x}", .{ in_history.data, result.data });
 
-    try expectSamePayload(ctx, "input payload", output[0], input[0]);
-}
-
-fn metadataValue(payload: converter.Payload, key: []const u8) ?[]const u8 {
-    for (payload.metadata.items) |entry| {
-        if (std.mem.eql(u8, entry.key, key)) return entry.value;
-    }
-    return null;
-}
-
-/// Payloads are equal when their data and their metadata entries are, in any order: the
-/// server does not keep a payload's metadata in the order it was sent.
-fn expectSamePayload(ctx: *harness.Context, what: []const u8, expected: converter.Payload, actual: converter.Payload) !void {
-    try ctx.expect(std.mem.eql(u8, expected.data, actual.data), "{s}: data is {x}, expected {x}", .{ what, actual.data, expected.data });
-    try ctx.expect(expected.metadata.items.len == actual.metadata.items.len, "{s}: {d} metadata entries, expected {d}", .{ what, actual.metadata.items.len, expected.metadata.items.len });
-    for (expected.metadata.items) |entry| {
-        const value = metadataValue(actual, entry.key) orelse return ctx.fail("{s}: no metadata entry \"{s}\"", .{ what, entry.key });
-        try ctx.expect(std.mem.eql(u8, entry.value, value), "{s}: metadata \"{s}\" is \"{s}\", expected \"{s}\"", .{ what, entry.key, value, entry.value });
-    }
+    try harness.payloads.expectSamePayload(ctx, "input payload", output[0], input[0]);
 }

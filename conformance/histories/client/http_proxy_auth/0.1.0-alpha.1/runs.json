@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-client/http_proxy_auth",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-client/http_proxy_auth"
+    }
+  ]
+}

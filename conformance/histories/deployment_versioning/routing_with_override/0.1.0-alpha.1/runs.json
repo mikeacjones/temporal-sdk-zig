@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-deployment_versioning/routing_with_override",
+  "runs": [
+    {
+      "file": "1-WaitForSignal.json",
+      "workflow_id": "conformance-deployment_versioning/routing_with_override"
+    }
+  ]
+}

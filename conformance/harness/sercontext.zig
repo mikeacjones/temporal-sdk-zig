@@ -96,16 +96,6 @@ pub fn expectSignature(ctx: *Context, what: []const u8, expected: []const u8, ac
     return ctx.fail("{s}: expected context signature \"{s}\", got \"(none)\"", .{ what, expected });
 }
 
-/// The first event of `event_type`, or a failure "history has no <EVENT_TYPE_...> event".
-pub fn findEvent(ctx: *Context, recorded: temporal.history.History, event_type: history.EventType) error{FeatureFailed}!temporal.history.HistoryEvent {
-    for (recorded.events.items) |event| {
-        if (event.event_type == event_type) return event;
-    }
-    if (std.enums.tagName(history.EventType, event_type)) |name|
-        return ctx.fail("history has no {s} event", .{name});
-    return ctx.fail("history has no event of type {d}", .{@backingInt(event_type)});
-}
-
 const Attributes = temporal.proto.temporal.api.history.v1.HistoryEvent.attributes_union;
 
 /// The attributes of the first event that carries attributes of kind `tag`, or a failure
@@ -455,16 +445,6 @@ test "sercontext expectSignature and findEvent report what is missing" {
     try std.testing.expectEqualStrings("start input: expected context signature \"wf|a|b\", got \"wf|a|c\"", ctx.failure_message_.?);
     try std.testing.expectError(error.FeatureFailed, expectSignature(&ctx, "result", "wf|a|b", null));
     try std.testing.expectEqualStrings("result: expected context signature \"wf|a|b\", got \"(none)\"", ctx.failure_message_.?);
-
-    var events = [_]temporal.history.HistoryEvent{
-        .{ .event_id = 1, .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED },
-        .{ .event_id = 2, .event_type = .EVENT_TYPE_MARKER_RECORDED },
-        .{ .event_id = 3, .event_type = .EVENT_TYPE_MARKER_RECORDED },
-    };
-    const recorded: temporal.history.History = .{ .events = .fromOwnedSlice(&events) };
-    try std.testing.expectEqual(2, (try findEvent(&ctx, recorded, .EVENT_TYPE_MARKER_RECORDED)).event_id);
-    try std.testing.expectError(error.FeatureFailed, findEvent(&ctx, recorded, .EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED));
-    try std.testing.expectEqualStrings("history has no EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED event", ctx.failure_message_.?);
 }
 
 test "sercontext findAttributes and scheduledActivitySignature read the recorded events" {

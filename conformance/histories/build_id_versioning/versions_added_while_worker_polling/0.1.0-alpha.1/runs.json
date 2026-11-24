@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-build_id_versioning/versions_added_while_worker_polling",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-build_id_versioning/versions_added_while_worker_polling"
+    }
+  ]
+}
