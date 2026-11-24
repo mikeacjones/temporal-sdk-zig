@@ -24,6 +24,11 @@ variant: ?[]const u8 = null,
 /// Runner-created endpoint targeting task_queue.
 nexus_endpoint: ?[]const u8 = null,
 capabilities: []const Capability = &.{},
+/// host:port of the dev server this feature runs against. Set by the runner.
+address: []const u8 = "",
+/// host:port of the runner's HTTP CONNECT proxy; set only for a feature whose suite
+/// config.json has expectUnauthedProxyCount or expectAuthedProxyCount.
+http_proxy: ?[]const u8 = null,
 failure_message_: ?[]const u8 = null,
 worker_: ?*Worker = null,
 running_: ?*Io.Future(Worker.RunError!void) = null,
@@ -33,6 +38,10 @@ definition_: ?*const Feature = null,
 restarted_: ?*Restarted = null,
 /// The worker the last `stopWorker` stopped, for its `fatalMessage`.
 stopped_: ?*Worker = null,
+
+/// The basic-auth credentials the runner's proxy accepts (the suite's values).
+pub const http_proxy_username = "proxy-user";
+pub const http_proxy_password = "proxy-pass";
 
 const Restarted = struct { worker: Worker, running: Io.Future(Worker.RunError!void) };
 
