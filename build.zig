@@ -289,7 +289,10 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
     };
 
     // The core's replay poller panics on some malformed histories, and a panic there hung
-    // the replayer, so this runs in its own process under a time limit.
+    // the replayer, so this runs in its own process under a time limit. The program
+    // generates malformed histories from the three test histories (see the header of
+    // tools/checks/replay_malformed.zig) and names the one that hangs, aborts or leaks;
+    // `zig build replay-malformed -- --only <name>` reruns one.
     {
         const program = b.addExecutable(.{ .name = "replay-malformed", .root_module = b.createModule(.{
             .root_source_file = b.path("tools/checks/replay_malformed.zig"),
@@ -299,7 +302,21 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         }) });
         const run = Limited.case(b, in.test_step, limit_tool, "replay malformed histories", Limited.seconds, 0);
         run.addArtifactArg(program);
-        run.addFileArg(b.path("src/testdata/helloworld_history.json"));
+        const histories = [_][]const u8{
+            "src/testdata/helloworld_history.json",
+            "src/testdata/signal_history.json",
+            "src/testdata/local_activity_history.json",
+        };
+        for (histories) |history| run.addFileArg(b.path(history));
+        // Captures the program's stderr, a line per case, so that a pass prints nothing;
+        // a failure still shows all of it.
+        run.expectStdErrMatch("all returned without a hang, an abort or a leak");
+
+        const direct = b.addRunArtifact(program);
+        direct.setCwd(b.path("."));
+        direct.addPassthruArgs();
+        for (histories) |history| direct.addFileArg(b.path(history));
+        b.step("replay-malformed", "Replay generated malformed histories through WorkflowReplayer; pass -- --only <text> for some").dependOn(&direct.step);
     }
 
     // zig build alloc-failures
