@@ -18,6 +18,17 @@ pub const Feature = struct {
     execute: *const fn (*Context) anyerror!void,
     /// Options may borrow slices from file-scope constants for the client and its worker.
     configureClient: ?*const fn (*temporal.client.Options) void = null,
+    /// Extra `temporal server start-dev` arguments. A feature that sets them runs on a dev
+    /// server of its own instead of the shared one. Borrowed from file-scope constants.
+    dev_server_args: []const []const u8 = &.{},
+
+    /// The options every worker of this feature runs with: `worker_options` with
+    /// `failure_stack_traces` off, so no absolute source path reaches a recorded history.
+    pub fn workerOptions(feature: *const Feature) temporal.worker.Options {
+        var options = feature.worker_options;
+        options.failure_stack_traces = false;
+        return options;
+    }
 
     /// Replayer options for a stored run of this feature: the given namespace and task queue,
     /// and the codecs and failure converter `.configureClient` sets on a default
@@ -41,9 +52,10 @@ pub fn define(comptime spec: anytype) Feature {
             !std.mem.eql(u8, name, "activities") and
             !std.mem.eql(u8, name, "nexus_services") and
             !std.mem.eql(u8, name, "worker_options") and
-            !std.mem.eql(u8, name, "configureClient"))
+            !std.mem.eql(u8, name, "configureClient") and
+            !std.mem.eql(u8, name, "dev_server_args"))
         {
-            @compileError("unknown feature field ." ++ name ++ "; expected .execute, .workflows, .activities, .nexus_services, .worker_options or .configureClient");
+            @compileError("unknown feature field ." ++ name ++ "; expected .execute, .workflows, .activities, .nexus_services, .worker_options, .configureClient or .dev_server_args");
         }
     }
     if (!@hasField(@TypeOf(spec), "execute")) @compileError("a feature requires .execute");
@@ -85,6 +97,7 @@ pub fn define(comptime spec: anytype) Feature {
         }.registerReplayer,
         .execute = spec.execute,
         .configureClient = if (@hasField(@TypeOf(spec), "configureClient")) spec.configureClient else null,
+        .dev_server_args = if (@hasField(@TypeOf(spec), "dev_server_args")) spec.dev_server_args else &.{},
     };
 }
 
@@ -131,6 +144,27 @@ test "conformance define retains the client configuration callback" {
     var options: temporal.client.Options = .{};
     feature.configureClient.?(&options);
     try std.testing.expect(options.encode_failure_attributes);
+}
+
+test "conformance define retains the dev server arguments" {
+    const execute = struct {
+        fn execute(_: *Context) !void {}
+    }.execute;
+    const plain = define(.{ .execute = execute });
+    try std.testing.expectEqual(0, plain.dev_server_args.len);
+    const feature = define(.{ .execute = execute, .dev_server_args = &temporal.testing.DevServer.standalone_activity_args });
+    try std.testing.expectEqual(&temporal.testing.DevServer.standalone_activity_args[0], &feature.dev_server_args[0]);
+    try std.testing.expectEqual(temporal.testing.DevServer.standalone_activity_args.len, feature.dev_server_args.len);
+}
+
+test "conformance worker options turn failure stack traces off" {
+    const execute = struct {
+        fn execute(_: *Context) !void {}
+    }.execute;
+    const feature = define(.{ .worker_options = .{ .failure_stack_traces = true, .max_cached_workflows = 3 }, .execute = execute });
+    const options = feature.workerOptions();
+    try std.testing.expect(!options.failure_stack_traces);
+    try std.testing.expectEqual(@as(u32, 3), options.max_cached_workflows);
 }
 
 test "conformance replayer options carry the codecs set by configureClient" {

@@ -342,10 +342,19 @@ fn runSelected(
         return err;
     };
 
-    const last_shared = for (0..selected.len) |offset| {
-        const i = selected.len - 1 - offset;
-        const config = selected[i] orelse continue;
-        if (config.run_variants.len == 0) break i;
+    // A feature refused before it runs needs no server.
+    const runnable = try arena.dupe(?feature_config.Config, selected);
+    for (registry, runnable, outcomes) |entry, *maybe_config, *outcome| {
+        const config = maybe_config.* orelse continue;
+        if (try refusal(arena, entry, config)) |message| {
+            outcome.* = .{ .fail = message };
+            maybe_config.* = null;
+        }
+    }
+    const last_shared = for (0..runnable.len) |offset| {
+        const i = runnable.len - 1 - offset;
+        const config = runnable[i] orelse continue;
+        if (usesSharedServer(registry[i].feature, config)) break i;
     } else null;
     var shared: ?temporal.testing.DevServer = null;
     defer if (shared) |*server| server.stop(io);
@@ -356,12 +365,12 @@ fn runSelected(
     }
 
     const runner: Runner = .{ .gpa = gpa, .arena = arena, .io = io, .exe = exe, .work_dir = run_path, .histories = histories };
-    for (registry, selected, outcomes, 0..) |entry, maybe_config, *outcome, i| {
+    for (registry, runnable, outcomes, 0..) |entry, maybe_config, *outcome, i| {
         const config = maybe_config orelse continue;
         const path = entry.path;
         const needs_endpoint = config.needs_nexus_endpoint or std.mem.startsWith(u8, path, "nexus/");
         var sets: std.ArrayList(record.Set) = .empty;
-        if (config.run_variants.len == 0) {
+        if (usesSharedServer(entry.feature, config)) {
             const result = try runner.runFeature(shared.?.address(), entry, i, null, needs_endpoint, null);
             outcome.* = result.outcome;
             if (result.set) |set| try sets.append(arena, set);
@@ -369,10 +378,14 @@ fn runSelected(
                 shared.?.stop(io);
                 shared = null;
             }
+        } else if (config.run_variants.len == 0) {
+            const result = try runner.runOwnServer(defaults, entry, i, null, needs_endpoint, null);
+            outcome.* = result.outcome;
+            if (result.set) |set| try sets.append(arena, set);
         } else {
             const variants = try arena.alloc(report.VariantOutcome, config.run_variants.len);
             for (config.run_variants, variants, 0..) |variant, *variant_outcome, j| {
-                const result = try runner.runVariant(defaults, entry, i, j, needs_endpoint, variant);
+                const result = try runner.runOwnServer(defaults, entry, i, j, needs_endpoint, variant);
                 variant_outcome.* = .{ .name = variant.name, .outcome = result.outcome };
                 if (result.set) |set| try sets.append(arena, set);
             }
@@ -382,6 +395,31 @@ fn runSelected(
             outcome.* = recordingFailure(arena, message);
         }
     }
+}
+
+/// Why a selected feature is not run, if it isn't.
+fn refusal(arena: Allocator, entry: features.Entry, config: feature_config.Config) error{OutOfMemory}!?[]const u8 {
+    if (config.no_workflow and entry.feature.workflow_types.len != 0)
+        return try std.fmt.allocPrint(arena, "{s}/config.json says noWorkflow, but the feature declares workflows", .{entry.path});
+    return null;
+}
+
+/// Run variants and `dev_server_args` each get a dev server of their own.
+fn usesSharedServer(feature: *const harness.Feature, config: feature_config.Config) bool {
+    return config.run_variants.len == 0 and feature.dev_server_args.len == 0;
+}
+
+/// The arguments of a feature's own dev server: the suite's dynamic config with the
+/// variant's overrides, then the feature's `dev_server_args`.
+fn ownServerArgs(
+    arena: Allocator,
+    defaults: []const dynamic_config.Entry,
+    feature: *const harness.Feature,
+    variant: ?feature_config.Variant,
+) error{OutOfMemory}![]const []const u8 {
+    const merged = if (variant) |v| try dynamic_config.merge(arena, defaults, v.dynamic_config) else defaults;
+    const config_args = try dynamic_config.serverArgs(arena, merged);
+    return std.mem.concat(arena, []const u8, &.{ config_args, feature.dev_server_args });
 }
 
 const FeatureResult = struct {
@@ -397,21 +435,27 @@ const Runner = struct {
     work_dir: []const u8,
     histories: ?[]const u8,
 
-    fn runVariant(
+    /// Runs a feature, or one run variant of it, on a dev server started for it alone.
+    fn runOwnServer(
         runner: Runner,
         defaults: []const dynamic_config.Entry,
         entry: features.Entry,
         index: usize,
-        variant_index: usize,
+        variant_index: ?usize,
         needs_endpoint: bool,
-        variant: feature_config.Variant,
+        variant: ?feature_config.Variant,
     ) !FeatureResult {
-        const merged = try dynamic_config.merge(runner.arena, defaults, variant.dynamic_config);
-        const args = try dynamic_config.serverArgs(runner.arena, merged);
-        var server = temporal.testing.DevServer.start(runner.gpa, runner.io, .{ .namespace = namespace, .port = 0, .extra_args = args }) catch |err|
-            return .{ .outcome = failure(runner.arena, "cannot start variant dev server: {t}", .{err}) };
+        const args = try ownServerArgs(runner.arena, defaults, entry.feature, variant);
+        var server = temporal.testing.DevServer.start(runner.gpa, runner.io, .{ .namespace = namespace, .port = 0, .extra_args = args }) catch |err| {
+            const what = if (variant != null) "variant" else "feature";
+            return .{ .outcome = failure(runner.arena, "cannot start {s} dev server: {t}", .{ what, err }) };
+        };
         defer server.stop(runner.io);
-        std.log.info("conformance variant {s}#{s} dev server at {s}", .{ entry.path, variant.name, server.address() });
+        if (variant) |v| {
+            std.log.info("conformance variant {s}#{s} dev server at {s}", .{ entry.path, v.name, server.address() });
+        } else {
+            std.log.info("conformance feature {s} dev server at {s}", .{ entry.path, server.address() });
+        }
         return runner.runFeature(server.address(), entry, index, variant_index, needs_endpoint, variant);
     }
 
@@ -735,10 +779,7 @@ fn executeFeature(feature: *const harness.Feature, ctx: *harness.Context, addres
 fn executeWithWorker(feature: *const harness.Feature, ctx: *harness.Context) report.Outcome {
     const io = ctx.io;
     const arena = ctx.arena;
-    var worker_options = feature.worker_options;
-    // Error return traces include absolute source paths in server histories.
-    worker_options.failure_stack_traces = false;
-    var worker = temporal.worker.Worker.init(ctx.gpa, io, ctx.client, ctx.task_queue, worker_options) catch |err|
+    var worker = temporal.worker.Worker.init(ctx.gpa, io, ctx.client, ctx.task_queue, feature.workerOptions()) catch |err|
         return failure(arena, "worker init returned error.{t}", .{err});
     defer worker.deinit();
     feature.register(&worker) catch |err| return failure(arena, "registering feature definitions returned error.{t}", .{err});
@@ -754,6 +795,9 @@ fn executeWithWorker(feature: *const harness.Feature, ctx: *harness.Context) rep
     };
     ctx.worker_ = &worker;
     ctx.running_ = &running;
+    ctx.definition_ = feature;
+    // Runs after the final stopWorker and the outcome's message, before worker.deinit.
+    defer ctx.deinit();
     var worker_result: temporal.worker.Worker.RunError!void = {};
     const outcome = blk: {
         defer ctx.stopWorker() catch |err| switch (err) {
@@ -763,7 +807,7 @@ fn executeWithWorker(feature: *const harness.Feature, ctx: *harness.Context) rep
         break :blk execute(feature, ctx);
     };
     worker_result catch |err| {
-        const message = worker.fatalMessage();
+        const message = (ctx.stopped_ orelse &worker).fatalMessage();
         return switch (outcome) {
             .pass => failure(arena, "worker stopped with error.{t}{s}{s}", .{ err, if (message == null) "" else ": ", message orelse "" }),
             .fail => |detail| blk: {
@@ -1013,4 +1057,50 @@ test "conformance worker startup report includes the underlying run error" {
     };
     const outcome = executeWithWorker(&feature, &ctx);
     try std.testing.expectEqualStrings("worker failed to start with error.InvalidOptions", outcome.fail);
+}
+
+test "conformance refuses a noWorkflow feature that declares workflows" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const Example = struct {
+        fn run(_: *temporal.workflow.Context) !void {}
+        fn drive(_: *harness.Context) !void {}
+    };
+    const with_workflow = harness.define(.{ .workflows = .{temporal.workflow.Def("Workflow", Example.run)}, .execute = Example.drive });
+    const client_only = harness.define(.{ .execute = Example.drive });
+    try std.testing.expectEqualStrings(
+        "activity/standalone/config.json says noWorkflow, but the feature declares workflows",
+        (try refusal(arena, .{ .path = "activity/standalone", .feature = &with_workflow }, .{ .no_workflow = true })).?,
+    );
+    try std.testing.expectEqual(null, try refusal(arena, .{ .path = "activity/standalone", .feature = &client_only }, .{ .no_workflow = true }));
+    try std.testing.expectEqual(null, try refusal(arena, .{ .path = "activity/basic", .feature = &with_workflow }, .{}));
+}
+
+test "conformance gives a feature with dev server arguments a server of its own" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const drive = struct {
+        fn drive(_: *harness.Context) !void {}
+    }.drive;
+    const extra = [_][]const u8{ "--dynamic-config-value", "extra.setting=true" };
+    const plain = harness.define(.{ .execute = drive });
+    const own = harness.define(.{ .execute = drive, .dev_server_args = &extra });
+    const variants: []const feature_config.Variant = &.{.{ .name = "one", .dynamic_config = &.{.{ .key = "a", .json_value = "2" }} }};
+    try std.testing.expect(usesSharedServer(&plain, .{}));
+    try std.testing.expect(!usesSharedServer(&own, .{}));
+    try std.testing.expect(!usesSharedServer(&plain, .{ .run_variants = variants }));
+
+    const defaults: []const dynamic_config.Entry = &.{.{ .key = "a", .json_value = "1" }};
+    const shared_args = try dynamic_config.serverArgs(arena, defaults);
+    try std.testing.expectEqualDeep(shared_args, try ownServerArgs(arena, defaults, &plain, null));
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "--dynamic-config-value", "a=1", "--dynamic-config-value", "extra.setting=true" }),
+        try ownServerArgs(arena, defaults, &own, null),
+    );
+    try std.testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "--dynamic-config-value", "a=2", "--dynamic-config-value", "extra.setting=true" }),
+        try ownServerArgs(arena, defaults, &own, variants[0]),
+    );
 }

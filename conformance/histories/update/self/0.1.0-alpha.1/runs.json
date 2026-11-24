@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-update/self",
+  "runs": [
+    {
+      "file": "1-SelfUpdateWorkflow.json",
+      "workflow_id": "conformance-update/self"
+    }
+  ]
+}

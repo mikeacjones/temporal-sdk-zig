@@ -13,6 +13,8 @@ pub const Variant = struct {
 
 pub const Config = struct {
     needs_nexus_endpoint: bool = false,
+    /// The suite's `noWorkflow`: the feature runs no workflow, so it has no history.
+    no_workflow: bool = false,
     run_variants: []const Variant = &.{},
 };
 
@@ -33,6 +35,9 @@ pub fn parse(arena: Allocator, json: []const u8) error{OutOfMemory}!Parsed {
         if (std.mem.eql(u8, key, "needsNexusEndpoint")) {
             if (value != .bool) return .{ .unsupported = "needsNexusEndpoint must be a boolean" };
             config.needs_nexus_endpoint = value.bool;
+        } else if (std.mem.eql(u8, key, "noWorkflow")) {
+            if (value != .bool) return .{ .unsupported = "noWorkflow must be a boolean" };
+            config.no_workflow = value.bool;
         } else if (std.mem.eql(u8, key, "runVariants")) {
             if (value != .array) return .{ .unsupported = "runVariants must be an array" };
             const variants = try arena.alloc(Variant, value.array.items.len);
@@ -123,13 +128,22 @@ test "feature config reads endpoint and ordered variants with JSON overrides" {
     try std.testing.expectEqualDeep(@as(Parsed, .{ .config = .{} }), try parse(arena, "{}"));
 }
 
+test "feature config reads noWorkflow" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    try std.testing.expectEqualDeep(@as(Parsed, .{ .config = .{ .no_workflow = true } }), try parse(arena, "{\"noWorkflow\": true}"));
+    try std.testing.expectEqualDeep(@as(Parsed, .{ .config = .{} }), try parse(arena, "{\"noWorkflow\": false}"));
+}
+
 test "feature config rejects unsupported keys and malformed variants" {
     var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer state.deinit();
     for ([_]struct { json: []const u8, message: []const u8 }{
         .{ .json = "[", .message = "invalid JSON" },
         .{ .json = "[]", .message = "expected a JSON object" },
-        .{ .json = "{\"noWorkflow\": false}", .message = "unsupported key \"noWorkflow\"" },
+        .{ .json = "{\"noWorkflow\": \"true\"}", .message = "noWorkflow must be a boolean" },
+        .{ .json = "{\"noWorkflows\": true}", .message = "unsupported key \"noWorkflows\"" },
         .{ .json = "{\"needsNexusEndpoint\": 1}", .message = "needsNexusEndpoint" },
         .{ .json = "{\"runVariants\": {}}", .message = "runVariants must be an array" },
         .{ .json = "{\"runVariants\": [false]}", .message = "runVariants[0]" },

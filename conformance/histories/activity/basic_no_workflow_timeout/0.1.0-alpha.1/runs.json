@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-activity/basic_no_workflow_timeout",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-activity/basic_no_workflow_timeout"
+    }
+  ]
+}

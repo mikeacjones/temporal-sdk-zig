@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-child_workflow/throws_on_execute",
+  "runs": [
+    {
+      "file": "1-MainWorkflow.json",
+      "workflow_id": "conformance-child_workflow/throws_on_execute"
+    },
+    {
+      "file": "2-ChildWorkflow.json",
+      "workflow_id": "conformance-child_workflow/throws_on_execute-child"
+    }
+  ]
+}
