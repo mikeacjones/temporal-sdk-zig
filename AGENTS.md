@@ -140,7 +140,7 @@ To read a failure: the program prints `replay-malformed: <name>` before each cas
 
 ## Conformance
 
-`addConformanceSteps` in build.zig adds three commands that run Temporal's cross-SDK features suite against this SDK. The suite is `temporalio/features` at the commit build.zig.zon pins as the lazy dependency `temporal_features`. Each command runs a nested `zig build <step> -Dconformance-suite=true`, and only the nested build fetches the suite. The first run needs network, for that fetch and for the dev server's download. The suite's own Go, TypeScript, and other harnesses are not used: the Zig versions of its features live in `conformance/features/`, and no Go toolchain is needed. The harness is `conformance/harness/` and the runner `conformance/runner/`. Run times are measurements, not limits: they were measured on 2026-11-18 on the factory's Mac (Apple M4 Pro, 14 cores, 64 GB, macOS 27.2.1), each command in its own fresh `git clone --recursive` with no `.zig-cache`, while other builds ran on the machine. The first runs include building the Rust core with cargo (about 70 s). Machine-wide caches were already warm: Zig's global package cache held the suite and the other dependencies, so nothing was downloaded; the dev server's Temporal CLI binary was already in `$TMPDIR`; and cargo's registry and the Rust toolchain were installed.
+`addConformanceSteps` in build.zig adds three commands that run Temporal's cross-SDK features suite against this SDK. The suite is `temporalio/features` at the commit build.zig.zon pins as the lazy dependency `temporal_features`. Each command runs a nested `zig build <step> -Dconformance-suite=true`, and only the nested build fetches the suite. The first run needs network, for that fetch and for the dev server's download. The suite's own Go, TypeScript, and other harnesses are not used: the Zig versions of its features live in `conformance/features/`, and no Go toolchain is needed. The harness is `conformance/harness/` and the runner `conformance/runner/`. Run times are measurements, not limits: they were measured on 2026-11-24 on the factory's Mac (Apple M4 Max, 16 cores, 128 GB, macOS 27.2.1) in one fresh worktree of main at the commit that held all 79 written features (84 suite features, 5 not applicable, none unwritten; 73 passed and 6 failed on known SDK gaps), while other builds ran on the machine (load average 1.5 to 5). A repeat run is a run with the worktree's `.zig-cache` already filled by an earlier run of the same command; the figures are the range over two or three such runs. Only `zig build conformance` was also measured on a first run, with no `.zig-cache` in the worktree, which includes building the Rust core with cargo. Machine-wide caches were already warm: Zig's global package cache held the suite and the other dependencies, so nothing was downloaded; the dev server's Temporal CLI binary was already in `$TMPDIR`; and cargo's registry and the Rust toolchain were installed.
 
 ### `zig build conformance`
 
@@ -157,7 +157,7 @@ The report is written to `zig-out/conformance/report.json` (under `--prefix` whe
 The table on stdout ends with the count of each status and the report's path.
 
 - When to run: After writing or changing a feature, or a change to the SDK that a written feature covers.
-- Run time: about 42 s on a repeat run, almost all of it running the features (first run about 103 s).
+- Run time: about 2.5 min (139 to 151 s) on a repeat run, almost all of it running the features, the dev servers of their own included (first run about 202 s).
 
 ### `zig build conformance-check`
 
@@ -178,14 +178,14 @@ counts<TAB>failing=<n><TAB>uncovered=<n><TAB>unknown-row=<n>
 Supported rows come first in table order, then the `unknown-row` lines by feature path. Rows that are partial, missing, or not applicable print nothing. The command exits non-zero when there is a `failing` or `unknown-row` line, and also, with nothing on stdout, when the map check fails, when the suite run fails, or when the report or PARITY.md's feature table cannot be read. A feature that fails doesn't fail the suite run: it reaches the comparison as a `fail` status. It takes no `-Dfeature`, and fails at once if given one. On main it exits non-zero while supported rows map to unwritten features, which is expected: each `failing ... unwritten` line is a feature still to write.
 
 - When to run: When changing PARITY.md's statuses, parity_map.zon, or before claiming a row as supported.
-- Run time: about 37 s on a repeat run (first run about 114 s).
+- Run time: about 2.5 min (149 to 152 s) on a repeat run, almost all of it the suite run.
 
 ### `zig build conformance-map`
 
 Checks `conformance/parity_map.zon` against the suite's features and `conformance/not_applicable.zon`, without starting a server or writing a report. It reports a duplicate entry, an entry for a feature the suite lacks, a not-applicable feature mapped to a row, a `.none` with an empty reason, and a suite feature with no entry, and on success prints one line to standard error: `./conformance/parity_map.zon: 84 entries, 77 mapped to 31 PARITY.md rows, 7 none`. It doesn't read PARITY.md, and `-Dfeature` has no effect.
 
 - When to run: After editing parity_map.zon or moving to a new suite commit.
-- Run time: about 10 s on a repeat run (first run about 82 s).
+- Run time: about 15 s (14 to 16 s) on a repeat run.
 
 ### The parity map and PARITY.md
 
