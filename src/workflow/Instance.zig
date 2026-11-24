@@ -261,6 +261,12 @@ versions: std.StringHashMapUnmanaged(i32) = .empty,
 /// The state of each mutable side effect (`workflow.Context.mutableSideEffect`) by its ID.
 /// Arena memory, keys included.
 mutable_side_effects: std.StringHashMapUnmanaged(MutableSideEffect) = .empty,
+/// The workflow-local variables the run has set (`workflow.LocalVar`), in the order first
+/// set, scanned linearly. Arena memory, names and values included.
+local_values: std.ArrayList(LocalValue) = .empty,
+/// The coroutine running a side-effect function now (`func` of `workflow.Context.sideEffect`,
+/// `func` or `eql` of `mutableSideEffect`), if one is; see `beginSideEffect`.
+side_effect: ?SideEffectMarker = null,
 /// Sent with each successful completion when `send_versioning_behavior`; starts as the
 /// registered workflow's.
 versioning_behavior: workflow.VersioningBehavior = .unspecified,
@@ -275,6 +281,8 @@ deployment_version: ?deployment.Version = null,
 pub const QueryHandler = struct {
     context: *const anyopaque,
     call: *const fn (context: *const anyopaque, out: Allocator, conv: *const converter.Context, args: []const converter.Payload) anyerror!converter.Payload,
+    /// Shown in the answer to `workflow_metadata_query`. Arena memory, or a literal.
+    description: []const u8 = "",
 };
 
 /// A type-erased dynamic query handler: like `QueryHandler`, but `call` also gets the query
@@ -293,6 +301,8 @@ pub const SignalHandler = struct {
     decode: SignalDecode,
     call: *const fn (context: *const anyopaque, args: *const anyopaque) anyerror!void,
     unfinished_policy: workflow.HandlerUnfinishedPolicy = .warn_and_abandon,
+    /// Shown in the answer to `workflow_metadata_query`. Arena memory, or a literal.
+    description: []const u8 = "",
 };
 
 /// A type-erased update handler. `decode` turns an update's name and payloads into the
@@ -306,6 +316,8 @@ pub const UpdateHandler = struct {
     validate: ?*const fn (context: *const anyopaque, args: *const anyopaque) anyerror!void,
     call: *const fn (context: *const anyopaque, out: Allocator, conv: *const converter.Context, args: *const anyopaque) anyerror!converter.Payload,
     unfinished_policy: workflow.HandlerUnfinishedPolicy = .warn_and_abandon,
+    /// Shown in the answer to `workflow_metadata_query`. Arena memory, or a literal.
+    description: []const u8 = "",
 };
 
 /// Decodes a signal's or update's payloads into the handler's arguments (see `SignalHandler`).
@@ -1183,12 +1195,76 @@ fn readOnlyFailure(a: Allocator, what: []const u8, name: []const u8, call: []con
     });
 }
 
+// ---------------------------------------------------------------- workflow-local variables
+
+/// One variable of `local_values`: its name, its type's identity (`workflow.LocalVar(T)`'s
+/// `type_id`), and its box, which `workflow.LocalVar(T).set` overwrites in place.
+pub const LocalValue = struct {
+    name: []const u8,
+    /// The address of a global that exists once per `T`. Not `@typeName(T)`: two types can
+    /// share a name (a struct declared in a type-returning function, for each argument), and
+    /// a box of one read as the other would be read or written past its end.
+    type_id: *const anyopaque,
+    value: *anyopaque,
+};
+
+/// The box of the variable named `name` with type identity `type_id`, or null if the run has
+/// not set it.
+pub fn localValue(inst: *const Instance, name: []const u8, type_id: *const anyopaque) ?*anyopaque {
+    for (inst.local_values.items) |v| {
+        if (v.type_id == type_id and std.mem.eql(u8, v.name, name)) return v.value;
+    }
+    return null;
+}
+
+/// Adds the variable `name` with type identity `type_id` (static) and its box `value` (arena
+/// memory). `name` is copied; on error nothing is added and the copy is freed.
+pub fn addLocalValue(inst: *Instance, name: []const u8, type_id: *const anyopaque, value: *anyopaque) error{OutOfMemory}!void {
+    const a = inst.arena();
+    const copy = try a.dupe(u8, name);
+    errdefer a.free(copy);
+    try inst.local_values.append(a, .{ .name = copy, .type_id = type_id, .value = value });
+}
+
+/// Whether the code running now may not set a workflow-local variable: a query handler or an
+/// update validator (not in history), or a side-effect function (not run on replay). A set
+/// there would leave the run with a value a replay of its history doesn't give it.
+pub fn refuseLocalSet(inst: *Instance) bool {
+    if (inst.side_effect) |m| if (m.fiber == inst.sched.currentFiber()) return true;
+    return inst.wio.currentReadOnly() != null;
+}
+
+/// Which coroutine is inside a side-effect function; null `fiber` is code outside any
+/// coroutine.
+pub const SideEffectMarker = struct { fiber: ?*Scheduler.Fiber };
+
+/// Marks the code running now as inside a side-effect function until `endSideEffect`, which
+/// gets the returned previous marker and must be called (with `defer`) on every way out.
+pub fn beginSideEffect(inst: *Instance) ?SideEffectMarker {
+    const previous = inst.side_effect;
+    inst.side_effect = .{ .fiber = inst.sched.currentFiber() };
+    return previous;
+}
+
+pub fn endSideEffect(inst: *Instance, previous: ?SideEffectMarker) void {
+    inst.side_effect = previous;
+}
+
 // ---------------------------------------------------------------- stack trace query
 
 /// The query type Temporal's UI and CLI send to show where a running workflow waits. The
 /// worker answers it for every workflow with `stackTrace`, unless the workflow registered a
 /// handler of its own for it.
 pub const stack_trace_query = "__stack_trace";
+
+/// The query type Temporal's UI sends to show where a running workflow waits, with the source
+/// around each place. The worker answers it for every workflow with `enhancedStackTrace`; no
+/// handler can be registered for it (`workflow.reservedQueryError`).
+pub const enhanced_stack_trace_query = "__enhanced_stack_trace";
+
+/// The query type Temporal's UI sends to list a workflow's handlers. The worker answers it
+/// for every workflow with `workflowMetadata`; no handler can be registered for it.
+pub const workflow_metadata_query = "__temporal_workflow_metadata";
 
 /// The answer to the `__stack_trace` query: a line naming the workflow and how many
 /// coroutines it has, then an entry per live coroutine in the order they started, each a
@@ -1256,6 +1332,115 @@ fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{Ou
         }
         try call_sites.write(if (reader) |*r| r else null, w, f, "  ");
     }
+}
+
+/// The answer to the `__enhanced_stack_trace` query (`workflow.EnhancedStackTrace`): a stack
+/// per live coroutine, in the order and set `__stack_trace` lists them, each holding the
+/// call sites `call_sites.write` writes for it; and the excerpts of the source files those
+/// are in that the worker can read (`call_sites.excerpts`). A closed workflow has no stacks.
+/// Memory comes from `out`.
+///
+/// Read-only and marked as SDK work as `stackTrace` is; the source files are read inside the
+/// same mark.
+fn enhancedStackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}!workflow.EnhancedStackTrace {
+    const T = workflow.EnhancedStackTrace;
+    var trace: T = .{ .sdk = .{ .name = sdk_name, .version = sdk_version } };
+    if (inst.finished) return trace;
+
+    const sdk_work = inst.sched.currentFiber() == null;
+    if (sdk_work) inst.sched.sdk_work.store(true, .release);
+    defer if (sdk_work) inst.sched.sdk_work.store(false, .release);
+    var reader = try call_sites.Reader.init(out);
+    defer if (reader) |*r| r.deinit();
+
+    var count: usize = 0;
+    var it = inst.sched.firstLive();
+    while (it) |f| : (it = f.live_next) count += 1;
+    const stacks = try out.alloc(T.Stack, count);
+    // The lines of the call sites in each file, by file, in the order the files first appear.
+    var lines: std.array_hash_map.String(std.ArrayList(u32)) = .empty;
+    it = inst.sched.firstLive();
+    var i: usize = 0;
+    while (it) |f| : ({
+        it = f.live_next;
+        i += 1;
+    }) {
+        const found = try call_sites.locations(if (reader) |*r| r else null, out, f);
+        const locations = try out.alloc(T.Location, found.len);
+        for (found, locations) |loc, *l| {
+            l.* = .{
+                .file_path = loc.file_path,
+                .line = std.math.cast(i32, loc.line) orelse std.math.maxInt(i32),
+                .column = std.math.cast(i32, loc.column) orelse std.math.maxInt(i32),
+                .function_name = loc.function_name,
+            };
+            if (loc.line == 0) continue;
+            const entry = try lines.getOrPut(out, loc.file_path);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(out, loc.line);
+        }
+        stacks[i] = .{ .locations = locations };
+    }
+    trace.stacks = stacks;
+
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var budget: usize = call_sites.max_excerpt_bytes;
+    for (lines.keys(), lines.values()) |path, file_lines| {
+        const excerpts = try call_sites.excerpts(out, &scratch, path, file_lines.items, &budget) orelse continue;
+        const slices = try out.alloc(T.FileSlice, excerpts.len);
+        for (excerpts, slices) |e, *slice| slice.* = .{ .line_offset = e.line_offset, .content = e.content };
+        try trace.sources.map.put(out, path, slices);
+    }
+    return trace;
+}
+
+const sdk_name = @import("../bridge/Connection.zig").default_client_name;
+const sdk_version: []const u8 = @import("build_options").version;
+
+/// Description of the built-in queries in `workflowMetadata`'s answer.
+const stack_trace_description = "Where each coroutine of the workflow waits, as text.";
+const enhanced_stack_trace_description = "Where each coroutine of the workflow waits, as locations with the source around them.";
+const workflow_metadata_description = "The workflow's type and its query, signal and update handlers with their descriptions.";
+
+/// The answer to the `__temporal_workflow_metadata` query: the workflow type, and the name
+/// and description of every query handler in `queries` with the three queries the worker
+/// answers itself (a handler registered for `__stack_trace` given with its own description),
+/// every signal handler in `signal_handlers` (signal channels included), and every update
+/// handler in `update_handlers`, each list sorted by name in byte order. Dynamic handlers
+/// aren't listed. `current_details` is empty. Read-only; memory comes from `out`. Names and
+/// descriptions that aren't valid UTF-8 have U+FFFD for each bad byte, as protobuf strings
+/// must be valid UTF-8.
+fn workflowMetadata(inst: *const Instance, out: Allocator) error{OutOfMemory}!proto.temporal.api.sdk.v1.WorkflowMetadata {
+    const Definition = proto.temporal.api.sdk.v1.WorkflowInteractionDefinition;
+    var queries: std.ArrayList(Definition) = try .initCapacity(out, inst.queries.count() + 3);
+    if (!inst.queries.contains(stack_trace_query)) queries.appendAssumeCapacity(.{ .name = stack_trace_query, .description = stack_trace_description });
+    queries.appendAssumeCapacity(.{ .name = enhanced_stack_trace_query, .description = enhanced_stack_trace_description });
+    queries.appendAssumeCapacity(.{ .name = workflow_metadata_query, .description = workflow_metadata_description });
+    for (inst.queries.keys(), inst.queries.values()) |name, h| {
+        // `rootHandleQuery` answers these two first; no registration reaches the table.
+        if (std.mem.eql(u8, name, enhanced_stack_trace_query) or std.mem.eql(u8, name, workflow_metadata_query)) continue;
+        queries.appendAssumeCapacity(try definition(out, name, h.description));
+    }
+    var signals: std.ArrayList(Definition) = try .initCapacity(out, inst.signal_handlers.count());
+    for (inst.signal_handlers.keys(), inst.signal_handlers.values()) |name, h| signals.appendAssumeCapacity(try definition(out, name, h.description));
+    var updates: std.ArrayList(Definition) = try .initCapacity(out, inst.update_handlers.count());
+    for (inst.update_handlers.keys(), inst.update_handlers.values()) |name, h| updates.appendAssumeCapacity(try definition(out, name, h.description));
+    for ([_][]Definition{ queries.items, signals.items, updates.items }) |list| std.mem.sortUnstable(Definition, list, {}, definitionLessThan);
+    return .{ .definition = .{
+        .type = try call_sites.validUtf8(out, inst.info.workflow_type),
+        .query_definitions = queries,
+        .signal_definitions = signals,
+        .update_definitions = updates,
+    } };
+}
+
+fn definition(out: Allocator, name: []const u8, description: []const u8) error{OutOfMemory}!proto.temporal.api.sdk.v1.WorkflowInteractionDefinition {
+    return .{ .name = try call_sites.validUtf8(out, name), .description = try call_sites.validUtf8(out, description) };
+}
+
+fn definitionLessThan(_: void, a: proto.temporal.api.sdk.v1.WorkflowInteractionDefinition, b: proto.temporal.api.sdk.v1.WorkflowInteractionDefinition) bool {
+    return std.mem.order(u8, a.name, b.name) == .lt;
 }
 
 /// Which part of the workflow coroutine `f` runs.
@@ -3604,6 +3789,9 @@ fn rootHandleSignal(ptr: *anyopaque, input: interceptor.HandleSignalInput, _: in
 
 fn rootHandleQuery(ptr: *anyopaque, input: interceptor.HandleQueryInput, _: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
+    // The worker's own answers to these come first, so no handler can shadow them.
+    if (std.mem.eql(u8, input.query_type, enhanced_stack_trace_query)) return converter.toPayloadWithContext(input.arena, &inst.converter_context, try inst.enhancedStackTrace(input.arena));
+    if (std.mem.eql(u8, input.query_type, workflow_metadata_query)) return converter.toPayloadWithContext(input.arena, &inst.converter_context, try inst.workflowMetadata(input.arena));
     if (inst.queries.get(input.query_type)) |handler| return handler.call(handler.context, input.arena, &inst.converter_context, input.args.payloads);
     if (std.mem.eql(u8, input.query_type, stack_trace_query)) return converter.toPayloadWithContext(input.arena, &inst.converter_context, try inst.stackTrace(input.arena));
     if (reservedQuery(input.query_type)) return error.QueryNotRegistered;
@@ -8893,17 +9081,20 @@ test "query: read-only code keeps the run's state as replay sees it" {
     try testing.expectEqualStrings("UnsupportedVersion", answer(try readOnlyQuery(a, inst, "version"), 0).variant.?.failed.message);
 
     // Reserved query types don't go to the dynamic handler: the worker answers the stack
-    // trace query itself, here for a workflow function the refused set woke, which hasn't
-    // run since.
+    // trace and metadata queries itself, here for a workflow function the refused set woke,
+    // which hasn't run since; another `__temporal` type fails.
     const c = try inst.activate(&try queryActivation(a, &.{
         .{ "q1", "__stack_trace", &.{} },
         .{ "q2", "__temporal_workflow_metadata", &.{} },
-        .{ "q3", "custom", &.{} },
+        .{ "q3", "__temporal_other", &.{} },
+        .{ "q4", "custom", &.{} },
     }), a);
     const trace = try converter.fromPayload([]const u8, a, answer(c, 0).variant.?.succeeded.response.?);
     try testing.expect(std.mem.startsWith(u8, trace, "workflow \"ReadOnlyState\": 1 coroutine\n\ncoroutine 1 \"workflow\", the workflow function, is ready to run\n"));
-    try testing.expectEqualStrings("QueryNotRegistered", failure_mod.applicationType(answer(c, 1).variant.?.failed).?);
-    try testing.expectEqualStrings("\"custom\"", answer(c, 2).variant.?.succeeded.response.?.data);
+    const metadata = try converter.fromPayload(proto.temporal.api.sdk.v1.WorkflowMetadata, a, answer(c, 1).variant.?.succeeded.response.?);
+    try testing.expectEqualStrings("ReadOnlyState", metadata.definition.?.type);
+    try testing.expectEqualStrings("QueryNotRegistered", failure_mod.applicationType(answer(c, 2).variant.?.failed).?);
+    try testing.expectEqualStrings("\"custom\"", answer(c, 3).variant.?.succeeded.response.?.data);
 
     // The workflow (woken by the query's refused set, or by this signal's) draws the number
     // replay draws: the queries' draws left the run's generator alone.

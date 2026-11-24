@@ -7,6 +7,8 @@ const converter = @import("converter.zig");
 const interceptor = @import("interceptor.zig");
 const testing_ns = @import("testing.zig");
 const log = @import("log.zig");
+const worker_mod = @import("worker.zig");
+const builtin = @import("builtin");
 
 const testing = std.testing;
 
@@ -592,6 +594,133 @@ test "workflow: the worker answers __stack_trace with no handler, and the run's 
     defer replayer.deinit();
     try replayer.registerWorkflow(BlockedWorkflow);
     try replayer.replayHistory(history);
+}
+
+const BlockedStatus = workflow.QueryDef("status", fn () []const u8);
+
+/// The lines of `DescribedBlocked`'s two waits, set as the code reaches them.
+var described_lines: struct { condition: u32 = 0, timer: u32 = 0 } = .{};
+
+/// `BlockedWorkflow` with described handlers: waits until `release` is signaled, with a
+/// coroutine sleeping for an hour beside it.
+const DescribedBlocked = workflow.Def("metadata_blocked", struct {
+    fn release(released: *bool) void {
+        released.* = true;
+    }
+    fn isReleased(released: *bool) bool {
+        return released.*;
+    }
+    fn status(released: *bool) []const u8 {
+        return if (released.*) "released" else "waiting";
+    }
+    fn nap(ctx: *workflow.Context) void {
+        described_lines.timer = @src().line + 1;
+        ctx.sleep(.fromSeconds(3600), .{}) catch {};
+    }
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const released = try ctx.allocator().create(bool);
+        released.* = false;
+        try ctx.setSignalHandlerWithOptions(ReleaseBlocked, released, release, .{ .description = "Lets the workflow finish" });
+        try ctx.setQueryHandlerWithOptions(BlockedStatus, released, status, .{ .description = "Whether the workflow was released" });
+        var napping = ctx.io().async(nap, .{ctx});
+        defer napping.cancel(ctx.io());
+        described_lines.condition = @src().line + 1;
+        try ctx.await(released, isReleased);
+        return "released";
+    }
+}.run);
+
+fn runWorker(w: *worker_mod.Worker) worker_mod.Worker.RunError!void {
+    return w.run();
+}
+
+/// Asks `id`'s run for `__enhanced_stack_trace` until both of its coroutines wait (the first
+/// answer can come before the first workflow task ran them), and returns that answer.
+fn twoStacks(env: *testing_ns.WorkflowEnvironment, a: std.mem.Allocator, id: []const u8) !workflow.EnhancedStackTrace {
+    for (0..200) |_| {
+        const trace = try env.queryWorkflow(workflow.EnhancedStackTraceQuery, a, id, .{});
+        if (trace.stacks.len == 2) return trace;
+    }
+    return error.TestNeverWaited;
+}
+
+/// Checks that `stack`'s innermost call site is `line` of this file, with the source around
+/// it in `trace.sources`. An optimized build may have no locations.
+fn expectDescribedLocation(trace: workflow.EnhancedStackTrace, stack: workflow.EnhancedStackTrace.Stack, line: u32) !void {
+    if (stack.locations.len == 0 and builtin.mode != .debug) return;
+    try testing.expect(stack.locations.len > 0);
+    const loc = stack.locations[0];
+    try testing.expect(std.mem.endsWith(u8, loc.file_path, "workflow_api_test.zig"));
+    try testing.expectEqual(@as(i32, @intCast(line)), loc.line);
+    const slices = trace.sources.map.get(loc.file_path) orelse return error.TestExpectedSource;
+    var lines = std.mem.splitScalar(u8, @embedFile("workflow_api_test.zig"), '\n');
+    for (1..line) |_| _ = lines.next();
+    const text = lines.next().?;
+    for (slices) |slice| if (slice.line_offset < line and std.mem.find(u8, slice.content, text) != null) return;
+    return error.TestExpectedSource;
+}
+
+test "workflow: the worker answers __enhanced_stack_trace and __temporal_workflow_metadata on a cached run and on one rebuilt from history, and both histories replay" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(DescribedBlocked);
+
+    // A second worker with its cache off rebuilds the run from history for every task,
+    // queries included.
+    const uncached_queue = "metadata-uncached";
+    var uncached = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, uncached_queue, .{ .max_cached_workflows = 0 });
+    defer uncached.deinit();
+    try uncached.registerWorkflow(DescribedBlocked);
+    var running = try testing.io.concurrent(runWorker, .{&uncached});
+    defer {
+        uncached.stop();
+        running.await(testing.io) catch {};
+    }
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cached_run = try env.startWorkflow(DescribedBlocked, .{}, .{});
+    defer cached_run.deinit();
+    var rebuilt_run = try env.startWorkflow(DescribedBlocked, .{ .task_queue = uncached_queue }, .{});
+    defer rebuilt_run.deinit();
+
+    const trace = try twoStacks(env, a, cached_run.id);
+    try testing.expectEqualStrings("temporal-zig", trace.sdk.name);
+    try testing.expectEqualStrings(@import("build_options").version, trace.sdk.version);
+    try expectDescribedLocation(trace, trace.stacks[0], described_lines.condition);
+    try expectDescribedLocation(trace, trace.stacks[1], described_lines.timer);
+    // The rebuilt run waits in the same places, so it answers the same.
+    const rebuilt_trace = try twoStacks(env, a, rebuilt_run.id);
+    try testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, trace, .{}), try std.json.Stringify.valueAlloc(a, rebuilt_trace, .{}));
+
+    for ([_][]const u8{ cached_run.id, rebuilt_run.id }) |id| {
+        const metadata = try env.queryWorkflow(workflow.WorkflowMetadataQuery, a, id, .{});
+        try testing.expectEqualStrings("", metadata.current_details);
+        const def = metadata.definition.?;
+        try testing.expectEqualStrings("metadata_blocked", def.type);
+        const queries = def.query_definitions.items;
+        try testing.expectEqual(@as(usize, 4), queries.len);
+        for (queries, [_][]const u8{ "__enhanced_stack_trace", "__stack_trace", "__temporal_workflow_metadata", "status" }) |q, name| try testing.expectEqualStrings(name, q.name);
+        try testing.expectEqualStrings("Whether the workflow was released", queries[3].description);
+        try testing.expect(queries[0].description.len > 0);
+        try testing.expectEqual(@as(usize, 1), def.signal_definitions.items.len);
+        try testing.expectEqualStrings("release", def.signal_definitions.items[0].name);
+        try testing.expectEqualStrings("Lets the workflow finish", def.signal_definitions.items[0].description);
+        try testing.expectEqual(@as(usize, 0), def.update_definitions.items.len);
+    }
+
+    var replayer: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(DescribedBlocked);
+    for ([_]*@TypeOf(cached_run){ &cached_run, &rebuilt_run }) |run| {
+        try env.signalWorkflow(ReleaseBlocked, run.id, .{});
+        try testing.expectEqualStrings("released", try env.getResult(DescribedBlocked, run, a, null));
+        // A closed run still answers: no stacks, the same handlers.
+        try testing.expectEqual(@as(usize, 0), (try env.queryWorkflow(workflow.EnhancedStackTraceQuery, a, run.id, .{})).stacks.len);
+        try testing.expectEqual(@as(usize, 4), (try env.queryWorkflow(workflow.WorkflowMetadataQuery, a, run.id, .{})).definition.?.query_definitions.items.len);
+        try replayer.replayHistory(try env.client.fetchHistory(a, run.id, run.run_id));
+    }
 }
 
 /// Two coroutines wait on one activity's future: first a coroutine started with `io.async`,
@@ -1260,4 +1389,400 @@ test "WorkflowReplayer replays mutableSideEffect histories without calling its f
     defer changed.deinit();
     try changed.registerWorkflow(MutableSideEffect.Dropped);
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(mutable_side_effect_changed_history));
+}
+
+// ---------------------------------------------------------------- workflow-local variables
+
+const Instance = @import("workflow/Instance.zig");
+const proto = @import("proto.zig");
+const act_pb = proto.coresdk.workflow_activation;
+const cmd_pb = proto.coresdk.workflow_commands;
+const done_pb = proto.coresdk.workflow_completion;
+
+const LocalVars = struct {
+    const tag: workflow.LocalVar([]const u8) = .{ .name = "test.tag", .default = "none" };
+    const count: workflow.LocalVar(u32) = .{ .name = "test.count", .default = 0 };
+    /// The same name as `count` with another type: another variable.
+    const count_text: workflow.LocalVar([]const u8) = .{ .name = "test.count", .default = "text" };
+    const outbound_calls: workflow.LocalVar(u32) = .{ .name = "test.outbound", .default = 0 };
+
+    const Release = workflow.SignalDef("local_var_release", fn () void);
+    const Tag = workflow.QueryDef("local_var_tag", fn () []const u8);
+
+    /// What the last run of `run` to finish returned, on the worker or in a replay.
+    var last_buf: [128]u8 = undefined;
+    var last_len: usize = 0;
+
+    const State = struct {
+        ctx: *workflow.Context,
+        released: bool = false,
+
+        fn release(s: *State) void {
+            s.released = true;
+        }
+        fn isReleased(s: *State) bool {
+            return s.released;
+        }
+        fn currentTag(s: *State) []const u8 {
+            return tag.get(s.ctx);
+        }
+    };
+
+    fn bump(ctx: *workflow.Context) !void {
+        try count.set(ctx, count.get(ctx) + 100);
+    }
+
+    fn one(_: void) u32 {
+        return 1;
+    }
+
+    /// Reads `tag` (still the default), sets it to `name`, adds 100 to `count` from a
+    /// coroutine of its own, records a side effect, and waits for `Release`. Returns
+    /// "<initial tag> <tag> <count> <count_text> <outbound_calls>".
+    fn run(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const initial = tag.get(ctx);
+        try tag.set(ctx, try ctx.allocator().dupe(u8, name));
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(Tag, s, State.currentTag);
+        try ctx.setSignalHandler(Release, s, State.release);
+        var child = ctx.io().async(bump, .{ctx});
+        try child.await(ctx.io());
+        _ = try ctx.sideEffect(u32, {}, one);
+        try ctx.await(s, State.isReleased);
+        const out = try std.fmt.allocPrint(ctx.allocator(), "{s} {s} {d} {s} {d}", .{ initial, tag.get(ctx), count.get(ctx), count_text.get(ctx), outbound_calls.get(ctx) });
+        @memcpy(last_buf[0..out.len], out);
+        last_len = out.len;
+        return out;
+    }
+    const Def = workflow.Def("local_vars", run);
+
+    /// Adds 1 to `count` when the run's interceptors are built, 10 in `executeWorkflow`, and
+    /// 1 to `outbound_calls` for each side effect.
+    const Audit = struct {
+        pub fn interceptWorkflow(_: *Audit, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+            count.set(ctx, count.get(ctx) + 1) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ReadOnly => unreachable,
+            };
+            const r = try ctx.allocator().create(Run);
+            r.* = .{ .ctx = ctx };
+            return .{ .inbound = interceptor.WorkflowInbound.from(Run, r), .outbound = interceptor.WorkflowOutbound.from(Run, r) };
+        }
+
+        const Run = struct {
+            ctx: *workflow.Context,
+
+            pub fn executeWorkflow(r: *Run, input: interceptor.ExecuteWorkflowInput, next: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
+                try count.set(r.ctx, count.get(r.ctx) + 10);
+                return next.executeWorkflow(input);
+            }
+
+            pub fn sideEffect(r: *Run, input: interceptor.SideEffectInput, next: interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(converter.Payload) {
+                outbound_calls.set(r.ctx, outbound_calls.get(r.ctx) + 1) catch {};
+                return next.sideEffect(input);
+            }
+        };
+    };
+
+    /// Tries to set `count` to 99 from a side-effect function: 1 if refused with the value
+    /// unchanged, 2 if refused with it changed, 0 if it was set.
+    fn setInFunc(ctx: *workflow.Context) u32 {
+        const before = count.get(ctx);
+        count.set(ctx, 99) catch |err| return if (err == error.ReadOnly and count.get(ctx) == before) 1 else 2;
+        return 0;
+    }
+
+    /// The context `eqlSet` tries to set `count` in, and what that set returned.
+    var eql_ctx: ?*workflow.Context = null;
+    var eql_outcome: []const u8 = "not called";
+
+    fn eqlSet(recorded: u32, current: u32) bool {
+        if (eql_ctx) |c| {
+            const before = count.get(c);
+            eql_outcome = if (count.set(c, 77)) |_| "set" else |err| if (err == error.ReadOnly and count.get(c) == before) "refused" else @errorName(err);
+        }
+        return recorded == current;
+    }
+
+    /// Sets `count` to 5, then tries to set it from `sideEffect`'s function and from
+    /// `mutableSideEffect`'s function and `eql`, then sets it again. Returns the three
+    /// functions' results and `count`.
+    fn sideEffects(ctx: *workflow.Context) ![]const u8 {
+        try count.set(ctx, 5);
+        const in_side_effect = try ctx.sideEffect(u32, ctx, setInFunc);
+        const first = try ctx.mutableSideEffect(u32, "cfg", ctx, setInFunc, eqlSet);
+        eql_ctx = ctx;
+        defer eql_ctx = null;
+        const second = try ctx.mutableSideEffect(u32, "cfg", ctx, setInFunc, eqlSet);
+        try count.set(ctx, count.get(ctx) + 1);
+        return std.fmt.allocPrint(ctx.allocator(), "{d} {d} {d} {d}", .{ in_side_effect, first, second, count.get(ctx) });
+    }
+    const SideEffects = workflow.Def("local_vars_side_effects", sideEffects);
+
+    /// Counts the warnings of refused sets. Called from the worker's threads.
+    const Warnings = struct {
+        count: std.atomic.Value(usize) = .init(0),
+
+        fn sink(w: *Warnings) log.Sink {
+            return .{ .ptr = w, .vtable = &.{ .log = record } };
+        }
+
+        fn record(ptr: ?*anyopaque, level: log.Level, text: []const u8, fields: []const log.Field) void {
+            const w: *Warnings = @ptrCast(@alignCast(ptr.?));
+            if (level != .warn or !std.mem.startsWith(u8, text, "LocalVar.set in a side-effect function is refused")) return;
+            for (fields) |f| if (std.mem.eql(u8, f.key, "LocalVar")) {
+                _ = w.count.fetchAdd(1, .monotonic);
+            };
+        }
+    };
+};
+
+test "workflow: LocalVar values belong to one run, reach its coroutines and interceptors, and replay" {
+    var audit: LocalVars.Audit = .{};
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(LocalVars.Audit, &audit)};
+    const env = try testing_ns.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(LocalVars.Def);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Both runs set their tag and wait, cached on the worker at once; then each finishes.
+    var first = try env.startWorkflow(LocalVars.Def, .{}, .{"first"});
+    defer first.deinit();
+    var second = try env.startWorkflow(LocalVars.Def, .{}, .{"second"});
+    defer second.deinit();
+    for ([_][]const u8{ "first", "second" }, [_][]const u8{ first.id, second.id }) |want, id| {
+        for (0..200) |_| {
+            if (std.mem.eql(u8, try env.queryWorkflow(LocalVars.Tag, a, id, .{}), want)) break;
+        } else return error.TestNeverSet;
+    }
+    try env.signalWorkflow(LocalVars.Release, first.id, .{});
+    try testing.expectEqualStrings("none first 111 text 1", try env.getResult(LocalVars.Def, &first, a, null));
+    try testing.expectEqualStrings("second", try env.queryWorkflow(LocalVars.Tag, a, second.id, .{}));
+    try env.signalWorkflow(LocalVars.Release, second.id, .{});
+    try testing.expectEqualStrings("none second 111 text 1", try env.getResult(LocalVars.Def, &second, a, null));
+
+    // The replay rebuilds the values from the default by running the same code again.
+    const history = try env.client.fetchHistory(a, first.id, first.run_id);
+    var replayer: testing_ns.WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .interceptors = &interceptors });
+    defer replayer.deinit();
+    try replayer.registerWorkflow(LocalVars.Def);
+    LocalVars.last_len = 0;
+    try replayer.replayHistory(history);
+    try testing.expectEqualStrings("none first 111 text 1", LocalVars.last_buf[0..LocalVars.last_len]);
+}
+
+test "workflow: LocalVar.set in a side-effect function or mutableSideEffect's eql is refused, and the run replays" {
+    var warnings: LocalVars.Warnings = .{};
+    const env = try testing_ns.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .logger = warnings.sink() });
+    defer env.deinit();
+    try env.registerWorkflow(LocalVars.SideEffects);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    LocalVars.eql_outcome = "not called";
+    var run = try env.startWorkflow(LocalVars.SideEffects, .{}, .{});
+    defer run.deinit();
+    // Each function's set was refused and left 5; the set after them worked.
+    try testing.expectEqualStrings("1 1 1 6", try env.getResult(LocalVars.SideEffects, &run, a, null));
+    try testing.expectEqualStrings("refused", LocalVars.eql_outcome);
+    // One for each refused set: `sideEffect`'s function, `mutableSideEffect`'s function on
+    // both calls, and `eql` on the second.
+    try testing.expectEqual(4, warnings.count.load(.monotonic));
+
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    var replayer: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(LocalVars.SideEffects);
+    try replayer.replayHistory(history);
+}
+
+fn localVarActivation(a: std.mem.Allocator, job: act_pb.WorkflowActivationJob.variant_union) !act_pb.WorkflowActivation {
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+    try act.jobs.append(a, .{ .variant = job });
+    return act;
+}
+
+fn localVarCommands(c: done_pb.WorkflowActivationCompletion) []const cmd_pb.WorkflowCommand {
+    return c.status.?.successful.commands.items;
+}
+
+const LocalVarHandlers = struct {
+    ctx: *workflow.Context,
+
+    const TrySet = workflow.QueryDef("local_var_try_set", fn () u32);
+    const Read = workflow.QueryDef("local_var_read", fn () u32);
+    const Bump = workflow.UpdateDef("local_var_bump", fn () u32);
+    const Finish = workflow.SignalDef("local_var_finish", fn () void);
+
+    /// What the last refused set returned, and what `count` read just after it.
+    var refused: ?anyerror = null;
+    var after_refusal: u32 = 0;
+    /// What `count` read when the run started.
+    var initial: u32 = 1234;
+
+    fn trySet(h: *LocalVarHandlers) u32 {
+        h.attempt();
+        return LocalVars.count.get(h.ctx);
+    }
+    fn read(h: *LocalVarHandlers) u32 {
+        return LocalVars.count.get(h.ctx);
+    }
+    fn validate(h: *LocalVarHandlers) void {
+        h.attempt();
+    }
+    fn bump(h: *LocalVarHandlers) !u32 {
+        try LocalVars.count.set(h.ctx, LocalVars.count.get(h.ctx) + 1);
+        return LocalVars.count.get(h.ctx);
+    }
+    fn attempt(h: *LocalVarHandlers) void {
+        refused = null;
+        LocalVars.count.set(h.ctx, 42) catch |err| {
+            refused = err;
+        };
+        after_refusal = LocalVars.count.get(h.ctx);
+    }
+    fn finish(_: *LocalVarHandlers) void {
+        finished = true;
+    }
+    var finished = false;
+    fn isFinished(_: *LocalVarHandlers) bool {
+        return finished;
+    }
+
+    /// Sets `count` to 5 and a string variable from the run's memory, sets `count` 100 more
+    /// times, and waits for `Finish`.
+    fn run(ctx: *workflow.Context) !u32 {
+        initial = LocalVars.count.get(ctx);
+        const h = try ctx.allocator().create(LocalVarHandlers);
+        h.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(TrySet, h, trySet);
+        try ctx.setQueryHandler(Read, h, read);
+        try ctx.setUpdateHandlerWithValidator(Bump, h, bump, validate);
+        try ctx.setSignalHandler(Finish, h, finish);
+        try LocalVars.tag.set(ctx, try std.fmt.allocPrint(ctx.allocator(), "run {s}", .{ctx.info().workflow_id}));
+        for (0..100) |i| try LocalVars.count.set(ctx, @intCast(i));
+        try LocalVars.count.set(ctx, 5);
+        try ctx.await(h, isFinished);
+        return LocalVars.count.get(ctx);
+    }
+    const Def = workflow.Def("local_var_handlers", run);
+
+    fn start(a: std.mem.Allocator) !*Instance {
+        finished = false;
+        const inst = try Instance.create(testing.allocator, Def.registered, .{});
+        errdefer inst.destroy();
+        const init: act_pb.InitializeWorkflow = .{ .workflow_type = "local_var_handlers", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+        try testing.expectEqual(0, localVarCommands(try inst.activate(&try localVarActivation(a, .{ .initialize_workflow = init }), a)).len);
+        return inst;
+    }
+
+    fn query(inst: *Instance, a: std.mem.Allocator, query_type: []const u8) !cmd_pb.QueryResult.variant_union {
+        const cmds = localVarCommands(try inst.activate(&try localVarActivation(a, .{ .query_workflow = .{ .query_id = "q1", .query_type = query_type } }), a));
+        try testing.expectEqual(1, cmds.len);
+        return cmds[0].variant.?.respond_to_query.variant.?;
+    }
+
+    fn readCount(inst: *Instance, a: std.mem.Allocator) !u32 {
+        return converter.fromPayload(u32, a, (try query(inst, a, "local_var_read")).succeeded.response.?);
+    }
+};
+
+test "LocalVar.set in a query handler or an update validator returns ReadOnly, leaves the value, and fails the query or rejects the update" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try LocalVarHandlers.start(a);
+    defer inst.destroy();
+    try testing.expectEqual(5, try LocalVarHandlers.readCount(inst, a));
+
+    const allocated = inst.allocated;
+    const failed = (try LocalVarHandlers.query(inst, a, "local_var_try_set")).failed;
+    try testing.expectEqual(error.ReadOnly, LocalVarHandlers.refused.?);
+    try testing.expectEqual(5, LocalVarHandlers.after_refusal);
+    try testing.expect(std.mem.find(u8, failed.message, "LocalVar.set") != null);
+    try testing.expectEqualStrings("ReadOnlyViolation", failed.failure_info.?.application_failure_info.type);
+    try testing.expectEqual(allocated, inst.allocated);
+
+    const update: act_pb.DoUpdate = .{ .id = "u1", .protocol_instance_id = "u1", .name = "local_var_bump", .run_validator = true };
+    const cmds = localVarCommands(try inst.activate(&try localVarActivation(a, .{ .do_update = update }), a));
+    try testing.expectEqual(1, cmds.len);
+    const rejected = cmds[0].variant.?.update_response.response.?.rejected;
+    try testing.expect(std.mem.find(u8, rejected.message, "LocalVar.set") != null);
+    try testing.expectEqual(error.ReadOnly, LocalVarHandlers.refused.?);
+    try testing.expectEqual(5, LocalVarHandlers.after_refusal);
+    try testing.expectEqual(5, try LocalVarHandlers.readCount(inst, a));
+}
+
+test "LocalVar values are freed with the run on completion and on eviction, and a rebuilt run starts from the default" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+
+    // Completion: the signal ends the run; destroy frees what it set (testing.allocator
+    // checks).
+    {
+        const inst = try LocalVarHandlers.start(a);
+        defer inst.destroy();
+        // One entry per variable, however often it was set.
+        try testing.expectEqual(2, inst.local_values.items.len);
+        const cmds = localVarCommands(try inst.activate(&try localVarActivation(a, .{ .signal_workflow = .{ .signal_name = "local_var_finish" } }), a));
+        try testing.expectEqual(1, cmds.len);
+        const result = cmds[0].variant.?.complete_workflow_execution.result.?;
+        try testing.expectEqual(5, try converter.fromPayload(u32, a, result));
+    }
+
+    // Eviction mid-run, then the same run rebuilt: it starts from the default again.
+    {
+        const inst = try LocalVarHandlers.start(a);
+        try testing.expectEqual(0, LocalVarHandlers.initial);
+        try testing.expectEqual(5, try LocalVarHandlers.readCount(inst, a));
+        inst.destroy();
+    }
+    LocalVarHandlers.initial = 1234;
+    const rebuilt = try LocalVarHandlers.start(a);
+    defer rebuilt.destroy();
+    try testing.expectEqual(0, LocalVarHandlers.initial);
+}
+
+/// A library's per-run state, generic over what it holds. `Slot` is declared inside the
+/// function, so every instantiation has the same `@typeName` ("...LocalVarSlot.Slot") though
+/// the types, and their sizes, differ.
+fn LocalVarSlot(comptime V: type) type {
+    const Slot = struct { value: V };
+    return Slot;
+}
+
+const LocalVarSameTypeName = struct {
+    const small: workflow.LocalVar(LocalVarSlot(u8)) = .{ .name = "test.slot", .default = .{ .value = 0 } };
+    const big: workflow.LocalVar(LocalVarSlot([64]u8)) = .{ .name = "test.slot", .default = .{ .value = @splat(0xAA) } };
+
+    /// What `big` read after `small` was set.
+    var big_read: [64]u8 = undefined;
+
+    fn run(ctx: *workflow.Context) !u32 {
+        try small.set(ctx, .{ .value = 7 });
+        big_read = big.get(ctx).value;
+        return small.get(ctx).value;
+    }
+    const Def = workflow.Def("local_var_same_type_name", run);
+};
+
+test "LocalVar: the same name with another type whose @typeName is equal is another variable" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try Instance.create(testing.allocator, LocalVarSameTypeName.Def.registered, .{});
+    defer inst.destroy();
+    const init: act_pb.InitializeWorkflow = .{ .workflow_type = "local_var_same_type_name", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    const cmds = localVarCommands(try inst.activate(&try localVarActivation(a, .{ .initialize_workflow = init }), a));
+    try testing.expectEqual(1, cmds.len);
+    try testing.expectEqual(7, try converter.fromPayload(u32, a, cmds[0].variant.?.complete_workflow_execution.result.?));
+    // `big` was never set, so it reads its default, not the 1-byte box of `small` and the
+    // arena memory after it.
+    try testing.expectEqualSlices(u8, &@as([64]u8, @splat(0xAA)), &LocalVarSameTypeName.big_read);
 }
