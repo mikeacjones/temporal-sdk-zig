@@ -1,7 +1,7 @@
 //! Activities still running when their worker begins shutting down learn of it before the
 //! graceful shutdown period ends: one then completes, one fails, and one ignores it and
-//! times out. The driver stops the worker once they run and starts a new one, which runs
-//! the workflow to its end.
+//! times out. The driver stops the worker once the first two run (the third's 300 ms timeout
+//! may end it before it starts) and starts a new one, which runs the workflow to its end.
 const std = @import("std");
 const temporal = @import("temporal");
 const harness = @import("harness");
@@ -23,22 +23,22 @@ pub const feature = harness.define(.{
     .execute = execute,
 });
 
-/// How many of the three activities have started on the first worker; read by `execute`.
-var activities_started: std.atomic.Value(u32) = .init(0);
+/// How many of CancelSuccess and CancelFailure have started on the first worker; read by
+/// `execute`. CancelIgnore is not counted: the server may time it out before it starts.
+var graceful_started: std.atomic.Value(u32) = .init(0);
 
 fn cancelSuccess(ctx: *activity.Context) !void {
-    _ = activities_started.fetchAdd(1, .acq_rel);
+    _ = graceful_started.fetchAdd(1, .acq_rel);
     try ctx.waitForWorkerStop();
 }
 
 fn cancelFailure(ctx: *activity.Context) !void {
-    _ = activities_started.fetchAdd(1, .acq_rel);
+    _ = graceful_started.fetchAdd(1, .acq_rel);
     try ctx.waitForWorkerStop();
     return ctx.fail(.{ .message = shutdown_message });
 }
 
 fn cancelIgnore(ctx: *activity.Context) !void {
-    _ = activities_started.fetchAdd(1, .acq_rel);
     // Ignores the worker's cancel, as Go's time.Sleep does; its 300 ms schedule-to-close
     // timeout ends it on the server long before this returns.
     const io = ctx.io();
@@ -97,12 +97,14 @@ fn execute(ctx: *harness.Context) !void {
     defer run.deinit();
     try ctx.waitForEvent(run.id, run.run_id, .EVENT_TYPE_ACTIVITY_TASK_SCHEDULED, .fromSeconds(5));
 
-    // The activities must be running on this worker when it stops, or they would wait for
-    // the next worker's shutdown instead.
+    // CancelSuccess and CancelFailure must be running on this worker when it stops, or they
+    // would wait for the next worker's shutdown instead. CancelIgnore is not awaited: its
+    // 300 ms timeout can end it on the server before it reaches this worker, and the
+    // workflow expects that timeout either way.
     const deadline = Io.Timestamp.now(ctx.io, .boot).addDuration(.fromSeconds(5));
-    while (activities_started.load(.acquire) < 3) {
+    while (graceful_started.load(.acquire) < 2) {
         const remaining = Io.Timestamp.now(ctx.io, .boot).durationTo(deadline).nanoseconds;
-        if (remaining <= 0) return ctx.fail("expected 3 activities to start within 5s, {d} did", .{activities_started.load(.acquire)});
+        if (remaining <= 0) return ctx.fail("expected CancelSuccess and CancelFailure to start within 5s, {d} of 2 did", .{graceful_started.load(.acquire)});
         try ctx.io.sleep(.fromNanoseconds(@min(20 * std.time.ns_per_ms, remaining)), .boot);
     }
 

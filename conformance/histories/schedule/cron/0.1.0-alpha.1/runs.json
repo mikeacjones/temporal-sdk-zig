@@ -1,0 +1,18 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-schedule/cron",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-schedule/cron"
+    },
+    {
+      "file": "2-Workflow.json",
+      "workflow_id": "conformance-schedule/cron"
+    },
+    {
+      "file": "3-Workflow.json",
+      "workflow_id": "conformance-schedule/cron"
+    }
+  ]
+}

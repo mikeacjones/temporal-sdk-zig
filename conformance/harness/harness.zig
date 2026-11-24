@@ -6,6 +6,10 @@ pub const Context = @import("Context.zig");
 pub const history = @import("history.zig");
 pub const stored = @import("stored.zig");
 pub const sercontext = @import("sercontext.zig");
+pub const SideWorker = @import("SideWorker.zig");
+pub const deployments = @import("deployments.zig");
+pub const build_ids = @import("build_ids.zig");
+pub const payloads = @import("payloads.zig");
 
 pub const Feature = struct {
     has_worker: bool,
@@ -106,6 +110,10 @@ test {
     _ = history;
     _ = stored;
     _ = sercontext;
+    _ = SideWorker;
+    _ = deployments;
+    _ = build_ids;
+    _ = payloads;
 }
 
 test "conformance define defaults to a client-only feature" {
@@ -171,8 +179,8 @@ test "conformance replayer options carry the codecs set by configureClient" {
     const Example = struct {
         var context: u8 = 0;
         const codecs = [_]temporal.converter.PayloadCodec{.{ .ptr = &context, .vtable = &.{ .encode = passThrough, .decode = passThrough } }};
-        fn passThrough(_: *anyopaque, _: std.mem.Allocator, _: std.Io, payloads: []const temporal.converter.Payload) temporal.converter.CodecError![]temporal.converter.Payload {
-            return @constCast(payloads);
+        fn passThrough(_: *anyopaque, _: std.mem.Allocator, _: std.Io, input: []const temporal.converter.Payload) temporal.converter.CodecError![]temporal.converter.Payload {
+            return @constCast(input);
         }
         fn execute(_: *Context) !void {}
         fn configure(options: *temporal.client.Options) void {

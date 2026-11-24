@@ -1,0 +1,63 @@
+//! An auto-upgrade run moves to the deployment's new current version at its next workflow
+//! task: it returns version 2.0's result after 2.0 has become current.
+const std = @import("std");
+const temporal = @import("temporal");
+const harness = @import("harness");
+const workflow = temporal.workflow;
+
+const deployment_name = "conformance-routing-auto-upgrade";
+
+const WaitForSignal = workflow.DefWithOptions("WaitForSignal", waitForSignalV1, .{ .versioning_behavior = .auto_upgrade });
+const WaitForSignalV2 = workflow.DefWithOptions("WaitForSignal", waitForSignalV2, .{ .versioning_behavior = .auto_upgrade });
+const StartSignal = workflow.SignalDef("start-signal", fn ([]const u8) void);
+
+pub const feature = harness.define(.{
+    .workflows = .{WaitForSignal},
+    .worker_options = temporal.worker.Options{ .deployment = .{ .deployment_name = deployment_name, .build_id = "1.0" } },
+    .execute = execute,
+});
+
+const SignalState = struct {
+    value: ?[]const u8 = null,
+
+    fn receive(state: *SignalState, value: []const u8) void {
+        state.value = value;
+    }
+
+    fn received(state: *SignalState) bool {
+        return state.value != null;
+    }
+};
+
+fn waitForSignal(ctx: *workflow.Context, comptime suffix: []const u8) ![]const u8 {
+    const state = try ctx.allocator().create(SignalState);
+    state.* = .{};
+    try ctx.setSignalHandler(StartSignal, state, SignalState.receive);
+    try ctx.await(state, SignalState.received);
+    return std.fmt.allocPrint(ctx.allocator(), "{s}" ++ suffix, .{state.value.?});
+}
+
+fn waitForSignalV1(ctx: *workflow.Context) ![]const u8 {
+    return waitForSignal(ctx, "_v1");
+}
+
+fn waitForSignalV2(ctx: *workflow.Context) ![]const u8 {
+    return waitForSignal(ctx, "_v2");
+}
+
+fn execute(ctx: *harness.Context) !void {
+    const v2 = try harness.SideWorker.start(ctx, .{ .deployment = .{
+        .deployment_name = deployment_name,
+        .build_id = "2.0",
+        .default_versioning_behavior = .auto_upgrade,
+    } }, .{ .workflows = .{WaitForSignalV2} });
+    defer v2.stop();
+
+    try harness.deployments.setCurrent(ctx, deployment_name, "1.0");
+    var run = try ctx.client.executeWorkflow(WaitForSignal, ctx.startOptions(), .{});
+    defer run.deinit();
+    try harness.deployments.waitForWorkflowRunning(ctx, run.id, run.run_id);
+    try harness.deployments.setCurrent(ctx, deployment_name, "2.0");
+    try ctx.client.signalWorkflow(StartSignal, run.id, run.run_id, .{"prefix"});
+    try ctx.expectEqualStrings("prefix_v2", try run.get(ctx.arena));
+}

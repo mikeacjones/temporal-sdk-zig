@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-schedule/trigger",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-schedule/trigger-2026-11-24T14:58:36Z"
+    },
+    {
+      "file": "2-Workflow.json",
+      "workflow_id": "conformance-schedule/trigger-2026-11-24T14:58:38Z"
+    }
+  ]
+}
