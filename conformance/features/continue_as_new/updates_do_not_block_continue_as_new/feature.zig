@@ -82,9 +82,11 @@ const UpdateOutcome = union(enum) {
 };
 
 /// Sends the update to the workflow's latest run and waits for its result, on a task of
-/// its own while `execute` waits for the server to admit it. Strings are allocated from
-/// `gpa` and freed by `execute`.
-fn sendUpdate(client: *temporal.client.Client, gpa: std.mem.Allocator, workflow_id: []const u8) UpdateOutcome {
+/// its own while `execute` waits for the server to admit it. Sets `finished` when it
+/// returns, so that wait can tell an update call that already ended. Strings are
+/// allocated from `gpa` and freed by `execute`.
+fn sendUpdate(client: *temporal.client.Client, gpa: std.mem.Allocator, workflow_id: []const u8, io: Io, finished: *Io.Event) UpdateOutcome {
+    defer finished.set(io);
     var update = client.updateWorkflow(Update, workflow_id, "", .{}, .{ .update_id = update_id }) catch |err| return .{ .err = err };
     defer update.deinit();
     var scratch: std.heap.ArenaAllocator = .init(gpa);
@@ -106,8 +108,11 @@ fn freeOutcome(gpa: std.mem.Allocator, outcome: UpdateOutcome) void {
     }
 }
 
-/// Polls until the server has admitted the update, or `admit_limit` passes.
-fn waitUntilAdmitted(ctx: *harness.Context, workflow_id: []const u8) !void {
+const Admission = enum { admitted, update_call_ended };
+
+/// Polls until the server has admitted the update, or `sendUpdate` has returned (its
+/// `finished` is set) without it, or `admit_limit` passes.
+fn waitUntilAdmitted(ctx: *harness.Context, workflow_id: []const u8, finished: *Io.Event) !Admission {
     const io = ctx.io;
     const deadline = Io.Clock.Timestamp.now(io, .boot).addDuration(.{ .raw = admit_limit, .clock = .boot });
     var scratch: std.heap.ArenaAllocator = .init(ctx.gpa);
@@ -120,14 +125,21 @@ fn waitUntilAdmitted(ctx: *harness.Context, workflow_id: []const u8) !void {
             .identity = ctx.client.identity,
             .wait_policy = .{ .lifecycle_stage = .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ADMITTED },
         }, null)) |_| {
-            return;
+            return .admitted;
         } else |err| switch (err) {
             error.NotFound => {},
             else => return err,
         }
+        // An update call that failed or was rejected is never admitted: report its own
+        // outcome instead of waiting out `admit_limit`.
+        if (finished.isSet()) return .update_call_ended;
         if (Io.Clock.Timestamp.now(io, .boot).durationTo(deadline).raw.nanoseconds <= 0)
             return ctx.fail("update {s} of workflow {s} was not admitted within {f}", .{ update_id, workflow_id, admit_limit });
-        try io.sleep(.fromMilliseconds(50), .boot);
+        // Wakes early when the update call ends.
+        finished.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .boot } }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => return error.Canceled,
+        };
     }
 }
 
@@ -139,6 +151,11 @@ fn execute(ctx: *harness.Context) !void {
 
     var run = try ctx.client.executeWorkflow(Workflow, ctx.startOptions(), .{});
     defer run.deinit();
+    // Leave no run open on a failure path: terminate the workflow's current run, the first
+    // or the one after continue-as-new, unless it completed. A run already closed answers
+    // NotFound, which is ignored like every other cleanup error.
+    var completed = false;
+    defer if (!completed) ctx.client.terminateWorkflow(run.id, "", "feature cleanup") catch {};
     const first_run_id = try ctx.arena.dupe(u8, run.run_id);
 
     first_task_in_progress.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .boot } }) catch |err| switch (err) {
@@ -146,11 +163,12 @@ fn execute(ctx: *harness.Context) !void {
         error.Canceled => return error.Canceled,
     };
 
-    var pending = try io.concurrent(sendUpdate, .{ ctx.client, ctx.gpa, run.id });
+    var update_finished: Io.Event = .unset;
+    var pending = try io.concurrent(sendUpdate, .{ ctx.client, ctx.gpa, run.id, io, &update_finished });
     var awaited = false;
     defer if (!awaited) freeOutcome(ctx.gpa, pending.cancel(io));
 
-    try waitUntilAdmitted(ctx, run.id);
+    const admission = try waitUntilAdmitted(ctx, run.id, &update_finished);
     // The workflow now answers its first task with continue-as-new.
     update_admitted.set(io);
 
@@ -159,12 +177,19 @@ fn execute(ctx: *harness.Context) !void {
     defer freeOutcome(ctx.gpa, outcome);
     const update_run_id = switch (outcome) {
         .run_id => |id| id,
-        .failed => |message| return ctx.fail("update failed: {s}", .{message}),
-        .err => |err| return err,
+        .failed => |message| return switch (admission) {
+            .admitted => ctx.fail("expected update {s} to complete, but it failed: {s}", .{ update_id, message }),
+            .update_call_ended => ctx.fail("expected update {s} to be admitted, but it failed before admission: {s}", .{ update_id, message }),
+        },
+        .err => |err| return switch (admission) {
+            .admitted => err,
+            .update_call_ended => ctx.fail("expected update {s} to be admitted, but the update call returned error.{s} before admission", .{ update_id, @errorName(err) }),
+        },
     };
     try ctx.expect(!block_timed_out.load(.acquire), "the first workflow task stopped waiting for the update to be admitted after {f}", .{block_limit});
 
     const result = try run.get(ctx.arena);
+    completed = true;
     try ctx.expect(!std.mem.eql(u8, update_run_id, first_run_id), "expected the update to be handled on the run after continue-as-new, but it was handled on the first run {s}", .{first_run_id});
     try ctx.expectEqualStrings(result, update_run_id);
 
