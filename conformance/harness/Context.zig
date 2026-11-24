@@ -4,6 +4,7 @@ const Context = @This();
 const std = @import("std");
 const temporal = @import("temporal");
 const history = @import("history.zig");
+const Feature = @import("harness.zig").Feature;
 const Io = std.Io;
 const Worker = temporal.worker.Worker;
 
@@ -26,6 +27,14 @@ capabilities: []const Capability = &.{},
 failure_message_: ?[]const u8 = null,
 worker_: ?*Worker = null,
 running_: ?*Io.Future(Worker.RunError!void) = null,
+/// The feature being run; set by the runner, for `startWorker`.
+definition_: ?*const Feature = null,
+/// The worker `startWorker` made, owned by the context and allocated from `gpa`.
+restarted_: ?*Restarted = null,
+/// The worker the last `stopWorker` stopped, for its `fatalMessage`.
+stopped_: ?*Worker = null,
+
+const Restarted = struct { worker: Worker, running: Io.Future(Worker.RunError!void) };
 
 pub fn startOptions(ctx: *const Context) temporal.client.StartWorkflowOptions {
     return .{ .id = ctx.task_queue, .task_queue = ctx.task_queue, .execution_timeout = .fromSeconds(60) };
@@ -66,8 +75,77 @@ pub fn stopWorker(ctx: *Context) (Worker.RunError || error{NoWorker})!void {
     const running = ctx.running_ orelse return error.NoWorker;
     ctx.worker_ = null;
     ctx.running_ = null;
+    ctx.stopped_ = worker;
     worker.stop();
     return running.await(ctx.io);
+}
+
+/// Starts a new worker for this feature on `task_queue`, with the feature's workflows,
+/// activities, Nexus services and worker options, after `stopWorker` stopped the previous
+/// one. The context owns it; `stopWorker` stops it like the first. Every failure but
+/// cancellation is reported through `fail`, with a message starting "startWorker: ".
+pub fn startWorker(ctx: *Context) error{ FeatureFailed, Canceled }!void {
+    const definition = ctx.definition_ orelse return ctx.fail("startWorker: the feature declares no workflows, activities or Nexus services", .{});
+    if (!definition.has_worker) return ctx.fail("startWorker: the feature declares no workflows, activities or Nexus services", .{});
+    if (ctx.worker_ != null) return ctx.fail("startWorker: the feature's worker is still running; call stopWorker first", .{});
+    // An earlier restarted worker has been stopped, since `worker_` is null.
+    ctx.freeRestarted();
+
+    const gpa = ctx.gpa;
+    const io = ctx.io;
+    const restarted = gpa.create(Restarted) catch |err| return ctx.fail("startWorker: worker init returned error.{t}", .{err});
+    restarted.worker = Worker.init(gpa, io, ctx.client, ctx.task_queue, definition.workerOptions()) catch |err| {
+        gpa.destroy(restarted);
+        return ctx.fail("startWorker: worker init returned error.{t}", .{err});
+    };
+    const worker = &restarted.worker;
+    var started = false;
+    errdefer {
+        if (started) {
+            worker.stop();
+            // The run task must end before the worker is freed, even if this task was canceled.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            restarted.running.await(io) catch {};
+        }
+        worker.deinit();
+        gpa.destroy(restarted);
+    }
+    definition.register(worker) catch |err| return ctx.fail("startWorker: registering feature definitions returned error.{t}", .{err});
+    restarted.running = io.concurrent(Worker.run, .{worker}) catch |err|
+        return ctx.fail("startWorker: starting worker task returned error.{t}", .{err});
+    started = true;
+    worker.waitUntilRunning() catch |start_err| switch (start_err) {
+        error.Canceled => return error.Canceled,
+        error.WorkerFailedToStart => {
+            started = false;
+            worker.stop();
+            restarted.running.await(io) catch |err| {
+                const message = worker.fatalMessage();
+                return ctx.fail("startWorker: worker failed to start with error.{t}{s}{s}", .{ err, if (message == null) "" else ": ", message orelse "" });
+            };
+            return ctx.fail("startWorker: worker failed to start with error.{t}", .{start_err});
+        },
+    };
+    ctx.restarted_ = restarted;
+    ctx.worker_ = worker;
+    ctx.running_ = &restarted.running;
+}
+
+/// Frees the worker `startWorker` made, if any. The runner calls it after the last
+/// `stopWorker`; a feature never does.
+pub fn deinit(ctx: *Context) void {
+    std.debug.assert(ctx.worker_ == null);
+    ctx.freeRestarted();
+    ctx.stopped_ = null;
+}
+
+fn freeRestarted(ctx: *Context) void {
+    const restarted = ctx.restarted_ orelse return;
+    if (ctx.stopped_ == &restarted.worker) ctx.stopped_ = null;
+    restarted.worker.deinit();
+    ctx.gpa.destroy(restarted);
+    ctx.restarted_ = null;
 }
 
 /// Polls the named run's history without retaining snapshots in the feature arena.
@@ -352,4 +430,105 @@ test "conformance stopWorker returns the run result and consumes the worker futu
     };
     try std.testing.expectError(error.NothingRegistered, ctx.stopWorker());
     try std.testing.expectError(error.NoWorker, ctx.stopWorker());
+}
+
+test "conformance startWorker reports misuse through fail" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var client = try temporal.client.Client.init(gpa, io, .{});
+    defer client.close();
+    var ctx: Context = .{
+        .gpa = gpa,
+        .io = io,
+        .arena = arena.allocator(),
+        .client = &client,
+        .feature = "test/worker",
+        .namespace = "default",
+        .task_queue = "conformance-test/worker",
+    };
+    const no_worker_message = "startWorker: the feature declares no workflows, activities or Nexus services";
+    try std.testing.expectError(error.FeatureFailed, ctx.startWorker());
+    try std.testing.expectEqualStrings(no_worker_message, ctx.failure_message_.?);
+
+    const Example = struct {
+        fn run(_: *temporal.workflow.Context) !void {}
+        fn execute(_: *Context) !void {}
+    };
+    const client_only = @import("harness.zig").define(.{ .execute = Example.execute });
+    ctx.definition_ = &client_only;
+    ctx.failure_message_ = null;
+    try std.testing.expectError(error.FeatureFailed, ctx.startWorker());
+    try std.testing.expectEqualStrings(no_worker_message, ctx.failure_message_.?);
+
+    const with_workflow = @import("harness.zig").define(.{
+        .workflows = .{temporal.workflow.Def("Workflow", Example.run)},
+        .execute = Example.execute,
+    });
+    ctx.definition_ = &with_workflow;
+    var worker = try Worker.init(gpa, io, &client, "conformance-test/worker", .{});
+    defer worker.deinit();
+    var running = io.async(Worker.run, .{&worker});
+    ctx.worker_ = &worker;
+    ctx.running_ = &running;
+    try std.testing.expectError(error.FeatureFailed, ctx.startWorker());
+    try std.testing.expectEqualStrings("startWorker: the feature's worker is still running; call stopWorker first", ctx.failure_message_.?);
+    try std.testing.expectEqual(&worker, ctx.worker_.?);
+    try std.testing.expectError(error.NothingRegistered, ctx.stopWorker());
+    try std.testing.expectEqual(&worker, ctx.stopped_.?);
+    ctx.deinit();
+    try std.testing.expectEqual(null, ctx.stopped_);
+    try std.testing.expectEqual(null, ctx.restarted_);
+}
+
+test "conformance startWorker frees the new worker when it fails to start" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var client = try temporal.client.Client.init(gpa, io, .{});
+    defer client.close();
+    const Example = struct {
+        fn run(_: *temporal.workflow.Context) !void {}
+        fn execute(_: *Context) !void {}
+    };
+    // Option validation fails when the worker runs, before the lazy client connects.
+    const feature = @import("harness.zig").define(.{
+        .workflows = .{temporal.workflow.Def("Workflow", Example.run)},
+        .worker_options = .{ .max_activities_per_second = 0 },
+        .execute = Example.execute,
+    });
+    var ctx: Context = .{
+        .gpa = gpa,
+        .io = io,
+        .arena = arena.allocator(),
+        .client = &client,
+        .feature = "test/worker",
+        .namespace = "default",
+        .task_queue = "conformance-test/worker",
+        .definition_ = &feature,
+    };
+    defer ctx.deinit();
+    try std.testing.expectError(error.FeatureFailed, ctx.startWorker());
+    try std.testing.expectEqualStrings("startWorker: worker failed to start with error.InvalidOptions", ctx.failure_message_.?);
+    try std.testing.expectEqual(null, ctx.restarted_);
+    try std.testing.expectEqual(null, ctx.worker_);
+    try std.testing.expectEqual(null, ctx.running_);
+}
+
+test "conformance deinit without a restarted worker does nothing" {
+    var ctx: Context = .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .arena = std.testing.allocator,
+        .client = undefined,
+        .feature = "test/worker",
+        .namespace = "default",
+        .task_queue = "conformance-test/worker",
+    };
+    ctx.deinit();
+    ctx.deinit();
+    try std.testing.expectEqual(null, ctx.restarted_);
+    try std.testing.expectEqual(null, ctx.stopped_);
 }

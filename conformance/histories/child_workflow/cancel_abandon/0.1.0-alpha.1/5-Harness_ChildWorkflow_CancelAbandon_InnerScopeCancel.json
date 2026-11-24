@@ -1,0 +1,278 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-24T02:44:41.217791Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048741",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "Harness_ChildWorkflow_CancelAbandon_InnerScopeCancel"
+        },
+        "taskQueue": {
+          "name": "conformance-child_workflow/cancel_abandon",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImZvbyBiYXIi"
+            }
+          ]
+        },
+        "workflowExecutionTimeout": "60s",
+        "workflowRunTimeout": "60s",
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a20b70-f281-7c0d-b44e-99be4a77f3e1",
+        "identity": "conformance",
+        "firstExecutionRunId": "01a20b70-f281-7c0d-b44e-99be4a77f3e1",
+        "attempt": 1,
+        "workflowExecutionExpirationTime": "2026-11-24T02:45:41.218Z",
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "conformance-child_workflow/cancel_abandon-closing-inner-scope"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-24T02:44:41.217811Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048742",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-child_workflow/cancel_abandon",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-24T02:44:41.218615Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048748",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "conformance",
+        "requestId": "dd1d9da2-3006-49c7-8ea1-8716bf8e0ed0",
+        "historySizeBytes": "433"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-24T02:44:41.222789Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048752",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "conformance",
+        "workerVersion": {},
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            3,
+            2,
+            1,
+            4
+          ],
+          "sdkName": "temporal-zig",
+          "sdkVersion": "0.1.0-alpha.1"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-11-24T02:44:41.222907Z",
+      "eventType": "EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED",
+      "taskId": "1048753",
+      "startChildWorkflowExecutionInitiatedEventAttributes": {
+        "namespace": "default",
+        "namespaceId": "01a20b70-f110-78dd-ba50-1dec1d60c46a",
+        "workflowId": "conformance-child_workflow/cancel_abandon-closing-inner-scope-child",
+        "workflowType": {
+          "name": "Harness_ChildWorkflow_CancelAbandon_Child"
+        },
+        "taskQueue": {
+          "name": "conformance-child_workflow/cancel_abandon",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImZvbyBiYXIi"
+            }
+          ]
+        },
+        "workflowRunTimeout": "20s",
+        "workflowTaskTimeout": "10s",
+        "parentClosePolicy": "PARENT_CLOSE_POLICY_ABANDON",
+        "workflowTaskCompletedEventId": "4",
+        "workflowIdReusePolicy": "WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE",
+        "header": {},
+        "inheritBuildId": true
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-11-24T02:44:41.222915Z",
+      "eventType": "EVENT_TYPE_TIMER_STARTED",
+      "taskId": "1048754",
+      "timerStartedEventAttributes": {
+        "timerId": "1",
+        "startToFireTimeout": "5s",
+        "workflowTaskCompletedEventId": "4"
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-11-24T02:44:41.223745Z",
+      "eventType": "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048764",
+      "childWorkflowExecutionStartedEventAttributes": {
+        "namespace": "default",
+        "namespaceId": "01a20b70-f110-78dd-ba50-1dec1d60c46a",
+        "initiatedEventId": "5",
+        "workflowExecution": {
+          "workflowId": "conformance-child_workflow/cancel_abandon-closing-inner-scope-child",
+          "runId": "01a20b70-f287-75d0-8037-ab5f6c751b22"
+        },
+        "workflowType": {
+          "name": "Harness_ChildWorkflow_CancelAbandon_Child"
+        },
+        "header": {}
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-11-24T02:44:41.223749Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048765",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-cf98778abe7448f9807dc746e752ea99",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "conformance-child_workflow/cancel_abandon"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-11-24T02:44:41.224685Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048773",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "8",
+        "identity": "conformance",
+        "requestId": "0015fc03-5f32-4e4e-9f4f-739e54c66cf5",
+        "historySizeBytes": "1284"
+      }
+    },
+    {
+      "eventId": "10",
+      "eventTime": "2026-11-24T02:44:41.226852Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048781",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "8",
+        "startedEventId": "9",
+        "identity": "conformance",
+        "workerVersion": {},
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "11",
+      "eventTime": "2026-11-24T02:44:41.333607Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED",
+      "taskId": "1048787",
+      "workflowExecutionSignaledEventAttributes": {
+        "signalName": "close",
+        "input": {},
+        "identity": "conformance",
+        "requestId": "993a0ffb-5e4f-4109-968c-f60330bff060"
+      }
+    },
+    {
+      "eventId": "12",
+      "eventTime": "2026-11-24T02:44:41.333611Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048788",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-cf98778abe7448f9807dc746e752ea99",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "conformance-child_workflow/cancel_abandon"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "13",
+      "eventTime": "2026-11-24T02:44:41.334201Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048792",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "12",
+        "identity": "conformance",
+        "requestId": "9033f9aa-079c-4272-90a3-dc15175bbe9e",
+        "historySizeBytes": "1625"
+      }
+    },
+    {
+      "eventId": "14",
+      "eventTime": "2026-11-24T02:44:41.336113Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048796",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "12",
+        "startedEventId": "13",
+        "identity": "conformance",
+        "workerVersion": {},
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "15",
+      "eventTime": "2026-11-24T02:44:41.336125Z",
+      "eventType": "EVENT_TYPE_TIMER_CANCELED",
+      "taskId": "1048797",
+      "timerCanceledEventAttributes": {
+        "timerId": "1",
+        "startedEventId": "6",
+        "workflowTaskCompletedEventId": "14",
+        "identity": "conformance"
+      }
+    },
+    {
+      "eventId": "16",
+      "eventTime": "2026-11-24T02:44:41.336130Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048798",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ImNhbmNlbGxlZCI="
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "14"
+      }
+    }
+  ]
+}

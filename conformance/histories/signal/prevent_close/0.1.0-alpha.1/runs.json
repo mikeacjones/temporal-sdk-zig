@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-signal/prevent_close",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-signal/prevent_close-out-of-execution"
+    },
+    {
+      "file": "2-Workflow.json",
+      "workflow_id": "conformance-signal/prevent_close-prevent-close"
+    }
+  ]
+}

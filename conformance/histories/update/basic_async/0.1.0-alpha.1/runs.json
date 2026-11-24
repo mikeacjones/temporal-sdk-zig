@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-update/basic_async",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-update/basic_async"
+    }
+  ]
+}

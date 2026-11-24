@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-signal/child_workflow",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-signal/child_workflow"
+    },
+    {
+      "file": "2-ChildWorkflow.json",
+      "workflow_id": "conformance-signal/child_workflow-child"
+    }
+  ]
+}
