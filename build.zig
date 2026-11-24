@@ -167,11 +167,124 @@ pub fn build(b: *std.Build) void {
         hang_dump.has_side_effects = true;
         test_step.dependOn(&hang_dump.step);
     }
+    // The test of the machine watch below, under the same guard: it needs bash and ps.
+    if (b.graph.host.result.os.tag != .windows and pathExists(b, "scripts/machine-watch-test.sh")) {
+        const machine_watch_test = b.addSystemCommand(&.{ "bash", "scripts/machine-watch-test.sh" });
+        machine_watch_test.setCwd(b.path("."));
+        machine_watch_test.has_side_effects = true;
+        test_step.dependOn(&machine_watch_test.step);
+    }
+    // The wiring test runs `zig build readme-check` and `zig build test-allocators` itself, so it
+    // is a step of its own rather than part of test.
+    if (b.graph.host.result.os.tag != .windows and pathExists(b, "scripts/machine-watch-wiring-test.sh")) {
+        const wiring_test = b.addSystemCommand(&.{ "bash", "scripts/machine-watch-wiring-test.sh" });
+        wiring_test.setCwd(b.path("."));
+        wiring_test.has_side_effects = true;
+        b.step("machine-watch-wiring-test", "Check that only test and core start the machine watch")
+            .dependOn(&wiring_test.step);
+    }
     if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, hang_report, .{
         .core_lib = core_lib_opt,
         .core_bundle = core_bundle_opt,
         .protoc = protoc_opt,
     });
+    // Last, so that every step the calls above hang on test_step is inside the watched window.
+    addMachineWatch(b, test_step, "test", target, optimize);
+    addMachineWatch(b, core_step, "core", target, optimize);
+}
+
+/// Samples the machine's memory, swap and load while the steps `top` depends on run, and prints
+/// one summary line after them (scripts/machine-watch.sh has the fields). A start step runs
+/// before every step of top's graph, and a report step after start and all of top's
+/// dependencies, which becomes top's only dependency. Both always succeed, so the watch never
+/// changes a build's outcome. The sampler watches the `zig build` process and stops by itself
+/// once that is gone, so a failed or killed build leaves nothing running. Its files live in
+/// .zig-cache/machine-watch/<host>-<zig build PID>-<name>, so builds running at once in one
+/// cache each keep their own. On a Windows host both steps only print that the watch is
+/// unavailable.
+fn addMachineWatch(
+    b: *std.Build,
+    top: *std.Build.Step,
+    name: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const label = b.fmt("{s} {s}-{s} {s}", .{
+        name,
+        @tagName(target.result.cpu.arch),
+        @tagName(target.result.os.tag),
+        // The -Doptimize spelling CI's matrix uses; the enum's tags are lowercase.
+        switch (optimize) {
+            .debug => "Debug",
+            .safe => "ReleaseSafe",
+            .fast => "ReleaseFast",
+            .small => "ReleaseSmall",
+        },
+    });
+    if (b.graph.host.result.os.tag == .windows) {
+        const message = b.fmt("machine-watch {s}: unavailable on Windows", .{label});
+        const start = b.addSystemCommand(&.{ "cmd.exe", "/c", "echo", message });
+        start.has_side_effects = true;
+        const report = b.addSystemCommand(&.{ "cmd.exe", "/c", "echo", message });
+        report.has_side_effects = true;
+        top.dependOn(&start.step);
+        top.dependOn(&report.step);
+        return;
+    }
+
+    const start = b.addSystemCommand(&.{ "bash", "scripts/machine-watch.sh", "start" });
+    start.addDirectoryArg2(.cache_root, .{ .suffix = "/machine-watch", .make_absolute = true });
+    start.addArg(name);
+    start.setEnvironmentVariable("MACHINE_WATCH_LABEL", label);
+    // Start only when the `zig build` command line names this step. Steps other commands
+    // share with this one (readme-check's check runs, the core library) depend on start below,
+    // so those commands run it too; it must not leave them a sampler that no report stops.
+    start.setEnvironmentVariable("MACHINE_WATCH_IF_REQUESTED", "1");
+    start.setName(b.fmt("{s}{s}", .{ machine_watch_start_prefix, name }));
+    start.setCwd(b.path("."));
+    start.has_side_effects = true;
+    // Captured output, so start never takes the build runner's stderr lock, which a step that
+    // inherits stdio (cargo) holds for as long as it runs.
+    start.expectExitCode(0);
+
+    const report = b.addSystemCommand(&.{ "bash", "scripts/machine-watch.sh", "report" });
+    report.addDirectoryArg2(.cache_root, .{ .suffix = "/machine-watch", .make_absolute = true });
+    report.addArgs(&.{ name, label });
+    report.setCwd(b.path("."));
+    report.has_side_effects = true;
+
+    // Every step of top's graph that has no dependencies depends on start, so start is the only
+    // step of that graph ready when the build begins. Depending only on top's direct
+    // dependencies is not enough: the build runner starts its ready steps in a shuffled order,
+    // and once -j steps are busy it runs the next one in the scheduling thread, so start could
+    // wait out a whole cargo build.
+    var seen: std.AutoHashMapUnmanaged(*std.Build.Step, void) = .empty;
+    var stack: std.ArrayList(*std.Build.Step) = .empty;
+    stack.appendSlice(b.allocator, top.dependencies.items) catch @panic("OOM");
+    // Another watch's start step does not count as a dependency: cargo, a leaf of both test and
+    // core, depends on both starts.
+    while (stack.pop()) |step| {
+        const entry = seen.getOrPut(b.allocator, step) catch @panic("OOM");
+        if (entry.found_existing or isMachineWatchStart(step)) continue;
+        var leaf = true;
+        for (step.dependencies.items) |dep| {
+            if (isMachineWatchStart(dep)) continue;
+            leaf = false;
+            stack.append(b.allocator, dep) catch @panic("OOM");
+        }
+        if (leaf) step.dependOn(&start.step);
+    }
+
+    report.step.dependOn(&start.step);
+    for (top.dependencies.items) |step| report.step.dependOn(step);
+    top.dependencies.clearRetainingCapacity();
+    top.dependOn(&report.step);
+}
+
+const machine_watch_start_prefix = "machine-watch start ";
+
+fn isMachineWatchStart(step: *const std.Build.Step) bool {
+    return std.mem.startsWith(u8, step.name, machine_watch_start_prefix);
 }
 
 /// The files under examples/readme whose regions README.md copies, in a fixed order.
@@ -289,7 +402,10 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
     };
 
     // The core's replay poller panics on some malformed histories, and a panic there hung
-    // the replayer, so this runs in its own process under a time limit.
+    // the replayer, so this runs in its own process under a time limit. The program
+    // generates malformed histories from the three test histories (see the header of
+    // tools/checks/replay_malformed.zig) and names the one that hangs, aborts or leaks;
+    // `zig build replay-malformed -- --only <name>` reruns one.
     {
         const program = b.addExecutable(.{ .name = "replay-malformed", .root_module = b.createModule(.{
             .root_source_file = b.path("tools/checks/replay_malformed.zig"),
@@ -299,7 +415,21 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         }) });
         const run = Limited.case(b, in.test_step, limit_tool, "replay malformed histories", Limited.seconds, 0);
         run.addArtifactArg(program);
-        run.addFileArg(b.path("src/testdata/helloworld_history.json"));
+        const histories = [_][]const u8{
+            "src/testdata/helloworld_history.json",
+            "src/testdata/signal_history.json",
+            "src/testdata/local_activity_history.json",
+        };
+        for (histories) |history| run.addFileArg(b.path(history));
+        // Captures the program's stderr, a line per case, so that a pass prints nothing;
+        // a failure still shows all of it.
+        run.expectStdErrMatch("all returned without a hang, an abort or a leak");
+
+        const direct = b.addRunArtifact(program);
+        direct.setCwd(b.path("."));
+        direct.addPassthruArgs();
+        for (histories) |history| direct.addFileArg(b.path(history));
+        b.step("replay-malformed", "Replay generated malformed histories through WorkflowReplayer; pass -- --only <text> for some").dependOn(&direct.step);
     }
 
     // Sweeps `Worker.run`'s early exits (concurrency, allocation, stop, validation) in a
