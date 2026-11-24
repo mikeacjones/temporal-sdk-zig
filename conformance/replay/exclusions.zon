@@ -1,1 +1,4 @@
-.{}
+.{
+    .{ .feature = "serialization_context/async_activity_completion", .bead = "temporal-sdk-zig-d51.4.31", .reason = "Client.completeActivityById gives codecs no workflow or activity type, so the workflow's worker refuses the result it decodes with both." },
+    .{ .feature = "serialization_context/external_signal", .bead = "temporal-sdk-zig-d51.4.32", .reason = "A signal to another workflow is encoded with the sender's context, so the receiver refuses it under its own." },
+}
