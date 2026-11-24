@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-data_converter/failure",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-data_converter/failure"
+    }
+  ]
+}
