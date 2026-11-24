@@ -302,6 +302,23 @@ fn addCheckSteps(b: *std.Build, in: CheckInputs) void {
         run.addFileArg(b.path("src/testdata/helloworld_history.json"));
     }
 
+    // Sweeps `Worker.run`'s early exits (concurrency, allocation, stop, validation) in a
+    // process of its own, so that a run that never returns fails this one named case; the
+    // program's watchdog names the point first, after 30 s. The sweeps take a few seconds in
+    // Debug alone; 480 leaves room for a ship, which runs Debug, ReleaseSafe and containers
+    // at once.
+    {
+        const worker_exits_seconds = 480;
+        const program = b.addExecutable(.{ .name = "worker-exits", .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/checks/worker_exits.zig"),
+            .target = in.target,
+            .optimize = in.optimize,
+            .imports = &.{.{ .name = "temporal", .module = in.temporal }},
+        }) });
+        const run = Limited.case(b, in.test_step, limit_tool, "worker exits", worker_exits_seconds, 0);
+        run.addArtifactArg(program);
+    }
+
     // zig build alloc-failures
     {
         const helper = struct {
