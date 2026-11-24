@@ -7,6 +7,8 @@ const converter = @import("converter.zig");
 const interceptor = @import("interceptor.zig");
 const testing_ns = @import("testing.zig");
 const log = @import("log.zig");
+const worker_mod = @import("worker.zig");
+const builtin = @import("builtin");
 
 const testing = std.testing;
 
@@ -592,6 +594,133 @@ test "workflow: the worker answers __stack_trace with no handler, and the run's 
     defer replayer.deinit();
     try replayer.registerWorkflow(BlockedWorkflow);
     try replayer.replayHistory(history);
+}
+
+const BlockedStatus = workflow.QueryDef("status", fn () []const u8);
+
+/// The lines of `DescribedBlocked`'s two waits, set as the code reaches them.
+var described_lines: struct { condition: u32 = 0, timer: u32 = 0 } = .{};
+
+/// `BlockedWorkflow` with described handlers: waits until `release` is signaled, with a
+/// coroutine sleeping for an hour beside it.
+const DescribedBlocked = workflow.Def("metadata_blocked", struct {
+    fn release(released: *bool) void {
+        released.* = true;
+    }
+    fn isReleased(released: *bool) bool {
+        return released.*;
+    }
+    fn status(released: *bool) []const u8 {
+        return if (released.*) "released" else "waiting";
+    }
+    fn nap(ctx: *workflow.Context) void {
+        described_lines.timer = @src().line + 1;
+        ctx.sleep(.fromSeconds(3600), .{}) catch {};
+    }
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const released = try ctx.allocator().create(bool);
+        released.* = false;
+        try ctx.setSignalHandlerWithOptions(ReleaseBlocked, released, release, .{ .description = "Lets the workflow finish" });
+        try ctx.setQueryHandlerWithOptions(BlockedStatus, released, status, .{ .description = "Whether the workflow was released" });
+        var napping = ctx.io().async(nap, .{ctx});
+        defer napping.cancel(ctx.io());
+        described_lines.condition = @src().line + 1;
+        try ctx.await(released, isReleased);
+        return "released";
+    }
+}.run);
+
+fn runWorker(w: *worker_mod.Worker) worker_mod.Worker.RunError!void {
+    return w.run();
+}
+
+/// Asks `id`'s run for `__enhanced_stack_trace` until both of its coroutines wait (the first
+/// answer can come before the first workflow task ran them), and returns that answer.
+fn twoStacks(env: *testing_ns.WorkflowEnvironment, a: std.mem.Allocator, id: []const u8) !workflow.EnhancedStackTrace {
+    for (0..200) |_| {
+        const trace = try env.queryWorkflow(workflow.EnhancedStackTraceQuery, a, id, .{});
+        if (trace.stacks.len == 2) return trace;
+    }
+    return error.TestNeverWaited;
+}
+
+/// Checks that `stack`'s innermost call site is `line` of this file, with the source around
+/// it in `trace.sources`. An optimized build may have no locations.
+fn expectDescribedLocation(trace: workflow.EnhancedStackTrace, stack: workflow.EnhancedStackTrace.Stack, line: u32) !void {
+    if (stack.locations.len == 0 and builtin.mode != .debug) return;
+    try testing.expect(stack.locations.len > 0);
+    const loc = stack.locations[0];
+    try testing.expect(std.mem.endsWith(u8, loc.file_path, "workflow_api_test.zig"));
+    try testing.expectEqual(@as(i32, @intCast(line)), loc.line);
+    const slices = trace.sources.map.get(loc.file_path) orelse return error.TestExpectedSource;
+    var lines = std.mem.splitScalar(u8, @embedFile("workflow_api_test.zig"), '\n');
+    for (1..line) |_| _ = lines.next();
+    const text = lines.next().?;
+    for (slices) |slice| if (slice.line_offset < line and std.mem.find(u8, slice.content, text) != null) return;
+    return error.TestExpectedSource;
+}
+
+test "workflow: the worker answers __enhanced_stack_trace and __temporal_workflow_metadata on a cached run and on one rebuilt from history, and both histories replay" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(DescribedBlocked);
+
+    // A second worker with its cache off rebuilds the run from history for every task,
+    // queries included.
+    const uncached_queue = "metadata-uncached";
+    var uncached = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, uncached_queue, .{ .max_cached_workflows = 0 });
+    defer uncached.deinit();
+    try uncached.registerWorkflow(DescribedBlocked);
+    var running = try testing.io.concurrent(runWorker, .{&uncached});
+    defer {
+        uncached.stop();
+        running.await(testing.io) catch {};
+    }
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cached_run = try env.startWorkflow(DescribedBlocked, .{}, .{});
+    defer cached_run.deinit();
+    var rebuilt_run = try env.startWorkflow(DescribedBlocked, .{ .task_queue = uncached_queue }, .{});
+    defer rebuilt_run.deinit();
+
+    const trace = try twoStacks(env, a, cached_run.id);
+    try testing.expectEqualStrings("temporal-zig", trace.sdk.name);
+    try testing.expectEqualStrings(@import("build_options").version, trace.sdk.version);
+    try expectDescribedLocation(trace, trace.stacks[0], described_lines.condition);
+    try expectDescribedLocation(trace, trace.stacks[1], described_lines.timer);
+    // The rebuilt run waits in the same places, so it answers the same.
+    const rebuilt_trace = try twoStacks(env, a, rebuilt_run.id);
+    try testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, trace, .{}), try std.json.Stringify.valueAlloc(a, rebuilt_trace, .{}));
+
+    for ([_][]const u8{ cached_run.id, rebuilt_run.id }) |id| {
+        const metadata = try env.queryWorkflow(workflow.WorkflowMetadataQuery, a, id, .{});
+        try testing.expectEqualStrings("", metadata.current_details);
+        const def = metadata.definition.?;
+        try testing.expectEqualStrings("metadata_blocked", def.type);
+        const queries = def.query_definitions.items;
+        try testing.expectEqual(@as(usize, 4), queries.len);
+        for (queries, [_][]const u8{ "__enhanced_stack_trace", "__stack_trace", "__temporal_workflow_metadata", "status" }) |q, name| try testing.expectEqualStrings(name, q.name);
+        try testing.expectEqualStrings("Whether the workflow was released", queries[3].description);
+        try testing.expect(queries[0].description.len > 0);
+        try testing.expectEqual(@as(usize, 1), def.signal_definitions.items.len);
+        try testing.expectEqualStrings("release", def.signal_definitions.items[0].name);
+        try testing.expectEqualStrings("Lets the workflow finish", def.signal_definitions.items[0].description);
+        try testing.expectEqual(@as(usize, 0), def.update_definitions.items.len);
+    }
+
+    var replayer: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(DescribedBlocked);
+    for ([_]*@TypeOf(cached_run){ &cached_run, &rebuilt_run }) |run| {
+        try env.signalWorkflow(ReleaseBlocked, run.id, .{});
+        try testing.expectEqualStrings("released", try env.getResult(DescribedBlocked, run, a, null));
+        // A closed run still answers: no stacks, the same handlers.
+        try testing.expectEqual(@as(usize, 0), (try env.queryWorkflow(workflow.EnhancedStackTraceQuery, a, run.id, .{})).stacks.len);
+        try testing.expectEqual(@as(usize, 4), (try env.queryWorkflow(workflow.WorkflowMetadataQuery, a, run.id, .{})).definition.?.query_definitions.items.len);
+        try replayer.replayHistory(try env.client.fetchHistory(a, run.id, run.run_id));
+    }
 }
 
 /// Two coroutines wait on one activity's future: first a coroutine started with `io.async`,

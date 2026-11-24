@@ -653,3 +653,300 @@ test "a failed workflow's and a failed update's stack trace text is built as SDK
         }
     }
 }
+
+// ---------------------------------------------------------------- __enhanced_stack_trace and __temporal_workflow_metadata
+
+/// Sends query `Query` (a `workflow.QueryDef`) to `inst` and returns the answer decoded,
+/// checking that the activation emits nothing else.
+fn queryAnswer(comptime Query: type, inst: *Instance, a: Allocator) !Query.Result {
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_999 } };
+    try act.jobs.append(a, .{ .variant = .{ .query_workflow = .{ .query_id = "q1", .query_type = Query.query_name } } });
+    const cmds = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    const payload = switch (cmds[0].variant.?.respond_to_query.variant.?) {
+        .succeeded => |s| s.response.?,
+        .failed => |f| {
+            std.debug.print("{s} failed: {s}\n", .{ Query.query_name, f.message });
+            return error.TestUnexpectedResult;
+        },
+    };
+    return converter.fromPayload(Query.Result, a, payload);
+}
+
+const this_file = @embedFile("stack_trace_test.zig");
+
+/// Line `n` (1-based) of this file.
+fn sourceLine(n: u32) []const u8 {
+    var lines = std.mem.splitScalar(u8, this_file, '\n');
+    for (1..n) |_| _ = lines.next();
+    return lines.next() orelse "";
+}
+
+/// Checks that `stack`'s innermost location is `line` of this file, and that `trace.sources`
+/// holds that file with an excerpt that has the line and the five around it, as they are in
+/// the file. An optimized build may have no locations for it (see `expectCallSite`).
+fn expectLocation(trace: workflow.EnhancedStackTrace, stack: workflow.EnhancedStackTrace.Stack, line: u32) !void {
+    if (stack.locations.len == 0 and builtin.mode != .debug) return;
+    try testing.expect(stack.locations.len > 0);
+    const loc = stack.locations[0];
+    try testing.expect(std.mem.endsWith(u8, loc.file_path, "stack_trace_test.zig"));
+    try testing.expectEqual(@as(i32, @intCast(line)), loc.line);
+    try testing.expect(loc.column > 0);
+    try testing.expect(loc.function_name.len > 0);
+    try testing.expect(!loc.internal_code);
+    const slices = trace.sources.map.get(loc.file_path) orelse return error.TestExpectedSource;
+    for (slices) |slice| {
+        const first = slice.line_offset + 1;
+        const count: u32 = @intCast(std.mem.count(u8, slice.content, "\n"));
+        if (line < first or line >= first + count) continue;
+        try testing.expect(first + call_sites.excerpt_context_lines <= line);
+        try testing.expect(line + call_sites.excerpt_context_lines < first + count);
+        var lines = std.mem.splitScalar(u8, slice.content, '\n');
+        for (first..first + count) |n| try testing.expectEqualStrings(sourceLine(@intCast(n)), lines.next().?);
+        return;
+    }
+    std.debug.print("no excerpt holds line {d}\n", .{line});
+    return error.TestExpectedSource;
+}
+
+test "__enhanced_stack_trace gives each coroutine's call sites and the source around them" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try Instance.create(testing.allocator, WaitsWf.registered, .{});
+    defer inst.destroy();
+    try startWaits(inst, a, false);
+
+    const trace = try queryAnswer(workflow.EnhancedStackTraceQuery, inst, a);
+    try testing.expectEqualStrings("temporal-zig", trace.sdk.name);
+    try testing.expectEqualStrings(@import("build_options").version, trace.sdk.version);
+    try testing.expectEqual(@as(usize, 3), trace.stacks.len);
+    try expectLocation(trace, trace.stacks[0], wait_lines.activity);
+    try expectLocation(trace, trace.stacks[1], wait_lines.timer);
+    try expectLocation(trace, trace.stacks[2], wait_lines.condition);
+    // Excerpts of one file are in ascending order and don't overlap or touch.
+    for (trace.sources.map.values()) |slices| for (slices[0..slices.len -| 1], slices[@min(1, slices.len)..]) |x, y| {
+        try testing.expect(x.line_offset + std.mem.count(u8, x.content, "\n") + 1 < y.line_offset + 1);
+    };
+}
+
+test "__enhanced_stack_trace and __temporal_workflow_metadata change nothing, and a replay of the same history answers the same" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const first = try Instance.create(testing.allocator, WaitsWf.registered, .{});
+    defer first.destroy();
+    try startWaits(first, a, false);
+
+    const allocated = first.allocated;
+    const seqs = .{ first.next_activity_seq, first.next_timer_seq };
+    const trace = try std.json.Stringify.valueAlloc(a, try queryAnswer(workflow.EnhancedStackTraceQuery, first, a), .{});
+    const metadata = try std.json.Stringify.valueAlloc(a, try queryAnswer(workflow.WorkflowMetadataQuery, first, a), .{});
+    try testing.expectEqual(allocated, first.allocated);
+    try testing.expectEqual(seqs, .{ first.next_activity_seq, first.next_timer_seq });
+
+    const replayed = try Instance.create(testing.allocator, WaitsWf.registered, .{});
+    defer replayed.destroy();
+    try startWaits(replayed, a, true);
+    try testing.expectEqualStrings(trace, try std.json.Stringify.valueAlloc(a, try queryAnswer(workflow.EnhancedStackTraceQuery, replayed, a), .{}));
+    try testing.expectEqualStrings(metadata, try std.json.Stringify.valueAlloc(a, try queryAnswer(workflow.WorkflowMetadataQuery, replayed, a), .{}));
+
+    // The run goes on as if no query had come.
+    try testing.expectEqual(@as(usize, 0), commandsOf(try first.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 1 } }), a)).len);
+    try testing.expectEqual(@as(usize, 2), (try queryAnswer(workflow.EnhancedStackTraceQuery, first, a)).stacks.len);
+}
+
+/// Checks that `defs` holds exactly `want` (name and description pairs), in that order.
+fn expectDefinitions(defs: std.ArrayList(proto.temporal.api.sdk.v1.WorkflowInteractionDefinition), want: []const [2][]const u8) !void {
+    errdefer for (defs.items) |d| std.debug.print("  {s}: {s}\n", .{ d.name, d.description });
+    try testing.expectEqual(want.len, defs.items.len);
+    for (want, defs.items) |w, d| {
+        try testing.expectEqualStrings(w[0], d.name);
+        try testing.expectEqualStrings(w[1], d.description);
+    }
+}
+
+const builtin_enhanced = [2][]const u8{ "__enhanced_stack_trace", "Where each coroutine of the workflow waits, as locations with the source around them." };
+const builtin_stack_trace = [2][]const u8{ "__stack_trace", "Where each coroutine of the workflow waits, as text." };
+const builtin_metadata = [2][]const u8{ "__temporal_workflow_metadata", "The workflow's type and its query, signal and update handlers with their descriptions." };
+
+test "__temporal_workflow_metadata lists the workflow type and the built-in queries for a workflow with no handlers of its own" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try Instance.create(testing.allocator, WaitsWf.registered, .{});
+    defer inst.destroy();
+    try startWaits(inst, a, false);
+    const metadata = try queryAnswer(workflow.WorkflowMetadataQuery, inst, a);
+    try testing.expectEqualStrings("", metadata.current_details);
+    const def = metadata.definition.?;
+    try testing.expectEqualStrings("Waits", def.type);
+    try expectDefinitions(def.query_definitions, &.{ builtin_enhanced, builtin_stack_trace, builtin_metadata });
+    try expectDefinitions(def.signal_definitions, &.{});
+    try expectDefinitions(def.update_definitions, &.{.{ "approve", "" }});
+}
+
+const Status = workflow.QueryDef("status", fn () []const u8);
+const Count = workflow.QueryDef("count", fn () u32);
+const Add = workflow.SignalDef("add", fn (u32) void);
+const Reset = workflow.UpdateDef("reset", fn (u32) u32);
+const Lower = workflow.UpdateDef("lower", fn () void);
+const Note = workflow.SignalDef("note", fn ([]const u8) void);
+
+/// Declares described handlers, and registers more in `run`: a `__stack_trace` handler, a
+/// signal channel, a signal by name and a dynamic query handler.
+const Described = struct {
+    total: u32 = 0,
+
+    pub const queries = .{
+        .status = .{ Status, .{ .description = "How far the run got" } },
+        .count = .{ Count, workflow.QueryHandlerOptions{ .description = "The total" } },
+    };
+    pub const signals = .{ .add = .{ Add, .{ .description = "Adds to the total", .unfinished_policy = .abandon } } };
+    pub const updates = .{
+        .reset = .{ Reset, .checkReset, .{ .description = "Sets the total" } },
+        .lower = Lower,
+    };
+
+    pub fn run(d: *Described, ctx: *workflow.Context) !void {
+        try ctx.setQueryHandlerWithOptions(OwnStackTrace, &own_context, ownTrace, .{ .description = "The workflow's own trace" });
+        _ = try ctx.signalChannel(Note);
+        const name = try std.fmt.allocPrint(ctx.allocator(), "by-name-{d}", .{d.total});
+        try ctx.setSignalHandlerByNameWithOptions(name, @Tuple(&.{}), d, byName, .{ .description = "A signal named at run time \xff" });
+        try ctx.setDynamicQueryHandler(&own_context, AnyQuery.answer);
+        try ctx.io().sleep(.fromSeconds(60), .awake);
+    }
+    fn ownTrace(_: *const u8) []const u8 {
+        return "own";
+    }
+    fn byName(_: *Described) void {}
+    pub fn status(_: *Described) []const u8 {
+        return "running";
+    }
+    pub fn count(d: *Described) u32 {
+        return d.total;
+    }
+    pub fn add(d: *Described, n: u32) void {
+        d.total += n;
+    }
+    pub fn reset(d: *Described, to: u32) u32 {
+        d.total = to;
+        return to;
+    }
+    pub fn checkReset(_: *Described, _: u32) void {}
+    pub fn lower(_: *Described) void {}
+};
+const DescribedWf = workflow.Def("Described", Described);
+
+test "__temporal_workflow_metadata lists every handler a struct workflow declares and registers, with its description, sorted by name" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try Instance.create(testing.allocator, DescribedWf.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "Described"), a);
+
+    const allocated = inst.allocated;
+    const def = (try queryAnswer(workflow.WorkflowMetadataQuery, inst, a)).definition.?;
+    try testing.expectEqual(allocated, inst.allocated);
+    try testing.expectEqualStrings("Described", def.type);
+    try expectDefinitions(def.query_definitions, &.{
+        builtin_enhanced,
+        .{ "__stack_trace", "The workflow's own trace" },
+        builtin_metadata,
+        .{ "count", "The total" },
+        .{ "status", "How far the run got" },
+    });
+    try expectDefinitions(def.signal_definitions, &.{
+        .{ "add", "Adds to the total" },
+        .{ "by-name-0", "A signal named at run time \u{fffd}" },
+        .{ "note", "" },
+    });
+    try expectDefinitions(def.update_definitions, &.{ .{ "lower", "" }, .{ "reset", "Sets the total" } });
+    // The signal's other option still applies.
+    try testing.expectEqual(workflow.HandlerUnfinishedPolicy.abandon, inst.signal_handlers.get("add").?.unfinished_policy);
+    // The workflow's own `__stack_trace` handler answers it; the dynamic handler gets none of
+    // the three.
+    try testing.expectEqualStrings("own", try queryAnswer(OwnStackTrace, inst, a));
+    try testing.expectEqual(@as(usize, 1), (try queryAnswer(workflow.EnhancedStackTraceQuery, inst, a)).stacks.len);
+}
+
+test "__enhanced_stack_trace and __temporal_workflow_metadata on a closed workflow" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try Instance.create(testing.allocator, Quick.registered, .{});
+    defer inst.destroy();
+    _ = commandsOf(try inst.activate(&try initActivation(a, "Quick"), a))[0].variant.?.complete_workflow_execution;
+    const trace = try queryAnswer(workflow.EnhancedStackTraceQuery, inst, a);
+    try testing.expectEqualStrings("temporal-zig", trace.sdk.name);
+    try testing.expectEqual(@as(usize, 0), trace.stacks.len);
+    try testing.expectEqual(@as(usize, 0), trace.sources.map.count());
+    const def = (try queryAnswer(workflow.WorkflowMetadataQuery, inst, a)).definition.?;
+    try testing.expectEqualStrings("Quick", def.type);
+    try expectDefinitions(def.query_definitions, &.{ builtin_enhanced, builtin_stack_trace, builtin_metadata });
+}
+
+test "__enhanced_stack_trace's JSON has the field names Temporal's UI reads" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try Instance.create(testing.allocator, WaitsWf.registered, .{});
+    defer inst.destroy();
+    try startWaits(inst, a, false);
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_999 } };
+    try act.jobs.append(a, .{ .variant = .{ .query_workflow = .{ .query_id = "q1", .query_type = "__enhanced_stack_trace" } } });
+    const payload = commandsOf(try inst.activate(&act, a))[0].variant.?.respond_to_query.variant.?.succeeded.response.?;
+    try testing.expectEqualStrings("json/plain", converter.encodingOf(payload).?);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, payload.data, .{});
+    const root = parsed.object;
+    try testing.expectEqualStrings("temporal-zig", root.get("sdk").?.object.get("name").?.string);
+    const stacks = root.get("stacks").?.array.items;
+    try testing.expectEqual(@as(usize, 3), stacks.len);
+    try testing.expect(root.get("sources").? == .object);
+    for (stacks) |stack| for (stack.object.get("locations").?.array.items) |loc| {
+        for ([_][]const u8{ "file_path", "line", "column", "function_name", "internal_code" }) |field| try testing.expect(loc.object.get(field) != null);
+        const slices = root.get("sources").?.object.get(loc.object.get("file_path").?.string) orelse continue;
+        for (slices.array.items) |slice| {
+            try testing.expect(slice.object.get("line_offset").? == .integer);
+            try testing.expect(slice.object.get("content").? == .string);
+        }
+    };
+}
+
+/// Asks for both answers through `next.handleQuery` from inside workflow code, before the
+/// workflow function runs.
+const SelfQueries = struct {
+    arena: Allocator,
+    trace: ?anyerror!converter.Payload = null,
+    metadata: ?anyerror!converter.Payload = null,
+
+    pub fn interceptWorkflow(s: *SelfQueries, _: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
+        return .{ .inbound = interceptor.WorkflowInbound.from(SelfQueries, s) };
+    }
+
+    pub fn executeWorkflow(s: *SelfQueries, input: interceptor.ExecuteWorkflowInput, next: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
+        s.trace = next.handleQuery(.{ .query_type = "__enhanced_stack_trace", .args = .{ .payloads = &.{} }, .header = .{}, .arena = s.arena });
+        s.metadata = next.handleQuery(.{ .query_type = "__temporal_workflow_metadata", .args = .{ .payloads = &.{} }, .header = .{}, .arena = s.arena });
+        return next.executeWorkflow(input);
+    }
+};
+
+test "__enhanced_stack_trace and __temporal_workflow_metadata asked for from inside workflow code by an interceptor answer, and leave sdk_work clear" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var self_queries: SelfQueries = .{ .arena = a };
+    const interceptors = [_]interceptor.Worker{.from(SelfQueries, &self_queries)};
+    const inst = try Instance.create(testing.allocator, WaitsWf.registered, .{ .interceptors = &interceptors });
+    defer inst.destroy();
+    const started = commandsOf(try inst.activate(&try initActivation(a, "Waits"), a));
+    try testing.expectEqual(@as(usize, 2), started.len);
+    const trace = try converter.fromPayload(workflow.EnhancedStackTrace, a, try self_queries.trace.?);
+    try testing.expectEqualStrings("temporal-zig", trace.sdk.name);
+    // Only the calling coroutine is live, and it is running, not blocked.
+    try testing.expectEqual(@as(usize, 1), trace.stacks.len);
+    const metadata = try converter.fromPayload(proto.temporal.api.sdk.v1.WorkflowMetadata, a, try self_queries.metadata.?);
+    try testing.expectEqualStrings("Waits", metadata.definition.?.type);
+    try testing.expect(!inst.sched.sdk_work.load(.acquire));
+}

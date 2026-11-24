@@ -805,6 +805,71 @@ test "workflows: the worker answers the stack trace query for every workflow" {
     try testing.expect(std.mem.startsWith(u8, answer, "workflow \"reminder\": 1 coroutine\n\ncoroutine 1 \"workflow\", the workflow function, waits on a timer (1h)\n  at "));
 }
 
+// example: workflow-metadata-queries
+pub const TicketStatus = workflow.QueryDef("ticket_status", fn () []const u8);
+pub const Escalate = workflow.SignalDef("escalate", fn () void);
+pub const Assign = workflow.UpdateDef("assign", fn (agent: []const u8) []const u8);
+pub const Ticket = struct {
+    status: []const u8 = "open",
+    // The descriptions are shown with each handler in the answer to __temporal_workflow_metadata.
+    pub const queries = .{ .ticketStatus = .{ TicketStatus, .{ .description = "open, escalated or assigned" } } };
+    pub const signals = .{ .escalate = .{ Escalate, .{ .description = "Hands the ticket to the next tier" } } };
+    pub const updates = .{ .assign = .{ Assign, .{ .description = "Assigns an agent; returns the status before" } } };
+    pub fn run(t: *Ticket, ctx: *workflow.Context) ![]const u8 {
+        try ctx.await(t, isAssigned);
+        return t.status;
+    }
+    pub fn ticketStatus(t: *Ticket) []const u8 {
+        return t.status;
+    }
+    pub fn escalate(t: *Ticket) void {
+        t.status = "escalated";
+    }
+    pub fn assign(t: *Ticket, _: []const u8) []const u8 {
+        defer t.status = "assigned";
+        return t.status;
+    }
+    fn isAssigned(t: *Ticket) bool {
+        return std.mem.eql(u8, t.status, "assigned");
+    }
+};
+pub const TicketWorkflow = workflow.Def("ticket", Ticket);
+
+// From any client: the worker answers both queries for every workflow, with no handler to register.
+fn ticketQueries(client: *temporal.client.Client, arena: std.mem.Allocator, workflow_id: []const u8) ![]const temporal.proto.temporal.api.sdk.v1.WorkflowInteractionDefinition {
+    const metadata = try client.queryWorkflow(workflow.WorkflowMetadataQuery, arena, workflow_id, "", .{});
+    return metadata.definition.?.query_definitions.items;
+}
+fn ticketStacks(client: *temporal.client.Client, arena: std.mem.Allocator, workflow_id: []const u8) !workflow.EnhancedStackTrace {
+    return client.queryWorkflow(workflow.EnhancedStackTraceQuery, arena, workflow_id, "", .{});
+}
+// end-example
+
+test "workflows: the worker answers the enhanced stack trace and metadata queries for every workflow" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(TicketWorkflow);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(TicketWorkflow, .{}, .{});
+    defer run.deinit();
+    // The workflow's first task may not have run yet; ask until it waits.
+    const trace = for (0..200) |_| {
+        const t = try ticketStacks(&env.client, a, run.id);
+        if (t.stacks.len == 1) break t;
+    } else return error.TestNeverWaited;
+    try testing.expectEqualStrings("temporal-zig", trace.sdk.name);
+
+    const queries = try ticketQueries(&env.client, a, run.id);
+    try testing.expectEqual(@as(usize, 4), queries.len);
+    try testing.expectEqualStrings("ticket_status", queries[3].name);
+    try testing.expectEqualStrings("open, escalated or assigned", queries[3].description);
+    try testing.expectEqualStrings("open", try env.updateWorkflow(Assign, a, run.id, .{"kim"}, null));
+    try testing.expectEqualStrings("assigned", try env.getResult(TicketWorkflow, &run, a, null));
+}
+
 // example: workflow-local-var
 /// How many activities the run has scheduled, kept by `ActivityCounter` for any code of the run.
 pub const activities_scheduled: workflow.LocalVar(u32) = .{ .name = "readme.activities_scheduled", .default = 0 };
