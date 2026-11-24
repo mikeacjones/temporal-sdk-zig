@@ -2503,6 +2503,7 @@ fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: wo
             .start_to_close_timeout = proto_time.durationToProto(options.start_to_close_timeout),
             .local_retry_threshold = proto_time.durationToProto(options.local_retry_threshold),
             .cancellation_type = protoCancellationType(options.cancellation_type),
+            .include_arguments_in_marker = options.arguments_in_marker,
         },
         .id_from_seq = options.activity_id.len == 0,
         .user_metadata = try summaryMetadata(a, options.summary),
@@ -6455,7 +6456,7 @@ test "activity: eviction while two coroutines wait on one future ends both waits
 }
 
 // Runs `Greet` as a local activity with the cancellation type named by `mode`; "no_timeouts"
-// leaves out both close timeouts.
+// leaves out both close timeouts, and "arguments_in_marker" sets that option.
 const LocalGreet = struct {
     fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
         var opts: workflow.LocalActivityOptions = .{
@@ -6465,6 +6466,8 @@ const LocalGreet = struct {
         };
         if (std.mem.eql(u8, mode, "no_timeouts")) {
             opts.start_to_close_timeout = null;
+        } else if (std.mem.eql(u8, mode, "arguments_in_marker")) {
+            opts.arguments_in_marker = true;
         } else {
             opts.cancellation_type = std.meta.stringToEnum(ActivityState.CancellationType, mode) orelse return error.InvalidPayload;
         }
@@ -6508,6 +6511,32 @@ test "local activity: ScheduleLocalActivity, then the result of its local resolu
 
     const done = commandsOf(try inst.activate(&try resolveLocal(a, 1, .{ .completed = .{ .result = try converter.toPayload(a, @as([]const u8, "Hello local!")) } }), a));
     try testing.expectEqualStrings("\"Hello local!\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "local activity: arguments_in_marker sets include_arguments_in_marker, also on the retry after a backoff, and is off by default" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, LocalGreetWf.registered, .{});
+    defer inst.destroy();
+
+    const first = commandsOf(try inst.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "arguments_in_marker")}), a));
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expect(first[0].variant.?.schedule_local_activity.include_arguments_in_marker);
+
+    const backoff = commandsOf(try inst.activate(&try localBackoff(a, 1), a));
+    const timer = backoff[0].variant.?.start_timer;
+    const retry = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = timer.seq } }), a));
+    try testing.expectEqual(@as(usize, 1), retry.len);
+    const sched = retry[0].variant.?.schedule_local_activity;
+    try testing.expectEqual(@as(u32, 2), sched.seq);
+    try testing.expect(sched.include_arguments_in_marker);
+
+    // Left unset, the command doesn't ask for the arguments.
+    const unset = try create(testing.allocator, LocalGreetWf.registered, .{});
+    defer unset.destroy();
+    const plain = commandsOf(try unset.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "try_cancel")}), a));
+    try testing.expect(!plain[0].variant.?.schedule_local_activity.include_arguments_in_marker);
 }
 
 test "local activity backoff: a timer, then the next attempt with a new seq" {

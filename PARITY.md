@@ -73,7 +73,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Deterministic UUIDs | Java, Python, TypeScript, .NET, PHP | GA | supported | [Determinism](README.md#determinism) |
 | Activities from workflows: timeouts, retry policy, cancellation types | all | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [retryactivity](samples/retryactivity) |
 | Local activities | all | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [greetingslocal](samples/greetingslocal) |
-| Local activity arguments recorded in the marker | TypeScript, .NET | GA | missing | `temporal-sdk-zig-d51.7.47`. `workflow.LocalActivityOptions` has no field that records the arguments in the local activity marker. |
+| Local activity arguments recorded in the marker | TypeScript, .NET | GA | supported | [Activities and local activities](README.md#activities-and-local-activities) |
 | Activities by name, without a typed definition | all | GA | supported | [Dynamic activities](README.md#dynamic-activities), [dynamic](samples/dynamic) |
 | Durable timers, conditions, and conditions with a timeout | all | GA | supported | [Timers and conditions](README.md#timers-and-conditions), [timer](samples/timer) |
 | Summaries and details on workflow starts, activities, timers, and child workflows | all | pre-release | supported | [Activities and local activities](README.md#activities-and-local-activities), [Timers and conditions](README.md#timers-and-conditions), [Child workflows](README.md#child-workflows) |

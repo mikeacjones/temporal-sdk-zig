@@ -792,6 +792,7 @@ Notes:
 - `priority` is a `workflow.Priority`; null uses the workflow's, and each zero field inherits the workflow's value. A value the server rejects fails the workflow task.
 - `versioning_intent` (`workflow.VersioningIntent`: `unspecified`, `compatible`, `default`) picks the build an activity runs on, only on task queues with build-ID-based versioning rules. `unspecified` means `compatible` on the workflow's own task queue and `default` elsewhere.
 - Adding any of the three to existing workflow code doesn't break replay of histories recorded without them.
+- `arguments_in_marker` (on `workflow.LocalActivityOptions`, default false) records the local activity's arguments in its marker event beside the result, so they show in the workflow's history. The marker holds the argument payloads as the worker's payload codecs encoded them. Turning it on or off doesn't break replay of histories recorded either way.
 
 #### Timers and conditions
 `ctx.sleep` blocks on a durable timer, as `ctx.io().sleep` does, and takes `workflow.SleepOptions`: a `summary` the UI and CLI show on the timer's started event. `workflow.Context.await` blocks until a condition holds, and `awaitTimeout` gives up after a timeout.
