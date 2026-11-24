@@ -1,1 +1,3 @@
-.{}
+.{
+    .{ .feature = "signal/signal_with_start", .bead = "temporal-sdk-zig-d51.7.49", .reason = "A signal buffered when its handler is registered runs only after the workflow function blocks, so the new workflow completes before processing the start-carried signal and the feature fails, leaving no history to record." },
+}
