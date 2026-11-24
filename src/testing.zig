@@ -5567,13 +5567,14 @@ test "client: terminate, reset and execution-options API shapes" {
     const terminate_options: client_mod.TerminateOptions = .{};
     try testing.expectEqualStrings("", terminate_options.first_execution_run_id);
 
-    // The reset point has no default.
-    const reset_info = @typeInfo(client_mod.ResetOptions).@"struct";
-    const point_index = comptime for (reset_info.field_names, 0..) |name, i| {
-        if (std.mem.eql(u8, name, "workflow_task_finish_event_id")) break i;
-    } else unreachable;
-    try testing.expect(reset_info.field_types[point_index] == i64);
-    try testing.expect(reset_info.field_attrs[point_index].default_value_ptr == null);
+    // The reset point is an event ID or a target: the event ID defaults to 0 (no event ID)
+    // and the target to null, and resetWorkflow refuses options that name neither or both.
+    try testing.expect(@FieldType(client_mod.ResetOptions, "workflow_task_finish_event_id") == i64);
+    try testing.expect(@FieldType(client_mod.ResetOptions, "target") == ?client_mod.ResetTarget);
+    const default_reset: client_mod.ResetOptions = .{};
+    try testing.expectEqual(0, default_reset.workflow_task_finish_event_id);
+    try testing.expect(default_reset.target == null);
+    try testing.expectEqual(0, default_reset.post_reset_operations.len);
     const reset_options: client_mod.ResetOptions = .{ .workflow_task_finish_event_id = 4 };
     try testing.expectEqualStrings("", reset_options.reason);
     try testing.expectEqualStrings("", reset_options.request_id);
@@ -5586,6 +5587,7 @@ test "client: terminate, reset and execution-options API shapes" {
     // Changes default to changing nothing, so fields can be added without breaking callers.
     const changes: client_mod.WorkflowExecutionOptionsChanges = .{};
     try testing.expect(changes.versioning_override == null);
+    try testing.expect(changes.priority == null);
     try testing.expect(@FieldType(client_mod.VersioningOverrideChange, "set") == deployment_mod.VersioningOverride);
     try testing.expect(@FieldType(client_mod.WorkflowExecutionOptions, "versioning_override") == ?deployment_mod.VersioningOverride);
     try testing.expect(@FieldType(client_mod.WorkflowExecutionOptions, "raw") == proto.temporal.api.workflowservice.v1.UpdateWorkflowExecutionOptionsResponse);
