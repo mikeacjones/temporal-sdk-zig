@@ -1,11 +1,18 @@
 //! With no worker polling, a query times out at the deadline the client gave it. The driver
 //! stops the worker, queries with a 1 s deadline and expects the call to fail when it
-//! passes, then starts a new worker and finishes the workflow with the "finish" signal.
+//! passes with error.DeadlineExceeded, as the suite's feature.go checks, then starts a new
+//! worker and finishes the workflow with the "finish" signal.
+//!
+//! The client reports a deadline as error.RpcFailed, like any other gRPC failure, so this
+//! feature fails until bead temporal-sdk-zig-ad0 ("Client: report a query's deadline as
+//! error.DeadlineExceeded") is done. Every path out of `execute` terminates the run, because
+//! the worker may be stopped when the check fails and no signal could finish it.
 const std = @import("std");
 const temporal = @import("temporal");
 const harness = @import("harness");
 
 const Io = std.Io;
+const gap_bead = "temporal-sdk-zig-ad0";
 const workflow = temporal.workflow;
 
 const Workflow = workflow.Def("Workflow", runWorkflow);
@@ -44,27 +51,25 @@ fn runWorkflow(ctx: *workflow.Context) !void {
 fn execute(ctx: *harness.Context) !void {
     var run = try ctx.client.executeWorkflow(Workflow, ctx.startOptions(), .{});
     defer run.deinit();
+    // Runs before run.deinit. The run has normally completed by now and the terminate fails
+    // harmlessly; after a failed expectation the worker is stopped, so only a terminate
+    // closes the run.
+    defer ctx.client.terminateWorkflow(run.id, run.run_id, "feature cleanup") catch {};
     // The worker must have run the first workflow task, or the server would hold the query
     // for that task instead of sending it to a worker.
     try ctx.waitForEvent(run.id, run.run_id, .EVENT_TYPE_WORKFLOW_TASK_COMPLETED, .fromSeconds(10));
 
     try ctx.stopWorker();
 
-    const timeout: Io.Duration = .fromSeconds(1);
-    const latest_failure: Io.Duration = .fromSeconds(5);
-    var short = try ctx.client.withRpcOptions(.{ .timeout = timeout });
+    var short = try ctx.client.withRpcOptions(.{ .timeout = .fromSeconds(1) });
     var message: []const u8 = "";
-    const started = Io.Timestamp.now(ctx.io, .awake);
     const result = short.queryWorkflowWithOptions(SomeQuery, ctx.arena, run.id, run.run_id, .{}, .{ .failure_message = &message });
-    const elapsed = started.durationTo(Io.Timestamp.now(ctx.io, .awake));
     if (result) |answer| {
-        return ctx.fail("query \"somequery\" with no worker answered {}; expected it to fail at its 1s deadline", .{answer});
+        return ctx.fail("query \"somequery\" with no worker answered {}; expected error.DeadlineExceeded at its 1s deadline (gap: " ++ gap_bead ++ ")", .{answer});
     } else |err| {
-        try ctx.expect(err == error.RpcFailed, "query \"somequery\" with no worker returned error.{s} (\"{s}\"); expected error.RpcFailed at its 1s deadline", .{ @errorName(err), message });
+        // QueryError has no DeadlineExceeded member yet, so compare by name.
+        try ctx.expect(std.mem.eql(u8, @errorName(err), "DeadlineExceeded"), "query \"somequery\" with no worker returned error.{s} (\"{s}\"); expected error.DeadlineExceeded at its 1s deadline (gap: " ++ gap_bead ++ ")", .{ @errorName(err), message });
     }
-    // The client reports the deadline as error.RpcFailed, as it does any other gRPC failure;
-    // when it failed tells the deadline apart, as Client.callService's rule for CANCELLED does.
-    try ctx.expect(elapsed.nanoseconds >= timeout.nanoseconds and elapsed.nanoseconds < latest_failure.nanoseconds, "query \"somequery\" with no worker failed after {d} ms (\"{s}\"); expected it to fail at its 1s deadline", .{ elapsed.toMilliseconds(), message });
 
     try ctx.startWorker();
     try ctx.client.signalWorkflow(Finish, run.id, run.run_id, .{});
