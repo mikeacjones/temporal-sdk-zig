@@ -48,6 +48,10 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "greetingslocal:starter")) return @import("greetingslocal/starter.zig").main(init);
     if (std.mem.eql(u8, name, "helloworld:worker")) return @import("helloworld/worker.zig").main(init);
     if (std.mem.eql(u8, name, "helloworld:starter")) return @import("helloworld/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "helloworld-apiKey:worker")) return @import("helloworld-apiKey/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "helloworld-apiKey:starter")) return @import("helloworld-apiKey/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "helloworldmtls:worker")) return @import("helloworldmtls/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "helloworldmtls:starter")) return @import("helloworldmtls/starter.zig").main(init);
     if (std.mem.eql(u8, name, "io-group:worker")) return @import("io-group/worker.zig").main(init);
     if (std.mem.eql(u8, name, "io-group:starter")) return @import("io-group/starter.zig").main(init);
     if (std.mem.eql(u8, name, "logadapter:worker")) return @import("logadapter/worker.zig").main(init);

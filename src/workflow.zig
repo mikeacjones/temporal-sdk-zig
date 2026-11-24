@@ -57,6 +57,9 @@
 //!     }
 //!     const order_id = try ctx.sideEffect(u64, {}, newOrderId);
 //!
+//! A value read often that changes rarely uses `ctx.mutableSideEffect` instead, which records
+//! a new value only when it differs from the last one recorded.
+//!
 //! Concurrency in a workflow uses `std.Io`, which `ctx.io()` implements deterministically:
 //!
 //! - Coroutines: `io.async(fn, args)`, or `std.Io.Group.async` for a set of them.
@@ -1096,8 +1099,8 @@ pub const Context = struct {
     /// not an error union: a call that failed the first time and was skipped on replay would
     /// change the workflow's commands. Return failures as values (an optional or a union).
     ///
-    /// For a value that changes over the run, keep it in workflow state and record each new
-    /// reading with another `sideEffect`.
+    /// For a value that is read often and changes rarely, use `mutableSideEffect`, which
+    /// records a new value only when it differs from the last one recorded.
     pub fn sideEffect(ctx: *Context, comptime T: type, context: anytype, comptime func: fn (@TypeOf(context)) T) SideEffectError!T {
         const value: ?converter.Payload = if (ctx.instance.replaying) null else try converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), func(context));
         const future: ActivityFuture(T) = .{ .ctx = ctx, .state = ctx.instance.sideEffect(value).state };
@@ -1107,6 +1110,73 @@ pub const Context = struct {
                 ctx.instance.setLastFailure(null);
                 return error.SideEffectFailed;
             },
+            error.WrongArgumentCount => error.InvalidPayload,
+            else => |e| e,
+        };
+    }
+
+    /// Reads a nondeterministic value that is read often and changes rarely (a configuration
+    /// setting, for example), recording it in history only when it changed:
+    ///
+    ///     const limit = try ctx.mutableSideEffect(u32, "rate-limit", config, Config.rateLimit, eqlU32);
+    ///
+    /// `id` names the value within the run: calls with the same ID share one recorded value,
+    /// and calls with different IDs are independent. It is used as given, with no validation,
+    /// and must be valid UTF-8. Patch IDs starting with `__temporal_mse:` belong to the SDK.
+    ///
+    /// When not replaying, `func(context)` runs on every call. If no value is recorded for
+    /// `id` yet, or `eql(recorded, current)` is false, the new value is recorded as a side
+    /// effect is (`sideEffect`). Otherwise nothing is recorded, no history event is added,
+    /// and no interceptor is called. On replay neither `func` nor `eql` runs: the value comes
+    /// from what history recorded at or before this call.
+    ///
+    /// This returns the value recorded for `id`, decoded as `T` into `ctx.allocator()` on
+    /// every call: never `func`'s fresh result, so first execution and replay return the same
+    /// value. `eql` gets the recorded value first and the new one second; it must be pure,
+    /// and must not block or touch the workflow context. `std.meta.eql` compares slices by
+    /// pointer, so it is no use for a `T` holding slices. `func` follows `sideEffect`'s
+    /// rules: quick, no blocking, no context use, and it returns `T`, not an error union.
+    ///
+    /// A call waits for any recording of `id` in flight, and for its own when the value
+    /// changed, so other coroutines may run during it. A changed value adds a patch marker
+    /// (with an update of the `TemporalChangeVersion` search attribute) and a side effect's
+    /// marker to history. Errors are those of `sideEffect`, and `SideEffectFailed` also when
+    /// called from read-only code (a query handler or update validator), or when a replayed
+    /// call finds no recorded value, which also fails the workflow task.
+    pub fn mutableSideEffect(
+        ctx: *Context,
+        comptime T: type,
+        id: []const u8,
+        context: anytype,
+        comptime func: fn (@TypeOf(context)) T,
+        comptime eql: fn (recorded: T, current: T) bool,
+    ) SideEffectError!T {
+        const inst = ctx.instance;
+        const call = try inst.mutableSideEffectBegin(id);
+        var value: ?converter.Payload = null;
+        const changed = if (inst.replaying) try inst.mutableSideEffectNotified(id, call) else changed: {
+            const current = func(context);
+            if (inst.mutableSideEffectValue(id)) |recorded| {
+                // The previous value is decoded into scratch memory freed before returning, so
+                // an unchanged call holds as much of the run's memory as it does on replay.
+                var scratch: std.heap.ArenaAllocator = .init(inst.arena());
+                defer scratch.deinit();
+                const previous = converter.fromPayloadWithContext(T, scratch.allocator(), ctx.converterContext(), recorded) catch |err| return mapDecodeError(err);
+                if (eql(previous, current)) break :changed false;
+            }
+            value = try converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), current);
+            break :changed true;
+        };
+        if (changed) try inst.mutableSideEffectRecord(id, call, value);
+        const recorded = inst.mutableSideEffectValue(id) orelse {
+            inst.mutableSideEffectNotRecorded(id);
+            return error.SideEffectFailed;
+        };
+        return converter.fromPayloadWithContext(T, ctx.allocator(), ctx.converterContext(), recorded) catch |err| mapDecodeError(err);
+    }
+
+    fn mapDecodeError(err: converter.DecodeError) SideEffectError {
+        return switch (err) {
             error.WrongArgumentCount => error.InvalidPayload,
             else => |e| e,
         };

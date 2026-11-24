@@ -168,9 +168,9 @@ pub const Options = struct {
     /// own bookkeeping for the run, which uses the same allocator), plus one
     /// `workflow_stack_size` for each coroutine stack the run holds, running or kept for
     /// reuse. The figure depends on what the workflow did, so a run rebuilt by replay counts
-    /// the same as one cached since its start, with one exception: a `ctx.sideEffect` value
-    /// is encoded and recorded only when it first runs, so a cached run counts those
-    /// encodings and a replayed one doesn't. A run within that margin of the limit can fail
+    /// the same as one cached since its start, with one exception: a `ctx.sideEffect` value,
+    /// and a `ctx.mutableSideEffect` value that changed, is encoded and recorded only when it
+    /// first runs, so a cached run counts those encodings and a replayed one doesn't. A run within that margin of the limit can fail
     /// its task on the worker that has it cached and pass once evicted and replayed.
     ///
     /// Checked once at the end of each activation that runs workflow code, after every

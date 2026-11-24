@@ -1,0 +1,11 @@
+// How samples-test validates this sample: start the worker, run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. Both run against
+// a Temporal server of their own in Docker, with TLS and JWT authorization: the programs read
+// its address, CA certificate and server name from the environment, and connect with
+// TEMPORAL_API_KEY, a token the server accepts as a bearer token, as their API key.
+.{
+    .expect = .{"Workflow result: Hello Temporal!"},
+    .timeout_seconds = 120,
+    .tests = .{"helloworld_test.zig"},
+    .docker_server = .{ .jwt = true },
+}

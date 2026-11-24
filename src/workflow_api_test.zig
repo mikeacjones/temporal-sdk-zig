@@ -1052,3 +1052,212 @@ test "WorkflowReplayer replays local activity markers with arguments and catches
     try changed.registerWorkflow(workflow.Def("la_arguments_in_marker", ArgumentsInMarker.runOne));
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(local_activity_arguments_history));
 }
+
+const MutableSideEffect = struct {
+    /// How many times `readValue` ran, on any run.
+    var reads: usize = 0;
+    /// What the query handler's call returned.
+    var query_result: ?anyerror = null;
+
+    const Read = workflow.QueryDef("mse_read", fn () u32);
+
+    fn readValue(value: u32) u32 {
+        reads += 1;
+        return value;
+    }
+
+    fn eqlU32(recorded: u32, current: u32) bool {
+        return recorded == current;
+    }
+
+    const QueryState = struct {
+        ctx: *workflow.Context,
+        fn read(s: *QueryState) workflow.Context.SideEffectError!u32 {
+            const value = s.ctx.mutableSideEffect(u32, "cfg", @as(u32, 0), readValue, eqlU32) catch |err| {
+                query_result = err;
+                return err;
+            };
+            query_result = null;
+            return value;
+        }
+    };
+
+    /// For each of `values`, waits on a 1 ms timer when `sleep` is set, then, unless the
+    /// value is 0, reads it through `mutableSideEffect` with ID "cfg". Returns the values the
+    /// calls returned, separated by spaces.
+    fn run(ctx: *workflow.Context, values: []const u32, sleep: bool) ![]const u8 {
+        const s = try ctx.allocator().create(QueryState);
+        s.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(Read, s, QueryState.read);
+        var out: std.ArrayList(u8) = .empty;
+        for (values) |value| {
+            if (sleep) try ctx.sleep(.fromMilliseconds(1), .{});
+            if (value == 0) continue;
+            const got = try ctx.mutableSideEffect(u32, "cfg", value, readValue, eqlU32);
+            if (out.items.len > 0) try out.append(ctx.allocator(), ' ');
+            try out.print(ctx.allocator(), "{d}", .{got});
+        }
+        return out.items;
+    }
+    const Def = workflow.Def("mutable_side_effect", run);
+
+    /// `run` without the `mutableSideEffect` calls.
+    fn dropped(ctx: *workflow.Context, values: []const u32, sleep: bool) ![]const u8 {
+        for (values) |_| if (sleep) try ctx.sleep(.fromMilliseconds(1), .{});
+        return "";
+    }
+    const Dropped = workflow.Def("mutable_side_effect", dropped);
+
+    fn readIn(ctx: *workflow.Context, value: u32) workflow.Context.SideEffectError!u32 {
+        return ctx.mutableSideEffect(u32, "cfg", value, readValue, eqlU32);
+    }
+
+    /// Reads 1 and 2 for ID "cfg" in two coroutines at once: the second call waits for the
+    /// first one's recording. Returns "<first> <second>".
+    fn concurrent(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var first = io.async(readIn, .{ ctx, 1 });
+        var second = io.async(readIn, .{ ctx, 2 });
+        const a = try first.await(io);
+        const b = try second.await(io);
+        return std.fmt.allocPrint(ctx.allocator(), "{d} {d}", .{ a, b });
+    }
+    const Concurrent = workflow.Def("mutable_side_effect_concurrent", concurrent);
+
+    fn countEvents(history: anytype, event_type: anytype) usize {
+        var n: usize = 0;
+        for (history.events.items) |e| n += @intFromBool(e.event_type == event_type);
+        return n;
+    }
+
+    /// Runs `Def` with `values` and `sleep` on `env`, checks that `readValue` ran once per
+    /// call and not again while `getResult` replayed the run, and returns the result and the
+    /// history.
+    fn runOnce(env: *testing_ns.WorkflowEnvironment, a: std.mem.Allocator, values: []const u32, sleep: bool) !struct { []const u8, @import("proto.zig").temporal.api.history.v1.History } {
+        var calls: usize = 0;
+        for (values) |v| calls += @intFromBool(v != 0);
+        const before = reads;
+        var run_handle = try env.startWorkflow(Def, .{}, .{ values, sleep });
+        defer run_handle.deinit();
+        const result = try env.getResult(Def, &run_handle, a, null);
+        try testing.expectEqual(before + calls, reads);
+        return .{ result, try env.client.fetchHistory(a, run_handle.id, run_handle.run_id) };
+    }
+};
+
+test "workflow: mutableSideEffect records an unchanged value once, adding no events for later calls" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(MutableSideEffect.Def);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const result, const history = try MutableSideEffect.runOnce(env, a, &.{ 5, 5, 5, 5 }, true);
+    try testing.expectEqualStrings("5 5 5 5", result);
+    try testing.expectEqual(2, MutableSideEffect.countEvents(history, .EVENT_TYPE_MARKER_RECORDED));
+
+    // The same timers with one call: the three unchanged calls added nothing.
+    const one, const one_history = try MutableSideEffect.runOnce(env, a, &.{ 5, 0, 0, 0 }, true);
+    try testing.expectEqualStrings("5", one);
+    try testing.expectEqual(one_history.events.items.len, history.events.items.len);
+
+    var replayer: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(MutableSideEffect.Def);
+    const before = MutableSideEffect.reads;
+    try replayer.replayHistory(history);
+    try testing.expectEqual(before, MutableSideEffect.reads);
+}
+
+test "workflow: mutableSideEffect records each changed value and returns the recorded ones" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(MutableSideEffect.Def);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const result, const history = try MutableSideEffect.runOnce(env, a, &.{ 1, 1, 2, 2, 3 }, true);
+    try testing.expectEqualStrings("1 1 2 2 3", result);
+    // A patch marker and the side effect's marker for each of the three changes.
+    try testing.expectEqual(6, MutableSideEffect.countEvents(history, .EVENT_TYPE_MARKER_RECORDED));
+}
+
+test "workflow: mutableSideEffect changes around an unchanged call in one workflow task replay cleanly" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(MutableSideEffect.Def);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const result, const history = try MutableSideEffect.runOnce(env, a, &.{ 1, 1, 2 }, false);
+    try testing.expectEqualStrings("1 1 2", result);
+    try testing.expectEqual(4, MutableSideEffect.countEvents(history, .EVENT_TYPE_MARKER_RECORDED));
+    var replayer: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(MutableSideEffect.Def);
+    try replayer.replayHistory(history);
+}
+
+test "workflow: mutableSideEffect calls for one ID in two coroutines wait for each other's recording and replay cleanly" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(MutableSideEffect.Concurrent);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(MutableSideEffect.Concurrent, .{}, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("1 2", try env.getResult(MutableSideEffect.Concurrent, &run, a, null));
+    const history = try env.client.fetchHistory(a, run.id, run.run_id);
+    try testing.expectEqual(4, MutableSideEffect.countEvents(history, .EVENT_TYPE_MARKER_RECORDED));
+    var replayer: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer replayer.deinit();
+    try replayer.registerWorkflow(MutableSideEffect.Concurrent);
+    try replayer.replayHistory(history);
+}
+
+test "workflow: mutableSideEffect in a query handler returns SideEffectFailed" {
+    const env = try testing_ns.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(MutableSideEffect.Def);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var run = try env.startWorkflow(MutableSideEffect.Def, .{}, .{ &[_]u32{4}, false });
+    defer run.deinit();
+    try testing.expectEqualStrings("4", try env.getResult(MutableSideEffect.Def, &run, a, null));
+    const before = MutableSideEffect.reads;
+    MutableSideEffect.query_result = error.TestExpectedQuery;
+    try testing.expectError(error.QueryFailed, env.queryWorkflow(MutableSideEffect.Read, a, run.id, .{}));
+    try testing.expectEqual(error.SideEffectFailed, MutableSideEffect.query_result.?);
+    try testing.expectEqual(before, MutableSideEffect.reads);
+}
+
+/// Dev-server runs of `MutableSideEffect.Def`, fetched with `Client.fetchHistory` and encoded
+/// as ProtoJSON (`protojson.encode`), indented, the host name in the worker identity and the
+/// sticky task queue replaced. The changed one ran with values 1, 1, 2, 2, 3 and timers, so
+/// it records three changes; the unchanged one with 5, 5, 5, 5 and timers, so it records
+/// only the first call.
+const mutable_side_effect_changed_history = @embedFile("testdata/mutable_side_effect_changed_history.json");
+const mutable_side_effect_unchanged_history = @embedFile("testdata/mutable_side_effect_unchanged_history.json");
+
+test "WorkflowReplayer replays mutableSideEffect histories without calling its function and catches a dropped call" {
+    const before = MutableSideEffect.reads;
+    for ([_][]const u8{ mutable_side_effect_changed_history, mutable_side_effect_unchanged_history }) |history| {
+        var ok: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+        defer ok.deinit();
+        try ok.registerWorkflow(MutableSideEffect.Def);
+        try ok.replayHistoryJson(history);
+    }
+    try testing.expectEqual(before, MutableSideEffect.reads);
+
+    var changed: testing_ns.WorkflowReplayer = .init(testing.allocator, testing.io);
+    defer changed.deinit();
+    try changed.registerWorkflow(MutableSideEffect.Dropped);
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(mutable_side_effect_changed_history));
+}
