@@ -299,7 +299,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | saga | [saga](samples/saga) | ported |
 | schedule | [schedule](samples/schedule) | ported |
 | searchattributes | [searchattributes](samples/searchattributes) | ported |
-| serverjwtauth | | planned: `temporal-sdk-zig-d51.16.61` |
+| serverjwtauth | [serverjwtauth](samples/serverjwtauth) | ported |
 | session-failure | | planned: `temporal-sdk-zig-d51.16.73` |
 | shoppingcart | [shoppingcart](samples/shoppingcart) | ported |
 | sleep-for-days | [sleep-for-days](samples/sleep-for-days) | ported |
