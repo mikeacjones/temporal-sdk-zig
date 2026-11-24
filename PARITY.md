@@ -31,8 +31,8 @@ A status counts every public declaration in `src/`, documented or not. A feature
 
 | Feature | SDKs | Stage | Zig | Where |
 |---------|------|-------|-----|-------|
-| Connect with TLS, mutual TLS, and gRPC headers | all | GA | supported | [Connecting](README.md#connecting) |
-| API key authentication | all | GA | supported | [Connecting](README.md#connecting) |
+| Connect with TLS, mutual TLS, and gRPC headers | all | GA | supported | [Connecting](README.md#connecting), [helloworldmtls](samples/helloworldmtls) |
+| API key authentication | all | GA | supported | [Connecting](README.md#connecting), [helloworld-apiKey](samples/helloworld-apiKey) |
 | Client RPC retry policy and a client-wide RPC timeout | all | GA | supported | [Connecting](README.md#connecting) |
 | RPC timeout and gRPC metadata on a single call | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |
 | Environment configuration: profiles from a TOML file and environment variables | Go, Python, TypeScript, .NET, Ruby, Java | GA | supported | [Connecting](README.md#connecting), [external-env-conf](samples/external-env-conf) |
@@ -228,68 +228,104 @@ Sources for the release stages: [Worker Versioning GA](https://temporal.io/blog/
 
 ## Samples
 
-Each Zig sample lives in [samples](samples) and is validated against a dev server, with its tests, by `zig build samples-test`.
+Each Zig sample lives in [samples](samples) and is validated against a dev server, with its tests, by `zig build samples-test`. The table has one row for every top-level directory of [samples-go](https://github.com/temporalio/samples-go) as of 2026-11-19 (commit 79eadc2), except `.github` and `.vscode`, sorted by directory name. **Status** is one of:
 
-| Zig sample | samples-go sample |
-|------------|-------------------|
-| [helloworld](samples/helloworld) | helloworld |
-| [greetings](samples/greetings) | greetings |
-| [branch](samples/branch) | branch |
-| [splitmerge-future](samples/splitmerge-future) | splitmerge-future |
-| [splitmerge-select](samples/splitmerge-select) | splitmerge-selector |
-| [choice-exclusive](samples/choice-exclusive) | choice-exclusive |
-| [choice-multi](samples/choice-multi) | choice-multi |
-| [io-group](samples/io-group) | goroutine |
-| [timer](samples/timer) | timer |
-| [start-delay](samples/start-delay) | start-delay |
-| [retryactivity](samples/retryactivity) | retryactivity |
-| [cron](samples/cron) | cron |
-| [greetingslocal](samples/greetingslocal) | greetingslocal |
-| [cancellation](samples/cancellation) | cancellation |
-| [child-workflow](samples/child-workflow) | child-workflow |
-| [query](samples/query) | query |
-| [memo](samples/memo) | memo |
-| [await-signals](samples/await-signals) | await-signals |
-| [update](samples/update) | update |
-| [early-return](samples/early-return) | early-return |
-| [reqrespquery](samples/reqrespquery) | reqrespquery |
-| [reqrespupdate](samples/reqrespupdate) | reqrespupdate |
-| [safe_message_handler](samples/safe_message_handler) | safe_message_handler |
-| [shoppingcart](samples/shoppingcart) | shoppingcart |
-| [updatabletimer](samples/updatabletimer) | updatabletimer |
-| [sleep-for-days](samples/sleep-for-days) | sleep-for-days |
-| [child-workflow-continue-as-new](samples/child-workflow-continue-as-new) | child-workflow-continue-as-new |
-| [saga](samples/saga) | saga |
-| [dsl](samples/dsl) | dsl |
-| [reqrespactivity](samples/reqrespactivity) | reqrespactivity |
-| [dynamic](samples/dynamic) | dynamic |
-| [worker-specific-task-queues](samples/worker-specific-task-queues) | worker-specific-task-queues |
-| [synchronous-proxy](samples/synchronous-proxy) | synchronous-proxy |
-| [batch-sliding-window](samples/batch-sliding-window) | batch-sliding-window |
-| [expense](samples/expense) | expense |
-| [polling](samples/polling) | polling |
-| [dynamic-workflows](samples/dynamic-workflows) | dynamic-workflows |
-| [mutex](samples/mutex) | mutex |
-| [searchattributes](samples/searchattributes) | searchattributes, typed-searchattributes |
-| [multi-history-replay](samples/multi-history-replay) | multi-history-replay |
-| [recovery](samples/recovery) | recovery |
-| [schedule](samples/schedule) | schedule |
-| [standalone-activity](samples/standalone-activity) | standalone-activity |
-| [eager-workflow-start](samples/eager-workflow-start) | eager-workflow-start |
-| [snappycompress](samples/snappycompress) | snappycompress |
-| [codec-server](samples/codec-server) | codec-server |
-| [pso](samples/pso) | pso |
-| [logadapter](samples/logadapter) | slogadapter, zapadapter |
-| [ctxpropagation](samples/ctxpropagation) | ctxpropagation |
-| [workflow-security-interceptor](samples/workflow-security-interceptor) | workflow-security-interceptor |
-| [metrics](samples/metrics) | metrics |
-| [logger-interceptor](samples/logger-interceptor) | logger-interceptor |
-| [encryption](samples/encryption) | encryption |
-| [worker-versioning](samples/worker-versioning) | worker-versioning |
-| [nexus](samples/nexus) | nexus |
-| [nexus-cancelation](samples/nexus-cancelation) | nexus-cancelation |
-| [external-env-conf](samples/external-env-conf) | external-env-conf |
+- `ported`: the Zig sample linked in **Zig sample** demonstrates the same feature and passes `zig build samples-test`.
+- `planned`: no Zig sample exists yet; the bead that adds it is named, or `unfiled` where none is filed.
+- `not applicable`: the sample has no Zig equivalent; the reason is recorded under [Samples with no Zig equivalent](#samples-with-no-zig-equivalent).
+
+| samples-go sample | Zig sample | Status |
+|-------------------|------------|--------|
+| await-signals | [await-signals](samples/await-signals) | ported |
+| batch-sliding-window | [batch-sliding-window](samples/batch-sliding-window) | ported |
+| branch | [branch](samples/branch) | ported |
+| cancellation | [cancellation](samples/cancellation) | ported |
+| child-workflow | [child-workflow](samples/child-workflow) | ported |
+| child-workflow-continue-as-new | [child-workflow-continue-as-new](samples/child-workflow-continue-as-new) | ported |
+| choice-exclusive | [choice-exclusive](samples/choice-exclusive) | ported |
+| choice-multi | [choice-multi](samples/choice-multi) | ported |
+| codec-server | [codec-server](samples/codec-server) | ported |
+| cron | [cron](samples/cron) | ported |
+| ctxpropagation | [ctxpropagation](samples/ctxpropagation) | ported |
+| datadog | | planned: `temporal-sdk-zig-d51.16.78` |
+| dsl | [dsl](samples/dsl) | ported |
+| dynamic | [dynamic](samples/dynamic) | ported |
+| dynamic-workflows | [dynamic-workflows](samples/dynamic-workflows) | ported |
+| dynamicconfig | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
+| dynamicmtls | [dynamicmtls](samples/dynamicmtls) | ported |
+| eager-workflow-start | [eager-workflow-start](samples/eager-workflow-start) | ported |
+| early-return | [early-return](samples/early-return) | ported |
+| encryption | [encryption](samples/encryption) | ported |
+| expense | [expense](samples/expense) | ported |
+| external-env-conf | [external-env-conf](samples/external-env-conf) | ported |
+| external-storage | | planned: `temporal-sdk-zig-d51.16.75` |
+| fileprocessing | | planned: `temporal-sdk-zig-d51.16.72` |
+| gcp | | planned: `temporal-sdk-zig-d51.16.80` |
+| googleadk | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
+| goroutine | [io-group](samples/io-group) | ported |
+| greetings | [greetings](samples/greetings) | ported |
+| greetingslocal | [greetingslocal](samples/greetingslocal) | ported |
+| grpc-proxy | | planned: `temporal-sdk-zig-d51.16.81` |
+| helloworld | [helloworld](samples/helloworld) | ported |
+| helloworld-apiKey | [helloworld-apiKey](samples/helloworld-apiKey) | ported |
+| helloworldmtls | [helloworldmtls](samples/helloworldmtls) | ported |
+| lambda-worker | | planned: `temporal-sdk-zig-d51.16.79` |
+| logger-interceptor | [logger-interceptor](samples/logger-interceptor) | ported |
+| memo | [memo](samples/memo) | ported |
+| metrics | [metrics](samples/metrics) | ported |
+| multi-history-replay | [multi-history-replay](samples/multi-history-replay) | ported |
+| mutex | [mutex](samples/mutex) | ported |
+| nexus | [nexus](samples/nexus) | ported |
+| nexus-cancelation | [nexus-cancelation](samples/nexus-cancelation) | ported |
+| nexus-context-propagation | | planned: `temporal-sdk-zig-d51.16.66` |
+| nexus-messaging | | planned: `temporal-sdk-zig-d51.16.67` |
+| nexus-messaging-temporal-operation | | planned: `temporal-sdk-zig-d51.16.68` |
+| nexus-multiple-arguments | | planned: `temporal-sdk-zig-d51.16.69` |
+| nexus-serialization-context | | planned: `temporal-sdk-zig-d51.16.107` |
+| nexus-standalone-activity | | planned: `temporal-sdk-zig-d51.16.70` |
+| nexus-standalone-operations | | planned: `temporal-sdk-zig-d51.16.71` |
+| opentelemetry | | planned: `temporal-sdk-zig-d51.16.76` |
+| opentelemetry-v2 | | planned: `temporal-sdk-zig-d51.16.77` |
+| pickfirst | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
+| polling | [polling](samples/polling) | ported |
+| pso | [pso](samples/pso) | ported |
+| query | [query](samples/query) | ported |
+| recovery | [recovery](samples/recovery) | ported |
+| reqrespactivity | [reqrespactivity](samples/reqrespactivity) | ported |
+| reqrespquery | [reqrespquery](samples/reqrespquery) | ported |
+| reqrespupdate | [reqrespupdate](samples/reqrespupdate) | ported |
+| retryactivity | [retryactivity](samples/retryactivity) | ported |
+| safe_message_handler | [safe_message_handler](samples/safe_message_handler) | ported |
+| saga | [saga](samples/saga) | ported |
+| schedule | [schedule](samples/schedule) | ported |
+| searchattributes | [searchattributes](samples/searchattributes) | ported |
+| serverjwtauth | [serverjwtauth](samples/serverjwtauth) | ported |
+| session-failure | | planned: `temporal-sdk-zig-d51.16.73` |
+| shoppingcart | [shoppingcart](samples/shoppingcart) | ported |
+| sleep-for-days | [sleep-for-days](samples/sleep-for-days) | ported |
+| slogadapter | [logadapter](samples/logadapter) | ported |
+| snappycompress | [snappycompress](samples/snappycompress) | ported |
+| splitmerge-future | [splitmerge-future](samples/splitmerge-future) | ported |
+| splitmerge-selector | [splitmerge-select](samples/splitmerge-select) | ported |
+| standalone-activity | [standalone-activity](samples/standalone-activity) | ported |
+| start-delay | [start-delay](samples/start-delay) | ported |
+| synchronous-proxy | [synchronous-proxy](samples/synchronous-proxy) | ported |
+| temporal-fixtures | | planned: `temporal-sdk-zig-d51.16.82` |
+| timer | [timer](samples/timer) | ported |
+| typed-searchattributes | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
+| updatabletimer | [updatabletimer](samples/updatabletimer) | ported |
+| update | [update](samples/update) | ported |
+| worker-specific-task-queues | [worker-specific-task-queues](samples/worker-specific-task-queues) | ported |
+| worker-versioning | [worker-versioning](samples/worker-versioning) | ported |
+| workflow-security-interceptor | [workflow-security-interceptor](samples/workflow-security-interceptor) | ported |
+| workflowstreams | | planned: `temporal-sdk-zig-d51.16.74` |
+| zapadapter | [logadapter](samples/logadapter) | ported |
 
 ## Samples with no Zig equivalent
 
-None are recorded yet.
+| samples-go sample | Reason |
+|-------------------|--------|
+| dynamicconfig | A server configuration file, not a sample. |
+| googleadk | Runs Google's Go ADK agent library; there is no Zig ADK. |
+| pickfirst | Exercises grpc-go's pick_first load-balancing policy; the Rust core owns the gRPC connection. Revisit if the core exposes load-balancing options. |
+| typed-searchattributes | Holds only a pointer to searchattributes, whose Zig sample covers typed search attributes. |
