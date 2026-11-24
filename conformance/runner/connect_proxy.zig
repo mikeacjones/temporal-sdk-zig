@@ -88,11 +88,22 @@ fn acceptLoop(proxy: *Proxy) void {
                 return;
             },
         };
-        proxy.tunnels.concurrent(io, tunnel, .{ proxy, stream }) catch |err| {
+        spawnProtected(io, &proxy.tunnels, .{ proxy, stream }) catch |err| {
             std.log.warn("HTTP CONNECT proxy {s} cannot serve a connection: {t}", .{ hostPort(proxy), err });
             stream.close(io);
         };
     }
+}
+
+/// Starts a tunnel task with cancelation blocked. Starting a task allocates, and in a Debug
+/// build Zig 0.17.1's DebugAllocator captures a stack trace there whose unwinding makes
+/// cancelable Io calls on this thread: a cancel `stop` requests at that moment is
+/// acknowledged and dropped, after which every syscall of this task is uncancelable and the
+/// next accept blocks `stop` forever. Blocked, the request stays pending for the next accept.
+fn spawnProtected(io: Io, tunnels: *Io.Group, args: struct { *Proxy, net.Stream }) Io.ConcurrentError!void {
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    return tunnels.concurrent(io, tunnel, args);
 }
 
 const Request = struct {
@@ -139,7 +150,12 @@ fn tunnel(proxy: *Proxy, client: net.Stream) Io.Cancelable!void {
     // Bytes the client sent after the head belong to the tunnel.
     try writeAll(io, target, in.buffered());
 
-    var downstream = io.concurrent(pumpThenShutdown, .{ io, target, client }) catch return;
+    // Cancelation blocked for the reason `spawnProtected` gives: a cancel dropped here would
+    // leave the reads of `pump` below uncancelable.
+    const protection = io.swapCancelProtection(.blocked);
+    const started = io.concurrent(pumpThenShutdown, .{ io, target, client });
+    _ = io.swapCancelProtection(protection);
+    var downstream = started catch return;
     defer downstream.cancel(io) catch {};
     const upstream = pump(io, client, target);
     // Shutdown is a cancelation point: a cancel it reports is consumed, so pass it on, or
@@ -460,6 +476,137 @@ test "connect proxy stop ends a tunnel whose target shutdown is canceled after i
     const returned = try CancelBeforeShutdown.waitFor(&stopped);
     // A stop that still waits for the tunnel is let go by ending the target's side of it.
     if (!returned) echoing.cancel(io);
+    stopping.await(io);
+    try testing.expect(returned);
+}
+
+/// An Io that passes every call to `testing.io`, except that the first task start of kind
+/// `which` after `armed` is set does what a Debug build's DebugAllocator can do there: it
+/// waits until its task is canceled and acknowledges the cancel without reporting it. When
+/// cancelation is blocked, as the proxy has it while starting a task, it cannot see the
+/// cancel, so it waits until `stopping` is set and then a little longer, for the cancel that
+/// `stop` sends to arrive meanwhile.
+const CancelInSpawn = struct {
+    var vtable: Io.VTable = undefined;
+    var which: enum { group, future } = .group;
+    var armed: std.atomic.Value(bool) = .init(false);
+    var entered: std.atomic.Value(bool) = .init(false);
+    var stopping: std.atomic.Value(bool) = .init(false);
+    /// Once set, an accept returns error.Canceled after it accepts a connection, which lets a
+    /// stop that waits for an uncancelable accept go.
+    var release: std.atomic.Value(bool) = .init(false);
+
+    fn io() Io {
+        vtable = testing.io.vtable.*;
+        vtable.concurrent = concurrent;
+        vtable.groupConcurrent = groupConcurrent;
+        vtable.netAccept = netAccept;
+        return .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    }
+
+    fn reset(kind: @TypeOf(which)) void {
+        which = kind;
+        armed.store(false, .release);
+        entered.store(false, .release);
+        stopping.store(false, .release);
+        release.store(false, .release);
+    }
+
+    fn swallowCancel(userdata: ?*anyopaque, kind: @TypeOf(which)) void {
+        if (kind != which or armed.cmpxchgStrong(true, false, .acq_rel, .acquire) != null) return;
+        const inner = testing.io.vtable;
+        entered.store(true, .release);
+        const protection = inner.swapCancelProtection(userdata, .unblocked);
+        _ = inner.swapCancelProtection(userdata, protection);
+        if (protection == .unblocked) while (true) {
+            inner.checkCancel(userdata) catch return;
+            std.Thread.yield() catch {};
+        };
+        while (!stopping.load(.acquire)) std.Thread.yield() catch {};
+        testing.io.sleep(.fromMilliseconds(50), .boot) catch {};
+    }
+
+    fn concurrent(
+        userdata: ?*anyopaque,
+        result_len: usize,
+        result_alignment: std.mem.Alignment,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start_fn: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    ) Io.ConcurrentError!*Io.AnyFuture {
+        swallowCancel(userdata, .future);
+        return testing.io.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start_fn);
+    }
+
+    fn groupConcurrent(
+        userdata: ?*anyopaque,
+        group: *Io.Group,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start_fn: *const fn (context: *const anyopaque) void,
+    ) Io.ConcurrentError!void {
+        swallowCancel(userdata, .group);
+        return testing.io.vtable.groupConcurrent(userdata, group, context, context_alignment, start_fn);
+    }
+
+    fn netAccept(userdata: ?*anyopaque, server: net.Socket.Handle, options: net.Server.AcceptOptions) net.Server.AcceptError!net.Socket {
+        const socket = try testing.io.vtable.netAccept(userdata, server, options);
+        if (!release.load(.acquire)) return socket;
+        (net.Stream{ .socket = socket }).close(testing.io);
+        return error.Canceled;
+    }
+};
+
+test "connect proxy stop ends an accept loop canceled while it starts a tunnel" {
+    const io = testing.io;
+    CancelInSpawn.reset(.group);
+    CancelInSpawn.armed.store(true, .release);
+    const proxy = try start(testing.allocator, CancelInSpawn.io());
+    const client = try connectTo(proxy);
+    defer client.close(io);
+    _ = try CancelBeforeShutdown.waitFor(&CancelInSpawn.entered);
+
+    CancelInSpawn.stopping.store(true, .release);
+    var stopped: std.atomic.Value(bool) = .init(false);
+    var stopping = try io.concurrent(CancelBeforeShutdown.stopAndMark, .{ proxy, &stopped });
+    const returned = try CancelBeforeShutdown.waitFor(&stopped);
+    // A stop that still waits for the accept loop is let go by a connection that ends it.
+    if (!returned) {
+        CancelInSpawn.release.store(true, .release);
+        const wake = try connectTo(proxy);
+        wake.close(io);
+    }
+    stopping.await(io);
+    try testing.expect(returned);
+}
+
+test "connect proxy stop ends a tunnel canceled while it starts copying to its client" {
+    const io = testing.io;
+    const echo = try startEcho();
+    defer testing.allocator.destroy(echo);
+    defer echo.server.deinit(io);
+    var echoing = try io.concurrent(Echo.serve, .{echo});
+    defer echoing.cancel(io);
+
+    CancelInSpawn.reset(.future);
+    const proxy = try start(testing.allocator, CancelInSpawn.io());
+    // Armed after `start`, whose accept task is a future too.
+    CancelInSpawn.armed.store(true, .release);
+    var target_buffer: [32]u8 = undefined;
+    var head_buffer: [128]u8 = undefined;
+    const head = try std.fmt.bufPrint(&head_buffer, "CONNECT {s} HTTP/1.1\r\n\r\n", .{echo.hostPort(&target_buffer)});
+    const client = try connectTo(proxy);
+    defer client.close(io);
+    var read_buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings("HTTP/1.1 200 Connection established\r\n", try sendHead(client, head, &read_buffer));
+    _ = try CancelBeforeShutdown.waitFor(&CancelInSpawn.entered);
+
+    CancelInSpawn.stopping.store(true, .release);
+    var stopped: std.atomic.Value(bool) = .init(false);
+    var stopping = try io.concurrent(CancelBeforeShutdown.stopAndMark, .{ proxy, &stopped });
+    const returned = try CancelBeforeShutdown.waitFor(&stopped);
+    // A stop that still waits for the tunnel is let go by ending the client's side of it.
+    if (!returned) try client.shutdown(io, .send);
     stopping.await(io);
     try testing.expect(returned);
 }
