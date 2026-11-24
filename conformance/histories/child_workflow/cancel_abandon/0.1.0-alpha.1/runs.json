@@ -1,0 +1,30 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-child_workflow/cancel_abandon",
+  "runs": [
+    {
+      "file": "1-Harness_ChildWorkflow_CancelAbandon_MainScope.json",
+      "workflow_id": "conformance-child_workflow/cancel_abandon-main-scope"
+    },
+    {
+      "file": "2-Harness_ChildWorkflow_CancelAbandon_Child.json",
+      "workflow_id": "conformance-child_workflow/cancel_abandon-main-scope-child"
+    },
+    {
+      "file": "3-Harness_ChildWorkflow_CancelAbandon_InnerScopeCancel.json",
+      "workflow_id": "conformance-child_workflow/cancel_abandon-inner-scope"
+    },
+    {
+      "file": "4-Harness_ChildWorkflow_CancelAbandon_Child.json",
+      "workflow_id": "conformance-child_workflow/cancel_abandon-inner-scope-child"
+    },
+    {
+      "file": "5-Harness_ChildWorkflow_CancelAbandon_InnerScopeCancel.json",
+      "workflow_id": "conformance-child_workflow/cancel_abandon-closing-inner-scope"
+    },
+    {
+      "file": "6-Harness_ChildWorkflow_CancelAbandon_Child.json",
+      "workflow_id": "conformance-child_workflow/cancel_abandon-closing-inner-scope-child"
+    }
+  ]
+}
