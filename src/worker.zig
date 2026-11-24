@@ -1105,7 +1105,8 @@ pub const Worker = struct {
     /// Shuts down and frees a core worker nothing polls, nor will. As for any core worker,
     /// each task type it polls (`task_types`) is polled until it returns null before
     /// finalizing: a core polling activities otherwise waits in `finalizeShutdown` forever
-    /// for its activity poller to see the shutdown.
+    /// for its activity poller to see the shutdown. The polls go through `pollCore`, so one
+    /// whose cell `w.gpa` refuses is followed by one that reaches the core.
     fn freeUnpolledCore(w: *Worker, core: bridge.Worker, task_queue: []const u8, task_types: bridge.Worker.Options.TaskTypes) void {
         core.initiateShutdown();
         var message: ?[]u8 = null;
@@ -1116,7 +1117,18 @@ pub const Worker = struct {
             .{ task_types.local_activities or task_types.remote_activities, bridge.Worker.pollActivityTask },
             .{ task_types.nexus, bridge.Worker.pollNexusTask },
         };
-        for (polls) |p| if (p[0]) while (p[1](core, w.gpa, w.io, null) catch null) |polled| polled.deinit();
+        var gpa_refused = false;
+        for (polls) |p| if (p[0]) while (true) {
+            const refused_before = gpa_refused;
+            const polled = w.pollCore(core, p[1], null, &gpa_refused) catch |err| switch (err) {
+                // `w.gpa` refused the cell before the poll reached the core: the next poll
+                // takes its cell elsewhere. A refusal after that one, or a failed poll, ends
+                // the polls as before.
+                error.OutOfMemory => if (refused_before) break else continue,
+                error.PollFailed => break,
+            } orelse break;
+            polled.deinit();
+        };
         core.finalizeShutdown(w.gpa, w.io, &message) catch |err| {
             log.warn("shutting down the unstarted worker for task queue {s} failed: {s}", .{ task_queue, message orelse @errorName(err) });
         };
@@ -1130,8 +1142,9 @@ pub const Worker = struct {
     /// every later one takes its cell from `std.heap.page_allocator`, without `message`
     /// (which belongs to `w.gpa`). A core worker is finalized only once each of its pollers
     /// has polled it to null, so a poll loop, or `freeUnpolledCore`, must still reach the
-    /// core after `w.gpa` has run out, or `run` never returns. The refusal is reported as a
-    /// poll failure, which shuts the run down, so those later polls only drain the core.
+    /// core after `w.gpa` has run out, or `run` never returns. A poll loop reports the
+    /// refusal as a poll failure, which shuts the run down, so its later polls only drain
+    /// the core; `freeUnpolledCore`, draining a core already shut down, polls again.
     fn pollCore(w: *Worker, core: bridge.Worker, poll: PollTask, message: ?*?[]u8, gpa_refused: *bool) PollError!?bridge.Worker.Polled {
         if (gpa_refused.*) return poll(core, std.heap.page_allocator, w.io, null);
         return poll(core, w.gpa, w.io, message) catch |err| {
@@ -5078,6 +5091,110 @@ test "a poll the worker's allocator refuses is reported, and the polls after it 
     // Shut down and never polled, the core has nothing more to give: the poll returns null.
     try testing.expectEqual(null, try w.pollCore(core, bridge.Worker.pollActivityTask, null, &gpa_refused));
     try core.finalizeShutdown(testing.allocator, testing.io, null);
+}
+
+/// An allocator that refuses one allocation, the first once `armed` is set, and gives every other
+/// from `parent`: a transient out-of-memory, which `std.testing.FailingAllocator` (refusing
+/// every allocation from its fail index on) can't express.
+const RefuseOnce = struct {
+    parent: Allocator,
+    armed: std.atomic.Value(bool) = .init(false),
+    refused: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(r: *RefuseOnce) Allocator {
+        return .{ .ptr = r, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const r: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        if (r.armed.cmpxchgStrong(true, false, .acq_rel, .acquire) == null) {
+            _ = r.refused.fetchAdd(1, .acq_rel);
+            return null;
+        }
+        return r.parent.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const r: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        return r.parent.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const r: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        return r.parent.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const r: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        r.parent.rawFree(memory, alignment, ra);
+    }
+
+    /// An Io whose `concurrent` refuses every call, first arming `r`: a worker that can't
+    /// start its poll loops, and whose next allocation after that is refused.
+    const NoThreads = struct {
+        var refuse: *RefuseOnce = undefined;
+        var vtable: Io.VTable = undefined;
+
+        fn io(base: Io, r: *RefuseOnce) Io {
+            refuse = r;
+            vtable = base.vtable.*;
+            vtable.concurrent = concurrent;
+            return .{ .userdata = base.userdata, .vtable = &vtable };
+        }
+
+        fn concurrent(
+            userdata: ?*anyopaque,
+            result_len: usize,
+            result_alignment: std.mem.Alignment,
+            context: []const u8,
+            context_alignment: std.mem.Alignment,
+            start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+        ) Io.ConcurrentError!*Io.AnyFuture {
+            _ = .{ userdata, result_len, result_alignment, context, context_alignment, start };
+            refuse.armed.store(true, .release);
+            return error.ConcurrencyUnavailable;
+        }
+    };
+};
+
+// `run` frees a core worker that no loop polls by polling it to null before finalizing it.
+// Those polls ended at the first failure, so one whose cell the worker's allocator refused
+// never reached the core: its activity poller never saw the shutdown, and finalizing, which
+// could allocate again, waited for it forever. A refused poll now drains on like a poll loop's.
+test "run returns when the worker's allocator refuses one poll of a core worker it frees unpolled" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var refuse: RefuseOnce = .{ .parent = testing.allocator };
+    // No debug-info read, whose start would be the first `concurrent` call, and no workflow:
+    // the first `concurrent` is the activity loop's, and the next allocation the poll's cell.
+    var w = try Worker.init(refuse.allocator(), RefuseOnce.NoThreads.io(testing.io, &refuse), &client, "refuse-one-poll", .{ .failure_stack_traces = false });
+    defer w.deinit();
+    try w.registerActivity(HelloTest.Greet);
+
+    const Run = struct {
+        result: Worker.RunError!void = {},
+        done: Io.Event = .unset,
+        fn run(r: *@This(), worker: *Worker) void {
+            r.result = worker.run();
+            r.done.set(testing.io);
+        }
+    };
+    var r: Run = .{};
+    // On the real Io: the worker's refuses `concurrent`.
+    var future = try testing.io.concurrent(Run.run, .{ &r, &w });
+    r.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } }) catch |err| switch (err) {
+        // Run is stuck in `finalizeShutdown` for good, and nothing can free what it holds.
+        error.Timeout => std.debug.panic("Worker.run did not return within 30 s after one refused allocation", .{}),
+        error.Canceled => |e| return e,
+    };
+    future.await(testing.io);
+    try testing.expectError(error.ConcurrencyUnavailable, r.result);
+    try testing.expectEqual(1, refuse.refused.load(.acquire));
 }
 
 const CancelTest = struct {
