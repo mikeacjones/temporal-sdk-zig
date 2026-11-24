@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-update/non_durable_reject",
+  "runs": [
+    {
+      "file": "1-NonDurableReject.json",
+      "workflow_id": "conformance-update/non_durable_reject"
+    }
+  ]
+}
