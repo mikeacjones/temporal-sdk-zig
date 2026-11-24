@@ -111,18 +111,10 @@ const ThrowingWorkflow = workflow.Def("ThrowingWorkflow", runThrowingWorkflow);
 const FailWithTransferDetail = activity.Def("fail_with_transfer_detail", failWithTransferDetail);
 const StandaloneTransferActivity = activity.Def("standalone_transfer_activity", standaloneTransferActivity);
 
-/// Whether the harness can start the dev server with standalone activities enabled. Until it
-/// can, the standalone activity step is skipped; the workflow's history is the same either way.
-const own_server = @hasField(harness.Feature, "dev_server_args");
-
-pub const feature = if (own_server) harness.define(.{
+pub const feature = harness.define(.{
     .workflows = .{ Workflow, ThrowingWorkflow },
     .activities = .{ FailWithTransferDetail, StandaloneTransferActivity },
     .dev_server_args = &temporal.testing.DevServer.standalone_activity_args,
-    .execute = execute,
-}) else harness.define(.{
-    .workflows = .{ Workflow, ThrowingWorkflow },
-    .activities = .{ FailWithTransferDetail, StandaloneTransferActivity },
     .execute = execute,
 });
 
@@ -200,11 +192,7 @@ fn runThrowingWorkflow(ctx: *workflow.Context, _: ThrowingValue) !void {
 
 fn execute(ctx: *harness.Context) !void {
     try expectThrowingStart(ctx);
-    if (own_server) {
-        try exerciseStandaloneActivity(ctx);
-    } else {
-        std.log.info("skipping the standalone activity step: the harness cannot start a dev server with standalone activities enabled", .{});
-    }
+    try exerciseStandaloneActivity(ctx);
 
     var run = try ctx.client.executeWorkflow(Workflow, ctx.startOptions(), .{
         NonGenericValue{ .value = "non-generic", .extra = "client-extra" },
