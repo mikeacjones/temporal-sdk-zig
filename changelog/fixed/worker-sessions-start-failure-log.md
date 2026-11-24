@@ -1,0 +1,1 @@
+A `worker.Worker` with `Options.sessions` whose `run` fails while starting (out of threads or memory once its core workers exist) no longer reads freed memory, which could crash the process, when it logs that a session queue's core worker failed to shut down. `run` freed the session host, which owns the session queues' names, before the core workers that the log line names.

@@ -1,0 +1,1 @@
+`worker.Worker.run` returns when it ends before polling and the worker's allocator refuses one allocation while it shuts the unused worker down, instead of waiting forever for an activity poller that never ran.
