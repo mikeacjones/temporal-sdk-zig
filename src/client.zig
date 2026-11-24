@@ -1814,11 +1814,21 @@ pub const Client = struct {
     }
 
     /// Resets a workflow: a new run of `workflow_id` starts with the history of run `run_id`
-    /// (the latest run when empty) up to `options.workflow_task_finish_event_id`, and goes on
-    /// from there. The base run, if still running, ends terminated, as does whichever run of
-    /// the workflow is current; a closed base run stays as it was. Events after the reset
-    /// point are reapplied to the new run as `options.reapply_exclude` allows. A repeated
-    /// call may reset again, even with the same `request_id`.
+    /// (the latest run when empty) up to the reset point, and goes on from there. The reset
+    /// point is `options.workflow_task_finish_event_id`, or the workflow task
+    /// `options.target` chooses. The base run, if still running, ends terminated, as does
+    /// whichever run of the workflow is current; a closed base run stays as it was. Events
+    /// after the reset point are reapplied to the new run as `options.reapply_exclude`
+    /// allows, and the server applies `options.post_reset_operations` to the new run, in
+    /// order. A repeated call may reset again, even with the same `request_id`.
+    ///
+    /// With `options.target`, the reset point is found before the reset, with ordinary
+    /// calls that retry as `describeWorkflow` and `historyIterator` do: `.first_workflow_task`
+    /// and `.last_workflow_task` read the base run's history (describing the workflow first
+    /// to pin its latest run when `run_id` is empty), and `.build_id` reads the run's reset
+    /// points from its description. The reset then names that run, so a run started in
+    /// between (continue-as-new, another reset) isn't the one reset. A target that finds no
+    /// point is `error.NoResetPoint`, logged, and nothing is reset.
     ///
     /// Returns the new run's ID, allocated from `arena` (as is everything the call
     /// allocates); `getWorkflow` makes a handle to it. A handle that names the base run's ID,
@@ -1827,25 +1837,52 @@ pub const Client = struct {
     /// with an empty run ID reads the latest run when `get` runs, so it gets the new run's
     /// result.
     ///
-    /// A non-positive event ID is `error.InvalidOptions` before any call. An event ID the
-    /// server refuses (not at a workflow task's boundary, or beyond the history) is
-    /// `error.RpcFailed`; refusals are logged as warnings with the server's reason. The
-    /// request is sent once, without the automatic retries other calls get. A transport
-    /// failure is `error.RpcFailed` too, and after it the reset may or may not have
-    /// happened: before resetting again, describe the base run, whose
+    /// Options that name no reset point or two, an empty `ResetTarget.build_id`, or a
+    /// post-reset operation that changes nothing are `error.InvalidOptions` before any call,
+    /// logged. An event ID the server refuses (not at a workflow task's boundary, or beyond
+    /// the history), or a post-reset change it refuses (such as a pin to a version no worker
+    /// has polled with), is `error.RpcFailed`; refusals are logged as warnings with the
+    /// server's reason. The reset request is sent once, without the automatic retries other
+    /// calls get. A transport failure is `error.RpcFailed` too, and after it the reset may
+    /// or may not have happened: before resetting again, describe the base run, whose
     /// `raw.workflow_extended_info.reset_run_id` names the new run once it has been reset.
     pub fn resetWorkflow(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8, options: ResetOptions) ResetError![]const u8 {
-        if (options.workflow_task_finish_event_id <= 0) {
-            log.warn("resetting workflow {s}: ResetOptions.workflow_task_finish_event_id is {d}; set it to the event ID of a workflow task's completed, failed, timed-out, or started event in the run's history (see Client.fetchHistory)", .{ workflow_id, options.workflow_task_finish_event_id });
+        if (options.target) |target| {
+            if (options.workflow_task_finish_event_id != 0) {
+                log.warn("resetting workflow {s}: both ResetOptions.workflow_task_finish_event_id ({d}) and ResetOptions.target name a reset point; set only one of them", .{ workflow_id, options.workflow_task_finish_event_id });
+                return error.InvalidOptions;
+            }
+            if (target == .build_id and target.build_id.len == 0) {
+                log.warn("resetting workflow {s}: ResetOptions.target is an empty build_id; set it to the build ID of a worker that completed a workflow task of the run", .{workflow_id});
+                return error.InvalidOptions;
+            }
+        } else if (options.workflow_task_finish_event_id <= 0) {
+            log.warn("resetting workflow {s}: ResetOptions.workflow_task_finish_event_id is {d}; set it to the event ID of a workflow task's completed, failed, timed-out, or started event in the run's history (see Client.fetchHistory and resetPointEventId), or set ResetOptions.target to choose the reset point", .{ workflow_id, options.workflow_task_finish_event_id });
             return error.InvalidOptions;
         }
+        var operations: std.ArrayList(proto.temporal.api.workflow.v1.PostResetOperation) = .empty;
+        for (options.post_reset_operations, 0..) |operation, i| switch (operation) {
+            .update_execution_options => |changes| {
+                const execution_options, const mask = try executionOptionsProto(arena, changes);
+                if (mask.paths.items.len == 0) {
+                    log.warn("resetting workflow {s}: ResetOptions.post_reset_operations[{d}] changes nothing; set a field of its WorkflowExecutionOptionsChanges such as versioning_override or priority", .{ workflow_id, i });
+                    return error.InvalidOptions;
+                }
+                try operations.append(arena, .{ .variant = .{ .update_workflow_options = .{ .workflow_execution_options = execution_options, .update_mask = mask } } });
+            },
+        };
+        const point: ResetPoint = if (options.target) |target|
+            try c.findResetPoint(arena, workflow_id, run_id, target)
+        else
+            .{ .run_id = run_id, .event_id = options.workflow_task_finish_event_id };
         var request: wfs.ResetWorkflowExecutionRequest = .{
             .namespace = c.namespace,
-            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = point.run_id },
             .reason = options.reason,
-            .workflow_task_finish_event_id = options.workflow_task_finish_event_id,
+            .workflow_task_finish_event_id = point.event_id,
             .request_id = if (options.request_id.len > 0) options.request_id else try uuid(arena, c.io),
             .identity = c.identity,
+            .post_reset_operations = operations,
         };
         const exclude = options.reapply_exclude;
         for ([_]struct { bool, enums.ResetReapplyExcludeType }{
@@ -1861,6 +1898,67 @@ pub const Client = struct {
         return response.run_id;
     }
 
+    /// A reset point `findResetPoint` found: the run to reset and the event its history
+    /// ends at.
+    const ResetPoint = struct { run_id: []const u8, event_id: i64 };
+
+    /// Finds the reset point `target` names for run `run_id` of `workflow_id` (the latest
+    /// run when empty), pinning the run: the returned run ID is never empty. Allocates the
+    /// run ID from `arena`; a history read goes through a scratch arena freed before it
+    /// returns, so a long history doesn't pile up in `arena`.
+    fn findResetPoint(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8, target: ResetTarget) ResetError!ResetPoint {
+        switch (target) {
+            .build_id => |build_id| {
+                const d = try c.describeWorkflow(arena, workflow_id, run_id);
+                const info = d.raw.workflow_execution_info orelse return error.InvalidResponse; // describeWorkflow checked it.
+                const points = if (info.auto_reset_points) |p| p.points.items else &.{};
+                const p = for (points) |p| {
+                    if (std.mem.eql(u8, p.build_id, build_id)) break p;
+                } else {
+                    log.warn("resetting workflow {s}: run {s} has no reset point for build ID {s}; nothing was reset", .{ workflow_id, d.run_id, build_id });
+                    return error.NoResetPoint;
+                };
+                const base = if (p.run_id.len > 0) p.run_id else d.run_id;
+                if (!p.resettable) {
+                    log.warn("resetting workflow {s}: the reset point of build ID {s} in run {s} isn't resettable; nothing was reset", .{ workflow_id, build_id, base });
+                    return error.NoResetPoint;
+                }
+                if (proto_time.timestampFromProto(p.expire_time)) |expires| {
+                    if (expires.nanoseconds < Io.Timestamp.now(c.io, .real).nanoseconds) {
+                        log.warn("resetting workflow {s}: the reset point of build ID {s} in run {s} has expired; nothing was reset", .{ workflow_id, build_id, base });
+                        return error.NoResetPoint;
+                    }
+                }
+                if (base.len == 0) {
+                    log.warn("DescribeWorkflowExecution for workflow {s} returned no run ID", .{workflow_id});
+                    return error.InvalidResponse;
+                }
+                return .{ .run_id = base, .event_id = p.first_workflow_task_completed_id };
+            },
+            .first_workflow_task, .last_workflow_task => {
+                const base = if (run_id.len > 0) run_id else (try c.describeWorkflow(arena, workflow_id, "")).run_id;
+                if (base.len == 0) {
+                    log.warn("DescribeWorkflowExecution for workflow {s} returned no run ID", .{workflow_id});
+                    return error.InvalidResponse;
+                }
+                var scan: ResetPointScan = .{ .point = if (target == .first_workflow_task) .first_workflow_task else .last_workflow_task };
+                var it = try c.historyIterator(workflow_id, base, .{});
+                defer it.deinit();
+                var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+                defer scratch.deinit();
+                while (try it.next(scratch.allocator())) |event| {
+                    if (scan.add(event)) break;
+                    _ = scratch.reset(.retain_capacity);
+                }
+                const event_id = scan.result() orelse {
+                    log.warn("resetting workflow {s}: run {s} has no workflow task to reset to; nothing was reset", .{ workflow_id, base });
+                    return error.NoResetPoint;
+                };
+                return .{ .run_id = base, .event_id = event_id };
+            },
+        }
+    }
+
     /// Changes the execution options of run `run_id` of `workflow_id` (the latest run when
     /// empty): each non-null field of `changes` is applied, and the others are left as they
     /// are. The server records a change in the workflow's history, once any workflow task in
@@ -1874,28 +1972,23 @@ pub const Client = struct {
     /// a version whose workers haven't polled the workflow's task queue, is
     /// `error.RpcFailed`; refusals are logged as warnings with the server's reason.
     pub fn updateWorkflowExecutionOptions(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8, changes: WorkflowExecutionOptionsChanges) UpdateExecutionOptionsError!WorkflowExecutionOptions {
-        var request: wfs.UpdateWorkflowExecutionOptionsRequest = .{
-            .namespace = c.namespace,
-            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
-            // The server requires the options even when the change only clears a field.
-            .workflow_execution_options = .{},
-            .update_mask = .{},
-            .identity = c.identity,
-        };
-        if (changes.versioning_override) |change| {
-            request.workflow_execution_options.?.versioning_override = switch (change) {
-                .set => |o| versioningOverrideProto(o),
-                .remove => null,
-            };
-            try request.update_mask.?.paths.append(arena, "versioning_override");
-        }
-        if (request.update_mask.?.paths.items.len == 0) {
-            log.warn("updating the execution options of workflow {s}: WorkflowExecutionOptionsChanges changes nothing; set a field such as versioning_override", .{workflow_id});
+        const options, const mask = try executionOptionsProto(arena, changes);
+        if (mask.paths.items.len == 0) {
+            log.warn("updating the execution options of workflow {s}: WorkflowExecutionOptionsChanges changes nothing; set a field such as versioning_override or priority", .{workflow_id});
             return error.InvalidOptions;
         }
+        const request: wfs.UpdateWorkflowExecutionOptionsRequest = .{
+            .namespace = c.namespace,
+            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .workflow_execution_options = options,
+            .update_mask = mask,
+            .identity = c.identity,
+        };
         const response = try c.workflowChange(wfs.UpdateWorkflowExecutionOptionsResponse, "UpdateWorkflowExecutionOptions", request, arena, workflow_id);
+        const result = response.workflow_execution_options;
         return .{
-            .versioning_override = if (response.workflow_execution_options) |o| deployment.VersioningOverride.fromProto(o.versioning_override) else null,
+            .versioning_override = if (result) |o| deployment.VersioningOverride.fromProto(o.versioning_override) else null,
+            .priority = if (result) |o| if (o.priority) |p| if (p.priority_key == 0 and p.fairness_key.len == 0 and p.fairness_weight == 0) null else workflow.Priority{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight } else null else null,
             .raw = response,
         };
     }
@@ -3619,10 +3712,14 @@ pub const TerminateError = error{
 
 pub const ResetOptions = struct {
     /// The event the new run's history ends at: the ID of a workflow task's completed,
-    /// failed, or timed-out event in the base run's history (see `Client.fetchHistory`);
-    /// the server also accepts the task's started event. The new run goes on from the end
-    /// of that workflow task. Required.
-    workflow_task_finish_event_id: i64,
+    /// failed, or timed-out event in the base run's history (see `resetPointEventId` and
+    /// `Client.fetchHistory`); the server also accepts the task's started event. The new run
+    /// goes on from the end of that workflow task. Set this or `target`, not both. 0 (the
+    /// default) means `target` chooses.
+    workflow_task_finish_event_id: i64 = 0,
+    /// Chooses the reset point for the caller instead of an event ID. Null means
+    /// `workflow_task_finish_event_id` names it.
+    target: ?ResetTarget = null,
     /// Recorded in the new run's history and in the terminated event of the run the reset
     /// terminates, if one was running.
     reason: []const u8 = "",
@@ -3631,6 +3728,35 @@ pub const ResetOptions = struct {
     request_id: []const u8 = "",
     /// Which kinds of events recorded after the reset point are not reapplied to the new run.
     reapply_exclude: ResetReapplyExclude = .{},
+    /// Applied by the server to the new run, in order, as part of the reset. Borrowed for
+    /// the call.
+    post_reset_operations: []const PostResetOperation = &.{},
+};
+
+/// Which workflow task `Client.resetWorkflow` resets to when the caller gives no event ID.
+/// The first and last workflow task are found in the base run's history: the event ID of
+/// its first or last workflow task completed event, or, when no workflow task has completed,
+/// the started event of its first scheduled one (which the server refuses if that task
+/// hasn't started). `resetPointEventId` applies the same rule.
+pub const ResetTarget = union(enum) {
+    /// The end of the run's first workflow task.
+    first_workflow_task,
+    /// The end of the run's last completed workflow task.
+    last_workflow_task,
+    /// The end of the first workflow task a worker with this build ID completed, as the
+    /// server recorded it in the run's reset points. Borrowed for the call. The point can
+    /// lie in an earlier run of the chain; that run is then the one reset.
+    build_id: []const u8,
+};
+
+/// One operation the server applies to the new run of a reset, as part of the reset. The
+/// server applies only execution option changes after a reset: no server release applies a
+/// signal sent this way, so there is no case for one. Signal the new run once
+/// `Client.resetWorkflow` returns instead.
+pub const PostResetOperation = union(enum) {
+    /// Changes the new run's execution options, as `Client.updateWorkflowExecutionOptions`
+    /// would. At least one field of the changes must be set.
+    update_execution_options: WorkflowExecutionOptionsChanges,
 };
 
 /// Kinds of events, recorded in the base run after the reset point, that a reset doesn't
@@ -3643,9 +3769,14 @@ pub const ResetReapplyExclude = struct {
 };
 
 pub const ResetError = error{
-    /// `ResetOptions.workflow_task_finish_event_id` isn't positive; logged, and nothing was
-    /// sent.
+    /// The options name no reset point (`workflow_task_finish_event_id` isn't positive and
+    /// `target` is null), or two (both are set); `target` is a `build_id` that is empty; or
+    /// a `post_reset_operations` entry changes nothing. Logged, and nothing was sent.
     InvalidOptions,
+    /// `ResetOptions.target` found no reset point: the history has no workflow task, or the
+    /// run's reset points have none for the build ID, or that point isn't resettable or has
+    /// expired. Logged, and nothing was reset.
+    NoResetPoint,
     /// A payload codec failed encoding the request (logged), or an interceptor returned it.
     CodecFailed,
     OutOfMemory,
@@ -3659,10 +3790,75 @@ pub const ResetError = error{
     InvalidResponse,
 };
 
+/// Which workflow task of a history `resetPointEventId` looks for.
+pub const HistoryResetPoint = union(enum) {
+    /// The first completed workflow task; when none has completed, the started event of the
+    /// first scheduled one.
+    first_workflow_task,
+    /// The last completed workflow task; when none has completed, the started event of the
+    /// first scheduled one.
+    last_workflow_task,
+    /// The last workflow task that completed at or before this time. Events without a time
+    /// are skipped.
+    last_workflow_task_at_or_before: Io.Timestamp,
+};
+
+/// The event ID to pass as `ResetOptions.workflow_task_finish_event_id`, or null when
+/// `events` has no such point. `events` is a run's history, oldest first, such as
+/// `(try client.fetchHistory(arena, id, run_id)).events.items`. The first and last workflow
+/// task follow the same rule as `ResetTarget`. Allocates nothing; safe from any thread.
+pub fn resetPointEventId(events: []const HistoryEvent, point: HistoryResetPoint) ?i64 {
+    var scan: ResetPointScan = .{ .point = point };
+    for (events) |event| if (scan.add(event)) break;
+    return scan.result();
+}
+
+/// The rule `resetPointEventId` and `ResetTarget` share, fed a history one event at a time,
+/// oldest first. It is the server's batch-reset rule, so both give the event ID the server
+/// would.
+const ResetPointScan = struct {
+    point: HistoryResetPoint,
+    found: ?i64 = null,
+    first_scheduled: ?i64 = null,
+
+    /// Takes the next event; true when the rest of the history can't change the result.
+    fn add(scan: *ResetPointScan, event: HistoryEvent) bool {
+        switch (event.event_type) {
+            .EVENT_TYPE_WORKFLOW_TASK_SCHEDULED => {
+                if (scan.first_scheduled == null) scan.first_scheduled = event.event_id;
+            },
+            .EVENT_TYPE_WORKFLOW_TASK_COMPLETED => switch (scan.point) {
+                .first_workflow_task => {
+                    scan.found = event.event_id;
+                    return true;
+                },
+                .last_workflow_task => scan.found = event.event_id,
+                .last_workflow_task_at_or_before => |limit| {
+                    const time = proto_time.timestampFromProto(event.event_time) orelse return false;
+                    if (time.nanoseconds <= limit.nanoseconds) scan.found = event.event_id;
+                },
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    fn result(scan: *const ResetPointScan) ?i64 {
+        if (scan.found) |id| return id;
+        return switch (scan.point) {
+            .first_workflow_task, .last_workflow_task => if (scan.first_scheduled) |id| id + 1 else null,
+            .last_workflow_task_at_or_before => null,
+        };
+    }
+};
+
 /// The changes `Client.updateWorkflowExecutionOptions` makes. A null field leaves that
 /// option as it is; at least one must be set.
 pub const WorkflowExecutionOptionsChanges = struct {
     versioning_override: ?VersioningOverrideChange = null,
+    /// Replaces the workflow's task priority and fairness as a whole. `.{}` puts every
+    /// field back to the server's default. Needs server 1.30 or later.
+    priority: ?workflow.Priority = null,
 };
 
 pub const VersioningOverrideChange = union(enum) {
@@ -3680,6 +3876,8 @@ pub const WorkflowExecutionOptions = struct {
     /// Null when the run has no override, or one of a kind this SDK has no case for (read
     /// it from `raw`).
     versioning_override: ?deployment.VersioningOverride,
+    /// Null when the run has no priority or every field is at its default.
+    priority: ?workflow.Priority,
     /// The full server response, for anything not lifted into the fields above.
     raw: wfs.UpdateWorkflowExecutionOptionsResponse,
 };
@@ -3767,6 +3965,27 @@ fn versioningOverrideProto(o: deployment.VersioningOverride) proto.temporal.api.
         } },
         .auto_upgrade => .{ .auto_upgrade = true },
     } };
+}
+
+/// The execution options and update mask that apply `changes`, as the server's update and
+/// post-reset requests carry them; borrows `changes`' slices, and the mask's list is
+/// allocated from `arena`. The options are always present: the server requires them even
+/// when the change only clears a field. An empty mask means `changes` changes nothing.
+fn executionOptionsProto(arena: Allocator, changes: WorkflowExecutionOptionsChanges) error{OutOfMemory}!struct { proto.temporal.api.workflow.v1.WorkflowExecutionOptions, proto.google.protobuf.FieldMask } {
+    var options: proto.temporal.api.workflow.v1.WorkflowExecutionOptions = .{};
+    var mask: proto.google.protobuf.FieldMask = .{};
+    if (changes.versioning_override) |change| {
+        options.versioning_override = switch (change) {
+            .set => |o| versioningOverrideProto(o),
+            .remove => null,
+        };
+        try mask.paths.append(arena, "versioning_override");
+    }
+    if (changes.priority) |p| {
+        options.priority = .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight };
+        try mask.paths.append(arena, "priority");
+    }
+    return .{ options, mask };
 }
 
 /// Lifts the fields of `info` into a `WorkflowExecutionInfo` that borrows it.
@@ -5218,6 +5437,11 @@ pub fn WorkflowRun(comptime T: type) type {
         /// again. A run that has closed but whose history keeps coming back without a close
         /// event returns `error.InvalidResponse` after `max_empty_pages_after_close` such
         /// pages, logged. A run that no longer exists returns `error.NotFound`.
+        ///
+        /// A reset is not followed: a handle that names a run ID reports
+        /// `error.WorkflowTerminated` once that run is reset (or the run's own result if it
+        /// had closed), while a handle with an empty run ID reads the latest run and so gets
+        /// the new run's result.
         pub fn get(run: *Self, arena: Allocator) ResultError!T {
             return run.getWithOptions(arena, .{});
         }

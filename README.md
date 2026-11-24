@@ -634,21 +634,19 @@ Notes:
 
 #### Workflow reset and execution options
 
-`Client.resetWorkflow` starts a new run of a workflow from an earlier point in a run's history, the end of a workflow task, and returns the new run's ID. `Client.updateWorkflowExecutionOptions` changes a running workflow's execution options, such as its versioning override.
+`Client.resetWorkflow` starts a new run of a workflow from an earlier point in a run's history, the end of a workflow task, and returns the new run's ID. The reset point is an event ID, or a `ResetOptions.target` the client finds in the run: its first or last workflow task, or the first one a given build ID completed. `ResetOptions.post_reset_operations` changes the new run's execution options as part of the reset. `Client.updateWorkflowExecutionOptions` changes a running workflow's execution options, such as its versioning override and its priority.
 
 <!-- example: client-reset -->
 ```zig
 // Reset the latest run to the end of its first workflow task: the new run keeps the
-// history up to there. Reading the run ID once makes both calls name the same run.
-const run_id = (try client.describeWorkflow(arena, workflow_id, "")).run_id;
-const history = try client.fetchHistory(arena, workflow_id, run_id);
-const first_task = for (history.events.items) |event| {
-    if (event.attributes) |attrs| if (attrs == .workflow_task_completed_event_attributes) break event.event_id;
-} else return error.NoCompletedWorkflowTask;
-const new_run_id = try client.resetWorkflow(arena, workflow_id, run_id, .{
-    .workflow_task_finish_event_id = first_task,
+// history up to there. The client finds the point in the run's history and resets
+// that same run, even if another run starts in between.
+const new_run_id = try client.resetWorkflow(arena, workflow_id, "", .{
+    .target = .first_workflow_task,
     .reason = "greet again",
     .reapply_exclude = .{ .signals = true }, // the new run doesn't get the earlier `finish`
+    // Applied to the new run as part of the reset: its tasks go ahead of others.
+    .post_reset_operations = &.{.{ .update_execution_options = .{ .priority = .{ .priority_key = 1 } } }},
 });
 var new_run = try client.getWorkflow([]const u8, workflow_id, new_run_id);
 defer new_run.deinit();
@@ -656,23 +654,47 @@ defer new_run.deinit();
 
 <!-- example: client-execution-options -->
 ```zig
-// Auto-upgrade from the next workflow task on, whatever the workflow's definition says.
+// Auto-upgrade from the next workflow task on, whatever the workflow's definition says,
+// and dispatch its tasks after other work on the task queue.
 const options = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{
     .versioning_override = .{ .set = .auto_upgrade },
+    .priority = .{ .priority_key = 5 },
 });
-std.log.info("versioning override: {s}", .{if (options.versioning_override) |o| @tagName(o) else "none"});
-// Back to the definition's behavior.
-_ = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{ .versioning_override = .remove });
+std.log.info("versioning override: {s}, priority key: {d}", .{
+    if (options.versioning_override) |o| @tagName(o) else "none",
+    if (options.priority) |p| p.priority_key else 0,
+});
+// Back to the definition's behavior and the default priority.
+_ = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{ .versioning_override = .remove, .priority = .{} });
+```
+
+<!-- example: client-reset-point -->
+```zig
+// Reset to the last workflow task that completed at or before `before`, such as the
+// moment a bad deployment started. Reading the history of a named run makes both calls
+// name the same run.
+const history = try client.fetchHistory(arena, workflow_id, run_id);
+const point = temporal.client.resetPointEventId(history.events.items, .{
+    .last_workflow_task_at_or_before = before,
+}) orelse return error.NoWorkflowTaskBefore;
+const new_run_id = try client.resetWorkflow(arena, workflow_id, run_id, .{
+    .workflow_task_finish_event_id = point,
+    .reason = "undo the bad deployment",
+});
 ```
 Notes:
-- The reset point is the event ID of a workflow task's completed, failed, or timed-out event, or its started event, found with `Client.fetchHistory`; a non-positive one is `error.InvalidOptions`, and one the server refuses is `error.RpcFailed`. An unknown workflow or run is `error.NotFound`.
-- A running base run ends terminated, as does the workflow's current run; a closed base run stays as it was. A handle that names the base run's ID, such as one `executeWorkflow` returned, doesn't follow the reset: its `get` returns `error.WorkflowTerminated` (or the run's own result if it had closed). A handle made with an empty run ID reads the latest run when `get` runs, so it gets the new run's result.
+- The reset point is the event ID of a workflow task's completed, failed, or timed-out event, or its started event, in `ResetOptions.workflow_task_finish_event_id`, or a `ResetOptions.target`; set one of them. Naming neither or both, or an empty `.build_id`, is `error.InvalidOptions` before any call. An event ID the server refuses is `error.RpcFailed`. An unknown workflow or run is `error.NotFound`.
+- `.first_workflow_task` and `.last_workflow_task` read the base run's history: the event ID of its first or last workflow task completed event, or, when no workflow task has completed, the started event of the first scheduled one (which the server refuses as `error.RpcFailed` if that task hasn't started). With an empty run ID, the client first describes the workflow to pin its latest run, and the reset names that run.
+- `.build_id` resets to the end of the first workflow task a worker with that build ID (`worker.Options.build_id`) completed, as the server recorded it in the run's reset points. That point can be in an earlier run of the chain, which is then the run reset.
+- A target that finds no point is `error.NoResetPoint`, and nothing is reset: a history with no workflow task, or no reset point for the build ID, or one that isn't resettable or has expired.
+- `client.resetPointEventId(events, point)` gives the event ID for a history you read yourself, with the same rule for the first and last workflow task, and `.last_workflow_task_at_or_before` finds the last workflow task that completed at or before a time. It returns null when there is no such point.
+- A running base run ends terminated, as does the workflow's current run; a closed base run stays as it was. `WorkflowRun.get` on a handle that names the base run's ID, such as one `executeWorkflow` returned, doesn't follow the reset: it returns `error.WorkflowTerminated` (or the run's own result if it had closed). A handle made with an empty run ID reads the latest run when `get` runs, so it gets the new run's result.
 - Signals, updates, and Nexus events recorded after the reset point are reapplied to the new run unless `ResetOptions.reapply_exclude` excludes them. Don't rely on `request_id` to deduplicate: a repeated request may reset again.
-- A reset is sent once, without the automatic retries other calls get, unless it is made through a view whose `RpcOptions.retry` is `true`, which retries it and can reset twice. A transport failure is `error.RpcFailed` too, and after it the reset may or may not have happened: before resetting again, describe the base run, whose `raw.workflow_extended_info.reset_run_id` names the new run once it has been reset.
+- `ResetOptions.post_reset_operations` are applied by the server to the new run, in order, as part of the reset. Each is a `WorkflowExecutionOptionsChanges` that must change something, or the reset is `error.InvalidOptions`. A change the server refuses, such as a pin to a version no worker has polled with, fails the reset with `error.RpcFailed`. There is no post-reset signal: no server release applies one, so signal the new run after `resetWorkflow` returns.
+- A reset is sent once, without the automatic retries other calls get, unless it is made through a view whose `RpcOptions.retry` is `true`, which retries it and can reset twice. The calls a target makes before it are ordinary calls and retry. A transport failure of the reset is `error.RpcFailed` too, and after it the reset may or may not have happened: before resetting again, describe the base run, whose `raw.workflow_extended_info.reset_run_id` names the new run once it has been reset.
 - In `WorkflowExecutionOptionsChanges`, `null` leaves an option as it is, `.remove` clears the override, and `.set` replaces it; changing nothing is `error.InvalidOptions`. A pin (`.set = .{ .pinned = version }`) needs a worker of that version to have polled the workflow's task queue, or it is `error.RpcFailed`; auto-upgrade needs none. A closed workflow is `error.NotFound`.
+- `priority` replaces the workflow's priority and fairness as a whole, and `.{}` puts them back to the server's defaults. It needs server 1.30 or later. `WorkflowExecutionOptions.priority` reads it back, null when every field is at its default.
 - The server's refusals are logged as warnings with its reason.
-<!-- stub: temporal-sdk-zig-d51.5.30 -->
-- Not implemented yet: operations applied after a reset, helpers that pick a reset point, and changing a workflow's priority or time-skipping configuration.
 
 #### Namespaces and raw service access
 

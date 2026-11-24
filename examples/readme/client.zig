@@ -338,16 +338,14 @@ pub fn stopChain(client: *temporal.client.Client, workflow_id: []const u8, first
 pub fn resetGreeter(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8) ![]const u8 {
     // example: client-reset
     // Reset the latest run to the end of its first workflow task: the new run keeps the
-    // history up to there. Reading the run ID once makes both calls name the same run.
-    const run_id = (try client.describeWorkflow(arena, workflow_id, "")).run_id;
-    const history = try client.fetchHistory(arena, workflow_id, run_id);
-    const first_task = for (history.events.items) |event| {
-        if (event.attributes) |attrs| if (attrs == .workflow_task_completed_event_attributes) break event.event_id;
-    } else return error.NoCompletedWorkflowTask;
-    const new_run_id = try client.resetWorkflow(arena, workflow_id, run_id, .{
-        .workflow_task_finish_event_id = first_task,
+    // history up to there. The client finds the point in the run's history and resets
+    // that same run, even if another run starts in between.
+    const new_run_id = try client.resetWorkflow(arena, workflow_id, "", .{
+        .target = .first_workflow_task,
         .reason = "greet again",
         .reapply_exclude = .{ .signals = true }, // the new run doesn't get the earlier `finish`
+        // Applied to the new run as part of the reset: its tasks go ahead of others.
+        .post_reset_operations = &.{.{ .update_execution_options = .{ .priority = .{ .priority_key = 1 } } }},
     });
     var new_run = try client.getWorkflow([]const u8, workflow_id, new_run_id);
     defer new_run.deinit();
@@ -357,14 +355,36 @@ pub fn resetGreeter(client: *temporal.client.Client, arena: Allocator, workflow_
 
 pub fn overrideVersioning(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8) !void {
     // example: client-execution-options
-    // Auto-upgrade from the next workflow task on, whatever the workflow's definition says.
+    // Auto-upgrade from the next workflow task on, whatever the workflow's definition says,
+    // and dispatch its tasks after other work on the task queue.
     const options = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{
         .versioning_override = .{ .set = .auto_upgrade },
+        .priority = .{ .priority_key = 5 },
     });
-    std.log.info("versioning override: {s}", .{if (options.versioning_override) |o| @tagName(o) else "none"});
-    // Back to the definition's behavior.
-    _ = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{ .versioning_override = .remove });
+    std.log.info("versioning override: {s}, priority key: {d}", .{
+        if (options.versioning_override) |o| @tagName(o) else "none",
+        if (options.priority) |p| p.priority_key else 0,
+    });
+    // Back to the definition's behavior and the default priority.
+    _ = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{ .versioning_override = .remove, .priority = .{} });
     // end-example
+}
+
+pub fn resetBefore(client: *temporal.client.Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8, before: Io.Timestamp) ![]const u8 {
+    // example: client-reset-point
+    // Reset to the last workflow task that completed at or before `before`, such as the
+    // moment a bad deployment started. Reading the history of a named run makes both calls
+    // name the same run.
+    const history = try client.fetchHistory(arena, workflow_id, run_id);
+    const point = temporal.client.resetPointEventId(history.events.items, .{
+        .last_workflow_task_at_or_before = before,
+    }) orelse return error.NoWorkflowTaskBefore;
+    const new_run_id = try client.resetWorkflow(arena, workflow_id, run_id, .{
+        .workflow_task_finish_event_id = point,
+        .reason = "undo the bad deployment",
+    });
+    // end-example
+    return new_run_id;
 }
 
 pub fn scheduleGreetings(client: *temporal.client.Client, arena: Allocator) !void {
@@ -619,19 +639,27 @@ test "client: examples against a dev server" {
     var changes: std.ArrayList(temporal.proto.temporal.api.history.v1.WorkflowExecutionOptionsUpdatedEventAttributes) = .empty;
     var events = try client.historyIterator(reset.id, reset.run_id, .{ .wait_new_event = true });
     defer events.deinit();
-    while (changes.items.len < 2) {
+    // The first is the reset's post-reset operation.
+    while (changes.items.len < 3) {
         const event = (try events.next(arena)) orelse return error.TestUnexpectedResult;
         const attrs = event.attributes orelse continue;
         if (attrs == .workflow_execution_options_updated_event_attributes) try changes.append(arena, attrs.workflow_execution_options_updated_event_attributes);
     }
-    const set = changes.items[0].versioning_override orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(1, (changes.items[0].priority orelse return error.TestUnexpectedResult).priority_key);
+    const set = changes.items[1].versioning_override orelse return error.TestUnexpectedResult;
     try std.testing.expect((set.override orelse return error.TestUnexpectedResult) == .auto_upgrade);
-    try std.testing.expect(changes.items[1].unset_versioning_override);
+    try std.testing.expectEqual(5, (changes.items[1].priority orelse return error.TestUnexpectedResult).priority_key);
+    try std.testing.expect(changes.items[2].unset_versioning_override);
+    // Before the update and the signal, which a reset to this time reapplies.
+    const before_update = Io.Timestamp.now(io, .real);
     var update = try client.updateWorkflow(SetGreeting, reset.id, reset.run_id, .{"Hi"}, .{});
     defer update.deinit();
     try std.testing.expectEqualStrings("Hello", try update.get(arena));
     try client.signalWorkflow(Finish, reset.id, reset.run_id, .{});
     try std.testing.expectEqualStrings("Hi, Ada!", try reset.get(arena));
+    var undone = try client.getWorkflow([]const u8, reset.id, try resetBefore(&client, arena, reset.id, reset.run_id, before_update));
+    defer undone.deinit();
+    try std.testing.expectEqualStrings("Hi, Ada!", try undone.get(arena));
     try scheduleGreetings(&client, arena);
     try std.testing.expectEqualStrings("Hello, Ada!", try runStandaloneActivity(&client, arena));
     try std.testing.expectEqualStrings("Hello, Grace!", try controlStandaloneActivity(&client, arena));
