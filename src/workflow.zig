@@ -60,6 +60,14 @@
 //! A value read often that changes rarely uses `ctx.mutableSideEffect` instead, which records
 //! a new value only when it differs from the last one recorded.
 //!
+//! A library or interceptor that keeps state for each run declares a `LocalVar`: a typed
+//! value with a default, which any code holding the run's `*Context` reads and sets, and
+//! which each run has its own copy of. Query handlers, update validators and side-effect
+//! functions may read it but not set it:
+//!
+//!     const depth: temporal.workflow.LocalVar(u32) = .{ .name = "audit.depth", .default = 0 };
+//!     try depth.set(ctx, depth.get(ctx) + 1);
+//!
 //! Concurrency in a workflow uses `std.Io`, which `ctx.io()` implements deterministically:
 //!
 //! - Coroutines: `io.async(fn, args)`, or `std.Io.Group.async` for a set of them.
@@ -1102,7 +1110,7 @@ pub const Context = struct {
     /// For a value that is read often and changes rarely, use `mutableSideEffect`, which
     /// records a new value only when it differs from the last one recorded.
     pub fn sideEffect(ctx: *Context, comptime T: type, context: anytype, comptime func: fn (@TypeOf(context)) T) SideEffectError!T {
-        const value: ?converter.Payload = if (ctx.instance.replaying) null else try converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), func(context));
+        const value: ?converter.Payload = if (ctx.instance.replaying) null else try converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), ctx.callSideEffectFn(T, func, .{context}));
         const future: ActivityFuture(T) = .{ .ctx = ctx, .state = ctx.instance.sideEffect(value).state };
         return future.get() catch |err| switch (err) {
             error.ActivityFailed => error.SideEffectFailed,
@@ -1155,14 +1163,14 @@ pub const Context = struct {
         const call = try inst.mutableSideEffectBegin(id);
         var value: ?converter.Payload = null;
         const changed = if (inst.replaying) try inst.mutableSideEffectNotified(id, call) else changed: {
-            const current = func(context);
+            const current = ctx.callSideEffectFn(T, func, .{context});
             if (inst.mutableSideEffectValue(id)) |recorded| {
                 // The previous value is decoded into scratch memory freed before returning, so
                 // an unchanged call holds as much of the run's memory as it does on replay.
                 var scratch: std.heap.ArenaAllocator = .init(inst.arena());
                 defer scratch.deinit();
                 const previous = converter.fromPayloadWithContext(T, scratch.allocator(), ctx.converterContext(), recorded) catch |err| return mapDecodeError(err);
-                if (eql(previous, current)) break :changed false;
+                if (ctx.callSideEffectFn(bool, eql, .{ previous, current })) break :changed false;
             }
             value = try converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), current);
             break :changed true;
@@ -1173,6 +1181,14 @@ pub const Context = struct {
             return error.SideEffectFailed;
         };
         return converter.fromPayloadWithContext(T, ctx.allocator(), ctx.converterContext(), recorded) catch |err| mapDecodeError(err);
+    }
+
+    /// Calls a side-effect function, marking it as one for `LocalVar.set` (see
+    /// `Instance.beginSideEffect`).
+    fn callSideEffectFn(ctx: *Context, comptime R: type, comptime f: anytype, args: anytype) R {
+        const previous = ctx.instance.beginSideEffect();
+        defer ctx.instance.endSideEffect(previous);
+        return @call(.auto, f, args);
     }
 
     fn mapDecodeError(err: converter.DecodeError) SideEffectError {
@@ -2426,6 +2442,84 @@ fn alreadyStarted(f: *const failure_mod.Failure) bool {
         }
     }
     return false;
+}
+
+/// A variable scoped to one workflow run, for libraries and interceptors that keep per-run
+/// state without threading it through the workflow's code. Declare it once, usually as a
+/// container-level constant, and build it with a struct literal:
+///
+///     const depth: temporal.workflow.LocalVar(u32) = .{ .name = "audit.depth", .default = 0 };
+///
+///     try depth.set(ctx, depth.get(ctx) + 1);
+///
+/// Any code of the run that holds its `*Context` reaches the same value: the workflow
+/// function, the coroutines it starts, its signal and update handlers, and the run's
+/// workflow interceptors (with the `Context` `interceptor.Worker.interceptWorkflow` got).
+/// Each run has its own values, which start at `default` and are freed with the run, when it
+/// completes or is evicted; a run rebuilt from history gets them back by replaying the code
+/// that set them.
+///
+/// A variable is its `name` and its `T`: copies are the same variable, and so are two
+/// declarations with the same name and type, so a library should prefix its names
+/// ("mylib.depth"). The same name with another `T` is another variable.
+///
+/// The value is immutable and may be shared by every run and thread; `get` and `set` are
+/// workflow code, on the run's worker thread only.
+pub fn LocalVar(comptime T: type) type {
+    return struct {
+        /// Identifies the variable within a run, together with `T`. Copied into the run's
+        /// memory the first time the run sets it.
+        name: []const u8,
+        /// What `get` returns in a run that has not set the variable.
+        default: T,
+
+        pub const Value = T;
+
+        /// Identifies `T` within a run's table by its address, which no other type's
+        /// `LocalVar` shares, even one with the same `@typeName`. Never written.
+        var type_id: u8 = 0;
+
+        /// `ReadOnly`: the caller is a query handler, an update validator, or a side-effect
+        /// function (`func` of `Context.sideEffect`, `func` or `eql` of
+        /// `Context.mutableSideEffect`), none of which runs again when the run is replayed.
+        /// The value is unchanged. In a query handler or validator the query fails, or the
+        /// update is rejected, with a `ReadOnlyViolation` failure naming `LocalVar.set`; in a
+        /// side-effect function a warning naming the variable is logged.
+        /// `OutOfMemory`: the run's first set of the variable could not allocate it; it stays
+        /// unset.
+        pub const SetError = error{ OutOfMemory, ReadOnly };
+
+        /// The value the run last set, or `default`. Allowed everywhere, read-only code
+        /// included.
+        pub fn get(v: @This(), ctx: *const Context) T {
+            if (@sizeOf(T) == 0) return v.default;
+            const box = ctx.instance.localValue(v.name, &type_id) orelse return v.default;
+            return @as(*const T, @ptrCast(@alignCast(box))).*;
+        }
+
+        /// Sets the run's value. `value` is copied shallowly into the run's memory; memory it
+        /// points to (a string's bytes) is borrowed and must outlive the run or come from
+        /// `ctx.allocator()`. The first set of a variable in a run allocates it; later sets
+        /// overwrite it in place.
+        pub fn set(v: @This(), ctx: *Context, value: T) SetError!void {
+            const inst = ctx.instance;
+            if (inst.refuseLocalSet()) {
+                if (!inst.wio.refuse("LocalVar.set"))
+                    inst.logger.warn("LocalVar.set in a side-effect function is refused: side-effect functions don't run on replay, so the value would differ there; set it from the code that calls sideEffect or mutableSideEffect", .{ .LocalVar = v.name });
+                return error.ReadOnly;
+            }
+            if (@sizeOf(T) == 0) return;
+            if (inst.localValue(v.name, &type_id)) |box| {
+                @as(*T, @ptrCast(@alignCast(box))).* = value;
+                return;
+            }
+            const a = inst.arena();
+            const box = try a.create(T);
+            errdefer a.destroy(box);
+            box.* = value;
+            try inst.addLocalValue(v.name, &type_id, @ptrCast(box));
+        }
+    };
 }
 
 /// The signals of one name, from `Context.signalChannel` or `signalChannelByName`, read in

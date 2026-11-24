@@ -804,3 +804,52 @@ test "workflows: the worker answers the stack trace query for every workflow" {
     } else return error.TestNeverWaited;
     try testing.expect(std.mem.startsWith(u8, answer, "workflow \"reminder\": 1 coroutine\n\ncoroutine 1 \"workflow\", the workflow function, waits on a timer (1h)\n  at "));
 }
+
+// example: workflow-local-var
+/// How many activities the run has scheduled, kept by `ActivityCounter` for any code of the run.
+pub const activities_scheduled: workflow.LocalVar(u32) = .{ .name = "readme.activities_scheduled", .default = 0 };
+
+pub const ActivityCounter = struct {
+    pub fn interceptWorkflow(_: *ActivityCounter, ctx: *workflow.Context) error{OutOfMemory}!temporal.interceptor.Workflow {
+        // The first set allocates the run's value, so the sets below can't fail.
+        activities_scheduled.set(ctx, 0) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ReadOnly => unreachable, // interceptWorkflow is not read-only code
+        };
+        const run = try ctx.allocator().create(Run);
+        run.* = .{ .ctx = ctx };
+        return .{ .outbound = temporal.interceptor.WorkflowOutbound.from(Run, run) };
+    }
+
+    const Run = struct {
+        ctx: *workflow.Context,
+
+        pub fn executeActivity(r: *Run, input: temporal.interceptor.ActivityInput, next: temporal.interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(temporal.converter.Payload) {
+            activities_scheduled.set(r.ctx, activities_scheduled.get(r.ctx) + 1) catch {};
+            return next.executeActivity(input);
+        }
+    };
+};
+
+fn greetAndCount(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    _ = try ctx.executeActivity(Greet, greet_options, .{name}).get();
+    const second = try ctx.executeActivity(Greet, greet_options, .{name}).get();
+    return std.fmt.allocPrint(ctx.allocator(), "{s} after {d} activities", .{ second, activities_scheduled.get(ctx) });
+}
+pub const GreetAndCount = workflow.Def("greet_and_count", greetAndCount);
+// end-example
+
+test "workflows: an interceptor keeps a workflow-local count that the workflow reads" {
+    var counter: ActivityCounter = .{};
+    const interceptors = [_]temporal.interceptor.Worker{.from(ActivityCounter, &counter)};
+    const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(GreetAndCount);
+    try env.registerActivity(Greet);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("Hello, Ann! after 2 activities", try env.executeWorkflow(GreetAndCount, .{"Ann"}, a, null));
+    try testing.expectEqualStrings("Hello, Bo! after 2 activities", try env.executeWorkflow(GreetAndCount, .{"Bo"}, a, null));
+}

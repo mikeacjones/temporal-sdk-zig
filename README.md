@@ -1348,6 +1348,51 @@ Notes:
 - `ctx.isReplaying()` says whether the task replays history. `ctx.metrics()` records nothing during replay, and `ctx.logger()` drops its records then, and while the run is evicted from the worker's cache (its code unwinding with `error.Canceled` after the worker stops or drops the run), unless `worker.Options.log_during_replay` is set. Eviction doesn't change `ctx.isReplaying()`: it keeps the value the last activation set.
 - `ctx.lastCompletionResult(T)` and `ctx.previousRunFailure()` read a cron or retried workflow's previous run.
 
+#### Workflow-local variables
+`workflow.LocalVar(T)` is a typed value scoped to one workflow run, for a library or an interceptor that keeps state per run without the workflow passing it around. Declare it once with a name and a default; any code of the run holding its `*workflow.Context` reads it with `get` and sets it with `set`: the workflow function, the coroutines it starts, its handlers, and the run's workflow interceptors.
+
+<!-- example: workflow-local-var -->
+```zig
+/// How many activities the run has scheduled, kept by `ActivityCounter` for any code of the run.
+pub const activities_scheduled: workflow.LocalVar(u32) = .{ .name = "readme.activities_scheduled", .default = 0 };
+
+pub const ActivityCounter = struct {
+    pub fn interceptWorkflow(_: *ActivityCounter, ctx: *workflow.Context) error{OutOfMemory}!temporal.interceptor.Workflow {
+        // The first set allocates the run's value, so the sets below can't fail.
+        activities_scheduled.set(ctx, 0) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ReadOnly => unreachable, // interceptWorkflow is not read-only code
+        };
+        const run = try ctx.allocator().create(Run);
+        run.* = .{ .ctx = ctx };
+        return .{ .outbound = temporal.interceptor.WorkflowOutbound.from(Run, run) };
+    }
+
+    const Run = struct {
+        ctx: *workflow.Context,
+
+        pub fn executeActivity(r: *Run, input: temporal.interceptor.ActivityInput, next: temporal.interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(temporal.converter.Payload) {
+            activities_scheduled.set(r.ctx, activities_scheduled.get(r.ctx) + 1) catch {};
+            return next.executeActivity(input);
+        }
+    };
+};
+
+fn greetAndCount(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    _ = try ctx.executeActivity(Greet, greet_options, .{name}).get();
+    const second = try ctx.executeActivity(Greet, greet_options, .{name}).get();
+    return std.fmt.allocPrint(ctx.allocator(), "{s} after {d} activities", .{ second, activities_scheduled.get(ctx) });
+}
+pub const GreetAndCount = workflow.Def("greet_and_count", greetAndCount);
+```
+
+Notes:
+- Each run has its own values. They start at the default, are freed with the run when it completes or is evicted from the worker's cache, and a run rebuilt from history gets them back by replaying the code that set them.
+- A variable is its name and its type: copies of a declaration, and two declarations with the same name and type, are the same variable, so prefix names with your library's (`"mylib.depth"`). The same name with another type is another variable.
+- `set` copies the value shallowly into the run's memory. Memory it points to, such as a string's bytes, is borrowed: it must outlive the run or come from `ctx.allocator()`. The first set of a variable in a run allocates it (`error.OutOfMemory`, which leaves it unset); later sets overwrite it in place.
+- `get` works everywhere. `set` returns `error.ReadOnly`, leaving the value unchanged, in code that doesn't run again on replay: a query handler or an update validator, where the query then fails or the update is rejected with a `ReadOnlyViolation` failure naming `LocalVar.set`, and the function of `sideEffect` or the function or comparison of `mutableSideEffect`, where a warning naming the variable is logged.
+- A declaration may be shared by every run and thread; `get` and `set` are workflow code.
+
 #### Failure policy
 
 An error that workflow code returns either fails the workflow, which closes the run, or fails the workflow task, which leaves the run open: the server retries the task, and the retry replays the history with whatever code the worker that takes it runs. By default `error.OutOfMemory` fails the task, `error.Canceled` cancels the workflow, and every other error fails the workflow, because a Zig workflow that returns an error means to fail. `worker.Options.workflow_task_failure_errors` lists errors that fail the task instead, for every workflow of a worker, and `workflow.DefOptions.task_failure_errors` lists them for one definition; an error either list names fails the task. `nondeterminism_fails_workflow`, on either, fails the workflow instead of the task when a run's code no longer matches its history.

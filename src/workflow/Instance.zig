@@ -261,6 +261,12 @@ versions: std.StringHashMapUnmanaged(i32) = .empty,
 /// The state of each mutable side effect (`workflow.Context.mutableSideEffect`) by its ID.
 /// Arena memory, keys included.
 mutable_side_effects: std.StringHashMapUnmanaged(MutableSideEffect) = .empty,
+/// The workflow-local variables the run has set (`workflow.LocalVar`), in the order first
+/// set, scanned linearly. Arena memory, names and values included.
+local_values: std.ArrayList(LocalValue) = .empty,
+/// The coroutine running a side-effect function now (`func` of `workflow.Context.sideEffect`,
+/// `func` or `eql` of `mutableSideEffect`), if one is; see `beginSideEffect`.
+side_effect: ?SideEffectMarker = null,
 /// Sent with each successful completion when `send_versioning_behavior`; starts as the
 /// registered workflow's.
 versioning_behavior: workflow.VersioningBehavior = .unspecified,
@@ -1181,6 +1187,61 @@ fn readOnlyFailure(a: Allocator, what: []const u8, name: []const u8, call: []con
         .message = try std.fmt.allocPrint(a, "{s} for \"{s}\" called {s}, which query handlers and update validators may not call: they only read workflow state, so they must not start activities, timers, child workflows or other commands, or block", .{ what, name, call }),
         .type = "ReadOnlyViolation",
     });
+}
+
+// ---------------------------------------------------------------- workflow-local variables
+
+/// One variable of `local_values`: its name, its type's identity (`workflow.LocalVar(T)`'s
+/// `type_id`), and its box, which `workflow.LocalVar(T).set` overwrites in place.
+pub const LocalValue = struct {
+    name: []const u8,
+    /// The address of a global that exists once per `T`. Not `@typeName(T)`: two types can
+    /// share a name (a struct declared in a type-returning function, for each argument), and
+    /// a box of one read as the other would be read or written past its end.
+    type_id: *const anyopaque,
+    value: *anyopaque,
+};
+
+/// The box of the variable named `name` with type identity `type_id`, or null if the run has
+/// not set it.
+pub fn localValue(inst: *const Instance, name: []const u8, type_id: *const anyopaque) ?*anyopaque {
+    for (inst.local_values.items) |v| {
+        if (v.type_id == type_id and std.mem.eql(u8, v.name, name)) return v.value;
+    }
+    return null;
+}
+
+/// Adds the variable `name` with type identity `type_id` (static) and its box `value` (arena
+/// memory). `name` is copied; on error nothing is added and the copy is freed.
+pub fn addLocalValue(inst: *Instance, name: []const u8, type_id: *const anyopaque, value: *anyopaque) error{OutOfMemory}!void {
+    const a = inst.arena();
+    const copy = try a.dupe(u8, name);
+    errdefer a.free(copy);
+    try inst.local_values.append(a, .{ .name = copy, .type_id = type_id, .value = value });
+}
+
+/// Whether the code running now may not set a workflow-local variable: a query handler or an
+/// update validator (not in history), or a side-effect function (not run on replay). A set
+/// there would leave the run with a value a replay of its history doesn't give it.
+pub fn refuseLocalSet(inst: *Instance) bool {
+    if (inst.side_effect) |m| if (m.fiber == inst.sched.currentFiber()) return true;
+    return inst.wio.currentReadOnly() != null;
+}
+
+/// Which coroutine is inside a side-effect function; null `fiber` is code outside any
+/// coroutine.
+pub const SideEffectMarker = struct { fiber: ?*Scheduler.Fiber };
+
+/// Marks the code running now as inside a side-effect function until `endSideEffect`, which
+/// gets the returned previous marker and must be called (with `defer`) on every way out.
+pub fn beginSideEffect(inst: *Instance) ?SideEffectMarker {
+    const previous = inst.side_effect;
+    inst.side_effect = .{ .fiber = inst.sched.currentFiber() };
+    return previous;
+}
+
+pub fn endSideEffect(inst: *Instance, previous: ?SideEffectMarker) void {
+    inst.side_effect = previous;
 }
 
 // ---------------------------------------------------------------- stack trace query
