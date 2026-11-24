@@ -70,6 +70,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Payloads](#payloads)
     - [Payload codecs](#payload-codecs)
     - [Failures](#failures-1)
+    - [Payload size limits](#payload-size-limits)
     - [External payload storage](#external-payload-storage)
     - [Remote codec client](#remote-codec-client)
   - [Testing](#testing)
@@ -339,6 +340,7 @@ Notes:
 - `keep_alive` defaults to a ping every 30 s, sent even while the connection is idle; a ping not answered within 15 s drops the connection, and later calls connect again. Both durations must be positive, or `connect` and `init` return `error.InvalidOptions`, logged. Set `keep_alive` to null to send no pings.
 - `worker_heartbeat_interval` (default null: every 60 s) applies to every worker on the client's sdk-core runtime, so clients from `forNamespace` share it. It must be from 1 s to 60 s, or `.zero` to turn worker heartbeats off; any other value makes `connect` and `init` return `error.InvalidOptions`, logged. Workers send heartbeats only to a server whose namespace reports support for them, and skip them silently otherwise.
 - `Client.reconnect` takes a new `http_connect_proxy` and `keep_alive` in `client.ConnectionOptions`; `worker_heartbeat_interval` stays as `connect` or `init` set it.
+- `payloads_warning_size` and `memo_warning_size` log a warning for a request that carries a large payload or memo: see [Payload size limits](#payload-size-limits).
 
 #### Starting workflows
 
@@ -792,6 +794,7 @@ Notes:
 - `priority` is a `workflow.Priority`; null uses the workflow's, and each zero field inherits the workflow's value. A value the server rejects fails the workflow task.
 - `versioning_intent` (`workflow.VersioningIntent`: `unspecified`, `compatible`, `default`) picks the build an activity runs on, only on task queues with build-ID-based versioning rules. `unspecified` means `compatible` on the workflow's own task queue and `default` elsewhere.
 - Adding any of the three to existing workflow code doesn't break replay of histories recorded without them.
+- `arguments_in_marker` (on `workflow.LocalActivityOptions`, default false) records the local activity's arguments in its marker event beside the result, so they show in the workflow's history. The marker holds the argument payloads as the worker's payload codecs encoded them. Turning it on or off doesn't break replay of histories recorded either way.
 
 #### Timers and conditions
 `ctx.sleep` blocks on a durable timer, as `ctx.io().sleep` does, and takes `workflow.SleepOptions`: a `summary` the UI and CLI show on the timer's started event. `workflow.Context.await` blocks until a condition holds, and `awaitTimeout` gives up after a timeout.
@@ -1147,7 +1150,7 @@ Notes:
 - `get` returns a `workflow.SignalWithStartResult`: the target's `workflow_id`, the `run_id` of the run that got the signal, and `started`, true when this call started that run and false when it only signaled a running one.
 - `get`'s errors (`workflow.SignalWithStartError`): `error.WorkflowExecutionAlreadyStarted` when the ID is taken in a way `id_reuse_policy` forbids, such as a closed run under `.reject_duplicate`; `error.SignalWithStartFailed` for any other refusal or failure; `error.Canceled` when the waiting coroutine is canceled (the call is canceled and `get` waits until it is) or the run is evicted; `error.InvalidOptions` (logged, nothing sent) for an empty ID or name, `.fail`, a negative timeout or start delay, `start_delay` with `cron_schedule`, or a search attribute value that can't be indexed; and `error.InvalidPayload` when the server's answer doesn't decode. After the first three, `sent.failure()` holds the server's failure.
 - The target is in this workflow's namespace.
-- The workflow's arguments and the signal's arguments are converted with the target's converter context (namespace, `id` and workflow type). The worker's payload codecs encode them, the memo and the header inside the request, with that same context, so the target decodes its start as usual.
+- The workflow's arguments and the signal's arguments are converted with the target's converter context (namespace, `id` and workflow type). The worker's payload codecs encode them, the memo and the header fields marked for the codecs (see [Context propagation](#context-propagation)) inside the request, with that same context, so the target decodes its start as usual.
 - The server must enable `history.enableSignalWithStartFromWorkflow`. On a dev server, pass `--dynamic-config-value history.enableSignalWithStartFromWorkflow=true` in `testing.DevServer.Options.extra_args`, or in `WorkflowEnvironment.Options.dev_server_extra_args`, as the example's test does. Without it, the server refuses to complete the workflow task that sends the call ("SignalWithStart operation is disabled", logged by the worker as a warning): the task is retried until the setting is on, and `get` waits meanwhile.
 - The time-skipping test server doesn't support it: test with a dev server (`WorkflowEnvironment.startWithOptions`) or a real server.
 - The call is a Nexus operation on the server's system endpoint, recorded in history as one, but interceptors see it on `WorkflowOutbound.signalWithStartWorkflow`, not `executeNexusOperation`. Replay checks that the call is still made, not its arguments, as for every Nexus operation.
@@ -1708,6 +1711,7 @@ Notes:
 - `default_heartbeat_throttle_interval` (30 s) and `max_heartbeat_throttle_interval` (60 s): an activity's heartbeats reach the server at 80% of its heartbeat timeout, at most every `max_heartbeat_throttle_interval`, or every `default_heartbeat_throttle_interval` without a heartbeat timeout; heartbeats in between keep only the latest details. Session activities are throttled the same way. Neither may be negative, and the default may not be above the maximum.
 - `max_eager_activity_reservations_per_workflow_task` (3): how many activities on the worker's own task queue one workflow task may ask the server to start on this worker eagerly, with free activity slots, in the answer to the task's completion; 0 turns eager activities off for the worker, as either per-second limit does. `ActivityOptions.disable_eager_execution` turns it off for one activity.
 - `poll_activity_tasks` (true): false stops the worker polling its task queue for activity tasks, so its registered activities run only as local activities of its own workflows (`workflow.Context.executeLocalActivity`); activities scheduled through the task queue wait for another worker or time out. It needs a registered workflow when activities are registered, and can't be combined with `sessions`.
+- `fail_oversized_payloads` (true): the worker fails a task whose completion carries payloads larger than the namespace's limit instead of sending it; false sends it anyway, for a proxy that changes payload sizes. See [Payload size limits](#payload-size-limits).
 - `run` returns `error.InvalidOptions`, and logs the option and why, for a per-second limit that is zero, negative, infinite or NaN (or a `max_activities_per_second` below one per 2^61 seconds, about 4.4e-19 per second), a negative duration among the ones above, a default heartbeat throttle interval above the maximum, or `poll_activity_tasks = false` with `sessions` or with activities but no workflow.
 - `graceful_shutdown_period` (zero) and `workflow_memory_limit` (null): see below.
 - `workflow_task_failure_errors` (empty) and `nondeterminism_fails_workflow` (false): which errors and whether nondeterminism fail the workflow task or the workflow; see [Failure policy](#failure-policy).
@@ -1979,6 +1983,7 @@ Notes:
 
 - Codecs run in order on the way out and in reverse on the way in. Search attributes are never encoded. The codecs are borrowed and must outlive the client.
 - A codec returns as many payloads as it was given and passes through payloads it didn't encode. It runs on many threads at once, never in workflow code.
+- Header fields skip the codecs on the way out unless the propagator that writes them sets `encode_fields` (see [Context propagation](#context-propagation)); fields an interceptor or other code writes into a header are sent as written. On the way in every header field goes through the codecs' decode, so a codec's `decode` must return a payload it didn't encode unchanged: a codec that fails on one fails the workflow task, activity task, or client call that carries it.
 - `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.Context`: namespace, workflow, activity, and propagated values. On the workflow's worker a codec gets the run's context, except for an activity's, local activity's or child's arguments and results, which carry the activity's type and ID or the child's workflow ID and type, as on the worker that runs it; signals to other workflows carry the run's.
 - `converter.codecHandler(codecs, options)` serves `POST /encode` and `/decode` for the Temporal Web UI and CLI. It doesn't authenticate callers.
 
@@ -2157,10 +2162,38 @@ Notes:
 - Failures the SDK makes for its own reports (workflow task failures, unregistered activities, queries and updates, codec failures, cancel acknowledgements) and those it builds for user code without the server (an interceptor's refusal, a child that couldn't start, a canceled local activity) aren't converted, nor is a failed query's message on the client.
 - `encode_failure_attributes` applies after `toFailure` and is undone before `fromFailure`, so the converter always sees plain messages.
 
+#### Payload size limits
+
+The server refuses payloads larger than the namespace's payload size limit (2 MiB on a default server) and memos larger than its memo limit. A worker checks its own completions against those limits before sending them, and a client logs a warning when a request it sends carries a large payload or memo, well before the server would refuse it.
+
+<!-- example: payload-size-limits -->
+```zig
+var client = try temporal.client.Client.connect(gpa, io, .{
+    .host_port = "temporal.internal:7233",
+    // Warn above 1 MiB per payload field and 4 KiB per memo; 0 turns a warning off.
+    .payloads_warning_size = 1024 * 1024,
+    .memo_warning_size = 4 * 1024,
+});
+defer client.close();
+var w = try Worker.init(gpa, io, &client, "greetings", .{
+    // A proxy between this worker and the server encrypts payloads, which changes their
+    // size: send every completion and let the server judge it.
+    .fail_oversized_payloads = false,
+});
+defer w.deinit();
+```
+
+Notes:
+- `worker.Options.fail_oversized_payloads` (true): the worker reads the namespace's limits from the server when it starts, and fails a workflow or activity task whose completion carries a payload field larger than the payload limit, or a memo larger than the memo limit, instead of sending it. A workflow task fails as a workflow task failure with cause `WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE`, which the server retries: the run stays open, so a fixed worker can finish it. An activity task fails with a retryable application failure of type `PayloadsTooLarge`, which the activity's retry policy retries. A server that reports no limits for the namespace means no check.
+- The worker logs why at error level, with the field's `size` and the `limit` as fields, through the client's logger (`client.Options.logger`). The record is sdk-core's, so it is logged only while `client.Options.core_log_level` forwards errors; null logs nothing.
+- Set `fail_oversized_payloads` to false when something between the worker and the server changes payload sizes, such as a proxy that encrypts or compresses them. The worker then sends every completion, and what the server does with an oversized one is what the run sees: a server may fail the workflow task and terminate the run, for one. It applies to the worker's session activities too.
+- `client.Options.payloads_warning_size` (512 KiB) and `memo_warning_size` (2 KiB), in bytes: a request with a payload field larger than the first, or a memo larger than the second, logs one warning per such field through the client's logger, with the field's `size` and the `limit`. The request is still sent. 0 turns a warning off. The warnings, like the worker's errors, are sdk-core's records and need `core_log_level` at `.warn` or below (the default), and may be logged from one of sdk-core's threads.
+- The warning sizes belong to the connection: they apply to every client sharing it (`Client.forNamespace`, `Client.withRpcOptions`) and to the completions of every worker on it, whatever `fail_oversized_payloads` is. `Client.reconnect` takes them in `client.ConnectionOptions`; a `ConnectionOptions` that leaves them out gets the defaults.
+
 #### External payload storage
 <!-- stub: temporal-sdk-zig-d51.4.9 -->
 Not implemented yet.
-Drivers that store large payloads outside history behind reference payloads, with payload size limits.
+Drivers that store large payloads outside history behind reference payloads.
 
 #### Remote codec client
 <!-- stub: temporal-sdk-zig-d51.4.4 -->
@@ -2660,6 +2693,8 @@ Notes:
 - Workers on the client use `client.Options.propagators` too.
 - A workflow's `ctx.propagated()` holds its start header's values and passes them on to every activity, child, signal, continue-as-new, and Nexus operation it sends.
 - `Values.put` copies the value but borrows what it points to, such as a string's bytes.
+- Header fields are sent as written, without the [payload codecs](#payload-codecs), unless the propagator that writes them sets `ContextPropagator.encode_fields`: `HeaderPropagator(tenant).encoded_propagator` is `HeaderPropagator(tenant).propagator` with its field encoded. An opted-in field is encoded alone, with the same `converter.Context` as the other payloads of its call; in a workflow, by its worker when it sends the workflow's commands. Fields an interceptor or other code writes into a header (`converter.HeaderWriter.put` and `set`) are sent as written.
+- On receipt every header field is decoded by the codecs before any propagator's `extract`, interceptor or `ctx.headers()` sees it, whether its sender encoded it or not: a field the codecs encoded arrives decoded, and one they didn't arrives unchanged, as long as each codec passes through payloads it didn't encode. So `ctx.headers()` holds decoded values, and code that copies one into an outgoing header sends it as written, not encoded.
 - Nexus operations a workflow calls carry its values too. The propagators write their fields into one Nexus header, `propagation.nexus_header_name` (`temporal-zig-context`), whose value is the fields as a protobuf `temporal.api.common.v1.Header`, base64url-encoded, in name order so a replay sends the same bytes. On the handling worker the client's propagators read it back: the handler's `ctx.propagated()` holds the values, and a workflow a workflow-run operation starts carries them on unless the handler sets `options.context` in its `nexus.WorkflowStart` itself.
 - How the header combines with `NexusOperationOptions.headers`: when the propagators write nothing, the caller's headers are sent exactly as given. Otherwise the caller's headers are sent in their order, without any named `temporal-zig-context` (ignoring case), followed by the propagated one. Outbound workflow interceptors see the combined list and may change it; the handler's `ctx.propagated()` reads the header as the request arrived, before inbound interceptors run.
 - Like every Nexus header, the propagated values skip the payload codecs, are recorded in the caller's history, and count toward the server's limit on a call's Nexus headers, so don't propagate secrets or large values over Nexus. A header value that doesn't decode is logged and skipped, and the request is still handled.

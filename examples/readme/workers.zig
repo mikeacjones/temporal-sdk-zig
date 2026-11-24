@@ -191,6 +191,29 @@ test "workers: several workers in one process compile" {
     _ = &runGreetingAndReportWorkers;
 }
 
+fn payloadLimitsExample(gpa: std.mem.Allocator, io: std.Io) !void {
+    // example: payload-size-limits
+    var client = try temporal.client.Client.connect(gpa, io, .{
+        .host_port = "temporal.internal:7233",
+        // Warn above 1 MiB per payload field and 4 KiB per memo; 0 turns a warning off.
+        .payloads_warning_size = 1024 * 1024,
+        .memo_warning_size = 4 * 1024,
+    });
+    defer client.close();
+    var w = try Worker.init(gpa, io, &client, "greetings", .{
+        // A proxy between this worker and the server encrypts payloads, which changes their
+        // size: send every completion and let the server judge it.
+        .fail_oversized_payloads = false,
+    });
+    defer w.deinit();
+    // end-example
+    try w.registerWorkflow(Greeting);
+}
+
+test "workers: payload size limit options compile" {
+    _ = &payloadLimitsExample;
+}
+
 fn writeCard(ctx: *activity.Context, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(ctx.allocator(), "card-{s}.txt", .{name});
 }

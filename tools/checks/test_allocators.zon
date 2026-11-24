@@ -10,6 +10,11 @@
         .reason = "Holds std's debug info lock while a worker runs; testing.allocator captures a stack trace on each allocation, which takes that lock on macOS, so the worker gets a DebugAllocator without stack traces that still reports leaks.",
     },
     .{
+        .file = "src/worker.zig",
+        .test_name = "a sessions worker that can't start logs its session queues while they're still allocated",
+        .reason = "Gives the worker a FailingAllocator over page_allocator, which unmaps each allocation when it is freed, so a log line that reads a freed session queue name faults instead of printing testing.allocator's poisoned bytes; the FailingAllocator's counters check for leaks.",
+    },
+    .{
         .file = "src/workflow/Instance.zig",
         .test_name = "query: ctx.fail in a query handler leaves the run no failure in the query's freed memory",
         .reason = "Zeros the query's backing buffer after activation to simulate released query memory and check that the later workflow failure is intact.",

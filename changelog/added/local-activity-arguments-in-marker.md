@@ -1,0 +1,1 @@
+`workflow.LocalActivityOptions.arguments_in_marker` records a local activity's arguments, as the worker's payload codecs encoded them, in its marker event, so they show in the workflow's history. Off by default; see [Activities and local activities](https://github.com/mikeacjones/temporal-sdk-zig/blob/main/README.md#activities-and-local-activities).

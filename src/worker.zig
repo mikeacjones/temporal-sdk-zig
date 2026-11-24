@@ -27,6 +27,8 @@ const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
 const proto_time = @import("proto_time.zig");
 const converter = @import("converter.zig");
+/// For `encodeMessageWithHeaderFields`, which `converter` doesn't re-export.
+const codec_pass = @import("converter/codec.zig");
 const failure_mod = @import("failure.zig");
 const log_mod = @import("log.zig");
 const workflow = @import("workflow.zig");
@@ -136,6 +138,18 @@ pub const Options = struct {
     /// free, are asked for. 0 turns eager activity execution off for the worker; so does
     /// either per-second limit.
     max_eager_activity_reservations_per_workflow_task: u32 = 3,
+    /// Whether the worker fails a workflow or activity task whose completion carries payloads
+    /// larger than the namespace's payload size limit (or a memo larger than its memo limit),
+    /// instead of sending a completion the server would reject. sdk-core reads the limits
+    /// from the namespace when the worker starts; a server that reports none means no check.
+    /// A workflow task fails as a task failure the server retries, so the run stays open; an
+    /// activity task fails with a retryable application failure of type `PayloadsTooLarge`.
+    /// sdk-core logs the reason at error level through the client's logger
+    /// (`client.Options.logger`), unless `client.Options.core_log_level` is null. Set false
+    /// when a proxy between the worker and the server changes payload sizes (one that
+    /// encrypts, say): the completion is then sent and the server's answer stands. Applies to
+    /// session activities too. See README.md's "Payload size limits".
+    fail_oversized_payloads: bool = true,
     /// Whether the worker polls its task queue for activity tasks. False runs the
     /// registered activities only as local activities of this worker's workflows
     /// (`workflow.Context.executeLocalActivity`): activities scheduled through the task queue
@@ -726,14 +740,16 @@ pub const Worker = struct {
         const core = try w.createCore(created_on, core_options, &message);
         defer if (finalized) core.deinit() else w.freeUnpolledCore(core, w.task_queue, core_options.task_types);
 
+        // Declared before the session cores, so it is freed after them: their task queues
+        // are its strings, which `freeUnpolledCore` logs.
+        var host: ?SessionHost = null;
+        defer if (host) |*h| h.deinit();
         // Polled even without registered activities: a workflow's side effects run as local
         // activities.
         var activity_cores: [3]ActivityCore = undefined;
         activity_cores[0] = .{ .core = core, .task_queue = w.task_queue };
         var core_count: usize = 1;
         defer for (activity_cores[1..core_count]) |c| if (finalized) c.core.deinit() else w.freeUnpolledCore(c.core, c.task_queue, session_task_types);
-        var host: ?SessionHost = null;
-        defer if (host) |*h| h.deinit();
         if (w.options.sessions) |o| {
             host = try SessionHost.init(w, o.max_concurrent_sessions);
             for ([_][]const u8{ host.?.creation_queue, host.?.host_queue }, sessionSlots(w.options.max_concurrent_activity_executions, o.max_concurrent_sessions)) |queue, slots| {
@@ -1033,6 +1049,7 @@ pub const Worker = struct {
             .nexus_task_pollers = if (registered.nexus) corePollerBehavior(o.nexus_task_poller_behavior, o.max_concurrent_nexus_task_pollers) else .{ .simple_maximum = 1 },
             .graceful_shutdown_period_ms = millis(o.graceful_shutdown_period),
             .nondeterminism_as_workflow_fail = o.nondeterminism_fails_workflow,
+            .disable_payload_error_limit = !o.fail_oversized_payloads,
         };
     }
 
@@ -1077,6 +1094,7 @@ pub const Worker = struct {
             .max_heartbeat_throttle_interval_ms = main.max_heartbeat_throttle_interval_ms,
             .activity_task_pollers = main.activity_task_pollers,
             .graceful_shutdown_period_ms = main.graceful_shutdown_period_ms,
+            .disable_payload_error_limit = main.disable_payload_error_limit,
         };
     }
 
@@ -1103,22 +1121,52 @@ pub const Worker = struct {
     /// Shuts down and frees a core worker nothing polls, nor will. As for any core worker,
     /// each task type it polls (`task_types`) is polled until it returns null before
     /// finalizing: a core polling activities otherwise waits in `finalizeShutdown` forever
-    /// for its activity poller to see the shutdown.
+    /// for its activity poller to see the shutdown. The polls go through `pollCore`, so one
+    /// whose cell `w.gpa` refuses is followed by one that reaches the core.
     fn freeUnpolledCore(w: *Worker, core: bridge.Worker, task_queue: []const u8, task_types: bridge.Worker.Options.TaskTypes) void {
         core.initiateShutdown();
         var message: ?[]u8 = null;
         defer if (message) |m| w.gpa.free(m);
         // Nothing was polled, so no task is outstanding; a poll returns null, or fails.
-        const polls = [_]struct { bool, *const fn (bridge.Worker, Allocator, Io, ?*?[]u8) bridge.Worker.PollError!?bridge.Worker.Polled }{
+        const polls = [_]struct { bool, PollTask }{
             .{ task_types.workflows, bridge.Worker.pollWorkflowActivation },
             .{ task_types.local_activities or task_types.remote_activities, bridge.Worker.pollActivityTask },
             .{ task_types.nexus, bridge.Worker.pollNexusTask },
         };
-        for (polls) |p| if (p[0]) while (p[1](core, w.gpa, w.io, null) catch null) |polled| polled.deinit();
+        var gpa_refused = false;
+        for (polls) |p| if (p[0]) while (true) {
+            const refused_before = gpa_refused;
+            const polled = w.pollCore(core, p[1], null, &gpa_refused) catch |err| switch (err) {
+                // `w.gpa` refused the cell before the poll reached the core: the next poll
+                // takes its cell elsewhere. A refusal after that one, or a failed poll, ends
+                // the polls as before.
+                error.OutOfMemory => if (refused_before) break else continue,
+                error.PollFailed => break,
+            } orelse break;
+            polled.deinit();
+        };
         core.finalizeShutdown(w.gpa, w.io, &message) catch |err| {
             log.warn("shutting down the unstarted worker for task queue {s} failed: {s}", .{ task_queue, message orelse @errorName(err) });
         };
         core.deinit();
+    }
+
+    const PollTask = *const fn (bridge.Worker, Allocator, Io, ?*?[]u8) PollError!?bridge.Worker.Polled;
+
+    /// Polls `core` for its next task with `poll`. The poll's cell comes from `w.gpa` until
+    /// `w.gpa` refuses one: that poll returns `error.OutOfMemory` and sets `gpa_refused`, and
+    /// every later one takes its cell from `std.heap.page_allocator`, without `message`
+    /// (which belongs to `w.gpa`). A core worker is finalized only once each of its pollers
+    /// has polled it to null, so a poll loop, or `freeUnpolledCore`, must still reach the
+    /// core after `w.gpa` has run out, or `run` never returns. A poll loop reports the
+    /// refusal as a poll failure, which shuts the run down, so its later polls only drain
+    /// the core; `freeUnpolledCore`, draining a core already shut down, polls again.
+    fn pollCore(w: *Worker, core: bridge.Worker, poll: PollTask, message: ?*?[]u8, gpa_refused: *bool) PollError!?bridge.Worker.Polled {
+        if (gpa_refused.*) return poll(core, std.heap.page_allocator, w.io, null);
+        return poll(core, w.gpa, w.io, message) catch |err| {
+            if (err == error.OutOfMemory) gpa_refused.* = true;
+            return err;
+        };
     }
 
     /// The core's versioning strategy for `options`, or `error.InvalidOptions` (logged) for
@@ -1317,8 +1365,9 @@ fn workflowLoop(w: *Worker, core: bridge.Worker) void {
     // The core allows one poll at a time, so this loop is the only poller; each activation
     // gets its own task. The core's workflow task slots bound how many run at once.
     var group: Io.Group = .init;
+    var gpa_refused = false;
     while (true) {
-        const polled = core.pollWorkflowActivation(w.gpa, w.io, &message) catch |err| {
+        const polled = w.pollCore(core, bridge.Worker.pollWorkflowActivation, &message, &gpa_refused) catch |err| {
             w.pollFailed(.workflow, w.task_queue, err, message);
             continue;
         } orelse break;
@@ -1586,7 +1635,7 @@ pub const WorkflowRunner = struct {
 
     fn decodeActivationPayloads(r: *WorkflowRunner, act: *act_pb.WorkflowActivation, cached: ?*const Instance, a: Allocator, io: Io) converter.CodecError!void {
         if (r.codecs.len == 0) return;
-        if (cached) |inst| return codeWithOwnContexts(act_pb.WorkflowActivation, act, &act.jobs, jobCodecContext, inst, r.codecs, a, io, &runCodecContext(r.namespace, inst), .decode);
+        if (cached) |inst| return codeWithOwnContexts(act_pb.WorkflowActivation, act, &act.jobs, jobCodecContext, noHeaderCodecFields, inst, r.codecs, a, io, &runCodecContext(r.namespace, inst), .decode);
         const index = for (act.jobs.items, 0..) |job, i| {
             if (job.variant) |v| if (v == .initialize_workflow) break i;
         } else return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &.{ .namespace = r.namespace });
@@ -1606,6 +1655,8 @@ pub const WorkflowRunner = struct {
 
     /// Encodes the completion's payloads: an activity's, local activity's or child's start
     /// command with that call's context (as the payload hooks got), the rest with the run's.
+    /// Of a command's header fields only those its outbound call marked for the codecs
+    /// (`Instance.commandHeaderCodecFields`) are encoded; the rest are sent as written.
     fn encodeCompletionPayloads(r: *WorkflowRunner, completion: *done_pb.WorkflowActivationCompletion, inst: *const Instance, a: Allocator, io: Io) converter.CodecError!void {
         if (r.codecs.len == 0) return;
         const run_context = runCodecContext(r.namespace, inst);
@@ -1614,7 +1665,7 @@ pub const WorkflowRunner = struct {
             .failed => null,
         } else null;
         const list = commands orelse return converter.encodeMessage(done_pb.WorkflowActivationCompletion, completion, r.codecs, a, io, &run_context);
-        return codeWithOwnContexts(done_pb.WorkflowActivationCompletion, completion, list, commandCodecContext, inst, r.codecs, a, io, &run_context, .encode);
+        return codeWithOwnContexts(done_pb.WorkflowActivationCompletion, completion, list, commandCodecContext, Instance.commandHeaderCodecFields, inst, r.codecs, a, io, &run_context, .encode);
     }
 
     const Handled = struct {
@@ -2000,13 +2051,17 @@ fn readVarint(bytes: []const u8, i: *usize) ?u64 {
 }
 
 /// Codes `msg` (`.encode` or `.decode`) with `run_context`, except the items of `list`, a list
-/// inside `msg`, that `contextOf` gives a context of their own: each of those is coded alone
-/// with it. `list` is replaced by a copy first, so the caller's items are left as they were.
+/// inside `msg`, that `contextOf` gives a context of their own or, when encoding, that
+/// `headerFieldsOf` names header fields to encode for: each of those is coded alone, with its
+/// context (or `run_context`) and those names. An encoding pass leaves every other header field
+/// as it is; a decoding pass decodes them all. `list` is replaced by a copy first, so the
+/// caller's items are left as they were.
 fn codeWithOwnContexts(
     comptime Msg: type,
     msg: *Msg,
     list: anytype,
     comptime contextOf: anytype,
+    comptime headerFieldsOf: anytype,
     inst: *const Instance,
     codecs: []const converter.PayloadCodec,
     a: Allocator,
@@ -2014,25 +2069,36 @@ fn codeWithOwnContexts(
     run_context: *const converter.Context,
     comptime direction: enum { encode, decode },
 ) converter.CodecError!void {
-    const code = switch (direction) {
-        .encode => converter.encodeMessage,
-        .decode => converter.decodeMessage,
+    const Code = struct {
+        fn code(comptime T: type, m: *T, cs: []const converter.PayloadCodec, arena: Allocator, i: Io, context: *const converter.Context, header_fields: []const []const u8) converter.CodecError!void {
+            return switch (direction) {
+                .encode => codec_pass.encodeMessageWithHeaderFields(T, m, cs, arena, i, context, header_fields),
+                .decode => converter.decodeMessage(T, m, cs, arena, i, context),
+            };
+        }
     };
     const Item = @typeInfo(@TypeOf(list.items)).pointer.child;
     const items = try a.dupe(Item, list.items);
     list.* = .fromOwnedSlice(items);
     var own: std.ArrayList(struct { index: usize, item: Item }) = .empty;
     for (items, 0..) |*item, i| {
-        const context = contextOf(inst, item) orelse continue;
+        const own_context = contextOf(inst, item);
+        const header_fields: []const []const u8 = if (direction == .encode) headerFieldsOf(inst, item) else &.{};
+        if (own_context == null and header_fields.len == 0) continue;
         var copy = item.*;
-        try code(Item, &copy, codecs, a, io, context);
+        try Code.code(Item, &copy, codecs, a, io, own_context orelse run_context, header_fields);
         try own.append(a, .{ .index = i, .item = copy });
         item.* = .{};
     }
-    try code(Msg, msg, codecs, a, io, run_context);
+    try Code.code(Msg, msg, codecs, a, io, run_context, &.{});
     // Coding copied the list, keeping its length and order; the items coded alone go back
     // into the copy.
     for (own.items) |o| list.items[o.index] = o.item;
+}
+
+/// Activation jobs have no header fields to encode.
+fn noHeaderCodecFields(_: *const Instance, _: *const act_pb.WorkflowActivationJob) []const []const u8 {
+    return &.{};
 }
 
 /// The codec context of an activation job that resolves an activity or a child workflow:
@@ -2107,8 +2173,9 @@ fn activityLoop(w: *Worker, core: bridge.Worker, task_queue: []const u8) void {
     };
     var message: ?[]u8 = null;
     defer if (message) |m| w.gpa.free(m);
+    var gpa_refused = false;
     while (true) {
-        const polled = core.pollActivityTask(w.gpa, w.io, &message) catch |err| {
+        const polled = w.pollCore(core, bridge.Worker.pollActivityTask, &message, &gpa_refused) catch |err| {
             w.pollFailed(.activity, task_queue, err, message);
             continue;
         } orelse break;
@@ -2739,8 +2806,9 @@ fn nexusLoop(w: *Worker, core: bridge.Worker) void {
     defer running.map.deinit(w.gpa);
     var message: ?[]u8 = null;
     defer if (message) |m| w.gpa.free(m);
+    var gpa_refused = false;
     while (true) {
-        const polled = core.pollNexusTask(w.gpa, w.io, &message) catch |err| {
+        const polled = w.pollCore(core, bridge.Worker.pollNexusTask, &message, &gpa_refused) catch |err| {
             w.pollFailed(.nexus, w.task_queue, err, message);
             continue;
         } orelse break;
@@ -3873,6 +3941,7 @@ test "worker options map to the core options of the task queue" {
         .max_eager_activity_reservations_per_workflow_task = 0,
         .poll_activity_tasks = false,
         .graceful_shutdown_period = .fromSeconds(6),
+        .fail_oversized_payloads = false,
     };
     const all: Worker.Registered = .{ .workflows = true, .activities = true, .nexus = true };
     try Worker.checkOptions(options, "mapped", all);
@@ -3896,6 +3965,7 @@ test "worker options map to the core options of the task queue" {
     try testing.expectEqual(9000, core.max_heartbeat_throttle_interval_ms);
     try testing.expectEqual(0, core.max_eager_activity_reservations_per_workflow_task);
     try testing.expectEqual(6000, core.graceful_shutdown_period_ms);
+    try testing.expect(core.disable_payload_error_limit);
     // Activities still run, as local activities of the worker's workflows.
     try testing.expectEqual(bridge.Worker.Options.TaskTypes{ .workflows = true, .local_activities = true, .remote_activities = false, .nexus = true }, core.task_types);
 }
@@ -3913,6 +3983,9 @@ test "default worker options give the core its own defaults" {
     try testing.expectEqual(defaults.max_eager_activity_reservations_per_workflow_task, core.max_eager_activity_reservations_per_workflow_task);
     try testing.expectEqual(defaults.tuner.local_activity.fixed, core.tuner.local_activity.fixed);
     try testing.expectEqual(defaults.graceful_shutdown_period_ms, core.graceful_shutdown_period_ms);
+    // The oversized-payload check is on.
+    try testing.expect(!core.disable_payload_error_limit);
+    try testing.expectEqual(defaults.disable_payload_error_limit, core.disable_payload_error_limit);
     try testing.expectEqual(1000, core.max_cached_workflows);
     try testing.expectEqual(100, core.tuner.workflow.fixed);
     try testing.expectEqual(100, core.tuner.activity.fixed);
@@ -4031,6 +4104,18 @@ test "session queues get the heartbeat throttling but not the per-second limits"
     try testing.expectEqual(0, session.max_activities_per_second);
     try testing.expectEqual(0, session.max_task_queue_activities_per_second);
     try testing.expectEqual(bridge.Worker.Options.TaskTypes{ .workflows = false, .local_activities = false, .remote_activities = true, .nexus = false }, session.task_types);
+    try testing.expect(!session.disable_payload_error_limit);
+}
+
+test "session queues fail oversized payloads as the worker's own queue does" {
+    const registered: Worker.Registered = .{ .workflows = false, .activities = true, .nexus = false };
+    for ([_]bool{ true, false }) |fail| {
+        const options: Options = .{ .fail_oversized_payloads = fail, .sessions = .{} };
+        try Worker.checkOptions(options, "q", registered);
+        const core = Worker.coreOptions(options, "ns", "q", .{ .none = .{} }, registered);
+        try testing.expectEqual(!fail, core.disable_payload_error_limit);
+        try testing.expectEqual(!fail, Worker.sessionCoreOptions(core, "q@host", 1).disable_payload_error_limit);
+    }
 }
 
 test "a per-worker activity rate turns eager activities off; without one the reservations pass through" {
@@ -4970,6 +5055,196 @@ test "run returns when the Io of a worker with activities can't start its first 
     defer run.deinit();
     try testing.expectEqualStrings("Hello Temporal!", try run.get(arena.allocator()));
     try client_sink.waitForCoreRecordsPast(seen, .fromSeconds(30));
+}
+
+/// An Io whose `concurrent` refuses every call, first making `failing` refuse every later
+/// allocation: a worker that runs out of threads and memory once its core workers exist.
+const NoThreadsNorMemory = struct {
+    var failing: *std.testing.FailingAllocator = undefined;
+    var vtable: Io.VTable = undefined;
+
+    fn io(base: Io, f: *std.testing.FailingAllocator) Io {
+        failing = f;
+        vtable = base.vtable.*;
+        vtable.concurrent = concurrent;
+        return .{ .userdata = base.userdata, .vtable = &vtable };
+    }
+
+    fn concurrent(
+        userdata: ?*anyopaque,
+        result_len: usize,
+        result_alignment: std.mem.Alignment,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    ) Io.ConcurrentError!*Io.AnyFuture {
+        _ = .{ userdata, result_len, result_alignment, context, context_alignment, start };
+        failing.fail_index = failing.alloc_index;
+        return error.ConcurrencyUnavailable;
+    }
+};
+
+// A sessions worker whose first poll loop can't start frees its session core workers unpolled,
+// and finalizing one that can't allocate logs its task queue: one of the session host's
+// strings. `run` freed the host first, so the log read freed memory (found by
+// tools/checks/worker_exits.zig's allocation sweep, as a segfault).
+test "a sessions worker that can't start logs its session queues while they're still allocated" {
+    // Finalizing without memory is logged as a warning, which must be formatted (the test
+    // runner formats only records at `testing.log_level`) for the queue's name to be read.
+    testing.log_level = .warn;
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    // page_allocator unmaps each allocation when it is freed, so reading one afterwards faults.
+    var failing: std.testing.FailingAllocator = .init(std.heap.page_allocator, .{});
+    // No debug-info read, whose start would be the first `concurrent` call.
+    var w = try Worker.init(failing.allocator(), NoThreadsNorMemory.io(testing.io, &failing), &client, "sessions-no-threads-nor-memory", .{ .sessions = .{}, .failure_stack_traces = false });
+    try w.registerWorkflow(HelloTest.Hello);
+    try w.registerActivity(HelloTest.Greet);
+    try testing.expectError(error.ConcurrencyUnavailable, w.run());
+    try testing.expect(failing.has_induced_failure);
+    w.deinit();
+    try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+// The poll loops ran forever once the worker's allocator refused a poll's cell: each poll
+// failed before reaching the core, so none saw the shutdown the failure began, and `run`
+// never returned (found by tools/checks/worker_exits.zig's allocation sweep). After the
+// refusal, which a loop reports, the polls get their cells elsewhere and drain the core.
+test "a poll the worker's allocator refuses is reported, and the polls after it still reach the core" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var w = try Worker.init(failing.allocator(), testing.io, &client, "poll-out-of-memory", .{});
+    defer w.deinit();
+    const core = try bridge.Worker.init(testing.allocator, try client.currentConnection(), .{
+        .namespace = "default",
+        .task_queue = "poll-out-of-memory",
+        .task_types = .{ .workflows = false, .remote_activities = true, .local_activities = false, .nexus = false },
+    }, null);
+    defer core.deinit();
+    core.initiateShutdown();
+    failing.fail_index = failing.alloc_index;
+
+    var gpa_refused = false;
+    try testing.expectError(error.OutOfMemory, w.pollCore(core, bridge.Worker.pollActivityTask, null, &gpa_refused));
+    try testing.expect(gpa_refused);
+    // Shut down and never polled, the core has nothing more to give: the poll returns null.
+    try testing.expectEqual(null, try w.pollCore(core, bridge.Worker.pollActivityTask, null, &gpa_refused));
+    try core.finalizeShutdown(testing.allocator, testing.io, null);
+}
+
+/// An allocator that refuses one allocation, the first once `armed` is set, and gives every other
+/// from `parent`: a transient out-of-memory, which `std.testing.FailingAllocator` (refusing
+/// every allocation from its fail index on) can't express.
+const RefuseOnce = struct {
+    parent: Allocator,
+    armed: std.atomic.Value(bool) = .init(false),
+    refused: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(r: *RefuseOnce) Allocator {
+        return .{ .ptr = r, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const r: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        if (r.armed.cmpxchgStrong(true, false, .acq_rel, .acquire) == null) {
+            _ = r.refused.fetchAdd(1, .acq_rel);
+            return null;
+        }
+        return r.parent.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const r: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        return r.parent.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const r: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        return r.parent.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const r: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        r.parent.rawFree(memory, alignment, ra);
+    }
+
+    /// An Io whose `concurrent` refuses every call, first arming `r`: a worker that can't
+    /// start its poll loops, and whose next allocation after that is refused.
+    const NoThreads = struct {
+        var refuse: *RefuseOnce = undefined;
+        var vtable: Io.VTable = undefined;
+
+        fn io(base: Io, r: *RefuseOnce) Io {
+            refuse = r;
+            vtable = base.vtable.*;
+            vtable.concurrent = concurrent;
+            return .{ .userdata = base.userdata, .vtable = &vtable };
+        }
+
+        fn concurrent(
+            userdata: ?*anyopaque,
+            result_len: usize,
+            result_alignment: std.mem.Alignment,
+            context: []const u8,
+            context_alignment: std.mem.Alignment,
+            start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+        ) Io.ConcurrentError!*Io.AnyFuture {
+            _ = .{ userdata, result_len, result_alignment, context, context_alignment, start };
+            refuse.armed.store(true, .release);
+            return error.ConcurrencyUnavailable;
+        }
+    };
+};
+
+// `run` frees a core worker that no loop polls by polling it to null before finalizing it.
+// Those polls ended at the first failure, so one whose cell the worker's allocator refused
+// never reached the core: its activity poller never saw the shutdown, and finalizing, which
+// could allocate again, waited for it forever. A refused poll now drains on like a poll loop's.
+test "run returns when the worker's allocator refuses one poll of a core worker it frees unpolled" {
+    const rt = try bridge.Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var server = try bridge.EphemeralServer.startDevServer(testing.allocator, testing.io, rt, .{}, null);
+    defer server.shutdown(testing.io, null) catch {};
+    var client = try client_mod.Client.connect(testing.allocator, testing.io, .{ .host_port = server.target });
+    defer client.close();
+
+    var refuse: RefuseOnce = .{ .parent = testing.allocator };
+    // No debug-info read, whose start would be the first `concurrent` call, and no workflow:
+    // the first `concurrent` is the activity loop's, and the next allocation the poll's cell.
+    var w = try Worker.init(refuse.allocator(), RefuseOnce.NoThreads.io(testing.io, &refuse), &client, "refuse-one-poll", .{ .failure_stack_traces = false });
+    defer w.deinit();
+    try w.registerActivity(HelloTest.Greet);
+
+    const Run = struct {
+        result: Worker.RunError!void = {},
+        done: Io.Event = .unset,
+        fn run(r: *@This(), worker: *Worker) void {
+            r.result = worker.run();
+            r.done.set(testing.io);
+        }
+    };
+    var r: Run = .{};
+    // On the real Io: the worker's refuses `concurrent`.
+    var future = try testing.io.concurrent(Run.run, .{ &r, &w });
+    r.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } }) catch |err| switch (err) {
+        // Run is stuck in `finalizeShutdown` for good, and nothing can free what it holds.
+        error.Timeout => std.debug.panic("Worker.run did not return within 30 s after one refused allocation", .{}),
+        error.Canceled => |e| return e,
+    };
+    future.await(testing.io);
+    try testing.expectError(error.ConcurrencyUnavailable, r.result);
+    try testing.expectEqual(1, refuse.refused.load(.acquire));
 }
 
 const CancelTest = struct {
@@ -6427,6 +6702,74 @@ test "the workflow runner hands codecs the run's propagated values and identity"
     for (want, recorder.calls.items) |w, got| try testing.expectEqualStrings(w, got);
     // The workflow saw the header decoded once, not dropped by the two-step decode.
     try testing.expectEqualStrings("acme", runner.runs.get("run-1").?.inst.propagated.get(ContextRecordingCodec.tenant).?);
+}
+
+const HeaderCodecTest = struct {
+    const tenant = propagation.key([]const u8, "tenant");
+    const user = propagation.key([]const u8, "user");
+    const propagators = [_]propagation.ContextPropagator{
+        propagation.HeaderPropagator(tenant).encoded_propagator,
+        propagation.HeaderPropagator(user).propagator,
+    };
+
+    fn call(ctx: *workflow.Context) !void {
+        _ = ctx.executeActivityByName(void, "Act", .{ .start_to_close_timeout = .fromSeconds(10) }, .{});
+        _ = ctx.executeChildWorkflowByName(void, "Kid", .{ .id = "kid" }, .{});
+        _ = ctx.signalWithStartWorkflowByName("Target", .{ .id = "target", .id_conflict_policy = .use_existing }, .{}, "go", .{});
+        try ctx.sleep(.fromSeconds(60), .{});
+    }
+    const Call = workflow.Def("CallMarked", call);
+
+    fn encodingOf(entries: anytype, name: []const u8) []const u8 {
+        for (entries) |e| if (std.mem.eql(u8, e.key, name)) return converter.encodingOf(e.value.?) orelse "unset";
+        return "missing";
+    }
+};
+
+test "the workflow runner encodes only the header fields of a command that its propagators marked" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const zlib: converter.ZlibCodec = .{ .always_encode = true };
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, HeaderCodecTest.Call.workflow_name, HeaderCodecTest.Call.registered);
+    var runner: WorkflowRunner = .{
+        .gpa = testing.allocator,
+        .workflows = &workflows,
+        .task_queue = "tq",
+        .namespace = "ns",
+        .stack_size = 256 * 1024,
+        .codecs = &codecs,
+        .propagators = &HeaderCodecTest.propagators,
+    };
+    defer runner.deinit();
+
+    // The start header arrives plain, as another SDK's client sends it, and decodes as it is.
+    var init: act_pb.InitializeWorkflow = .{ .workflow_type = "CallMarked", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    try init.headers.append(a, .{ .key = "tenant", .value = try converter.toPayload(a, @as([]const u8, "acme")) });
+    try init.headers.append(a, .{ .key = "user", .value = try converter.toPayload(a, @as([]const u8, "ann")) });
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+    try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+    var bytes: Io.Writer.Allocating = .init(a);
+    try act.encode(&bytes.writer, a);
+
+    const completion = (try runner.handle(bytes.written(), a, testing.io)).completion;
+    const commands = completion.status.?.successful.commands.items;
+    const schedule = commands[0].variant.?.schedule_activity;
+    try testing.expectEqualStrings("binary/zlib", HeaderCodecTest.encodingOf(schedule.headers.items, "tenant"));
+    try testing.expectEqualStrings("json/plain", HeaderCodecTest.encodingOf(schedule.headers.items, "user"));
+    const child = commands[1].variant.?.start_child_workflow_execution;
+    try testing.expectEqualStrings("binary/zlib", HeaderCodecTest.encodingOf(child.headers.items, "tenant"));
+    try testing.expectEqualStrings("json/plain", HeaderCodecTest.encodingOf(child.headers.items, "user"));
+    // A signal-with-start's header, inside its envelope, follows the same marks.
+    const envelope = commands[2].variant.?.schedule_nexus_operation.input.?;
+    const request = (try @import("nexus/system.zig").decode(a, envelope)).signal_with_start_request;
+    try testing.expectEqualStrings("binary/zlib", HeaderCodecTest.encodingOf(request.header.?.fields.items, "tenant"));
+    try testing.expectEqualStrings("json/plain", HeaderCodecTest.encodingOf(request.header.?.fields.items, "user"));
+    // The timer has no payloads.
+    try testing.expect(commands[3].variant.? == .start_timer);
 }
 
 const NexusCodecTest = struct {

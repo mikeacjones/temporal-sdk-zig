@@ -20,6 +20,15 @@
 //!
 //! `HeaderPropagator(tenant).propagator` carries one key as a header field of the same name.
 //!
+//! Header fields skip the client's payload codecs (`client.Options.codecs`) unless the
+//! propagator that writes them sets `ContextPropagator.encode_fields`:
+//! `HeaderPropagator(tenant).encoded_propagator` is the same propagator with its field
+//! encoded. Fields an interceptor or other code writes into a header are sent as written. On
+//! receipt every header field goes through the codecs' decode before any propagator's
+//! `extract` sees it, so a field the codecs encoded arrives decoded, and one they didn't
+//! encode arrives unchanged as long as every codec passes through payloads it didn't encode
+//! (the `converter.PayloadCodec` rule).
+//!
 //! Nexus operations carry the values too. When a workflow calls an operation, the propagators
 //! write their fields into one Nexus header, `nexus_header_name`, whose value is the fields
 //! as a protobuf `temporal.api.common.v1.Header`, base64url-encoded. The caller's own
@@ -122,6 +131,9 @@ pub const Values = struct {
 pub const ContextPropagator = struct {
     ptr: ?*anyopaque,
     vtable: *const VTable,
+    /// Whether the header fields `inject` writes go through the client's payload codecs
+    /// (`client.Options.codecs`) when the call is sent. False, the default, sends them as written.
+    encode_fields: bool = false,
 
     pub const VTable = struct {
         inject: *const fn (ptr: ?*anyopaque, arena: Allocator, values: *const Values, header: *converter.HeaderWriter) error{OutOfMemory}!void,
@@ -138,11 +150,17 @@ pub const ContextPropagator = struct {
 };
 
 /// A propagator that carries the value of `k` (a `key`) as the header field `k.name`, encoded
-/// with the default converter: `HeaderPropagator(tenant).propagator`.
+/// with the default converter: `HeaderPropagator(tenant).propagator`, whose field is sent as
+/// written, or `HeaderPropagator(tenant).encoded_propagator`, whose field the client's payload
+/// codecs encode.
 pub fn HeaderPropagator(comptime k: anytype) type {
     const T = @TypeOf(k).Value;
     return struct {
-        pub const propagator: ContextPropagator = .{ .ptr = null, .vtable = &.{ .inject = inject, .extract = extract } };
+        pub const propagator: ContextPropagator = .{ .ptr = null, .vtable = &vtable };
+        /// `propagator` with `encode_fields` set: the payload codecs encode its field.
+        pub const encoded_propagator: ContextPropagator = .{ .ptr = null, .vtable = &vtable, .encode_fields = true };
+
+        const vtable: ContextPropagator.VTable = .{ .inject = inject, .extract = extract };
 
         fn inject(_: ?*anyopaque, arena: Allocator, values: *const Values, header: *converter.HeaderWriter) error{OutOfMemory}!void {
             const v = values.get(k) orelse return;
@@ -156,9 +174,16 @@ pub fn HeaderPropagator(comptime k: anytype) type {
     };
 }
 
-/// Runs every propagator's `inject`, in order.
+/// Runs every propagator's `inject`, in order, with `header.encode_fields` set to the
+/// propagator's `encode_fields`, so the fields each writes are marked for the codecs as it
+/// asks. `header.encode_fields` is put back as it was on return, also on error.
 pub fn injectAll(propagators: []const ContextPropagator, arena: Allocator, values: *const Values, header: *converter.HeaderWriter) error{OutOfMemory}!void {
-    for (propagators) |p| try p.inject(arena, values, header);
+    const mode = header.encode_fields;
+    defer header.encode_fields = mode;
+    for (propagators) |p| {
+        header.encode_fields = p.encode_fields;
+        try p.inject(arena, values, header);
+    }
 }
 
 /// Runs every propagator's `extract`, in order. A propagator whose fields don't decode is
@@ -180,7 +205,9 @@ const nexus_encoding = std.base64.url_safe_no_pad;
 
 /// Runs every propagator's `inject` and returns the value of the `nexus_header_name` header
 /// that carries the fields, or null when the propagators wrote none. The fields are encoded
-/// in name order, so the same values give the same bytes. Memory comes from `arena`.
+/// in name order, so the same values give the same bytes. Like every Nexus header, the value
+/// skips the payload codecs, whatever the propagators' `encode_fields`. Memory comes from
+/// `arena`.
 pub fn injectNexusHeader(propagators: []const ContextPropagator, arena: Allocator, values: *const Values) error{OutOfMemory}!?[]const u8 {
     if (propagators.len == 0) return null;
     var w: converter.HeaderWriter = .init(arena);
@@ -310,4 +337,49 @@ test "values travel through the Nexus header and an undecodable one is skipped" 
         try extractNexusHeader(&propagators, a, bad, &skipped);
         try testing.expectEqual(@as(usize, 0), skipped.count());
     }
+}
+
+test "injectAll marks the fields of propagators that set encode_fields, and puts the writer's mode back" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tenant = comptime key([]const u8, "tenant");
+    const user = comptime key([]const u8, "user");
+    const propagators = [_]ContextPropagator{ HeaderPropagator(tenant).encoded_propagator, HeaderPropagator(user).propagator };
+    try testing.expect(HeaderPropagator(tenant).encoded_propagator.encode_fields);
+    try testing.expect(!HeaderPropagator(tenant).propagator.encode_fields);
+
+    var sent: Values = .init(a);
+    try sent.put(tenant, "acme");
+    try sent.put(user, "ann");
+    var w: converter.HeaderWriter = .init(a);
+    try injectAll(&propagators, a, &sent, &w);
+    try testing.expect(w.encodes("tenant"));
+    try testing.expect(!w.encodes("user"));
+    try testing.expect(!w.encode_fields);
+    // Both fields read back the same, marked or not.
+    var received: Values = .init(a);
+    try extractAll(&propagators, a, w.header(), &received, "a test call");
+    try testing.expectEqualStrings("acme", received.get(tenant).?);
+    try testing.expectEqualStrings("ann", received.get(user).?);
+
+    // A writer already in encoding mode gets it back, also when a propagator fails.
+    w.encode_fields = true;
+    try injectAll(propagators[1..], a, &sent, &w);
+    try testing.expect(w.encode_fields);
+    try testing.expect(!w.encodes("user"));
+    const failing: ContextPropagator = .{ .ptr = null, .encode_fields = false, .vtable = &.{
+        .inject = struct {
+            fn inject(_: ?*anyopaque, _: Allocator, _: *const Values, _: *converter.HeaderWriter) error{OutOfMemory}!void {
+                return error.OutOfMemory;
+            }
+        }.inject,
+        .extract = HeaderPropagator(user).propagator.vtable.extract,
+    } };
+    try testing.expectError(error.OutOfMemory, injectAll(&.{failing}, a, &sent, &w));
+    try testing.expect(w.encode_fields);
+
+    // The Nexus header carries a marked field as written: it skips the codecs.
+    const value = (try injectNexusHeader(&propagators, a, &sent)).?;
+    try testing.expectEqualStrings(value, (try injectNexusHeader(&.{ HeaderPropagator(tenant).propagator, HeaderPropagator(user).propagator }, a, &sent)).?);
 }

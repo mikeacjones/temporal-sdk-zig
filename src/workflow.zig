@@ -542,6 +542,10 @@ pub const LocalActivityOptions = struct {
     /// shown by the UI and CLI. Sent as a JSON string payload, through the worker's payload
     /// codecs, with every attempt. Empty sends none.
     summary: []const u8 = "",
+    /// Record the activity's arguments in its local activity marker, so they show in the
+    /// workflow's history beside the result. The marker holds the argument payloads as the
+    /// worker's payload codecs encoded them. Off by default: a marker then holds only the result.
+    arguments_in_marker: bool = false,
 };
 
 /// What canceling a child workflow does: `ChildWorkflowFuture.cancel`, or canceling the

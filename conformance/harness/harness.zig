@@ -5,6 +5,7 @@ const temporal = @import("temporal");
 pub const Context = @import("Context.zig");
 pub const history = @import("history.zig");
 pub const stored = @import("stored.zig");
+pub const sercontext = @import("sercontext.zig");
 
 pub const Feature = struct {
     has_worker: bool,
@@ -104,6 +105,7 @@ test {
     _ = Context;
     _ = history;
     _ = stored;
+    _ = sercontext;
 }
 
 test "conformance define defaults to a client-only feature" {

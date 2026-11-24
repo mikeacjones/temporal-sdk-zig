@@ -23,8 +23,10 @@ pub const propagate_key = propagation.key(CryptContext, "encryption");
 
 /// Carries `propagate_key` in every call's header, so the workflow and its activities see
 /// the key ID the workflow was started with and encrypt their results with the same key.
-/// Set it in `client.Options.propagators` in every program; workers use the client's.
-pub const propagator = propagation.HeaderPropagator(propagate_key).propagator;
+/// Its header field goes through the codecs too (`encoded_propagator`), so nothing in the
+/// history is left in the clear. Set it in `client.Options.propagators` in every program;
+/// workers use the client's.
+pub const propagator = propagation.HeaderPropagator(propagate_key).encoded_propagator;
 
 /// The activity's input: fields by name, encoded as a JSON object.
 pub const Info = std.json.ArrayHashMap([]const u8);

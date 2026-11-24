@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-telemetry/metrics",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-telemetry/metrics"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-serialization_context/child_workflow_payloads_default_id",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-serialization_context/child_workflow_payloads_default_id"
+    },
+    {
+      "file": "2-ChildWorkflow.json",
+      "workflow_id": "25162e29-c8d7-4e84-966a-7e99bca4c687"
+    }
+  ]
+}

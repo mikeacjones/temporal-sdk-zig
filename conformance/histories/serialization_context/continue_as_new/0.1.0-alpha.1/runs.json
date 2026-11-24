@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-serialization_context/continue_as_new",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-serialization_context/continue_as_new"
+    },
+    {
+      "file": "2-Workflow.json",
+      "workflow_id": "conformance-serialization_context/continue_as_new"
+    }
+  ]
+}

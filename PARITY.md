@@ -73,7 +73,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Deterministic UUIDs | Java, Python, TypeScript, .NET, PHP | GA | supported | [Determinism](README.md#determinism) |
 | Activities from workflows: timeouts, retry policy, cancellation types | all | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [retryactivity](samples/retryactivity) |
 | Local activities | all | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [greetingslocal](samples/greetingslocal) |
-| Local activity arguments recorded in the marker | TypeScript, .NET | GA | missing | `temporal-sdk-zig-d51.7.47`. `workflow.LocalActivityOptions` has no field that records the arguments in the local activity marker. |
+| Local activity arguments recorded in the marker | TypeScript, .NET | GA | supported | [Activities and local activities](README.md#activities-and-local-activities) |
 | Activities by name, without a typed definition | all | GA | supported | [Dynamic activities](README.md#dynamic-activities), [dynamic](samples/dynamic) |
 | Durable timers, conditions, and conditions with a timeout | all | GA | supported | [Timers and conditions](README.md#timers-and-conditions), [timer](samples/timer) |
 | Summaries and details on workflow starts, activities, timers, and child workflows | all | pre-release | supported | [Activities and local activities](README.md#activities-and-local-activities), [Timers and conditions](README.md#timers-and-conditions), [Child workflows](README.md#child-workflows) |
@@ -155,14 +155,14 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Custom payload conversion | all | GA | supported | [Payloads](README.md#payloads) |
 | Raw payloads passed through unconverted | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Payloads](README.md#payloads) |
 | Payload codecs for compression and encryption | all | GA | supported | [Payload codecs](README.md#payload-codecs), [encryption](samples/encryption), [snappycompress](samples/snappycompress) |
-| Payload codecs on header fields, chosen by the field's producer | Go, Java, Python, TypeScript | GA | partial | `temporal-sdk-zig-d51.4.30`. Every header field goes through `client.Options.codecs`. Missing: leaving a propagator's or the caller's header fields unencoded, which is the other SDKs' default, and choosing per propagator. |
+| Payload codecs on header fields, chosen by the field's producer | Go, Java, Python, TypeScript | GA | supported | [Context propagation](README.md#context-propagation) |
 | Codec server for the Web UI and CLI | Go, Java, Python, TypeScript, .NET | GA | supported | [Payload codecs](README.md#payload-codecs), [codec-server](samples/codec-server) |
 | Remote codec client: a payload codec that sends payloads to a codec server's `/encode` and `/decode` | Go, Java | GA, deferred | partial | `temporal-sdk-zig-d51.4.4`. Missing: a ready-made codec that calls a codec server; a `converter.PayloadCodec` can make those HTTP calls itself. |
 | Serialization context for converters and codecs | Go, Java, Python, TypeScript, .NET, PHP | GA | supported | [Payloads](README.md#payloads), [Payload codecs](README.md#payload-codecs) |
 | Failures with cause chains and kinds | all | GA | supported | [Failures](README.md#failures-1) |
 | Encoded failure attributes (message and stack trace through the codecs) | all | GA | supported | [Failures](README.md#failures-1) |
 | Custom failure converter (errors to failures and back) | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Failures](README.md#failures-1) |
-| Payload size limits: a worker fails a task whose payloads are too large, and clients warn above a size | all | GA | partial | `temporal-sdk-zig-d51.4.29`. sdk-core fails a task whose payloads exceed the namespace's limit, with the check always on. Missing: a `worker.Options` field that turns the check off, client warning sizes, and README.md documentation. |
+| Payload size limits: a worker fails a task whose payloads are too large, and clients warn above a size | all | GA | supported | [Payload size limits](README.md#payload-size-limits) |
 | External payload storage (Public Preview) | Go, Java, Python, TypeScript, .NET | pre-release | partial | `temporal-sdk-zig-d51.4.9`. Missing: storage drivers and a payload size threshold; a `converter.PayloadCodec` can store payloads elsewhere and pass references instead. |
 
 ### Testing
