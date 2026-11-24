@@ -10,7 +10,8 @@
 //! stacks the run holds (in use or pooled) at the configured stack size. Both depend on what
 //! the run did, so the same activations give the same figure on any worker and on replay,
 //! except for allocations made only when not replaying: a side effect's encoded value (and
-//! the argument list carrying it) is counted where it first ran, and not when replayed. With
+//! the argument list carrying it), from `sideEffect` or from a `mutableSideEffect` call whose
+//! value changed, is counted where it first ran, and not when replayed. With
 //! `Options.memory_limit` set, `activate` compares the figure with the limit once all
 //! coroutines have blocked in an activation that ran them, and fails the workflow task (not
 //! the workflow) when the run is over it.
@@ -57,6 +58,11 @@ pub const reserved_activity_prefix = "__temporal_";
 /// The local activity that records a side effect's value by returning its input. Histories
 /// name it in their markers, so it must never change.
 pub const side_effect_activity_type = reserved_activity_prefix ++ "side_effect";
+/// Starts the patch ID that marks a change of a mutable side effect's value
+/// (`workflow.Context.mutableSideEffect`): the prefix, the caller's ID, ":", and the call's
+/// number for that ID. Histories name it, so it must never change. The number stays last so
+/// that `recordedVersion` never reads one of these as a version.
+pub const mutable_side_effect_patch_prefix = reserved_activity_prefix ++ "mse:";
 
 // Sessions (`workflow.Context.createSession`). Histories name these, so they must never change.
 /// The activity that holds a session's slot on its host, from creation until the session
@@ -252,6 +258,9 @@ notified_patches: std.array_hash_map.String(void) = .empty,
 patches: std.StringHashMapUnmanaged(bool) = .empty,
 /// What the run's first `getVersion` call returned for each change ID. Arena memory.
 versions: std.StringHashMapUnmanaged(i32) = .empty,
+/// The state of each mutable side effect (`workflow.Context.mutableSideEffect`) by its ID.
+/// Arena memory, keys included.
+mutable_side_effects: std.StringHashMapUnmanaged(MutableSideEffect) = .empty,
 /// Sent with each successful completion when `send_versioning_behavior`; starts as the
 /// registered workflow's.
 versioning_behavior: workflow.VersioningBehavior = .unspecified,
@@ -2304,6 +2313,109 @@ pub fn sideEffect(inst: *Instance, value: ?converter.Payload) workflow.ActivityF
     return inst.outboundNext().sideEffect(.{ .value = value });
 }
 
+// ---------------------------------------------------------------- mutable side effects
+
+/// One ID's state for `workflow.Context.mutableSideEffect`.
+pub const MutableSideEffect = struct {
+    /// The calls for the ID that were not refused, including one in progress.
+    calls: u32 = 0,
+    /// The value last recorded for the ID (arena memory), null until one is.
+    value: ?converter.Payload = null,
+    /// The recording in flight, until a caller for the ID sees it resolved and settles it.
+    recording: ?*ActivityState = null,
+
+    /// Takes a resolved recording's value, if it recorded one. A failed or canceled
+    /// recording leaves the previous value.
+    fn settle(e: *MutableSideEffect, state: *ActivityState) void {
+        if (e.recording != state) return;
+        e.recording = null;
+        switch (state.outcome.?) {
+            .completed => |p| if (p) |v| {
+                e.value = v;
+            },
+            .failed, .cancelled => {},
+        }
+    }
+};
+
+/// Steps 1 to 3 of `workflow.Context.mutableSideEffect`: refuses read-only code, counts the
+/// call for `id`, then waits until no recording for `id` is in flight. Returns the call's
+/// number for `id`.
+pub fn mutableSideEffectBegin(inst: *Instance, id: []const u8) workflow.Context.SideEffectError!u32 {
+    if (inst.wio.refuse("mutableSideEffect")) {
+        inst.setLastFailure(null);
+        return error.SideEffectFailed;
+    }
+    const a = inst.arena();
+    if (!inst.mutable_side_effects.contains(id)) try inst.mutable_side_effects.put(a, try a.dupe(u8, id), .{});
+    const entry = inst.mutable_side_effects.getPtr(id).?;
+    entry.calls += 1;
+    const call = entry.calls;
+    // Other coroutines may add IDs while this one waits, so the entry is looked up again
+    // after every wait.
+    while (inst.mutable_side_effects.getPtr(id).?.recording) |state| {
+        if (state.outcome == null) try inst.awaitRecording(state);
+        inst.mutable_side_effects.getPtr(id).?.settle(state);
+    }
+    return call;
+}
+
+/// The value last recorded for `id`, which `mutableSideEffectBegin` has seen.
+pub fn mutableSideEffectValue(inst: *Instance, id: []const u8) ?converter.Payload {
+    return inst.mutable_side_effects.getPtr(id).?.value;
+}
+
+/// The patch ID that marks call `call` for `id` as a change. Arena memory; the caller frees it.
+fn mutableSideEffectPatchId(inst: *Instance, id: []const u8, call: u32) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(inst.arena(), mutable_side_effect_patch_prefix ++ "{s}:{d}", .{ id, call });
+}
+
+/// On replay, whether call `call` for `id` recorded a new value: history has its patch.
+pub fn mutableSideEffectNotified(inst: *Instance, id: []const u8, call: u32) error{OutOfMemory}!bool {
+    const patch_id = try inst.mutableSideEffectPatchId(id, call);
+    defer inst.arena().free(patch_id);
+    return inst.notified_patches.contains(patch_id);
+}
+
+/// Step 5 of `workflow.Context.mutableSideEffect`: marks call `call` for `id` as a change,
+/// records `value` (null on replay) as a side effect, and waits for the recording.
+pub fn mutableSideEffectRecord(inst: *Instance, id: []const u8, call: u32, value: ?converter.Payload) workflow.Context.SideEffectError!void {
+    {
+        const patch_id = try inst.mutableSideEffectPatchId(id, call);
+        defer inst.arena().free(patch_id);
+        try inst.recordPatch(patch_id, true, false);
+    }
+    const state = inst.sideEffect(value).state catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.InvalidOptions, error.SessionFailed => {
+            inst.setLastFailure(null);
+            return error.SideEffectFailed;
+        },
+    };
+    inst.mutable_side_effects.getPtr(id).?.recording = state;
+    try inst.awaitActivity(state);
+    inst.mutable_side_effects.getPtr(id).?.settle(state);
+    switch (state.outcome.?) {
+        .completed => |p| if (p == null) {
+            inst.setLastFailure(null);
+            return error.SideEffectFailed;
+        },
+        .failed, .cancelled => |f| {
+            inst.setLastFailure(f);
+            return error.SideEffectFailed;
+        },
+    }
+}
+
+/// A replayed call for `id` that recorded nothing, with nothing recorded before it: the code
+/// no longer matches the history, so the workflow task fails.
+pub fn mutableSideEffectNotRecorded(inst: *Instance, id: []const u8) void {
+    inst.setLastFailure(null);
+    inst.task_failure_type = "MutableSideEffectNotRecorded";
+    inst.task_failure = std.fmt.allocPrint(inst.arena(), "mutableSideEffect(\"{s}\"): history has no recorded value for this call; the workflow code changed since the run recorded it", .{id}) catch
+        "mutableSideEffect: history has no recorded value for this call; the workflow code changed since the run recorded it";
+}
+
 /// Encodes `args` and starts a child workflow through the outbound interceptors.
 pub fn executeChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workflow.ChildWorkflowOptions, args: anytype) workflow.ChildWorkflowFuture(converter.Payload) {
     if (inst.wio.refuse("executeChildWorkflow")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
@@ -2704,6 +2816,21 @@ pub fn awaitActivity(inst: *Instance, state: *ActivityState) error{Canceled}!voi
     if (!canceled) return;
     if (state.outcome.? == .cancelled) return error.Canceled;
     inst.wio.io().recancel();
+}
+
+/// Blocks the calling coroutine until another coroutine's mutable side effect recording
+/// resolves. Unlike `awaitActivity`, a cancel of this coroutine returns error.Canceled
+/// without canceling the recording, which belongs to the coroutine that started it.
+fn awaitRecording(inst: *Instance, state: *ActivityState) error{Canceled}!void {
+    const reason: WorkflowIo.Wait.Reason = .{ .what = "a mutable side effect (Context.mutableSideEffect)" };
+    var entry: FutureWaiters.Entry = .{ .wait = inst.wio.newWaitPoint(reason) };
+    state.waiters.add(&entry);
+    defer state.waiters.remove(&entry);
+    while (state.outcome == null) {
+        if (inst.evicting) return error.Canceled;
+        entry.wait = inst.wio.newWaitPoint(reason);
+        try inst.wio.waitFor(&entry.wait, true);
+    }
 }
 
 pub fn cancelActivity(inst: *Instance, state: *ActivityState) void {
@@ -4086,6 +4213,119 @@ test "patches: getVersion fails the task for a recorded version below min_suppor
     const older = try create(testing.allocator, PatchesWf.registered, .{});
     defer older.destroy();
     try testing.expect((try runPatches(older, a, true, &.{}, 2)).status.? == .failed);
+}
+
+// Mutable side effects: two calls for one ID whose value doesn't change.
+const MutableSideEffects = struct {
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const first = try ctx.mutableSideEffect(u32, "cfg", {}, seven, eqlU32);
+        const second = try ctx.mutableSideEffect(u32, "cfg", {}, seven, eqlU32);
+        return std.fmt.allocPrint(ctx.allocator(), "{d} {d}", .{ first, second });
+    }
+
+    fn seven(_: void) u32 {
+        return 7;
+    }
+
+    fn eqlU32(recorded: u32, current: u32) bool {
+        return recorded == current;
+    }
+};
+const MutableSideEffectsWf = workflow.Def("MutableSideEffects", MutableSideEffects.run);
+
+// An unchanged mutable side effect call: returns how many more bytes the run holds after it.
+const MutableSideEffectMemory = struct {
+    fn run(ctx: *workflow.Context) !usize {
+        _ = try ctx.mutableSideEffect([]const u8, "cfg", {}, name, eqlText);
+        const before = ctx.instance.allocated;
+        const again = try ctx.mutableSideEffect([]const u8, "cfg", {}, name, eqlText);
+        if (!std.mem.eql(u8, again, "seven")) return error.InvalidPayload;
+        return ctx.instance.allocated - before;
+    }
+
+    fn name(_: void) []const u8 {
+        return "seven";
+    }
+
+    fn eqlText(recorded: []const u8, current: []const u8) bool {
+        return std.mem.eql(u8, recorded, current);
+    }
+};
+const MutableSideEffectMemoryWf = workflow.Def("MutableSideEffectMemory", MutableSideEffectMemory.run);
+
+test "patches: an unchanged mutable side effect call holds as much memory on replay as when it first ran" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var results: [2][]const u8 = undefined;
+    for ([_]bool{ false, true }, &results) |replaying, *result| {
+        const inst = try create(testing.allocator, MutableSideEffectMemoryWf.registered, .{});
+        defer inst.destroy();
+        var act = try initActivation(a, "MutableSideEffectMemory", .{});
+        act.is_replaying = replaying;
+        if (replaying) try act.jobs.append(a, .{ .variant = .{ .notify_has_patch = .{ .patch_id = mutable_side_effect_patch_prefix ++ "cfg:1" } } });
+        const first = commandsOf(try inst.activate(&act, a));
+        var resolved = try resolveLocal(a, first[1].variant.?.schedule_local_activity.seq, .{ .completed = .{ .result = try converter.toPayload(a, @as([]const u8, "seven")) } });
+        resolved.is_replaying = replaying;
+        const done = commandsOf(try inst.activate(&resolved, a));
+        result.* = try a.dupe(u8, done[0].variant.?.complete_workflow_execution.result.?.data);
+    }
+    // The decoded return value only, in both.
+    try testing.expectEqualStrings(results[0], results[1]);
+    try testing.expectEqualStrings("5", results[0]);
+}
+
+test "patches: a mutable side effect records its first value and not an unchanged one" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, MutableSideEffectsWf.registered, .{});
+    defer inst.destroy();
+    const first = commandsOf(try inst.activate(&try initActivation(a, "MutableSideEffects", .{}), a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try expectMarker(first[0], mutable_side_effect_patch_prefix ++ "cfg:1", false);
+    const sched = first[1].variant.?.schedule_local_activity;
+    try testing.expectEqualStrings(side_effect_activity_type, sched.activity_type);
+    try testing.expectEqualStrings("7", sched.arguments.items[0].data);
+    const done = commandsOf(try inst.activate(&try resolveLocal(a, sched.seq, .{ .completed = .{ .result = try converter.toPayload(a, @as(u32, 7)) } }), a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("\"7 7\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "patches: a replayed mutable side effect follows its patch and reads the recorded value" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, MutableSideEffectsWf.registered, .{});
+    defer inst.destroy();
+    var act = try initActivation(a, "MutableSideEffects", .{});
+    act.is_replaying = true;
+    try act.jobs.append(a, .{ .variant = .{ .notify_has_patch = .{ .patch_id = mutable_side_effect_patch_prefix ++ "cfg:1" } } });
+    const first = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try expectMarker(first[0], mutable_side_effect_patch_prefix ++ "cfg:1", false);
+    const sched = first[1].variant.?.schedule_local_activity;
+    try testing.expectEqual(@as(usize, 0), sched.arguments.items.len);
+    // The recorded value, not the function's: on replay the function doesn't run.
+    var resolved = try resolveLocal(a, sched.seq, .{ .completed = .{ .result = try converter.toPayload(a, @as(u32, 9)) } });
+    resolved.is_replaying = true;
+    const done = commandsOf(try inst.activate(&resolved, a));
+    try testing.expectEqual(@as(usize, 1), done.len);
+    try testing.expectEqualStrings("\"9 9\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "patches: a replayed mutable side effect with no patch and no value fails the task" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, MutableSideEffectsWf.registered, .{});
+    defer inst.destroy();
+    var act = try initActivation(a, "MutableSideEffects", .{});
+    act.is_replaying = true;
+    const c = try inst.activate(&act, a);
+    const f = c.status.?.failed.failure.?;
+    try testing.expectEqualStrings("MutableSideEffectNotRecorded", failure_mod.applicationType(f).?);
+    try testing.expectEqualStrings("mutableSideEffect(\"cfg\"): history has no recorded value for this call; the workflow code changed since the run recorded it", f.message);
 }
 
 // Versioning behavior: the Def's goes with every completion until the run sets another.
