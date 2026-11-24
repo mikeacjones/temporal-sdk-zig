@@ -60,6 +60,14 @@
 //! A value read often that changes rarely uses `ctx.mutableSideEffect` instead, which records
 //! a new value only when it differs from the last one recorded.
 //!
+//! A library or interceptor that keeps state for each run declares a `LocalVar`: a typed
+//! value with a default, which any code holding the run's `*Context` reads and sets, and
+//! which each run has its own copy of. Query handlers, update validators and side-effect
+//! functions may read it but not set it:
+//!
+//!     const depth: temporal.workflow.LocalVar(u32) = .{ .name = "audit.depth", .default = 0 };
+//!     try depth.set(ctx, depth.get(ctx) + 1);
+//!
 //! Concurrency in a workflow uses `std.Io`, which `ctx.io()` implements deterministically:
 //!
 //! - Coroutines: `io.async(fn, args)`, or `std.Io.Group.async` for a set of them.
@@ -113,6 +121,15 @@
 //! type and its arguments still encoded (`converter.EncodedValues`):
 //!
 //!     try ctx.setDynamicQueryHandler(state, State.anyQuery); // fn (*State, []const u8, EncodedValues) !T
+//!
+//! The worker answers three queries for every workflow without any registration:
+//! `__stack_trace` (`StackTraceQuery`, which the workflow may answer itself instead),
+//! `__enhanced_stack_trace` (`EnhancedStackTraceQuery`) and `__temporal_workflow_metadata`
+//! (`WorkflowMetadataQuery`). The last two names are reserved: registering a handler for
+//! either is a compile error. The metadata lists each registered query, signal and update
+//! with the description given in its options (`QueryHandlerOptions`, `HandlerOptions`):
+//!
+//!     try ctx.setQueryHandlerWithOptions(Greeting, state, State.current, .{ .description = "The current greeting" });
 //!
 //! Signals change a workflow's state from outside. Name one with `SignalDef` and handle it
 //! with `ctx.setSignalHandler`. Each signal runs its handler in a coroutine of its own, so a
@@ -355,6 +372,18 @@ pub const HandlerUnfinishedPolicy = enum {
 /// `setUpdateHandlerWithOptions`, and their dynamic and by-name variants).
 pub const HandlerOptions = struct {
     unfinished_policy: HandlerUnfinishedPolicy = .warn_and_abandon,
+    /// Shown for the signal or update in the answer to `__temporal_workflow_metadata`
+    /// (`WorkflowMetadataQuery`). Copied into the run's memory. Ignored by the dynamic
+    /// handlers, which have no name.
+    description: []const u8 = "",
+};
+
+/// Options for registering a query handler (`Context.setQueryHandlerWithOptions`, or a
+/// struct workflow's `queries` entry).
+pub const QueryHandlerOptions = struct {
+    /// Shown for the query in the answer to `__temporal_workflow_metadata`
+    /// (`WorkflowMetadataQuery`). Copied into the run's memory.
+    description: []const u8 = "",
 };
 
 /// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
@@ -1102,7 +1131,7 @@ pub const Context = struct {
     /// For a value that is read often and changes rarely, use `mutableSideEffect`, which
     /// records a new value only when it differs from the last one recorded.
     pub fn sideEffect(ctx: *Context, comptime T: type, context: anytype, comptime func: fn (@TypeOf(context)) T) SideEffectError!T {
-        const value: ?converter.Payload = if (ctx.instance.replaying) null else try converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), func(context));
+        const value: ?converter.Payload = if (ctx.instance.replaying) null else try converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), ctx.callSideEffectFn(T, func, .{context}));
         const future: ActivityFuture(T) = .{ .ctx = ctx, .state = ctx.instance.sideEffect(value).state };
         return future.get() catch |err| switch (err) {
             error.ActivityFailed => error.SideEffectFailed,
@@ -1155,14 +1184,14 @@ pub const Context = struct {
         const call = try inst.mutableSideEffectBegin(id);
         var value: ?converter.Payload = null;
         const changed = if (inst.replaying) try inst.mutableSideEffectNotified(id, call) else changed: {
-            const current = func(context);
+            const current = ctx.callSideEffectFn(T, func, .{context});
             if (inst.mutableSideEffectValue(id)) |recorded| {
                 // The previous value is decoded into scratch memory freed before returning, so
                 // an unchanged call holds as much of the run's memory as it does on replay.
                 var scratch: std.heap.ArenaAllocator = .init(inst.arena());
                 defer scratch.deinit();
                 const previous = converter.fromPayloadWithContext(T, scratch.allocator(), ctx.converterContext(), recorded) catch |err| return mapDecodeError(err);
-                if (eql(previous, current)) break :changed false;
+                if (ctx.callSideEffectFn(bool, eql, .{ previous, current })) break :changed false;
             }
             value = try converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), current);
             break :changed true;
@@ -1173,6 +1202,14 @@ pub const Context = struct {
             return error.SideEffectFailed;
         };
         return converter.fromPayloadWithContext(T, ctx.allocator(), ctx.converterContext(), recorded) catch |err| mapDecodeError(err);
+    }
+
+    /// Calls a side-effect function, marking it as one for `LocalVar.set` (see
+    /// `Instance.beginSideEffect`).
+    fn callSideEffectFn(ctx: *Context, comptime R: type, comptime f: anytype, args: anytype) R {
+        const previous = ctx.instance.beginSideEffect();
+        defer ctx.instance.endSideEffect(previous);
+        return @call(.auto, f, args);
     }
 
     fn mapDecodeError(err: converter.DecodeError) SideEffectError {
@@ -1453,7 +1490,10 @@ pub const Context = struct {
     /// Answers queries of type `Query` (a `QueryDef`) with `handler(context, args...)`, which
     /// returns `Query.Result` or an error union of it; an error fails the query with the
     /// error's name. Registering the same query type again replaces its handler. A handler
-    /// for `__stack_trace` (`StackTraceQuery`) replaces the worker's own answer to it.
+    /// for `__stack_trace` (`StackTraceQuery`) replaces the worker's own answer to it. The
+    /// worker answers `__enhanced_stack_trace` (`EnhancedStackTraceQuery`) and
+    /// `__temporal_workflow_metadata` (`WorkflowMetadataQuery`) itself, so registering a
+    /// handler for either is a compile error.
     ///
     /// Handlers run synchronously on the worker thread, outside any coroutine, possibly after
     /// the workflow function has returned. They must only read workflow state. A handler that
@@ -1479,6 +1519,16 @@ pub const Context = struct {
     ///     const state = try ctx.allocator().create(State);
     ///     try ctx.setQueryHandler(GetStatus, state, State.status);
     pub fn setQueryHandler(ctx: *Context, comptime Query: type, context: anytype, comptime handler: anytype) SetQueryHandlerError!void {
+        if (comptime reservedQueryError(Query.query_name)) |message| @compileError(message);
+        return ctx.setQueryHandlerWithOptions(Query, context, handler, .{});
+    }
+
+    /// `setQueryHandler` with options: a description, which the answer to
+    /// `__temporal_workflow_metadata` shows for the query.
+    ///
+    ///     try ctx.setQueryHandlerWithOptions(GetStatus, state, State.status, .{ .description = "The order's status" });
+    pub fn setQueryHandlerWithOptions(ctx: *Context, comptime Query: type, context: anytype, comptime handler: anytype, options: QueryHandlerOptions) SetQueryHandlerError!void {
+        if (comptime reservedQueryError(Query.query_name)) |message| @compileError(message);
         const C = @TypeOf(context);
         comptime checkHandler("query handler for \"" ++ Query.query_name ++ "\"", Query.Args, C, @TypeOf(handler), Query.Result);
         const Erased = struct {
@@ -1492,7 +1542,14 @@ pub const Context = struct {
         };
         const stored = try ctx.allocator().create(C);
         stored.* = context;
-        return ctx.instance.setQueryHandler(Query.query_name, .{ .context = @ptrCast(stored), .call = Erased.call }, contextAddress(context));
+        const description = try ctx.copyDescription(options.description);
+        return ctx.instance.setQueryHandler(Query.query_name, .{ .context = @ptrCast(stored), .call = Erased.call, .description = description }, contextAddress(context));
+    }
+
+    /// `description` in the run's memory, or "" for an empty one.
+    fn copyDescription(ctx: *Context, description: []const u8) error{OutOfMemory}![]const u8 {
+        if (description.len == 0) return "";
+        return ctx.allocator().dupe(u8, description);
     }
 
     /// Answers every query that has no handler registered for its type with
@@ -1504,9 +1561,10 @@ pub const Context = struct {
     /// Registering again replaces the dynamic handler. A handler registered for a query type
     /// with `setQueryHandler` still answers that type. Without a dynamic handler, a query of
     /// an unregistered type fails with `QueryNotRegistered`. The query types Temporal's tools
-    /// send never reach the dynamic handler: the worker answers `__stack_trace` itself
-    /// (`StackTraceQuery`), and `__enhanced_stack_trace` and `__temporal...` fail with
-    /// `QueryNotRegistered`.
+    /// send never reach the dynamic handler: the worker answers `__stack_trace`
+    /// (`StackTraceQuery`), `__enhanced_stack_trace` (`EnhancedStackTraceQuery`) and
+    /// `__temporal_workflow_metadata` (`WorkflowMetadataQuery`) itself, and other
+    /// `__temporal...` types fail with `QueryNotRegistered`.
     ///
     /// The handler is read-only and its `context` must outlive the run, as in
     /// `setQueryHandler`; a pointer into the calling coroutine's stack returns
@@ -1566,7 +1624,8 @@ pub const Context = struct {
     }
 
     /// `setSignalHandler` with options, such as `.unfinished_policy = .abandon` for a handler
-    /// whose work may be cut short when the workflow ends (see `HandlerUnfinishedPolicy`).
+    /// whose work may be cut short when the workflow ends (see `HandlerUnfinishedPolicy`), or
+    /// a `.description` for the answer to `__temporal_workflow_metadata`.
     ///
     ///     try ctx.setSignalHandlerWithOptions(Ping, state, State.ping, .{ .unfinished_policy = .abandon });
     pub fn setSignalHandlerWithOptions(ctx: *Context, comptime Signal: type, context: anytype, comptime handler: anytype, options: HandlerOptions) SetSignalHandlerError!void {
@@ -1608,7 +1667,8 @@ pub const Context = struct {
         };
         const stored = try ctx.allocator().create(C);
         stored.* = context;
-        return ctx.instance.setSignalHandler(name, .{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call, .unfinished_policy = options.unfinished_policy }, contextAddress(context));
+        const description = try ctx.copyDescription(options.description);
+        return ctx.instance.setSignalHandler(name, .{ .context = @ptrCast(stored), .decode = Erased.decode, .call = Erased.call, .unfinished_policy = options.unfinished_policy, .description = description }, contextAddress(context));
     }
 
     /// Handles every signal that has no handler registered for its name with
@@ -1754,7 +1814,8 @@ pub const Context = struct {
 
     /// `setUpdateHandlerWithValidator` with options, such as `.unfinished_policy = .abandon`
     /// for a handler whose work may be cut short when the workflow ends (see
-    /// `HandlerUnfinishedPolicy`). `validator` is `null` for an update without one.
+    /// `HandlerUnfinishedPolicy`), or a `.description` for the answer to
+    /// `__temporal_workflow_metadata`. `validator` is `null` for an update without one.
     ///
     ///     try ctx.setUpdateHandlerWithOptions(SetLimit, state, State.set, null, .{ .unfinished_policy = .abandon });
     pub fn setUpdateHandlerWithOptions(ctx: *Context, comptime Update: type, context: anytype, comptime handler: anytype, comptime validator: anytype, options: HandlerOptions) SetUpdateHandlerError!void {
@@ -1785,12 +1846,14 @@ pub const Context = struct {
         };
         const stored = try ctx.allocator().create(C);
         stored.* = context;
+        const description = try ctx.copyDescription(options.description);
         return ctx.instance.setUpdateHandler(Update.update_name, .{
             .context = @ptrCast(stored),
             .decode = Erased.decode,
             .validate = if (has_validator) Erased.validate else null,
             .call = Erased.call,
             .unfinished_policy = options.unfinished_policy,
+            .description = description,
         }, contextAddress(context));
     }
 
@@ -2428,6 +2491,84 @@ fn alreadyStarted(f: *const failure_mod.Failure) bool {
     return false;
 }
 
+/// A variable scoped to one workflow run, for libraries and interceptors that keep per-run
+/// state without threading it through the workflow's code. Declare it once, usually as a
+/// container-level constant, and build it with a struct literal:
+///
+///     const depth: temporal.workflow.LocalVar(u32) = .{ .name = "audit.depth", .default = 0 };
+///
+///     try depth.set(ctx, depth.get(ctx) + 1);
+///
+/// Any code of the run that holds its `*Context` reaches the same value: the workflow
+/// function, the coroutines it starts, its signal and update handlers, and the run's
+/// workflow interceptors (with the `Context` `interceptor.Worker.interceptWorkflow` got).
+/// Each run has its own values, which start at `default` and are freed with the run, when it
+/// completes or is evicted; a run rebuilt from history gets them back by replaying the code
+/// that set them.
+///
+/// A variable is its `name` and its `T`: copies are the same variable, and so are two
+/// declarations with the same name and type, so a library should prefix its names
+/// ("mylib.depth"). The same name with another `T` is another variable.
+///
+/// The value is immutable and may be shared by every run and thread; `get` and `set` are
+/// workflow code, on the run's worker thread only.
+pub fn LocalVar(comptime T: type) type {
+    return struct {
+        /// Identifies the variable within a run, together with `T`. Copied into the run's
+        /// memory the first time the run sets it.
+        name: []const u8,
+        /// What `get` returns in a run that has not set the variable.
+        default: T,
+
+        pub const Value = T;
+
+        /// Identifies `T` within a run's table by its address, which no other type's
+        /// `LocalVar` shares, even one with the same `@typeName`. Never written.
+        var type_id: u8 = 0;
+
+        /// `ReadOnly`: the caller is a query handler, an update validator, or a side-effect
+        /// function (`func` of `Context.sideEffect`, `func` or `eql` of
+        /// `Context.mutableSideEffect`), none of which runs again when the run is replayed.
+        /// The value is unchanged. In a query handler or validator the query fails, or the
+        /// update is rejected, with a `ReadOnlyViolation` failure naming `LocalVar.set`; in a
+        /// side-effect function a warning naming the variable is logged.
+        /// `OutOfMemory`: the run's first set of the variable could not allocate it; it stays
+        /// unset.
+        pub const SetError = error{ OutOfMemory, ReadOnly };
+
+        /// The value the run last set, or `default`. Allowed everywhere, read-only code
+        /// included.
+        pub fn get(v: @This(), ctx: *const Context) T {
+            if (@sizeOf(T) == 0) return v.default;
+            const box = ctx.instance.localValue(v.name, &type_id) orelse return v.default;
+            return @as(*const T, @ptrCast(@alignCast(box))).*;
+        }
+
+        /// Sets the run's value. `value` is copied shallowly into the run's memory; memory it
+        /// points to (a string's bytes) is borrowed and must outlive the run or come from
+        /// `ctx.allocator()`. The first set of a variable in a run allocates it; later sets
+        /// overwrite it in place.
+        pub fn set(v: @This(), ctx: *Context, value: T) SetError!void {
+            const inst = ctx.instance;
+            if (inst.refuseLocalSet()) {
+                if (!inst.wio.refuse("LocalVar.set"))
+                    inst.logger.warn("LocalVar.set in a side-effect function is refused: side-effect functions don't run on replay, so the value would differ there; set it from the code that calls sideEffect or mutableSideEffect", .{ .LocalVar = v.name });
+                return error.ReadOnly;
+            }
+            if (@sizeOf(T) == 0) return;
+            if (inst.localValue(v.name, &type_id)) |box| {
+                @as(*T, @ptrCast(@alignCast(box))).* = value;
+                return;
+            }
+            const a = inst.arena();
+            const box = try a.create(T);
+            errdefer a.destroy(box);
+            box.* = value;
+            try inst.addLocalValue(v.name, &type_id, @ptrCast(box));
+        }
+    };
+}
+
 /// The signals of one name, from `Context.signalChannel` or `signalChannelByName`, read in
 /// arrival order. `Args` is the signal's argument tuple; each receive returns a `Value`: the
 /// argument itself for a signal with one argument, else the whole tuple. Allocated in
@@ -2582,7 +2723,10 @@ pub const DefOptions = struct {
 ///   a pub method of `W` to a `QueryDef`, `SignalDef`, or `UpdateDef`. An update entry may also
 ///   name a validator method: `.{ UpdateDef, .validatorMethod }`. A signal or update entry
 ///   may end with `HandlerOptions`, such as `.{ Add, .{ .unfinished_policy = .abandon } }` or
-///   `.{ Reset, .checkReset, .{ .unfinished_policy = .abandon } }`.
+///   `.{ Reset, .checkReset, .{ .description = "Sets the counter" } }`, and a query entry
+///   with `QueryHandlerOptions`, such as `.{ Current, .{ .description = "The counter" } }`.
+///   A query entry for `__enhanced_stack_trace` or `__temporal_workflow_metadata`, which the
+///   worker answers itself, is a compile error.
 /// - A handler method takes `self: *W` followed by the Def's arguments and returns what
 ///   `Context.setQueryHandler`, `setSignalHandler`, or `setUpdateHandler` accepts. A
 ///   validator returns `void` or `!void`. Each Def appears once per declaration.
@@ -2681,8 +2825,8 @@ fn StructDef(comptime name: []const u8, comptime W: type, comptime options: DefO
             const w = try ctx.allocator().create(W);
             w.* = .{};
             inline for (comptime entryNames(W, "queries")) |entry| {
-                const D = comptime handlerEntry("queries", @field(W.queries, entry)).?.def;
-                try ctx.setQueryHandler(D, w, @field(W, entry));
+                const e = comptime handlerEntry("queries", @field(W.queries, entry)).?;
+                try ctx.setQueryHandlerWithOptions(e.def, w, @field(W, entry), .{ .description = e.options.description });
             }
             inline for (comptime entryNames(W, "signals")) |entry| {
                 const e = comptime handlerEntry("signals", @field(W.signals, entry)).?;
@@ -2766,6 +2910,7 @@ fn structDefError(comptime prefix: []const u8, comptime W: type) ?[]const u8 {
             const value = @field(entries, entry);
             const e = handlerEntry(decl, value) orelse return where ++ " must be " ++ defKind(decl).want ++ ", not " ++ describe(value);
             const def_name = @field(e.def, defKind(decl).name_decl);
+            if (std.mem.eql(u8, decl, "queries")) if (reservedQueryError(def_name)) |message| return where ++ ": " ++ message;
             for (e_info.field_names[0..i]) |earlier| {
                 const other = handlerEntry(decl, @field(entries, earlier)).?.def;
                 if (std.mem.eql(u8, @field(other, defKind(decl).name_decl), def_name))
@@ -2792,7 +2937,7 @@ fn defKind(comptime decl: []const u8) struct { def: []const u8, name_decl: []con
         .name_decl = "query_name",
         .noun = "query",
         .example = "`.{ .status = Status }`",
-        .want = "a QueryDef (temporal.workflow.QueryDef(name, fn (args...) Result))",
+        .want = "a QueryDef (temporal.workflow.QueryDef(name, fn (args...) Result)), or .{ QueryDef, QueryHandlerOptions } such as .{ Status, .{ .description = \"...\" } }",
     };
     if (std.mem.eql(u8, decl, "signals")) return .{
         .def = "SignalDef",
@@ -2811,48 +2956,85 @@ fn defKind(comptime decl: []const u8) struct { def: []const u8, name_decl: []con
 }
 
 /// The Def of an entry of `W.queries`, `signals`, or `updates`, the name of its validator
-/// method, and its handler options, or null if the entry isn't one of `decl`'s kind. A signal
-/// entry is `Def` or `.{ Def, options }`; an update entry is also `.{ Def, .validator }` or
-/// `.{ Def, .validator, options }`.
+/// method, and its handler options, or null if the entry isn't one of `decl`'s kind. A query
+/// or signal entry is `Def` or `.{ Def, options }`; an update entry is also
+/// `.{ Def, .validator }` or `.{ Def, .validator, options }`. A query entry's options are
+/// `QueryHandlerOptions`, given here as the `HandlerOptions` with the same description.
 fn handlerEntry(comptime decl: []const u8, comptime value: anytype) ?struct { def: type, validator: ?[]const u8 = null, options: HandlerOptions = .{} } {
     const name_decl = defKind(decl).name_decl;
     if (@TypeOf(value) == type) return if (isDef(value, name_decl)) .{ .def = value } else null;
-    if (std.mem.eql(u8, decl, "queries")) return null;
     const s = switch (@typeInfo(@TypeOf(value))) {
         .@"struct" => |s| s,
         else => return null,
     };
     if (!s.is_tuple or s.field_types.len < 2 or s.field_types.len > 3 or s.field_types[0] != type) return null;
     if (!isDef(value[0], name_decl)) return null;
+    if (std.mem.eql(u8, decl, "queries")) {
+        if (s.field_types.len != 2) return null;
+        const options = handlerOptions(QueryHandlerOptions, value[1]) orelse return null;
+        return .{ .def = value[0], .options = .{ .description = options.description } };
+    }
     const updates = std.mem.eql(u8, decl, "updates");
     const has_validator = updates and @typeInfo(s.field_types[1]) == .enum_literal;
     if (s.field_types.len == 3 and !has_validator) return null;
     if (s.field_types.len == 2 and has_validator) return .{ .def = value[0], .validator = @tagName(value[1]) };
-    const options = handlerOptions(value[s.field_types.len - 1]) orelse return null;
+    const options = handlerOptions(HandlerOptions, value[s.field_types.len - 1]) orelse return null;
     return .{ .def = value[0], .validator = if (has_validator) @tagName(value[1]) else null, .options = options };
 }
 
-/// `value` as `HandlerOptions`: a `HandlerOptions`, or a struct literal of its fields such as
-/// `.{ .unfinished_policy = .abandon }`. Null if it is neither.
-fn handlerOptions(comptime value: anytype) ?HandlerOptions {
+/// `value` as `Options` (`HandlerOptions` or `QueryHandlerOptions`): an `Options`, or a
+/// struct literal of its fields such as `.{ .unfinished_policy = .abandon }` or
+/// `.{ .description = "..." }`. Null if it is neither.
+fn handlerOptions(comptime Options: type, comptime value: anytype) ?Options {
     const T = @TypeOf(value);
-    if (T == HandlerOptions) return value;
+    if (T == Options) return value;
     const s = switch (@typeInfo(T)) {
         .@"struct" => |s| s,
         else => return null,
     };
     if (s.is_tuple) return null;
-    var options: HandlerOptions = .{};
+    var options: Options = .{};
     for (s.field_names, s.field_types) |name, F| {
-        if (!@hasField(HandlerOptions, name)) return null;
-        const Want = @FieldType(HandlerOptions, name);
+        if (!@hasField(Options, name)) return null;
+        const Want = @FieldType(Options, name);
         if (F == Want) {
             @field(options, name) = @field(value, name);
         } else if (@typeInfo(F) == .enum_literal and @typeInfo(Want) == .@"enum") {
             @field(options, name) = std.meta.stringToEnum(Want, @tagName(@field(value, name))) orelse return null;
+        } else if (Want == []const u8 and isString(F)) {
+            @field(options, name) = @field(value, name);
         } else return null;
     }
     return options;
+}
+
+/// Whether a value of type `T` is a string that coerces to `[]const u8`: a string literal
+/// (`*const [n:0]u8`), or a slice or pointer to an array of `u8`.
+fn isString(comptime T: type) bool {
+    const p = switch (@typeInfo(T)) {
+        .pointer => |p| p,
+        else => return false,
+    };
+    return switch (p.size) {
+        .slice => p.child == u8,
+        .one => switch (@typeInfo(p.child)) {
+            .array => |a| a.child == u8,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Why a query handler can't be registered for queries of type `query_name`, as the compile
+/// error `Context.setQueryHandler`, `Context.setQueryHandlerWithOptions` and a struct
+/// workflow's `queries` entry report, or null if it can: the worker answers
+/// `__enhanced_stack_trace` and `__temporal_workflow_metadata` itself, for every workflow.
+fn reservedQueryError(comptime query_name: []const u8) ?[]const u8 {
+    for ([_][]const u8{ Instance.enhanced_stack_trace_query, Instance.workflow_metadata_query }) |reserved| {
+        if (std.mem.eql(u8, query_name, reserved))
+            return "query type \"" ++ query_name ++ "\" is reserved: the worker answers it itself for every workflow, so a handler registered for it would never run; give the query another name";
+    }
+    return null;
 }
 
 fn isDef(comptime T: type, comptime name_decl: []const u8) bool {
@@ -2938,6 +3120,56 @@ pub fn DynamicDefWithOptions(comptime func: anytype, comptime options: DefOption
 /// copied, cut to 64 bytes, to the waiting coroutine's stack), and no allocation; the
 /// coroutines' stacks are unwound and debug info is read only to answer.
 pub const StackTraceQuery = QueryDef(Instance.stack_trace_query, fn () []const u8);
+
+/// The answer to `__enhanced_stack_trace` (`EnhancedStackTraceQuery`), which the worker
+/// encodes as JSON (`json/plain`) with these field names, the shape Temporal's UI reads.
+/// `stacks` has one entry per live coroutine, in the order and set of `__stack_trace`'s
+/// entries, each listing its call sites in workflow code, innermost first. `sources` maps
+/// each file those call sites are in, where the worker can read it at the path its debug
+/// info names, to excerpts of the lines around them.
+pub const EnhancedStackTrace = struct {
+    sdk: Sdk = .{},
+    stacks: []const Stack = &.{},
+    sources: std.json.ArrayHashMap([]const FileSlice) = .{},
+
+    /// The SDK that answered: `temporal-zig` and `temporal.version`.
+    pub const Sdk = struct { name: []const u8 = "", version: []const u8 = "" };
+    /// One coroutine's call sites; none when the build has no debug info for them.
+    pub const Stack = struct { locations: []const Location = &.{} };
+    pub const Location = struct {
+        file_path: []const u8 = "",
+        /// 1-based.
+        line: i32 = 0,
+        column: i32 = 0,
+        function_name: []const u8 = "",
+        /// Always false: SDK and standard library frames are left out.
+        internal_code: bool = false,
+    };
+    /// The lines of a file after its first `line_offset` lines.
+    pub const FileSlice = struct { line_offset: u32 = 0, content: []const u8 = "" };
+};
+
+/// The query Temporal's UI sends to show where a running workflow waits, with the source
+/// around each place, which a worker answers for every workflow it runs without any
+/// registration (see `EnhancedStackTrace`). Registering a handler for it is a compile error.
+///
+///     const trace = try client.queryWorkflow(temporal.workflow.EnhancedStackTraceQuery, arena, id, "", .{});
+///
+/// Answering is read-only, as for `StackTraceQuery`. Source excerpts are read from the files
+/// at the paths in the worker's debug info, which on a machine other than the one that
+/// built the worker are usually missing; those files are left out of `sources`.
+pub const EnhancedStackTraceQuery = QueryDef(Instance.enhanced_stack_trace_query, fn () EnhancedStackTrace);
+
+/// The query Temporal's UI sends to list a workflow's handlers, which a worker answers for
+/// every workflow it runs without any registration: the workflow type and every query,
+/// signal and update name registered in the run, each with the description it was registered
+/// with, sorted by name. The queries include the three the worker answers itself. Dynamic
+/// handlers aren't listed, and `current_details` is empty. Registering a handler for it is a
+/// compile error.
+///
+///     const metadata = try client.queryWorkflow(temporal.workflow.WorkflowMetadataQuery, arena, id, "", .{});
+///     for (metadata.definition.?.query_definitions.items) |q| std.debug.print("{s}: {s}\n", .{ q.name, q.description });
+pub const WorkflowMetadataQuery = QueryDef(Instance.workflow_metadata_query, fn () proto.temporal.api.sdk.v1.WorkflowMetadata);
 
 /// Names a query and its signature: `F` is a function type whose parameters are the query's
 /// arguments and whose return type is its result. Workflows answer it with
@@ -3279,6 +3511,57 @@ test "a struct Def's handler declaration errors name the workflow, the entry, an
         pub const signals = .{ .add = .{ T.Add, .{ .unfinished_policy = .abandon } } };
         pub const updates = .{ .reset = .{ T.Reset, HandlerOptions{ .unfinished_policy = .abandon } } };
     })) == null);
+}
+
+test "a query handler for __enhanced_stack_trace or __temporal_workflow_metadata is refused with an error naming the query type" {
+    const T = StructDefTests;
+    inline for (.{ "__enhanced_stack_trace", "__temporal_workflow_metadata" }) |name| {
+        try T.expectMessage(comptime reservedQueryError(name), &.{ "query type \"", name, "\" is reserved", "the worker answers it itself", "give the query another name" });
+    }
+    try std.testing.expect(comptime reservedQueryError(EnhancedStackTraceQuery.query_name) != null);
+    try std.testing.expect(comptime reservedQueryError(WorkflowMetadataQuery.query_name) != null);
+    // `__stack_trace` stays the workflow's to answer; other names are free.
+    try std.testing.expect(comptime reservedQueryError("__stack_trace") == null);
+    try std.testing.expect(comptime reservedQueryError("__temporal_other") == null);
+    try std.testing.expect(comptime reservedQueryError("status") == null);
+
+    // A struct workflow's `queries` entry, plain or with options.
+    const W = struct {
+        pub const queries = .{ .meta = .{ WorkflowMetadataQuery, .{ .description = "mine" } } };
+        pub fn run(_: *@This(), _: *Context) !void {}
+        pub fn meta(_: *@This()) proto.temporal.api.sdk.v1.WorkflowMetadata {
+            return .{};
+        }
+    };
+    try T.expectMessage(comptime defError("W", W), &.{ "workflow \"W\": queries.meta: query type \"__temporal_workflow_metadata\" is reserved", "give the query another name" });
+    const Trace = struct {
+        pub const queries = .{ .trace = EnhancedStackTraceQuery };
+        pub fn run(_: *@This(), _: *Context) !void {}
+        pub fn trace(_: *@This()) EnhancedStackTrace {
+            return .{};
+        }
+    };
+    try T.expectMessage(comptime defError("W", Trace), &.{"queries.trace: query type \"__enhanced_stack_trace\" is reserved"});
+}
+
+test "struct workflow entries take a description: string literals, slices and the options types" {
+    const T = StructDefTests;
+    const literal = comptime handlerEntry("queries", .{ T.Total, .{ .description = "The total" } }).?;
+    try std.testing.expectEqualStrings("The total", literal.options.description);
+    const typed = comptime handlerEntry("queries", .{ T.Total, QueryHandlerOptions{ .description = "typed" } }).?;
+    try std.testing.expectEqualStrings("typed", typed.options.description);
+    const slice: []const u8 = "a slice";
+    const sliced = comptime handlerEntry("signals", .{ T.Add, .{ .description = slice, .unfinished_policy = .abandon } }).?;
+    try std.testing.expectEqualStrings("a slice", sliced.options.description);
+    try std.testing.expectEqual(HandlerUnfinishedPolicy.abandon, sliced.options.unfinished_policy);
+    const update = comptime handlerEntry("updates", .{ T.Reset, .checkReset, .{ .description = "Resets" } }).?;
+    try std.testing.expectEqualStrings("Resets", update.options.description);
+    try std.testing.expectEqualStrings("checkReset", update.validator.?);
+    // Not a description: a number, or a query option a query doesn't have.
+    try std.testing.expect(comptime handlerEntry("queries", .{ T.Total, .{ .description = 5 } }) == null);
+    try std.testing.expect(comptime handlerEntry("signals", .{ T.Add, .{ .description = .abandon } }) == null);
+    try std.testing.expect(comptime handlerEntry("queries", .{ T.Total, .{ .description = "x", .unfinished_policy = .abandon } }) == null);
+    try std.testing.expect(comptime handlerEntry("queries", .{ T.Total, HandlerOptions{} }) == null);
 }
 
 test "executeNexusOperation's compile errors name the service and the operation" {

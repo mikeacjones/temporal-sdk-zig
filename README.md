@@ -939,6 +939,7 @@ Notes:
 - Function workflows use `ctx.setSignalHandler`, `setQueryHandler`, and `setUpdateHandler(WithValidator)`, with a context from `ctx.allocator()`. `ctx.currentUpdate()` gives an update handler or validator its update's ID and name.
 - Signal and update handlers run in their own coroutines and may block; query handlers and validators must only read state (see below).
 - `ctx.setSignalHandlerByName` handles a signal named at run time, and `ctx.setDynamicSignalHandler` every signal without a handler.
+- A handler can carry a description, which Temporal's UI shows from the answer to the `__temporal_workflow_metadata` query: `.description` in `QueryHandlerOptions` (`ctx.setQueryHandlerWithOptions`) or `HandlerOptions` (`setSignalHandlerWithOptions`, `setUpdateHandlerWithOptions`), or in a struct workflow's entry, such as `.{ GuestCount, .{ .description = "Guests so far" } }`. See [Stack trace and metadata queries](#stack-trace-and-metadata-queries).
 
 `ctx.setDynamicQueryHandler(context, handler)` answers every query that has no handler of its own. The handler gets the query type and the arguments still encoded (`converter.EncodedValues`), like a dynamic signal handler, and returns the answer:
 
@@ -977,7 +978,7 @@ Notes:
 - An error from the handler, or an argument that doesn't decode, fails the query with the error's name. Registering again replaces the dynamic handler; its context must outlive the run, and one on the calling coroutine's stack returns `error.QueryContextOnStack`.
 - Query handlers and update validators must not change workflow state: history doesn't record queries or rejected updates, so a change would make the run differ from its replay. A call from one that would start an activity, timer, child workflow or any other command (`executeActivity`, `sleep`, `executeChildWorkflow`, `signalExternalWorkflow`, `upsertMemo`, `completeSession`, ...), register or remove a handler (`setSignalHandler`, `signalChannel`, `setUpdateHandler`, ...), take a signal from a channel (`receive`, `tryReceive`), change the run's settings (`setVersioningBehavior`), start a coroutine (`io.concurrent`), or block (`ctx.await`, a pending future's `get`) is refused: it returns `error.InvalidOptions` or `error.Canceled` (or does nothing, where it can't fail), the query fails or the update is rejected with a `ReadOnlyViolation` failure whose message names the call, whatever the handler returns, no command is sent, and the workflow task doesn't fail. A zero `sleep` returns at once, `io.async` runs its function inline, and `io.random` draws without moving the workflow's random sequence. `ctx.fail` and `ctx.failWith` describe the query's failure or the update's rejection, not the workflow's.
 - `setCoroutineName` does nothing in a query handler or a validator run on delivery, which run outside any coroutine, so the query or update goes on. It is refused like the calls above in a validator that runs in a coroutine, which happens when the workflow function or a handler registers the handler of an update that is waiting for one: it would otherwise rename that coroutine.
-- Query types Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, and those starting with `__temporal`) don't go to the dynamic handler. The worker answers `__stack_trace` itself (see [Stack trace query](#stack-trace-query)); the others fail with `QueryNotRegistered`.
+- Query types Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, and those starting with `__temporal`) don't go to the dynamic handler. The worker answers `__stack_trace`, `__enhanced_stack_trace` and `__temporal_workflow_metadata` itself (see [Stack trace query](#stack-trace-query) and [Stack trace and metadata queries](#stack-trace-and-metadata-queries)); other `__temporal` types fail with `QueryNotRegistered`.
 - In a query handler, `ctx.allocator()` is the query's memory, freed once the answer is sent, so decoding arguments there doesn't grow the run.
 - Waits that can't fail can't be refused: an uncancelable wait that would block (such as `std.Io.Mutex.lockUncancelable` on a mutex the workflow holds), or awaiting or canceling a pending `std.Io.Future`, panics the worker in a query handler or a validator run on delivery. A validator run in a handler's coroutine (when the handler registers the update's handler) blocks only that coroutine, and its update is rejected with `ReadOnlyViolation` once the wait ends. Don't wait in them.
 - A handler or validator that wakes a workflow coroutine through `std.Io` (`Event.set`, `Condition.signal`, `Queue.put`, `Mutex.unlock` on something a coroutine waits for) also fails the query or has the update rejected with `ReadOnlyViolation`. The wake itself still happens, since `std.Io` has already changed the primitive: the woken coroutine runs in the next workflow task that runs workflow code.
@@ -1348,6 +1349,51 @@ Notes:
 - `ctx.isReplaying()` says whether the task replays history. `ctx.metrics()` records nothing during replay, and `ctx.logger()` drops its records then, and while the run is evicted from the worker's cache (its code unwinding with `error.Canceled` after the worker stops or drops the run), unless `worker.Options.log_during_replay` is set. Eviction doesn't change `ctx.isReplaying()`: it keeps the value the last activation set.
 - `ctx.lastCompletionResult(T)` and `ctx.previousRunFailure()` read a cron or retried workflow's previous run.
 
+#### Workflow-local variables
+`workflow.LocalVar(T)` is a typed value scoped to one workflow run, for a library or an interceptor that keeps state per run without the workflow passing it around. Declare it once with a name and a default; any code of the run holding its `*workflow.Context` reads it with `get` and sets it with `set`: the workflow function, the coroutines it starts, its handlers, and the run's workflow interceptors.
+
+<!-- example: workflow-local-var -->
+```zig
+/// How many activities the run has scheduled, kept by `ActivityCounter` for any code of the run.
+pub const activities_scheduled: workflow.LocalVar(u32) = .{ .name = "readme.activities_scheduled", .default = 0 };
+
+pub const ActivityCounter = struct {
+    pub fn interceptWorkflow(_: *ActivityCounter, ctx: *workflow.Context) error{OutOfMemory}!temporal.interceptor.Workflow {
+        // The first set allocates the run's value, so the sets below can't fail.
+        activities_scheduled.set(ctx, 0) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ReadOnly => unreachable, // interceptWorkflow is not read-only code
+        };
+        const run = try ctx.allocator().create(Run);
+        run.* = .{ .ctx = ctx };
+        return .{ .outbound = temporal.interceptor.WorkflowOutbound.from(Run, run) };
+    }
+
+    const Run = struct {
+        ctx: *workflow.Context,
+
+        pub fn executeActivity(r: *Run, input: temporal.interceptor.ActivityInput, next: temporal.interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(temporal.converter.Payload) {
+            activities_scheduled.set(r.ctx, activities_scheduled.get(r.ctx) + 1) catch {};
+            return next.executeActivity(input);
+        }
+    };
+};
+
+fn greetAndCount(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    _ = try ctx.executeActivity(Greet, greet_options, .{name}).get();
+    const second = try ctx.executeActivity(Greet, greet_options, .{name}).get();
+    return std.fmt.allocPrint(ctx.allocator(), "{s} after {d} activities", .{ second, activities_scheduled.get(ctx) });
+}
+pub const GreetAndCount = workflow.Def("greet_and_count", greetAndCount);
+```
+
+Notes:
+- Each run has its own values. They start at the default, are freed with the run when it completes or is evicted from the worker's cache, and a run rebuilt from history gets them back by replaying the code that set them.
+- A variable is its name and its type: copies of a declaration, and two declarations with the same name and type, are the same variable, so prefix names with your library's (`"mylib.depth"`). The same name with another type is another variable.
+- `set` copies the value shallowly into the run's memory. Memory it points to, such as a string's bytes, is borrowed: it must outlive the run or come from `ctx.allocator()`. The first set of a variable in a run allocates it (`error.OutOfMemory`, which leaves it unset); later sets overwrite it in place.
+- `get` works everywhere. `set` returns `error.ReadOnly`, leaving the value unchanged, in code that doesn't run again on replay: a query handler or an update validator, where the query then fails or the update is rejected with a `ReadOnlyViolation` failure naming `LocalVar.set`, and the function of `sideEffect` or the function or comparison of `mutableSideEffect`, where a warning naming the variable is logged.
+- A declaration may be shared by every run and thread; `get` and `set` are workflow code.
+
 #### Failure policy
 
 An error that workflow code returns either fails the workflow, which closes the run, or fails the workflow task, which leaves the run open: the server retries the task, and the retry replays the history with whatever code the worker that takes it runs. By default `error.OutOfMemory` fails the task, `error.Canceled` cancels the workflow, and every other error fails the workflow, because a Zig workflow that returns an error means to fail. `worker.Options.workflow_task_failure_errors` lists errors that fail the task instead, for every workflow of a worker, and `workflow.DefOptions.task_failure_errors` lists them for one definition; an error either list names fails the task. `nondeterminism_fails_workflow`, on either, fails the workflow instead of the task when a run's code no longer matches its history.
@@ -1432,9 +1478,61 @@ Notes:
 - The answer is always valid UTF-8, so clients receive it as a JSON string. Names in it (workflow and activity types, coroutine names, update IDs, paths) are written as they are when they are valid UTF-8, with bytes that aren't replaced by U+FFFD and control characters, `"` and `\` escaped as in Zig string literals (`\n`, `\"`), so a name can't add lines or entries of its own. A cut activity type is cut between characters.
 
 #### Stack trace and metadata queries
-<!-- stub: temporal-sdk-zig-d51.6.9 -->
-Not implemented yet.
-The built-in `__enhanced_stack_trace` and `__temporal_workflow_metadata` queries will report each coroutine's location with the source around it, and which handlers are registered with their descriptions. The plain `__stack_trace` query is answered already: see [Stack trace query](#stack-trace-query).
+Temporal's UI sends two more queries of its own, which a worker answers for every workflow with no handler to register, as it does `__stack_trace`:
+
+- `__enhanced_stack_trace` (`workflow.EnhancedStackTraceQuery`) gives where each coroutine waits as data, with the source around each place: `workflow.EnhancedStackTrace`, sent as JSON. `sdk` names the SDK (`temporal-zig`) and its version. `stacks` has one entry per live coroutine, in the order and set of `__stack_trace`'s entries, each a list of `locations` (`file_path`, `line`, `column`, `function_name`, and `internal_code`, always false), innermost first. `sources` maps each file those locations are in to excerpts of it, each a `line_offset` (the number of lines before it) and its `content`.
+- `__temporal_workflow_metadata` (`workflow.WorkflowMetadataQuery`) gives the workflow's type and its handlers: a `temporal.proto.temporal.api.sdk.v1.WorkflowMetadata` whose `definition` lists every query, signal and update the run has registered, each with its description, sorted by name. The queries include the three the worker answers itself.
+
+A handler's description is an option of its registration: `.description` in `QueryHandlerOptions` (`ctx.setQueryHandlerWithOptions`) and in `HandlerOptions` (`setSignalHandlerWithOptions`, `setUpdateHandlerWithOptions`, and the by-name variants), or in a struct workflow's entry:
+
+<!-- example: workflow-metadata-queries -->
+```zig
+pub const TicketStatus = workflow.QueryDef("ticket_status", fn () []const u8);
+pub const Escalate = workflow.SignalDef("escalate", fn () void);
+pub const Assign = workflow.UpdateDef("assign", fn (agent: []const u8) []const u8);
+pub const Ticket = struct {
+    status: []const u8 = "open",
+    // The descriptions are shown with each handler in the answer to __temporal_workflow_metadata.
+    pub const queries = .{ .ticketStatus = .{ TicketStatus, .{ .description = "open, escalated or assigned" } } };
+    pub const signals = .{ .escalate = .{ Escalate, .{ .description = "Hands the ticket to the next tier" } } };
+    pub const updates = .{ .assign = .{ Assign, .{ .description = "Assigns an agent; returns the status before" } } };
+    pub fn run(t: *Ticket, ctx: *workflow.Context) ![]const u8 {
+        try ctx.await(t, isAssigned);
+        return t.status;
+    }
+    pub fn ticketStatus(t: *Ticket) []const u8 {
+        return t.status;
+    }
+    pub fn escalate(t: *Ticket) void {
+        t.status = "escalated";
+    }
+    pub fn assign(t: *Ticket, _: []const u8) []const u8 {
+        defer t.status = "assigned";
+        return t.status;
+    }
+    fn isAssigned(t: *Ticket) bool {
+        return std.mem.eql(u8, t.status, "assigned");
+    }
+};
+pub const TicketWorkflow = workflow.Def("ticket", Ticket);
+
+// From any client: the worker answers both queries for every workflow, with no handler to register.
+fn ticketQueries(client: *temporal.client.Client, arena: std.mem.Allocator, workflow_id: []const u8) ![]const temporal.proto.temporal.api.sdk.v1.WorkflowInteractionDefinition {
+    const metadata = try client.queryWorkflow(workflow.WorkflowMetadataQuery, arena, workflow_id, "", .{});
+    return metadata.definition.?.query_definitions.items;
+}
+fn ticketStacks(client: *temporal.client.Client, arena: std.mem.Allocator, workflow_id: []const u8) !workflow.EnhancedStackTrace {
+    return client.queryWorkflow(workflow.EnhancedStackTraceQuery, arena, workflow_id, "", .{});
+}
+```
+
+Notes:
+- The two names are reserved: `setQueryHandler`, `setQueryHandlerWithOptions`, or a struct workflow's `queries` entry for `__enhanced_stack_trace` or `__temporal_workflow_metadata` is a compile error saying the worker answers that query itself. `__stack_trace` stays the workflow's to answer, and a handler it registers for it is listed with its own description. A dynamic query handler gets none of the three.
+- A stack lists at most 16 call sites. Which frames are listed, and when a build gives none, follows `__stack_trace` (see [Stack trace query](#stack-trace-query)): a coroutine whose call sites can't be read has an entry with no locations. A closed workflow has no stacks.
+- Sources are read from the files at the paths the worker's debug info names, so a worker running where it was built sends them, and one deployed elsewhere usually sends none: a file that is missing, unreadable, or larger than 4 MiB is left out. Each excerpt holds the 5 lines before and after a location, with windows that overlap or touch merged, in file order. Once an answer's excerpts total 256 KiB, later ones are left out.
+- Paths, function names and source text are valid UTF-8 in both answers, with each byte that isn't replaced by U+FFFD; the JSON encoder escapes the rest. Handler names and descriptions in the metadata are treated the same way.
+- Signal channels are listed with the signals, with an empty description. Dynamic handlers aren't listed, and `current_details` is empty.
+- A description is copied into the run's memory when the handler is registered. Both answers are read-only and allocate only in the query's memory, which is freed once the answer is sent, so a run restored from history answers as the run that first got there did.
 
 ### Activities
 

@@ -1,0 +1,1 @@
+Registering a query handler for `__enhanced_stack_trace` or `__temporal_workflow_metadata` (with `Context.setQueryHandler`, `setQueryHandlerWithOptions`, or a struct workflow's `queries` entry) is now a compile error, since the worker answers both queries itself; before, the workflow's handler answered them. Rename such a query, or remove the handler and use the worker's answer.
