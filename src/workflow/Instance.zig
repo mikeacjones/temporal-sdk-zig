@@ -101,6 +101,10 @@ replaying: bool = false,
 log_silenced: bool = false,
 /// Commands produced during the current activation.
 commands: std.ArrayList(cmd_pb.WorkflowCommand) = .empty,
+/// For each command of `commands` whose header has fields the worker's codecs encode, the
+/// names of those fields (`commandHeaderCodecFields`). Cleared with `commands`, so it never
+/// holds more than one activation's. Arena memory.
+command_codec_fields: std.ArrayList(CommandCodecFields) = .empty,
 next_activity_seq: u32 = 1,
 next_timer_seq: u32 = 1,
 next_child_seq: u32 = 1,
@@ -234,6 +238,8 @@ held_handlers: std.ArrayList(*HandlerRun) = .empty,
 /// The latest `requestContinueAsNew`, sent if the workflow function returns
 /// error.ContinueAsNew. Arena memory.
 continue_as_new: ?cmd_pb.ContinueAsNewWorkflowExecution = null,
+/// The header fields of `continue_as_new` the worker's codecs encode, sorted. Arena memory.
+continue_as_new_codec_fields: []const []const u8 = &.{},
 /// From the latest activation that wasn't query-only.
 history_length: u32 = 0,
 history_size_bytes: u64 = 0,
@@ -519,6 +525,8 @@ pub const ActivityState = struct {
         /// The summary, sent with every attempt: the core records the last attempt's on the
         /// marker.
         user_metadata: ?sdk_pb.UserMetadata = null,
+        /// The header fields the worker's codecs encode in every attempt's command, sorted.
+        codec_fields: []const []const u8 = &.{},
     };
 
     pub const Outcome = union(enum) {
@@ -738,6 +746,7 @@ pub fn teardown(inst: *Instance) usize {
     inst.evicting = true;
     inst.log_silenced = true;
     inst.commands.clearRetainingCapacity();
+    inst.command_codec_fields.clearRetainingCapacity();
     // The root and handler coroutines may still be blocked even after the workflow finished
     // (a handler's error finishes it, and handlers outlive the root).
     if (inst.root) |root| inst.wio.cancelTask(root);
@@ -829,6 +838,49 @@ fn emit(inst: *Instance, command: cmd_pb.WorkflowCommand) error{OutOfMemory}!voi
     try inst.commands.append(inst.arena(), command);
 }
 
+const CommandTag = std.meta.Tag(@typeInfo(@FieldType(cmd_pb.WorkflowCommand, "variant")).optional.child);
+
+/// The names of the header fields the worker's codecs encode in one emitted command.
+const CommandCodecFields = struct { tag: CommandTag, seq: u32, names: []const []const u8 };
+
+/// The names, sorted, of the header fields of `cmd`, one of the activation's commands, that
+/// the worker's codecs encode: those the header writer of its outbound call marked
+/// (`converter.HeaderWriter.codec_fields`). Empty for a command with none or without a
+/// header. For a signal-with-start, the names are those of the header inside its envelope.
+/// Points into the run's arena, valid until the next activation.
+pub fn commandHeaderCodecFields(inst: *const Instance, cmd: *const cmd_pb.WorkflowCommand) []const []const u8 {
+    const variant = cmd.variant orelse return &.{};
+    const seq = switch (variant) {
+        .continue_as_new_workflow_execution => return inst.continue_as_new_codec_fields,
+        .schedule_activity => |c| c.seq,
+        .schedule_local_activity => |c| c.seq,
+        .start_child_workflow_execution => |c| c.seq,
+        .signal_external_workflow_execution => |c| c.seq,
+        .schedule_nexus_operation => |c| c.seq,
+        else => return &.{},
+    };
+    for (inst.command_codec_fields.items) |m| if (m.tag == std.meta.activeTag(variant) and m.seq == seq) return m.names;
+    return &.{};
+}
+
+/// A copy of `names` in the run's arena, or an empty list.
+fn copyCodecFields(inst: *Instance, names: []const []const u8) error{OutOfMemory}![]const []const u8 {
+    if (names.len == 0) return &.{};
+    return inst.arena().dupe([]const u8, names);
+}
+
+/// Makes room for one entry of `command_codec_fields`, before a command is emitted, so the
+/// entry can be added after it without failing.
+fn reserveCodecFields(inst: *Instance, names: []const []const u8) error{OutOfMemory}!void {
+    if (names.len > 0) try inst.command_codec_fields.ensureUnusedCapacity(inst.arena(), 1);
+}
+
+/// Records `names` (arena memory) for the command just emitted, after `reserveCodecFields`.
+fn markEmitted(inst: *Instance, tag: CommandTag, seq: u32, names: []const []const u8) void {
+    if (names.len == 0 or inst.evicting) return;
+    inst.command_codec_fields.appendAssumeCapacity(.{ .tag = tag, .seq = seq, .names = names });
+}
+
 /// Applies an activation and returns its completion. `out` holds the completion's memory
 /// until the caller has sent it. RemoveFromCache jobs are the caller's to handle (complete
 /// the activation, then `destroy`); they are ignored here.
@@ -856,6 +908,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     inst.replaying = act.is_replaying;
     inst.log_silenced = act.is_replaying or inst.evicting;
     inst.commands.clearRetainingCapacity();
+    inst.command_codec_fields.clearRetainingCapacity();
     inst.task_failure = null;
     inst.task_failure_type = "UnsupportedJob";
     inst.accepted_update = false;
@@ -1976,7 +2029,7 @@ pub fn requestContinueAsNew(inst: *Instance, workflow_type: []const u8, options:
 /// Records the ContinueAsNewWorkflowExecution command to send if the workflow function returns
 /// error.ContinueAsNew, replacing any earlier request. `args` and `header` are arena memory;
 /// `workflow_type` is copied.
-fn recordContinueAsNew(inst: *Instance, workflow_type: []const u8, options: workflow.ContinueAsNewOptions, args: []const converter.Payload, header: converter.Header) sa.EncodeError!void {
+fn recordContinueAsNew(inst: *Instance, workflow_type: []const u8, options: workflow.ContinueAsNewOptions, args: []const converter.Payload, header: converter.Header, codec_fields: []const []const u8) sa.EncodeError!void {
     const a = inst.arena();
     var cmd: cmd_pb.ContinueAsNewWorkflowExecution = .{
         // Copied: a name given at run time (or by an interceptor) may not outlive the call.
@@ -2002,6 +2055,7 @@ fn recordContinueAsNew(inst: *Instance, workflow_type: []const u8, options: work
         try sa.toProto(a, updates, .start)
     else
         try inst.search_attributes.toProto(a);
+    inst.continue_as_new_codec_fields = try inst.copyCodecFields(codec_fields);
     inst.continue_as_new = cmd;
 }
 
@@ -2432,7 +2486,7 @@ fn newActivity(inst: *Instance, activity_type: []const u8, cancellation_type: Ac
     return state;
 }
 
-fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflow.ActivityOptions, args: []const converter.Payload, header: converter.Header) ScheduleError!*ActivityState {
+fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflow.ActivityOptions, args: []const converter.Payload, header: converter.Header, codec_fields: []const []const u8) ScheduleError!*ActivityState {
     const a = inst.arena();
     const state = try inst.newActivity(activity_type, options.cancellation_type);
     const seq = state.seq;
@@ -2466,10 +2520,13 @@ fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflo
         .compatible => .COMPATIBLE,
         .default => .DEFAULT,
     };
+    const names = try inst.copyCodecFields(codec_fields);
+    try inst.reserveCodecFields(names);
     try inst.emit(.{
         .user_metadata = try summaryMetadata(a, options.summary),
         .variant = .{ .schedule_activity = cmd },
     });
+    inst.markEmitted(.schedule_activity, seq, names);
     return state;
 }
 
@@ -2479,7 +2536,7 @@ fn summaryMetadata(a: Allocator, summary: []const u8) error{OutOfMemory}!?sdk_pb
     return .{ .summary = try converter.toPayload(a, summary) };
 }
 
-fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: workflow.LocalActivityOptions, args: []const converter.Payload, header: converter.Header) ScheduleError!*ActivityState {
+fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: workflow.LocalActivityOptions, args: []const converter.Payload, header: converter.Header, codec_fields: []const []const u8) ScheduleError!*ActivityState {
     if (options.start_to_close_timeout == null and options.schedule_to_close_timeout == null) {
         inst.logger.warn("local activity options need start_to_close_timeout or schedule_to_close_timeout", .{ .ActivityType = activity_type });
         return error.InvalidOptions;
@@ -2507,10 +2564,13 @@ fn scheduleLocalActivity(inst: *Instance, activity_type: []const u8, options: wo
         },
         .id_from_seq = options.activity_id.len == 0,
         .user_metadata = try summaryMetadata(a, options.summary),
+        .codec_fields = try inst.copyCodecFields(codec_fields),
     };
     if (options.retry_policy) |rp| local.cmd.retry_policy = try protoRetryPolicy(a, rp);
     state.local = local;
+    try inst.reserveCodecFields(local.codec_fields);
     try inst.emit(.{ .user_metadata = local.user_metadata, .variant = .{ .schedule_local_activity = local.cmd } });
+    inst.markEmitted(.schedule_local_activity, local.cmd.seq, local.codec_fields);
     return state;
 }
 
@@ -2549,7 +2609,9 @@ fn retryLocalActivity(inst: *Instance, state: *ActivityState) !void {
         local.cmd.activity_id = try std.fmt.allocPrint(a, "{d}", .{state.seq});
         state.context.activity_id = local.cmd.activity_id;
     }
+    try inst.reserveCodecFields(local.codec_fields);
     try inst.emit(.{ .user_metadata = local.user_metadata, .variant = .{ .schedule_local_activity = local.cmd } });
+    inst.markEmitted(.schedule_local_activity, local.cmd.seq, local.codec_fields);
 }
 
 fn protoCancellationType(t: ActivityState.CancellationType) cmd_pb.ActivityCancellationType {
@@ -2711,7 +2773,7 @@ fn resolveActivity(inst: *Instance, r: *const act_pb.ResolveActivity) !void {
 
 /// Emits StartChildWorkflowExecution for `workflow_type`. A child without an ID gets a UUID
 /// drawn from the workflow's seeded randomness, so replay generates the same one.
-fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workflow.ChildWorkflowOptions, args: []const converter.Payload, header: converter.Header) ScheduleError!*ChildState {
+fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workflow.ChildWorkflowOptions, args: []const converter.Payload, header: converter.Header, codec_fields: []const []const u8) ScheduleError!*ChildState {
     if (workflow_type.len == 0) {
         inst.logger.warn("executeChildWorkflowByName: the child workflow type is empty", .{ .ChildWorkflowID = options.id });
         return error.InvalidOptions;
@@ -2769,6 +2831,8 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidSearchAttribute => return error.InvalidOptions,
     };
+    const names = try inst.copyCodecFields(codec_fields);
+    try inst.reserveCodecFields(names);
     try inst.children.put(a, state.seq, state);
     try inst.child_codecs.put(a, state.seq, state);
     inst.next_child_seq += 1;
@@ -2779,6 +2843,7 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
         } else null,
         .variant = .{ .start_child_workflow_execution = cmd },
     });
+    inst.markEmitted(.start_child_workflow_execution, state.seq, names);
     return state;
 }
 
@@ -3109,6 +3174,7 @@ fn sendSignalWithStart(
     args: []const converter.Payload,
     signal_args: []const converter.Payload,
     header: converter.Header,
+    codec_fields: []const []const u8,
 ) ScheduleError!*NexusOperationState {
     const fields = .{ .WorkflowID = options.id, .WorkflowType = workflow_type, .SignalName = signal_name };
     if (options.id.len == 0) {
@@ -3192,7 +3258,11 @@ fn sendSignalWithStart(
     };
     if (header.fields.len > 0) request.header = .{ .fields = try header.toEntries(common.Header.FieldsEntry, a) };
     const payload = try system.envelope(a, request);
-    return inst.scheduleNexusOperation(system.workflow_service, system.signal_with_start_operation, .{ .endpoint = system.endpoint }, payload);
+    const names = try inst.copyCodecFields(codec_fields);
+    try inst.reserveCodecFields(names);
+    const state = try inst.scheduleNexusOperation(system.workflow_service, system.signal_with_start_operation, .{ .endpoint = system.endpoint }, payload);
+    inst.markEmitted(.schedule_nexus_operation, state.seq, names);
+    return state;
 }
 
 /// Why the server would refuse `rp` (temporalio/temporal common/retrypolicy
@@ -3219,7 +3289,7 @@ pub const SignalTarget = union(enum) {
 
 /// Emits SignalExternalWorkflowExecution sending `signal_name` with `args` and `header` (arena
 /// memory) to `target`. The name and IDs are copied into the arena.
-fn sendSignalExternal(inst: *Instance, target: SignalTarget, signal_name: []const u8, args: []const converter.Payload, header: converter.Header) ScheduleError!*ExternalState {
+fn sendSignalExternal(inst: *Instance, target: SignalTarget, signal_name: []const u8, args: []const converter.Payload, header: converter.Header, codec_fields: []const []const u8) ScheduleError!*ExternalState {
     const workflow_id = switch (target) {
         .execution => |e| e.workflow_id,
         .child => |id| id,
@@ -3229,6 +3299,8 @@ fn sendSignalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
         return error.InvalidOptions;
     }
     const a = inst.arena();
+    const names = try inst.copyCodecFields(codec_fields);
+    try inst.reserveCodecFields(names);
     const state = try inst.newExternal(.signal, workflow_id);
     try inst.emit(.{ .variant = .{ .signal_external_workflow_execution = .{
         .seq = state.seq,
@@ -3244,6 +3316,7 @@ fn sendSignalExternal(inst: *Instance, target: SignalTarget, signal_name: []cons
             .child => .{ .child_workflow_id = state.workflow_id },
         },
     } } });
+    inst.markEmitted(.signal_external_workflow_execution, state.seq, names);
     return state;
 }
 
@@ -3450,7 +3523,7 @@ const outbound_root: interceptor.WorkflowOutbound.VTable = .{
 fn rootExecuteActivity(ptr: *anyopaque, input: interceptor.ActivityInput, _: interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(converter.Payload) {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
     const options = if (input.options.session) |s| inst.sessionActivityOptions(input, s) catch |err| return .{ .ctx = &inst.ctx, .state = err } else input.options;
-    return .{ .ctx = &inst.ctx, .state = inst.scheduleActivity(input.activity_type, options, input.args.payloads, input.header.header()) };
+    return .{ .ctx = &inst.ctx, .state = inst.scheduleActivity(input.activity_type, options, input.args.payloads, input.header.header(), input.header.codec_fields.items) };
 }
 
 /// The options that run an activity in `session`, on its host's task queue, after writing the
@@ -3478,7 +3551,7 @@ fn sessionActivityOptions(inst: *Instance, input: interceptor.ActivityInput, ses
 
 fn rootExecuteLocalActivity(ptr: *anyopaque, input: interceptor.LocalActivityInput, _: interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(converter.Payload) {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    return .{ .ctx = &inst.ctx, .state = inst.scheduleLocalActivity(input.activity_type, input.options, input.args.payloads, input.header.header()) };
+    return .{ .ctx = &inst.ctx, .state = inst.scheduleLocalActivity(input.activity_type, input.options, input.args.payloads, input.header.header(), input.header.codec_fields.items) };
 }
 
 fn rootSideEffect(ptr: *anyopaque, input: interceptor.SideEffectInput, _: interceptor.WorkflowOutbound.Next) workflow.ActivityFuture(converter.Payload) {
@@ -3486,7 +3559,7 @@ fn rootSideEffect(ptr: *anyopaque, input: interceptor.SideEffectInput, _: interc
     const options: workflow.LocalActivityOptions = .{ .start_to_close_timeout = .fromSeconds(10) };
     const value: [1]converter.Payload = .{input.value orelse .{}};
     const args: []const converter.Payload = if (input.value != null) &value else &.{};
-    const state = inst.scheduleLocalActivity(side_effect_activity_type, options, args, .{}) catch |err| return .{ .ctx = &inst.ctx, .state = err };
+    const state = inst.scheduleLocalActivity(side_effect_activity_type, options, args, .{}, &.{}) catch |err| return .{ .ctx = &inst.ctx, .state = err };
     // A side effect's value is the run's own, encoded in the workflow with its context. The
     // worker that runs the local activity has no header to read the run's values from.
     state.context = inst.converter_context;
@@ -3497,7 +3570,7 @@ fn rootSideEffect(ptr: *anyopaque, input: interceptor.SideEffectInput, _: interc
 
 fn rootExecuteChildWorkflow(ptr: *anyopaque, input: interceptor.ChildWorkflowInput, _: interceptor.WorkflowOutbound.Next) workflow.ChildWorkflowFuture(converter.Payload) {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    return .{ .ctx = &inst.ctx, .state = inst.startChildWorkflow(input.workflow_type, input.options, input.args.payloads, input.header.header()) };
+    return .{ .ctx = &inst.ctx, .state = inst.startChildWorkflow(input.workflow_type, input.options, input.args.payloads, input.header.header(), input.header.codec_fields.items) };
 }
 
 fn rootExecuteNexusOperation(ptr: *anyopaque, input: interceptor.NexusOperationInput, _: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(converter.Payload) {
@@ -3511,14 +3584,14 @@ fn rootSignalWithStartWorkflow(ptr: *anyopaque, input: interceptor.SignalWithSta
     return .{
         .ctx = &inst.ctx,
         .workflow_id = workflow_id,
-        .state = inst.sendSignalWithStart(input.workflow_type, input.signal_name, input.options, input.args.payloads, input.signal_args.payloads, input.header.header()),
+        .state = inst.sendSignalWithStart(input.workflow_type, input.signal_name, input.options, input.args.payloads, input.signal_args.payloads, input.header.header(), input.header.codec_fields.items),
     };
 }
 
 fn rootSignalExternalWorkflow(ptr: *anyopaque, input: interceptor.SignalExternalInput, _: interceptor.WorkflowOutbound.Next) workflow.SignalExternalFuture {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
     const target: SignalTarget = if (input.child) .{ .child = input.workflow_id } else .{ .execution = .{ .workflow_id = input.workflow_id, .run_id = input.run_id } };
-    return .{ .ctx = &inst.ctx, .state = inst.sendSignalExternal(target, input.signal_name, input.args.payloads, input.header.header()) };
+    return .{ .ctx = &inst.ctx, .state = inst.sendSignalExternal(target, input.signal_name, input.args.payloads, input.header.header(), input.header.codec_fields.items) };
 }
 
 fn rootCancelExternalWorkflow(ptr: *anyopaque, input: interceptor.CancelExternalInput, _: interceptor.WorkflowOutbound.Next) workflow.CancelExternalFuture {
@@ -3528,7 +3601,7 @@ fn rootCancelExternalWorkflow(ptr: *anyopaque, input: interceptor.CancelExternal
 
 fn rootContinueAsNew(ptr: *anyopaque, input: interceptor.ContinueAsNewInput, _: interceptor.WorkflowOutbound.Next) interceptor.WorkflowOutbound.ContinueAsNewError!void {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    return inst.recordContinueAsNew(input.workflow_type, input.options, input.args.payloads, input.header.header());
+    return inst.recordContinueAsNew(input.workflow_type, input.options, input.args.payloads, input.header.header(), input.header.codec_fields.items);
 }
 
 fn rootLogger(ptr: *anyopaque, _: interceptor.LoggerInput, _: interceptor.WorkflowOutbound.Next) log.Logger {
@@ -6537,6 +6610,84 @@ test "local activity: arguments_in_marker sets include_arguments_in_marker, also
     defer unset.destroy();
     const plain = commandsOf(try unset.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "try_cancel")}), a));
     try testing.expect(!plain[0].variant.?.schedule_local_activity.include_arguments_in_marker);
+}
+
+test "header codec marks: every command with a header keeps the fields its propagators marked, a local activity's retry too, until the next activation" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const tenant = comptime propagation.key([]const u8, "tenant");
+    const user = comptime propagation.key([]const u8, "user");
+    const propagators = [_]propagation.ContextPropagator{
+        propagation.HeaderPropagator(tenant).encoded_propagator,
+        propagation.HeaderPropagator(user).propagator,
+    };
+    const W = struct {
+        fn run(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+            if (std.mem.eql(u8, mode, "continue")) return ctx.continueAsNewByName("Marked", .{}, .{@as([]const u8, "done")});
+            const remote = ctx.executeActivityByName(void, "Act", .{ .start_to_close_timeout = .fromSeconds(10) }, .{});
+            _ = ctx.executeLocalActivityByName(void, "Act", .{
+                .start_to_close_timeout = .fromSeconds(5),
+                .retry_policy = .{ .initial_interval = .fromSeconds(10), .maximum_attempts = 5 },
+                .local_retry_threshold = .fromSeconds(2),
+            }, .{});
+            _ = ctx.executeChildWorkflowByName(void, "Kid", .{ .id = "kid" }, .{});
+            _ = ctx.signalExternalWorkflowByName("go", "target", "", .{});
+            _ = ctx.signalWithStartWorkflowByName("Target", .{ .id = "started", .id_conflict_policy = .use_existing }, .{}, "go", .{});
+            remote.get() catch {};
+            return "";
+        }
+        const Def = workflow.Def("Marked", run);
+    };
+    const inst = try create(testing.allocator, W.Def.registered, .{ .propagators = &propagators });
+    defer inst.destroy();
+    var act = try initActivation(a, "Marked", .{@as([]const u8, "all")});
+    try act.jobs.items[0].variant.?.initialize_workflow.headers.append(a, .{ .key = "tenant", .value = try converter.toPayload(a, @as([]const u8, "acme")) });
+    try act.jobs.items[0].variant.?.initialize_workflow.headers.append(a, .{ .key = "user", .value = try converter.toPayload(a, @as([]const u8, "ann")) });
+
+    const first = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 5), first.len);
+    for (first) |*cmd| {
+        // Both fields are in every header; only the opted-in propagator's is marked.
+        const names = inst.commandHeaderCodecFields(cmd);
+        try testing.expectEqual(@as(usize, 1), names.len);
+        try testing.expectEqualStrings("tenant", names[0]);
+    }
+    try testing.expectEqual(@as(usize, 2), first[0].variant.?.schedule_activity.headers.items.len);
+    try testing.expectEqual(@as(usize, 2), first[2].variant.?.start_child_workflow_execution.headers.items.len);
+    try testing.expectEqual(@as(usize, 2), first[3].variant.?.signal_external_workflow_execution.headers.items.len);
+    // A command of another seq, or of a kind without a header, has none.
+    var other = first[0];
+    other.variant.?.schedule_activity.seq = 99;
+    try testing.expectEqual(@as(usize, 0), inst.commandHeaderCodecFields(&other).len);
+    try testing.expectEqual(@as(usize, 0), inst.commandHeaderCodecFields(&.{ .variant = .{ .start_timer = .{ .seq = 1 } } }).len);
+
+    // The local activity (seq 2) backs off: the next activation's timer has no marks, and the
+    // first activation's are gone.
+    const backoff = commandsOf(try inst.activate(&try localBackoff(a, 2), a));
+    try testing.expectEqual(@as(usize, 1), backoff.len);
+    try testing.expectEqual(@as(usize, 0), inst.command_codec_fields.items.len);
+    try testing.expectEqual(@as(usize, 0), inst.commandHeaderCodecFields(&first[0]).len);
+    const retry = commandsOf(try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = backoff[0].variant.?.start_timer.seq } }), a));
+    try testing.expectEqual(@as(usize, 1), retry.len);
+    try testing.expect(retry[0].variant.?.schedule_local_activity.seq != 2);
+    const names = inst.commandHeaderCodecFields(&retry[0]);
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("tenant", names[0]);
+
+    // Continue-as-new keeps its own.
+    const continued = try create(testing.allocator, W.Def.registered, .{ .propagators = &propagators });
+    defer continued.destroy();
+    var cont = try initActivation(a, "Marked", .{@as([]const u8, "continue")});
+    try cont.jobs.items[0].variant.?.initialize_workflow.headers.append(a, .{ .key = "tenant", .value = try converter.toPayload(a, @as([]const u8, "acme")) });
+    const last = commandsOf(try continued.activate(&cont, a));
+    try testing.expectEqual(@as(usize, 1), last.len);
+    try testing.expectEqualStrings("tenant", continued.commandHeaderCodecFields(&last[0])[0]);
+
+    // Without opted-in propagators nothing is marked.
+    const plain = try create(testing.allocator, W.Def.registered, .{ .propagators = propagators[1..] });
+    defer plain.destroy();
+    for (commandsOf(try plain.activate(&act, a))) |*cmd| try testing.expectEqual(@as(usize, 0), plain.commandHeaderCodecFields(cmd).len);
 }
 
 test "local activity backoff: a timer, then the next attempt with a new seq" {

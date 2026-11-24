@@ -27,6 +27,8 @@ const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
 const proto_time = @import("proto_time.zig");
 const converter = @import("converter.zig");
+/// For `encodeMessageWithHeaderFields`, which `converter` doesn't re-export.
+const codec_pass = @import("converter/codec.zig");
 const failure_mod = @import("failure.zig");
 const log_mod = @import("log.zig");
 const workflow = @import("workflow.zig");
@@ -1600,7 +1602,7 @@ pub const WorkflowRunner = struct {
 
     fn decodeActivationPayloads(r: *WorkflowRunner, act: *act_pb.WorkflowActivation, cached: ?*const Instance, a: Allocator, io: Io) converter.CodecError!void {
         if (r.codecs.len == 0) return;
-        if (cached) |inst| return codeWithOwnContexts(act_pb.WorkflowActivation, act, &act.jobs, jobCodecContext, inst, r.codecs, a, io, &runCodecContext(r.namespace, inst), .decode);
+        if (cached) |inst| return codeWithOwnContexts(act_pb.WorkflowActivation, act, &act.jobs, jobCodecContext, noHeaderCodecFields, inst, r.codecs, a, io, &runCodecContext(r.namespace, inst), .decode);
         const index = for (act.jobs.items, 0..) |job, i| {
             if (job.variant) |v| if (v == .initialize_workflow) break i;
         } else return converter.decodeMessage(act_pb.WorkflowActivation, act, r.codecs, a, io, &.{ .namespace = r.namespace });
@@ -1620,6 +1622,8 @@ pub const WorkflowRunner = struct {
 
     /// Encodes the completion's payloads: an activity's, local activity's or child's start
     /// command with that call's context (as the payload hooks got), the rest with the run's.
+    /// Of a command's header fields only those its outbound call marked for the codecs
+    /// (`Instance.commandHeaderCodecFields`) are encoded; the rest are sent as written.
     fn encodeCompletionPayloads(r: *WorkflowRunner, completion: *done_pb.WorkflowActivationCompletion, inst: *const Instance, a: Allocator, io: Io) converter.CodecError!void {
         if (r.codecs.len == 0) return;
         const run_context = runCodecContext(r.namespace, inst);
@@ -1628,7 +1632,7 @@ pub const WorkflowRunner = struct {
             .failed => null,
         } else null;
         const list = commands orelse return converter.encodeMessage(done_pb.WorkflowActivationCompletion, completion, r.codecs, a, io, &run_context);
-        return codeWithOwnContexts(done_pb.WorkflowActivationCompletion, completion, list, commandCodecContext, inst, r.codecs, a, io, &run_context, .encode);
+        return codeWithOwnContexts(done_pb.WorkflowActivationCompletion, completion, list, commandCodecContext, Instance.commandHeaderCodecFields, inst, r.codecs, a, io, &run_context, .encode);
     }
 
     const Handled = struct {
@@ -2014,13 +2018,17 @@ fn readVarint(bytes: []const u8, i: *usize) ?u64 {
 }
 
 /// Codes `msg` (`.encode` or `.decode`) with `run_context`, except the items of `list`, a list
-/// inside `msg`, that `contextOf` gives a context of their own: each of those is coded alone
-/// with it. `list` is replaced by a copy first, so the caller's items are left as they were.
+/// inside `msg`, that `contextOf` gives a context of their own or, when encoding, that
+/// `headerFieldsOf` names header fields to encode for: each of those is coded alone, with its
+/// context (or `run_context`) and those names. An encoding pass leaves every other header field
+/// as it is; a decoding pass decodes them all. `list` is replaced by a copy first, so the
+/// caller's items are left as they were.
 fn codeWithOwnContexts(
     comptime Msg: type,
     msg: *Msg,
     list: anytype,
     comptime contextOf: anytype,
+    comptime headerFieldsOf: anytype,
     inst: *const Instance,
     codecs: []const converter.PayloadCodec,
     a: Allocator,
@@ -2028,25 +2036,36 @@ fn codeWithOwnContexts(
     run_context: *const converter.Context,
     comptime direction: enum { encode, decode },
 ) converter.CodecError!void {
-    const code = switch (direction) {
-        .encode => converter.encodeMessage,
-        .decode => converter.decodeMessage,
+    const Code = struct {
+        fn code(comptime T: type, m: *T, cs: []const converter.PayloadCodec, arena: Allocator, i: Io, context: *const converter.Context, header_fields: []const []const u8) converter.CodecError!void {
+            return switch (direction) {
+                .encode => codec_pass.encodeMessageWithHeaderFields(T, m, cs, arena, i, context, header_fields),
+                .decode => converter.decodeMessage(T, m, cs, arena, i, context),
+            };
+        }
     };
     const Item = @typeInfo(@TypeOf(list.items)).pointer.child;
     const items = try a.dupe(Item, list.items);
     list.* = .fromOwnedSlice(items);
     var own: std.ArrayList(struct { index: usize, item: Item }) = .empty;
     for (items, 0..) |*item, i| {
-        const context = contextOf(inst, item) orelse continue;
+        const own_context = contextOf(inst, item);
+        const header_fields: []const []const u8 = if (direction == .encode) headerFieldsOf(inst, item) else &.{};
+        if (own_context == null and header_fields.len == 0) continue;
         var copy = item.*;
-        try code(Item, &copy, codecs, a, io, context);
+        try Code.code(Item, &copy, codecs, a, io, own_context orelse run_context, header_fields);
         try own.append(a, .{ .index = i, .item = copy });
         item.* = .{};
     }
-    try code(Msg, msg, codecs, a, io, run_context);
+    try Code.code(Msg, msg, codecs, a, io, run_context, &.{});
     // Coding copied the list, keeping its length and order; the items coded alone go back
     // into the copy.
     for (own.items) |o| list.items[o.index] = o.item;
+}
+
+/// Activation jobs have no header fields to encode.
+fn noHeaderCodecFields(_: *const Instance, _: *const act_pb.WorkflowActivationJob) []const []const u8 {
+    return &.{};
 }
 
 /// The codec context of an activation job that resolves an activity or a child workflow:
@@ -6458,6 +6477,74 @@ test "the workflow runner hands codecs the run's propagated values and identity"
     for (want, recorder.calls.items) |w, got| try testing.expectEqualStrings(w, got);
     // The workflow saw the header decoded once, not dropped by the two-step decode.
     try testing.expectEqualStrings("acme", runner.runs.get("run-1").?.inst.propagated.get(ContextRecordingCodec.tenant).?);
+}
+
+const HeaderCodecTest = struct {
+    const tenant = propagation.key([]const u8, "tenant");
+    const user = propagation.key([]const u8, "user");
+    const propagators = [_]propagation.ContextPropagator{
+        propagation.HeaderPropagator(tenant).encoded_propagator,
+        propagation.HeaderPropagator(user).propagator,
+    };
+
+    fn call(ctx: *workflow.Context) !void {
+        _ = ctx.executeActivityByName(void, "Act", .{ .start_to_close_timeout = .fromSeconds(10) }, .{});
+        _ = ctx.executeChildWorkflowByName(void, "Kid", .{ .id = "kid" }, .{});
+        _ = ctx.signalWithStartWorkflowByName("Target", .{ .id = "target", .id_conflict_policy = .use_existing }, .{}, "go", .{});
+        try ctx.sleep(.fromSeconds(60), .{});
+    }
+    const Call = workflow.Def("CallMarked", call);
+
+    fn encodingOf(entries: anytype, name: []const u8) []const u8 {
+        for (entries) |e| if (std.mem.eql(u8, e.key, name)) return converter.encodingOf(e.value.?) orelse "unset";
+        return "missing";
+    }
+};
+
+test "the workflow runner encodes only the header fields of a command that its propagators marked" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const zlib: converter.ZlibCodec = .{ .always_encode = true };
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, HeaderCodecTest.Call.workflow_name, HeaderCodecTest.Call.registered);
+    var runner: WorkflowRunner = .{
+        .gpa = testing.allocator,
+        .workflows = &workflows,
+        .task_queue = "tq",
+        .namespace = "ns",
+        .stack_size = 256 * 1024,
+        .codecs = &codecs,
+        .propagators = &HeaderCodecTest.propagators,
+    };
+    defer runner.deinit();
+
+    // The start header arrives plain, as another SDK's client sends it, and decodes as it is.
+    var init: act_pb.InitializeWorkflow = .{ .workflow_type = "CallMarked", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    try init.headers.append(a, .{ .key = "tenant", .value = try converter.toPayload(a, @as([]const u8, "acme")) });
+    try init.headers.append(a, .{ .key = "user", .value = try converter.toPayload(a, @as([]const u8, "ann")) });
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+    try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+    var bytes: Io.Writer.Allocating = .init(a);
+    try act.encode(&bytes.writer, a);
+
+    const completion = (try runner.handle(bytes.written(), a, testing.io)).completion;
+    const commands = completion.status.?.successful.commands.items;
+    const schedule = commands[0].variant.?.schedule_activity;
+    try testing.expectEqualStrings("binary/zlib", HeaderCodecTest.encodingOf(schedule.headers.items, "tenant"));
+    try testing.expectEqualStrings("json/plain", HeaderCodecTest.encodingOf(schedule.headers.items, "user"));
+    const child = commands[1].variant.?.start_child_workflow_execution;
+    try testing.expectEqualStrings("binary/zlib", HeaderCodecTest.encodingOf(child.headers.items, "tenant"));
+    try testing.expectEqualStrings("json/plain", HeaderCodecTest.encodingOf(child.headers.items, "user"));
+    // A signal-with-start's header, inside its envelope, follows the same marks.
+    const envelope = commands[2].variant.?.schedule_nexus_operation.input.?;
+    const request = (try @import("nexus/system.zig").decode(a, envelope)).signal_with_start_request;
+    try testing.expectEqualStrings("binary/zlib", HeaderCodecTest.encodingOf(request.header.?.fields.items, "tenant"));
+    try testing.expectEqualStrings("json/plain", HeaderCodecTest.encodingOf(request.header.?.fields.items, "user"));
+    // The timer has no payloads.
+    try testing.expect(commands[3].variant.? == .start_timer);
 }
 
 const NexusCodecTest = struct {

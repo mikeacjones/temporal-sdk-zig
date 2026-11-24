@@ -155,7 +155,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Custom payload conversion | all | GA | supported | [Payloads](README.md#payloads) |
 | Raw payloads passed through unconverted | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Payloads](README.md#payloads) |
 | Payload codecs for compression and encryption | all | GA | supported | [Payload codecs](README.md#payload-codecs), [encryption](samples/encryption), [snappycompress](samples/snappycompress) |
-| Payload codecs on header fields, chosen by the field's producer | Go, Java, Python, TypeScript | GA | partial | `temporal-sdk-zig-d51.4.30`. Every header field goes through `client.Options.codecs`. Missing: leaving a propagator's or the caller's header fields unencoded, which is the other SDKs' default, and choosing per propagator. |
+| Payload codecs on header fields, chosen by the field's producer | Go, Java, Python, TypeScript | GA | supported | [Context propagation](README.md#context-propagation) |
 | Codec server for the Web UI and CLI | Go, Java, Python, TypeScript, .NET | GA | supported | [Payload codecs](README.md#payload-codecs), [codec-server](samples/codec-server) |
 | Remote codec client: a payload codec that sends payloads to a codec server's `/encode` and `/decode` | Go, Java | GA, deferred | partial | `temporal-sdk-zig-d51.4.4`. Missing: a ready-made codec that calls a codec server; a `converter.PayloadCodec` can make those HTTP calls itself. |
 | Serialization context for converters and codecs | Go, Java, Python, TypeScript, .NET, PHP | GA | supported | [Payloads](README.md#payloads), [Payload codecs](README.md#payload-codecs) |

@@ -6,7 +6,7 @@
 //! Covered:
 //! - converter.toPayload, converter.fromPayload, converter.toPayloads,
 //!   converter.fromPayloads, converter.toFields, converter.fieldValue,
-//!   converter.Header.fromEntries, converter.Header.toEntries
+//!   converter.Header.fromEntries, converter.Header.toEntries, converter.HeaderWriter.put
 //! - failure.fromError, failure.application, failure.copyChain, failure.encodeAttributes,
 //!   failure.decodeAttributes
 //! - history.fromJson
@@ -122,6 +122,25 @@ fn headerFromEntries(a: Allocator, entries: []const ProtoEntry) !void {
 fn headerToEntries(a: Allocator, header: converter.Header) !void {
     _ = try header.toEntries(ProtoEntry, a);
     _ = try header.toEntries(LocalEntry, a);
+}
+
+/// Writes three fields marked for the codecs, writes each again unmarked, then marks one of
+/// them and a new one, into a fresh writer.
+fn headerWriterPut(a: Allocator) !void {
+    var w: converter.HeaderWriter = .init(a);
+    for ([_][]const u8{ "trace", "baggage", "tenant" }) |name| {
+        w.encode_fields = true;
+        try w.put(name, .{ .data = name });
+        w.encode_fields = false;
+        try w.put(name, .{ .data = name });
+    }
+    w.encode_fields = true;
+    for ([_][]const u8{ "trace", "zone" }) |name| try w.put(name, .{ .data = name });
+    std.debug.assert(w.fields.items.len == 4 and w.codec_fields.items.len == 2);
+}
+
+test "converter.HeaderWriter.put" {
+    try alloc_failures.run("converter.HeaderWriter.put", .arena, headerWriterPut, .{});
 }
 
 test "converter.toPayload" {
@@ -655,14 +674,16 @@ const tenant = propagation.key([]const u8, "tenant");
 const Caller = struct { user: []const u8, roles: []const []const u8, level: u8 };
 const caller = propagation.key(Caller, "caller");
 
+/// One propagator whose field the codecs encode, so `injectAll` also marks a field.
 const propagators = [_]propagation.ContextPropagator{
-    propagation.HeaderPropagator(tenant).propagator,
+    propagation.HeaderPropagator(tenant).encoded_propagator,
     propagation.HeaderPropagator(caller).propagator,
 };
 
 fn propagationInjectAll(a: Allocator, values: *const propagation.Values) !void {
     var header: converter.HeaderWriter = .init(a);
     try propagation.injectAll(&propagators, a, values, &header);
+    std.debug.assert(header.encodes("tenant") and !header.encodes("caller"));
 }
 
 fn propagationExtractAll(a: Allocator, header: converter.Header) !void {

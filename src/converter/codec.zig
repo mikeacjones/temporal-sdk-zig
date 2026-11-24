@@ -26,9 +26,11 @@ pub const CodecError = error{ OutOfMemory, Canceled, CodecFailed };
 /// fields empty, and the codec server (`codecHandler`) and `encodePayloads` pass no context
 /// at all.
 ///
-/// Header payloads go through codecs like any other, so a codec can't read a propagated
-/// value from the header it is encoding; it reads it from `values` instead. Everything is
-/// borrowed for the duration of the codec or hook call only.
+/// A header field goes through the codecs on the way out only when the propagator that wrote
+/// it sets `propagation.ContextPropagator.encode_fields`; such a field is encoded alone, with
+/// the context of the message it travels in. On the way in every header field is given to
+/// the codecs' decode. A codec reads propagated values from `values`, not from the header.
+/// Everything is borrowed for the duration of the codec or hook call only.
 pub const Context = struct {
     /// The call's propagated values (`temporal.propagation`): a client call's `.context`, the
     /// values a workflow run extracted from its start header (`ctx.propagated()` in the
@@ -74,8 +76,12 @@ pub const CodecContext = Context;
 /// from `arena` (a returned payload may borrow its input). They must return as many payloads
 /// as they were given, in the same order, and must leave payloads they don't recognize
 /// unchanged: decoding passes through payloads a codec didn't encode, so a codec sees plain
-/// payloads too. Both may be called from several threads at once, never from workflow code;
-/// `io` is the client's or worker's.
+/// payloads too. Header fields depend on this: every received header field is decoded, and
+/// most were never encoded (only a propagator that sets
+/// `propagation.ContextPropagator.encode_fields` has its fields encoded), so a `decode` that
+/// fails on a payload it didn't encode fails the task or call that carries it. Both may be
+/// called from several threads at once, never from workflow code; `io` is the client's or
+/// worker's.
 ///
 /// A codec that needs to know whose payloads it transforms also sets `encodeWithContext`
 /// and `decodeWithContext`, which the client and workers call instead with a
@@ -165,18 +171,28 @@ fn checkCount(want: usize, got: []Payload, comptime what: []const u8) CodecError
 }
 
 /// Encodes every payload in the protobuf message `msg` with `codecs` (see `visitPayloads`
-/// for which ones), replacing them in place, passing `context` to each codec. Memory comes
-/// from `arena`; `msg` may borrow memory it doesn't own, which is left unchanged. No codecs
-/// leaves `msg` as it is. A payload marked `__temporal_system_payload: "true"` (a system
-/// Nexus envelope) is not given to the codecs; the payloads inside it are, with the context
-/// of the workflow its request names. A marked payload of a message type the SDK doesn't
-/// know is `error.CodecFailed` (logged).
+/// for which ones), replacing them in place, passing `context` to each codec, except header
+/// fields, which it leaves as they are. Memory comes from `arena`; `msg` may borrow memory it
+/// doesn't own, which is left unchanged. No codecs leaves `msg` as it is. A payload marked
+/// `__temporal_system_payload: "true"` (a system Nexus envelope) is not given to the codecs;
+/// the payloads inside it are, with the context of the workflow its request names. A marked
+/// payload of a message type the SDK doesn't know is `error.CodecFailed` (logged).
 pub fn encodeMessage(comptime T: type, msg: *T, codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const Context) CodecError!void {
-    if (codecs.len == 0) return;
-    return visitPayloads(T, msg, arena, ChainVisitor{ .codecs = codecs, .arena = arena, .io = io, .context = context, .encode = true });
+    return encodeMessageWithHeaderFields(T, msg, codecs, arena, io, context, &.{});
 }
 
-/// Decodes every payload in the protobuf message `msg` with `codecs`, as `encodeMessage`. A
+/// `encodeMessage` that also encodes, in every header it meets in `msg` (inside system
+/// envelopes too), the fields whose names are in `header_fields`, which is sorted. Each such
+/// field is encoded alone, as a one-payload list, with `context`; a codec that returns other
+/// than one payload is `error.CodecFailed`. The names are the `converter.HeaderWriter`
+/// marks of the header the message was built from.
+pub fn encodeMessageWithHeaderFields(comptime T: type, msg: *T, codecs: []const PayloadCodec, arena: Allocator, io: Io, context: *const Context, header_fields: []const []const u8) CodecError!void {
+    if (codecs.len == 0) return;
+    return visitPayloads(T, msg, arena, ChainVisitor{ .codecs = codecs, .arena = arena, .io = io, .context = context, .encode = true, .header_fields = header_fields });
+}
+
+/// Decodes every payload in the protobuf message `msg` with `codecs`, as `encodeMessage`, and
+/// every header field too, encoded or not: a codec passes through what it didn't encode. A
 /// payload marked `__temporal_system_payload: "true"` is not given to the codecs; the
 /// payloads inside it are, with the context of the workflow its request names. A marked
 /// payload of a message type the SDK doesn't know is `error.CodecFailed` (logged).
@@ -191,6 +207,9 @@ const ChainVisitor = struct {
     io: Io,
     context: *const Context,
     encode: bool,
+    /// The header fields an encoding pass encodes, sorted; the others are left as they are.
+    /// A decoding pass decodes every header field.
+    header_fields: []const []const u8 = &.{},
     /// How many system envelopes enclose the payloads being visited.
     depth: u8 = 0,
 
@@ -224,6 +243,17 @@ const ChainVisitor = struct {
             }
         }
         return out;
+    }
+
+    pub fn visitHeaderField(v: ChainVisitor, name: []const u8, payload: Payload) CodecError!Payload {
+        if (v.encode and std.sort.binarySearch([]const u8, v.header_fields, name, nameOrder) == null) return payload;
+        if (system.isMarked(payload)) return v.visitSystemPayload(payload);
+        const out = try chainPayloads(v.codecs, v.arena, v.io, v.context, &.{payload}, v.encode);
+        return out[0];
+    }
+
+    fn nameOrder(name: []const u8, other: []const u8) std.math.Order {
+        return std.mem.order(u8, name, other);
     }
 
     /// Codes the payloads inside the system Nexus envelope `p` and encodes it again with its
@@ -273,6 +303,14 @@ const ChainVisitor = struct {
 /// and recursive messages such as a failure's causes. Search attributes are skipped: the
 /// server reads them, so they stay as the converter wrote them.
 ///
+/// A visitor that also declares
+/// `visitHeaderField(name: []const u8, payload: Payload) CodecError!Payload` gets that call,
+/// instead of `visit`, for each field of a header: a `temporal.api.common.v1.Header`'s
+/// `fields`, and in sdk-core's messages a field named `headers` or `header_fields` whose
+/// entries have `key` and `value: ?Payload` (an activation's start, signal, update and query
+/// jobs, the schedule, start, signal and continue-as-new commands, an activity task's start).
+/// Memos and Nexus headers are not headers. A field without a value is not visited.
+///
 /// Visiting copies, into `arena`, every list and pointed-to message on the way to a payload
 /// before replacing anything, so memory `value` borrows is never written. The visitor must
 /// return as many payloads as it was given.
@@ -303,10 +341,48 @@ pub fn visitPayloads(comptime T: type, value: *T, arena: Allocator, visitor: any
             if (E != Payload) for (items) |*item| try visitPayloads(E, item, arena, visitor);
             value.* = .fromOwnedSlice(items);
         } else {
-            inline for (s.field_names) |name| try visitPayloads(@FieldType(T, name), &@field(value, name), arena, visitor);
+            inline for (s.field_names) |name| {
+                const F = @FieldType(T, name);
+                if (comptime isHeaderEntries(T, name) and hasHeaderHook(@TypeOf(visitor))) {
+                    try visitHeaderEntries(F, &@field(value, name), arena, visitor);
+                } else try visitPayloads(F, &@field(value, name), arena, visitor);
+            }
         },
         else => {},
     }
+}
+
+/// Whether the field `name` of the message `T` holds a header's fields (see `visitPayloads`).
+fn isHeaderEntries(comptime T: type, comptime name: []const u8) bool {
+    const F = @FieldType(T, name);
+    if (T == proto.temporal.api.common.v1.Header) return std.mem.eql(u8, name, "fields");
+    if (!std.mem.eql(u8, name, "headers") and !std.mem.eql(u8, name, "header_fields")) return false;
+    if (!isArrayList(F)) return false;
+    const E = @typeInfo(@FieldType(F, "items")).pointer.child;
+    return @typeInfo(E) == .@"struct" and @hasField(E, "key") and @FieldType(E, "key") == []const u8 and
+        @hasField(E, "value") and @FieldType(E, "value") == ?Payload;
+}
+
+fn hasHeaderHook(comptime V: type) bool {
+    const Base = switch (@typeInfo(V)) {
+        .pointer => |p| p.child,
+        else => V,
+    };
+    return switch (@typeInfo(Base)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(Base, "visitHeaderField"),
+        else => false,
+    };
+}
+
+/// Replaces each value of the header entries `list` with what `visitor.visitHeaderField`
+/// returns for it, in the list's order, after copying the list into `arena`.
+fn visitHeaderEntries(comptime L: type, list: *L, arena: Allocator, visitor: anytype) CodecError!void {
+    const E = @typeInfo(@FieldType(L, "items")).pointer.child;
+    const items = try arena.dupe(E, list.items);
+    for (items) |*e| if (e.value) |p| {
+        e.value = try visitor.visitHeaderField(e.key, p);
+    };
+    list.* = .fromOwnedSlice(items);
 }
 
 fn isArrayList(comptime T: type) bool {
@@ -884,10 +960,11 @@ test "encodeMessage and decodeMessage code a system envelope's inner payloads wi
     const envelope = try system.envelope(a, try testSignalWithStartRequest(a));
     const envelope_data = try a.dupe(u8, envelope.data);
     var completion = try testCompletion(a, envelope);
-    try encodeMessage(@TypeOf(completion), &completion, &chain, a, testing.io, &run_context);
+    // The header field marked for the codecs is encoded inside the envelope too.
+    try encodeMessageWithHeaderFields(@TypeOf(completion), &completion, &chain, a, testing.io, &run_context, &.{"trace"});
 
-    // Each inner payload coded once, with the target's context; the activity's arguments
-    // with the run's.
+    // Each inner payload coded once, with the target's context (the header field alone); the
+    // activity's arguments with the run's.
     try testing.expectEqual(@as(usize, 7), try recording.countFor(true, target_context));
     try testing.expectEqual(@as(usize, 2), try recording.countFor(true, run_context));
     try testing.expectEqual(@as(usize, 7), recording.records.items.len);
@@ -1124,4 +1201,142 @@ test "system envelopes nested up to the limit are coded; one more level fails th
     var leaf_calls: usize = 0;
     for (recording.records.items) |rec| leaf_calls += rec.count;
     try testing.expectEqual(2 * (ChainVisitor.max_system_payload_depth + 1), leaf_calls);
+}
+
+test "an encoding pass encodes only the named header fields, each alone; a decoding pass decodes every one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cmd_pb = proto.coresdk.workflow_commands;
+    var recording: RecordingCodec = .{ .records_arena = a };
+    const chain = [_]PayloadCodec{recording.codec()};
+    const context: Context = .{ .namespace = "ns", .workflow_id = "wf", .workflow_type = "Wf" };
+
+    // A client request's header, and a command's headers beside a memo and a Nexus header.
+    var request: proto.temporal.api.workflowservice.v1.StartWorkflowExecutionRequest = .{ .workflow_id = "wf", .header = .{}, .memo = .{} };
+    for ([_][]const u8{ "baggage", "plain", "trace" }) |name| try request.header.?.fields.append(a, .{ .key = name, .value = try converter.toPayload(a, name) });
+    try request.header.?.fields.append(a, .{ .key = "empty" });
+    try request.memo.?.fields.append(a, .{ .key = "trace", .value = try converter.toPayload(a, @as([]const u8, "memo")) });
+    const before = try a.dupe(proto.temporal.api.common.v1.Header.FieldsEntry, request.header.?.fields.items);
+    try encodeMessageWithHeaderFields(@TypeOf(request), &request, &chain, a, testing.io, &context, &.{ "baggage", "trace" });
+    const fields = request.header.?.fields.items;
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(fields[0].value.?).?);
+    // The unnamed field is the payload as written, byte for byte.
+    try testing.expectEqualSlices(u8, before[1].value.?.data, fields[1].value.?.data);
+    try testing.expectEqualStrings("json/plain", converter.encodingOf(fields[1].value.?).?);
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(fields[2].value.?).?);
+    try testing.expectEqual(@as(?Payload, null), fields[3].value);
+    // A memo entry of a named field's name is no header field: it is coded like any memo.
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(request.memo.?.fields.items[0].value.?).?);
+    // The header the request borrowed is unchanged.
+    try testing.expectEqualStrings("json/plain", converter.encodingOf(before[0].value.?).?);
+    // One call per named field, one payload each, with the message's context; one for the memo.
+    try testing.expectEqual(@as(usize, 3), recording.records.items.len);
+    try testing.expectEqual(@as(usize, 3), try recording.countFor(true, context));
+    for (recording.records.items) |r| try testing.expectEqual(@as(usize, 1), r.count);
+
+    recording.records.clearRetainingCapacity();
+    try decodeMessage(@TypeOf(request), &request, &chain, a, testing.io, &context);
+    // Every header field with a value is given to the codecs, the plain one too.
+    try testing.expectEqual(@as(usize, 4), try recording.countFor(false, context));
+    for (request.header.?.fields.items[0..3], [_][]const u8{ "baggage", "plain", "trace" }) |f, want| {
+        try testing.expectEqualStrings(want, try converter.fromPayload([]const u8, a, f.value.?));
+    }
+
+    // encodeMessage names no field: headers stay as written, in sdk-core's commands too.
+    var schedule: cmd_pb.ScheduleActivity = .{ .seq = 1, .activity_type = "Greet" };
+    try schedule.headers.append(a, .{ .key = "trace", .value = try converter.toPayload(a, @as([]const u8, "t")) });
+    var nexus: cmd_pb.ScheduleNexusOperation = .{ .seq = 2 };
+    try nexus.nexus_header.append(a, .{ .key = "trace", .value = "t" });
+    var success: proto.coresdk.workflow_completion.Success = .{};
+    try success.commands.append(a, .{ .variant = .{ .schedule_activity = schedule } });
+    try success.commands.append(a, .{ .variant = .{ .schedule_nexus_operation = nexus } });
+    var completion: proto.coresdk.workflow_completion.WorkflowActivationCompletion = .{ .run_id = "run", .status = .{ .successful = success } };
+    var unnamed = completion;
+    recording.records.clearRetainingCapacity();
+    try encodeMessage(@TypeOf(unnamed), &unnamed, &chain, a, testing.io, &context);
+    // (The activity's empty argument list is still visited, as zero payloads.)
+    try testing.expectEqual(@as(usize, 0), try recording.countFor(true, context));
+    try testing.expectEqualStrings("json/plain", converter.encodingOf(unnamed.status.?.successful.commands.items[0].variant.?.schedule_activity.headers.items[0].value.?).?);
+    try encodeMessageWithHeaderFields(@TypeOf(completion), &completion, &chain, a, testing.io, &context, &.{"trace"});
+    const commands = completion.status.?.successful.commands.items;
+    try testing.expectEqualStrings(RecordingCodec.name, converter.encodingOf(commands[0].variant.?.schedule_activity.headers.items[0].value.?).?);
+    try testing.expectEqualStrings("t", commands[1].variant.?.schedule_nexus_operation.nexus_header.items[0].value);
+}
+
+/// Returns two payloads for every list it is given.
+const DoublingCodec = struct {
+    fn codec() PayloadCodec {
+        return .{ .ptr = undefined, .vtable = &.{ .encode = double, .decode = double } };
+    }
+
+    fn double(_: *anyopaque, arena: Allocator, _: Io, payloads: []const Payload) CodecError![]Payload {
+        const out = try arena.alloc(Payload, payloads.len * 2);
+        for (out, 0..) |*o, i| o.* = payloads[i / 2];
+        return out;
+    }
+};
+
+test "a codec that returns other than one payload for a header field fails the pass" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const level = testing.log_level;
+    defer testing.log_level = level;
+    testing.log_level = .err;
+    var request: proto.temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest = .{ .signal_name = "s", .header = .{} };
+    try request.header.?.fields.append(a, .{ .key = "trace", .value = try converter.toPayload(a, @as([]const u8, "t")) });
+    const chain = [_]PayloadCodec{DoublingCodec.codec()};
+    // Unnamed, the field never reaches the codec.
+    var unnamed = request;
+    try encodeMessage(@TypeOf(unnamed), &unnamed, &chain, a, testing.io, &.{});
+    var named = request;
+    try testing.expectError(error.CodecFailed, encodeMessageWithHeaderFields(@TypeOf(named), &named, &chain, a, testing.io, &.{}, &.{"trace"}));
+    var received = request;
+    try testing.expectError(error.CodecFailed, decodeMessage(@TypeOf(received), &received, &chain, a, testing.io, &.{}));
+}
+
+/// Records the names of the header fields it visits and counts the other payloads.
+const HeaderNamingVisitor = struct {
+    arena: Allocator,
+    names: *std.ArrayList([]const u8),
+    others: *usize,
+
+    pub fn visit(v: HeaderNamingVisitor, payloads: []const Payload) CodecError![]Payload {
+        v.others.* += payloads.len;
+        return v.arena.dupe(Payload, payloads);
+    }
+
+    pub fn visitHeaderField(v: HeaderNamingVisitor, name: []const u8, payload: Payload) CodecError!Payload {
+        try v.names.append(v.arena, name);
+        return converter.payloadWithEncoding(v.arena, "test/header", payload.data);
+    }
+};
+
+test "visitPayloads calls visitHeaderField for each header field of a request, an activation and an activity task" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names: std.ArrayList([]const u8) = .empty;
+    var others: usize = 0;
+    const visitor: HeaderNamingVisitor = .{ .arena = a, .names = &names, .others = &others };
+
+    var request: proto.temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest = .{ .signal_name = "s", .header = .{}, .input = .{} };
+    try request.header.?.fields.append(a, .{ .key = "a", .value = try converter.toPayload(a, @as(i64, 1)) });
+    try request.input.?.payloads.append(a, try converter.toPayload(a, @as(i64, 2)));
+    try visitPayloads(@TypeOf(request), &request, a, visitor);
+    try testing.expectEqualStrings("test/header", converter.encodingOf(request.header.?.fields.items[0].value.?).?);
+
+    var signal: proto.coresdk.workflow_activation.SignalWorkflow = .{ .signal_name = "go" };
+    try signal.headers.append(a, .{ .key = "b", .value = try converter.toPayload(a, @as(i64, 3)) });
+    try signal.input.append(a, try converter.toPayload(a, @as(i64, 4)));
+    try visitPayloads(@TypeOf(signal), &signal, a, visitor);
+
+    var start: proto.coresdk.activity_task.Start = .{ .activity_type = "Greet" };
+    try start.header_fields.append(a, .{ .key = "c", .value = try converter.toPayload(a, @as(i64, 5)) });
+    try visitPayloads(@TypeOf(start), &start, a, visitor);
+
+    try testing.expectEqual(@as(usize, 3), names.items.len);
+    for (names.items, [_][]const u8{ "a", "b", "c" }) |got, want| try testing.expectEqualStrings(want, got);
+    try testing.expectEqual(@as(usize, 2), others);
 }
