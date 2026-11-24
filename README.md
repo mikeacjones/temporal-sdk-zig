@@ -70,6 +70,7 @@ The Temporal Zig SDK is a framework for authoring workflows and activities in Zi
     - [Payloads](#payloads)
     - [Payload codecs](#payload-codecs)
     - [Failures](#failures-1)
+    - [Payload size limits](#payload-size-limits)
     - [External payload storage](#external-payload-storage)
     - [Remote codec client](#remote-codec-client)
   - [Testing](#testing)
@@ -339,6 +340,7 @@ Notes:
 - `keep_alive` defaults to a ping every 30 s, sent even while the connection is idle; a ping not answered within 15 s drops the connection, and later calls connect again. Both durations must be positive, or `connect` and `init` return `error.InvalidOptions`, logged. Set `keep_alive` to null to send no pings.
 - `worker_heartbeat_interval` (default null: every 60 s) applies to every worker on the client's sdk-core runtime, so clients from `forNamespace` share it. It must be from 1 s to 60 s, or `.zero` to turn worker heartbeats off; any other value makes `connect` and `init` return `error.InvalidOptions`, logged. Workers send heartbeats only to a server whose namespace reports support for them, and skip them silently otherwise.
 - `Client.reconnect` takes a new `http_connect_proxy` and `keep_alive` in `client.ConnectionOptions`; `worker_heartbeat_interval` stays as `connect` or `init` set it.
+- `payloads_warning_size` and `memo_warning_size` log a warning for a request that carries a large payload or memo: see [Payload size limits](#payload-size-limits).
 
 #### Starting workflows
 
@@ -1709,6 +1711,7 @@ Notes:
 - `default_heartbeat_throttle_interval` (30 s) and `max_heartbeat_throttle_interval` (60 s): an activity's heartbeats reach the server at 80% of its heartbeat timeout, at most every `max_heartbeat_throttle_interval`, or every `default_heartbeat_throttle_interval` without a heartbeat timeout; heartbeats in between keep only the latest details. Session activities are throttled the same way. Neither may be negative, and the default may not be above the maximum.
 - `max_eager_activity_reservations_per_workflow_task` (3): how many activities on the worker's own task queue one workflow task may ask the server to start on this worker eagerly, with free activity slots, in the answer to the task's completion; 0 turns eager activities off for the worker, as either per-second limit does. `ActivityOptions.disable_eager_execution` turns it off for one activity.
 - `poll_activity_tasks` (true): false stops the worker polling its task queue for activity tasks, so its registered activities run only as local activities of its own workflows (`workflow.Context.executeLocalActivity`); activities scheduled through the task queue wait for another worker or time out. It needs a registered workflow when activities are registered, and can't be combined with `sessions`.
+- `fail_oversized_payloads` (true): the worker fails a task whose completion carries payloads larger than the namespace's limit instead of sending it; false sends it anyway, for a proxy that changes payload sizes. See [Payload size limits](#payload-size-limits).
 - `run` returns `error.InvalidOptions`, and logs the option and why, for a per-second limit that is zero, negative, infinite or NaN (or a `max_activities_per_second` below one per 2^61 seconds, about 4.4e-19 per second), a negative duration among the ones above, a default heartbeat throttle interval above the maximum, or `poll_activity_tasks = false` with `sessions` or with activities but no workflow.
 - `graceful_shutdown_period` (zero) and `workflow_memory_limit` (null): see below.
 - `workflow_task_failure_errors` (empty) and `nondeterminism_fails_workflow` (false): which errors and whether nondeterminism fail the workflow task or the workflow; see [Failure policy](#failure-policy).
@@ -2158,10 +2161,38 @@ Notes:
 - Failures the SDK makes for its own reports (workflow task failures, unregistered activities, queries and updates, codec failures, cancel acknowledgements) and those it builds for user code without the server (an interceptor's refusal, a child that couldn't start, a canceled local activity) aren't converted, nor is a failed query's message on the client.
 - `encode_failure_attributes` applies after `toFailure` and is undone before `fromFailure`, so the converter always sees plain messages.
 
+#### Payload size limits
+
+The server refuses payloads larger than the namespace's payload size limit (2 MiB on a default server) and memos larger than its memo limit. A worker checks its own completions against those limits before sending them, and a client logs a warning when a request it sends carries a large payload or memo, well before the server would refuse it.
+
+<!-- example: payload-size-limits -->
+```zig
+var client = try temporal.client.Client.connect(gpa, io, .{
+    .host_port = "temporal.internal:7233",
+    // Warn above 1 MiB per payload field and 4 KiB per memo; 0 turns a warning off.
+    .payloads_warning_size = 1024 * 1024,
+    .memo_warning_size = 4 * 1024,
+});
+defer client.close();
+var w = try Worker.init(gpa, io, &client, "greetings", .{
+    // A proxy between this worker and the server encrypts payloads, which changes their
+    // size: send every completion and let the server judge it.
+    .fail_oversized_payloads = false,
+});
+defer w.deinit();
+```
+
+Notes:
+- `worker.Options.fail_oversized_payloads` (true): the worker reads the namespace's limits from the server when it starts, and fails a workflow or activity task whose completion carries a payload field larger than the payload limit, or a memo larger than the memo limit, instead of sending it. A workflow task fails as a workflow task failure with cause `WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE`, which the server retries: the run stays open, so a fixed worker can finish it. An activity task fails with a retryable application failure of type `PayloadsTooLarge`, which the activity's retry policy retries. A server that reports no limits for the namespace means no check.
+- The worker logs why at error level, with the field's `size` and the `limit` as fields, through the client's logger (`client.Options.logger`). The record is sdk-core's, so it is logged only while `client.Options.core_log_level` forwards errors; null logs nothing.
+- Set `fail_oversized_payloads` to false when something between the worker and the server changes payload sizes, such as a proxy that encrypts or compresses them. The worker then sends every completion, and what the server does with an oversized one is what the run sees: a server may fail the workflow task and terminate the run, for one. It applies to the worker's session activities too.
+- `client.Options.payloads_warning_size` (512 KiB) and `memo_warning_size` (2 KiB), in bytes: a request with a payload field larger than the first, or a memo larger than the second, logs one warning per such field through the client's logger, with the field's `size` and the `limit`. The request is still sent. 0 turns a warning off. The warnings, like the worker's errors, are sdk-core's records and need `core_log_level` at `.warn` or below (the default), and may be logged from one of sdk-core's threads.
+- The warning sizes belong to the connection: they apply to every client sharing it (`Client.forNamespace`, `Client.withRpcOptions`) and to the completions of every worker on it, whatever `fail_oversized_payloads` is. `Client.reconnect` takes them in `client.ConnectionOptions`; a `ConnectionOptions` that leaves them out gets the defaults.
+
 #### External payload storage
 <!-- stub: temporal-sdk-zig-d51.4.9 -->
 Not implemented yet.
-Drivers that store large payloads outside history behind reference payloads, with payload size limits.
+Drivers that store large payloads outside history behind reference payloads.
 
 #### Remote codec client
 <!-- stub: temporal-sdk-zig-d51.4.4 -->

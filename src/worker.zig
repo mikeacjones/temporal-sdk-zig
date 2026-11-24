@@ -136,6 +136,18 @@ pub const Options = struct {
     /// free, are asked for. 0 turns eager activity execution off for the worker; so does
     /// either per-second limit.
     max_eager_activity_reservations_per_workflow_task: u32 = 3,
+    /// Whether the worker fails a workflow or activity task whose completion carries payloads
+    /// larger than the namespace's payload size limit (or a memo larger than its memo limit),
+    /// instead of sending a completion the server would reject. sdk-core reads the limits
+    /// from the namespace when the worker starts; a server that reports none means no check.
+    /// A workflow task fails as a task failure the server retries, so the run stays open; an
+    /// activity task fails with a retryable application failure of type `PayloadsTooLarge`.
+    /// sdk-core logs the reason at error level through the client's logger
+    /// (`client.Options.logger`), unless `client.Options.core_log_level` is null. Set false
+    /// when a proxy between the worker and the server changes payload sizes (one that
+    /// encrypts, say): the completion is then sent and the server's answer stands. Applies to
+    /// session activities too. See README.md's "Payload size limits".
+    fail_oversized_payloads: bool = true,
     /// Whether the worker polls its task queue for activity tasks. False runs the
     /// registered activities only as local activities of this worker's workflows
     /// (`workflow.Context.executeLocalActivity`): activities scheduled through the task queue
@@ -1033,6 +1045,7 @@ pub const Worker = struct {
             .nexus_task_pollers = if (registered.nexus) corePollerBehavior(o.nexus_task_poller_behavior, o.max_concurrent_nexus_task_pollers) else .{ .simple_maximum = 1 },
             .graceful_shutdown_period_ms = millis(o.graceful_shutdown_period),
             .nondeterminism_as_workflow_fail = o.nondeterminism_fails_workflow,
+            .disable_payload_error_limit = !o.fail_oversized_payloads,
         };
     }
 
@@ -1077,6 +1090,7 @@ pub const Worker = struct {
             .max_heartbeat_throttle_interval_ms = main.max_heartbeat_throttle_interval_ms,
             .activity_task_pollers = main.activity_task_pollers,
             .graceful_shutdown_period_ms = main.graceful_shutdown_period_ms,
+            .disable_payload_error_limit = main.disable_payload_error_limit,
         };
     }
 
@@ -3873,6 +3887,7 @@ test "worker options map to the core options of the task queue" {
         .max_eager_activity_reservations_per_workflow_task = 0,
         .poll_activity_tasks = false,
         .graceful_shutdown_period = .fromSeconds(6),
+        .fail_oversized_payloads = false,
     };
     const all: Worker.Registered = .{ .workflows = true, .activities = true, .nexus = true };
     try Worker.checkOptions(options, "mapped", all);
@@ -3896,6 +3911,7 @@ test "worker options map to the core options of the task queue" {
     try testing.expectEqual(9000, core.max_heartbeat_throttle_interval_ms);
     try testing.expectEqual(0, core.max_eager_activity_reservations_per_workflow_task);
     try testing.expectEqual(6000, core.graceful_shutdown_period_ms);
+    try testing.expect(core.disable_payload_error_limit);
     // Activities still run, as local activities of the worker's workflows.
     try testing.expectEqual(bridge.Worker.Options.TaskTypes{ .workflows = true, .local_activities = true, .remote_activities = false, .nexus = true }, core.task_types);
 }
@@ -3913,6 +3929,9 @@ test "default worker options give the core its own defaults" {
     try testing.expectEqual(defaults.max_eager_activity_reservations_per_workflow_task, core.max_eager_activity_reservations_per_workflow_task);
     try testing.expectEqual(defaults.tuner.local_activity.fixed, core.tuner.local_activity.fixed);
     try testing.expectEqual(defaults.graceful_shutdown_period_ms, core.graceful_shutdown_period_ms);
+    // The oversized-payload check is on.
+    try testing.expect(!core.disable_payload_error_limit);
+    try testing.expectEqual(defaults.disable_payload_error_limit, core.disable_payload_error_limit);
     try testing.expectEqual(1000, core.max_cached_workflows);
     try testing.expectEqual(100, core.tuner.workflow.fixed);
     try testing.expectEqual(100, core.tuner.activity.fixed);
@@ -4031,6 +4050,18 @@ test "session queues get the heartbeat throttling but not the per-second limits"
     try testing.expectEqual(0, session.max_activities_per_second);
     try testing.expectEqual(0, session.max_task_queue_activities_per_second);
     try testing.expectEqual(bridge.Worker.Options.TaskTypes{ .workflows = false, .local_activities = false, .remote_activities = true, .nexus = false }, session.task_types);
+    try testing.expect(!session.disable_payload_error_limit);
+}
+
+test "session queues fail oversized payloads as the worker's own queue does" {
+    const registered: Worker.Registered = .{ .workflows = false, .activities = true, .nexus = false };
+    for ([_]bool{ true, false }) |fail| {
+        const options: Options = .{ .fail_oversized_payloads = fail, .sessions = .{} };
+        try Worker.checkOptions(options, "q", registered);
+        const core = Worker.coreOptions(options, "ns", "q", .{ .none = .{} }, registered);
+        try testing.expectEqual(!fail, core.disable_payload_error_limit);
+        try testing.expectEqual(!fail, Worker.sessionCoreOptions(core, "q@host", 1).disable_payload_error_limit);
+    }
 }
 
 test "a per-worker activity rate turns eager activities off; without one the reservations pass through" {

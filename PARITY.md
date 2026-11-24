@@ -162,7 +162,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Failures with cause chains and kinds | all | GA | supported | [Failures](README.md#failures-1) |
 | Encoded failure attributes (message and stack trace through the codecs) | all | GA | supported | [Failures](README.md#failures-1) |
 | Custom failure converter (errors to failures and back) | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Failures](README.md#failures-1) |
-| Payload size limits: a worker fails a task whose payloads are too large, and clients warn above a size | all | GA | partial | `temporal-sdk-zig-d51.4.29`. sdk-core fails a task whose payloads exceed the namespace's limit, with the check always on. Missing: a `worker.Options` field that turns the check off, client warning sizes, and README.md documentation. |
+| Payload size limits: a worker fails a task whose payloads are too large, and clients warn above a size | all | GA | supported | [Payload size limits](README.md#payload-size-limits) |
 | External payload storage (Public Preview) | Go, Java, Python, TypeScript, .NET | pre-release | partial | `temporal-sdk-zig-d51.4.9`. Missing: storage drivers and a payload size threshold; a `converter.PayloadCodec` can store payloads elsewhere and pass references instead. |
 
 ### Testing

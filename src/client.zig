@@ -143,6 +143,19 @@ pub const Options = struct {
     /// replaces it for the calls of a view from `Client.withRpcOptions`. Null keeps sdk-core's
     /// default of 30 s. Must be positive; under 1 ms counts as 1 ms.
     rpc_timeout: ?Duration = null,
+    /// Log a warning when a payload-carrying field of a request this client or its workers
+    /// send is larger than this many bytes: one warning per such field, through `logger`,
+    /// with the field's `size` and this `limit`. The request is still sent. 0 turns the
+    /// warning off. The warning is sdk-core's own log record, so `core_log_level` null (or
+    /// above `.warn`) drops it. It belongs to the connection, so it applies to every client
+    /// sharing it (`Client.forNamespace`, `Client.withRpcOptions`). See README.md's "Payload
+    /// size limits".
+    payloads_warning_size: u64 = default_payloads_warning_size,
+    /// The same as `payloads_warning_size`, for a request's memo. 0 turns the warning off.
+    memo_warning_size: u64 = default_memo_warning_size,
+
+    const default_payloads_warning_size = (bridge.Connection.Options{ .target_url = "", .identity = "" }).payloads_warn_size;
+    const default_memo_warning_size = (bridge.Connection.Options{ .target_url = "", .identity = "" }).memo_warn_size;
 
     pub const KeepAlive = struct {
         /// Time between pings. Must be positive.
@@ -207,6 +220,8 @@ pub const Options = struct {
             .retry = o.retry,
             .client_name = o.client_name,
             .client_version = o.client_version,
+            .payloads_warning_size = o.payloads_warning_size,
+            .memo_warning_size = o.memo_warning_size,
         };
     }
 };
@@ -224,6 +239,8 @@ pub const ConnectionOptions = struct {
     retry: ?Options.Retry = null,
     client_name: []const u8 = bridge.Connection.default_client_name,
     client_version: []const u8 = bridge.Connection.default_client_version,
+    payloads_warning_size: u64 = Options.default_payloads_warning_size,
+    memo_warning_size: u64 = Options.default_memo_warning_size,
 };
 
 /// Why an option was rejected, naming the option and its value, for the caller to log.
@@ -297,6 +314,8 @@ fn bridgeConnectionOptions(url: []const u8, identity: []const u8, options: Conne
         .retry = retry,
         .keep_alive = keep_alive,
         .http_connect_proxy = proxy,
+        .payloads_warn_size = options.payloads_warning_size,
+        .memo_warn_size = options.memo_warning_size,
     };
 }
 
@@ -6199,6 +6218,8 @@ test "default options send what the client always sent" {
         try testing.expect(b.retry == null);
         try testing.expect(b.http_connect_proxy == null);
         try testing.expect(b.tls == null);
+        try testing.expectEqual(@as(u64, 512 * 1024), b.payloads_warn_size);
+        try testing.expectEqual(@as(u64, 2 * 1024), b.memo_warn_size);
         try testing.expectEqual(@as(u64, 60_000), try heartbeatIntervalMs(o.worker_heartbeat_interval, &rejection));
         try testing.expectEqual(@as(u32, 0), try rpcTimeoutMs(o.rpc_timeout, &rejection));
     }
@@ -6212,8 +6233,12 @@ test "custom connection options map to the bridge, through connectionOptions too
         .retry = .{ .max_retries = 3, .max_elapsed_time = .zero, .initial_interval = .fromMicroseconds(10) },
         .client_name = "wrapper",
         .client_version = "1.2.3 beta",
+        .payloads_warning_size = 0,
+        .memo_warning_size = 100,
     };
     const b = try bridgeConnectionOptions("http://h:1", "id", o.connectionOptions(), null, &rejection);
+    try testing.expectEqual(@as(u64, 0), b.payloads_warn_size);
+    try testing.expectEqual(@as(u64, 100), b.memo_warn_size);
     try testing.expectEqual(@as(u64, 10_000), b.keep_alive.?.interval_ms);
     try testing.expectEqual(@as(u64, 15_000), b.keep_alive.?.timeout_ms);
     try testing.expectEqualStrings("proxy.corp:3128", b.http_connect_proxy.?.target_host);
@@ -6235,6 +6260,9 @@ test "custom connection options map to the bridge, through connectionOptions too
 
     const off = try bridgeConnectionOptions("http://h:1", "id", .{ .keep_alive = null }, null, &rejection);
     try testing.expect(off.keep_alive == null);
+    // A ConnectionOptions that leaves the warning sizes out gets the defaults.
+    try testing.expectEqual(@as(u64, 512 * 1024), off.payloads_warn_size);
+    try testing.expectEqual(@as(u64, 2 * 1024), off.memo_warn_size);
 
     try testing.expectEqual(@as(u64, 0), try heartbeatIntervalMs(.zero, &rejection));
     try testing.expectEqual(@as(u64, 15_000), try heartbeatIntervalMs(.fromSeconds(15), &rejection));
