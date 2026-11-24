@@ -1,0 +1,188 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-24T10:19:43.046880Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1050398",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "WaitForSignal"
+        },
+        "taskQueue": {
+          "name": "conformance-deployment_versioning/routing_with_override",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {},
+        "workflowExecutionTimeout": "60s",
+        "workflowRunTimeout": "60s",
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a20d11-8a46-7d69-95e2-9546d839d5d7",
+        "identity": "conformance",
+        "firstExecutionRunId": "01a20d11-8a46-7d69-95e2-9546d839d5d7",
+        "attempt": 1,
+        "workflowExecutionExpirationTime": "2026-11-24T10:20:43.047Z",
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "conformance-deployment_versioning/routing_with_override",
+        "versioningOverride": {
+          "pinned": {
+            "behavior": "PINNED_OVERRIDE_BEHAVIOR_PINNED",
+            "version": {
+              "buildId": "1.0",
+              "deploymentName": "conformance-routing-with-override"
+            }
+          }
+        }
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-24T10:19:43.046919Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1050399",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-deployment_versioning/routing_with_override",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-24T10:19:43.047718Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1050410",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "conformance",
+        "requestId": "0c783fa1-4cce-4f17-af9a-b7f18836e7ef",
+        "historySizeBytes": "428"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-24T10:19:43.051193Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1050438",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "conformance",
+        "workerVersion": {
+          "buildId": "1.0"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            1,
+            2,
+            4,
+            3
+          ],
+          "sdkName": "temporal-zig",
+          "sdkVersion": "0.1.0-alpha.1"
+        },
+        "meteringMetadata": {},
+        "versioningBehavior": "VERSIONING_BEHAVIOR_PINNED",
+        "workerDeploymentName": "conformance-routing-with-override",
+        "deploymentVersion": {
+          "buildId": "1.0",
+          "deploymentName": "conformance-routing-with-override"
+        }
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-11-24T10:19:43.050929Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED",
+      "taskId": "1050439",
+      "workflowExecutionSignaledEventAttributes": {
+        "signalName": "start-signal",
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "InByZWZpeCI="
+            }
+          ]
+        },
+        "identity": "conformance",
+        "requestId": "0e6e9f74-0c5a-499c-8b02-fde1ecb96670"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-11-24T10:19:43.051212Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1050440",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-9815517a2c6043e3b14fb2273f60de98",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "conformance-deployment_versioning/routing_with_override"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-11-24T10:19:43.051214Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1050441",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "6",
+        "identity": "conformance",
+        "requestId": "request-from-RespondWorkflowTaskCompleted",
+        "historySizeBytes": "509",
+        "workerVersion": {
+          "buildId": "1.0"
+        }
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-11-24T10:19:43.053272Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1050447",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "6",
+        "startedEventId": "7",
+        "identity": "conformance",
+        "workerVersion": {
+          "buildId": "1.0"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {},
+        "versioningBehavior": "VERSIONING_BEHAVIOR_PINNED",
+        "workerDeploymentName": "conformance-routing-with-override",
+        "deploymentVersion": {
+          "buildId": "1.0",
+          "deploymentName": "conformance-routing-with-override"
+        }
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-11-24T10:19:43.053285Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1050448",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "InByZWZpeF92MSI="
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "8"
+      }
+    }
+  ]
+}

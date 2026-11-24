@@ -1,0 +1,176 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-24T10:19:34.355191Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048932",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "WaitForSignal"
+        },
+        "taskQueue": {
+          "name": "conformance-deployment_versioning/routing_auto_upgrade",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {},
+        "workflowExecutionTimeout": "60s",
+        "workflowRunTimeout": "60s",
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a20d11-6853-72e6-9cad-be913bb76032",
+        "identity": "conformance",
+        "firstExecutionRunId": "01a20d11-6853-72e6-9cad-be913bb76032",
+        "attempt": 1,
+        "workflowExecutionExpirationTime": "2026-11-24T10:20:34.355Z",
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "conformance-deployment_versioning/routing_auto_upgrade"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-24T10:19:34.355238Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048933",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-deployment_versioning/routing_auto_upgrade",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-24T10:19:34.357513Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048939",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "conformance",
+        "requestId": "ed8d9798-52a4-426a-b216-175294af6c3e",
+        "historySizeBytes": "379"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-24T10:19:34.363846Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048943",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "conformance",
+        "workerVersion": {
+          "buildId": "1.0"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            3,
+            1,
+            4,
+            2
+          ],
+          "sdkName": "temporal-zig",
+          "sdkVersion": "0.1.0-alpha.1"
+        },
+        "meteringMetadata": {},
+        "versioningBehavior": "VERSIONING_BEHAVIOR_AUTO_UPGRADE",
+        "workerDeploymentName": "conformance-routing-auto-upgrade",
+        "deploymentVersion": {
+          "buildId": "1.0",
+          "deploymentName": "conformance-routing-auto-upgrade"
+        }
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-11-24T10:19:36.393908Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED",
+      "taskId": "1049245",
+      "workflowExecutionSignaledEventAttributes": {
+        "signalName": "start-signal",
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "InByZWZpeCI="
+            }
+          ]
+        },
+        "identity": "conformance",
+        "requestId": "22a9d419-7766-4658-8264-89cd2dcaa84b"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-11-24T10:19:36.393911Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1049246",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-da642a57fc384303890caa308986b60b",
+          "kind": "TASK_QUEUE_KIND_STICKY",
+          "normalName": "conformance-deployment_versioning/routing_auto_upgrade"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-11-24T10:19:36.394716Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1049250",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "6",
+        "identity": "conformance",
+        "requestId": "75713ed0-aeab-4102-b863-b91f72917587",
+        "historySizeBytes": "899"
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-11-24T10:19:36.398564Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1049254",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "6",
+        "startedEventId": "7",
+        "identity": "conformance",
+        "workerVersion": {
+          "buildId": "2.0"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {},
+        "versioningBehavior": "VERSIONING_BEHAVIOR_AUTO_UPGRADE",
+        "workerDeploymentName": "conformance-routing-auto-upgrade",
+        "deploymentVersion": {
+          "buildId": "2.0",
+          "deploymentName": "conformance-routing-auto-upgrade"
+        }
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-11-24T10:19:36.398605Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1049255",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "InByZWZpeF92MiI="
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "8"
+      }
+    }
+  ]
+}
