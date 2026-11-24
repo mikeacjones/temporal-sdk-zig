@@ -31,7 +31,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 
 | Feature | SDKs | Stage | Zig | Where |
 |---------|------|-------|-----|-------|
-| Connect with TLS, mutual TLS, and gRPC headers | all | GA | supported | [Connecting](README.md#connecting) |
+| Connect with TLS, mutual TLS, and gRPC headers | all | GA | supported | [Connecting](README.md#connecting), [helloworldmtls](samples/helloworldmtls) |
 | API key authentication | all | GA | supported | [Connecting](README.md#connecting), [helloworld-apiKey](samples/helloworld-apiKey) |
 | Client RPC retry policy and a client-wide RPC timeout | all | GA | supported | [Connecting](README.md#connecting) |
 | RPC timeout and gRPC metadata on a single call | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |
@@ -268,7 +268,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | grpc-proxy | | planned: `temporal-sdk-zig-d51.16.81` |
 | helloworld | [helloworld](samples/helloworld) | ported |
 | helloworld-apiKey | [helloworld-apiKey](samples/helloworld-apiKey) | ported |
-| helloworldmtls | | planned: `temporal-sdk-zig-d51.16.59` |
+| helloworldmtls | [helloworldmtls](samples/helloworldmtls) | ported |
 | lambda-worker | | planned: `temporal-sdk-zig-d51.16.79` |
 | logger-interceptor | [logger-interceptor](samples/logger-interceptor) | ported |
 | memo | [memo](samples/memo) | ported |
