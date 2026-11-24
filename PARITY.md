@@ -99,7 +99,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Patching: patched and deprecated patches | Python, TypeScript, .NET, Ruby | GA | supported | [Versioning and patching](README.md#versioning-and-patching) |
 | Version numbers in code (get version) | Go, Java, PHP | GA | supported | [Versioning and patching](README.md#versioning-and-patching) |
 | Side effects | Go, Java, PHP | GA | supported | [Side effects, memo, and search attributes](README.md#side-effects-memo-and-search-attributes) |
-| Mutable side effects | Go, Java | GA, deferred | partial | `temporal-sdk-zig-d51.7.34`. Missing: a mutable side effect that records a marker only when the value changes; calling `ctx.sideEffect` each time returns the current value but records a marker every call. |
+| Mutable side effects | Go, Java | GA | supported | [Side effects, memo, and search attributes](README.md#side-effects-memo-and-search-attributes) |
 | Workflow-local variables: a value scoped to one run that any of its code can reach | Go, Java | GA, deferred | partial | `temporal-sdk-zig-d51.7.15`. Missing: a per-run value that code holding only the workflow context can reach, like Go's local variables and Java's workflow locals; a run's state lives in its struct fields or in `ctx.allocator()` memory and is passed down explicitly, and `ctx.propagated()` is read-only. |
 | Memo, read and upserted | all | GA | supported | [memo](samples/memo) |
 | Search attributes, typed and upserted | all | GA | supported | [searchattributes](samples/searchattributes) |

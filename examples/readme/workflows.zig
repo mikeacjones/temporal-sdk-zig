@@ -653,6 +653,37 @@ test "workflows: side effects, memo, and search attributes" {
     try testing.expectEqualStrings(want, result);
 }
 
+// example: workflow-mutable-side-effect
+var discount_percent: std.atomic.Value(u32) = .init(10); // changed by an operator
+fn readDiscount(_: void) u32 {
+    return discount_percent.load(.monotonic);
+}
+fn sameDiscount(recorded: u32, current: u32) bool {
+    return recorded == current;
+}
+fn quotePrices(ctx: *workflow.Context, prices: []const u32) ![]const u8 {
+    var quotes: std.ArrayList(u8) = .empty;
+    for (prices) |price| {
+        // Recorded on the first call and whenever the setting changes; other calls add nothing.
+        const discount = try ctx.mutableSideEffect(u32, "discount", {}, readDiscount, sameDiscount);
+        try quotes.print(ctx.allocator(), "{d} ", .{price * (100 - discount) / 100});
+    }
+    return quotes.items;
+}
+pub const QuotePrices = workflow.Def("quote_prices", quotePrices);
+// end-example
+
+test "workflows: a mutable side effect" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(QuotePrices);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(QuotePrices, .{&.{ 100, 200 }}, arena.allocator(), null);
+    try testing.expectEqualStrings("90 180 ", result);
+}
+
 // example: workflow-session
 fn greetOnOneHost(ctx: *workflow.Context, names: []const []const u8) ![]const u8 {
     const session = try ctx.createSession(.{

@@ -1267,6 +1267,36 @@ Notes:
 - A null or empty value in `ctx.upsertMemo` removes the key; `memoValue` returns null for a missing key.
 - An unregistered search attribute fails the workflow task until it exists; `error.InvalidSearchAttribute` means an unindexable value.
 
+`workflow.Context.mutableSideEffect` reads a value that is read often and changes rarely, keyed by an ID, and records it only when your comparison says it differs from the last value recorded for that ID.
+
+<!-- example: workflow-mutable-side-effect -->
+```zig
+var discount_percent: std.atomic.Value(u32) = .init(10); // changed by an operator
+fn readDiscount(_: void) u32 {
+    return discount_percent.load(.monotonic);
+}
+fn sameDiscount(recorded: u32, current: u32) bool {
+    return recorded == current;
+}
+fn quotePrices(ctx: *workflow.Context, prices: []const u32) ![]const u8 {
+    var quotes: std.ArrayList(u8) = .empty;
+    for (prices) |price| {
+        // Recorded on the first call and whenever the setting changes; other calls add nothing.
+        const discount = try ctx.mutableSideEffect(u32, "discount", {}, readDiscount, sameDiscount);
+        try quotes.print(ctx.allocator(), "{d} ", .{price * (100 - discount) / 100});
+    }
+    return quotes.items;
+}
+pub const QuotePrices = workflow.Def("quote_prices", quotePrices);
+```
+
+Notes:
+- The function and the comparison don't run on replay; every call returns the recorded value, decoded again.
+- An unchanged call adds no history events and reaches no interceptor.
+- Each change records two markers and an update of the `TemporalChangeVersion` search attribute, which lists a `__temporal_mse:<id>:<n>` entry per change; the core stops updating it once the list passes 2048 bytes.
+- Patch IDs starting with `__temporal_mse:` belong to the SDK: don't pass one to `patched`, `deprecatePatch` or `getVersion`.
+- Query handlers and update validators get `error.SideEffectFailed`.
+
 #### Sessions
 `workflow.Context.createSession` opens a session that runs activities on one worker host, `ActivityOptions.session` runs one in it, and `completeSession` ends it.
 
