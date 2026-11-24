@@ -86,7 +86,19 @@ pub fn stopWorker(ctx: *Context) (Worker.RunError || error{NoWorker})!void {
 /// cancellation is reported through `fail`, with a message starting "startWorker: ".
 pub fn startWorker(ctx: *Context) error{ FeatureFailed, Canceled }!void {
     const definition = ctx.definition_ orelse return ctx.fail("startWorker: the feature declares no workflows, activities or Nexus services", .{});
+    return ctx.startWorkerWith(definition.workerOptions());
+}
+
+/// Like `startWorker`, but the new worker runs with `options` instead of the feature's
+/// `.worker_options` (still with `failure_stack_traces` off). Same definitions, same task
+/// queue, same ownership: the context owns it and `stopWorker` stops it. Slices in
+/// `options` (such as a build ID) must outlive the worker: file-scope constants or
+/// `arena` memory.
+pub fn startWorkerWith(ctx: *Context, options: temporal.worker.Options) error{ FeatureFailed, Canceled }!void {
+    const definition = ctx.definition_ orelse return ctx.fail("startWorker: the feature declares no workflows, activities or Nexus services", .{});
     if (!definition.has_worker) return ctx.fail("startWorker: the feature declares no workflows, activities or Nexus services", .{});
+    var worker_options = options;
+    worker_options.failure_stack_traces = false;
     if (ctx.worker_ != null) return ctx.fail("startWorker: the feature's worker is still running; call stopWorker first", .{});
     // An earlier restarted worker has been stopped, since `worker_` is null.
     ctx.freeRestarted();
@@ -94,7 +106,7 @@ pub fn startWorker(ctx: *Context) error{ FeatureFailed, Canceled }!void {
     const gpa = ctx.gpa;
     const io = ctx.io;
     const restarted = gpa.create(Restarted) catch |err| return ctx.fail("startWorker: worker init returned error.{t}", .{err});
-    restarted.worker = Worker.init(gpa, io, ctx.client, ctx.task_queue, definition.workerOptions()) catch |err| {
+    restarted.worker = Worker.init(gpa, io, ctx.client, ctx.task_queue, worker_options) catch |err| {
         gpa.destroy(restarted);
         return ctx.fail("startWorker: worker init returned error.{t}", .{err});
     };
@@ -511,6 +523,46 @@ test "conformance startWorker frees the new worker when it fails to start" {
     };
     defer ctx.deinit();
     try std.testing.expectError(error.FeatureFailed, ctx.startWorker());
+    try std.testing.expectEqualStrings("startWorker: worker failed to start with error.InvalidOptions", ctx.failure_message_.?);
+    try std.testing.expectEqual(null, ctx.restarted_);
+    try std.testing.expectEqual(null, ctx.worker_);
+    try std.testing.expectEqual(null, ctx.running_);
+}
+
+test "conformance startWorkerWith runs the new worker with the given options" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var client = try temporal.client.Client.init(gpa, io, .{});
+    defer client.close();
+    const Example = struct {
+        fn run(_: *temporal.workflow.Context) !void {}
+        fn execute(_: *Context) !void {}
+    };
+    const feature = @import("harness.zig").define(.{
+        .workflows = .{temporal.workflow.Def("Workflow", Example.run)},
+        .worker_options = .{ .build_id = "1.0", .use_build_id_versioning = true },
+        .execute = Example.execute,
+    });
+    var ctx: Context = .{
+        .gpa = gpa,
+        .io = io,
+        .arena = arena.allocator(),
+        .client = &client,
+        .feature = "test/worker",
+        .namespace = "default",
+        .task_queue = "conformance-test/worker",
+    };
+    defer ctx.deinit();
+    const no_worker_message = "startWorker: the feature declares no workflows, activities or Nexus services";
+    try std.testing.expectError(error.FeatureFailed, ctx.startWorkerWith(.{}));
+    try std.testing.expectEqualStrings(no_worker_message, ctx.failure_message_.?);
+
+    // The feature's options are valid; these are not, and option validation fails when the
+    // worker runs, before the lazy client connects.
+    ctx.definition_ = &feature;
+    try std.testing.expectError(error.FeatureFailed, ctx.startWorkerWith(.{ .use_build_id_versioning = true }));
     try std.testing.expectEqualStrings("startWorker: worker failed to start with error.InvalidOptions", ctx.failure_message_.?);
     try std.testing.expectEqual(null, ctx.restarted_);
     try std.testing.expectEqual(null, ctx.worker_);

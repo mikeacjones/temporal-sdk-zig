@@ -388,3 +388,34 @@ test "conformance replay rejects an exclusion with an empty bead or reason, and 
         }));
     }
 }
+
+test "conformance build_id_versioning/versions_added_while_worker_polling stored run gives the signal after 1.2 to the 1.2 worker" {
+    // The README: once 1.2 is added as the default of the set, the polling 1.1 worker must
+    // not get the run's next task. The feature's third "add1" signal is sent after 1.2 is
+    // added, so the workflow task that follows it must be completed by build 1.2.
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const prefix = "build_id_versioning/versions_added_while_worker_polling/";
+    for (stored_histories.files) |file| {
+        if (!std.mem.startsWith(u8, file.path, prefix) or !std.mem.endsWith(u8, file.path, "-Workflow.json")) continue;
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, file.bytes, .{});
+        var signals: usize = 0;
+        var completed_by: ?[]const u8 = null;
+        for (root.object.get("events").?.array.items) |event| {
+            const event_type = event.object.get("eventType").?.string;
+            if (std.mem.eql(u8, event_type, "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED")) {
+                signals += 1;
+            } else if (signals == 3 and std.mem.eql(u8, event_type, "EVENT_TYPE_WORKFLOW_TASK_COMPLETED")) {
+                const attributes = event.object.get("workflowTaskCompletedEventAttributes").?.object;
+                const version = attributes.get("workerVersion") orelse break;
+                completed_by = version.object.get("buildId").?.string;
+                break;
+            }
+        }
+        std.testing.expectEqualStrings("1.2", completed_by orelse "none") catch |err| {
+            std.debug.print("{s}: the task after the third add1 signal was completed by build {s}\n", .{ file.path, completed_by orelse "none" });
+            return err;
+        };
+    }
+}
