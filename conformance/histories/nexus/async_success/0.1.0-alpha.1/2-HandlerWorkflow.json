@@ -1,0 +1,128 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-11-24T14:04:35.268958Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048604",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "HandlerWorkflow"
+        },
+        "taskQueue": {
+          "name": "conformance-nexus/async_success",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "IndvcmxkIg=="
+            }
+          ]
+        },
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "01a20ddf-6a44-7e9e-bd37-1ef11202e972",
+        "identity": "conformance",
+        "firstExecutionRunId": "01a20ddf-6a44-7e9e-bd37-1ef11202e972",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s",
+        "workflowId": "async-success-world",
+        "completionCallbacks": [
+          {
+            "links": [
+              {
+                "workflowEvent": {
+                  "namespace": "default",
+                  "workflowId": "conformance-nexus/async_success",
+                  "runId": "01a20ddf-6a38-779d-ac2a-53260bd16327",
+                  "eventRef": {
+                    "eventId": "5",
+                    "eventType": "EVENT_TYPE_NEXUS_OPERATION_SCHEDULED"
+                  }
+                }
+              }
+            ],
+            "nexus": {
+              "url": "temporal://system",
+              "header": {
+                "nexus-operation-token": "eyJ0IjoxLCJucyI6ImRlZmF1bHQiLCJ3aWQiOiJhc3luYy1zdWNjZXNzLXdvcmxkIn0",
+                "temporal-callback-token": "{\"v\":1,\"d\":\"CiQwMWEyMGRkZi02OWM4LTczOTktYTRjZi04ZDVmY2RmZjE4OTESH2NvbmZvcm1hbmNlLW5leHVzL2FzeW5jX3N1Y2Nlc3MaJDAxYTIwZGRmLTZhMzgtNzc5ZC1hYzJhLTUzMjYwYmQxNjMyNyIsCh4KGW5leHVzb3BlcmF0aW9ucy5PcGVyYXRpb24SATUSAhADGgIQAyICEAMqJDJiNWRkMWRlLTQ3YTgtNGE1My1hNjA2LWViMWI4YjdmYTE0OA==\"}"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-11-24T14:04:35.268994Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048605",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "conformance-nexus/async_success",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-11-24T14:04:35.269985Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048610",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "conformance",
+        "requestId": "6d96bc12-5f8c-4acf-962b-f90663d3bb24",
+        "historySizeBytes": "829"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-11-24T14:04:35.272861Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048626",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "conformance",
+        "workerVersion": {},
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            2,
+            3,
+            4,
+            1
+          ],
+          "sdkName": "temporal-zig",
+          "sdkVersion": "0.1.0-alpha.1"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-11-24T14:04:35.272887Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048627",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "IkhlbGxvLCB3b3JsZCEi"
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "4"
+      }
+    }
+  ]
+}

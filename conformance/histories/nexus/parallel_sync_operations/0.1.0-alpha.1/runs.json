@@ -1,0 +1,10 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-nexus/parallel_sync_operations",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-nexus/parallel_sync_operations"
+    }
+  ]
+}

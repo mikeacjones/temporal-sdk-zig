@@ -1,0 +1,14 @@
+{
+  "namespace": "default",
+  "task_queue": "conformance-nexus/async_success",
+  "runs": [
+    {
+      "file": "1-Workflow.json",
+      "workflow_id": "conformance-nexus/async_success"
+    },
+    {
+      "file": "2-HandlerWorkflow.json",
+      "workflow_id": "async-success-world"
+    }
+  ]
+}

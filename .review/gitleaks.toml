@@ -6,3 +6,8 @@ useDefault = true
 [[allowlists]]
 description = "TLS keys generated for the samples' Docker server; they protect nothing"
 paths = ['''^tools/fixtures/tls/.*\.key$''']
+
+[[allowlists]]
+description = "Nexus operation tokens in the stored conformance histories: base64 JSON naming the namespace and backing workflow ID of one dev-server run; they grant nothing"
+regexTarget = "match"
+regexes = ['''^(operationToken|nexus-operation-token)": "[A-Za-z0-9_=-]+"?$''']
