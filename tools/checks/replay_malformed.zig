@@ -343,7 +343,9 @@ fn mutate(history: *History, kind: Kind, k: usize) void {
         .clear_workflow_execution_timeout => if (startedAttributes(history)) |a| {
             a.workflow_execution_timeout = null;
         },
-        .clear_started_attributes => events.items[0].attributes = null,
+        .clear_started_attributes => if (events.items.len > 0) {
+            events.items[0].attributes = null;
+        },
         .task_started_past_end => events.items[k - 1].event_id = events.items[events.items.len - 1].event_id + 1,
     }
 }
