@@ -323,4 +323,9 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 
 ## Samples with no Zig equivalent
 
-The reasons for the rows of the [Samples](#samples) table whose status is `not applicable` are recorded here.
+| samples-go sample | Reason |
+|-------------------|--------|
+| dynamicconfig | A server configuration file, not a sample. |
+| googleadk | Runs Google's Go ADK agent library; there is no Zig ADK. |
+| pickfirst | Exercises grpc-go's pick_first load-balancing policy; the Rust core owns the gRPC connection. Revisit if the core exposes load-balancing options. |
+| typed-searchattributes | Holds only a pointer to searchattributes, whose Zig sample covers typed search attributes. |
