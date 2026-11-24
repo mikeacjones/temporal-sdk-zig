@@ -252,7 +252,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | dynamic | [dynamic](samples/dynamic) | ported |
 | dynamic-workflows | [dynamic-workflows](samples/dynamic-workflows) | ported |
 | dynamicconfig | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
-| dynamicmtls | | planned: `temporal-sdk-zig-d51.16.60` |
+| dynamicmtls | [dynamicmtls](samples/dynamicmtls) | ported |
 | eager-workflow-start | [eager-workflow-start](samples/eager-workflow-start) | ported |
 | early-return | [early-return](samples/early-return) | ported |
 | encryption | [encryption](samples/encryption) | ported |
