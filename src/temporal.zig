@@ -55,6 +55,7 @@ test {
     _ = @import("converter_context_test.zig");
     _ = @import("failure_converter_test.zig");
     _ = @import("workflow_api_test.zig");
+    _ = @import("payload_limits_test.zig");
     _ = @import("workflow/stack_trace_test.zig");
     _ = @import("workflow/call_sites.zig");
 }

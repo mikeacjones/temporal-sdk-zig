@@ -957,3 +957,98 @@ test "WorkflowReplayer replays an awaitTimeout whose timer fired in the signal's
     try changed.registerWorkflow(workflow.Def("await_timeout_tie", AwaitTimeoutTie.alwaysTimesOut));
     try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(await_timeout_tie_history));
 }
+
+const ArgumentsInMarker = struct {
+    const MarkerEcho = activity.Def("la_marker_echo", struct {
+        fn echo(_: *activity.Context, text: []const u8) ![]const u8 {
+            return text;
+        }
+    }.echo);
+
+    /// Runs `MarkerEcho` as a local activity twice: with "recorded" and `arguments_in_marker` set,
+    /// then with "plain" and the option left off.
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const recorded = try ctx.executeLocalActivity(MarkerEcho, .{ .start_to_close_timeout = .fromSeconds(10), .arguments_in_marker = true }, .{"recorded"}).get();
+        const plain = try ctx.executeLocalActivity(MarkerEcho, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"plain"}).get();
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s}", .{ recorded, plain });
+    }
+
+    /// `run` with the second local activity left out.
+    fn runOne(ctx: *workflow.Context) ![]const u8 {
+        return ctx.executeLocalActivity(MarkerEcho, .{ .start_to_close_timeout = .fromSeconds(10), .arguments_in_marker = true }, .{"recorded"}).get();
+    }
+
+    const Workflow = workflow.Def("la_arguments_in_marker", run);
+
+    /// The arguments recorded in each local activity marker of `history`, in event order:
+    /// null for a marker without them.
+    fn markerInputs(a: std.mem.Allocator, history: anytype) ![]const ?[]const converter.Payload {
+        var out: std.ArrayList(?[]const converter.Payload) = .empty;
+        for (history.events.items) |event| switch (event.attributes.?) {
+            .marker_recorded_event_attributes => |attrs| {
+                var input: ?[]const converter.Payload = null;
+                for (attrs.details.items) |entry| {
+                    if (std.mem.eql(u8, entry.key, "input")) input = entry.value.?.payloads.items;
+                }
+                try out.append(a, input);
+            },
+            else => {},
+        };
+        return out.items;
+    }
+};
+
+test "workflow: arguments_in_marker records a local activity's arguments, as the codecs encoded them, in its marker only" {
+    var wrapping: WrappingCodec = .{};
+    const codecs = [_]converter.PayloadCodec{wrapping.codec()};
+    const env = try testing_ns.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs });
+    defer env.deinit();
+    try env.registerWorkflow(ArgumentsInMarker.Workflow);
+    try env.registerActivity(ArgumentsInMarker.MarkerEcho);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(ArgumentsInMarker.Workflow, .{}, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("recorded plain", try env.getResult(ArgumentsInMarker.Workflow, &run, a, null));
+
+    // Read through a client without codecs, to see the payloads as the server holds them.
+    var raw = try @import("client.zig").Client.connect(testing.allocator, testing.io, env.server.dev.clientOptions());
+    defer raw.close();
+    const history = try raw.fetchHistory(a, run.id, run.run_id);
+    const inputs = try ArgumentsInMarker.markerInputs(a, history);
+    try testing.expectEqual(@as(usize, 2), inputs.len);
+    try testing.expect(inputs[1] == null);
+    const recorded = inputs[0] orelse return error.TestExpectedArguments;
+    try testing.expectEqual(@as(usize, 1), recorded.len);
+    var reference: WrappingCodec = .{};
+    const expected = try reference.codec().encode(a, testing.io, &.{try converter.toPayload(a, @as([]const u8, "recorded"))});
+    try testing.expectEqualStrings(WrappingCodec.encoding, converter.encodingOf(recorded[0]).?);
+    try testing.expectEqualSlices(u8, expected[0].data, recorded[0].data);
+
+    var replayer: testing_ns.WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs });
+    defer replayer.deinit();
+    try replayer.registerWorkflow(ArgumentsInMarker.Workflow);
+    try replayer.replayHistory(history);
+}
+
+/// A dev-server run of `ArgumentsInMarker.Workflow` on a worker with `WrappingCodec`, fetched
+/// with `Client.fetchHistory` through a client without codecs and encoded as ProtoJSON
+/// (`temporal.protojson.encode`), indented. Its first local activity marker holds the
+/// arguments, wrapped; the second holds none.
+const local_activity_arguments_history = @embedFile("testdata/local_activity_arguments_history.json");
+
+test "WorkflowReplayer replays local activity markers with arguments and catches a removed local activity" {
+    var wrapping: WrappingCodec = .{};
+    const codecs = [_]converter.PayloadCodec{wrapping.codec()};
+    var ok: testing_ns.WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs });
+    defer ok.deinit();
+    try ok.registerWorkflow(ArgumentsInMarker.Workflow);
+    try ok.replayHistoryJson(local_activity_arguments_history);
+
+    var changed: testing_ns.WorkflowReplayer = .initWithOptions(testing.allocator, testing.io, .{ .codecs = &codecs });
+    defer changed.deinit();
+    try changed.registerWorkflow(workflow.Def("la_arguments_in_marker", ArgumentsInMarker.runOne));
+    try testing.expectError(error.Nondeterminism, changed.replayHistoryJson(local_activity_arguments_history));
+}

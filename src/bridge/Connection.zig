@@ -46,6 +46,14 @@ pub const Options = struct {
     /// connects to one address.
     dns_load_balancing_interval_ms: ?u64 = null,
     compression: enum { gzip, none } = .gzip,
+    /// The core logs a warning when a payload-carrying field of a request on this connection
+    /// is larger than this many bytes; the request is still sent. 0 turns the warning off.
+    /// The default is sdk-core's `DEFAULT_PAYLOADS_WARN_SIZE` (crates/client/src/options_structs.rs),
+    /// which the C header does not export: recheck it when the core is bumped.
+    payloads_warn_size: u64 = 512 * 1024,
+    /// The same for a request's memo. The default is sdk-core's `DEFAULT_MEMO_WARN_SIZE`, in
+    /// the same file.
+    memo_warn_size: u64 = 2 * 1024,
     /// Serves every gRPC call of the connection, including the GetSystemInfo that `connect`
     /// makes, in Zig instead of over the network. `target_url` must still be a valid URL;
     /// TLS, keep-alive, proxy, DNS load balancing and compression are ignored. Per-call
@@ -471,6 +479,8 @@ const CoreOptions = struct {
             .gzip => c.TemporalCoreClientGrpcCompression_Gzip,
             .none => c.TemporalCoreClientGrpcCompression_None,
         };
+        core.payloads_warn_size = options.payloads_warn_size;
+        core.memo_warn_size = options.memo_warn_size;
     }
 };
 
@@ -767,6 +777,8 @@ test "connection options reach the core's C structs" {
     try testing.expectEqual(@as(u64, 15_000), core.connection.keep_alive_options.*.timeout_millis);
     try testing.expect(core.connection.retry_options == null);
     try testing.expect(core.connection.http_connect_proxy_options == null);
+    try testing.expectEqual(@as(u64, 512 * 1024), core.connection.payloads_warn_size);
+    try testing.expectEqual(@as(u64, 2 * 1024), core.connection.memo_warn_size);
 
     // Custom values, and null keep-alive.
     try core.init(a, .{
@@ -777,7 +789,11 @@ test "connection options reach the core's C structs" {
         .keep_alive = null,
         .retry = .{ .max_elapsed_time_ms = 0, .max_retries = 3 },
         .http_connect_proxy = .{ .target_host = "proxy.corp:3128", .username = "svc", .password = "pw" },
+        .payloads_warn_size = 0,
+        .memo_warn_size = 7,
     });
+    try testing.expectEqual(@as(u64, 0), core.connection.payloads_warn_size);
+    try testing.expectEqual(@as(u64, 7), core.connection.memo_warn_size);
     try testing.expectEqualStrings("wrapper", bytes.slice(core.connection.client_name));
     try testing.expectEqualStrings("9.9.9", bytes.slice(core.connection.client_version));
     try testing.expect(core.connection.keep_alive_options == null);

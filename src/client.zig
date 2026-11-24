@@ -19,6 +19,8 @@ const bridge = @import("bridge.zig");
 const proto = @import("proto.zig");
 const proto_time = @import("proto_time.zig");
 const converter = @import("converter.zig");
+/// For `encodeMessageWithHeaderFields`, which `converter` doesn't re-export.
+const codec_pass = @import("converter/codec.zig");
 const search_attributes = @import("search_attributes.zig");
 const failure_mod = @import("failure.zig");
 const history_mod = @import("history.zig");
@@ -59,7 +61,10 @@ pub const Options = struct {
     /// Payload codecs, such as `converter.ZlibCodec` or encryption, applied in order to every
     /// payload this client sends and in reverse to every payload it receives (results,
     /// failures, memos, history events), and by every worker on this client to its workflow
-    /// and activity payloads. Search attributes are never encoded. A codec that sets
+    /// and activity payloads. Search attributes are never encoded. Header fields are encoded
+    /// only when the propagator that writes them sets
+    /// `propagation.ContextPropagator.encode_fields`; every received header field is decoded,
+    /// so a codec must pass through payloads it didn't encode. A codec that sets
     /// `encodeWithContext` and `decodeWithContext` sees each call's `converter.Context`:
     /// its propagated values and the workflow or activity it is for. Borrowed: the slice and
     /// the codecs must outlive the client and its workers. Called concurrently: workers run
@@ -98,8 +103,9 @@ pub const Options = struct {
     /// carries a header into that header, and every worker on this client reads them back out
     /// for its workflows, activities and the Nexus requests it handles. A workflow's values
     /// travel with the Nexus operations it calls, in one Nexus header
-    /// (`propagation.nexus_header_name`); see `temporal.propagation`. Borrowed: the slice and
-    /// the propagators must outlive the client and its workers.
+    /// (`propagation.nexus_header_name`); see `temporal.propagation`. The fields a propagator
+    /// writes skip `codecs` unless it sets `encode_fields`. Borrowed: the slice and the
+    /// propagators must outlive the client and its workers.
     propagators: []const propagation.ContextPropagator = &.{},
     /// Interceptors of the workflows, activities and Nexus requests of every worker on this
     /// client (the requests a worker handles and the operations a workflow calls), before the
@@ -143,6 +149,19 @@ pub const Options = struct {
     /// replaces it for the calls of a view from `Client.withRpcOptions`. Null keeps sdk-core's
     /// default of 30 s. Must be positive; under 1 ms counts as 1 ms.
     rpc_timeout: ?Duration = null,
+    /// Log a warning when a payload-carrying field of a request this client or its workers
+    /// send is larger than this many bytes: one warning per such field, through `logger`,
+    /// with the field's `size` and this `limit`. The request is still sent. 0 turns the
+    /// warning off. The warning is sdk-core's own log record, so `core_log_level` null (or
+    /// above `.warn`) drops it. It belongs to the connection, so it applies to every client
+    /// sharing it (`Client.forNamespace`, `Client.withRpcOptions`). See README.md's "Payload
+    /// size limits".
+    payloads_warning_size: u64 = default_payloads_warning_size,
+    /// The same as `payloads_warning_size`, for a request's memo. 0 turns the warning off.
+    memo_warning_size: u64 = default_memo_warning_size,
+
+    const default_payloads_warning_size = (bridge.Connection.Options{ .target_url = "", .identity = "" }).payloads_warn_size;
+    const default_memo_warning_size = (bridge.Connection.Options{ .target_url = "", .identity = "" }).memo_warn_size;
 
     pub const KeepAlive = struct {
         /// Time between pings. Must be positive.
@@ -207,6 +226,8 @@ pub const Options = struct {
             .retry = o.retry,
             .client_name = o.client_name,
             .client_version = o.client_version,
+            .payloads_warning_size = o.payloads_warning_size,
+            .memo_warning_size = o.memo_warning_size,
         };
     }
 };
@@ -224,6 +245,8 @@ pub const ConnectionOptions = struct {
     retry: ?Options.Retry = null,
     client_name: []const u8 = bridge.Connection.default_client_name,
     client_version: []const u8 = bridge.Connection.default_client_version,
+    payloads_warning_size: u64 = Options.default_payloads_warning_size,
+    memo_warning_size: u64 = Options.default_memo_warning_size,
 };
 
 /// Why an option was rejected, naming the option and its value, for the caller to log.
@@ -297,6 +320,8 @@ fn bridgeConnectionOptions(url: []const u8, identity: []const u8, options: Conne
         .retry = retry,
         .keep_alive = keep_alive,
         .http_connect_proxy = proxy,
+        .payloads_warn_size = options.payloads_warning_size,
+        .memo_warn_size = options.memo_warning_size,
     };
 }
 
@@ -2498,7 +2523,7 @@ pub const Client = struct {
         const a = arena_state.allocator();
         const request = try c.updateRequest(a, update_name, workflow_id, run_id, args, options);
         var header = try c.outgoingHeader(a, options.context);
-        const response = try c.updateUntilStage(a, request, &header, options.context);
+        const response = try c.updateUntilStage(a, request, &header, &.{}, options.context);
         const ref_run_id = if (response.update_ref) |r| if (r.workflow_execution) |e| e.run_id else "" else "";
         return .init(c, workflow_id, if (ref_run_id.len > 0) ref_run_id else run_id, request.request.?.meta.?.update_id, response.outcome);
     }
@@ -2561,9 +2586,14 @@ pub const Client = struct {
         const id = if (start_options.id.len > 0) start_options.id else try uuid(a, c.io);
 
         var update = try c.updateRequest(a, update_name, id, "", update_args, update_options);
-        update.request.?.input.?.header = try protoHeader(a, try c.outgoingHeader(a, update_options.context));
+        const update_header = try c.outgoingHeader(a, update_options.context);
+        update.request.?.input.?.header = try protoHeader(a, update_header);
         var start = try c.startRequest(a, workflow_type, id, start_options, args);
-        start.header = try protoHeader(a, try c.outgoingHeader(a, start_options.context));
+        const start_header = try c.outgoingHeader(a, start_options.context);
+        start.header = try protoHeader(a, start_header);
+        // One pass codes both operations, so the fields marked in either header are encoded
+        // in both: the same propagators wrote both.
+        const header_fields = try sortedUnion(a, start_header.codec_fields.items, update_header.codec_fields.items);
         const Operation = wfs.ExecuteMultiOperationRequest.Operation;
         var operations: std.ArrayList(Operation) = .empty;
         try operations.appendSlice(a, &.{
@@ -2573,10 +2603,10 @@ pub const Client = struct {
 
         var status: ?RpcStatus = null;
         // Both operations' payloads go through the codecs with the start's values.
-        const response = c.rpcCall(wfs.ExecuteMultiOperationResponse, "ExecuteMultiOperation", wfs.ExecuteMultiOperationRequest{
+        const response = c.rpcCallCoded(wfs.ExecuteMultiOperationResponse, "ExecuteMultiOperation", wfs.ExecuteMultiOperationRequest{
             .namespace = c.namespace,
             .operations = operations,
-        }, a, &status, null, start_options.context) catch |err| switch (err) {
+        }, a, &status, null, start_options.context, header_fields, .decode) catch |err| switch (err) {
             // The call fails with the failing operation's status code, and only the start
             // operation can fail with ALREADY_EXISTS.
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
@@ -2600,7 +2630,7 @@ pub const Client = struct {
         // with the same update ID, which the server deduplicates.
         if (!reachedStage(updated, update_options.wait_for_stage)) {
             update.workflow_execution.?.run_id = started.run_id;
-            updated = try c.updateUntilStage(a, update, null, update_options.context);
+            updated = try c.updateUntilStage(a, update, null, update_header.codec_fields.items, update_options.context);
         }
         return .init(c, id, started.run_id, update.request.?.meta.?.update_id, updated.outcome);
     }
@@ -2656,12 +2686,12 @@ pub const Client = struct {
 
     /// Sends `request` until the update reaches the stage it waits for: the server returns
     /// early, below that stage, when its long poll times out. `header` (null keeps the
-    /// request's own) is sent as the update's header; `values` are the update's propagated
-    /// values, for the codecs.
-    fn updateUntilStage(c: *Client, a: Allocator, request: wfs.UpdateWorkflowExecutionRequest, header: ?*converter.HeaderWriter, values: ?*const propagation.Values) UpdateError!wfs.UpdateWorkflowExecutionResponse {
+    /// request's own, whose fields named in `header_fields` the codecs encode) is sent as the
+    /// update's header; `values` are the update's propagated values, for the codecs.
+    fn updateUntilStage(c: *Client, a: Allocator, request: wfs.UpdateWorkflowExecutionRequest, header: ?*converter.HeaderWriter, header_fields: []const []const u8, values: ?*const propagation.Values) UpdateError!wfs.UpdateWorkflowExecutionResponse {
         const want: UpdateStage = if (request.wait_policy.?.lifecycle_stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED) .accepted else .completed;
         while (true) {
-            const response = c.rpcCall(wfs.UpdateWorkflowExecutionResponse, "UpdateWorkflowExecution", request, a, null, header, values) catch |err| switch (err) {
+            const response = c.rpcCallCoded(wfs.UpdateWorkflowExecutionResponse, "UpdateWorkflowExecution", request, a, null, header, values, header_fields, .decode) catch |err| switch (err) {
                 error.AlreadyExists => return error.InvalidResponse,
                 else => |e| return e,
             };
@@ -2679,6 +2709,32 @@ pub const Client = struct {
         var w: converter.HeaderWriter = .init(a);
         try propagation.injectAll(c.propagators, a, context orelse &propagation.Values.empty, &w);
         return w;
+    }
+
+    /// The names in the sorted lists `x` and `y`, sorted and each once. Allocated from `a`.
+    fn sortedUnion(a: Allocator, x: []const []const u8, y: []const []const u8) error{OutOfMemory}![]const []const u8 {
+        var out: std.ArrayList([]const u8) = try .initCapacity(a, x.len + y.len);
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < x.len or j < y.len) {
+            const order: std.math.Order = if (i == x.len) .gt else if (j == y.len) .lt else std.mem.order(u8, x[i], y[j]);
+            switch (order) {
+                .lt => {
+                    out.appendAssumeCapacity(x[i]);
+                    i += 1;
+                },
+                .gt => {
+                    out.appendAssumeCapacity(y[j]);
+                    j += 1;
+                },
+                .eq => {
+                    out.appendAssumeCapacity(x[i]);
+                    i += 1;
+                    j += 1;
+                },
+            }
+        }
+        return out.items;
     }
 
     /// `w`'s fields as a request header, or null when there are none. Allocated from `a`.
@@ -2712,7 +2768,7 @@ pub const Client = struct {
     /// not decoded by the codecs, so a payload they can't decode doesn't fail the call. The
     /// request is still encoded and the call still goes through the interceptors.
     fn rpcUndecoded(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator) RpcError!Response {
-        return c.rpcCallCoded(Response, method, request, arena, null, null, null, .skip);
+        return c.rpcCallCoded(Response, method, request, arena, null, null, null, &.{}, .skip);
     }
 
     /// Passes the call through the client's interceptors, which end in `send`. `header`, for
@@ -2720,11 +2776,14 @@ pub const Client = struct {
     /// `values` are the call's propagated values (its `.context`), which `send` hands the
     /// codecs.
     fn rpcCall(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter, values: ?*const propagation.Values) RpcError!Response {
-        return c.rpcCallCoded(Response, method, request, arena, status, header, values, .decode);
+        return c.rpcCallCoded(Response, method, request, arena, status, header, values, &.{}, .decode);
     }
 
-    /// `rpcCall`, with `response_codecs` saying whether `send` decodes the response.
-    fn rpcCallCoded(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter, values: ?*const propagation.Values, response_codecs: ResponseCodecs) RpcError!Response {
+    /// `rpcCall`, with `response_codecs` saying whether `send` decodes the response. The
+    /// codecs encode the header fields the header writer at the end of the interceptor chain
+    /// marks (`converter.HeaderWriter.codec_fields`), or with no writer there, those named in
+    /// `header_fields` (sorted), for a request whose headers were built without the chain.
+    fn rpcCallCoded(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter, values: ?*const propagation.Values, header_fields: []const []const u8, response_codecs: ResponseCodecs) RpcError!Response {
         const Request = @TypeOf(request);
         var req = request;
         var resp: Response = .{};
@@ -2741,6 +2800,7 @@ pub const Client = struct {
             client: *Client,
             status: ?*?RpcStatus,
             values: ?*const propagation.Values,
+            header_fields: []const []const u8,
             response_codecs: ResponseCodecs,
 
             const vtable: interceptor.Client.VTable = .{ .call = end };
@@ -2748,11 +2808,15 @@ pub const Client = struct {
             fn end(ptr: *anyopaque, input: *interceptor.ClientCall, _: interceptor.Client.Next) RpcError!void {
                 const e: *@This() = @ptrCast(@alignCast(ptr));
                 const r = input.request(Request).?;
-                if (comptime carriesHeader(Request)) if (input.header) |w| setHeader(Request, r, try protoHeader(input.arena, w.*));
-                input.response(Response).?.* = try e.client.send(Response, method, r.*, input.arena, e.status, e.values, e.response_codecs);
+                var marked = e.header_fields;
+                if (comptime carriesHeader(Request)) if (input.header) |w| {
+                    setHeader(Request, r, try protoHeader(input.arena, w.*));
+                    marked = w.codec_fields.items;
+                };
+                input.response(Response).?.* = try e.client.send(Response, method, r.*, input.arena, e.status, e.values, marked, e.response_codecs);
             }
         };
-        var end: End = .{ .client = c, .status = status, .values = values, .response_codecs = response_codecs };
+        var end: End = .{ .client = c, .status = status, .values = values, .header_fields = header_fields, .response_codecs = response_codecs };
         const next: interceptor.Client.Next = .{ .chain = c.interceptors, .root = .{ .ptr = &end, .vtable = &End.vtable } };
         try next.call(&call);
         return resp;
@@ -2861,14 +2925,15 @@ pub const Client = struct {
     /// caller to report instead of being logged; ALREADY_EXISTS still returns
     /// `error.AlreadyExists`. The codecs encode the
     /// request and decode the response with `values` and the workflow or activity the request
-    /// names. A request with a string field that is not valid UTF-8, as coded, is not sent:
+    /// names; of the request's header fields they encode only those named in `header_fields`
+    /// (sorted). A request with a string field that is not valid UTF-8, as coded, is not sent:
     /// it fails as a server's INVALID_ARGUMENT (status 3) naming the field would. With
     /// `response_codecs` `.skip`, the response's payloads and failure attributes are left
     /// as the server sent them.
-    fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values, response_codecs: ResponseCodecs) RpcError!Response {
+    fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values, header_fields: []const []const u8, response_codecs: ResponseCodecs) RpcError!Response {
         var codec_context: converter.Context = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
         requestIdentity(@TypeOf(request), &request, &codec_context);
-        return c.sendInContext(Response, method, request, arena, status, &codec_context, response_codecs);
+        return c.sendInContext(Response, method, request, arena, status, &codec_context, header_fields, response_codecs);
     }
 
     /// For `worker.Worker`: records a heartbeat of the activity attempt `task_token` with
@@ -2883,13 +2948,13 @@ pub const Client = struct {
             try payloads.payloads.appendSlice(arena, details);
             request.details = payloads;
         }
-        return c.sendInContext(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", request, arena, null, context, .decode);
+        return c.sendInContext(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", request, arena, null, context, &.{}, .decode);
     }
 
-    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.Context, response_codecs: ResponseCodecs) RpcError!Response {
+    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.Context, header_fields: []const []const u8, response_codecs: ResponseCodecs) RpcError!Response {
         var coded = request;
         if (c.encode_failure_attributes) try failure_mod.encodeAttributes(@TypeOf(coded), &coded, arena);
-        converter.encodeMessage(@TypeOf(coded), &coded, c.codecs, arena, c.io, codec_context) catch |err| {
+        codec_pass.encodeMessageWithHeaderFields(@TypeOf(coded), &coded, c.codecs, arena, c.io, codec_context, header_fields) catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: encoding its payloads with the client's codecs failed", .{method});
             return err;
         };
@@ -4426,12 +4491,36 @@ pub const ScheduleHandle = struct {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
-        var description = try h.describe(a);
+        // The response is decoded here rather than by the call, so the start action's header
+        // can go back as the server stored it: decoding gives every header field to the
+        // codecs, and encoding gives them none, so a field encoded when the schedule was
+        // created would otherwise be stored decoded.
+        var response = c.rpcUndecoded(wfs.DescribeScheduleResponse, "DescribeSchedule", wfs.DescribeScheduleRequest{
+            .namespace = c.namespace,
+            .schedule_id = h.id,
+        }, a) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+        const stored_header = startHeader(response.schedule);
+        converter.decodeMessage(wfs.DescribeScheduleResponse, &response, c.codecs, a, c.io, &.{ .namespace = c.namespace }) catch |err| {
+            if (err == error.CodecFailed) log.warn("DescribeSchedule failed: decoding the response's payloads with the client's codecs failed", .{});
+            return err;
+        };
+        try failure_mod.decodeAttributes(wfs.DescribeScheduleResponse, &response, a);
+        // A copy of each decoded field, serialized before the callback runs, so a change it
+        // makes in place still shows.
+        const described = try StoredHeader.snapshot(a, stored_header, startHeader(response.schedule));
+        var description = try schedule.Description.fromProto(a, h.id, response);
         const changes: schedule.Update = (try f(context, a, &description)) orelse return;
+        var sent = try changes.schedule.toProto(a, description.raw.schedule);
+        if (sent.action) |*action| if (action.start_workflow) |*sw| {
+            if (sw.header) |hd| sw.header = try described.restore(a, hd);
+        };
         _ = c.rpc(wfs.UpdateScheduleResponse, "UpdateSchedule", wfs.UpdateScheduleRequest{
             .namespace = c.namespace,
             .schedule_id = h.id,
-            .schedule = try changes.schedule.toProto(a, description.raw.schedule),
+            .schedule = sent,
             .conflict_token = description.raw.conflict_token,
             .identity = c.identity,
             .request_id = try uuid(a, c.io),
@@ -4440,6 +4529,62 @@ pub const ScheduleHandle = struct {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
         };
+    }
+
+    /// A schedule's start action header as the server stored it, beside its fields as
+    /// described (decoded), for `update` to send each field the callback left unchanged back
+    /// as stored. Decoding encoded fields and sending them back decoded would store them in
+    /// the clear, since header fields skip the codecs on the way out.
+    const StoredHeader = struct {
+        /// The stored entries, in the order the decoded ones have (decoding keeps it).
+        stored: []const proto.temporal.api.common.v1.Header.FieldsEntry = &.{},
+        /// Each decoded entry's key and value, serialized, copied before the callback runs.
+        described: []const struct { key: []const u8, value: ?[]const u8 } = &.{},
+
+        const Entry = proto.temporal.api.common.v1.Header.FieldsEntry;
+
+        fn snapshot(a: Allocator, stored: ?proto.temporal.api.common.v1.Header, decoded: ?proto.temporal.api.common.v1.Header) error{OutOfMemory}!StoredHeader {
+            const s = stored orelse return .{};
+            const d = decoded orelse return .{};
+            if (s.fields.items.len != d.fields.items.len) return .{};
+            const described = try a.alloc(@typeInfo(@FieldType(StoredHeader, "described")).pointer.child, d.fields.items.len);
+            for (d.fields.items, described) |e, *o| o.* = .{ .key = try a.dupe(u8, e.key), .value = if (e.value) |v| try serialized(a, v) else null };
+            return .{ .stored = s.fields.items, .described = described };
+        }
+
+        /// `header` with each entry whose key and value are as described replaced by the
+        /// stored entry; every other entry (changed, added) as the callback left it. A new
+        /// list from `a`; `header`'s own is not changed.
+        fn restore(h: StoredHeader, a: Allocator, header: proto.temporal.api.common.v1.Header) error{OutOfMemory}!proto.temporal.api.common.v1.Header {
+            if (h.described.len == 0) return header;
+            var out: std.ArrayList(Entry) = try .initCapacity(a, header.fields.items.len);
+            for (header.fields.items) |e| out.appendAssumeCapacity(try h.restoreEntry(a, e));
+            var copy = header;
+            copy.fields = out;
+            return copy;
+        }
+
+        fn restoreEntry(h: StoredHeader, a: Allocator, e: Entry) error{OutOfMemory}!Entry {
+            const value = e.value orelse return e;
+            const bytes = try serialized(a, value);
+            for (h.described, h.stored) |d, s| {
+                const dv = d.value orelse continue;
+                if (std.mem.eql(u8, d.key, e.key) and std.mem.eql(u8, s.key, e.key) and std.mem.eql(u8, dv, bytes)) return s;
+            }
+            return e;
+        }
+
+        fn serialized(a: Allocator, p: converter.Payload) error{OutOfMemory}![]const u8 {
+            var out: Io.Writer.Allocating = .init(a);
+            p.encode(&out.writer, a) catch return error.OutOfMemory;
+            return out.written();
+        }
+    };
+
+    /// The header of a schedule's workflow start action, or null.
+    fn startHeader(s: ?proto.temporal.api.schedule.v1.Schedule) ?proto.temporal.api.common.v1.Header {
+        const action = (s orelse return null).action orelse return null;
+        return (action.start_workflow orelse return null).header;
     }
 
     fn CallbackError(comptime f: anytype) type {
@@ -6199,6 +6344,8 @@ test "default options send what the client always sent" {
         try testing.expect(b.retry == null);
         try testing.expect(b.http_connect_proxy == null);
         try testing.expect(b.tls == null);
+        try testing.expectEqual(@as(u64, 512 * 1024), b.payloads_warn_size);
+        try testing.expectEqual(@as(u64, 2 * 1024), b.memo_warn_size);
         try testing.expectEqual(@as(u64, 60_000), try heartbeatIntervalMs(o.worker_heartbeat_interval, &rejection));
         try testing.expectEqual(@as(u32, 0), try rpcTimeoutMs(o.rpc_timeout, &rejection));
     }
@@ -6212,8 +6359,12 @@ test "custom connection options map to the bridge, through connectionOptions too
         .retry = .{ .max_retries = 3, .max_elapsed_time = .zero, .initial_interval = .fromMicroseconds(10) },
         .client_name = "wrapper",
         .client_version = "1.2.3 beta",
+        .payloads_warning_size = 0,
+        .memo_warning_size = 100,
     };
     const b = try bridgeConnectionOptions("http://h:1", "id", o.connectionOptions(), null, &rejection);
+    try testing.expectEqual(@as(u64, 0), b.payloads_warn_size);
+    try testing.expectEqual(@as(u64, 100), b.memo_warn_size);
     try testing.expectEqual(@as(u64, 10_000), b.keep_alive.?.interval_ms);
     try testing.expectEqual(@as(u64, 15_000), b.keep_alive.?.timeout_ms);
     try testing.expectEqualStrings("proxy.corp:3128", b.http_connect_proxy.?.target_host);
@@ -6235,6 +6386,9 @@ test "custom connection options map to the bridge, through connectionOptions too
 
     const off = try bridgeConnectionOptions("http://h:1", "id", .{ .keep_alive = null }, null, &rejection);
     try testing.expect(off.keep_alive == null);
+    // A ConnectionOptions that leaves the warning sizes out gets the defaults.
+    try testing.expectEqual(@as(u64, 512 * 1024), off.payloads_warn_size);
+    try testing.expectEqual(@as(u64, 2 * 1024), off.memo_warn_size);
 
     try testing.expectEqual(@as(u64, 0), try heartbeatIntervalMs(.zero, &rejection));
     try testing.expectEqual(@as(u64, 15_000), try heartbeatIntervalMs(.fromSeconds(15), &rejection));
@@ -7218,4 +7372,61 @@ test "loadOptions copies TEMPORAL_GRPC_META_<NAME> values from an env map into t
         if (std.mem.eql(u8, h.key, "tenant")) try testing.expectEqualStrings("blue", h.value);
         if (std.mem.eql(u8, h.key, "trace-bin")) try testing.expectEqualStrings("\x00\xff", h.value);
     }
+}
+
+test "a schedule update sends each start header field the callback left as described as stored, and every other as the callback left it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Header = proto.temporal.api.common.v1.Header;
+    const pl = struct {
+        fn of(al: Allocator, text: []const u8) !converter.Payload {
+            return converter.toPayload(al, text);
+        }
+    };
+    // As stored: "secret" encoded (here, by another encoding), "tenant" plain, "dup" twice.
+    var stored: Header = .{};
+    try stored.fields.append(a, .{ .key = "secret", .value = try converter.payloadWithEncoding(a, "test/wrapped", "xyz") });
+    try stored.fields.append(a, .{ .key = "tenant", .value = try pl.of(a, "acme") });
+    try stored.fields.append(a, .{ .key = "dup", .value = try pl.of(a, "one") });
+    try stored.fields.append(a, .{ .key = "dup", .value = try pl.of(a, "two") });
+    try stored.fields.append(a, .{ .key = "empty" });
+    // As described: decoded, in the same order.
+    var decoded: Header = .{};
+    try decoded.fields.append(a, .{ .key = "secret", .value = try pl.of(a, "s3cr3t") });
+    for (stored.fields.items[1..]) |e| try decoded.fields.append(a, e);
+    const h = try ScheduleHandle.StoredHeader.snapshot(a, stored, decoded);
+
+    // Unchanged: every field as stored.
+    const same = try h.restore(a, decoded);
+    try testing.expectEqualStrings("test/wrapped", converter.encodingOf(same.fields.items[0].value.?).?);
+    try testing.expectEqualStrings("\"two\"", same.fields.items[3].value.?.data);
+    try testing.expectEqual(@as(?converter.Payload, null), same.fields.items[4].value);
+    // The list restore was given is not changed.
+    try testing.expectEqualStrings("\"s3cr3t\"", decoded.fields.items[0].value.?.data);
+
+    // Changed in place: a value set, bytes mutated, a key renamed, a field removed and one
+    // added. Each is sent as the callback left it; the untouched ones still as stored.
+    var edited: Header = .{};
+    for (decoded.fields.items) |e| try edited.fields.append(a, .{ .key = e.key, .value = if (e.value) |v| try v.dupe(a) else null });
+    edited.fields.items[0].value = try pl.of(a, "new secret");
+    const tenant_data = try a.dupe(u8, edited.fields.items[1].value.?.data);
+    tenant_data[1] = 'A';
+    edited.fields.items[1].value.?.data = tenant_data;
+    edited.fields.items[2].key = "renamed";
+    _ = edited.fields.orderedRemove(4);
+    try edited.fields.append(a, .{ .key = "added", .value = try pl.of(a, "plain") });
+    const out = try h.restore(a, edited);
+    try testing.expectEqual(@as(usize, 5), out.fields.items.len);
+    try testing.expectEqualStrings("\"new secret\"", out.fields.items[0].value.?.data);
+    try testing.expectEqualStrings("\"Acme\"", out.fields.items[1].value.?.data);
+    try testing.expectEqualStrings("renamed", out.fields.items[2].key);
+    try testing.expectEqualStrings("\"two\"", out.fields.items[3].value.?.data);
+    try testing.expectEqualStrings("added", out.fields.items[4].key);
+
+    // A schedule without a stored header, or with no codecs (decoded is stored), changes nothing.
+    const none = try ScheduleHandle.StoredHeader.snapshot(a, null, null);
+    try testing.expectEqual(edited.fields.items.ptr, (try none.restore(a, edited)).fields.items.ptr);
+    const plain = try ScheduleHandle.StoredHeader.snapshot(a, stored, stored);
+    try testing.expectEqualStrings("test/wrapped", converter.encodingOf((try plain.restore(a, stored)).fields.items[0].value.?).?);
 }

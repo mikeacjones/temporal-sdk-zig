@@ -81,9 +81,9 @@
 //!
 //! Payload codecs on the workflow's worker get the run's context for its whole activation
 //! and completion, except an activity's, local activity's or child's payloads: the schedule
-//! or start command (arguments, header, memo, summary) and the resolutions (result and
-//! failure) get the same context as that call's hooks, with the scheduled activity type and
-//! ID, or the child's workflow ID and type. So the activity's worker and the child's own
+//! or start command (arguments, header fields marked for the codecs, memo, summary) and the
+//! resolutions (result and failure) get the same context as that call's hooks, with the
+//! scheduled activity type and ID, or the child's workflow ID and type. So the activity's worker and the child's own
 //! worker decode with the context the workflow's worker encoded with, and the reverse.
 //! Signals to other workflows, children included, keep the run's context for codecs. A side
 //! effect's value is the run's own although an internal local activity records it: codecs
@@ -767,23 +767,48 @@ pub const Header = struct {
 };
 
 /// Builds a `Header`: fields stay sorted by name, and putting a name again replaces its
-/// value. Names and payloads are borrowed; the list and encoded values come from `arena`.
+/// value. Names and payloads are borrowed; the lists and encoded values come from `arena`.
 /// Not thread-safe.
+///
+/// Each field also carries a mark saying whether the client's payload codecs encode it when
+/// the header is sent (`encodes`). A write marks the field when `encode_fields` is true and
+/// clears its mark when it is false, so the last writer of a field decides.
+/// `propagation.injectAll` sets `encode_fields` for each propagator from its
+/// `ContextPropagator.encode_fields`; it is false while interceptors and other code write, so
+/// their fields are sent as written.
 pub const HeaderWriter = struct {
     arena: Allocator,
     fields: std.ArrayList(Field) = .empty,
+    /// The names, sorted, of the fields in `fields` that the payload codecs encode when the
+    /// header is sent. Kept by `put`, `set`, `merge` and `remove`; don't edit it directly.
+    codec_fields: std.ArrayList([]const u8) = .empty,
+    /// Whether `put`, `set` and `merge` mark what they write for the codecs. A write while it
+    /// is false clears the field's mark. `propagation.injectAll` sets it for each propagator;
+    /// it is false while interceptors and other code write.
+    encode_fields: bool = false,
 
     pub fn init(arena: Allocator) HeaderWriter {
         return .{ .arena = arena };
     }
 
-    /// Sets the field `name` to `payload`.
+    /// Sets the field `name` to `payload`, marked for the codecs as `encode_fields` says.
     pub fn put(w: *HeaderWriter, name: []const u8, payload: Payload) error{OutOfMemory}!void {
         const i = std.sort.lowerBound(Field, w.fields.items, name, fieldOrder);
-        if (i < w.fields.items.len and std.mem.eql(u8, w.fields.items[i].name, name)) {
+        const exists = i < w.fields.items.len and std.mem.eql(u8, w.fields.items[i].name, name);
+        const m = std.sort.lowerBound([]const u8, w.codec_fields.items, name, nameOrder);
+        const marked = m < w.codec_fields.items.len and std.mem.eql(u8, w.codec_fields.items[m], name);
+        // Both lists are grown before either changes, so a failure leaves them as they were.
+        if (!exists) try w.fields.ensureUnusedCapacity(w.arena, 1);
+        if (w.encode_fields and !marked) try w.codec_fields.ensureUnusedCapacity(w.arena, 1);
+        if (exists) {
             w.fields.items[i].value = payload;
         } else {
-            try w.fields.insert(w.arena, i, .{ .name = name, .value = payload });
+            w.fields.insertAssumeCapacity(i, .{ .name = name, .value = payload });
+        }
+        if (w.encode_fields and !marked) {
+            w.codec_fields.insertAssumeCapacity(m, name);
+        } else if (!w.encode_fields and marked) {
+            _ = w.codec_fields.orderedRemove(m);
         }
     }
 
@@ -797,14 +822,20 @@ pub const HeaderWriter = struct {
         for (h.fields) |f| try w.put(f.name, f.value);
     }
 
-    /// Removes the field `name`, if present.
+    /// Removes the field `name`, and its mark, if present.
     pub fn remove(w: *HeaderWriter, name: []const u8) void {
+        if (std.sort.binarySearch([]const u8, w.codec_fields.items, name, nameOrder)) |m| _ = w.codec_fields.orderedRemove(m);
         const i = std.sort.binarySearch(Field, w.fields.items, name, fieldOrder) orelse return;
         _ = w.fields.orderedRemove(i);
     }
 
+    /// Whether the field `name` is marked for the codecs.
+    pub fn encodes(w: *const HeaderWriter, name: []const u8) bool {
+        return std.sort.binarySearch([]const u8, w.codec_fields.items, name, nameOrder) != null;
+    }
+
     /// The fields written so far; a later write leaves the view's slice as it is only until
-    /// the writer reallocates.
+    /// the writer reallocates. The view carries no marks.
     pub fn header(w: *const HeaderWriter) Header {
         return .{ .fields = w.fields.items };
     }
@@ -812,6 +843,10 @@ pub const HeaderWriter = struct {
 
 fn fieldOrder(name: []const u8, f: Field) std.math.Order {
     return std.mem.order(u8, name, f.name);
+}
+
+fn nameOrder(name: []const u8, other: []const u8) std.math.Order {
+    return std.mem.order(u8, name, other);
 }
 
 /// Turns the entries of a proto map of payloads, such as `Memo.fields` or
@@ -1390,6 +1425,71 @@ test "a header writes sorted fields that survive the wire and decode by name" {
     try testing.expectEqual(@as(?Payload, null), h.get("gone"));
     try testing.expectError(error.InvalidPayload, h.value(u32, a, "tenant"));
     try testing.expectEqualStrings("attempt", h.fields[0].name);
+}
+
+test "a header writer marks the fields written while encode_fields is set, and the last writer decides" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var w: HeaderWriter = .init(a);
+    try w.set("plain", @as(u32, 1));
+    w.encode_fields = true;
+    try w.set("trace", @as([]const u8, "t"));
+    try w.set("baggage", @as([]const u8, "b"));
+    try w.set("zone", @as([]const u8, "z"));
+    try testing.expect(!w.encodes("plain"));
+    try testing.expect(w.encodes("trace"));
+    try testing.expect(!w.encodes("missing"));
+    try testing.expectEqual(@as(usize, 3), w.codec_fields.items.len);
+    try testing.expectEqualStrings("baggage", w.codec_fields.items[0]);
+    try testing.expectEqualStrings("zone", w.codec_fields.items[2]);
+
+    // Writing a marked field again unmarked clears its mark, and the other way round; the
+    // field keeps one entry either way.
+    w.encode_fields = false;
+    try w.set("trace", @as([]const u8, "t2"));
+    try testing.expect(!w.encodes("trace"));
+    w.encode_fields = true;
+    try w.set("plain", @as(u32, 2));
+    try w.set("plain", @as(u32, 3));
+    try testing.expect(w.encodes("plain"));
+    try testing.expectEqual(@as(usize, 4), w.header().fields.len);
+    try testing.expectEqual(@as(usize, 3), w.codec_fields.items.len);
+
+    // `merge` follows the mode; `remove` drops the mark with the field.
+    w.encode_fields = false;
+    var other: HeaderWriter = .init(a);
+    try other.set("zone", @as([]const u8, "z2"));
+    try w.merge(other.header());
+    try testing.expect(!w.encodes("zone"));
+    w.remove("baggage");
+    try testing.expect(!w.encodes("baggage"));
+    try testing.expectEqual(@as(?Payload, null), w.header().get("baggage"));
+    w.remove("missing");
+    try testing.expectEqual(@as(usize, 1), w.codec_fields.items.len);
+    try testing.expectEqualStrings("plain", w.codec_fields.items[0]);
+}
+
+test "a header writer whose put runs out of memory leaves its fields and marks as they were" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    for (0..4) |fail_index| {
+        var failing: std.testing.FailingAllocator = .init(arena.allocator(), .{ .fail_index = fail_index });
+        var w: HeaderWriter = .init(failing.allocator());
+        w.encode_fields = true;
+        var written: usize = 0;
+        for ([_][]const u8{ "b", "a", "c", "d" }) |name| {
+            w.put(name, .{ .data = name }) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                continue;
+            };
+            written += 1;
+        }
+        try testing.expectEqual(written, w.fields.items.len);
+        try testing.expectEqual(written, w.codec_fields.items.len);
+        for (w.fields.items, w.codec_fields.items) |f, name| try testing.expectEqualStrings(f.name, name);
+    }
 }
 
 test "EncodedValues decodes arguments one at a time or as a tuple" {
