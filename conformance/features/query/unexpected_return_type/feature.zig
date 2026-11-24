@@ -5,7 +5,6 @@
 //! another type. The run-time case that stands in for it is a query sent by name
 //! (`Client.queryWorkflowByName`), whose `converter.EncodedValue` answer is decoded as
 //! `i64` and must fail, as Go's `q.Get(&intResult)` does.
-const std = @import("std");
 const temporal = @import("temporal");
 const harness = @import("harness");
 const workflow = temporal.workflow;

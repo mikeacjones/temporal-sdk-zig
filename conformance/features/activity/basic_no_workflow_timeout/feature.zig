@@ -1,7 +1,6 @@
 //! A workflow started without an execution timeout runs an activity with only a
 //! start-to-close timeout and then one with only a schedule-to-close timeout. The server
 //! would otherwise fill the unset activity timeouts from the workflow's.
-const std = @import("std");
 const temporal = @import("temporal");
 const harness = @import("harness");
 

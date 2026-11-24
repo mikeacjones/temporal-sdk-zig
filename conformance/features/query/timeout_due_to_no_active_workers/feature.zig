@@ -11,7 +11,6 @@ const std = @import("std");
 const temporal = @import("temporal");
 const harness = @import("harness");
 
-const Io = std.Io;
 const gap_bead = "temporal-sdk-zig-ad0";
 const workflow = temporal.workflow;
 

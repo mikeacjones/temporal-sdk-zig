@@ -2,7 +2,6 @@
 //! its result and describes it as completed. The suite's config says `noWorkflow`, so the
 //! feature declares only the activity, and it runs on a dev server of its own with
 //! standalone activities turned on.
-const std = @import("std");
 const temporal = @import("temporal");
 const harness = @import("harness");
 
