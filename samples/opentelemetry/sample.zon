@@ -1,0 +1,16 @@
+// How samples-test validates this sample: start an OTLP collector, then the worker, run the
+// starter, and check that the starter's output contains each `expect` line before
+// `timeout_seconds`. Both programs export their spans to the collector, which must then
+// hold the trace from the starter's span to the activity's own span, each under its parent.
+.{
+    .expect = .{"Workflow completed."},
+    .tests = .{"workflow_test.zig"},
+    .opentelemetry = true,
+    .otlp_spans = .{
+        .{ .name = "StartWorkflow:Workflow" },
+        .{ .name = "RunWorkflow:Workflow", .parent = "StartWorkflow:Workflow" },
+        .{ .name = "StartActivity:Activity", .parent = "RunWorkflow:Workflow" },
+        .{ .name = "RunActivity:Activity", .parent = "StartActivity:Activity" },
+        .{ .name = "custom-span", .parent = "RunActivity:Activity" },
+    },
+}

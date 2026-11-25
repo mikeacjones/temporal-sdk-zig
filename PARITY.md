@@ -189,7 +189,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Nexus interceptors | Go, Java, Python, TypeScript, .NET | GA | supported | [Interceptors](README.md#interceptors) |
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
 | Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation), [nexus-context-propagation](samples/nexus-context-propagation) |
-| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing) |
+| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing), [opentelemetry](samples/opentelemetry) |
 
 ### Nexus
 
@@ -247,7 +247,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | codec-server | [codec-server](samples/codec-server) | ported |
 | cron | [cron](samples/cron) | ported |
 | ctxpropagation | [ctxpropagation](samples/ctxpropagation) | ported |
-| datadog | | planned: `temporal-sdk-zig-d51.16.78` |
+| datadog | [datadog](samples/datadog) | ported |
 | dsl | [dsl](samples/dsl) | ported |
 | dynamic | [dynamic](samples/dynamic) | ported |
 | dynamic-workflows | [dynamic-workflows](samples/dynamic-workflows) | ported |
@@ -265,7 +265,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | goroutine | [io-group](samples/io-group) | ported |
 | greetings | [greetings](samples/greetings) | ported |
 | greetingslocal | [greetingslocal](samples/greetingslocal) | ported |
-| grpc-proxy | | planned: `temporal-sdk-zig-d51.16.81` |
+| grpc-proxy | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
 | helloworld | [helloworld](samples/helloworld) | ported |
 | helloworld-apiKey | [helloworld-apiKey](samples/helloworld-apiKey) | ported |
 | helloworldmtls | [helloworldmtls](samples/helloworldmtls) | ported |
@@ -284,7 +284,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | nexus-serialization-context | | planned: `temporal-sdk-zig-d51.16.107` |
 | nexus-standalone-activity | | planned: `temporal-sdk-zig-d51.16.70` |
 | nexus-standalone-operations | | planned: `temporal-sdk-zig-d51.16.71` |
-| opentelemetry | | planned: `temporal-sdk-zig-d51.16.76` |
+| opentelemetry | [opentelemetry](samples/opentelemetry) | ported |
 | opentelemetry-v2 | | planned: `temporal-sdk-zig-d51.16.77` |
 | pickfirst | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
 | polling | [polling](samples/polling) | ported |
@@ -310,7 +310,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | standalone-activity | [standalone-activity](samples/standalone-activity) | ported |
 | start-delay | [start-delay](samples/start-delay) | ported |
 | synchronous-proxy | [synchronous-proxy](samples/synchronous-proxy) | ported |
-| temporal-fixtures | | planned: `temporal-sdk-zig-d51.16.82` |
+| temporal-fixtures | [temporal-fixtures](samples/temporal-fixtures) | ported |
 | timer | [timer](samples/timer) | ported |
 | typed-searchattributes | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
 | updatabletimer | [updatabletimer](samples/updatabletimer) | ported |
@@ -327,5 +327,6 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 |-------------------|--------|
 | dynamicconfig | A server configuration file, not a sample. |
 | googleadk | Runs Google's Go ADK agent library; there is no Zig ADK. |
+| grpc-proxy | Its proxy must serve gRPC, which needs an HTTP/2 server; Zig's standard library has none and the Rust core provides only the client side of the connection. [codec-server](samples/codec-server) shows payload encoding kept outside the worker. Revisit when a Zig gRPC server exists. |
 | pickfirst | Exercises grpc-go's pick_first load-balancing policy; the Rust core owns the gRPC connection. Revisit if the core exposes load-balancing options. |
 | typed-searchattributes | Holds only a pointer to searchattributes, whose Zig sample covers typed search attributes. |

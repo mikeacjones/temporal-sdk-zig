@@ -1,0 +1,31 @@
+// How samples-test validates this sample: start the worker, run the starter with `--wait`,
+// and check that the starter's output contains each `expect` line before `timeout_seconds`.
+// With `--wait` the starter waits until every fixture workflow has the status it is for and
+// prints it; the workflows left running are stopped with the worker.
+.{
+    .expect = .{
+        "rainbow-statuses Running status=running",
+        "rainbow-statuses Completed status=completed",
+        "rainbow-statuses Failed status=failed",
+        "rainbow-statuses Canceled status=canceled",
+        "rainbow-statuses Terminated status=terminated",
+        "rainbow-statuses ContinuedAsNew status=continued_as_new",
+        "rainbow-statuses TimedOut status=timed_out",
+        "large-event-history status=failed",
+        "largepayload 5 status=completed",
+        "openNclosed 5 status=running",
+        "stuck-workflows stuck_activity status=running",
+        "stuck-workflows no_worker status=running",
+        "namespaces registered=20",
+    },
+    .starter_args = .{"--wait"},
+    .timeout_seconds = 180,
+    .tests = .{
+        "rainbow_statuses_test.zig",
+        "large_event_history_test.zig",
+        "largepayload_test.zig",
+        "open_n_closed_test.zig",
+        "stuck_workflows_test.zig",
+        "rainbow_statuses_replay_test.zig",
+    },
+}

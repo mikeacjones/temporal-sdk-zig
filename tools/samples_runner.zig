@@ -21,7 +21,13 @@
 //! with every namespace the selected samples declare, and then creates the Nexus endpoints
 //! they declare (see `Manifest.namespaces` and `Manifest.nexus_endpoints`).
 //!
-//! Usage: samples_runner <build-root> <work-dir> [--only <sample>] [--jobs <n>] (<sample>:<program> <exe>)...
+//! A sample whose sample.zon declares `otlp_spans` gets an OTLP collector of its own,
+//! tools/fixtures/otlp_collector.zig (passed as `--otlp-collector`), started before its worker;
+//! the worker and the starter get its address in OTEL_EXPORTER_OTLP_ENDPOINT. Once both have
+//! exited, the spans the collector received must include the declared ones, each under its
+//! declared parent (see `checkSpans`). No OTEL_* setting of the caller reaches a sample.
+//!
+//! Usage: samples_runner <build-root> <work-dir> [--only <sample>] [--jobs <n>] [--otlp-collector <exe>] (<sample>:<program> <exe>)...
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -55,6 +61,21 @@ const Manifest = struct {
     /// Several samples may declare an endpoint of the same name only with the same target. A
     /// sample with `docker_server` can't declare any.
     nexus_endpoints: []const NexusEndpoint = &.{},
+    /// Read by build.zig: the sample's programs and tests import `temporal_opentelemetry`
+    /// (contrib/opentelemetry) and `opentelemetry-sdk`, the sample keeps programs of its own
+    /// (it is not in samples/dispatch.zig), and it is built only in a root checkout.
+    opentelemetry: bool = false,
+    /// Spans an OTLP collector of the sample's own must have received by the time the starter
+    /// and the worker have exited. Not empty: the runner starts the collector before the worker
+    /// and gives both programs OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:<port>.
+    otlp_spans: []const ExpectedSpan = &.{},
+};
+
+/// One span the collector must have received.
+const ExpectedSpan = struct {
+    name: []const u8,
+    /// The name of the span that must be its parent, in the same trace. Null: a root span.
+    parent: ?[]const u8 = null,
 };
 
 /// A Nexus endpoint that routes operations to the worker polling `task_queue` in `namespace`,
@@ -119,6 +140,7 @@ pub fn main(init: std.process.Init) !void {
     const work_path = args.next() orelse return usage();
     var only: ?[]const u8 = null;
     var jobs: usize = 4;
+    var otlp_collector: ?[]const u8 = null;
     var samples: std.ArrayList(Sample) = .empty;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--only")) {
@@ -129,6 +151,10 @@ pub fn main(init: std.process.Init) !void {
             const text = args.next() orelse return usage();
             jobs = std.fmt.parseInt(usize, text, 10) catch return usage();
             if (jobs == 0) return usage();
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--otlp-collector")) {
+            otlp_collector = args.next() orelse return usage();
             continue;
         }
         const exe = args.next() orelse return usage();
@@ -173,6 +199,8 @@ pub fn main(init: std.process.Init) !void {
         const m = sample.manifest orelse continue;
         if (m.docker_server != null) needs_docker = true;
         sample.setup_failure = checkManifest(a.allocator(), m);
+        if (sample.setup_failure == null and m.otlp_spans.len > 0 and otlp_collector == null)
+            sample.setup_failure = "sample.zon declares otlp_spans, but the runner has no --otlp-collector (it is built only in a root checkout)";
     }
     for (selected, arenas, 0..) |*sample, *a, i| {
         if (sample.setup_failure == null) sample.setup_failure = endpointConflict(a.allocator(), selected, i);
@@ -187,14 +215,14 @@ pub fn main(init: std.process.Init) !void {
     const config_path = try std.fs.path.join(arena, &.{ work_path, "empty-temporal-config.toml" });
     var env = try init.environ_map.clone(arena);
     var to_remove: std.ArrayList([]const u8) = .empty;
-    for (env.keys()) |key| if (std.mem.startsWith(u8, key, "TEMPORAL_")) try to_remove.append(arena, key);
+    for (env.keys()) |key| if (std.mem.startsWith(u8, key, "TEMPORAL_") or std.mem.startsWith(u8, key, "OTEL_")) try to_remove.append(arena, key);
     for (to_remove.items) |key| _ = env.swapRemove(key);
     try env.put("TEMPORAL_ADDRESS", server.address());
     try env.put("TEMPORAL_NAMESPACE", "default");
     try env.put("TEMPORAL_CONFIG_FILE", config_path);
 
     const docker: Docker = if (needs_docker) prepareDocker(gpa, io, arena) else .unused;
-    var queue: Queue = .{ .samples = selected, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env, .docker = docker, .root_abs = root_abs, .work_abs = work_abs };
+    var queue: Queue = .{ .samples = selected, .results = results, .arenas = arenas, .root = root, .work = work, .work_path = work_path, .env = &env, .docker = docker, .root_abs = root_abs, .work_abs = work_abs, .otlp_collector = otlp_collector };
     var lanes: Io.Group = .init;
     for (0..@min(jobs, selected.len)) |_| lanes.concurrent(io, runLane, .{ gpa, io, &queue }) catch {
         // No thread for another lane: this one and any started before it share the queue.
@@ -242,6 +270,8 @@ const Queue = struct {
     docker: Docker,
     root_abs: []const u8,
     work_abs: []const u8,
+    /// The OTLP collector program, for the samples that declare `otlp_spans`.
+    otlp_collector: ?[]const u8,
 };
 
 /// Validates samples from `queue` until none are left.
@@ -274,7 +304,7 @@ fn selectSamples(arena: Allocator, samples: []const Sample, only: ?[]const u8) e
 }
 
 fn usage() noreturn {
-    std.log.err("usage: samples_runner <build-root> <work-dir> [--only <sample>] [--jobs <n>] (<sample>:<program> <exe>)...", .{});
+    std.log.err("usage: samples_runner <build-root> <work-dir> [--only <sample>] [--jobs <n>] [--otlp-collector <exe>] (<sample>:<program> <exe>)...", .{});
     std.process.exit(2);
 }
 
@@ -297,7 +327,7 @@ fn parseManifest(gpa: Allocator, arena: Allocator, source: [:0]const u8, path: [
     };
 }
 
-/// Why `manifest`'s namespaces or endpoints can't be satisfied, or null if they can.
+/// Why `manifest`'s namespaces, endpoints or spans can't be satisfied, or null if they can.
 fn checkManifest(arena: Allocator, manifest: Manifest) ?[]const u8 {
     if (manifest.docker_server != null and (manifest.namespaces.len > 0 or manifest.nexus_endpoints.len > 0))
         return "sample.zon sets docker_server with namespaces or nexus_endpoints, which only the shared dev server supports";
@@ -309,6 +339,20 @@ fn checkManifest(arena: Allocator, manifest: Manifest) ?[]const u8 {
             return std.fmt.allocPrint(arena, "sample.zon declares Nexus endpoint {s} twice", .{e.name}) catch "out of memory";
         if (!std.mem.eql(u8, e.namespace, "default") and !contains(manifest.namespaces, e.namespace))
             return std.fmt.allocPrint(arena, "sample.zon's Nexus endpoint {s} routes to namespace {s}, which is neither \"default\" nor in its namespaces", .{ e.name, e.namespace }) catch "out of memory";
+    }
+    for (manifest.otlp_spans, 0..) |span, i| {
+        if (span.name.len == 0) return "sample.zon declares an OTLP span with an empty name";
+        for (manifest.otlp_spans[0..i]) |earlier| if (std.mem.eql(u8, earlier.name, span.name))
+            return std.fmt.allocPrint(arena, "sample.zon declares OTLP span \"{s}\" twice", .{span.name}) catch "out of memory";
+    }
+    for (manifest.otlp_spans) |span| {
+        const parent = span.parent orelse continue;
+        // Names are unique by now, so another span is one of that name other than this one.
+        const declared = !std.mem.eql(u8, parent, span.name) and for (manifest.otlp_spans) |other| {
+            if (std.mem.eql(u8, other.name, parent)) break true;
+        } else false;
+        if (!declared)
+            return std.fmt.allocPrint(arena, "sample.zon's OTLP span \"{s}\" has the parent \"{s}\", which is not another declared span", .{ span.name, parent }) catch "out of memory";
     }
     return null;
 }
@@ -389,7 +433,7 @@ fn validate(gpa: Allocator, io: Io, arena: Allocator, queue: *const Queue, sampl
     const manifest = sample.manifest orelse return .{ .fail = "missing or invalid sample.zon" };
     if (sample.setup_failure) |reason| return .{ .fail = reason };
     const options = manifest.docker_server orelse
-        return failure(runPrograms(gpa, io, arena, queue.work, queue.work_path, queue.env, sample, manifest));
+        return failure(runPrograms(gpa, io, arena, queue.work, queue.work_path, queue.env, queue.otlp_collector, sample, manifest));
     switch (queue.docker) {
         .unused => unreachable,
         .ready => {},
@@ -400,7 +444,7 @@ fn validate(gpa: Allocator, io: Io, arena: Allocator, queue: *const Queue, sampl
     var detail: []const u8 = "";
     const container = startServer(gpa, io, arena, queue, sample.name, options, &env, &detail) catch return .{ .fail = detail };
     defer stopServer(gpa, io, container);
-    const result = runPrograms(gpa, io, arena, queue.work, queue.work_path, &env, sample, manifest);
+    const result = runPrograms(gpa, io, arena, queue.work, queue.work_path, &env, queue.otlp_collector, sample, manifest);
     if (result != null) showServerLog(gpa, io, container);
     return failure(result);
 }
@@ -409,9 +453,10 @@ fn failure(reason: ?[]const u8) Outcome {
     return if (reason) |r| .{ .fail = r } else .pass;
 }
 
-/// Runs a sample's worker and starter with `base_env`. Returns null on success or a short reason
-/// on failure (details are logged).
-fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path: []const u8, base_env: *const std.process.Environ.Map, sample: Sample, manifest: Manifest) ?[]const u8 {
+/// Runs a sample's worker and starter with `base_env`, and for a sample with `otlp_spans` the
+/// OTLP collector `otlp_collector` before them. Returns null on success or a short reason on
+/// failure (details are logged).
+fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path: []const u8, base_env: *const std.process.Environ.Map, otlp_collector: ?[]const u8, sample: Sample, manifest: Manifest) ?[]const u8 {
     const worker_exe = sample.worker orelse return "no worker program";
     const starter_exe = sample.starter orelse return "no starter program";
     var worker_env = base_env.clone(arena) catch return "out of memory";
@@ -422,6 +467,27 @@ fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path
     const log_name = std.fmt.allocPrint(arena, "{s}-worker.log", .{sample.name}) catch return "out of memory";
     const log_file = work.createFile(io, log_name, .{}) catch return "cannot create worker log";
     defer log_file.close(io);
+
+    // Started first and stopped last (defers run in reverse), so it is serving for as long as
+    // either program can export.
+    var collector: ?Collector = null;
+    defer if (collector) |*c| c.stop(io);
+    if (manifest.otlp_spans.len > 0) {
+        const exe = otlp_collector orelse return "sample.zon declares otlp_spans, but the runner has no --otlp-collector (it is built only in a root checkout)";
+        collector = Collector.start(io, arena, work, work_path, exe, sample.name) catch |err| switch (err) {
+            error.OutOfMemory => return "out of memory",
+            error.CannotCreateLog => return "cannot create the OTLP collector log",
+            error.StartFailed => {
+                std.log.err("{s}: the OTLP collector failed to start", .{sample.name});
+                if (collectorLogName(arena, sample.name)) |name| showLog(io, arena, work, work_path, "OTLP collector", name);
+                return "the OTLP collector failed to start";
+            },
+        };
+        const endpoint = std.fmt.allocPrint(arena, "http://{s}", .{collector.?.address}) catch return "out of memory";
+        worker_env.put("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint) catch return "out of memory";
+        starter_env.put("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint) catch return "out of memory";
+    }
+    const logs: Logs = .{ .io = io, .arena = arena, .work = work, .work_path = work_path, .worker = log_name, .collector = if (collector) |c| c.log_name else null };
 
     var worker_argv_list: std.ArrayList([]const u8) = .empty;
     worker_argv_list.append(arena, worker_exe) catch return "out of memory";
@@ -457,7 +523,7 @@ fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path
         error.OutOfMemory => return "out of memory",
         error.ReadFailed => {
             std.log.err("{s}: reading the starter's output failed", .{sample.name});
-            showLog(io, arena, work, work_path, log_name);
+            logs.show();
             return "reading the starter's output failed";
         },
     };
@@ -468,7 +534,7 @@ fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path
     const starter_term = starter.term orelse {
         std.log.err("{s}: starter did not finish within {d}s; killed it", .{ sample.name, manifest.timeout_seconds });
         std.log.err("{s}: starter output:\n{s}", .{ sample.name, output });
-        showLog(io, arena, work, work_path, log_name);
+        logs.show();
         return "starter did not finish in time";
     };
     const starter_ok = switch (starter_term) {
@@ -487,14 +553,185 @@ fn runPrograms(gpa: Allocator, io: Io, arena: Allocator, work: Io.Dir, work_path
     worker_reaped = worker_code != null;
     if (worker_code == null) dumpStacks(gpa, io, worker_pid);
 
-    if (!starter_ok or missing != null or worker_code == null or worker_code.? != 0) {
+    const reason: ?[]const u8 = if (!starter_ok)
+        "starter exited with an error"
+    else if (missing) |line|
+        std.fmt.allocPrint(arena, "starter output lacks \"{s}\"", .{line}) catch "starter output lacks an expected line"
+    else if (worker_code == null)
+        "worker did not stop within 20s of SIGTERM"
+    else if (worker_code.? != 0)
+        std.fmt.allocPrint(arena, "worker exited with status {d} after SIGTERM", .{worker_code.?}) catch "worker exited with an error"
+    else if (collector) |c|
+        // Both programs have exited, and each export was answered only once the collector had
+        // written its spans, so the file holds every span they exported.
+        checkCollectedSpans(io, arena, work, c.spans_name, manifest.otlp_spans)
+    else
+        null;
+    if (reason) |r| {
+        std.log.err("{s}: {s}", .{ sample.name, r });
         std.log.err("{s}: starter output:\n{s}", .{ sample.name, output });
-        showLog(io, arena, work, work_path, log_name);
+        logs.show();
     }
-    if (!starter_ok) return "starter exited with an error";
-    if (missing) |line| return std.fmt.allocPrint(arena, "starter output lacks \"{s}\"", .{line}) catch "starter output lacks an expected line";
-    if (worker_code == null) return "worker did not stop within 20s of SIGTERM";
-    if (worker_code.? != 0) return std.fmt.allocPrint(arena, "worker exited with status {d} after SIGTERM", .{worker_code.?}) catch "worker exited with an error";
+    return reason;
+}
+
+/// The sample's logs, shown when it fails.
+const Logs = struct {
+    io: Io,
+    arena: Allocator,
+    work: Io.Dir,
+    work_path: []const u8,
+    worker: []const u8,
+    collector: ?[]const u8,
+
+    fn show(l: Logs) void {
+        showLog(l.io, l.arena, l.work, l.work_path, "worker", l.worker);
+        if (l.collector) |name| showLog(l.io, l.arena, l.work, l.work_path, "OTLP collector", name);
+    }
+};
+
+fn collectorLogName(arena: Allocator, sample: []const u8) ?[]const u8 {
+    return std.fmt.allocPrint(arena, "{s}-otlp-collector.log", .{sample}) catch null;
+}
+
+/// A sample's OTLP collector (tools/fixtures/otlp_collector.zig), writing the spans it
+/// receives to `<sample>-spans.jsonl` and its output to `<sample>-otlp-collector.log` in the
+/// work directory.
+const Collector = struct {
+    pid: std.posix.pid_t,
+    /// "127.0.0.1:<port>", as it printed it.
+    address: []const u8,
+    spans_name: []const u8,
+    log_name: []const u8,
+
+    /// Starts the collector and waits up to 30 s for it to print its address. On
+    /// `error.StartFailed` the collector has been stopped and reaped.
+    fn start(io: Io, arena: Allocator, work: Io.Dir, work_path: []const u8, exe: []const u8, sample: []const u8) error{ OutOfMemory, CannotCreateLog, StartFailed }!Collector {
+        const spans_name = try std.fmt.allocPrint(arena, "{s}-spans.jsonl", .{sample});
+        const log_name = collectorLogName(arena, sample) orelse return error.OutOfMemory;
+        const spans_path = try std.fs.path.join(arena, &.{ work_path, spans_name });
+        const log_file = work.createFile(io, log_name, .{}) catch return error.CannotCreateLog;
+        defer log_file.close(io);
+        // Its stdout goes to the log too: the address it prints first is read from there.
+        const child = std.process.spawn(io, .{
+            .argv = &.{ exe, spans_path },
+            .stdin = .ignore,
+            .stdout = .{ .file = log_file },
+            .stderr = .{ .file = log_file },
+        }) catch return error.StartFailed;
+        var c: Collector = .{ .pid = child.id.?, .address = "", .spans_name = spans_name, .log_name = log_name };
+        var waited_ms: u32 = 0;
+        while (waited_ms < 30_000) : (waited_ms += 50) {
+            const contents = work.readFileAlloc(io, log_name, arena, .limited(64 * 1024)) catch "";
+            if (printedAddress(contents)) |a| {
+                c.address = a;
+                return c;
+            }
+            var status: c_int = 0;
+            const r = std.c.waitpid(c.pid, &status, 1); // WNOHANG
+            if (r == c.pid or r < 0) return error.StartFailed; // Exited and reaped: not to be signaled.
+            io.sleep(.fromMilliseconds(50), .awake) catch break;
+        }
+        c.stop(io);
+        return error.StartFailed;
+    }
+
+    /// The address the collector printed as the first line of `log`, once that line is whole.
+    fn printedAddress(log: []const u8) ?[]const u8 {
+        const end = std.mem.indexOfScalar(u8, log, '\n') orelse return null;
+        const line = log[0..end];
+        const prefix = "127.0.0.1:";
+        if (!std.mem.startsWith(u8, line, prefix)) return null;
+        _ = std.fmt.parseInt(u16, line[prefix.len..], 10) catch return null;
+        return line;
+    }
+
+    /// SIGTERM, then SIGKILL if it has not exited within 5 s; reaps it either way.
+    fn stop(c: *const Collector, io: Io) void {
+        std.posix.kill(c.pid, .TERM) catch {};
+        if (waitExit(io, c.pid, 5) != null) return;
+        std.posix.kill(c.pid, .KILL) catch {};
+        _ = waitExit(io, c.pid, 5);
+    }
+};
+
+/// Why the spans in the work directory's `spans_name` don't satisfy `expected`, or null.
+fn checkCollectedSpans(io: Io, arena: Allocator, work: Io.Dir, spans_name: []const u8, expected: []const ExpectedSpan) ?[]const u8 {
+    const jsonl = work.readFileAlloc(io, spans_name, arena, .limited(64 * 1024 * 1024)) catch |err|
+        return std.fmt.allocPrint(arena, "cannot read the collected spans: {s}: {t}", .{ spans_name, err }) catch "cannot read the collected spans";
+    const received = parseSpans(arena, jsonl) catch |err| return switch (err) {
+        error.OutOfMemory => "out of memory",
+        error.InvalidSpans => std.fmt.allocPrint(arena, "cannot read the collected spans: {s} is not one span per line", .{spans_name}) catch "cannot read the collected spans",
+    };
+    return checkSpans(arena, received, expected);
+}
+
+/// A span the collector received, as one line of its spans file has it.
+const ReceivedSpan = struct {
+    name: []const u8,
+    /// 32 lower-case hex digits.
+    trace_id: []const u8,
+    /// 16 lower-case hex digits.
+    span_id: []const u8,
+    /// 16 lower-case hex digits, or empty for a root span.
+    parent_span_id: []const u8,
+};
+
+/// The spans of a spans file: one JSON object per line, blank lines skipped.
+fn parseSpans(arena: Allocator, jsonl: []const u8) error{ OutOfMemory, InvalidSpans }![]ReceivedSpan {
+    var spans: std.ArrayList(ReceivedSpan) = .empty;
+    var lines = std.mem.splitScalar(u8, jsonl, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        const span = std.json.parseFromSliceLeaky(ReceivedSpan, arena, line, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidSpans,
+        };
+        if (!isHexId(span.trace_id, 32) or !isHexId(span.span_id, 16) or (span.parent_span_id.len > 0 and !isHexId(span.parent_span_id, 16)))
+            return error.InvalidSpans;
+        try spans.append(arena, span);
+    }
+    return spans.items;
+}
+
+fn isHexId(id: []const u8, len: usize) bool {
+    if (id.len != len) return false;
+    for (id) |c| switch (c) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// Null when every span of `expected` is satisfied by `received`, else why the first one that
+/// isn't is not. A received span S satisfies an expected span E when it has E's name and either
+/// E has no parent and S is a root, or some received span P has E's parent's name, S's
+/// trace ID, and S's parent span ID as its span ID.
+fn checkSpans(arena: Allocator, received: []const ReceivedSpan, expected: []const ExpectedSpan) ?[]const u8 {
+    for (expected) |e| {
+        var found = false;
+        var with_parent = false;
+        const satisfied = for (received) |s| {
+            if (!std.mem.eql(u8, s.name, e.name)) continue;
+            found = true;
+            if (s.parent_span_id.len > 0) with_parent = true;
+            const parent = e.parent orelse {
+                if (s.parent_span_id.len == 0) break true;
+                continue;
+            };
+            if (s.parent_span_id.len == 0) continue;
+            for (received) |p| {
+                if (std.mem.eql(u8, p.name, parent) and std.mem.eql(u8, p.span_id, s.parent_span_id) and std.mem.eql(u8, p.trace_id, s.trace_id)) break;
+            } else continue;
+            break true;
+        } else false;
+        if (satisfied) continue;
+        const oom = "out of memory";
+        if (!found) return std.fmt.allocPrint(arena, "the OTLP collector received no span \"{s}\"", .{e.name}) catch oom;
+        const parent = e.parent orelse return std.fmt.allocPrint(arena, "span \"{s}\" has a parent, expected a root span", .{e.name}) catch oom;
+        if (!with_parent) return std.fmt.allocPrint(arena, "span \"{s}\" has no parent, expected \"{s}\"", .{ e.name, parent }) catch oom;
+        return std.fmt.allocPrint(arena, "span \"{s}\" is not a child of \"{s}\"", .{ e.name, parent }) catch oom;
+    }
     return null;
 }
 
@@ -636,10 +873,10 @@ fn waitForWorkerStart(io: Io, arena: Allocator, work: Io.Dir, log_name: []const 
     return false;
 }
 
-fn showLog(io: Io, arena: Allocator, work: Io.Dir, work_path: []const u8, name: []const u8) void {
+fn showLog(io: Io, arena: Allocator, work: Io.Dir, work_path: []const u8, what: []const u8, name: []const u8) void {
     const contents = work.readFileAlloc(io, name, arena, .limited(1024 * 1024)) catch return;
     const tail = contents[contents.len -| 8000..];
-    std.log.err("worker log ({s}/{s}):\n{s}", .{ work_path, name, tail });
+    std.log.err("{s} log ({s}/{s}):\n{s}", .{ what, work_path, name, tail });
 }
 
 /// Logs the threads' stacks of a process that is stuck, with the platform's debugger, so a hang
@@ -1072,4 +1309,147 @@ test "--only selects a known sample and rejects an unknown one" {
     const all = try selectSamples(a, &samples, null);
     try testing.expectEqual(3, all.len);
     try testing.expectEqualStrings("mutex", all[2].name);
+}
+
+test "a manifest declares the OTLP spans its collector must receive" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const m = try testManifest(arena.allocator(),
+        \\.{
+        \\    .expect = .{"done"},
+        \\    .opentelemetry = true,
+        \\    .otlp_spans = .{
+        \\        .{ .name = "StartWorkflow:Workflow" },
+        \\        .{ .name = "RunWorkflow:Workflow", .parent = "StartWorkflow:Workflow" },
+        \\    },
+        \\}
+    );
+    try testing.expect(m.opentelemetry);
+    try testing.expectEqual(2, m.otlp_spans.len);
+    try testing.expectEqual(null, m.otlp_spans[0].parent);
+    try testing.expectEqualStrings("StartWorkflow:Workflow", m.otlp_spans[1].parent.?);
+    try testing.expectEqual(null, checkManifest(arena.allocator(), m));
+    const plain = try testManifest(arena.allocator(), ".{ .expect = .{\"done\"} }");
+    try testing.expect(!plain.opentelemetry);
+    try testing.expectEqual(0, plain.otlp_spans.len);
+}
+
+test "a manifest whose OTLP spans can't be checked is rejected with the reason" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "sample.zon declares an OTLP span with an empty name",
+        checkManifest(a, .{ .expect = &.{}, .otlp_spans = &.{ .{ .name = "root" }, .{ .name = "", .parent = "root" } } }).?,
+    );
+    try testing.expectEqualStrings(
+        "sample.zon declares OTLP span \"root\" twice",
+        checkManifest(a, .{ .expect = &.{}, .otlp_spans = &.{ .{ .name = "root" }, .{ .name = "child", .parent = "root" }, .{ .name = "root", .parent = "child" } } }).?,
+    );
+    try testing.expectEqualStrings(
+        "sample.zon's OTLP span \"child\" has the parent \"missing\", which is not another declared span",
+        checkManifest(a, .{ .expect = &.{}, .otlp_spans = &.{ .{ .name = "root" }, .{ .name = "child", .parent = "missing" } } }).?,
+    );
+    try testing.expectEqualStrings(
+        "sample.zon's OTLP span \"self\" has the parent \"self\", which is not another declared span",
+        checkManifest(a, .{ .expect = &.{}, .otlp_spans = &.{.{ .name = "self", .parent = "self" }} }).?,
+    );
+}
+
+const trace_a = "0af7651916cd43dd8448eb211c80319c";
+const trace_b = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+fn receivedSpan(name: []const u8, trace_id: []const u8, span_id: []const u8, parent_span_id: []const u8) ReceivedSpan {
+    return .{ .name = name, .trace_id = trace_id, .span_id = span_id, .parent_span_id = parent_span_id };
+}
+
+const chain = [_]ExpectedSpan{
+    .{ .name = "StartWorkflow:Workflow" },
+    .{ .name = "RunWorkflow:Workflow", .parent = "StartWorkflow:Workflow" },
+    .{ .name = "custom-span", .parent = "RunWorkflow:Workflow" },
+};
+
+test "spans that form the declared chain satisfy it, whatever else was received" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const spans = [_]ReceivedSpan{
+        // Children may arrive before their parents, and other spans may be mixed in.
+        receivedSpan("custom-span", trace_a, "0000000000000003", "0000000000000002"),
+        receivedSpan("RunWorkflow:Workflow", trace_a, "0000000000000002", "0000000000000001"),
+        receivedSpan("unrelated", trace_b, "00000000000000ff", ""),
+        receivedSpan("StartWorkflow:Workflow", trace_a, "0000000000000001", ""),
+    };
+    try testing.expectEqual(null, checkSpans(arena.allocator(), &spans, &chain));
+    // A second, broken copy of a span doesn't matter while one copy satisfies it.
+    const with_stray = spans ++ [_]ReceivedSpan{receivedSpan("custom-span", trace_b, "0000000000000004", "00000000000000ff")};
+    try testing.expectEqual(null, checkSpans(arena.allocator(), &with_stray, &chain));
+    try testing.expectEqual(null, checkSpans(arena.allocator(), &.{}, &.{}));
+}
+
+test "a missing span, a wrong parent, a root with a parent and a parent in another trace are named" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const start = receivedSpan("StartWorkflow:Workflow", trace_a, "0000000000000001", "");
+    const run = receivedSpan("RunWorkflow:Workflow", trace_a, "0000000000000002", "0000000000000001");
+
+    try testing.expectEqualStrings(
+        "the OTLP collector received no span \"custom-span\"",
+        checkSpans(a, &.{ start, run }, &chain).?,
+    );
+    try testing.expectEqualStrings(
+        "span \"custom-span\" has no parent, expected \"RunWorkflow:Workflow\"",
+        checkSpans(a, &.{ start, run, receivedSpan("custom-span", trace_a, "0000000000000003", "") }, &chain).?,
+    );
+    // Its parent is the start span, not the run span.
+    try testing.expectEqualStrings(
+        "span \"custom-span\" is not a child of \"RunWorkflow:Workflow\"",
+        checkSpans(a, &.{ start, run, receivedSpan("custom-span", trace_a, "0000000000000003", "0000000000000001") }, &chain).?,
+    );
+    try testing.expectEqualStrings(
+        "span \"StartWorkflow:Workflow\" has a parent, expected a root span",
+        checkSpans(a, &.{receivedSpan("StartWorkflow:Workflow", trace_a, "0000000000000001", "0000000000000009")}, &chain).?,
+    );
+    // The parent's span ID matches, but it is in another trace.
+    try testing.expectEqualStrings(
+        "span \"RunWorkflow:Workflow\" is not a child of \"StartWorkflow:Workflow\"",
+        checkSpans(a, &.{ start, receivedSpan("RunWorkflow:Workflow", trace_b, "0000000000000002", "0000000000000001") }, &chain).?,
+    );
+}
+
+test "a spans file is read one span per line, and a line that is not a span refuses it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const spans = try parseSpans(a,
+        \\{"name":"StartWorkflow:Workflow","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":""}
+        \\
+        \\{"name":"say \"hi\"","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"0001020304050607","parent_span_id":"b7ad6b7169203331"}
+        \\
+    );
+    try testing.expectEqual(2, spans.len);
+    try testing.expectEqualStrings("StartWorkflow:Workflow", spans[0].name);
+    try testing.expectEqualStrings("", spans[0].parent_span_id);
+    try testing.expectEqualStrings("say \"hi\"", spans[1].name);
+    try testing.expectEqualStrings("b7ad6b7169203331", spans[1].parent_span_id);
+    try testing.expectEqual(0, (try parseSpans(a, "")).len);
+
+    const bad = [_][]const u8{
+        "not json",
+        "{\"name\":\"x\",\"trace_id\":\"0af7651916cd43dd8448eb211c80319c\",\"span_id\":\"b7ad6b7169203331\"}",
+        "{\"name\":\"x\",\"trace_id\":\"0af7651916cd43dd8448eb211c80319c\",\"span_id\":\"b7ad6b7169203331\",\"parent_span_id\":\"\",\"extra\":1}",
+        "{\"name\":\"x\",\"trace_id\":\"0AF7651916CD43DD8448EB211C80319C\",\"span_id\":\"b7ad6b7169203331\",\"parent_span_id\":\"\"}",
+        "{\"name\":\"x\",\"trace_id\":\"0af7651916cd43dd\",\"span_id\":\"b7ad6b7169203331\",\"parent_span_id\":\"\"}",
+        "{\"name\":\"x\",\"trace_id\":\"0af7651916cd43dd8448eb211c80319c\",\"span_id\":\"b7ad6b71\",\"parent_span_id\":\"\"}",
+        "{\"name\":\"x\",\"trace_id\":\"0af7651916cd43dd8448eb211c80319c\",\"span_id\":\"b7ad6b7169203331\",\"parent_span_id\":\"zz\"}",
+        "{\"name\":\"x\",\"trace_id\":\"0af7651916cd43dd8448eb211c80319c\",\"span_id\":\"b7ad6b7169203331\",\"parent_span_id\":\"\"}\n[1]",
+    };
+    for (bad) |text| try testing.expectError(error.InvalidSpans, parseSpans(a, text));
+}
+
+test "the collector's address is its first whole line" {
+    try testing.expectEqualStrings("127.0.0.1:4318", Collector.printedAddress("127.0.0.1:4318\notlp-collector: refused").?);
+    try testing.expectEqual(null, Collector.printedAddress("127.0.0.1:43"));
+    try testing.expectEqual(null, Collector.printedAddress("error: cannot listen on 127.0.0.1: AddressInUse\n"));
+    try testing.expectEqual(null, Collector.printedAddress("127.0.0.1:99999\n"));
 }
