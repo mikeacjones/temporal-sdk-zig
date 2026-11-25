@@ -740,6 +740,93 @@ fn failedCall(name: []const u8) PortProbe {
     return .{ .failed = .{ .name = name, .err = std.c.errno(@as(c_int, -1)) } };
 }
 
+pub const ReservePortError = error{ReservePortFailed};
+
+/// A port on 127.0.0.1 for a server started next, such as the dev server's `--http-port` or the
+/// core's Prometheus exporter, which bind it with SO_REUSEADDR (Go's and Rust's listeners
+/// do). The port is left in TIME_WAIT, as sdk-core's `get_free_port` leaves the gRPC port it
+/// hands the dev server: until the server binds it, the port allocator hands it to no other
+/// bind(port 0) or connect, while the server's SO_REUSEADDR bind passes. A port only bound and
+/// closed is free again at once, and under the parallel tests' load another socket took it
+/// before the dev server bound it; the server then exited on EADDRINUSE and sdk-core waited out
+/// its startup timeout on "connection refused". The reservation lasts the TIME_WAIT (60 s on
+/// Linux, 30 s on macOS). On failure, logs the call that failed with its errno.
+pub fn reserveLoopbackPort() ReservePortError!u16 {
+    const probe = if (comptime builtin.os.tag.isDarwin()) reserveByConnect() else reserveByAccept();
+    switch (probe) {
+        .free => |port| return port,
+        .taken => unreachable,
+        .failed => |call| {
+            std.log.scoped(.temporal).warn("reserving a port on 127.0.0.1 failed: {s}: {t}", .{ call.name, call.err });
+            return error.ReservePortFailed;
+        },
+    }
+}
+
+/// Linux: sdk-core's reservation. A listener on 127.0.0.1:0 with SO_REUSEADDR, a connection to
+/// it, and the accepted side closes first, so the TIME_WAIT is on the listener's port with
+/// SO_REUSEADDR, inherited. Linux's connect skips a port a bind created; a TIME_WAIT left by a
+/// connect would not stop another connect to a different peer from sharing its port. Every fd
+/// is close-on-exec from the start, so a server spawned meanwhile holds no copy.
+fn reserveByAccept() PortProbe {
+    const listener = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0);
+    if (listener < 0) return failedCall("socket(AF_INET)");
+    defer _ = std.c.close(listener);
+    const on: c_int = 1;
+    if (std.c.setsockopt(listener, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &on, @sizeOf(c_int)) != 0) return failedCall("setsockopt(SO_REUSEADDR)");
+    var addr: std.c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    if (std.c.bind(listener, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return failedCall("bind(127.0.0.1:0)");
+    if (std.c.listen(listener, 1) != 0) return failedCall("listen");
+    var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(listener, @ptrCast(&addr), &len) != 0) return failedCall("getsockname");
+
+    const client = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0);
+    if (client < 0) return failedCall("socket(AF_INET)");
+    defer _ = std.c.close(client);
+    // Blocking: a loopback connect to a listener with room in its queue completes at once.
+    while (std.c.connect(client, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) switch (std.c.errno(@as(c_int, -1))) {
+        .INTR => continue,
+        // An interrupted connect goes on; a repeated call reports it done.
+        .ISCONN => break,
+        else => return failedCall("connect to the reserving listener"),
+    };
+    const accepted = while (true) {
+        const fd = std.c.accept4(listener, null, null, std.c.SOCK.CLOEXEC);
+        if (fd >= 0) break fd;
+        if (std.c.errno(fd) != .INTR) return failedCall("accept on the reserving listener");
+    };
+    defer _ = std.c.close(accepted);
+    // The accepted side's FIN goes first; once the client's answering FIN is in, that side is
+    // in TIME_WAIT before the port is returned.
+    if (std.c.shutdown(accepted, std.c.SHUT.WR) != 0) return failedCall("shutdown(accepted)");
+    if (waitFor(client, std.c.POLL.IN, probeDeadline()) != .SUCCESS) return failedCall("waiting for the accepted side's FIN");
+    if (std.c.shutdown(client, std.c.SHUT.WR) != 0) return failedCall("shutdown(client)");
+    if (waitFor(accepted, std.c.POLL.IN, probeDeadline()) != .SUCCESS) return failedCall("waiting for the client's FIN");
+    return .{ .free = std.mem.bigToNative(u16, addr.port) };
+}
+
+/// macOS: the IPv4 probe of `pickTestServerPort`, whose socket closes first and so leaves its
+/// TIME_WAIT on the port its connect was given. macOS has no SOCK_CLOEXEC, and a listener a
+/// spawned server kept a copy of would take the connections meant for that server (see
+/// `pickTestServerPort`); a connected copy does not.
+fn reserveByConnect() PortProbe {
+    const v4 = switch (ProbePeer.listen(std.c.AF.INET)) {
+        .peer => |p| p,
+        .failed => |probe| return probe,
+    };
+    defer _ = std.c.close(v4.fd);
+    const s4 = socketCloexec(std.c.AF.INET) orelse return failedCall("socket(AF_INET)");
+    const a4 = switch (v4.connect(s4)) {
+        .accepted => |fd| fd,
+        .failed => |probe| return closeAfter(s4, probe),
+    };
+    defer closePair(s4, a4);
+    var addr: std.c.sockaddr.in = undefined;
+    var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(s4, @ptrCast(&addr), &len) != 0) return failedCall("getsockname");
+    return .{ .free = std.mem.bigToNative(u16, addr.port) };
+}
+
 fn testServerOptions(
     arena: Allocator,
     executable: Executable,
@@ -793,6 +880,47 @@ test "a dev server starts, reports its address, and shuts down" {
     };
     try testing.expect(std.mem.startsWith(u8, server.target, "127.0.0.1:"));
     try server.shutdown(testing.io, null);
+}
+
+/// Binds a fresh TCP socket to 127.0.0.1:`port`, with SO_REUSEADDR when `reuse`; the errno.
+fn bindLoopback(port: u16, reuse: bool) std.c.E {
+    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    std.debug.assert(fd >= 0);
+    defer _ = std.c.close(fd);
+    const on: c_int = 1;
+    if (reuse) std.debug.assert(std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &on, @sizeOf(c_int)) == 0);
+    const addr: std.c.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return std.c.errno(@as(c_int, -1));
+    if (std.c.listen(fd, 1) != 0) return std.c.errno(@as(c_int, -1));
+    return .SUCCESS;
+}
+
+test "a reserved loopback port refuses other binds and takes the SO_REUSEADDR bind of the server it is for" {
+    // The race the reservation closes: a port that was only bound and closed is free at once,
+    // and a bind (or connect) elsewhere took the dev server's --http-port before the server
+    // bound it. While reserved, a bind without SO_REUSEADDR is refused, as the allocator's own
+    // choice of a port is; the server's bind, which sets it, succeeds.
+    const port = try reserveLoopbackPort();
+    try testing.expectEqual(std.c.E.ADDRINUSE, bindLoopback(port, false));
+    try testing.expectEqual(std.c.E.SUCCESS, bindLoopback(port, true));
+}
+
+test "a dev server serves its HTTP API on a reserved port" {
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    const port = try reserveLoopbackPort();
+    var port_text: [8]u8 = undefined;
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    var server = startDevServer(testing.allocator, testing.io, rt, .{
+        .extra_args = &.{ "--http-port", try std.fmt.bufPrint(&port_text, "{d}", .{port}) },
+    }, &failure) catch |err| {
+        std.debug.print("dev server failed to start: {s}\n", .{failure orelse "(no message)"});
+        return err;
+    };
+    defer server.shutdown(testing.io, null) catch {};
+    // The server holds the port now.
+    try testing.expectEqual(std.c.E.ADDRINUSE, bindLoopback(port, true));
 }
 
 test "a missing executable fails with the core's message" {

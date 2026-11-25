@@ -2,6 +2,7 @@
 //! endpoint, and a worker's Nexus task loop runs the handlers.
 
 const std = @import("std");
+const EphemeralServer = @import("bridge/EphemeralServer.zig");
 const client_mod = @import("client.zig");
 const converter = @import("converter.zig");
 const failure_mod = @import("failure.zig");
@@ -881,16 +882,10 @@ const DroppedLinks = struct {
     }
 };
 
-/// A port nothing listens on now, for the dev server's HTTP API.
-fn freePort(io: Io) !u16 {
-    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
-    var server = try any.listen(io, .{});
-    defer server.deinit(io);
-    return server.socket.address.getPort();
-}
-
 test "nexus: a request whose link isn't UTF-8 once percent-decoded starts its workflow, and the link is logged and dropped" {
-    const port = try freePort(testing.io);
+    // Reserved, not only bound and closed: under the parallel tests another socket took such a
+    // port before the dev server bound it, and the server exited (see reserveLoopbackPort).
+    const port = try EphemeralServer.reserveLoopbackPort();
     var port_text: [8]u8 = undefined;
     const extra_args = [_][]const u8{ "--http-port", try std.fmt.bufPrint(&port_text, "{d}", .{port}) };
     var dropped: DroppedLinks = .{};
