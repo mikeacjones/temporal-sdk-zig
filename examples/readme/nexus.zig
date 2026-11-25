@@ -43,6 +43,60 @@ fn registerGreetingService(w: *temporal.worker.Worker) !void {
 }
 // end-example
 
+fn order(ctx: *workflow.Context) !void {
+    _ = ctx;
+}
+const Order = workflow.Def("order", order);
+
+// example: nexus-activity-operation
+fn composeGreeting(ctx: *temporal.activity.Context, name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(ctx.allocator(), "Hello, {s}!", .{name});
+}
+pub const ComposeGreeting = temporal.activity.Def("compose_greeting", composeGreeting);
+
+pub const Compose = nexus.OperationDef("compose", []const u8, []const u8);
+pub const ComposeService = nexus.ServiceDef("compose-service", .{Compose});
+
+// An activity-run operation returns the standalone activity to start, and completes with
+// its result. The empty ID and task queue use the request ID and the worker's task queue.
+fn compose(_: *nexus.Context, name: []const u8) !nexus.ActivityStart(ComposeGreeting) {
+    return .{ .options = .{ .task_queue = "", .start_to_close_timeout = .fromSeconds(10) }, .args = .{name} };
+}
+
+pub const ComposeHandler = nexus.ServiceHandler(ComposeService, .{nexus.OperationHandler(Compose, compose)});
+
+fn registerComposeService(w: *temporal.worker.Worker) !void {
+    try w.registerActivity(ComposeGreeting);
+    try w.registerNexusService(ComposeHandler);
+}
+// end-example
+
+// example: nexus-signal
+pub const ApproveInput = struct { order_id: []const u8, user_id: []const u8 };
+pub const NoteInput = struct { order_id: []const u8, note: []const u8 };
+pub const Approve = nexus.OperationDef("approve", ApproveInput, void);
+pub const AttachNote = nexus.OperationDef("attach-note", NoteInput, void);
+pub const ApprovalService = nexus.ServiceDef("approval-service", .{ Approve, AttachNote });
+
+const ApproveSignal = workflow.SignalDef("approve", fn ([]const u8) void);
+const NoteSignal = workflow.SignalDef("attach_note", fn ([]const u8) void);
+
+// Signals the order's workflow once, even when the request is retried.
+fn approve(ctx: *nexus.Context, input: ApproveInput) !void {
+    try ctx.signalWorkflow(ApproveSignal, input.order_id, "", .{input.user_id});
+}
+
+// Signals the order's workflow, starting it first if it isn't running. The ID is required.
+fn attachNote(ctx: *nexus.Context, input: NoteInput) !void {
+    _ = try ctx.signalWithStartWorkflow(Order, .{ .id = input.order_id }, .{}, NoteSignal, .{input.note});
+}
+
+pub const ApprovalHandler = nexus.ServiceHandler(ApprovalService, .{
+    nexus.OperationHandler(Approve, approve),
+    nexus.OperationHandler(AttachNote, attachNote),
+});
+// end-example
+
 // example: nexus-caller
 fn greetThroughNexus(ctx: *workflow.Context, name: []const u8) ![]const u8 {
     const future = ctx.executeNexusOperation(GreetingService, Greet, .{
@@ -109,4 +163,21 @@ test "nexus: a synchronous operation runs from the handler's dispatch table, and
     const failed = op.start(&failing, try temporal.converter.toPayload(a, @as([]const u8, "")));
     try testing.expectEqual(nexus.HandlerErrorType.bad_request, failed.handler_error.type);
     try testing.expect(!failed.handler_error.retryable());
+}
+
+test "nexus: an activity-run operation and signaling operations are bound by their handlers' return types" {
+    _ = &registerComposeService;
+    try testing.expectEqual(nexus.Operation.Kind.activity_run, ComposeHandler.registered.find("compose").?.operation.kind);
+    try testing.expectEqual(nexus.Operation.Kind.sync, ApprovalHandler.registered.find("approve").?.operation.kind);
+
+    // Without a worker's client, a signal fails the request.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ctx: nexus.Context = .{ .arena = a, .io_ = testing.io, .info_ = .{ .service = "approval-service", .operation = "approve" } };
+    const input = try temporal.converter.toPayload(a, ApproveInput{ .order_id = "order-1", .user_id = "ziggy" });
+    testing.log_level = .err;
+    defer testing.log_level = .warn;
+    const refused = ApprovalHandler.registered.find("approve").?.start(&ctx, input);
+    try testing.expectEqualStrings("NoClient", refused.handler_error.cause.?.type);
 }

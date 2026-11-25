@@ -17,24 +17,46 @@ const Failure = failure_mod.Failure;
 
 /// The Nexus link type of a link to a workflow event.
 pub const workflow_event_link_type = "temporal.api.common.v1.Link.WorkflowEvent";
+/// The Nexus link type of a link to a standalone activity.
+pub const activity_link_type = "temporal.api.common.v1.Link.Activity";
+/// The Nexus link type of a link to a standalone Nexus operation.
+pub const nexus_operation_link_type = "temporal.api.common.v1.Link.NexusOperation";
+
+const workflow_event_path = "/namespaces/<namespace>/workflows/<workflow ID>/<run ID>/history";
+const activity_path = "/namespaces/<namespace>/activities/<activity ID>/<run ID>/details";
+const nexus_operation_path = "/namespaces/<namespace>/nexus-operations/<operation ID>/<run ID>/details";
 
 const scheme = "temporal://";
 const event_type_prefix = "EVENT_TYPE_";
 
 pub const LinkError = error{ OutOfMemory, InvalidLink };
 
-/// The Temporal link a Nexus request's `link` names. Only workflow-event links convert:
-/// `temporal:///namespaces/<ns>/workflows/<id>/<run>/history?<reference>`, with path segments
-/// percent-encoded and the reference either `referenceType=EventReference` with `eventType`
-/// and an optional `eventID`, or `referenceType=RequestIdReference` with `eventType` and an
-/// optional `requestID`. Event types may be named in PascalCase (`NexusOperationScheduled`)
-/// or as the enum constant (`EVENT_TYPE_NEXUS_OPERATION_SCHEDULED`). A link whose namespace,
-/// workflow ID, run ID or query parameter is not valid UTF-8 once percent-decoded is
-/// `error.InvalidLink`, since protobuf string fields must hold UTF-8. On
-/// `error.InvalidLink`, `why` says what is wrong. Memory comes from `a`.
+/// The Temporal link a Nexus request's `link` names. Three kinds convert, with path segments
+/// percent-encoded:
+/// - a workflow event, of type `workflow_event_link_type`:
+///   `temporal:///namespaces/<ns>/workflows/<id>/<run>/history?<reference>`, the reference
+///   either `referenceType=EventReference` with `eventType` and an optional `eventID`, or
+///   `referenceType=RequestIdReference` with `eventType` and an optional `requestID`. Event
+///   types may be named in PascalCase (`NexusOperationScheduled`) or as the enum constant
+///   (`EVENT_TYPE_NEXUS_OPERATION_SCHEDULED`);
+/// - a standalone activity, of type `activity_link_type`:
+///   `temporal:///namespaces/<ns>/activities/<activity ID>/<run ID>/details`;
+/// - a standalone Nexus operation, of type `nexus_operation_link_type`:
+///   `temporal:///namespaces/<ns>/nexus-operations/<operation ID>/<run ID>/details`.
+/// The last two take no query; one that is present is ignored. A link whose path segments or
+/// query parameters are not valid UTF-8 once percent-decoded is `error.InvalidLink`, since
+/// protobuf string fields must hold UTF-8. On `error.InvalidLink`, `why` says what is wrong.
+/// Memory comes from `a`.
 pub fn fromNexusLink(a: Allocator, link: nexus_pb.Link, why: *[]const u8) LinkError!common.Link {
-    if (!std.mem.eql(u8, link.type, workflow_event_link_type))
-        return invalid(why, "its type is not " ++ workflow_event_link_type);
+    const Kind = enum { workflow_event, activity, nexus_operation };
+    const kind: Kind = if (std.mem.eql(u8, link.type, workflow_event_link_type))
+        .workflow_event
+    else if (std.mem.eql(u8, link.type, activity_link_type))
+        .activity
+    else if (std.mem.eql(u8, link.type, nexus_operation_link_type))
+        .nexus_operation
+    else
+        return invalid(why, "its type is not " ++ workflow_event_link_type ++ ", " ++ activity_link_type ++ " or " ++ nexus_operation_link_type);
     if (!std.mem.startsWith(u8, link.url, scheme)) return invalid(why, "its URL doesn't start with " ++ scheme);
     const rest = link.url[scheme.len..];
     const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse return invalid(why, "its URL has no path");
@@ -48,15 +70,37 @@ pub fn fromNexusLink(a: Allocator, link: nexus_pb.Link, why: *[]const u8) LinkEr
     var segments: [8][]const u8 = undefined;
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |segment| {
-        if (count == segments.len) return invalid(why, "its path is not /namespaces/<namespace>/workflows/<workflow ID>/<run ID>/history");
+    const ok = while (it.next()) |segment| {
+        if (count == segments.len) break false;
         segments[count] = segment;
         count += 1;
-    }
-    if (count != 7 or segments[0].len != 0 or !std.mem.eql(u8, segments[1], "namespaces") or
-        !std.mem.eql(u8, segments[3], "workflows") or !std.mem.eql(u8, segments[6], "history") or
+    } else count == 7;
+    const collection, const leaf = switch (kind) {
+        .workflow_event => .{ "workflows", "history" },
+        .activity => .{ "activities", "details" },
+        .nexus_operation => .{ "nexus-operations", "details" },
+    };
+    if (!ok or segments[0].len != 0 or !std.mem.eql(u8, segments[1], "namespaces") or
+        !std.mem.eql(u8, segments[3], collection) or !std.mem.eql(u8, segments[6], leaf) or
         segments[2].len == 0 or segments[4].len == 0 or segments[5].len == 0)
-        return invalid(why, "its path is not /namespaces/<namespace>/workflows/<workflow ID>/<run ID>/history");
+        return switch (kind) {
+            .workflow_event => invalid(why, "its path is not " ++ workflow_event_path),
+            .activity => invalid(why, "its path is not " ++ activity_path),
+            .nexus_operation => invalid(why, "its path is not " ++ nexus_operation_path),
+        };
+    switch (kind) {
+        .workflow_event => {},
+        .activity => return .{ .variant = .{ .activity = .{
+            .namespace = try decodeComponent(a, segments[2], false, "namespace", why),
+            .activity_id = try decodeComponent(a, segments[4], false, "activity ID", why),
+            .run_id = try decodeComponent(a, segments[5], false, "run ID", why),
+        } } },
+        .nexus_operation => return .{ .variant = .{ .nexus_operation = .{
+            .namespace = try decodeComponent(a, segments[2], false, "namespace", why),
+            .operation_id = try decodeComponent(a, segments[4], false, "operation ID", why),
+            .run_id = try decodeComponent(a, segments[5], false, "run ID", why),
+        } } },
+    }
 
     var reference_type: ?[]const u8 = null;
     var event_type: ?[]const u8 = null;
@@ -111,14 +155,17 @@ pub fn fromNexusLink(a: Allocator, link: nexus_pb.Link, why: *[]const u8) LinkEr
 /// The Nexus form of `link`, as `fromNexusLink` reads it: segments percent-encoded except for
 /// unreserved characters; for an event reference the query `eventID` (when not 0),
 /// `eventType`, `referenceType`; for a request-ID reference `referenceType`, `requestID` (when
-/// not empty), `eventType`; event types in PascalCase. Only workflow-event links convert;
-/// on `error.InvalidLink`, `why` says why. Memory comes from `a`.
+/// not empty), `eventType`; event types in PascalCase. Workflow-event, activity and
+/// Nexus-operation links convert; on `error.InvalidLink`, `why` says why. Memory comes from
+/// `a`.
 pub fn toNexusLink(a: Allocator, link: common.Link, why: *[]const u8) LinkError!nexus_pb.Link {
     const variant = link.variant orelse return invalid(why, "it has no target");
     const event = switch (variant) {
         .workflow_event => |e| e,
+        .activity => |l| return detailsLink(a, activity_link_type, "/activities/", l.namespace, l.activity_id, l.run_id),
+        .nexus_operation => |l| return detailsLink(a, nexus_operation_link_type, "/nexus-operations/", l.namespace, l.operation_id, l.run_id),
         else => |v| {
-            why.* = try std.fmt.allocPrint(a, "it is a {t} link; only workflow-event links are sent", .{v});
+            why.* = try std.fmt.allocPrint(a, "it is a {t} link; only workflow-event, activity and Nexus-operation links are sent", .{v});
             return error.InvalidLink;
         },
     };
@@ -153,6 +200,23 @@ pub fn toNexusLink(a: Allocator, link: common.Link, why: *[]const u8) LinkError!
             },
         };
         return .{ .url = url.written(), .type = workflow_event_link_type };
+    }
+    return error.OutOfMemory;
+}
+
+/// `temporal:///namespaces/<namespace><collection><id>/<run ID>/details`, of type `link_type`.
+fn detailsLink(a: Allocator, comptime link_type: []const u8, comptime collection: []const u8, namespace: []const u8, id: []const u8, run_id: []const u8) error{OutOfMemory}!nexus_pb.Link {
+    var url: std.Io.Writer.Allocating = .init(a);
+    const w = &url.writer;
+    write: {
+        w.writeAll(scheme ++ "/namespaces/") catch break :write;
+        encodeComponent(w, namespace, false) catch break :write;
+        w.writeAll(collection) catch break :write;
+        encodeComponent(w, id, false) catch break :write;
+        w.writeByte('/') catch break :write;
+        encodeComponent(w, run_id, false) catch break :write;
+        w.writeAll("/details") catch break :write;
+        return .{ .url = url.written(), .type = link_type };
     }
     return error.OutOfMemory;
 }
@@ -304,32 +368,40 @@ pub fn operationFailure(a: Allocator, e: nexus.OperationError) error{OutOfMemory
     }
 }
 
-/// The completion of a start request that came to `result`. A started operation's links are
-/// converted to their Nexus form; one that doesn't convert is dropped and logged to `logger`.
-/// Memory comes from `a`, or is borrowed from `token` and `result`.
+/// The completion of a start request that came to `result`. The links of a finished or
+/// started operation are converted to their Nexus form; one that doesn't convert is dropped
+/// and logged to `logger`. Memory comes from `a`, or is borrowed from `token` and `result`.
 pub fn startCompletion(a: Allocator, token: []const u8, result: nexus.StartResult, logger: log_mod.Logger) error{OutOfMemory}!Completion {
     var response: nexus_pb.StartOperationResponse = .{};
     switch (result) {
-        .succeeded => |s| response.variant = .{ .sync_success = .{ .payload = s.result } },
+        .succeeded => |s| {
+            var sync: nexus_pb.StartOperationResponse.Sync = .{ .payload = s.result };
+            try appendNexusLinks(a, &sync.links, s.links, logger);
+            response.variant = .{ .sync_success = sync };
+        },
         .started => |s| {
             var started: nexus_pb.StartOperationResponse.Async = .{ .operation_token = s.token };
-            for (s.links) |link| {
-                var why: []const u8 = "";
-                const converted = toNexusLink(a, link, &why) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.InvalidLink => {
-                        logger.warn("Dropping a link of the started Nexus operation that can't be sent", .{ .Reason = why });
-                        continue;
-                    },
-                };
-                try started.links.append(a, converted);
-            }
+            try appendNexusLinks(a, &started.links, s.links, logger);
             response.variant = .{ .async_success = started };
         },
         .operation_error => |e| response.variant = .{ .failure = try operationFailure(a, e) },
         .handler_error => |e| return failedCompletion(a, token, e),
     }
     return .{ .task_token = token, .status = .{ .completed = .{ .variant = .{ .start_operation = response } } } };
+}
+
+fn appendNexusLinks(a: Allocator, out: *std.ArrayList(nexus_pb.Link), links: []const common.Link, logger: log_mod.Logger) error{OutOfMemory}!void {
+    for (links) |link| {
+        var why: []const u8 = "";
+        const converted = toNexusLink(a, link, &why) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidLink => {
+                logger.warn("Dropping a link of the Nexus operation's response that can't be sent", .{ .Reason = why });
+                continue;
+            },
+        };
+        try out.append(a, converted);
+    }
 }
 
 /// The completion of a cancel request that came to `result`. Memory as `startCompletion`.
@@ -447,6 +519,68 @@ test "workflow-event links convert to the shared URL form and back" {
     }
 }
 
+test "activity and Nexus-operation links convert to their URL form and back" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { link: common.Link, url: []const u8, type: []const u8 }{
+        .{
+            .link = .{ .variant = .{ .activity = .{ .namespace = "default", .activity_id = "greeting-Zig", .run_id = "run-1" } } },
+            .url = "temporal:///namespaces/default/activities/greeting-Zig/run-1/details",
+            .type = activity_link_type,
+        },
+        .{
+            .link = .{ .variant = .{ .activity = .{ .namespace = "d\u{e9}j\u{e0}", .activity_id = "a b/c?d", .run_id = "r#1" } } },
+            .url = "temporal:///namespaces/d%C3%A9j%C3%A0/activities/a%20b%2Fc%3Fd/r%231/details",
+            .type = activity_link_type,
+        },
+        .{
+            .link = .{ .variant = .{ .nexus_operation = .{ .namespace = "caller", .operation_id = "op 1", .run_id = "run-2" } } },
+            .url = "temporal:///namespaces/caller/nexus-operations/op%201/run-2/details",
+            .type = nexus_operation_link_type,
+        },
+    };
+    for (cases) |case| {
+        var why: []const u8 = "";
+        const nexus_link = try toNexusLink(a, case.link, &why);
+        try testing.expectEqualStrings(case.url, nexus_link.url);
+        try testing.expectEqualStrings(case.type, nexus_link.type);
+        try testing.expectEqualDeep(case.link, try fromNexusLink(a, nexus_link, &why));
+    }
+
+    // A host and a query are accepted, and the query ignored.
+    var why: []const u8 = "";
+    const hosted = try fromNexusLink(a, .{ .url = "temporal://host/namespaces/ns/activities/a/r/details?x=1", .type = activity_link_type }, &why);
+    try testing.expectEqualStrings("a", hosted.variant.?.activity.activity_id);
+
+    const bad = [_]nexus_pb.Link{
+        // Each type names its own path.
+        .{ .url = "temporal:///namespaces/ns/workflows/a/r/details", .type = activity_link_type },
+        .{ .url = "temporal:///namespaces/ns/activities/a/r/history", .type = activity_link_type },
+        .{ .url = "temporal:///namespaces/ns/activities/a/r/details", .type = nexus_operation_link_type },
+        .{ .url = "temporal:///namespaces/ns/nexus-operations/o/r/details", .type = workflow_event_link_type },
+        .{ .url = "temporal:///namespaces/ns/activities/a//details", .type = activity_link_type },
+        .{ .url = "temporal:///namespaces//activities/a/r/details", .type = activity_link_type },
+        .{ .url = "temporal:///namespaces/ns/activities/a/r/details/x", .type = activity_link_type },
+        .{ .url = "temporal:///namespaces/ns/activities/a/details", .type = activity_link_type },
+        .{ .url = "temporal:///namespaces/ns/activities/a/r/details/x/y/z", .type = activity_link_type },
+        .{ .url = "http:///namespaces/ns/activities/a/r/details", .type = activity_link_type },
+        .{ .url = "temporal:///namespaces/ns/activities/a%FF/r/details", .type = activity_link_type },
+        .{ .url = "temporal:///namespaces/ns/nexus-operations/o/r%2/details", .type = nexus_operation_link_type },
+        .{ .url = "temporal:///namespaces/ns/activities/a/r/details", .type = "temporal.api.common.v1.Link.Callback" },
+    };
+    for (bad) |link| {
+        why = "";
+        try testing.expectError(error.InvalidLink, fromNexusLink(a, link, &why));
+        try testing.expect(why.len > 0);
+    }
+    why = "";
+    try testing.expectError(error.InvalidLink, fromNexusLink(a, bad[0], &why));
+    try testing.expectEqualStrings("its path is not " ++ activity_path, why);
+    try testing.expectError(error.InvalidLink, fromNexusLink(a, bad[10], &why));
+    try testing.expectEqualStrings("its activity ID is not valid UTF-8 once percent-decoded", why);
+}
+
 test "Nexus links in other spellings parse, and malformed ones are rejected with a reason" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -487,7 +621,7 @@ test "Nexus links in other spellings parse, and malformed ones are rejected with
         try testing.expect(why.len > 0);
     }
 
-    // Only workflow-event links are sent.
+    // Only workflow-event, activity and Nexus-operation links are sent.
     why = "";
     try testing.expectError(error.InvalidLink, toNexusLink(a, .{ .variant = .{ .workflow = .{ .namespace = "ns", .workflow_id = "w" } } }, &why));
     try testing.expect(std.mem.indexOf(u8, why, "workflow link") != null);
@@ -543,17 +677,28 @@ test "every start result maps to the completion the core expects" {
 
     const sync = try startCompletion(a, "tt", .{ .succeeded = .{ .result = .{ .data = "\"hi\"" } } }, logger);
     try testing.expectEqualStrings("tt", sync.task_token);
-    try testing.expectEqualStrings("\"hi\"", sync.status.?.completed.variant.?.start_operation.variant.?.sync_success.payload.?.data);
+    const sync_success = sync.status.?.completed.variant.?.start_operation.variant.?.sync_success;
+    try testing.expectEqualStrings("\"hi\"", sync_success.payload.?.data);
+    try testing.expectEqual(0, sync_success.links.items.len);
 
     const links = [_]common.Link{
         eventLink("default", "handler", "run-1", .{ .request_id_ref = .{ .request_id = "req", .event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED } }),
         .{ .variant = .{ .workflow = .{ .namespace = "default", .workflow_id = "dropped" } } },
+        .{ .variant = .{ .activity = .{ .namespace = "default", .activity_id = "act", .run_id = "run-2" } } },
     };
     const started = try startCompletion(a, "tt", .{ .started = .{ .token = "op-token", .links = &links } }, logger);
     const async_success = started.status.?.completed.variant.?.start_operation.variant.?.async_success;
     try testing.expectEqualStrings("op-token", async_success.operation_token);
-    try testing.expectEqual(1, async_success.links.items.len);
+    try testing.expectEqual(2, async_success.links.items.len);
     try testing.expectEqualStrings("temporal:///namespaces/default/workflows/handler/run-1/history?referenceType=RequestIdReference&requestID=req&eventType=WorkflowExecutionStarted", async_success.links.items[0].url);
+    try testing.expectEqualStrings("temporal:///namespaces/default/activities/act/run-2/details", async_success.links.items[1].url);
+
+    // A synchronous result carries the links of what the handler signaled, in order.
+    const signaled = try startCompletion(a, "tt", .{ .succeeded = .{ .result = .{ .data = "\"hi\"" }, .links = links[0..2] } }, logger);
+    const signaled_links = signaled.status.?.completed.variant.?.start_operation.variant.?.sync_success.links.items;
+    try testing.expectEqual(1, signaled_links.len);
+    try testing.expectEqualStrings(workflow_event_link_type, signaled_links[0].type);
+    try testing.expectEqualStrings(async_success.links.items[0].url, signaled_links[0].url);
 
     const failed = try startCompletion(a, "tt", .{ .operation_error = .{ .state = .failed, .failure = .{ .message = "out of stock", .type = "OutOfStock" } } }, logger);
     const failed_failure = failed.status.?.completed.variant.?.start_operation.variant.?.failure;

@@ -9,8 +9,9 @@
 //!     pub const HelloService = temporal.nexus.ServiceDef("my-hello-service", .{ Echo, SayHello });
 //!
 //! The handling worker binds every operation to a handler. A synchronous handler returns the
-//! operation's output; a workflow-run handler returns the workflow to start, and the
-//! operation completes when that workflow closes, with its result:
+//! operation's output; a workflow-run handler returns the workflow to start (`WorkflowStart`),
+//! and an activity-run handler the standalone activity to start (`ActivityStart`); the
+//! operation completes when that workflow or activity closes, with its result:
 //!
 //!     fn echo(ctx: *temporal.nexus.Context, input: EchoInput) !EchoOutput {
 //!         _ = ctx;
@@ -29,7 +30,8 @@
 //! from `ctx.allocator()` lives until the operation's response has been sent. A handler fails
 //! the operation with `ctx.fail` or `ctx.failCanceled`, or fails the request with
 //! `ctx.handlerError`; any other error it returns becomes a handler error as `Context`
-//! describes.
+//! describes. A handler may send one signal or signal-with-start per request through
+//! `ctx.signalWorkflow` or `ctx.signalWithStartWorkflow`, deduplicated by the request's ID.
 
 const std = @import("std");
 const converter = @import("converter.zig");
@@ -168,6 +170,42 @@ pub fn WorkflowStart(comptime W: type) type {
     };
 }
 
+/// Experimental: the standalone activity an activity-run operation starts. A handler of
+/// operation `Op` returns `ActivityStart(A)` (or an error union of it), where `A` is an
+/// `activity.Def` whose `Result` is `Op.Output`. The operation completes when the activity
+/// closes: with its result, failed when it fails or times out, and canceled when it ends
+/// canceled. The server must let standalone activities complete Nexus operations (see
+/// `testing.DevServer.activity_callback_args`).
+///
+/// The activity is started through the worker's client with `options` and `args`, carrying
+/// the Nexus request ID as the start's request ID, the caller's completion callback, and the
+/// caller's links; a retried start with the same request ID finds the activity the first one
+/// started. An empty `options.id` uses the request ID, and an empty `options.task_queue` the
+/// worker's task queue. At least one of `options.start_to_close_timeout` and
+/// `options.schedule_to_close_timeout` must be set; otherwise the request fails as a
+/// non-retryable `bad_request`. A null `options.context` starts the activity with the
+/// request's propagated values. Canceling the operation requests the activity's
+/// cancellation, which a running attempt sees at its next heartbeat.
+/// Strings in `options` and `args` must live until the handler's response has been sent, as
+/// `ctx.allocator()` memory does.
+pub fn ActivityStart(comptime A: type) type {
+    if (@typeInfo(A) != .@"struct" or !@hasDecl(A, "activity_name") or !@hasDecl(A, "Args") or !@hasDecl(A, "Result"))
+        @compileError("nexus.ActivityStart takes a temporal.activity.Def, not " ++ @typeName(A));
+    return struct {
+        pub const Activity = A;
+        options: client_mod.StartActivityOptions,
+        args: A.Args,
+    };
+}
+
+fn isActivityStart(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct" or !@hasDecl(T, "Activity")) return false;
+    if (@TypeOf(T.Activity) != type) return false;
+    const A = T.Activity;
+    if (@typeInfo(A) != .@"struct" or !@hasDecl(A, "activity_name") or !@hasDecl(A, "Args") or !@hasDecl(A, "Result")) return false;
+    return T == ActivityStart(A);
+}
+
 fn isWorkflowStart(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct" or !@hasDecl(T, "Workflow")) return false;
     if (@TypeOf(T.Workflow) != type) return false;
@@ -180,6 +218,7 @@ fn isWorkflowStart(comptime T: type) bool {
 ///
 ///     fn (ctx: *nexus.Context, input: Op.Input) !Op.Output             // synchronous
 ///     fn (ctx: *nexus.Context, input: Op.Input) !nexus.WorkflowStart(W) // workflow-run
+///     fn (ctx: *nexus.Context, input: Op.Input) !nexus.ActivityStart(A) // activity-run
 ///
 /// or the same with a receiver first, `fn (self: *T, ctx: *nexus.Context, input: Op.Input)`,
 /// for handlers that share state; `ServiceHandler` binds them to one instance. For an
@@ -206,7 +245,7 @@ const Shape = struct {
     /// The handler's return type, and the type of its value without the error union.
     Return: type,
     Value: type,
-    runs_workflow: bool,
+    kind: Operation.Kind,
 };
 
 /// The shape of `func` as a handler of `Op` in `service`, or a message saying why it isn't
@@ -214,7 +253,7 @@ const Shape = struct {
 fn handlerShape(comptime service: []const u8, comptime Op: type, comptime func: anytype) union(enum) { ok: Shape, bad: []const u8 } {
     const what = "nexus service \"" ++ service ++ "\" operation \"" ++ Op.operation_name ++ "\"";
     const expected = "fn (ctx: *nexus.Context, input: " ++ @typeName(Op.Input) ++ ") !" ++ @typeName(Op.Output) ++
-        " or !nexus.WorkflowStart(W), optionally with a receiver pointer first";
+        ", !nexus.WorkflowStart(W) or !nexus.ActivityStart(A), optionally with a receiver pointer first";
     const F = @TypeOf(func);
     const f = switch (@typeInfo(F)) {
         .@"fn" => |f| f,
@@ -243,15 +282,23 @@ fn handlerShape(comptime service: []const u8, comptime Op: type, comptime func: 
         .error_union => |eu| eu.payload,
         else => Return,
     };
-    const runs_workflow = isWorkflowStart(Value);
-    if (runs_workflow) {
-        const W = Value.Workflow;
-        if (W.Result != Op.Output)
-            return .{ .bad = what ++ ": the handler starts workflow \"" ++ W.workflow_name ++ "\", whose result type " ++ @typeName(W.Result) ++ " is not the operation's output type " ++ @typeName(Op.Output) };
-    } else if (Value != Op.Output) {
-        return .{ .bad = what ++ ": the handler returns " ++ @typeName(Value) ++ ", not the operation's output type " ++ @typeName(Op.Output) ++ " or a nexus.WorkflowStart of a workflow with that result" };
+    const kind: Operation.Kind = if (isWorkflowStart(Value)) .workflow_run else if (isActivityStart(Value)) .activity_run else .sync;
+    switch (kind) {
+        .workflow_run => {
+            const W = Value.Workflow;
+            if (W.Result != Op.Output)
+                return .{ .bad = what ++ ": the handler starts workflow \"" ++ W.workflow_name ++ "\", whose result type " ++ @typeName(W.Result) ++ " is not the operation's output type " ++ @typeName(Op.Output) };
+        },
+        .activity_run => {
+            const A = Value.Activity;
+            if (A.Result != Op.Output)
+                return .{ .bad = what ++ ": the handler starts activity \"" ++ A.activity_name ++ "\", whose result type " ++ @typeName(A.Result) ++ " is not the operation's output type " ++ @typeName(Op.Output) };
+        },
+        .sync => if (Value != Op.Output) {
+            return .{ .bad = what ++ ": the handler returns " ++ @typeName(Value) ++ ", not the operation's output type " ++ @typeName(Op.Output) ++ ", a nexus.WorkflowStart of a workflow with that result, or a nexus.ActivityStart of an activity with that result" };
+        },
     }
-    return .{ .ok = .{ .bound = bound, .takes_input = rest.len == 1, .Receiver = Receiver, .Return = Return, .Value = Value, .runs_workflow = runs_workflow } };
+    return .{ .ok = .{ .bound = bound, .takes_input = rest.len == 1, .Receiver = Receiver, .Return = Return, .Value = Value, .kind = kind } };
 }
 
 /// Binds every operation of `Service` (a `ServiceDef`) to a handler: `handlers` is a tuple
@@ -458,6 +505,20 @@ pub const OperationError = struct {
 
 // ---------------------------------------------------------------- context
 
+/// Experimental: errors of `Context.signalWorkflow` and `signalWorkflowByName`.
+pub const SignalError = client_mod.SignalError || error{ NoClient, SignalAlreadySent };
+
+/// Experimental: errors of `Context.signalWithStartWorkflow` and its ByName form.
+pub const SignalWithStartError = client_mod.StartError || error{ NoClient, SignalAlreadySent };
+
+/// Experimental: what a handler's signal-with-start did. Memory is `ctx.allocator()`'s.
+pub const SignalWithStartResult = struct {
+    workflow_id: []const u8,
+    run_id: []const u8,
+    /// True when the call started the run; false when it only signaled a running one.
+    started: bool,
+};
+
 /// What a handler knows about the request it handles. Borrowed from the task: valid as long
 /// as `ctx.allocator()` memory.
 pub const Info = struct {
@@ -511,11 +572,13 @@ pub const CancelReason = enum(u8) {
 ///
 /// Any other error the handler returns is a handler error of type `internal` (retried) whose
 /// cause is an application failure named after the error, except: `error.NotFound` (as the
-/// client returns it for a workflow that doesn't exist) is `not_found`, and
-/// `error.WorkflowExecutionAlreadyStarted`, `error.InvalidOptions` and
+/// client returns it for a workflow that doesn't exist) is `not_found`;
+/// `error.SignalAlreadySent` (a second signal, see `signalWorkflowByName`) is `bad_request`,
+/// not retried; and `error.WorkflowExecutionAlreadyStarted`,
+/// `error.ActivityExecutionAlreadyStarted`, `error.InvalidOptions` and
 /// `error.InvalidSearchAttribute` are a non-retryable `internal`. Errors from starting or
-/// canceling a workflow-run operation's workflow map the same way, and a start or cancel the
-/// server rejects maps by its gRPC status: INVALID_ARGUMENT is `bad_request`; ALREADY_EXISTS,
+/// canceling an asynchronous operation's workflow or activity map the same way, and a start
+/// or cancel the server rejects maps by its gRPC status: INVALID_ARGUMENT is `bad_request`; ALREADY_EXISTS,
 /// FAILED_PRECONDITION and OUT_OF_RANGE a non-retryable `internal`; ABORTED and UNAVAILABLE
 /// `unavailable`; RESOURCE_EXHAUSTED `resource_exhausted`; UNIMPLEMENTED `not_implemented`;
 /// DEADLINE_EXCEEDED `upstream_timeout`; NOT_FOUND `not_found`; any other a retried
@@ -553,6 +616,12 @@ pub const Context = struct {
     returned_error_: ?anyerror = null,
     /// Written once by the worker when a cancel arrives, possibly from another thread.
     cancel_reason_: std.atomic.Value(u8) = .init(not_canceled),
+    /// Taken by the request's one signal (`signalWorkflow` and its kin) before it is sent,
+    /// and given back when sending fails, so two tasks of a handler can't both send.
+    signaled_: std.atomic.Value(bool) = .init(false),
+    /// The links of what the handler signaled, allocated from `arena` by the task that holds
+    /// `signaled_`; read once the handler has returned.
+    response_links_: std.ArrayList(Link) = .empty,
 
     const not_canceled = std.math.maxInt(u8);
 
@@ -595,12 +664,87 @@ pub const Context = struct {
 
     /// The client of the worker handling the request, for starting, signaling, and querying
     /// workflows (see `activity.Context.client` for why it is safe to share). Don't `close`
-    /// it. Returns `error.NoClient` (logged) for a context built without one.
+    /// it. Returns `error.NoClient` (logged) for a context built without one. Signals sent
+    /// through it carry their own request IDs, are not limited to one per request, and are
+    /// delivered again when the Nexus task is retried; `signalWorkflow` is deduplicated.
     pub fn client(ctx: *const Context) error{NoClient}!*client_mod.Client {
         return ctx.client_ orelse {
             ctx.logger_.warn("nexus.Context.client: this handler runs without a client", .{});
             return error.NoClient;
         };
+    }
+
+    /// Experimental: sends `Signal` (a `workflow.SignalDef`) with `args` through the worker's
+    /// client, with the request's ID as the signal's request ID and the caller's links. An
+    /// empty `run_id` is the latest run. See `signalWorkflowByName`.
+    pub fn signalWorkflow(ctx: *Context, comptime Signal: type, workflow_id: []const u8, run_id: []const u8, args: Signal.Args) SignalError!void {
+        return ctx.signalWorkflowByName(Signal.signal_name, workflow_id, run_id, args);
+    }
+
+    /// Experimental: `signalWorkflow` with the signal named at run time and `args` a tuple of
+    /// its arguments.
+    ///
+    /// A request sends one signal, through this or `signalWithStartWorkflow`, because the
+    /// signal carries the request's ID: a retried Nexus task sends it again with the same ID,
+    /// and the server drops the copy. A second call while the first is in flight or after it
+    /// succeeded returns `error.SignalAlreadySent` (logged), which a handler that returns it
+    /// reports as a `bad_request` handler error; a call that failed may be repeated. Signals
+    /// that need no deduplication go through `ctx.client()`. A signal does not use up the
+    /// start: the handler may still return a `WorkflowStart` or `ActivityStart`. The
+    /// response carries a link to the signal's event when the server returns one. The
+    /// signal carries the request's propagated values. Returns `error.NoClient` (logged) for
+    /// a context built without a client, and otherwise `Client.signalWorkflow`'s errors.
+    pub fn signalWorkflowByName(ctx: *Context, signal_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype) SignalError!void {
+        const c = try ctx.client();
+        try ctx.claimSignal("signalWorkflow");
+        errdefer ctx.signaled_.store(false, .release);
+        try ctx.response_links_.ensureUnusedCapacity(ctx.arena, 1);
+        const link = try c.signalNexusWorkflow(ctx.arena, signal_name, workflow_id, run_id, args, .{ .context = &ctx.propagated_ }, .{
+            .request_id = try requestId(ctx),
+            .links = ctx.info_.links,
+        });
+        if (link) |l| ctx.response_links_.appendAssumeCapacity(l);
+    }
+
+    /// Experimental: signal-with-start through the worker's client, with the request's ID as
+    /// the request ID, which deduplicates both the start and the signal, and the caller's
+    /// links. `options.id` must be set: an empty one returns `error.InvalidOptions` (logged),
+    /// since a generated ID would start a new workflow on every retried task. An empty
+    /// `options.task_queue` uses the worker's task queue and a null `options.context` the
+    /// request's propagated values. It counts as the request's one signal, as
+    /// `signalWorkflowByName` describes. The result's strings come from `allocator()`.
+    pub fn signalWithStartWorkflow(ctx: *Context, comptime Workflow: type, options: client_mod.StartWorkflowOptions, args: Workflow.Args, comptime Signal: type, signal_args: Signal.Args) SignalWithStartError!SignalWithStartResult {
+        return ctx.signalWithStartWorkflowByName(Workflow.workflow_name, options, args, Signal.signal_name, signal_args);
+    }
+
+    /// Experimental: `signalWithStartWorkflow` with the workflow type and the signal named at
+    /// run time; `args` and `signal_args` are tuples of their arguments.
+    pub fn signalWithStartWorkflowByName(ctx: *Context, workflow_type: []const u8, options: client_mod.StartWorkflowOptions, args: anytype, signal_name: []const u8, signal_args: anytype) SignalWithStartError!SignalWithStartResult {
+        const c = try ctx.client();
+        if (options.id.len == 0) {
+            ctx.logger_.warn("nexus.Context.signalWithStartWorkflow: options.id is empty; set it, since a generated ID would start a new workflow on every retried task", .{ .WorkflowType = workflow_type });
+            return error.InvalidOptions;
+        }
+        try ctx.claimSignal("signalWithStartWorkflow");
+        errdefer ctx.signaled_.store(false, .release);
+        try ctx.response_links_.ensureUnusedCapacity(ctx.arena, 1);
+        var o = options;
+        if (o.task_queue.len == 0) o.task_queue = ctx.info_.task_queue;
+        if (o.context == null) o.context = &ctx.propagated_;
+        const workflow_id = try ctx.arena.dupe(u8, o.id);
+        const r = try c.signalWithStartNexusWorkflow(ctx.arena, workflow_type, o, args, signal_name, signal_args, .{
+            .request_id = try requestId(ctx),
+            .links = ctx.info_.links,
+        });
+        if (r.link) |l| ctx.response_links_.appendAssumeCapacity(l);
+        return .{ .workflow_id = workflow_id, .run_id = r.run_id, .started = r.started };
+    }
+
+    /// Takes the request's one signal, or returns `error.SignalAlreadySent` (logged).
+    fn claimSignal(ctx: *Context, comptime method: []const u8) error{SignalAlreadySent}!void {
+        if (ctx.signaled_.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) return;
+        ctx.logger_.warn("nexus.Context." ++ method ++ ": this request has already sent its signal; a request sends one, because its signals share the request's ID and the server would drop the second; send signals that need no deduplication through ctx.client()", .{});
+        return error.SignalAlreadySent;
     }
 
     /// The logger the worker set up for the request, carrying its service and operation as
@@ -694,9 +838,9 @@ fn plainError(arena: Allocator, what: []const u8, err: anyerror) HandlerError {
 /// status `rejected` when `err` is `error.RpcFailed` and the status is known (see `Context`).
 /// Its message carries the server's.
 fn rpcError(arena: Allocator, what: []const u8, err: anyerror, rejected: ?client_mod.RpcRejection) HandlerError {
-    const plain = err == error.WorkflowExecutionAlreadyStarted or err == error.InvalidOptions or err == error.InvalidSearchAttribute;
+    const plain = err == error.WorkflowExecutionAlreadyStarted or err == error.ActivityExecutionAlreadyStarted or err == error.InvalidOptions or err == error.InvalidSearchAttribute;
     var e: HandlerError = .{
-        .type = if (err == error.NotFound) .not_found else .internal,
+        .type = if (err == error.NotFound) .not_found else if (err == error.SignalAlreadySent) .bad_request else .internal,
         .message = std.fmt.allocPrint(arena, "{s}: {t}", .{ what, err }) catch @errorName(err),
         .retry = if (plain) .non_retryable else .default,
         .cause = .{ .message = @errorName(err), .type = @errorName(err) },
@@ -742,13 +886,16 @@ pub const StartResult = union(enum) {
     pub const Succeeded = struct {
         /// The output as an encoded payload.
         result: Payload,
+        /// Experimental: links to what the handler signaled, sent with the result.
+        links: []const Link = &.{},
     };
 
     /// A started asynchronous operation.
     pub const Started = struct {
         /// Identifies the operation to `Operation.cancel`.
         token: []const u8,
-        /// For a workflow-run operation, a link to the started workflow's start event.
+        /// A link to the started workflow's start event or to the started activity, then
+        /// the links to what the handler signaled.
         links: []const Link = &.{},
     };
 };
@@ -757,7 +904,8 @@ pub const StartResult = union(enum) {
 /// `allocator()` or are static.
 pub const CancelResult = union(enum) {
     /// The cancel was delivered: for a workflow-run operation, the workflow's cancellation
-    /// was requested.
+    /// was requested; for an activity-run operation, the activity's, which a running attempt
+    /// sees at its next heartbeat.
     requested,
     /// A token that doesn't parse (`bad_request`), a workflow that doesn't exist
     /// (`not_found`), a synchronous operation (`not_implemented`), or a failed request.
@@ -778,8 +926,9 @@ pub const Operation = struct {
     cancel: *const fn (receiver: ?*anyopaque, ctx: *Context, token: []const u8) CancelResult,
 
     /// `sync` finishes in its start; `workflow_run` starts a workflow and finishes when the
-    /// workflow closes.
-    pub const Kind = enum { sync, workflow_run };
+    /// workflow closes; `activity_run` starts a standalone activity and finishes when the
+    /// activity closes.
+    pub const Kind = enum { sync, workflow_run, activity_run };
 };
 
 /// A service as a worker registers it; `operations` is static. Take it from
@@ -823,7 +972,7 @@ fn Implementation(comptime service: []const u8, comptime Op: type, comptime func
     const op = Op.operation_name;
     const what = "nexus operation \"" ++ op ++ "\" of service \"" ++ service ++ "\"";
     return struct {
-        const kind: Operation.Kind = if (shape.runs_workflow) .workflow_run else .sync;
+        const kind: Operation.Kind = shape.kind;
 
         fn call(receiver: ?*anyopaque, ctx: *Context, input: Op.Input) shape.Return {
             const args = if (shape.takes_input) .{input} else .{};
@@ -844,24 +993,26 @@ fn Implementation(comptime service: []const u8, comptime Op: type, comptime func
                 }
             else
                 call(receiver, ctx, in);
-            if (shape.runs_workflow) return startWorkflow(shape.Value.Workflow, what, ctx, value);
+            if (comptime kind == .workflow_run) return startWorkflow(shape.Value.Workflow, what, ctx, value);
+            if (comptime kind == .activity_run) return startActivity(shape.Value.Activity, what, ctx, value);
             return encodeOutput(ctx, value);
         }
 
         fn cancel(_: ?*anyopaque, ctx: *Context, token: []const u8) CancelResult {
-            if (shape.runs_workflow) return cancelWorkflow(what, ctx, token);
+            if (comptime kind == .workflow_run) return cancelWorkflow(what, ctx, token);
+            if (comptime kind == .activity_run) return cancelActivity(what, ctx, token);
             return .{ .handler_error = .{ .type = .not_implemented, .message = what ++ " is synchronous: it finishes in its start, so there is nothing to cancel" } };
         }
 
         fn encodeOutput(ctx: *Context, value: shape.Value) StartResult {
             const a = ctx.arena;
             const payload = converter.toPayloadWithContext(a, &codecContext(ctx), value) catch return outOfMemory(what);
-            if (ctx.codecs.len == 0) return .{ .succeeded = .{ .result = payload } };
+            if (ctx.codecs.len == 0) return .{ .succeeded = .{ .result = payload, .links = ctx.response_links_.items } };
             const encoded = converter.encodePayloadsWithContext(ctx.codecs, a, ctx.io_, &codecContext(ctx), &.{payload}) catch |err| return .{ .handler_error = .{
                 .type = .internal,
                 .message = std.fmt.allocPrint(a, "{s}: encoding its output with the client's codecs failed: {t}", .{ what, err }) catch what ++ ": encoding its output with the client's codecs failed",
             } };
-            return .{ .succeeded = .{ .result = encoded[0] } };
+            return .{ .succeeded = .{ .result = encoded[0], .links = ctx.response_links_.items } };
         }
     };
 }
@@ -919,27 +1070,45 @@ fn startWorkflow(comptime W: type, comptime what: []const u8, ctx: *Context, sta
     const i = &ctx.info_;
     var options = start.options;
     if (options.context == null) options.context = &ctx.propagated_;
-    var request_id = i.request_id;
-    if (request_id.len == 0) request_id = client_mod.uuid(a, ctx.io_) catch return outOfMemory(what);
+    const request_id = requestId(ctx) catch return outOfMemory(what);
     if (options.id.len == 0) options.id = request_id;
     if (options.task_queue.len == 0) options.task_queue = i.task_queue;
     const token = encodeWorkflowToken(a, c.namespace, options.id) catch return outOfMemory(what);
-
-    var headers: std.ArrayList(Header) = .empty;
-    headers.ensureTotalCapacity(a, i.callback_headers.len + 1) catch return outOfMemory(what);
-    for (i.callback_headers) |h| if (!std.ascii.eqlIgnoreCase(h.name, token_header)) headers.appendAssumeCapacity(h);
-    headers.appendAssumeCapacity(.{ .name = token_header, .value = token });
+    const headers = callbackHeaders(ctx, token) catch return outOfMemory(what);
 
     var rejected: ?client_mod.RpcRejection = null;
     const started = c.startNexusWorkflow(a, W.workflow_name, options, start.args, .{
         .request_id = request_id,
         .callback_url = i.callback_url,
-        .callback_headers = if (i.callback_url.len > 0) headers.items else &.{},
+        .callback_headers = headers,
         .links = i.links,
         .rejection = &rejected,
     }) catch |err| return .{ .handler_error = rpcError(a, what ++ ": starting workflow \"" ++ W.workflow_name ++ "\" failed", err, rejected) };
-    const links = a.dupe(Link, &.{started.link}) catch return outOfMemory(what);
+    const links = startedLinks(ctx, started.link) catch return outOfMemory(what);
     return .{ .started = .{ .token = token, .links = links } };
+}
+
+/// The links of a started operation: `own`, then those of the handler's signal.
+fn startedLinks(ctx: *Context, own: Link) error{OutOfMemory}![]const Link {
+    return std.mem.concat(ctx.arena, Link, &.{ &.{own}, ctx.response_links_.items });
+}
+
+/// The callback headers of an asynchronous start: the caller's, with `token` in place of
+/// any operation token they carry.
+fn callbackHeaders(ctx: *Context, token: []const u8) error{OutOfMemory}![]const Header {
+    const i = &ctx.info_;
+    if (i.callback_url.len == 0) return &.{};
+    var headers: std.ArrayList(Header) = .empty;
+    try headers.ensureTotalCapacity(ctx.arena, i.callback_headers.len + 1);
+    for (i.callback_headers) |h| if (!std.ascii.eqlIgnoreCase(h.name, token_header)) headers.appendAssumeCapacity(h);
+    headers.appendAssumeCapacity(.{ .name = token_header, .value = token });
+    return headers.items;
+}
+
+/// The request's ID, or a fresh UUID for a context built without one.
+fn requestId(ctx: *Context) error{OutOfMemory}![]const u8 {
+    if (ctx.info_.request_id.len > 0) return ctx.info_.request_id;
+    return client_mod.uuid(ctx.arena, ctx.io_);
 }
 
 fn outOfMemory(comptime what: []const u8) StartResult {
@@ -985,14 +1154,24 @@ const WorkflowToken = struct {
 const workflow_token_type = 1;
 
 fn encodeWorkflowToken(a: Allocator, namespace: []const u8, workflow_id: []const u8) error{OutOfMemory}![]const u8 {
-    const json = try std.json.Stringify.valueAlloc(a, .{ .t = @as(u8, workflow_token_type), .ns = namespace, .wid = workflow_id }, .{ .escape_unicode = true });
-    const encoder = std.base64.url_safe_no_pad.Encoder;
-    const out = try a.alloc(u8, encoder.calcSize(json.len));
-    return encoder.encode(out, json);
+    return encodeToken(a, .{ .t = @as(u8, workflow_token_type), .ns = namespace, .wid = workflow_id });
 }
 
 /// Parses a workflow-run token. On `error.InvalidToken`, `why` says what is wrong with it.
 fn decodeWorkflowToken(a: Allocator, token: []const u8, why: *[]const u8) error{ OutOfMemory, InvalidToken }!WorkflowToken {
+    const Fields = struct { t: i64, ns: []const u8, wid: ?[]const u8 = null, v: ?i64 = null };
+    const fields = try parseToken(Fields, a, token, workflow_token_type, "workflow run", why);
+    const wid = fields.wid orelse "";
+    if (wid.len == 0) {
+        why.* = "it names no workflow ID";
+        return error.InvalidToken;
+    }
+    return .{ .namespace = fields.ns, .workflow_id = wid };
+}
+
+/// The JSON fields of an operation token, checked to be of type `token_type` (named
+/// `type_name` in `why`) and version 0. `Fields` has `t`, `ns` and an optional `v`.
+fn parseToken(comptime Fields: type, a: Allocator, token: []const u8, comptime token_type: i64, comptime type_name: []const u8, why: *[]const u8) error{ OutOfMemory, InvalidToken }!Fields {
     if (token.len == 0) {
         why.* = "the token is empty";
         return error.InvalidToken;
@@ -1007,26 +1186,122 @@ fn decodeWorkflowToken(a: Allocator, token: []const u8, why: *[]const u8) error{
         why.* = "it is not base64url";
         return error.InvalidToken;
     };
-    const Fields = struct { t: i64, ns: []const u8, wid: ?[]const u8 = null, v: ?i64 = null };
     const fields = std.json.parseFromSliceLeaky(Fields, a, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         why.* = "it is not a JSON object with an integer \"t\" and a string \"ns\"";
         return error.InvalidToken;
     };
-    if (fields.t != workflow_token_type) {
-        why.* = std.fmt.allocPrint(a, "its type is {d}, not {d} (workflow run)", .{ fields.t, workflow_token_type }) catch "its type is not workflow run";
+    if (fields.t != token_type) {
+        why.* = std.fmt.allocPrint(a, "its type is {d}, not {d} (" ++ type_name ++ ")", .{ fields.t, token_type }) catch "its type is not " ++ type_name;
         return error.InvalidToken;
     }
     if (fields.v) |v| if (v != 0) {
         why.* = std.fmt.allocPrint(a, "its version is {d}; this worker reads version 0", .{v}) catch "its version is not 0";
         return error.InvalidToken;
     };
-    const wid = fields.wid orelse "";
-    if (wid.len == 0) {
-        why.* = "it names no workflow ID";
+    return fields;
+}
+
+fn encodeToken(a: Allocator, fields: anytype) error{OutOfMemory}![]const u8 {
+    const json = try std.json.Stringify.valueAlloc(a, fields, .{ .escape_unicode = true });
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const out = try a.alloc(u8, encoder.calcSize(json.len));
+    return encoder.encode(out, json);
+}
+
+// ---------------------------------------------------------------- activity-run operations
+
+/// Starts the standalone activity `start` describes for an activity-run operation, and
+/// returns its operation token and a link to it.
+fn startActivity(comptime A: type, comptime what: []const u8, ctx: *Context, start: ActivityStart(A)) StartResult {
+    const a = ctx.arena;
+    var options = start.options;
+    if (options.start_to_close_timeout == null and options.schedule_to_close_timeout == null) return .{ .handler_error = .{
+        .type = .bad_request,
+        .message = what ++ " starts activity \"" ++ A.activity_name ++ "\" without a timeout; set options.start_to_close_timeout or options.schedule_to_close_timeout of its nexus.ActivityStart",
+        .retry = .non_retryable,
+    } };
+    const c = ctx.client_ orelse return .{ .handler_error = .{
+        .type = .internal,
+        .message = what ++ " starts activity \"" ++ A.activity_name ++ "\", but its context has no client to start it with",
+        .retry = .non_retryable,
+    } };
+    const i = &ctx.info_;
+    if (options.context == null) options.context = &ctx.propagated_;
+    const request_id = requestId(ctx) catch return outOfMemory(what);
+    if (options.id.len == 0) options.id = request_id;
+    if (options.task_queue.len == 0) options.task_queue = i.task_queue;
+    // The run ID is not known before the start, so the callback's token names none.
+    const callback_token = encodeActivityToken(a, c.namespace, options.id, "") catch return outOfMemory(what);
+    const headers = callbackHeaders(ctx, callback_token) catch return outOfMemory(what);
+
+    var rejected: ?client_mod.RpcRejection = null;
+    const started = c.startNexusActivity(a, A.activity_name, options, start.args, .{
+        .request_id = request_id,
+        .callback_url = i.callback_url,
+        .callback_headers = headers,
+        .links = i.links,
+        .rejection = &rejected,
+    }) catch |err| return .{ .handler_error = rpcError(a, what ++ ": starting activity \"" ++ A.activity_name ++ "\" failed", err, rejected) };
+    const token = encodeActivityToken(a, c.namespace, options.id, started.run_id) catch return outOfMemory(what);
+    const links = startedLinks(ctx, started.link) catch return outOfMemory(what);
+    return .{ .started = .{ .token = token, .links = links } };
+}
+
+/// Requests cancellation of the activity an activity-run operation's `token` names.
+fn cancelActivity(comptime what: []const u8, ctx: *Context, token: []const u8) CancelResult {
+    const a = ctx.arena;
+    var why: []const u8 = "";
+    const t = decodeActivityToken(a, token, &why) catch |err| return .{ .handler_error = switch (err) {
+        error.OutOfMemory => .{ .type = .internal, .message = what ++ ": out of memory decoding its operation token" },
+        error.InvalidToken => .{
+            .type = .bad_request,
+            .message = std.fmt.allocPrint(a, "{s}: the operation token to cancel is not an activity-run token: {s}", .{ what, why }) catch what ++ ": the operation token to cancel is not an activity-run token",
+            .retry = .non_retryable,
+        },
+    } };
+    const c = ctx.client_ orelse return .{ .handler_error = .{
+        .type = .internal,
+        .message = what ++ ": canceling its activity needs a client, and its context has none",
+        .retry = .non_retryable,
+    } };
+    if (!std.mem.eql(u8, t.namespace, c.namespace)) return .{ .handler_error = .{
+        .type = .bad_request,
+        .message = std.fmt.allocPrint(a, "{s}: the operation token names activity \"{s}\" in namespace \"{s}\", but this worker's client is in namespace \"{s}\"", .{ what, t.activity_id, t.namespace, c.namespace }) catch what ++ ": the operation token names another namespace",
+        .retry = .non_retryable,
+    } };
+    var rejected: ?client_mod.RpcRejection = null;
+    c.cancelNexusActivity(a, t.activity_id, t.run_id, &rejected) catch |err|
+        return .{ .handler_error = rpcError(a, std.fmt.allocPrint(a, "{s}: canceling activity \"{s}\" failed", .{ what, t.activity_id }) catch what ++ ": canceling its activity failed", err, rejected) };
+    return .requested;
+}
+
+/// An activity-run operation token: `{"t":2,"ns":<namespace>,"aid":<activity ID>,"rid":<run
+/// ID>}` as JSON, base64url-encoded without padding. `rid` is left out when empty.
+const ActivityToken = struct {
+    namespace: []const u8,
+    activity_id: []const u8,
+    /// Empty for a token written before the activity started: its latest run.
+    run_id: []const u8,
+};
+
+const activity_token_type = 2;
+
+fn encodeActivityToken(a: Allocator, namespace: []const u8, activity_id: []const u8, run_id: []const u8) error{OutOfMemory}![]const u8 {
+    if (run_id.len == 0) return encodeToken(a, .{ .t = @as(u8, activity_token_type), .ns = namespace, .aid = activity_id });
+    return encodeToken(a, .{ .t = @as(u8, activity_token_type), .ns = namespace, .aid = activity_id, .rid = run_id });
+}
+
+/// Parses an activity-run token. On `error.InvalidToken`, `why` says what is wrong with it.
+fn decodeActivityToken(a: Allocator, token: []const u8, why: *[]const u8) error{ OutOfMemory, InvalidToken }!ActivityToken {
+    const Fields = struct { t: i64, ns: []const u8, aid: ?[]const u8 = null, rid: ?[]const u8 = null, v: ?i64 = null };
+    const fields = try parseToken(Fields, a, token, activity_token_type, "activity run", why);
+    const aid = fields.aid orelse "";
+    if (aid.len == 0) {
+        why.* = "it names no activity ID";
         return error.InvalidToken;
     }
-    return .{ .namespace = fields.ns, .workflow_id = wid };
+    return .{ .namespace = fields.ns, .activity_id = aid, .run_id = fields.rid orelse "" };
 }
 
 // ---------------------------------------------------------------- tests
@@ -1496,6 +1771,211 @@ test "a rejected workflow start or cancel maps to a handler error by its gRPC st
     try testing.expect(rpcError(a, "w", error.Canceled, null).retryable());
 }
 
+const activity_mod = @import("activity.zig");
+
+const ShoutActivity = struct {
+    fn shout(ctx: *activity_mod.Context, text: []const u8) ![]const u8 {
+        return std.ascii.allocUpperString(ctx.allocator(), text);
+    }
+    const Def = activity_mod.Def("NexusShout", shout);
+
+    const Run = OperationDef("shout-run", []const u8, []const u8);
+    const Untimed = OperationDef("untimed", []const u8, []const u8);
+    const Service = ServiceDef("activity-service", .{ Run, Untimed });
+
+    fn run(_: *Context, input: []const u8) !ActivityStart(Def) {
+        return .{ .options = .{ .task_queue = "", .start_to_close_timeout = .fromSeconds(10) }, .args = .{input} };
+    }
+    fn untimed(_: *Context, input: []const u8) ActivityStart(Def) {
+        return .{ .options = .{ .task_queue = "" }, .args = .{input} };
+    }
+    const Handler = ServiceHandler(Service, .{ OperationHandler(Run, run), OperationHandler(Untimed, untimed) });
+};
+
+test "an activity-run token has the shared JSON layout, with or without its run ID, and malformed tokens are rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const token = try encodeActivityToken(a, "default", "greeting-1", "run-1");
+    // base64url of {"t":2,"ns":"default","aid":"greeting-1","rid":"run-1"}, no padding.
+    try testing.expectEqualStrings("eyJ0IjoyLCJucyI6ImRlZmF1bHQiLCJhaWQiOiJncmVldGluZy0xIiwicmlkIjoicnVuLTEifQ", token);
+    var why: []const u8 = "";
+    const t = try decodeActivityToken(a, token, &why);
+    try testing.expectEqualStrings("default", t.namespace);
+    try testing.expectEqualStrings("greeting-1", t.activity_id);
+    try testing.expectEqualStrings("run-1", t.run_id);
+    // The callback's token names no run.
+    const no_run = try encodeActivityToken(a, "default", "greeting-\u{fc}", "");
+    try testing.expectEqualStrings("{\"t\":2,\"ns\":\"default\",\"aid\":\"greeting-\\u00fc\"}", try decodeBase64(a, no_run));
+    const parsed = try decodeActivityToken(a, no_run, &why);
+    try testing.expectEqualStrings("greeting-\u{fc}", parsed.activity_id);
+    try testing.expectEqualStrings("", parsed.run_id);
+    // Padded, with a version 0 and unknown fields.
+    const extra = try encodeBase64(a, "{\"v\":0,\"t\":2,\"ns\":\"\",\"aid\":\"x\",\"y\":[1]}");
+    try testing.expectEqualStrings("x", (try decodeActivityToken(a, try std.mem.concat(a, u8, &.{ extra, "=" }), &why)).activity_id);
+
+    const Bad = struct { token: []const u8, why: []const u8 };
+    for ([_]Bad{
+        .{ .token = "", .why = "the token is empty" },
+        .{ .token = "not base64!", .why = "it is not base64url" },
+        .{ .token = try encodeBase64(a, "[1,2]"), .why = "it is not a JSON object" },
+        .{ .token = try encodeWorkflowToken(a, "default", "w"), .why = "its type is 1, not 2 (activity run)" },
+        .{ .token = try encodeBase64(a, "{\"t\":2,\"ns\":\"default\"}"), .why = "it names no activity ID" },
+        .{ .token = try encodeBase64(a, "{\"t\":2,\"ns\":\"default\",\"aid\":\"\"}"), .why = "it names no activity ID" },
+        .{ .token = try encodeBase64(a, "{\"t\":2,\"aid\":\"a\"}"), .why = "it is not a JSON object" },
+        .{ .token = try encodeBase64(a, "{\"t\":2,\"ns\":\"default\",\"aid\":\"a\",\"v\":1}"), .why = "its version is 1" },
+    }) |bad| {
+        why = "";
+        try testing.expectError(error.InvalidToken, decodeActivityToken(a, bad.token, &why));
+        try testing.expect(std.mem.indexOf(u8, why, bad.why) != null);
+    }
+    // And a workflow-run token reader refuses an activity-run token.
+    try testing.expectError(error.InvalidToken, decodeWorkflowToken(a, token, &why));
+    try testing.expectEqualStrings("its type is 2, not 1 (workflow run)", why);
+}
+
+fn decodeBase64(a: Allocator, text: []const u8) ![]const u8 {
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const out = try a.alloc(u8, try decoder.calcSizeForSlice(text));
+    try decoder.decode(out, text);
+    return out;
+}
+
+test "an activity-run operation is refused before any call without a client or a timeout, and each kind cancels only its own tokens" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const run = ActivityShoutOp("shout-run");
+    try testing.expectEqual(Operation.Kind.activity_run, run.operation.kind);
+    const input = try converter.toPayload(a, @as([]const u8, "x"));
+
+    var ctx = testContext(a, "shout-run");
+    const no_client = run.start(&ctx, input).handler_error;
+    try testing.expectEqual(HandlerErrorType.internal, no_client.type);
+    try testing.expect(!no_client.retryable());
+    try testing.expect(std.mem.indexOf(u8, no_client.message, "starts activity \"NexusShout\", but its context has no client") != null);
+
+    // The timeout is checked first.
+    var timed_ctx = testContext(a, "untimed");
+    const untimed = ActivityShoutOp("untimed").start(&timed_ctx, input).handler_error;
+    try testing.expectEqual(HandlerErrorType.bad_request, untimed.type);
+    try testing.expect(!untimed.retryable());
+    try testing.expect(std.mem.indexOf(u8, untimed.message, "options.start_to_close_timeout or options.schedule_to_close_timeout") != null);
+
+    // An activity-run operation takes only activity-run tokens, and a workflow-run one only
+    // workflow-run tokens.
+    for ([_][]const u8{ "garbage", try encodeWorkflowToken(a, "default", "w") }) |token| {
+        const refused = run.cancel(&ctx, token).handler_error;
+        try testing.expectEqual(HandlerErrorType.bad_request, refused.type);
+        try testing.expect(!refused.retryable());
+        try testing.expect(std.mem.indexOf(u8, refused.message, "not an activity-run token") != null);
+    }
+    const workflow_run = WaitingWorkflow.Handler.registered.find("run").?;
+    const crossed = workflow_run.cancel(&ctx, try encodeActivityToken(a, "default", "a", "r")).handler_error;
+    try testing.expectEqual(HandlerErrorType.bad_request, crossed.type);
+    try testing.expect(std.mem.indexOf(u8, crossed.message, "its type is 2, not 1 (workflow run)") != null);
+    // A well-formed token still needs a client to cancel with.
+    const no_client_cancel = run.cancel(&ctx, try encodeActivityToken(a, "default", "a", "r")).handler_error;
+    try testing.expectEqual(HandlerErrorType.internal, no_client_cancel.type);
+    try testing.expect(!no_client_cancel.retryable());
+}
+
+fn ActivityShoutOp(comptime name: []const u8) BoundOperation {
+    return ShoutActivity.Handler.registered.find(name).?;
+}
+
+test "a handler's signals need a client, and a second signal maps to a bad request" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Ping2 = workflow.SignalDef("ping", fn () void);
+    var ctx = testContext(a, "o");
+    try testing.expectError(error.NoClient, ctx.signalWorkflow(Ping2, "w", "", .{}));
+    try testing.expectError(error.NoClient, ctx.signalWithStartWorkflow(WaitingWorkflow.Def, .{ .id = "w" }, .{"x"}, Ping2, .{}));
+    // Nothing was claimed.
+    try testing.expect(!ctx.signaled_.load(.acquire));
+
+    const second = rpcError(a, "nexus operation \"o\" of service \"s\" failed", error.SignalAlreadySent, null);
+    try testing.expectEqual(HandlerErrorType.bad_request, second.type);
+    try testing.expect(!second.retryable());
+    try testing.expectEqualStrings("SignalAlreadySent", second.cause.?.type);
+    const taken = rpcError(a, "w", error.ActivityExecutionAlreadyStarted, null);
+    try testing.expectEqual(HandlerErrorType.internal, taken.type);
+    try testing.expect(!taken.retryable());
+}
+
+test "a handler sends one signal per request with the request's ID and links, and may retry one that failed" {
+    const testing_mod = @import("testing.zig");
+    const env = try testing_mod.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Ping2 = workflow.SignalDef("ping", fn ([]const u8) void);
+    var target = try env.client.executeWorkflow(WaitingWorkflow.Def, .{ .id = "signal-target", .task_queue = env.task_queue }, .{"x"});
+    defer target.deinit();
+
+    const caller_link: Link = .{ .variant = .{ .workflow_event = .{
+        .namespace = "default",
+        .workflow_id = "caller-workflow",
+        .run_id = "8b2f1c5e-6a3d-4f7e-9c1b-2d4e6f8a0b1c",
+        .reference = .{ .event_ref = .{ .event_id = 5, .event_type = .EVENT_TYPE_NEXUS_OPERATION_SCHEDULED } },
+    } } };
+    var ctx: Context = .{ .arena = a, .io_ = testing.io, .client_ = &env.client, .info_ = .{
+        .service = "s",
+        .operation = "o",
+        .request_id = "nexus-signal-request-1",
+        .links = &.{caller_link},
+        .namespace = "default",
+        .task_queue = env.task_queue,
+    } };
+    // A signal that fails gives the claim back.
+    try testing.expectError(error.NotFound, ctx.signalWorkflow(Ping2, "no-such-workflow", "", .{"lost"}));
+    try ctx.signalWorkflow(Ping2, "signal-target", "", .{"first"});
+    try testing.expectError(error.SignalAlreadySent, ctx.signalWorkflow(Ping2, "signal-target", "", .{"second"}));
+    try testing.expectError(error.SignalAlreadySent, ctx.signalWithStartWorkflow(WaitingWorkflow.Def, .{ .id = "signal-target" }, .{"x"}, Ping2, .{"third"}));
+
+    // A retried task has a new context and sends again with the same request ID: the server
+    // drops the copy.
+    var retry: Context = .{ .arena = a, .io_ = testing.io, .client_ = &env.client, .info_ = ctx.info_ };
+    try retry.signalWorkflow(Ping2, "signal-target", "", .{"first"});
+
+    const history = try env.client.fetchHistory(a, "signal-target", "");
+    var signals: u32 = 0;
+    for (history.events.items) |event| {
+        if (event.event_type != .EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED) continue;
+        signals += 1;
+        const attrs = event.attributes.?.workflow_execution_signaled_event_attributes;
+        try testing.expectEqualStrings("ping", attrs.signal_name);
+        try testing.expectEqualStrings("\"first\"", attrs.input.?.payloads.items[0].data);
+        try testing.expectEqual(1, event.links.items.len);
+        try testing.expectEqualStrings("caller-workflow", event.links.items[0].variant.?.workflow_event.workflow_id);
+    }
+    try testing.expectEqual(1, signals);
+
+    // Signal-with-start needs an explicit workflow ID, refused before the claim.
+    var sws: Context = .{ .arena = a, .io_ = testing.io, .client_ = &env.client, .info_ = ctx.info_ };
+    sws.info_.request_id = "nexus-signal-request-2";
+    try testing.expectError(error.InvalidOptions, sws.signalWithStartWorkflow(WaitingWorkflow.Def, .{}, .{"x"}, Ping2, .{"y"}));
+    try testing.expect(!sws.signaled_.load(.acquire));
+    const started = try sws.signalWithStartWorkflow(WaitingWorkflow.Def, .{ .id = "signal-with-start-target" }, .{"x"}, Ping2, .{"y"});
+    try testing.expect(started.started);
+    try testing.expectEqualStrings("signal-with-start-target", started.workflow_id);
+    const described = try env.client.describeWorkflow(a, "signal-with-start-target", "");
+    try testing.expectEqualStrings(started.run_id, described.run_id);
+    // The worker's task queue stood in for the empty one.
+    try testing.expectEqualStrings(env.task_queue, described.task_queue);
+    // The same request again finds the run it started, and doesn't signal twice.
+    var sws_retry: Context = .{ .arena = a, .io_ = testing.io, .client_ = &env.client, .info_ = sws.info_ };
+    const again = try sws_retry.signalWithStartWorkflow(WaitingWorkflow.Def, .{ .id = "signal-with-start-target" }, .{"x"}, Ping2, .{"y"});
+    try testing.expectEqualStrings(started.run_id, again.run_id);
+    var sws_signals: u32 = 0;
+    for ((try env.client.fetchHistory(a, "signal-with-start-target", "")).events.items) |event| {
+        if (event.event_type == .EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED) sws_signals += 1;
+    }
+    try testing.expectEqual(1, sws_signals);
+}
+
 test "compile errors name the operation, the service, and what to fix" {
     const expectMessage = struct {
         fn f(comptime message: ?[]const u8, comptime parts: []const []const u8) !void {
@@ -1540,6 +2020,9 @@ test "compile errors name the operation, the service, and what to fix" {
         fn wrongWorkflow(_: *Context, _: EchoInput) !WorkflowStart(WaitingWorkflow.Def) {
             return undefined;
         }
+        fn wrongActivity(_: *Context, _: EchoInput) !ActivityStart(ShoutActivity.Def) {
+            return undefined;
+        }
         const A = struct {
             fn echo(_: *@This(), _: *Context, i: EchoInput) !EchoOutput {
                 return .{ .message = i.message, .length = 0 };
@@ -1561,6 +2044,9 @@ test "compile errors name the operation, the service, and what to fix" {
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.noInput), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "takes no input" });
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.noContext), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "*nexus.Context first" });
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.wrongWorkflow), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "starts workflow \"NexusWaiting\"", "result type []const u8", "output type" });
+    try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.wrongActivity), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "starts activity \"NexusShout\"", "result type []const u8", "output type" });
+    try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.wrongOutput), OperationHandler(Ping, H.ping) }), &.{ "nexus.WorkflowStart", "nexus.ActivityStart" });
+    try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.noContext), OperationHandler(Ping, H.ping) }), &.{"!nexus.ActivityStart(A)"});
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.A.echo), OperationHandler(Ping, H.B.ping) }), &.{ "nexus service \"svc\"", "one service handler binds one receiver" });
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.echo), u8 }), &.{ "nexus service \"svc\"", "element 1", "not a nexus.OperationHandler" });
     try expectMessage(comptime serviceHandlerError(Svc, OperationHandler(Echo, H.echo)), &.{ "nexus service \"svc\"", "tuple" });
