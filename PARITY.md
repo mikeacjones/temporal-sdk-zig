@@ -204,7 +204,7 @@ Nexus is GA in Go, Java, and Python, and since August 2026 in TypeScript and .NE
 | Nexus endpoints and handlers in tests | Go, Java, Python, TypeScript, .NET | GA | supported | [Serving operations](README.md#serving-operations) |
 | Nexus serialization context: endpoint, service, and operation in the converter context (Nexus Per Endpoint Encryption, Public Preview) | Go, Java, Python, TypeScript, .NET | pre-release | missing | `temporal-sdk-zig-d51.10.9`. `converter.Context` has no Nexus fields, and the context a Nexus caller propagates to the workflows, updates and activities its handler starts is not used. |
 | Temporal operation handlers: operations that start workflows or standalone activities and signal workflows through a Temporal client (Pre-release) | Go, Java, Python, TypeScript, .NET | pre-release | partial | `temporal-sdk-zig-d51.10.10`. `nexus.WorkflowStart` backs an operation with a workflow run, and `nexus.Context.client()` reaches the worker's client. Missing: operations backed by a standalone activity, and signals that reuse the operation's request ID, with links. |
-| Standalone Nexus operations from a client (Public Preview, November 2026) | Go, Java, Python, TypeScript, .NET | pre-release | supported | [Standalone operations](README.md#standalone-operations) |
+| Standalone Nexus operations from a client (Public Preview, November 2026) | Go, Java, Python, TypeScript, .NET | pre-release | supported | [Standalone operations](README.md#standalone-operations), [nexus-standalone-operations](samples/nexus-standalone-operations) |
 
 ### Others
 
@@ -283,7 +283,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | nexus-multiple-arguments | [nexus-multiple-arguments](samples/nexus-multiple-arguments) | ported |
 | nexus-serialization-context | | planned: `temporal-sdk-zig-d51.16.107` |
 | nexus-standalone-activity | | planned: `temporal-sdk-zig-d51.16.70` |
-| nexus-standalone-operations | | planned: `temporal-sdk-zig-d51.16.71` |
+| nexus-standalone-operations | [nexus-standalone-operations](samples/nexus-standalone-operations) | ported |
 | opentelemetry | [opentelemetry](samples/opentelemetry) | ported |
 | opentelemetry-v2 | | planned: `temporal-sdk-zig-d51.16.77` |
 | pickfirst | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |

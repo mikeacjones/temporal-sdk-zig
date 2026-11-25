@@ -1,0 +1,23 @@
+// How samples-test validates this sample: create the namespaces and the Nexus endpoint below
+// on the dev server, start the worker (the nexus sample's handler, in the handler namespace),
+// run the starter (in the caller namespace), and check that the starter's output contains
+// each `expect` line before `timeout_seconds`. Listing and counting are eventually
+// consistent, so only their headings are checked. worker.zig says how to set up a server by
+// hand.
+.{
+    .expect = .{
+        "Started Echo operation OperationID=nexus-standalone-echo-op",
+        "Echo result: hello",
+        "Started Hello operation OperationID=nexus-standalone-hello-op",
+        "Hello result: Hello Temporal 👋",
+        "ListNexusOperations results",
+        "Total Nexus operations: ",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"handler_test.zig"},
+    .imports = .{"nexus"},
+    .namespaces = .{ "my-standalone-operations-handler-namespace", "my-standalone-operations-caller-namespace" },
+    .nexus_endpoints = .{
+        .{ .name = "my-standalone-operations-endpoint", .namespace = "my-standalone-operations-handler-namespace", .task_queue = "nexus-standalone-operations-handler-queue" },
+    },
+}
