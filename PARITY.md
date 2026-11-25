@@ -265,7 +265,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | goroutine | [io-group](samples/io-group) | ported |
 | greetings | [greetings](samples/greetings) | ported |
 | greetingslocal | [greetingslocal](samples/greetingslocal) | ported |
-| grpc-proxy | | planned: `temporal-sdk-zig-d51.16.81` |
+| grpc-proxy | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
 | helloworld | [helloworld](samples/helloworld) | ported |
 | helloworld-apiKey | [helloworld-apiKey](samples/helloworld-apiKey) | ported |
 | helloworldmtls | [helloworldmtls](samples/helloworldmtls) | ported |
@@ -327,5 +327,6 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 |-------------------|--------|
 | dynamicconfig | A server configuration file, not a sample. |
 | googleadk | Runs Google's Go ADK agent library; there is no Zig ADK. |
+| grpc-proxy | Its proxy must serve gRPC, which needs an HTTP/2 server; Zig's standard library has none and the Rust core provides only the client side of the connection. [codec-server](samples/codec-server) shows payload encoding kept outside the worker. Revisit when a Zig gRPC server exists. |
 | pickfirst | Exercises grpc-go's pick_first load-balancing policy; the Rust core owns the gRPC connection. Revisit if the core exposes load-balancing options. |
 | typed-searchattributes | Holds only a pointer to searchattributes, whose Zig sample covers typed search attributes. |
