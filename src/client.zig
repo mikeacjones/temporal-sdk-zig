@@ -141,14 +141,18 @@ pub const Options = struct {
     /// `.zero` for no heartbeats. Null is sdk-core's 60 s.
     worker_heartbeat_interval: ?Duration = null,
     /// The deadline of each call this client makes, including each retry attempt, and of
-    /// `Client.checkHealth`. A call that runs out fails with `error.RpcFailed`, logged with
-    /// gRPC status 1 (CANCELLED, "Timeout expired"), or 4 (DEADLINE_EXCEEDED) when the server
-    /// gives up first, and isn't retried. Calls that wait on the server, such as
-    /// waiting for a workflow's result or an update's outcome, aren't limited by it, and
-    /// workers' own calls aren't affected. It also bounds `Client.connect`, and the first
-    /// connection of a client from `Client.init`, which a call makes. `RpcOptions.timeout`
-    /// replaces it for the calls of a view from `Client.withRpcOptions`. Null keeps sdk-core's
-    /// default of 30 s. Must be positive; under 1 ms counts as 1 ms.
+    /// `Client.checkHealth`. A call that runs out isn't retried. A query (`queryWorkflow`,
+    /// `queryWorkflowWithOptions`, `queryWorkflowByName` and `queryWorkflowByNameWithOptions`)
+    /// then returns `error.DeadlineExceeded`, unlogged, and `Client.callService` returns
+    /// `error.DeadlineExceeded`, logged as a warning unless its `failure` is given; every
+    /// other call fails with `error.RpcFailed`, logged with gRPC status 1 (CANCELLED,
+    /// "Timeout expired"), or 4 (DEADLINE_EXCEEDED) when the server gives up first. Calls
+    /// that wait on the server, such as waiting for a workflow's result or an update's
+    /// outcome, aren't limited by it, and workers' own calls aren't affected. It also bounds
+    /// `Client.connect`, and the first connection of a client from `Client.init`, which a
+    /// call makes. `RpcOptions.timeout` replaces it for the calls of a view from
+    /// `Client.withRpcOptions`. Null keeps sdk-core's default of 30 s. Must be positive;
+    /// under 1 ms counts as 1 ms.
     rpc_timeout: ?Duration = null,
     /// Log a warning when a payload-carrying field of a request this client or its workers
     /// send is larger than this many bytes: one warning per such field, through `logger`,
@@ -914,13 +918,17 @@ pub const Client = struct {
     /// only as long as the view's timeout.
     ///
     /// `options.timeout` replaces `Options.rpc_timeout` for each call, as that option
-    /// applies: it is the deadline of each call and of each of its retries, a call that runs
-    /// out fails with `error.RpcFailed` (gRPC status 1, "Timeout expired", or 4,
-    /// DEADLINE_EXCEEDED, logged), and a first connection made by a call waits for it. Calls
-    /// that long-poll the server until something happens aren't limited by it: waiting for a
-    /// workflow's or an activity's result (`get` on the handles), for an update to reach its
-    /// wait stage or its outcome, and following history with `wait_new_event`. Cancel the
-    /// calling task to stop those. Null keeps `Options.rpc_timeout`.
+    /// applies: it is the deadline of each call and of each of its retries, and a first
+    /// connection made by a call waits for it. A query (`queryWorkflow`,
+    /// `queryWorkflowWithOptions`, `queryWorkflowByName` and `queryWorkflowByNameWithOptions`)
+    /// that runs out returns `error.DeadlineExceeded`, unlogged; a `callService` call that
+    /// runs out returns `error.DeadlineExceeded` too, logged as a warning unless its `failure`
+    /// is given; any other call that runs out fails with `error.RpcFailed` (gRPC status 1,
+    /// "Timeout expired", or 4, DEADLINE_EXCEEDED, logged). Calls that long-poll the server
+    /// until something happens aren't limited by it: waiting for a workflow's or an
+    /// activity's result (`get` on the handles), for an update to reach its wait stage or its
+    /// outcome, and following history with `wait_new_event`. Cancel the calling task to stop
+    /// those. Null keeps `Options.rpc_timeout`.
     ///
     /// `options.retry`, when set, decides for each call whether sdk-core retries it with
     /// `Options.retry`'s policy. `true` makes a workflow reset retry too, which can reset the
