@@ -247,7 +247,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | codec-server | [codec-server](samples/codec-server) | ported |
 | cron | [cron](samples/cron) | ported |
 | ctxpropagation | [ctxpropagation](samples/ctxpropagation) | ported |
-| datadog | | planned: `temporal-sdk-zig-d51.16.78` |
+| datadog | [datadog](samples/datadog) | ported |
 | dsl | [dsl](samples/dsl) | ported |
 | dynamic | [dynamic](samples/dynamic) | ported |
 | dynamic-workflows | [dynamic-workflows](samples/dynamic-workflows) | ported |
