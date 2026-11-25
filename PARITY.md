@@ -310,7 +310,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | standalone-activity | [standalone-activity](samples/standalone-activity) | ported |
 | start-delay | [start-delay](samples/start-delay) | ported |
 | synchronous-proxy | [synchronous-proxy](samples/synchronous-proxy) | ported |
-| temporal-fixtures | | planned: `temporal-sdk-zig-d51.16.82` |
+| temporal-fixtures | [temporal-fixtures](samples/temporal-fixtures) | ported |
 | timer | [timer](samples/timer) | ported |
 | typed-searchattributes | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
 | updatabletimer | [updatabletimer](samples/updatabletimer) | ported |
