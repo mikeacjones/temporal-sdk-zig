@@ -102,6 +102,14 @@ pub const DevServer = struct {
         "--dynamic-config-value", "history.enableTransitionHistory=true",
     };
 
+    /// Experimental: `extra_args` that let a standalone activity complete a Nexus operation
+    /// (`nexus.ActivityStart`). Use them with `standalone_activity_args`.
+    pub const activity_callback_args = [_][]const u8{ "--dynamic-config-value", "activity.enableCallbacks=true" };
+
+    /// Experimental: `extra_args` that make the server return a link for a signal, which a
+    /// Nexus handler's response then carries (`nexus.Context.signalWorkflow`).
+    pub const signal_link_args = [_][]const u8{ "--dynamic-config-value", "history.enableCHASMSignalBacklinks=true" };
+
     pub fn start(gpa: Allocator, io: Io, options: Options) !DevServer {
         var message: ?[]u8 = null;
         defer if (message) |m| gpa.free(m);

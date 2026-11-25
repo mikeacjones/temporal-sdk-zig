@@ -1760,7 +1760,20 @@ pub const Client = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
         const id = if (options.id.len > 0) options.id else try uuid(a, c.io);
+        const request = try c.signalWithStartRequest(a, workflow_type, id, options, args, signal_name, signal_args);
+        var header = try c.outgoingHeader(a, options.context);
+        const response = c.rpcCall(wfs.SignalWithStartWorkflowExecutionResponse, "SignalWithStartWorkflowExecution", request, a, null, &header, options.context) catch |err| switch (err) {
+            error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
+            else => |e| return e,
+        };
+        const run_id = try c.gpa.dupe(u8, response.run_id);
+        errdefer c.gpa.free(run_id);
+        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
+    }
 
+    /// The signal-with-start request for workflow `id`, allocated from `a`.
+    /// `signalWithStartNexusWorkflow` shares it.
+    fn signalWithStartRequest(c: *Client, a: Allocator, workflow_type: []const u8, id: []const u8, options: StartWorkflowOptions, args: anytype, signal_name: []const u8, signal_args: anytype) (search_attributes.EncodeError || error{InvalidOptions})!wfs.SignalWithStartWorkflowExecutionRequest {
         const start = try c.startRequest(a, workflow_type, id, options, args);
         const context: converter.Context = .{
             .values = options.context orelse &.empty,
@@ -1780,15 +1793,56 @@ pub const Client = struct {
             if (comptime @hasField(Start, name) and @FieldType(Start, name) == F and !std.mem.eql(u8, name, "_unknown_fields"))
                 @field(request, name) = @field(start, name);
         }
+        return request;
+    }
 
-        var header = try c.outgoingHeader(a, options.context);
-        const response = c.rpcCall(wfs.SignalWithStartWorkflowExecutionResponse, "SignalWithStartWorkflowExecution", request, a, null, &header, options.context) catch |err| switch (err) {
+    /// Experimental: sends the signal of a Nexus operation handler
+    /// (`nexus.Context.signalWorkflow`). Applications don't call this. It is `signalWorkflowByNameWithOptions` with
+    /// `attach.request_id` as the signal's request ID, so the server drops a second signal
+    /// with the same ID, and `attach.links` recorded with the signal. Returns the server's
+    /// link to the signal's event, or null when it sends none (the dev server sends one with
+    /// `testing.DevServer.signal_link_args`). Everything the call allocates, and the link,
+    /// comes from `arena`.
+    pub fn signalNexusWorkflow(c: *Client, arena: Allocator, signal_name: []const u8, workflow_id: []const u8, run_id: []const u8, args: anytype, options: SignalOptions, attach: NexusSignalAttachments) SignalError!?proto.temporal.api.common.v1.Link {
+        var header = try c.outgoingHeader(arena, options.context);
+        const context = c.workflowContext(workflow_id, options.context);
+        var request: wfs.SignalWorkflowExecutionRequest = .{
+            .namespace = c.namespace,
+            .workflow_execution = .{ .workflow_id = workflow_id, .run_id = run_id },
+            .signal_name = signal_name,
+            .input = .{ .payloads = try converter.toPayloadsWithContext(arena, &context, args) },
+            .identity = c.identity,
+            .request_id = attach.request_id,
+        };
+        try request.links.appendSlice(arena, attach.links);
+        const response = c.rpcCall(wfs.SignalWorkflowExecutionResponse, "SignalWorkflowExecution", request, arena, null, &header, options.context) catch |err| switch (err) {
+            error.AlreadyExists => return error.InvalidResponse,
+            else => |e| return e,
+        };
+        return response.link;
+    }
+
+    /// Experimental: the signal-with-start of a Nexus operation handler
+    /// (`nexus.Context.signalWithStartWorkflow`). Applications don't call this. It is
+    /// `signalWithStartWorkflowByName` with `attach.request_id` as the request ID, which
+    /// deduplicates both the start and the signal, and `attach.links` recorded with them.
+    /// `options.id` must be set: an empty one is `error.InvalidOptions` (logged), since a
+    /// generated ID would start a new workflow on every retried request. Everything the call
+    /// allocates, and the result, comes from `arena`.
+    pub fn signalWithStartNexusWorkflow(c: *Client, arena: Allocator, workflow_type: []const u8, options: StartWorkflowOptions, args: anytype, signal_name: []const u8, signal_args: anytype, attach: NexusSignalAttachments) StartError!NexusSignalWithStarted {
+        if (options.id.len == 0) {
+            log.warn("signal-with-start of workflow type \"{s}\" for a Nexus operation: StartWorkflowOptions.id is empty; a generated ID would start a new workflow on every retried request, so set it", .{workflow_type});
+            return error.InvalidOptions;
+        }
+        var request = try c.signalWithStartRequest(arena, workflow_type, options.id, options, args, signal_name, signal_args);
+        request.request_id = attach.request_id;
+        try request.links.appendSlice(arena, attach.links);
+        var header = try c.outgoingHeader(arena, options.context);
+        const response = c.rpcCall(wfs.SignalWithStartWorkflowExecutionResponse, "SignalWithStartWorkflowExecution", request, arena, null, &header, options.context) catch |err| switch (err) {
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
             else => |e| return e,
         };
-        const run_id = try c.gpa.dupe(u8, response.run_id);
-        errdefer c.gpa.free(run_id);
-        return .{ .client = c, .id = try c.gpa.dupe(u8, id), .run_id = run_id };
+        return .{ .run_id = response.run_id, .started = response.started, .link = response.signal_link };
     }
 
     /// Terminates a workflow execution: it stops at once, with no chance to clean up. An empty
@@ -2385,6 +2439,28 @@ pub const Client = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
         const id = if (options.id.len > 0) options.id else try uuid(a, c.io);
+        const request = try c.startActivityRequest(a, activity_type, id, options, args);
+        var status: ?RpcStatus = null;
+        var header = try c.outgoingHeader(a, options.context);
+        const response = c.rpcCall(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status, &header, options.context) catch |err| switch (err) {
+            error.AlreadyExists => return error.ActivityExecutionAlreadyStarted,
+            error.RpcFailed => {
+                const st = status orelse return error.RpcFailed;
+                log.err("starting activity {s} of type \"{s}\" on task queue \"{s}\" failed: {s} (gRPC status {d})", .{ id, activity_type, options.task_queue, st.message, st.code });
+                return error.RpcFailed;
+            },
+            else => |e| return e,
+        };
+        var handle = try c.getActivityHandle(Result, id, response.run_id);
+        errdefer handle.deinit();
+        handle.activity_type = try c.gpa.dupe(u8, activity_type);
+        handle.started = response.started;
+        return handle;
+    }
+
+    /// The start request of standalone activity `id` for `options`, allocated from `a`.
+    /// `startNexusActivity` shares it, so every option reaches both.
+    fn startActivityRequest(c: *Client, a: Allocator, activity_type: []const u8, id: []const u8, options: StartActivityOptions, args: anytype) search_attributes.EncodeError!wfs.StartActivityExecutionRequest {
         var request: wfs.StartActivityExecutionRequest = .{
             .namespace = c.namespace,
             .identity = c.identity,
@@ -2419,22 +2495,78 @@ pub const Client = struct {
         if (options.summary.len > 0) request.user_metadata = .{ .summary = try converter.toPayload(a, options.summary) };
         if (options.priority) |p| request.priority = .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight };
         request.start_delay = proto_time.durationToProto(options.start_delay);
+        return request;
+    }
+
+    /// Experimental: starts the standalone activity behind a Nexus activity-run operation
+    /// (`temporal.nexus`), so the server completes the operation when the activity closes.
+    /// Applications don't call this: return a `nexus.ActivityStart` from an operation handler
+    /// instead.
+    ///
+    /// The request is a normal start of `activity_type` with `options` and `args`, plus
+    /// `attach`: its request ID replaces the generated one, so a retried start with the same
+    /// request ID finds the activity the first one started. With `attach.callback_url` set,
+    /// the completion callback carries `attach.links`; without it the request does. A start
+    /// that finds the activity running attaches the request ID, the callback and the links to
+    /// it. An empty `options.id` generates one, as `executeActivity` does; the Nexus handler
+    /// always sets it, since the operation token names the activity by ID.
+    ///
+    /// The result's memory, and everything the call allocates, comes from `arena`. Errors are
+    /// `executeActivity`'s; a rejection is logged only when `attach.rejection` is null.
+    pub fn startNexusActivity(c: *Client, arena: Allocator, activity_type: []const u8, options: StartActivityOptions, args: anytype, attach: NexusActivityAttachments) StartActivityError!NexusActivityStarted {
+        const id = if (options.id.len > 0) options.id else try uuid(arena, c.io);
+        var request = try c.startActivityRequest(arena, activity_type, id, options, args);
+        request.request_id = attach.request_id;
+        const has_callback = attach.callback_url.len > 0;
+        if (has_callback) {
+            var callback: proto.temporal.api.common.v1.Callback = .{ .variant = .{ .nexus = .{ .url = attach.callback_url } } };
+            for (attach.callback_headers) |h| try callback.variant.?.nexus.header.append(arena, .{ .key = h.name, .value = h.value });
+            try callback.links.appendSlice(arena, attach.links);
+            try request.completion_callbacks.append(arena, callback);
+        } else {
+            try request.links.appendSlice(arena, attach.links);
+        }
+        if (has_callback or attach.links.len > 0)
+            request.on_conflict_options = .{ .attach_request_id = true, .attach_completion_callbacks = has_callback, .attach_links = attach.links.len > 0 };
+        var header = try c.outgoingHeader(arena, options.context);
         var status: ?RpcStatus = null;
-        var header = try c.outgoingHeader(a, options.context);
-        const response = c.rpcCall(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, a, &status, &header, options.context) catch |err| switch (err) {
+        const status_out: ?*?RpcStatus = if (attach.rejection != null) &status else null;
+        const response = c.rpcCall(wfs.StartActivityExecutionResponse, "StartActivityExecution", request, arena, status_out, &header, options.context) catch |err| switch (err) {
             error.AlreadyExists => return error.ActivityExecutionAlreadyStarted,
             error.RpcFailed => {
-                const st = status orelse return error.RpcFailed;
-                log.err("starting activity {s} of type \"{s}\" on task queue \"{s}\" failed: {s} (gRPC status {d})", .{ id, activity_type, options.task_queue, st.message, st.code });
+                if (attach.rejection) |out| out.* = if (status) |s| rpcRejection(s) else null;
                 return error.RpcFailed;
             },
             else => |e| return e,
         };
-        var handle = try c.getActivityHandle(Result, id, response.run_id);
-        errdefer handle.deinit();
-        handle.activity_type = try c.gpa.dupe(u8, activity_type);
-        handle.started = response.started;
-        return handle;
+        return .{
+            .run_id = response.run_id,
+            .link = response.link orelse .{ .variant = .{ .activity = .{ .namespace = c.namespace, .activity_id = id, .run_id = response.run_id } } },
+        };
+    }
+
+    /// Experimental: requests cancellation of run `run_id` of standalone activity
+    /// `activity_id` (the latest run when empty) for a Nexus activity-run operation's cancel.
+    /// Applications don't call this. The activity learns of it at its next heartbeat. A
+    /// rejection the server reports with `error.RpcFailed` isn't logged: its gRPC status is
+    /// stored in `rejected` (null without one), its message allocated from `arena`, as is
+    /// everything the call allocates. FAILED_PRECONDITION means the activity has closed.
+    pub fn cancelNexusActivity(c: *Client, arena: Allocator, activity_id: []const u8, run_id: []const u8, rejected: *?RpcRejection) error{ OutOfMemory, Canceled, RpcFailed, NotFound, InvalidResponse, CodecFailed }!void {
+        var status: ?RpcStatus = null;
+        rejected.* = null;
+        _ = c.rpcWithStatus(wfs.RequestCancelActivityExecutionResponse, "RequestCancelActivityExecution", wfs.RequestCancelActivityExecutionRequest{
+            .namespace = c.namespace,
+            .activity_id = activity_id,
+            .run_id = run_id,
+            .identity = c.identity,
+            .request_id = try uuid(arena, c.io),
+        }, arena, &status) catch |err| switch (err) {
+            error.AlreadyExists, error.RpcFailed => {
+                if (status) |s| rejected.* = rpcRejection(s);
+                return error.RpcFailed;
+            },
+            else => |e| return e,
+        };
     }
 
     /// A handle to an activity started with `executeActivity`, for example by another
@@ -3757,6 +3889,49 @@ pub const NexusWorkflowStarted = struct {
     /// Links to the workflow's start event: the server's, or one naming the event by the
     /// request ID when the server sends none.
     link: proto.temporal.api.common.v1.Link,
+};
+
+/// Experimental: what `Client.startNexusActivity` attaches to the activity it starts, as
+/// `NexusWorkflowAttachments` does for a workflow. Borrowed for the call.
+pub const NexusActivityAttachments = struct {
+    /// The Nexus start request's ID, sent as the start's request ID.
+    request_id: []const u8,
+    /// Where the server delivers the operation's completion; empty attaches no callback.
+    callback_url: []const u8 = "",
+    /// Headers the server sends with the completion, the operation token among them.
+    callback_headers: []const NexusHeader = &.{},
+    /// Links back to what scheduled the operation: on the callback when there is one,
+    /// otherwise on the request.
+    links: []const proto.temporal.api.common.v1.Link = &.{},
+    /// As `NexusWorkflowAttachments.rejection`.
+    rejection: ?*?RpcRejection = null,
+};
+
+/// Experimental: the activity `Client.startNexusActivity` started, or found already started
+/// by the same request ID.
+pub const NexusActivityStarted = struct {
+    run_id: []const u8,
+    /// A link to the activity: the server's, or one naming it by namespace, ID and run ID
+    /// when the server sends none.
+    link: proto.temporal.api.common.v1.Link,
+};
+
+/// Experimental: what `Client.signalNexusWorkflow` and `signalWithStartNexusWorkflow`
+/// attach. Borrowed for the call.
+pub const NexusSignalAttachments = struct {
+    /// The Nexus start request's ID, sent as the signal's request ID.
+    request_id: []const u8,
+    /// Links back to what scheduled the operation, recorded with the signal.
+    links: []const proto.temporal.api.common.v1.Link = &.{},
+};
+
+/// Experimental: what `Client.signalWithStartNexusWorkflow` did.
+pub const NexusSignalWithStarted = struct {
+    run_id: []const u8,
+    /// True when the call started the run; false when it only signaled a running one.
+    started: bool,
+    /// The server's link to the signal's event, or null when it sends none.
+    link: ?proto.temporal.api.common.v1.Link,
 };
 
 /// How `Client.signalWorkflowWithOptions` sends a signal.

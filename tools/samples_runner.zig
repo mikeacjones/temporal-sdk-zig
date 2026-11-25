@@ -394,10 +394,14 @@ fn contains(list: []const []const u8, item: []const u8) bool {
 }
 
 /// Starts the shared dev server with the custom search attributes tests get, standalone
-/// activities, and the namespaces the samples declare.
+/// activities, standalone activities completing Nexus operations
+/// (`DevServer.activity_callback_args`), links for signals (`DevServer.signal_link_args`), and
+/// the namespaces the samples declare.
 fn startDevServer(gpa: Allocator, io: Io, arena: Allocator, samples: []const Sample) !temporal.testing.DevServer {
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(arena, &temporal.testing.DevServer.standalone_activity_args);
+    try args.appendSlice(arena, &temporal.testing.DevServer.activity_callback_args);
+    try args.appendSlice(arena, &temporal.testing.DevServer.signal_link_args);
     for (try serverNamespaces(arena, samples)) |ns| try args.appendSlice(arena, &.{ "--namespace", ns });
     return temporal.testing.DevServer.start(gpa, io, .{ .search_attributes = &temporal.testing.custom_search_attributes, .extra_args = args.items });
 }

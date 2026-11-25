@@ -3035,13 +3035,83 @@ Notes:
 
 - A handler is `fn (ctx: *nexus.Context, input: Input) !Output`, or takes a receiver pointer first to share state; register those with `Worker.registerNexusServiceWith` and an instance that outlives the worker. An operation whose input is `void` may leave the input parameter out. Handlers run on the worker's `std.Io`, like activities, and may do any I/O.
 - A handler that returns `nexus.WorkflowStart(W)` makes a workflow-run operation: the worker's client starts workflow `W` with the returned options and arguments, and the operation completes with the workflow's result when it closes. The start carries the Nexus request ID, so a retried start finds the workflow the first one started. An empty `options.id` uses the request ID and an empty `options.task_queue` the worker's task queue. Canceling the operation requests cancellation of the workflow.
-- A missing handler, a handler for an operation the service doesn't have, two operations with one name, a handler whose input or output type differs from the operation's, or a workflow whose result type isn't the operation's output is a compile error that names the service and the operation.
-- `ctx.fail` and `ctx.failCanceled` end the operation as failed or canceled, which the caller doesn't retry. `ctx.handlerError` fails the request with a `nexus.HandlerErrorType`; `bad_request`, `unauthenticated`, `unauthorized`, `not_found`, `conflict`, and `not_implemented` aren't retried by default, the others are, and `retry` overrides the default. Any other error a handler returns is a retried `internal` handler error named after it, except `error.NotFound`, which is `not_found`, and `error.WorkflowExecutionAlreadyStarted`, `error.InvalidOptions`, and `error.InvalidSearchAttribute`, which are `internal` and not retried.
-- When the server rejects a workflow-run operation's start or cancel, the handler error follows the gRPC status and carries the server's message: INVALID_ARGUMENT is `bad_request`; NOT_FOUND `not_found`; ALREADY_EXISTS, FAILED_PRECONDITION, and OUT_OF_RANGE an `internal` that isn't retried; ABORTED and UNAVAILABLE `unavailable`; RESOURCE_EXHAUSTED `resource_exhausted`; UNIMPLEMENTED `not_implemented`; DEADLINE_EXCEEDED `upstream_timeout`; any other a retried `internal`.
-- What a handler passes to `ctx.fail`, `ctx.failCanceled`, and `ctx.handlerError`, and the strings in a `WorkflowStart`, are stored as given: they must live until the response has been sent, as memory from `ctx.allocator()` does.
+- A handler that returns `nexus.ActivityStart(A)` makes an activity-run operation, backed by a standalone activity: see [Activity-backed operations and signals](#activity-backed-operations-and-signals).
+- A missing handler, a handler for an operation the service doesn't have, two operations with one name, a handler whose input or output type differs from the operation's, or a workflow or activity whose result type isn't the operation's output is a compile error that names the service and the operation.
+- `ctx.fail` and `ctx.failCanceled` end the operation as failed or canceled, which the caller doesn't retry. `ctx.handlerError` fails the request with a `nexus.HandlerErrorType`; `bad_request`, `unauthenticated`, `unauthorized`, `not_found`, `conflict`, and `not_implemented` aren't retried by default, the others are, and `retry` overrides the default. Any other error a handler returns is a retried `internal` handler error named after it, except `error.NotFound`, which is `not_found`; `error.SignalAlreadySent`, which is `bad_request`; and `error.WorkflowExecutionAlreadyStarted`, `error.ActivityExecutionAlreadyStarted`, `error.InvalidOptions`, and `error.InvalidSearchAttribute`, which are `internal` and not retried.
+- When the server rejects a workflow-run or activity-run operation's start or cancel, the handler error follows the gRPC status and carries the server's message: INVALID_ARGUMENT is `bad_request`; NOT_FOUND `not_found`; ALREADY_EXISTS, FAILED_PRECONDITION, and OUT_OF_RANGE an `internal` that isn't retried; ABORTED and UNAVAILABLE `unavailable`; RESOURCE_EXHAUSTED `resource_exhausted`; UNIMPLEMENTED `not_implemented`; DEADLINE_EXCEEDED `upstream_timeout`; any other a retried `internal`.
+- What a handler passes to `ctx.fail`, `ctx.failCanceled`, and `ctx.handlerError`, and the strings in a `WorkflowStart` or `ActivityStart`, are stored as given: they must live until the response has been sent, as memory from `ctx.allocator()` does.
 - `ctx.info()` gives the service, operation, endpoint, namespace, task queue, request ID, request deadline, headers (`Info.header` looks one up by name, ignoring case), and the caller's links; `ctx.client()` gives the worker's client, and `ctx.logger()` a logger that adds the service, operation, endpoint, and task queue to each message.
 - Registering a service name twice returns `error.AlreadyRegistered`.
 - A worker with a registered service polls its task queue for Nexus tasks: see [Serving operations](#serving-operations).
+
+#### Activity-backed operations and signals
+
+Experimental: the names and behavior below may change. A handler can back an asynchronous operation with a standalone activity, and can send a workflow one signal or signal-with-start per request that a retried request doesn't deliver twice.
+
+A handler that returns `nexus.ActivityStart(A)` makes an activity-run operation: the worker's client starts activity `A` on its own, without a workflow, and the server completes the operation when the activity closes, with its result, or failed when it fails or times out.
+
+<!-- example: nexus-activity-operation -->
+```zig
+fn composeGreeting(ctx: *temporal.activity.Context, name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(ctx.allocator(), "Hello, {s}!", .{name});
+}
+pub const ComposeGreeting = temporal.activity.Def("compose_greeting", composeGreeting);
+
+pub const Compose = nexus.OperationDef("compose", []const u8, []const u8);
+pub const ComposeService = nexus.ServiceDef("compose-service", .{Compose});
+
+// An activity-run operation returns the standalone activity to start, and completes with
+// its result. The empty ID and task queue use the request ID and the worker's task queue.
+fn compose(_: *nexus.Context, name: []const u8) !nexus.ActivityStart(ComposeGreeting) {
+    return .{ .options = .{ .task_queue = "", .start_to_close_timeout = .fromSeconds(10) }, .args = .{name} };
+}
+
+pub const ComposeHandler = nexus.ServiceHandler(ComposeService, .{nexus.OperationHandler(Compose, compose)});
+
+fn registerComposeService(w: *temporal.worker.Worker) !void {
+    try w.registerActivity(ComposeGreeting);
+    try w.registerNexusService(ComposeHandler);
+}
+```
+
+`ctx.signalWorkflow` and `ctx.signalWithStartWorkflow` (and their `ByName` forms) send through the worker's client with the Nexus request's ID as the signal's request ID:
+
+<!-- example: nexus-signal -->
+```zig
+pub const ApproveInput = struct { order_id: []const u8, user_id: []const u8 };
+pub const NoteInput = struct { order_id: []const u8, note: []const u8 };
+pub const Approve = nexus.OperationDef("approve", ApproveInput, void);
+pub const AttachNote = nexus.OperationDef("attach-note", NoteInput, void);
+pub const ApprovalService = nexus.ServiceDef("approval-service", .{ Approve, AttachNote });
+
+const ApproveSignal = workflow.SignalDef("approve", fn ([]const u8) void);
+const NoteSignal = workflow.SignalDef("attach_note", fn ([]const u8) void);
+
+// Signals the order's workflow once, even when the request is retried.
+fn approve(ctx: *nexus.Context, input: ApproveInput) !void {
+    try ctx.signalWorkflow(ApproveSignal, input.order_id, "", .{input.user_id});
+}
+
+// Signals the order's workflow, starting it first if it isn't running. The ID is required.
+fn attachNote(ctx: *nexus.Context, input: NoteInput) !void {
+    _ = try ctx.signalWithStartWorkflow(Order, .{ .id = input.order_id }, .{}, NoteSignal, .{input.note});
+}
+
+pub const ApprovalHandler = nexus.ServiceHandler(ApprovalService, .{
+    nexus.OperationHandler(Approve, approve),
+    nexus.OperationHandler(AttachNote, attachNote),
+});
+```
+
+Notes:
+
+- An empty `options.id` of an `ActivityStart` uses the request ID, an empty `options.task_queue` the worker's task queue, and a null `options.context` the request's propagated values. At least one of `options.start_to_close_timeout` and `options.schedule_to_close_timeout` is required; without either, the request fails as a `bad_request` that isn't retried, before any call. A retried start with the same request ID finds the activity the first one started.
+- Canceling an activity-run operation requests the activity's cancellation, which a running attempt sees at its next heartbeat (see `StartActivityOptions.heartbeat_timeout`); the operation ends canceled once the activity does. The activity's result payload reaches the caller as the activity returned it, so the caller decodes it with its own codecs.
+- A request sends one signal, through any of the four calls, because the signal carries the request's ID: when the Nexus task is retried, the new attempt sends it again with the same ID and the server drops the copy. A second call in the same request, while the first is in flight or after it succeeded, returns `error.SignalAlreadySent`; a handler that returns it fails the request as a `bad_request` that isn't retried. A call that failed may be repeated. A signal doesn't use up the start: the handler may still return a `WorkflowStart` or an `ActivityStart`.
+- `signalWithStartWorkflow` needs an explicit `options.id`: an empty one returns `error.InvalidOptions` (a non-retryable `internal` when returned), since a generated ID would start a new workflow on every retried request. An empty `options.task_queue` uses the worker's task queue. Its result says whether the call started the run; a retried request finds the run the first attempt started.
+- Signals sent through `ctx.client()` carry their own request IDs: they aren't limited to one per request, and a retried request delivers them again.
+- The activity a handler starts, and the workflow it signals, carry links to the caller's scheduling event; the operation's response carries links to the started activity and to the signal, which the caller's history records. The server returns a link for a signal only when its signal backlinks are enabled (see the next note).
+- The dev server needs `testing.DevServer.standalone_activity_args` and `testing.DevServer.activity_callback_args` for activity-run operations, and `testing.DevServer.signal_link_args` for links to signals, all passed as `extra_args` (or `WorkflowEnvironment.Options.dev_server_extra_args`).
 
 #### Calling operations from workflows
 
@@ -3115,7 +3185,7 @@ Notes:
 - A request for a service or an operation the worker doesn't have fails as `not_found`, naming both; one the worker can't decode fails as `bad_request`. Neither is retried.
 - A request the worker's Io has no thread for fails as `resource_exhausted`, which the server retries.
 - The client's payload codecs apply to an operation's input, its result, and the details of its failure.
-- The caller's links arrive in `ctx.info().links`, and a workflow-run operation's start returns a link to its workflow, which the caller's history records. Only workflow-event links are converted; a link of another kind, or one that doesn't parse, is logged and dropped.
+- The caller's links arrive in `ctx.info().links`, and a workflow-run or activity-run operation's start returns a link to its workflow or activity, which the caller's history records. Workflow-event, activity, and Nexus-operation links are converted; a link of another kind, or one that doesn't parse, is logged and dropped.
 - `max_concurrent_nexus_task_executions` and `max_concurrent_nexus_task_pollers` bound the requests handled and the polls open at once (see [Options](#options)).
 
 #### Standalone operations
