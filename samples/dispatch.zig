@@ -100,6 +100,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "schedule:starter")) return @import("schedule/starter.zig").main(init);
     if (std.mem.eql(u8, name, "searchattributes:worker")) return @import("searchattributes/worker.zig").main(init);
     if (std.mem.eql(u8, name, "searchattributes:starter")) return @import("searchattributes/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "session-failure:worker")) return @import("session-failure/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "session-failure:starter")) return @import("session-failure/starter.zig").main(init);
     if (std.mem.eql(u8, name, "shoppingcart:worker")) return @import("shoppingcart/worker.zig").main(init);
     if (std.mem.eql(u8, name, "shoppingcart:starter")) return @import("shoppingcart/starter.zig").main(init);
     if (std.mem.eql(u8, name, "sleep-for-days:worker")) return @import("sleep-for-days/worker.zig").main(init);

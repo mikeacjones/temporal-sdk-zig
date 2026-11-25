@@ -1,0 +1,10 @@
+// How samples-test validates this sample: start the worker, which is also a session host,
+// with its long-running activity shortened to two seconds, run the starter, and check that
+// the starter's output contains the `expect` line before `timeout_seconds`. The starter waits
+// for the workflow, whose two activities run in one session.
+.{
+    .expect = .{"Workflow completed"},
+    .worker_args = .{"2"},
+    .timeout_seconds = 60,
+    .tests = .{"workflow_test.zig"},
+}

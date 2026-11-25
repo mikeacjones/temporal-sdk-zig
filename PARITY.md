@@ -300,7 +300,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | schedule | [schedule](samples/schedule) | ported |
 | searchattributes | [searchattributes](samples/searchattributes) | ported |
 | serverjwtauth | [serverjwtauth](samples/serverjwtauth) | ported |
-| session-failure | | planned: `temporal-sdk-zig-d51.16.73` |
+| session-failure | [session-failure](samples/session-failure) | ported |
 | shoppingcart | [shoppingcart](samples/shoppingcart) | ported |
 | sleep-for-days | [sleep-for-days](samples/sleep-for-days) | ported |
 | slogadapter | [logadapter](samples/logadapter) | ported |
