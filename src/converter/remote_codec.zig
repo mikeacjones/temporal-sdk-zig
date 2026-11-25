@@ -42,9 +42,14 @@ pub const RemoteCodecOptions = struct {
 /// (`{"payloads":[...]}`) with `content-type: application/json`. Only an answer with status
 /// 200 whose body is such a list, holding as many payloads as were sent, succeeds. Anything
 /// else is `error.CodecFailed`, logged under the `temporal` scope; the input payloads are
-/// never passed through. A transport failure (connecting, writing or reading) is retried
-/// once at once, on a new connection, as connections are pooled and a server may close
-/// idle ones without notice: before the retry every idle pooled connection is closed. No context (`converter.Context`) is sent.
+/// never passed through. A transport failure (connecting, writing or reading, a body cut off
+/// by a failed read included) is retried once at once, on a new connection, as connections
+/// are pooled and a server may close idle ones without notice: before the retry every idle
+/// pooled connection is closed; so is a body the connection ends before its content-length.
+/// An answer whose head arrived is not retried, even when its body can't be decoded (a
+/// content-encoding other than identity, gzip, deflate and zstd, or a failed decompression). An https
+/// codec loads the system CA bundle on its first call, before the timed request, with
+/// cancels blocked. No context (`converter.Context`) is sent.
 pub const RemoteCodec = struct {
     state: *State,
 
@@ -283,13 +288,36 @@ const State = struct {
         s.headers = headers.items;
     }
 
+    /// Loads the system CA bundle into `client` on the first https call, before its exchange
+    /// starts, with cancels blocked. std.http.Client would otherwise load it inside the
+    /// exchange's `client.request`, where std drops a cancel that lands while it reads the
+    /// bundle's files (`Io.Writer.Allocating.sendFile` ignores a failed stat): the timeout's
+    /// cancel would be used up, and the TLS handshake after it could wait without a limit.
+    /// Setting `client.now` is how std knows the bundle is loaded, so its request never loads
+    /// it again. The load reads local files only; the caller's own cancel waits for it.
+    fn loadCertificateBundle(s: *State) std.crypto.Certificate.Bundle.RescanError!void {
+        if (!s.tls) return;
+        const io = s.io;
+        const prev = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prev);
+        const ca_lock = &s.client.ca_bundle_lock;
+        // Held exclusively for the load, so concurrent first calls load it once, and no
+        // handshake reads the bundle while it changes.
+        ca_lock.lockUncancelable(io);
+        defer ca_lock.unlock(io);
+        if (s.client.now != null) return;
+        const now = Io.Clock.real.now(io);
+        try s.client.ca_bundle.rescan(s.client.allocator, io, now);
+        s.client.now = now;
+    }
+
     /// std.http.Client checks every server certificate as of `client.now`, which it reads once,
-    /// on its first https request, and never again: in a codec that lives as long as a worker,
+    /// when the CA bundle is loaded, and never again: in a codec that lives as long as a worker,
     /// a certificate the server renewed later would be refused as not yet valid, and one that
     /// expired later accepted. So each https attempt moves `client.now` to the current time when
-    /// it is a minute or more off. `client.now` stays null until std's first request has loaded
-    /// the CA bundle (null is how std knows to load it), and is never set back to null, which a
-    /// handshake under way would assert against. A handshake reads `client.now` without the
+    /// it is a minute or more off. `client.now` stays null until `loadCertificateBundle` has
+    /// loaded the CA bundle (null is how std knows to load it), and is never set back to null,
+    /// which a handshake under way would assert against. A handshake reads `client.now` without the
     /// lock, so the write happens only with `handshake_lock` held exclusively, which no
     /// handshake of this codec can run under. When another call holds it (a slow connect, say)
     /// the refresh is skipped rather than waited for; a later call makes it.
@@ -305,7 +333,7 @@ const State = struct {
         }
         if (!s.handshake_lock.tryLock(s.io)) return;
         defer s.handshake_lock.unlock(s.io);
-        // std writes `client.now` (on its first https request) under the CA bundle lock.
+        // `client.now` is written under the CA bundle lock, by std and by `loadCertificateBundle`.
         ca_lock.lockUncancelable(s.io);
         defer ca_lock.unlock(s.io);
         if (s.client.now != null) s.client.now = now;
@@ -337,6 +365,13 @@ const State = struct {
         var blocking: CancelBlockingAllocator = .{ .io = s.io, .backing = call_arena };
         const arena = blocking.allocator();
 
+        s.loadCertificateBundle() catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => |e| return e,
+            else => {
+                log.warn("converter.RemoteCodec: {s} payloads with {s} failed: the system CA bundle could not be loaded: {t}", .{ op.verb(), s.url(op), err });
+                return error.CodecFailed;
+            },
+        };
         const body = try protojson.encode(arena, Payloads{ .payloads = .fromOwnedSlice(try arena.dupe(Payload, payloads)) });
         var job: Job = .{ .state = s, .arena = arena, .uri = switch (op) {
             .encode => s.encode_uri,
@@ -353,6 +388,10 @@ const State = struct {
                 return error.CodecFailed;
             },
             .response => |response| {
+                if (response.body_error) |err| {
+                    log.warn("converter.RemoteCodec: {s} payloads with {s} failed: the codec server answered HTTP {d} with a body that could not be decoded ({t})", .{ op.verb(), s.url(op), @backingInt(response.status), err });
+                    return error.CodecFailed;
+                }
                 if (response.status != .ok) {
                     const preview = response.body[0..@min(response.body.len, 256)];
                     log.warn("converter.RemoteCodec: {s} payloads with {s} failed: the codec server answered HTTP {d}: \"{f}\"", .{ op.verb(), s.url(op), @backingInt(response.status), std.zig.fmtString(preview) });
@@ -437,19 +476,26 @@ const State = struct {
             return error.Canceled;
         }
         var response_body: Io.Writer.Allocating = .init(arena);
-        const status = send(&request, arena, body, &response_body.writer) catch |err| {
+        const answer = send(&request, arena, body, &response_body.writer) catch |err| {
             // `Request.deinit` would put a connection that failed while sending back into the
             // pool, and would read the rest of a response body that failed, without a limit.
             if (request.connection) |c| c.closing = true;
             return transportFailure(err, request.connection);
         };
-        return .{ .response = .{ .status = status, .body = response_body.written() } };
+        if (answer.body_error != null) {
+            // The rest of the body is unread.
+            if (request.connection) |c| c.closing = true;
+        }
+        return .{ .response = .{ .status = answer.status, .body = response_body.written(), .body_error = answer.body_error } };
     }
 };
 
 /// What came back from the codec server.
 const Exchange = union(enum) {
-    response: struct { status: http.Status, body: []const u8 },
+    /// An answer: its head arrived. `body_error` is why its body could not be decoded (an
+    /// unsupported content-encoding, or a failed decompression), in which case `body` is
+    /// what was decoded before it.
+    response: struct { status: http.Status, body: []const u8, body_error: ?anyerror = null },
     /// The cause of the last attempt's failure, for the log.
     transport: anyerror,
 };
@@ -480,31 +526,107 @@ const Job = struct {
     }
 };
 
+/// A response whose head arrived. `body_error` is set when its body could not be decoded.
+const Answer = struct { status: http.Status, body_error: ?anyerror = null };
+
 /// `std.http.Client.fetch`'s exchange, returning its errors with the connection still held so
 /// the caller can mark it closing, and without its panic on a failed read of a body with a
-/// content length.
-fn send(request: *http.Client.Request, arena: Allocator, body: []const u8, out: *Io.Writer) !http.Status {
+/// content length. An error is a transport failure; a body that arrived but can't be decoded
+/// is an `Answer` with its `body_error`, as the server answered.
+fn send(request: *http.Client.Request, arena: Allocator, body: []const u8, out: *Io.Writer) !Answer {
     request.transfer_encoding = .{ .content_length = body.len };
     var body_writer = try request.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(body);
     try body_writer.end();
     try request.connection.?.flush();
 
+    // An answer in a content-encoding std doesn't know (br, say) fails std's head parsing as
+    // `HttpHeadersInvalid`, which would look like a broken connection. So the head is read
+    // here first, without consuming it, and such an answer is returned as one.
+    if (try unknownEncodingStatus(&request.reader)) |status|
+        return .{ .status = status, .body_error = error.HttpContentEncodingUnsupported };
+    // The accept-encoding header has gone out. Accepting every encoding std knows now only
+    // stops `receiveHead` from refusing an answer in one it wasn't asked for (zstd, compress):
+    // zstd is decoded, and compress is reported as undecodable below.
+    request.accept_encoding = @splat(true);
     var response = try request.receiveHead(&.{});
-    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+    const status = response.head.status;
+    const encoding = response.head.content_encoding;
+    const decompress_buffer: []u8 = switch (encoding) {
         .identity => &.{},
-        .zstd => try arena.alloc(u8, std.compress.zstd.default_window_len),
+        .zstd => try arena.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max),
         .deflate, .gzip => try arena.alloc(u8, std.compress.flate.max_window_len),
-        .compress => return error.UnsupportedCompressionMethod,
+        .compress => return .{ .status = status, .body_error = error.UnsupportedCompressionMethod },
     };
     var transfer_buffer: [64]u8 = undefined;
     var decompress: http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     _ = reader.streamRemaining(out) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+        error.ReadFailed => {
+            // A decompressor that failed on its input, rather than on reading it from the
+            // connection, was given a body it can't decode; unless the input ran out before
+            // the content-length did, which is the connection closing early.
+            const decompress_err: ?anyerror = switch (encoding) {
+                .identity, .compress => null,
+                .deflate, .gzip => decompress.flate.err,
+                .zstd => decompress.zstd.err,
+            };
+            if (decompress_err) |e| if (e != error.ReadFailed) {
+                if (e == error.EndOfStream and bodyCutShort(&request.reader)) return error.ResponseBodyTruncated;
+                return .{ .status = status, .body_error = e };
+            };
+            return response.bodyErr() orelse error.ReadFailed;
+        },
         error.WriteFailed => return error.OutOfMemory, // `out` is an allocating writer
     };
-    return response.head.status;
+    // An identity body ends where its transfer reader ends, and a connection that closes
+    // before the content-length is used up ends that reader as if the body were complete. A
+    // compressed body ends where its stream does, which may be before the transfer reader
+    // has read the framing after it (a chunk's CRLF, the last chunk): that body is complete,
+    // and `Request.deinit` closes the connection rather than reuse it half read.
+    if (encoding == .identity and bodyCutShort(&request.reader)) return error.ResponseBodyTruncated;
+    return .{ .status = status };
+}
+
+/// Whether the transfer reader stopped before its content-length or last chunk. Meaningful
+/// only once that reader itself has ended: after an identity body, or after a decompressor
+/// ran out of input.
+fn bodyCutShort(reader: *const http.Reader) bool {
+    return switch (reader.state) {
+        .body_remaining_content_length, .body_remaining_chunk_len => true,
+        else => false,
+    };
+}
+
+/// Reads the response head into the connection's buffer without consuming it, as
+/// `http.Reader.receiveHead` does, and returns its status when its content-encoding is one
+/// std.http.Client can't parse. Returns null for any other head, which `receiveHead` then
+/// reads from the buffer.
+fn unknownEncodingStatus(reader: *http.Reader) !?http.Status {
+    const in = reader.in;
+    var hp: http.HeadParser = .{};
+    var head_len: usize = 0;
+    while (hp.state != .finished) {
+        if (head_len >= reader.max_head_len) return error.HttpHeadersOversize;
+        const remaining = in.buffered()[head_len..];
+        if (remaining.len == 0) {
+            in.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return if (head_len == 0) error.HttpConnectionClosing else error.HttpRequestTruncated,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            continue;
+        }
+        head_len += hp.feed(remaining);
+    }
+    _ = http.Client.Response.Head.parse(in.buffered()[0..head_len]) catch |err| switch (err) {
+        // Raised only after the status line parsed, so its status is in bytes 9 to 11.
+        error.HttpContentEncodingUnsupported => {
+            const code = std.fmt.parseInt(u10, in.buffered()[9..12], 10) catch return null;
+            return @fromBackingInt(code);
+        },
+        else => {},
+    };
+    return null;
 }
 
 /// Sorts a failed attempt's error: a cancel or allocation failure is returned, and anything
@@ -564,6 +686,30 @@ const TestServer = struct {
         silent,
         /// Sends the head of a 200 with a body it never finishes.
         silent_body,
+        /// A 200 whose body says it is gzip and isn't.
+        bad_gzip,
+        /// A 200 whose body has content-encoding compress, which std.http.Client can't decode.
+        compress_encoding,
+        /// Sends the head of a 200 and part of its body, then resets the connection.
+        reset_body,
+        /// A 200 whose body has content-encoding zstd, which std.http.Client doesn't accept by default.
+        zstd_encoding,
+        /// A 200 whose body has content-encoding br, which std.http.Client can't decode.
+        brotli_encoding,
+        /// Sends the head of a gzip 200 and the start of its body, then closes the connection
+        /// (a FIN, not a reset).
+        close_gzip_body,
+        /// Answers with the request's own body as one raw zstd block, content-encoding zstd.
+        zstd_echo,
+        /// Sends the head of a 200 and part of its body, then closes the connection (a FIN).
+        close_identity_body,
+        /// Answers with the request's own body as a gzip stream of one stored deflate block,
+        /// content-encoding gzip, sent with transfer-encoding chunked, as a compressing proxy
+        /// or middleware sends an answer whose compressed length it doesn't know in advance.
+        gzip_echo_chunked,
+        /// A gzip header alone, as a whole body with its content-length: the gzip stream is cut
+        /// short, the transfer is not.
+        short_gzip_body,
     };
 
     const Seen = struct {
@@ -633,7 +779,14 @@ const TestServer = struct {
             var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
             defer arena_state.deinit();
             s.handle(arena_state.allocator(), &request) catch return;
+            if (s.mode == .reset_body) {
+                // Closing with a zero linger sends a reset, which the client's next read gets.
+                const reset: std.c.linger = .{ .onoff = 1, .linger = 0 };
+                _ = std.c.setsockopt(stream.socket.handle, std.c.SOL.SOCKET, std.c.SO.LINGER, &reset, @sizeOf(std.c.linger));
+                return;
+            }
             if (s.mode == .close_after_one) return;
+            if (s.mode == .close_gzip_body or s.mode == .close_identity_body) return;
         }
     }
 
@@ -660,7 +813,7 @@ const TestServer = struct {
             else => {},
         }
         var transfer: [4096]u8 = undefined;
-        _ = try (try request.readerExpectContinue(&transfer)).allocRemaining(arena, .unlimited);
+        const request_body = try (try request.readerExpectContinue(&transfer)).allocRemaining(arena, .unlimited);
         switch (s.mode) {
             .handler, .close_after_one => unreachable,
             .status_500 => try request.respond("the codec failed", .{ .status = .internal_server_error }),
@@ -675,6 +828,48 @@ const TestServer = struct {
                 try request.server.out.flush();
                 s.received.set(s.io);
                 try s.never.wait(s.io);
+            },
+            .bad_gzip => try request.respond("this is not gzip", .{ .extra_headers = &.{.{ .name = "content-encoding", .value = "gzip" }} }),
+            .compress_encoding => try request.respond("{\"payloads\":[]}", .{ .extra_headers = &.{.{ .name = "content-encoding", .value = "compress" }} }),
+            .reset_body, .close_identity_body => {
+                try request.server.out.writeAll("HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{\"payl");
+                try request.server.out.flush();
+            },
+            .zstd_encoding => try request.respond("this is not zstd", .{ .extra_headers = &.{.{ .name = "content-encoding", .value = "zstd" }} }),
+            .zstd_echo => {
+                // A zstd frame: magic, a single-segment header with a 4-byte content size, and
+                // one last block of type raw.
+                const frame = try arena.alloc(u8, 4 + 1 + 4 + 3 + request_body.len);
+                @memcpy(frame[0..4], &[_]u8{ 0x28, 0xb5, 0x2f, 0xfd });
+                frame[4] = 0xa0;
+                std.mem.writeInt(u32, frame[5..9], @intCast(request_body.len), .little);
+                std.mem.writeInt(u24, frame[9..12], @intCast(1 | (request_body.len << 3)), .little);
+                @memcpy(frame[12..], request_body);
+                try request.respond(frame, .{ .extra_headers = &.{.{ .name = "content-encoding", .value = "zstd" }} });
+            },
+            .brotli_encoding => try request.respond("this is not brotli", .{ .extra_headers = &.{.{ .name = "content-encoding", .value = "br" }} }),
+            .gzip_echo_chunked => {
+                // A gzip header, one final stored deflate block, the CRC-32 and the length.
+                const len: u16 = @intCast(request_body.len);
+                const gz = try arena.alloc(u8, 10 + 5 + len + 8);
+                @memcpy(gz[0..10], &[_]u8{ 0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 });
+                gz[10] = 0x01;
+                std.mem.writeInt(u16, gz[11..13], len, .little);
+                std.mem.writeInt(u16, gz[13..15], ~len, .little);
+                @memcpy(gz[15..][0..len], request_body);
+                std.mem.writeInt(u32, gz[15 + len ..][0..4], std.hash.Crc32.hash(request_body), .little);
+                std.mem.writeInt(u32, gz[19 + len ..][0..4], len, .little);
+                const out = request.server.out;
+                try out.print("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-encoding: gzip\r\ntransfer-encoding: chunked\r\n\r\n{x}\r\n", .{gz.len});
+                try out.writeAll(gz);
+                try out.writeAll("\r\n0\r\n\r\n");
+                try out.flush();
+            },
+            .short_gzip_body => try request.respond("\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03", .{ .extra_headers = &.{.{ .name = "content-encoding", .value = "gzip" }} }),
+            .close_gzip_body => {
+                // A gzip header, then nothing of the 100 bytes promised.
+                try request.server.out.writeAll("HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: 100\r\n\r\n\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03");
+                try request.server.out.flush();
             },
         }
     }
@@ -797,6 +992,101 @@ test "a remote codec fails on an answer other than 200, a malformed body, or a w
         // No retry for an answer.
         try testing.expectEqual(@as(usize, 2), server.snapshot().requests.len);
     }
+}
+
+test "a remote codec fails without a retry on a 200 whose body can't be decoded" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const payloads = try testPayloads(arena);
+    for ([_]TestServer.Mode{ .bad_gzip, .compress_encoding }) |mode| {
+        for ([_]?Io.Duration{ null, .fromSeconds(60) }) |timeout| {
+            var server: TestServer = undefined;
+            try server.start(mode, &.{});
+            defer server.stop();
+            var remote = try RemoteCodec.init(testing.allocator, testing.io, .{ .endpoint = server.endpoint(""), .timeout = timeout });
+            defer remote.deinit();
+            try testing.expectError(error.CodecFailed, remote.codec().encode(arena, testing.io, payloads));
+            // An answer, so not retried.
+            try testing.expectEqual(@as(usize, 1), server.snapshot().requests.len);
+        }
+    }
+}
+
+test "a remote codec fails without a retry on a 200 whose content-encoding it doesn't accept" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const payloads = try testPayloads(arena);
+    // The head of the answer arrived; its body is in an encoding the client doesn't decode.
+    for ([_]TestServer.Mode{ .zstd_encoding, .brotli_encoding }) |mode| {
+        var server: TestServer = undefined;
+        try server.start(mode, &.{});
+        defer server.stop();
+        var remote = try RemoteCodec.init(testing.allocator, testing.io, .{ .endpoint = server.endpoint("") });
+        defer remote.deinit();
+        try testing.expectError(error.CodecFailed, remote.codec().encode(arena, testing.io, payloads));
+        // An answer, so not retried.
+        try testing.expectEqual(@as(usize, 1), server.snapshot().requests.len);
+    }
+}
+
+test "a remote codec decodes an answer in zstd, which it didn't ask for" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: TestServer = undefined;
+    try server.start(.zstd_echo, &.{});
+    defer server.stop();
+    var remote = try RemoteCodec.init(testing.allocator, testing.io, .{ .endpoint = server.endpoint("") });
+    defer remote.deinit();
+    const echoed = try remote.codec().encode(arena, testing.io, try testPayloads(arena));
+    const values = try converter.fromPayloads(struct { []const u8, i64 }, arena, echoed);
+    try testing.expectEqualStrings("hello", values[0]);
+    try testing.expectEqual(@as(i64, 42), values[1]);
+}
+
+test "a remote codec retries once when the connection closes partway through an identity body" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A connection closed short of the content-length ends the stream as a complete body
+    // would; the codec must still see a transport failure, not a malformed answer.
+    var server: TestServer = undefined;
+    try server.start(.close_identity_body, &.{});
+    defer server.stop();
+    var remote = try RemoteCodec.init(testing.allocator, testing.io, .{ .endpoint = server.endpoint("") });
+    defer remote.deinit();
+    try testing.expectError(error.CodecFailed, remote.codec().encode(arena, testing.io, try testPayloads(arena)));
+    try testing.expectEqual(@as(usize, 2), server.snapshot().requests.len);
+}
+
+test "a remote codec retries once when the connection closes partway through a gzip body" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: TestServer = undefined;
+    try server.start(.close_gzip_body, &.{});
+    defer server.stop();
+    var remote = try RemoteCodec.init(testing.allocator, testing.io, .{ .endpoint = server.endpoint("") });
+    defer remote.deinit();
+    // The body ended 90 bytes short of its content-length: the connection failed, the server
+    // didn't send a body that can't be decoded.
+    try testing.expectError(error.CodecFailed, remote.codec().encode(arena, testing.io, try testPayloads(arena)));
+    try testing.expectEqual(@as(usize, 2), server.snapshot().requests.len);
+}
+
+test "a remote codec retries once when the connection fails partway through a body" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: TestServer = undefined;
+    try server.start(.reset_body, &.{});
+    defer server.stop();
+    var remote = try RemoteCodec.init(testing.allocator, testing.io, .{ .endpoint = server.endpoint("") });
+    defer remote.deinit();
+    try testing.expectError(error.CodecFailed, remote.codec().encode(arena, testing.io, try testPayloads(arena)));
+    try testing.expectEqual(@as(usize, 2), server.snapshot().requests.len);
 }
 
 test "a remote codec gives up after its timeout on a server that doesn't answer" {
@@ -1323,4 +1613,83 @@ test "a remote codec moves its certificate clock only while no handshake of its 
     s.client.now = null;
     s.refreshCertificateClock();
     try testing.expectEqual(@as(?Io.Timestamp, null), s.client.now);
+}
+
+test "a remote codec's timeout bounds its first https call, whose CA bundle load a cancel must not reach" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The Io's own allocations block cancels, so no Debug allocator can drop one (that effect
+    // is CancelBlockingAllocator's, and not what this test is about).
+    var blocking: CancelBlockingAllocator = .{ .io = undefined, .backing = testing.allocator };
+    var threaded: Io.Threaded = .init(blocking.allocator(), .{ .environ = testing.environ });
+    defer threaded.deinit();
+    blocking.io = threaded.io();
+
+    // The silent server never answers the TLS handshake. std.http.Client loads the system CA
+    // bundle on its first https request, and a cancel that lands while it reads the bundle's
+    // files can be dropped by std (Writer.Allocating.sendFile ignores a failed stat), after
+    // which the handshake could no longer be canceled. A fresh codec per call makes each call
+    // a first one; a 1 ns timeout cancels the exchange as early as it can.
+    var server: TestServer = undefined;
+    try server.start(.silent, &.{});
+    var stopped = false;
+    defer if (!stopped) server.stop();
+    var buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&buf, "https://127.0.0.1:{d}", .{server.listener.socket.address.getPort()});
+    const payloads = try testPayloads(arena);
+
+    for (0..6) |i| {
+        var remote = try RemoteCodec.init(testing.allocator, threaded.io(), .{ .endpoint = endpoint, .timeout = .fromNanoseconds(1) });
+        defer remote.deinit();
+        var call: TimedEncode = .{ .codec = remote.codec(), .arena = arena, .payloads = payloads };
+        var future = try io_tasks.concurrent(testing.io, TimedEncode.run, .{&call});
+        const returned = if (call.done.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(20), .clock = .awake } })) true else |_| false;
+        if (!returned) {
+            // The exchange is stuck in the TLS handshake; closing the connection ends it.
+            server.stop();
+            stopped = true;
+        }
+        future.await(testing.io);
+        if (!returned) {
+            std.debug.print("https call {d} of a remote codec with a 1 ns timeout had not returned after 20 s\n", .{i});
+            return error.TestUnexpectedResult;
+        }
+        try testing.expectError(error.CodecFailed, call.result);
+    }
+}
+
+test "a remote codec fails without a retry on a complete body holding a cut-short gzip stream" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The whole content-length arrived, so the server sent a body that can't be decoded; the
+    // connection did not fail.
+    var server: TestServer = undefined;
+    try server.start(.short_gzip_body, &.{});
+    defer server.stop();
+    var remote = try RemoteCodec.init(testing.allocator, testing.io, .{ .endpoint = server.endpoint("") });
+    defer remote.deinit();
+    try testing.expectError(error.CodecFailed, remote.codec().encode(arena, testing.io, try testPayloads(arena)));
+    try testing.expectEqual(@as(usize, 1), server.snapshot().requests.len);
+}
+
+test "a remote codec decodes a complete gzip 200 sent with chunked transfer-encoding" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The codec asks for gzip, and a compressing proxy or middleware sends it chunked. The
+    // decompressor stops at the end of the gzip stream, before the chunked reader has read the
+    // last chunk, and the answer is still complete: not cut off, and not retried.
+    var server: TestServer = undefined;
+    try server.start(.gzip_echo_chunked, &.{});
+    defer server.stop();
+    var remote = try RemoteCodec.init(testing.allocator, testing.io, .{ .endpoint = server.endpoint("") });
+    defer remote.deinit();
+    const echoed = try remote.codec().encode(arena, testing.io, try testPayloads(arena));
+    const values = try converter.fromPayloads(struct { []const u8, i64 }, arena, echoed);
+    try testing.expectEqualStrings("hello", values[0]);
+    try testing.expectEqual(@as(i64, 42), values[1]);
+    try testing.expectEqual(@as(usize, 1), server.snapshot().requests.len);
 }
