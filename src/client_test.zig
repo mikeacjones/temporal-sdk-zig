@@ -1738,3 +1738,254 @@ test "dev server: standalone Nexus operations, a second cancel of a running oper
     try testing.expectEqual(client_mod.NexusOperationExecutionStatus.running, d.status);
     try testing.expect(d.cancel_requested);
 }
+
+/// A config extension for the tests below: it records what `loadOptions` gave it, and sets
+/// `Options.api_key` from its table's `api_key`, or from the variable its table's `api_key_env`
+/// names, or fails with `error.NoApiKey` when its table has `fail = true`.
+const RecordingExtension = struct {
+    calls: usize = 0,
+    profile: []const u8 = "",
+    had_table: bool = false,
+    had_env: bool = false,
+    seen_api_key: []const u8 = "",
+
+    fn extension(r: *RecordingExtension, name: []const u8) client_mod.ConfigExtension {
+        return .{ .name = name, .ptr = r, .apply = apply };
+    }
+
+    fn apply(ptr: ?*anyopaque, input: client_mod.ConfigExtensionInput, options: *client_mod.Options) anyerror!void {
+        const r: *RecordingExtension = @ptrCast(@alignCast(ptr.?));
+        r.calls += 1;
+        r.profile = input.profile;
+        r.had_table = input.table != null;
+        r.had_env = input.env != null;
+        r.seen_api_key = options.api_key;
+        const table = input.table orelse return;
+        if (table.get("fail")) |f| if (f == .bool and f.bool) return error.NoApiKey;
+        if (table.get("api_key")) |v| options.api_key = try input.arena.dupe(u8, v.string);
+        if (table.get("api_key_env")) |v| {
+            const value = (input.env orelse return error.NoEnvironment).get(v.string) orelse return error.NoApiKey;
+            options.api_key = try input.arena.dupe(u8, value);
+        }
+    }
+};
+
+test "a config extension sets the API key from its own ext table" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var secrets: RecordingExtension = .{};
+    var other: RecordingExtension = .{};
+    const options = try client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .profile = "prod",
+        .config_data =
+        \\[profile.prod]
+        \\address = "prod.example.com:7233"
+        \\api_key = "from-profile"
+        \\[profile.prod.ext.secrets]
+        \\api_key = "from-extension"
+        \\rotated = 1979-05-27T07:32:00Z
+        \\[profile.prod.ext.other]
+        \\api_key = "from-other"
+        ,
+        .extensions = &.{ secrets.extension("secrets"), other.extension("other") },
+    });
+    try testing.expectEqualStrings("from-other", options.api_key);
+    try testing.expectEqualStrings("prod.example.com:7233", options.host_port);
+    try testing.expect(options.tls != null);
+    try testing.expectEqual(1, secrets.calls);
+    try testing.expectEqualStrings("prod", secrets.profile);
+    try testing.expect(secrets.had_table);
+    try testing.expect(!secrets.had_env);
+    // Extensions run in order, each on the options the previous one left.
+    try testing.expectEqualStrings("from-profile", secrets.seen_api_key);
+    try testing.expectEqualStrings("from-extension", other.seen_api_key);
+}
+
+test "a config extension's table holds parsed values, datetimes as strings" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const Check = struct {
+        fn apply(_: ?*anyopaque, input: client_mod.ConfigExtensionInput, _: *client_mod.Options) anyerror!void {
+            const table = input.table orelse return error.NoTable;
+            try testing.expectEqualStrings("value", table.get("str").?.string);
+            try testing.expectEqual(5, table.get("int").?.integer);
+            try testing.expect(table.get("flag").?.bool);
+            try testing.expectEqualStrings("1979-05-27T07:32:00Z", table.get("when").?.string);
+            try testing.expectEqual(2, table.get("list").?.array.items.len);
+            try testing.expectEqualStrings("inner", table.get("nested").?.object.get("key").?.string);
+        }
+    };
+    _ = try client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data =
+        \\[profile.default.ext.check]
+        \\str = "value"
+        \\int = 5
+        \\flag = true
+        \\when = 1979-05-27T07:32:00Z
+        \\list = [1, "two"]
+        \\nested = { key = "inner" }
+        ,
+        .extensions = &.{.{ .name = "check", .apply = Check.apply }},
+    });
+}
+
+test "a config extension whose profile has no table for it gets null" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var secrets: RecordingExtension = .{};
+    const options = try client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data =
+        \\[profile.default]
+        \\api_key = "from-profile"
+        \\[profile.default.ext.someone_else]
+        \\api_key = "not-ours"
+        ,
+        .extensions = &.{secrets.extension("secrets")},
+    });
+    try testing.expectEqual(1, secrets.calls);
+    try testing.expect(!secrets.had_table);
+    try testing.expectEqualStrings("default", secrets.profile);
+    try testing.expectEqualStrings("from-profile", options.api_key);
+
+    // No config file at all: the extension still runs, with no table.
+    var empty: std.process.Environ.Map = .init(testing.allocator);
+    defer empty.deinit();
+    var env_only: RecordingExtension = .{};
+    _ = try client_mod.loadOptions(arena.allocator(), .{ .env = &empty, .disable_file = true, .extensions = &.{env_only.extension("secrets")} });
+    try testing.expectEqual(1, env_only.calls);
+    try testing.expect(!env_only.had_table);
+    try testing.expect(env_only.had_env);
+}
+
+test "strict loadOptions accepts keys under ext and still rejects other unknown keys" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var secrets: RecordingExtension = .{};
+    const options = try client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .strict = true,
+        .config_data =
+        \\[profile.default]
+        \\address = "localhost:7233"
+        \\[profile.default.ext.secrets]
+        \\api_key = "from-extension"
+        \\anything = { goes = "here" }
+        \\[profile.default.ext.not_loaded]
+        \\whatever = 1
+        ,
+        .extensions = &.{secrets.extension("secrets")},
+    });
+    try testing.expectEqualStrings("from-extension", options.api_key);
+
+    // Without the extension, strict still accepts the tables.
+    _ = try client_mod.loadOptions(arena.allocator(), .{ .disable_env = true, .strict = true, .config_data =
+        \\[profile.default.ext.not_loaded]
+        \\whatever = 1
+    });
+
+    var never: RecordingExtension = .{};
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .strict = true,
+        .config_data =
+        \\[profile.default]
+        \\adress = "typo:7233"
+        \\[profile.default.ext.secrets]
+        \\api_key = "from-extension"
+        ,
+        .extensions = &.{never.extension("secrets")},
+    }));
+    // A bad core config fails before any extension runs.
+    try testing.expectEqual(0, never.calls);
+}
+
+test "a config extension that fails fails loadOptions, and later extensions don't run" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var failing: RecordingExtension = .{};
+    var after: RecordingExtension = .{};
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data =
+        \\[profile.default.ext.failing]
+        \\fail = true
+        ,
+        .extensions = &.{ failing.extension("failing"), after.extension("after") },
+    }));
+    try testing.expectEqual(1, failing.calls);
+    try testing.expectEqual(0, after.calls);
+
+    const OutOfMemory = struct {
+        fn apply(_: ?*anyopaque, _: client_mod.ConfigExtensionInput, _: *client_mod.Options) anyerror!void {
+            return error.OutOfMemory;
+        }
+    };
+    try testing.expectError(error.OutOfMemory, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data = "",
+        .extensions = &.{.{ .name = "oom", .apply = OutOfMemory.apply }},
+    }));
+}
+
+test "config extensions with an empty or repeated name fail loadOptions before any runs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var a: RecordingExtension = .{};
+    var b: RecordingExtension = .{};
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data = "",
+        .extensions = &.{ a.extension("secrets"), b.extension("") },
+    }));
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data = "",
+        .extensions = &.{ a.extension("secrets"), b.extension("other"), b.extension("secrets") },
+    }));
+    try testing.expectEqual(0, a.calls);
+    try testing.expectEqual(0, b.calls);
+}
+
+test "a config extension reads LoadOptions.env, and none with disable_env" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_PROFILE", "staging");
+    try env.put("MY_SECRET", "from-env");
+    const toml =
+        \\[profile.staging.ext.secrets]
+        \\api_key_env = "MY_SECRET"
+        \\[profile.default.ext.secrets]
+        \\api_key_env = "MY_SECRET"
+    ;
+    var secrets: RecordingExtension = .{};
+    const options = try client_mod.loadOptions(arena.allocator(), .{ .env = &env, .config_data = toml, .extensions = &.{secrets.extension("secrets")} });
+    try testing.expectEqualStrings("from-env", options.api_key);
+    try testing.expectEqualStrings("staging", secrets.profile);
+    try testing.expect(secrets.had_env);
+
+    // With disable_env the extension gets no environment, and TEMPORAL_PROFILE isn't read.
+    var no_env: RecordingExtension = .{};
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{ .env = &env, .config_data = toml, .disable_env = true, .extensions = &.{no_env.extension("secrets")} }));
+    try testing.expectEqualStrings("default", no_env.profile);
+    try testing.expect(!no_env.had_env);
+}
+
+test "ConfigEnv reads a map, or the process environment without one" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("SOME_VAR", "x");
+    const from_map: client_mod.ConfigEnv = .{ .map = &env };
+    try testing.expectEqualStrings("x", from_map.get("SOME_VAR").?);
+    try testing.expect(from_map.get("SOME") == null);
+
+    const process: client_mod.ConfigEnv = .{ .map = null };
+    const path = std.mem.span(std.c.getenv("PATH") orelse return error.SkipZigTest);
+    try testing.expectEqualStrings(path, process.get("PATH").?);
+    try testing.expect(process.get("PAT") == null);
+    try testing.expect(process.get("temporal-sdk-zig no such variable") == null);
+}

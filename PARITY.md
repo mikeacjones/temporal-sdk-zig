@@ -36,7 +36,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Client RPC retry policy and a client-wide RPC timeout | all | GA | supported | [Connecting](README.md#connecting) |
 | RPC timeout and gRPC metadata on a single call | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |
 | Environment configuration: profiles from a TOML file and environment variables | Go, Python, TypeScript, .NET, Ruby, Java | GA | supported | [Connecting](README.md#connecting), [external-env-conf](samples/external-env-conf) |
-| Environment configuration extensions: extension settings in a profile's ext tables (experimental) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | missing | `temporal-sdk-zig-d51.5.47`. `client.loadOptions` reads profiles through sdk-core and ignores their `ext` tables, so an extension can't reach its settings. |
+| Environment configuration extensions: extension settings in a profile's ext tables (experimental) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | supported | [Connecting](README.md#connecting) |
 | HTTP CONNECT proxy for the client connection | Python, TypeScript, .NET, Ruby, Go | GA | supported | [Proxy, keep-alive, and worker heartbeats](README.md#proxy-keep-alive-and-worker-heartbeats) |
 | gRPC keep-alive settings | Python, TypeScript, .NET, Ruby | GA | supported | [Proxy, keep-alive, and worker heartbeats](README.md#proxy-keep-alive-and-worker-heartbeats) |
 | Lazy connection, and changing the API key or headers on a connected client | Go, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |

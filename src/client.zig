@@ -6300,6 +6300,8 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
 /// TEMPORAL_TLS_CLIENT_KEY_PATH (or `_DATA`) and TEMPORAL_GRPC_META_<NAME> override the
 /// profile's values. TEMPORAL_TLS must be `true`, `false`, `1` or `0`, in any case:
 /// `loadOptions` returns `error.InvalidConfig` for any other value instead of guessing.
+/// A profile may also hold tables `[profile.<name>.ext.<extension>]`, read only by the
+/// `extensions` given; `strict` accepts any key under `ext`.
 pub const LoadOptions = struct {
     /// The profile to read from the config file. Empty uses TEMPORAL_PROFILE, then "default";
     /// a profile named here or by TEMPORAL_PROFILE must exist, "default" need not.
@@ -6318,6 +6320,58 @@ pub const LoadOptions = struct {
     strict: bool = false,
     /// The environment variables to read instead of the process's.
     env: ?*const std.process.Environ.Map = null,
+    /// Experimental: may change or be removed without notice. Extensions run in order on the
+    /// loaded options, after the profile and the environment were applied. Only read during
+    /// the call.
+    extensions: []const ConfigExtension = &.{},
+};
+
+/// Experimental: may change or be removed without notice. A separately packaged reader of
+/// `[profile.<profile>.ext.<name>]`, which `loadOptions` runs when it is in
+/// `LoadOptions.extensions`, for example to fetch an API key from a secrets manager.
+pub const ConfigExtension = struct {
+    /// The key of its table under the profile's `ext`. Not empty, and unique in the list.
+    name: []const u8,
+    /// Passed to `apply`.
+    ptr: ?*anyopaque = null,
+    /// Reads `input` and changes `options`. An error fails `loadOptions`: `error.OutOfMemory`
+    /// as itself, any other as `error.InvalidConfig` with the extension's name and the error
+    /// logged.
+    apply: *const fn (ptr: ?*anyopaque, input: ConfigExtensionInput, options: *Options) anyerror!void,
+};
+
+/// Experimental: may change or be removed without notice. What `loadOptions` gives a
+/// `ConfigExtension`.
+pub const ConfigExtensionInput = struct {
+    /// `loadOptions`'s arena: allocate what is stored in `options` from it.
+    arena: Allocator,
+    /// The profile that was loaded: `LoadOptions.profile`, else TEMPORAL_PROFILE, else
+    /// "default".
+    profile: []const u8,
+    /// The extension's own table as parsed values (TOML datetimes are strings); null when the
+    /// profile has no `ext.<name>` table or no config file was read. Lives in `arena`.
+    table: ?std.json.ObjectMap,
+    /// The environment `loadOptions` reads; null with `LoadOptions.disable_env`.
+    env: ?ConfigEnv,
+};
+
+/// Experimental: may change or be removed without notice. The environment a
+/// `ConfigExtension` reads: `LoadOptions.env`, or the process's when that is null.
+pub const ConfigEnv = struct {
+    map: ?*const std.process.Environ.Map,
+
+    /// The value of the variable `name`, or null. Borrows the map or the process environment:
+    /// copy it into the arena before storing it in `Options`.
+    pub fn get(e: ConfigEnv, name: []const u8) ?[]const u8 {
+        if (e.map) |m| return m.get(name);
+        var i: usize = 0;
+        while (std.c.environ[i]) |line| : (i += 1) {
+            const kv = std.mem.span(line);
+            if (kv.len > name.len and kv[name.len] == '=' and std.mem.eql(u8, kv[0..name.len], name))
+                return kv[name.len + 1 ..];
+        }
+        return null;
+    }
 };
 
 pub const LoadError = error{ OutOfMemory, InvalidConfig };
@@ -6332,9 +6386,23 @@ pub const LoadError = error{ OutOfMemory, InvalidConfig };
 /// isn't UTF-8, return `error.InvalidConfig`, with the reason logged. Each
 /// TEMPORAL_GRPC_META_<NAME> becomes a header named <name> in lower case with `_` as `-`
 /// (an empty value removes the profile's header), its value kept as bytes, so it is checked
-/// with the other `Options.headers` when the client is created. Strings are allocated from
-/// `arena`.
+/// with the other `Options.headers` when the client is created. Then each of
+/// `options.extensions` runs, in order, on the options loaded so far (experimental): an
+/// extension with an empty name or a name given twice, checked before anything is read, and
+/// an extension that fails, return `error.InvalidConfig` (an extension's `error.OutOfMemory`
+/// returns `error.OutOfMemory`), with the reason logged, and later extensions don't run.
+/// Strings are allocated from `arena`.
 pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
+    for (options.extensions, 0..) |ext, i| {
+        if (ext.name.len == 0) {
+            log.warn("loading client configuration failed: the config extension at index {d} has an empty name", .{i});
+            return error.InvalidConfig;
+        }
+        for (options.extensions[0..i]) |earlier| if (std.mem.eql(u8, earlier.name, ext.name)) {
+            log.warn("loading client configuration failed: the config extension name \"{s}\" is given twice", .{ext.name});
+            return error.InvalidConfig;
+        };
+    }
     if (!options.disable_env) {
         const tls_env: ?[]const u8 = if (options.env) |env|
             env.get("TEMPORAL_TLS")
@@ -6385,11 +6453,38 @@ pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
         return error.InvalidConfig;
     }
     var loaded: Options = .{};
+    var ext: ?std.json.Value = null;
     if (bridge.bytes.Owned.take(null, result.success)) |json| {
         defer json.deinit();
-        loaded = try profileOptions(arena, json.bytes());
+        loaded = try profileOptions(arena, json.bytes(), &ext);
     }
     if (!options.disable_env) loaded.headers = try grpcMetaHeaders(arena, loaded.headers, env);
+    if (options.extensions.len == 0) return loaded;
+
+    const profile: []const u8 = if (options.profile.len > 0) options.profile else for (env) |e| {
+        if (!options.disable_env and std.mem.eql(u8, e.key, "TEMPORAL_PROFILE") and e.value.len > 0) break e.value;
+    } else "default";
+    for (options.extensions) |extension| {
+        const table: ?std.json.ObjectMap = if (ext) |all| switch (all) {
+            .object => |o| if (o.get(extension.name)) |t| switch (t) {
+                .object => |table| table,
+                else => null,
+            } else null,
+            else => null,
+        } else null;
+        extension.apply(extension.ptr, .{
+            .arena = arena,
+            .profile = profile,
+            .table = table,
+            .env = if (options.disable_env) null else .{ .map = options.env },
+        }, &loaded) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.warn("loading client configuration failed: extension \"{s}\" failed: {t}", .{ extension.name, err });
+                return error.InvalidConfig;
+            },
+        };
+    }
     return loaded;
 }
 
@@ -6474,8 +6569,9 @@ pub fn loadDefaultOptions(arena: Allocator) LoadError!Options {
 }
 
 /// Options from sdk-core's JSON for a profile. A certificate's `data` is a JSON array of
-/// bytes.
-fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
+/// bytes. `ext` is set to the profile's `ext` object, its extensions' tables by name, if it
+/// has one.
+fn profileOptions(arena: Allocator, json: []const u8, ext: *?std.json.Value) LoadError!Options {
     const Source = struct { path: ?[]const u8 = null, data: ?[]const u8 = null };
     const Profile = struct {
         address: ?[]const u8 = null,
@@ -6489,6 +6585,7 @@ fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
             client_key: ?Source = null,
         } = null,
         grpc_meta: ?std.json.ArrayHashMap([]const u8) = null,
+        ext: ?std.json.Value = null,
     };
     const profile = std.json.parseFromSliceLeaky(Profile, arena, json, .{
         .allocate = .alloc_always,
@@ -6501,6 +6598,7 @@ fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
         },
     };
 
+    ext.* = profile.ext;
     var options: Options = .{};
     if (profile.address) |v| options.host_port = v;
     if (profile.namespace) |v| options.namespace = v;

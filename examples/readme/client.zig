@@ -27,6 +27,29 @@ fn connectExamples(gpa: Allocator, io: Io, arena: Allocator, api_key: []const u8
     // end-example
 }
 
+// example: client-config-extension
+/// Sets the API key from the variable its table names:
+///   [profile.prod.ext.secrets]
+///   api_key_env = "MY_TEMPORAL_API_KEY"
+/// A real one might fetch the key from a secrets manager instead.
+fn applySecrets(_: ?*anyopaque, input: temporal.client.ConfigExtensionInput, options: *temporal.client.Options) anyerror!void {
+    const table = input.table orelse return; // this profile has no [ext.secrets] table
+    const name = table.get("api_key_env") orelse return error.MissingApiKeyEnv;
+    if (name != .string) return error.MissingApiKeyEnv;
+    const env = input.env orelse return error.EnvironmentDisabled;
+    const key = env.get(name.string) orelse return error.ApiKeyNotSet;
+    options.api_key = try input.arena.dupe(u8, key); // the env's bytes are borrowed
+    if (options.tls == null) options.tls = .{};
+}
+
+fn loadWithSecrets(arena: std.mem.Allocator) !temporal.client.Options {
+    return temporal.client.loadOptions(arena, .{
+        .profile = "prod",
+        .extensions = &.{.{ .name = "secrets", .apply = applySecrets }},
+    });
+}
+// end-example
+
 fn lazyConnectExample(gpa: Allocator, io: Io, options: temporal.client.Options, rotated_key: []const u8) !void {
     // example: client-lazy
     // Nothing goes over the network yet: the first call that needs the server connects.
@@ -447,6 +470,28 @@ fn runWorker(w: *temporal.worker.Worker) temporal.worker.Worker.RunError!void {
 test "client: connecting compiles" {
     _ = &connectExamples;
     _ = &transportExample;
+}
+
+test "client: a config extension sets the API key" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("MY_TEMPORAL_API_KEY", "secret");
+    const options = try temporal.client.loadOptions(arena.allocator(), .{
+        .profile = "prod",
+        .env = &env,
+        .config_data =
+        \\[profile.prod]
+        \\address = "prod.example.com:7233"
+        \\[profile.prod.ext.secrets]
+        \\api_key_env = "MY_TEMPORAL_API_KEY"
+        ,
+        .extensions = &.{.{ .name = "secrets", .apply = applySecrets }},
+    });
+    try std.testing.expectEqualStrings("secret", options.api_key);
+    try std.testing.expect(options.tls != null);
+    _ = &loadWithSecrets;
 }
 
 /// A client interceptor that holds every UpdateWorkflowExecution request until the call is

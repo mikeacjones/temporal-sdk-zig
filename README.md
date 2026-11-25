@@ -259,6 +259,36 @@ Notes:
 - `Options.rpc_timeout` (default 30 s) bounds each call, but not waits for a result. It also bounds `connect`: a server that hasn't answered by then, such as one that accepts the connection but never completes the TLS handshake, fails it with `error.ConnectFailed`, logged with the reason. `connect` copies `namespace` and `identity`; `codecs`, `logger`, `propagators`, `worker_interceptors`, and `interceptors` are borrowed and must outlive the client and its workers.
 - `Options.headers` are sent with every call. A name ending in `-bin` (any case) is a gRPC binary header, whose value may be any bytes (gRPC sends it base64-encoded); any other header's value must be visible ASCII, space, or tab. `connect`, `init`, and `reconnect` return `error.InvalidOptions`, logged with the header's name, for a value or name gRPC can't send or two names that differ only in case (a name repeated exactly sends its last value), whether the header was set in code or loaded from `TEMPORAL_GRPC_META_<NAME>` or a profile's `grpc_meta`.
 
+Experimental: separately packaged code can keep its settings in a profile, in a table `[profile.<name>.ext.<extension>]`, and adjust the loaded options with them, for example to fetch the API key from a secrets manager. Give `loadOptions` each such `client.ConfigExtension` in `LoadOptions.extensions`.
+
+<!-- example: client-config-extension -->
+```zig
+/// Sets the API key from the variable its table names:
+///   [profile.prod.ext.secrets]
+///   api_key_env = "MY_TEMPORAL_API_KEY"
+/// A real one might fetch the key from a secrets manager instead.
+fn applySecrets(_: ?*anyopaque, input: temporal.client.ConfigExtensionInput, options: *temporal.client.Options) anyerror!void {
+    const table = input.table orelse return; // this profile has no [ext.secrets] table
+    const name = table.get("api_key_env") orelse return error.MissingApiKeyEnv;
+    if (name != .string) return error.MissingApiKeyEnv;
+    const env = input.env orelse return error.EnvironmentDisabled;
+    const key = env.get(name.string) orelse return error.ApiKeyNotSet;
+    options.api_key = try input.arena.dupe(u8, key); // the env's bytes are borrowed
+    if (options.tls == null) options.tls = .{};
+}
+
+fn loadWithSecrets(arena: std.mem.Allocator) !temporal.client.Options {
+    return temporal.client.loadOptions(arena, .{
+        .profile = "prod",
+        .extensions = &.{.{ .name = "secrets", .apply = applySecrets }},
+    });
+}
+```
+Notes:
+- Extensions run in list order, after the profile and the environment were applied, each on the options the one before left. `apply` gets a `client.ConfigExtensionInput`: `loadOptions`'s arena, the profile's name, its own table as `std.json` values (TOML datetimes as strings; null when the profile has no such table or no config file was read), and a `client.ConfigEnv` that reads `LoadOptions.env` or the process's environment (null with `disable_env`). Values from `ConfigEnv.get` are borrowed: copy what you keep into the arena.
+- An extension that returns an error fails `loadOptions` with `error.InvalidConfig`, logged with its name and the error (`error.OutOfMemory` is returned as itself), and later extensions don't run. An empty name, or a name given twice, fails it the same way before anything is read, and a profile that fails to load fails before any extension runs.
+- `strict` accepts every key under `ext`, whether or not an extension reads it, and still rejects other unknown keys. `loadDefaultOptions` runs no extensions.
+
 `Client.init` takes the same options but connects on first use, so a process can build its client before the server is reachable. `Client.updateApiKey` and `Client.updateHeaders` rotate the API key and the gRPC headers of a client, connected or not.
 
 <!-- example: client-lazy -->
