@@ -68,6 +68,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "nexus:starter")) return @import("nexus/starter.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-cancelation:worker")) return @import("nexus-cancelation/worker.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-cancelation:starter")) return @import("nexus-cancelation/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-multiple-arguments:worker")) return @import("nexus-multiple-arguments/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-multiple-arguments:starter")) return @import("nexus-multiple-arguments/starter.zig").main(init);
     if (std.mem.eql(u8, name, "polling:worker")) return @import("polling/worker.zig").main(init);
     if (std.mem.eql(u8, name, "polling:starter")) return @import("polling/starter.zig").main(init);
     if (std.mem.eql(u8, name, "pso:worker")) return @import("pso/worker.zig").main(init);
