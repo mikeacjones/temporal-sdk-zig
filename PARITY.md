@@ -57,7 +57,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Standalone activities (GA September 2026; Public Preview before) | Go, Java, Python, TypeScript, .NET | GA | supported | [Standalone activities](README.md#standalone-activities), [standalone-activity](samples/standalone-activity) |
 | Worker deployment management: current and ramping versions | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Worker deployments](README.md#worker-deployments), [worker-versioning](samples/worker-versioning) |
 | Update workflow execution options (versioning override) | Go, Java, Python, TypeScript, .NET | GA | supported | [Workflow reset and execution options](README.md#workflow-reset-and-execution-options) |
-| Reset a workflow | Go, Java | GA, deferred | partial | `temporal-sdk-zig-d51.5.30`. Missing: operations applied after a reset, and helpers that pick a reset point. |
+| Reset a workflow | Go, Java | GA | supported | [Workflow reset and execution options](README.md#workflow-reset-and-execution-options) |
 | Namespace management | Go, Java, TypeScript | GA | supported | [Namespaces and raw service access](README.md#namespaces-and-raw-service-access) |
 | Raw gRPC service calls (workflow, operator, and test services) | all | GA | supported | [Namespaces and raw service access](README.md#namespaces-and-raw-service-access) |
 | Cloud Operations API client | Go, Java, Python, TypeScript, .NET | pre-release | partial | `unfiled`. Typed calls to every CloudService method go through `Client.callService(.cloud, ...)` on a client connected to the Cloud Operations API with an API key ([Namespaces and raw service access](README.md#namespaces-and-raw-service-access)). Missing: a run against Temporal Cloud. |
@@ -189,7 +189,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Nexus interceptors | Go, Java, Python, TypeScript, .NET | GA | supported | [Interceptors](README.md#interceptors) |
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
 | Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation) |
-| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA, deferred | partial | `temporal-sdk-zig-d51.12.5`. Missing: a tracing interceptor and span export; the client and worker interceptors and context propagation it would use exist. |
+| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing) |
 
 ### Nexus
 

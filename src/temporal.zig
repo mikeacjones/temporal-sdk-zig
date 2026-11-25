@@ -8,6 +8,8 @@ pub const nexus = @import("nexus.zig");
 pub const converter = @import("converter.zig");
 pub const propagation = @import("propagation.zig");
 pub const interceptor = @import("interceptor.zig");
+/// Spans around client calls and worker runs, for a tracing backend the caller supplies.
+pub const tracing = @import("tracing.zig");
 pub const search_attributes = @import("search_attributes.zig");
 pub const failure = @import("failure.zig");
 pub const log = @import("log.zig");
@@ -44,6 +46,7 @@ test {
     _ = @import("proto_test.zig");
     _ = @import("propagation_test.zig");
     _ = @import("interceptor_test.zig");
+    _ = @import("tracing_test.zig");
     _ = @import("metrics_test.zig");
     _ = @import("client_tls_test.zig");
     _ = @import("client_namespace_test.zig");

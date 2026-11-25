@@ -634,21 +634,19 @@ Notes:
 
 #### Workflow reset and execution options
 
-`Client.resetWorkflow` starts a new run of a workflow from an earlier point in a run's history, the end of a workflow task, and returns the new run's ID. `Client.updateWorkflowExecutionOptions` changes a running workflow's execution options, such as its versioning override.
+`Client.resetWorkflow` starts a new run of a workflow from an earlier point in a run's history, the end of a workflow task, and returns the new run's ID. The reset point is an event ID, or a `ResetOptions.target` the client finds in the run: its first or last workflow task, or the first one a given build ID completed. `ResetOptions.post_reset_operations` changes the new run's execution options as part of the reset. `Client.updateWorkflowExecutionOptions` changes a running workflow's execution options, such as its versioning override and its priority.
 
 <!-- example: client-reset -->
 ```zig
 // Reset the latest run to the end of its first workflow task: the new run keeps the
-// history up to there. Reading the run ID once makes both calls name the same run.
-const run_id = (try client.describeWorkflow(arena, workflow_id, "")).run_id;
-const history = try client.fetchHistory(arena, workflow_id, run_id);
-const first_task = for (history.events.items) |event| {
-    if (event.attributes) |attrs| if (attrs == .workflow_task_completed_event_attributes) break event.event_id;
-} else return error.NoCompletedWorkflowTask;
-const new_run_id = try client.resetWorkflow(arena, workflow_id, run_id, .{
-    .workflow_task_finish_event_id = first_task,
+// history up to there. The client finds the point in the run's history and resets
+// that same run, even if another run starts in between.
+const new_run_id = try client.resetWorkflow(arena, workflow_id, "", .{
+    .target = .first_workflow_task,
     .reason = "greet again",
     .reapply_exclude = .{ .signals = true }, // the new run doesn't get the earlier `finish`
+    // Applied to the new run as part of the reset: its tasks go ahead of others.
+    .post_reset_operations = &.{.{ .update_execution_options = .{ .priority = .{ .priority_key = 1 } } }},
 });
 var new_run = try client.getWorkflow([]const u8, workflow_id, new_run_id);
 defer new_run.deinit();
@@ -656,23 +654,47 @@ defer new_run.deinit();
 
 <!-- example: client-execution-options -->
 ```zig
-// Auto-upgrade from the next workflow task on, whatever the workflow's definition says.
+// Auto-upgrade from the next workflow task on, whatever the workflow's definition says,
+// and dispatch its tasks after other work on the task queue.
 const options = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{
     .versioning_override = .{ .set = .auto_upgrade },
+    .priority = .{ .priority_key = 5 },
 });
-std.log.info("versioning override: {s}", .{if (options.versioning_override) |o| @tagName(o) else "none"});
-// Back to the definition's behavior.
-_ = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{ .versioning_override = .remove });
+std.log.info("versioning override: {s}, priority key: {d}", .{
+    if (options.versioning_override) |o| @tagName(o) else "none",
+    if (options.priority) |p| p.priority_key else 0,
+});
+// Back to the definition's behavior and the default priority.
+_ = try client.updateWorkflowExecutionOptions(arena, workflow_id, "", .{ .versioning_override = .remove, .priority = .{} });
+```
+
+<!-- example: client-reset-point -->
+```zig
+// Reset to the last workflow task that completed at or before `before`, such as the
+// moment a bad deployment started. Reading the history of a named run makes both calls
+// name the same run.
+const history = try client.fetchHistory(arena, workflow_id, run_id);
+const point = temporal.client.resetPointEventId(history.events.items, .{
+    .last_workflow_task_at_or_before = before,
+}) orelse return error.NoWorkflowTaskBefore;
+const new_run_id = try client.resetWorkflow(arena, workflow_id, run_id, .{
+    .workflow_task_finish_event_id = point,
+    .reason = "undo the bad deployment",
+});
 ```
 Notes:
-- The reset point is the event ID of a workflow task's completed, failed, or timed-out event, or its started event, found with `Client.fetchHistory`; a non-positive one is `error.InvalidOptions`, and one the server refuses is `error.RpcFailed`. An unknown workflow or run is `error.NotFound`.
-- A running base run ends terminated, as does the workflow's current run; a closed base run stays as it was. A handle that names the base run's ID, such as one `executeWorkflow` returned, doesn't follow the reset: its `get` returns `error.WorkflowTerminated` (or the run's own result if it had closed). A handle made with an empty run ID reads the latest run when `get` runs, so it gets the new run's result.
+- The reset point is the event ID of a workflow task's completed, failed, or timed-out event, or its started event, in `ResetOptions.workflow_task_finish_event_id`, or a `ResetOptions.target`; set one of them. Naming neither or both, or an empty `.build_id`, is `error.InvalidOptions` before any call. An event ID the server refuses is `error.RpcFailed`. An unknown workflow or run is `error.NotFound`.
+- `.first_workflow_task` and `.last_workflow_task` read the base run's history: the event ID of its first or last workflow task completed event, or, when no workflow task has completed, the started event of the first scheduled one (which the server refuses as `error.RpcFailed` if that task hasn't started). With an empty run ID, the client first describes the workflow to pin its latest run, and the reset names that run.
+- `.build_id` resets to the end of the first workflow task a worker with that build ID (`worker.Options.build_id`) completed, as the server recorded it in the run's reset points. That point can be in an earlier run of the chain, which is then the run reset.
+- A target that finds no point is `error.NoResetPoint`, and nothing is reset: a history with no workflow task, or no reset point for the build ID, or one that isn't resettable or has expired.
+- `client.resetPointEventId(events, point)` gives the event ID for a history you read yourself, with the same rule for the first and last workflow task, and `.last_workflow_task_at_or_before` finds the last workflow task that completed at or before a time. It returns null when there is no such point.
+- A running base run ends terminated, as does the workflow's current run; a closed base run stays as it was. `WorkflowRun.get` on a handle that names the base run's ID, such as one `executeWorkflow` returned, doesn't follow the reset: it returns `error.WorkflowTerminated` (or the run's own result if it had closed). A handle made with an empty run ID reads the latest run when `get` runs, so it gets the new run's result.
 - Signals, updates, and Nexus events recorded after the reset point are reapplied to the new run unless `ResetOptions.reapply_exclude` excludes them. Don't rely on `request_id` to deduplicate: a repeated request may reset again.
-- A reset is sent once, without the automatic retries other calls get, unless it is made through a view whose `RpcOptions.retry` is `true`, which retries it and can reset twice. A transport failure is `error.RpcFailed` too, and after it the reset may or may not have happened: before resetting again, describe the base run, whose `raw.workflow_extended_info.reset_run_id` names the new run once it has been reset.
+- `ResetOptions.post_reset_operations` are applied by the server to the new run, in order, as part of the reset. Each is a `WorkflowExecutionOptionsChanges` that must change something, or the reset is `error.InvalidOptions`. A change the server refuses, such as a pin to a version no worker has polled with, fails the reset with `error.RpcFailed`. There is no post-reset signal: no server release applies one, so signal the new run after `resetWorkflow` returns.
+- A reset is sent once, without the automatic retries other calls get, unless it is made through a view whose `RpcOptions.retry` is `true`, which retries it and can reset twice. The calls a target makes before it are ordinary calls and retry. A transport failure of the reset is `error.RpcFailed` too, and after it the reset may or may not have happened: before resetting again, describe the base run, whose `raw.workflow_extended_info.reset_run_id` names the new run once it has been reset.
 - In `WorkflowExecutionOptionsChanges`, `null` leaves an option as it is, `.remove` clears the override, and `.set` replaces it; changing nothing is `error.InvalidOptions`. A pin (`.set = .{ .pinned = version }`) needs a worker of that version to have polled the workflow's task queue, or it is `error.RpcFailed`; auto-upgrade needs none. A closed workflow is `error.NotFound`.
+- `priority` replaces the workflow's priority and fairness as a whole, and `.{}` puts them back to the server's defaults. It needs server 1.30 or later. `WorkflowExecutionOptions.priority` reads it back, null when every field is at its default.
 - The server's refusals are logged as warnings with its reason.
-<!-- stub: temporal-sdk-zig-d51.5.30 -->
-- Not implemented yet: operations applied after a reset, helpers that pick a reset point, and changing a workflow's priority or time-skipping configuration.
 
 #### Namespaces and raw service access
 
@@ -2852,9 +2874,92 @@ Notes:
 - Like every Nexus header, the propagated values skip the payload codecs, are recorded in the caller's history, and count toward the server's limit on a call's Nexus headers, so don't propagate secrets or large values over Nexus. A header value that doesn't decode is logged and skipped, and the request is still handled.
 
 #### Tracing
-<!-- stub: temporal-sdk-zig-d51.12.5 -->
-Not implemented yet.
-A tracing interceptor that creates spans around workflow, activity, and client calls and exports them to OpenTelemetry.
+
+`tracing.Interceptor` opens a span around each call a client sends and each piece of work a worker runs, and carries the span's context along with the call, so one trace runs from a client through its workflows to their activities, children and Nexus operations. The SDK depends on no tracing library: a backend implements `tracing.Tracer`, two functions that start and finish a span, and the module `temporal_opentelemetry` (below) implements it for OpenTelemetry.
+
+<!-- example: observability-tracing -->
+```zig
+const tracing = temporal.tracing;
+
+/// A tracer that numbers its spans and remembers each one's name and parent. Called from
+/// many threads at once.
+const CountingTracer = struct {
+    io: std.Io,
+    arena: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    spans: std.ArrayList(Started) = .empty,
+
+    const Started = struct { name: []const u8, parent: ?usize };
+
+    pub fn startSpan(t: *CountingTracer, arena: std.mem.Allocator, options: tracing.StartSpanOptions) error{OutOfMemory}!tracing.Span {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        // The parent is a span context this tracer wrote, here or in another process.
+        const parent_id = if (options.parent) |p| p.get("span-id") else null;
+        const parent = if (parent_id) |id| std.fmt.parseInt(usize, id, 10) catch null else null;
+        try t.spans.append(t.arena, .{ .name = try options.spanName(t.arena), .parent = parent });
+        // What travels to the span's children: allocated from the arena the call gives.
+        const fields = try arena.alloc(tracing.Field, 1);
+        fields[0] = .{ .name = "span-id", .value = try std.fmt.allocPrint(arena, "{d}", .{t.spans.items.len - 1}) };
+        return .{ .context = .{ .fields = fields } };
+    }
+
+    pub fn finishSpan(_: *CountingTracer, _: tracing.Span, _: tracing.FinishSpanOptions) void {}
+};
+```
+
+The interceptor needs three options on the client, all from one `tracing.Interceptor`: its client interceptor, its worker interceptor and its propagator. Workers on the client use the last two too.
+
+<!-- example: observability-tracing-setup -->
+```zig
+test "observability: the activity's span descends from the client's" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var counting: CountingTracer = .{ .io = testing.io, .arena = arena.allocator() };
+    // The interceptor and the slices must stay where they are while the client runs.
+    var traced: tracing.Interceptor = .init(tracing.Tracer.from(CountingTracer, &counting));
+    const client_interceptors = [_]temporal.interceptor.Client{traced.client()};
+    const worker_interceptors = [_]temporal.interceptor.Worker{traced.worker()};
+    const propagators = [_]temporal.propagation.ContextPropagator{traced.propagator()};
+
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .interceptors = &client_interceptors,
+        .worker_interceptors = &worker_interceptors,
+        .propagators = &propagators,
+    });
+    defer env.deinit();
+    try env.registerWorkflow(Greeting);
+    try env.registerActivity(Greet);
+    _ = try env.executeWorkflow(Greeting, .{"Ziggy"}, arena.allocator(), null);
+
+    const chain = try ancestry(&counting, arena.allocator(), "RunActivity:traced_greet");
+    try testing.expectEqual(4, chain.len);
+    try testing.expectEqualStrings("StartActivity:traced_greet", chain[1]);
+    try testing.expectEqualStrings("RunWorkflow:traced_greeting", chain[2]);
+    try testing.expectEqualStrings("StartWorkflow:traced_greeting", chain[3]);
+}
+```
+
+Spans are named `<operation>:<name>`, such as `StartWorkflow:greeting` or `RunActivity:greet`, and tagged with `temporalWorkflowID`, `temporalRunID`, `temporalActivityID` and `temporalUpdateID` where they apply:
+
+- On the client: `StartWorkflow`, `SignalWorkflow`, `SignalWithStartWorkflow`, `QueryWorkflow` and `UpdateWorkflow`, one span per request sent. A client waiting for an update's outcome sends the request again, so a long update shows several `UpdateWorkflow` spans, each a child of the caller's context. A context put under `tracing.span_key` in the call's `.context` is the parent.
+- In a workflow: `RunWorkflow`, `HandleSignal`, `HandleQuery`, `ValidateUpdate` and `HandleUpdate`, each the child of the client span whose header reached it; and `StartActivity` (local activities too), `StartChildWorkflow` and `StartNexusOperation`, children of the run's `RunWorkflow` span.
+- In an activity and a Nexus handler: `RunActivity`, `RunStartNexusOperationHandler` and `RunCancelNexusOperationHandler`. While one runs, `ctx.propagated().get(tracing.span_key)` is its span's context, and a client call given `.context = ctx.propagated()` continues the trace.
+
+Notes:
+
+- The span context travels in the header field `tracing.header_key` (`_tracer-data`), a JSON object of the tracer's fields, which the other Temporal SDKs read and write too. Over Nexus each field becomes a Nexus header of its own, such as `traceparent`, replacing a caller's header of the same name.
+- Replay starts no span: a workflow's spans are started only for work that is not replayed from history, except `HandleQuery` and `ValidateUpdate`, which never come from history. Nothing a tracer returns is read by workflow code, so a tracer cannot make a workflow nondeterministic, and a history recorded with tracing replays without it.
+- A run rebuilt from history after its worker dropped it from the cache emits no second `RunWorkflow` span: its later spans have the client's start span as their parent. That holds even when the run's first workflow task sent no commands, which sdk-core then runs again as live work, as long as the server records SDK metadata on completed workflow tasks (current Temporal servers and Temporal Cloud do). A `RunWorkflow` span still open when its run is dropped is finished then, without a failure.
+- Spans of a signal or update handler's own calls have the `RunWorkflow` span as their parent, not the handler's span. Signals and signal-with-start sent by a workflow, continue-as-new, update-with-start and schedules carry the context but open no span.
+- A span ends with a failure when its call returns an error, named by the error (a Nexus handler error by its type and message); continue-as-new and an activity's asynchronous completion are not failures.
+- A tracer is called from client, activity, Nexus and workflow threads at once, and may be asked to finish a span on another thread than started it, so it must be thread-safe. It runs on workflow threads too, so it should not block: export spans in the background. Out of memory starting a span fails the call, except a workflow's own activity, child or Nexus call, which goes on untraced with a warning.
+
+The module `temporal_opentelemetry` exports spans to OpenTelemetry through the OpenTelemetry Zig SDK (open-telemetry/opentelemetry-zig, alpha, pinned to a commit). Add it with the option `-Dopentelemetry`: `b.dependency("temporal", .{ .opentelemetry = true }).module("temporal_opentelemetry")`. Without the option the OpenTelemetry SDK is never fetched. Build the OpenTelemetry side with its own types: a `trace.TracerProvider` from `TracerProvider.init(gpa, io, id_generator)`, with a thread-safe `std.Random` behind its `IDGenerator`, since spans start on many threads; an `otlp.ConfigOptions` (OTLP over HTTP/protobuf to `localhost:4318` unless the `OTEL_EXPORTER_OTLP_*` variables of the environment map it is given say otherwise); a `trace.OTLPExporter`; and a `trace.BatchingProcessor` added with `addSpanProcessor`. Use the batching processor: the simple one exports on the thread that ends the span, which may be a workflow's. Then `temporal_opentelemetry.Tracer.init(gpa, io, try provider.getTracer(.{ .name = "my-app" }))` gives the tracer, and its `tracer()` the interface for `tracing.Interceptor.init`. Span contexts are W3C trace context, `traceparent` and `tracestate`; `temporal_opentelemetry.spanContext` and `fromSpanContext` convert them for code with spans of its own.
+
+- Shut down in this order: close the workers and the client, call the provider's `shutdown` (which exports what is left), then `temporal_opentelemetry.Tracer.deinit`.
+- The OpenTelemetry SDK borrows a span's name, attribute values and status text until it has exported the span, so `temporal_opentelemetry.Tracer` keeps its copies of them until `deinit`: its memory grows by tens of bytes for every span.
+- An error from the OpenTelemetry SDK other than running out of memory is logged under the `temporal_opentelemetry` scope, and the call goes on untraced.
 
 ### Nexus
 
@@ -3043,6 +3148,7 @@ zig build test -Doptimize=ReleaseSafe
 - `deps/` holds the sdk-core submodule and the cargo workspace that builds its C bridge.
 - `samples/` contains the samples, one per feature; [PARITY.md](PARITY.md) lists them and holds the feature table.
 - `examples/readme/` contains the compiled examples that this README's code blocks copy.
+- `contrib/` contains optional modules built on other libraries: `contrib/opentelemetry` is `temporal_opentelemetry`, added with `-Dopentelemetry`.
 - `tools/` contains build tools: the samples runner and the README example checker.
 - `scripts/` contains maintenance scripts.
 

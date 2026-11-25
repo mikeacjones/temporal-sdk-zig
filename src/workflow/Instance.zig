@@ -250,6 +250,13 @@ continue_as_new_codec_fields: []const []const u8 = &.{},
 history_length: u32 = 0,
 history_size_bytes: u64 = 0,
 continue_as_new_suggested: bool = false,
+/// Whether a workflow task of this run has completed before the current one, from the latest
+/// activation that wasn't query-only: the core reports the SDK version recorded in the run's
+/// earliest WorkflowTaskCompleted event (`last_sdk_version`), which the first completion writes
+/// when the server stores SDK metadata. A run rebuilt from history after a first task that
+/// sent no commands runs its workflow function with `replaying` false, so tracing reads this
+/// to tell that run from a new one. False on a server without SDK metadata.
+task_completed_before: bool = false,
 /// Patch IDs the core reported in history (NotifyHasPatch), in arrival order so that
 /// `getVersion` scans them deterministically. Arena memory.
 notified_patches: std.array_hash_map.String(void) = .empty,
@@ -924,6 +931,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
         inst.history_length = act.history_length;
         inst.history_size_bytes = act.history_size_bytes;
         inst.continue_as_new_suggested = act.continue_as_new_suggested;
+        inst.task_completed_before = act.last_sdk_version.len > 0;
         try inst.setDeploymentVersion(act.deployment_version_for_current_task);
     }
     inst.replaying = act.is_replaying;
@@ -10826,6 +10834,28 @@ test "continue-as-new: history length, size and suggestion follow each activatio
     try testing.expectEqual(@as(u32, 8), inst.ctx.historyLength());
     try testing.expectEqual(@as(u64, 800), inst.ctx.historySizeBytes());
     try testing.expect(inst.ctx.continueAsNewSuggested());
+}
+
+test "task_completed_before follows the activation's last_sdk_version, but not a query-only one" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const fresh = try create(testing.allocator, Nap.registered, .{});
+    defer fresh.destroy();
+    _ = try fresh.activate(&try initActivation(a, "Nap", .{}), a);
+    try testing.expect(!fresh.task_completed_before);
+
+    // Rebuilt from a history whose first task completed: the core reports its SDK version.
+    const rebuilt = try create(testing.allocator, Nap.registered, .{});
+    defer rebuilt.destroy();
+    var init = try initActivation(a, "Nap", .{});
+    init.last_sdk_version = "0.1.0";
+    _ = try rebuilt.activate(&init, a);
+    try testing.expect(rebuilt.task_completed_before);
+    var query = try oneJob(a, .{ .query_workflow = .{ .query_id = "q", .query_type = "none" } });
+    query.last_sdk_version = "";
+    _ = try rebuilt.activate(&query, a);
+    try testing.expect(rebuilt.task_completed_before);
 }
 
 // Struct workflows: handlers declared on the workflow type and registered at initialization.
