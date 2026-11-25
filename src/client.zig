@@ -2641,14 +2641,17 @@ pub const Client = struct {
     /// handler's result, decoded into `arena`. An empty `run_id` queries the latest run. A
     /// closed workflow still answers: the server has a worker replay its history. The server
     /// holds a query sent before the workflow's first workflow task completes until it does;
-    /// with no worker polling, the call fails with `error.RpcFailed` when its deadline passes.
+    /// with no worker polling, the call fails with `error.DeadlineExceeded` when its deadline
+    /// (`RpcOptions.timeout` from `withRpcOptions`, or `Options.rpc_timeout`) passes. Any other
+    /// failed call is `error.RpcFailed`, logged.
     pub fn queryWorkflow(c: *Client, comptime Query: type, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: Query.Args) QueryError!Query.Result {
         return c.queryWorkflowWithOptions(Query, arena, workflow_id, run_id, args, .{});
     }
 
     /// `queryWorkflow` with options. Returns `error.QueryFailed` when the handler fails or
-    /// the workflow has no handler for the query type, and `error.QueryRejected` when
-    /// `options.reject_condition` matches the workflow's state.
+    /// the workflow has no handler for the query type, `error.QueryRejected` when
+    /// `options.reject_condition` matches the workflow's state, and `error.DeadlineExceeded`
+    /// when the call's deadline passes first, as in `queryWorkflow`.
     pub fn queryWorkflowWithOptions(c: *Client, comptime Query: type, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: Query.Args, options: QueryOptions) QueryError!Query.Result {
         const context = c.workflowContext(workflow_id, options.context);
         const result = try c.sendQuery(Query.query_name, arena, workflow_id, run_id, try converter.toPayloadsWithContext(arena, &context, args), options);
@@ -2660,23 +2663,37 @@ pub const Client = struct {
     /// with no `workflow.QueryDef`, and returns the handler's result undecoded: decode it
     /// with `get(T, arena)`. The value is absent when the server returns no result payload,
     /// as for a handler that returns nothing. The payload lives in `arena`. Otherwise
-    /// behaves as `queryWorkflow`.
+    /// behaves as `queryWorkflow`, `error.DeadlineExceeded` included.
     pub fn queryWorkflowByName(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: anytype) QueryError!converter.EncodedValue {
         return c.queryWorkflowByNameWithOptions(query_type, arena, workflow_id, run_id, args, .{});
     }
 
     /// `queryWorkflowByName` with options, which behave as in `queryWorkflowWithOptions`:
     /// `error.QueryFailed` when the handler fails or the workflow has no handler named
-    /// `query_type`, and `error.QueryRejected` when `options.reject_condition` matches.
+    /// `query_type`, `error.QueryRejected` when `options.reject_condition` matches, and
+    /// `error.DeadlineExceeded` when the call's deadline passes first.
     pub fn queryWorkflowByNameWithOptions(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: anytype, options: QueryOptions) QueryError!converter.EncodedValue {
         const context = try dupeContext(arena, c.workflowContext(workflow_id, options.context));
         return .{ .payload = try c.sendQuery(query_type, arena, workflow_id, run_id, try converter.toPayloadsWithContext(arena, context, args), options), .context = context };
+    }
+
+    /// Whether a query that failed with gRPC status `code` and `message` after `elapsed_ms`
+    /// ran out of its deadline `deadline_ms` (0 for none), by `callService`'s rule: sdk-core
+    /// reports its own deadline as CANCELLED with "Timeout expired", the server's is
+    /// DEADLINE_EXCEEDED, and the server's stream reset at the same deadline arrives as
+    /// CANCELLED without the message once the call has run for its whole deadline.
+    fn isQueryDeadline(code: u32, message: []const u8, deadline_ms: u32, elapsed_ms: i64) bool {
+        if (code == 4) return true;
+        if (code != 1) return false;
+        return std.mem.indexOf(u8, message, "Timeout expired") != null or (deadline_ms > 0 and elapsed_ms >= deadline_ms);
     }
 
     /// Sends a query and returns its first result payload, or null when there is none.
     fn sendQuery(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, query_args: std.ArrayList(converter.Payload), options: QueryOptions) QueryError!?converter.Payload {
         var status: ?RpcStatus = null;
         var header = try c.outgoingHeader(arena, options.context);
+        const deadline_ms = c.callDeadlineMs();
+        const started = Io.Timestamp.now(c.io, .awake);
         const response = c.rpcCall(wfs.QueryWorkflowResponse, "QueryWorkflow", wfs.QueryWorkflowRequest{
             .namespace = c.namespace,
             .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
@@ -2691,6 +2708,9 @@ pub const Client = struct {
             error.RpcFailed => {
                 const s = status orelse return error.RpcFailed;
                 if (options.failure_message) |m| m.* = s.message;
+                // Not logged: the caller asked for the deadline.
+                if (isQueryDeadline(s.code, s.message, deadline_ms, started.durationTo(Io.Timestamp.now(c.io, .awake)).toMilliseconds()))
+                    return error.DeadlineExceeded;
                 // The server reports a failed query (a handler error or an unknown query
                 // type) as INVALID_ARGUMENT carrying a QueryFailedFailure detail.
                 if (s.code == 3 and s.hasDetail("temporal.api.errordetails.v1.QueryFailedFailure", arena)) return error.QueryFailed;
@@ -5861,8 +5881,8 @@ pub const HistoryIterator = struct {
 pub const QueryOptions = struct {
     /// When the server rejects the query instead of sending it to the workflow.
     reject_condition: QueryRejectCondition = .none,
-    /// On `error.QueryFailed` (or `error.RpcFailed`), receives the server's message, allocated
-    /// from the query's arena: the handler's error name, or for an unknown query type a
+    /// On `error.QueryFailed` (or `error.RpcFailed` or `error.DeadlineExceeded`), receives the
+    /// server's or the transport's message, allocated from the query's arena: the handler's error name, or for an unknown query type a
     /// message listing the workflow's registered query types.
     failure_message: ?*[]const u8 = null,
     /// On `error.QueryRejected`, receives the workflow's status.
@@ -5896,6 +5916,9 @@ pub const QueryError = error{
     QueryFailed,
     /// The workflow's state matched `QueryOptions.reject_condition`.
     QueryRejected,
+    /// The call's deadline (`RpcOptions.timeout` or `Options.rpc_timeout`) passed before an
+    /// answer came, for example because no worker is polling.
+    DeadlineExceeded,
 };
 
 /// Where a workflow run is in its lifecycle. Values match the server's; the enum is open so
@@ -7305,6 +7328,55 @@ test "rpc_timeout cuts short a query the server holds" {
         return error.TestUnexpectedResult;
     }
     try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
+}
+
+test "a query past its RpcOptions.timeout returns error.DeadlineExceeded" {
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var c = try Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer c.close();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No worker polls this task queue, so the server holds a query until its deadline.
+    const id = try uuid(a, testing.io);
+    _ = try c.rpc(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", wfs.StartWorkflowExecutionRequest{
+        .namespace = c.namespace,
+        .workflow_id = id,
+        .workflow_type = .{ .name = "Unpolled" },
+        .task_queue = .{ .name = try uuid(a, testing.io), .kind = .TASK_QUEUE_KIND_NORMAL },
+        .request_id = try uuid(a, testing.io),
+        .identity = c.identity,
+    }, a);
+    var short = try c.withRpcOptions(.{ .timeout = .fromMilliseconds(500) });
+    const start = Io.Timestamp.now(testing.io, .awake);
+    var message: []const u8 = "";
+    try testing.expectError(error.DeadlineExceeded, short.queryWorkflowByNameWithOptions("status", a, id, "", .{}, .{ .failure_message = &message }));
+    try testing.expect(start.durationTo(Io.Timestamp.now(testing.io, .awake)).nanoseconds < 10 * std.time.ns_per_s);
+    try testing.expect(message.len > 0);
+    try testing.expectError(error.DeadlineExceeded, short.queryWorkflowByName("status", a, id, "", .{}));
+
+    // A refusal that isn't the deadline keeps its own error, here a missing workflow.
+    try testing.expectError(error.NotFound, short.queryWorkflowByName("status", a, try uuid(a, testing.io), "", .{}));
+}
+
+test "only a deadline status makes a query error.DeadlineExceeded" {
+    // DEADLINE_EXCEEDED, and CANCELLED with sdk-core's message, whatever the timing.
+    try testing.expect(Client.isQueryDeadline(4, "", 0, 0));
+    try testing.expect(Client.isQueryDeadline(4, "deadline exceeded", 1000, 5));
+    try testing.expect(Client.isQueryDeadline(1, "Timeout expired", 0, 0));
+    try testing.expect(Client.isQueryDeadline(1, "status: Cancelled, message: \"Timeout expired\"", 1000, 5));
+    // CANCELLED without the message: the deadline only once the call ran for all of it.
+    try testing.expect(Client.isQueryDeadline(1, "stream reset", 1000, 1000));
+    try testing.expect(Client.isQueryDeadline(1, "stream reset", 1000, 1500));
+    try testing.expect(!Client.isQueryDeadline(1, "stream reset", 1000, 999));
+    try testing.expect(!Client.isQueryDeadline(1, "stream reset", 0, 60_000));
+    // Every other status stays error.RpcFailed (or QueryFailed), even after the deadline
+    // and with the message.
+    for ([_]u32{ 0, 2, 3, 5, 8, 9, 13, 14, 16 }) |code| {
+        try testing.expect(!Client.isQueryDeadline(code, "Timeout expired", 1000, 2000));
+    }
 }
 
 test "retry policy intervals and the OpenTelemetry periodicity are clamped, not narrowed" {
