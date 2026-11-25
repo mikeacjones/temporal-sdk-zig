@@ -278,7 +278,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | nexus | [nexus](samples/nexus) | ported |
 | nexus-cancelation | [nexus-cancelation](samples/nexus-cancelation) | ported |
 | nexus-context-propagation | | planned: `temporal-sdk-zig-d51.16.66` |
-| nexus-messaging | | planned: `temporal-sdk-zig-d51.16.67` |
+| nexus-messaging | [nexus-messaging](samples/nexus-messaging) | ported |
 | nexus-messaging-temporal-operation | | planned: `temporal-sdk-zig-d51.16.68` |
 | nexus-multiple-arguments | [nexus-multiple-arguments](samples/nexus-multiple-arguments) | ported |
 | nexus-serialization-context | | planned: `temporal-sdk-zig-d51.16.107` |
