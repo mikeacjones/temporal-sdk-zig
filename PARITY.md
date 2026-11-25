@@ -189,7 +189,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Nexus interceptors | Go, Java, Python, TypeScript, .NET | GA | supported | [Interceptors](README.md#interceptors) |
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
 | Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation) |
-| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing) |
+| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing), [opentelemetry](samples/opentelemetry) |
 
 ### Nexus
 
@@ -284,7 +284,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | nexus-serialization-context | | planned: `temporal-sdk-zig-d51.16.107` |
 | nexus-standalone-activity | | planned: `temporal-sdk-zig-d51.16.70` |
 | nexus-standalone-operations | | planned: `temporal-sdk-zig-d51.16.71` |
-| opentelemetry | | planned: `temporal-sdk-zig-d51.16.76` |
+| opentelemetry | [opentelemetry](samples/opentelemetry) | ported |
 | opentelemetry-v2 | | planned: `temporal-sdk-zig-d51.16.77` |
 | pickfirst | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
 | polling | [polling](samples/polling) | ported |
