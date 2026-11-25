@@ -3089,9 +3089,46 @@ Notes:
 - `max_concurrent_nexus_task_executions` and `max_concurrent_nexus_task_pollers` bound the requests handled and the polls open at once (see [Options](#options)).
 
 #### Standalone operations
-<!-- stub: temporal-sdk-zig-d51.5.12 -->
-Not implemented yet.
-Planned: starting, describing, and canceling Nexus operations from a client, outside a workflow.
+
+Experimental: a program can start a Nexus operation through an endpoint without a workflow. `client.Client.executeNexusOperation` starts an operation of a service contract and returns a `client.NexusOperationHandle`. `getNexusOperationHandle` gives another handle to it by its operation ID, in this process or another. With a handle, `get` waits for the result, `describe` reports the operation's status, and `cancel` and `terminate` end it. `listNexusOperations` and `countNexusOperations` find operations with a visibility query.
+
+<!-- example: nexus-standalone -->
+```zig
+/// Greets Ziggy through "greeting-endpoint" from a program, without a workflow.
+fn greetStandalone(client: *temporal.client.Client, arena: std.mem.Allocator) ![]const u8 {
+    var started = try client.executeNexusOperation(GreetingService, Greet, .{
+        .id = "greet-ziggy",
+        .endpoint = "greeting-endpoint",
+        .schedule_to_close_timeout = .fromSeconds(60),
+        .summary = "greet Ziggy",
+    }, "Ziggy");
+    defer started.deinit();
+
+    // Any process can follow the operation by its ID.
+    var handle = try client.getNexusOperationHandle([]const u8, "greet-ziggy", "");
+    defer handle.deinit();
+    const result = try handle.get(arena);
+    const description = try handle.describe(arena);
+    std.log.info("{s} through {s}: {t}", .{ description.operation, description.endpoint, description.status });
+
+    var it = try client.listNexusOperations("Endpoint = 'greeting-endpoint'", .{});
+    defer it.deinit();
+    while (try it.next(arena)) |op| std.log.info("{s}: {t}", .{ op.operation_id, op.status });
+    std.log.info("{d} operations", .{try client.countNexusOperations("Endpoint = 'greeting-endpoint'")});
+    return result;
+}
+```
+
+Notes:
+
+- The server must offer standalone Nexus operations, as the dev server does. On a server without them, `executeNexusOperation` returns `error.RpcFailed` and logs the server's reason, as it does for any other option the server refuses (an empty `endpoint`, for one). An endpoint the server doesn't know returns `error.NotFound`.
+- `StartNexusOperationOptions.id` must be unique among the namespace's running standalone operations. An empty ID generates a UUID: read it from `handle.id`. `id_conflict_policy` `.fail` returns `error.NexusOperationExecutionAlreadyStarted` for an ID that is running, and `.use_existing` returns a handle to the running operation, with `handle.started` false. `id_reuse_policy` says whether the ID of a closed operation may be used again.
+- `schedule_to_close_timeout` bounds the whole operation, its start included. `schedule_to_start_timeout` bounds the time until the handler starts it, and `start_to_close_timeout` bounds an asynchronous operation's run. Each is optional. `headers`, `summary`, `search_attributes` and `context` work as they do for a workflow's Nexus calls and for `executeActivity`.
+- `executeNexusOperationByName` calls a service this program has no contract for, by service and operation name. A service that lacks the operation, or an operation whose types differ from the service's, is a compile error naming both.
+- `get` long-polls until the operation closes, however long that takes: `Options.rpc_timeout` and `RpcOptions.timeout` don't cut it short, and canceling the calling task stops it with `error.Canceled`. It returns the result, or `error.NexusOperationFailed`, `NexusOperationCanceled`, `NexusOperationTerminated` or `NexusOperationTimedOut`, with `handle.failure()` saying why. A workflow-run operation whose workflow was terminated or timed out returns the last two, though `describe` reports it `failed`. Each call asks the server again.
+- `cancel` sends the handler a cancel request. A workflow-run operation's workflow is canceled, and the operation ends canceled. An operation that no handler has started yet stays running, with `describe`'s `cancel_requested` true, until the request is delivered. Canceling a running operation again succeeds. `terminate` closes the operation at once, without telling the handler. Both return `error.NexusOperationClosed` when the server refuses because the operation has closed; the dev server still accepts terminating an operation that ended canceled. Every handle method returns `error.NotFound` for an operation that doesn't exist.
+- The input and result go through the payload converter and the client's codecs, in a converter context with the namespace and the call's propagated values.
+- List and count queries are eventually consistent. Operations that workflows call aren't listed. The handle and the iterator own their memory with the client's allocator, so free them with `deinit`. They aren't thread-safe.
 
 ### Contrib
 <!-- stub: temporal-sdk-zig-d51.13.2, temporal-sdk-zig-d51.13.4, temporal-sdk-zig-d51.13.5, temporal-sdk-zig-d51.13.6 -->
