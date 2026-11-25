@@ -188,13 +188,8 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Client, workflow, and activity interceptors | all | GA | supported | [Interceptors](README.md#interceptors), [logger-interceptor](samples/logger-interceptor) |
 | Nexus interceptors | Go, Java, Python, TypeScript, .NET | GA | supported | [Interceptors](README.md#interceptors) |
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
-<<<<<<< HEAD
-| Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation) |
-| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing), [opentelemetry](samples/opentelemetry) |
-=======
 | Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation), [nexus-context-propagation](samples/nexus-context-propagation) |
-| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing) |
->>>>>>> a1fdb8ec76e462092e5df068480ab73c65925dd8
+| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing), [opentelemetry](samples/opentelemetry) |
 
 ### Nexus
 
