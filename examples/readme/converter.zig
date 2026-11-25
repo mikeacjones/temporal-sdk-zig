@@ -164,6 +164,76 @@ test "converter: compress payloads with the zlib codec" {
     try testing.expectEqualStrings(try std.fmt.allocPrint(arena, "Hello, {s}!", .{name}), result);
 }
 
+// example: converter-nexus-context
+/// Marks each payload with the key it would be encrypted with: one per Nexus endpoint for a
+/// Nexus operation's payloads, the default key for every other payload.
+const EndpointKeyCodec = struct {
+    const key_metadata = "key-id";
+
+    fn codec(c: *const EndpointKeyCodec) converter.PayloadCodec {
+        return .{ .ptr = @constCast(c), .vtable = &.{
+            .encode = encode,
+            .decode = decode,
+            .encodeWithContext = encodeWithContext,
+            .decodeWithContext = decodeWithContext,
+        } };
+    }
+
+    fn keyOf(p: converter.Payload) ?[]const u8 {
+        for (p.metadata.items) |entry| if (std.mem.eql(u8, entry.key, key_metadata)) return entry.value;
+        return null;
+    }
+
+    fn keyFor(context: *const converter.Context) []const u8 {
+        const n = context.nexus orelse return "default";
+        // The endpoint the caller called through, on the caller's worker and the handler's.
+        return if (std.mem.eql(u8, n.endpoint, "payments-endpoint")) "payments" else "default";
+    }
+
+    fn encodeWithContext(_: *anyopaque, arena: Allocator, _: std.Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const out = try arena.alloc(converter.Payload, payloads.len);
+        for (payloads, out) |p, *o| {
+            o.* = try p.dupe(arena);
+            // A real codec encrypts `o.data` with the key here.
+            try o.metadata.append(arena, .{ .key = key_metadata, .value = keyFor(context) });
+        }
+        return out;
+    }
+
+    fn decodeWithContext(_: *anyopaque, arena: Allocator, _: std.Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const out = try arena.dupe(converter.Payload, payloads);
+        for (out) |*p| {
+            const key = keyOf(p.*) orelse continue;
+            if (!std.mem.eql(u8, key, keyFor(context))) return error.CodecFailed;
+        }
+        return out;
+    }
+
+    fn encode(ptr: *anyopaque, arena: Allocator, io: std.Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return encodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn decode(ptr: *anyopaque, arena: Allocator, io: std.Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return decodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+};
+// end-example
+
+test "converter: a codec chooses its key by the Nexus endpoint" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    const keyed: EndpointKeyCodec = .{};
+    const codecs = [_]converter.PayloadCodec{keyed.codec()};
+    const payments: converter.Context = .{ .namespace = "default", .nexus = .{ .endpoint = "payments-endpoint", .service = "payments", .operation = "charge" } };
+    const plain = try converter.toPayload(arena, "card");
+    const encoded = try converter.encodePayloadsWithContext(&codecs, arena, io, &payments, &.{plain});
+    try testing.expectEqualStrings("payments", EndpointKeyCodec.keyOf(encoded[0]).?);
+    _ = try converter.decodePayloadsWithContext(&codecs, arena, io, &payments, encoded);
+    try testing.expectError(error.CodecFailed, converter.decodePayloadsWithContext(&codecs, arena, io, &.{}, encoded));
+}
+
 /// Serves `converter.codecHandler` over `codecs` on `listener` until canceled, a task per
 /// connection.
 fn serveCodecs(io: std.Io, listener: *std.Io.net.Server, codecs: []const converter.PayloadCodec) void {

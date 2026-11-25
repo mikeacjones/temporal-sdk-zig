@@ -1720,6 +1720,7 @@ fn approve(client: *temporal.client.Client, token: []const u8) !void {
 Notes:
 - `completeAsync` returns `error.CompleteAsync`, so `errdefer`s still in scope run; do the hand-off in an inner block.
 - Finish with `Client.completeActivity`, `failActivity`, or `reportActivityCancellation` (by token, or `*ById`), and heartbeat with `recordActivityHeartbeat`, which returns true once cancellation is requested. All return `error.NotFound` once the activity is no longer waiting.
+- Experimental: an activity a Nexus handler started has `info().nexus_context` set (see [Payload codecs](#payload-codecs)). Hand a copy of it with the token, and pass it to `completeActivityWithOptions`, `failActivityWithOptions`, `reportActivityCancellationWithOptions` or `recordActivityHeartbeatWithOptions` as `ActivityCompletionOptions.nexus_context`, or as `ActivityId.nexus_context` to the `*ById` calls, so those payloads are converted with the caller's context as the worker would.
 - A local activity that returns `completeAsync` fails with the non-retryable type `LocalActivityCompleteAsync`.
 
 #### Failures
@@ -2134,8 +2135,73 @@ Notes:
 - Codecs run in order on the way out and in reverse on the way in. Search attributes are never encoded. The codecs are borrowed and must outlive the client.
 - A codec returns as many payloads as it was given and passes through payloads it didn't encode. It runs on many threads at once, never in workflow code.
 - Header fields skip the codecs on the way out unless the propagator that writes them sets `encode_fields` (see [Context propagation](#context-propagation)); fields an interceptor or other code writes into a header are sent as written. On the way in every header field goes through the codecs' decode, so a codec's `decode` must return a payload it didn't encode unchanged: a codec that fails on one fails the workflow task, activity task, or client call that carries it.
-- `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.Context`: namespace, workflow, activity, and propagated values. On the workflow's worker a codec gets the run's context, except for an activity's, local activity's or child's arguments and results, which carry the activity's type and ID or the child's workflow ID and type, as on the worker that runs it; signals to other workflows carry the run's.
+- `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.Context`: namespace, workflow, activity, Nexus operation, and propagated values. On the workflow's worker a codec gets the run's context, except for an activity's, local activity's or child's arguments and results, which carry the activity's type and ID or the child's workflow ID and type, as on the worker that runs it, and a Nexus operation's payloads (see the next paragraph); signals to other workflows carry the run's.
 - `converter.codecHandler(codecs, options)` serves `POST /encode` and `/decode` for the Temporal Web UI and CLI. It doesn't authenticate callers. A client or worker can call such a server with a [Remote codec client](#remote-codec-client).
+
+Experimental: a Nexus operation's payloads carry `converter.Context.nexus`, a `converter.NexusContext` with the endpoint the caller called through and the service and operation, so a codec can pick a key per endpoint. Both sides see the same context: the caller's operation input, summary, result and failure, and the handler's input, synchronous result and failure, carry `nexus` and the local namespace and propagated values, with the workflow and activity fields empty. The payload converter's context hooks and the failure converter get the same context.
+
+<!-- example: converter-nexus-context -->
+```zig
+/// Marks each payload with the key it would be encrypted with: one per Nexus endpoint for a
+/// Nexus operation's payloads, the default key for every other payload.
+const EndpointKeyCodec = struct {
+    const key_metadata = "key-id";
+
+    fn codec(c: *const EndpointKeyCodec) converter.PayloadCodec {
+        return .{ .ptr = @constCast(c), .vtable = &.{
+            .encode = encode,
+            .decode = decode,
+            .encodeWithContext = encodeWithContext,
+            .decodeWithContext = decodeWithContext,
+        } };
+    }
+
+    fn keyOf(p: converter.Payload) ?[]const u8 {
+        for (p.metadata.items) |entry| if (std.mem.eql(u8, entry.key, key_metadata)) return entry.value;
+        return null;
+    }
+
+    fn keyFor(context: *const converter.Context) []const u8 {
+        const n = context.nexus orelse return "default";
+        // The endpoint the caller called through, on the caller's worker and the handler's.
+        return if (std.mem.eql(u8, n.endpoint, "payments-endpoint")) "payments" else "default";
+    }
+
+    fn encodeWithContext(_: *anyopaque, arena: Allocator, _: std.Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const out = try arena.alloc(converter.Payload, payloads.len);
+        for (payloads, out) |p, *o| {
+            o.* = try p.dupe(arena);
+            // A real codec encrypts `o.data` with the key here.
+            try o.metadata.append(arena, .{ .key = key_metadata, .value = keyFor(context) });
+        }
+        return out;
+    }
+
+    fn decodeWithContext(_: *anyopaque, arena: Allocator, _: std.Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const out = try arena.dupe(converter.Payload, payloads);
+        for (out) |*p| {
+            const key = keyOf(p.*) orelse continue;
+            if (!std.mem.eql(u8, key, keyFor(context))) return error.CodecFailed;
+        }
+        return out;
+    }
+
+    fn encode(ptr: *anyopaque, arena: Allocator, io: std.Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return encodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn decode(ptr: *anyopaque, arena: Allocator, io: std.Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return decodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+};
+```
+
+Notes:
+
+- The result and failure of a workflow-run or activity-run operation come from the workflow or activity the handler started, which encodes them, and an activity its heartbeat details, with the caller's `nexus` when the server propagated it with the start. Their arguments, signals, queries and other payloads keep their own context. An update whose task carries a propagated context, from a handler of another SDK, answers with it too.
+- Only a server that propagates the context does this; the stable dev server doesn't yet. `testing.DevServer.nexus_context_cli_version` names a Temporal CLI build whose dev server does; pass it as `WorkflowEnvironment.Options.dev_server_cli_version` or `DevServer.Options.cli_version`. Against another server the started workflow or activity encodes with its own context while the caller decodes with the Nexus one, so a codec that chooses its key by endpoint needs such a server, or payloads that say which key decodes them.
+- A client reading a history (`Client.fetchHistory`, `historyIterator`, and so the test environment's replays) decodes each Nexus operation's events with the operation's context, and the close event of a run, or the completion of an update, that carried a propagated context with that context, across pages. `WorkflowHandle.get` decodes a Nexus-started run's result and failure with the context the server sends with it. An update's or a standalone activity's handle decodes its result with the call's own context, not the propagated one. A workflow's `signalWithStartWorkflow`, which the SDK sends as a Nexus operation of its own, keeps the run's context.
+- `nexus` is null for every other payload, including those of a workflow that `workflow.Context.converterContext` returns in a Nexus-started run.
 
 #### Failures
 
@@ -3154,7 +3220,7 @@ Notes:
 - The worker cancels a handler through its `std.Io` when the request's deadline passes or the worker shuts down after `graceful_shutdown_period`; `ctx.cancelReason()` is then `timed_out` or `worker_shutdown`. A canceled handler that returns `error.Canceled` sends no response: the caller's attempt times out and the server retries the request until the operation's timeout. Anything else it returns after the cancel is reported as usual.
 - A request for a service or an operation the worker doesn't have fails as `not_found`, naming both; one the worker can't decode fails as `bad_request`. Neither is retried.
 - A request the worker's Io has no thread for fails as `resource_exhausted`, which the server retries.
-- The client's payload codecs apply to an operation's input, its result, and the details of its failure.
+- The client's payload codecs apply to an operation's input, its result, and the details of its failure, with the operation's Nexus context (`ctx.converterContext()`, and `converter.Context.nexus`: see [Payload codecs](#payload-codecs)). A workflow-run or activity-run start sends that context to the server, which hands it to the started workflow or activity for its result and failure.
 - The caller's links arrive in `ctx.info().links`, and a workflow-run or activity-run operation's start returns a link to its workflow or activity, which the caller's history records. Workflow-event, activity, and Nexus-operation links are converted; a link of another kind, or one that doesn't parse, is logged and dropped.
 - `max_concurrent_nexus_task_executions` and `max_concurrent_nexus_task_pollers` bound the requests handled and the polls open at once (see [Options](#options)).
 

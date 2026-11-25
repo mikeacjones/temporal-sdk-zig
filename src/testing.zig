@@ -94,6 +94,11 @@ pub const DevServer = struct {
         extra_args: []const []const u8 = &.{},
     };
 
+    /// Experimental: a `cli_version` whose server propagates a Nexus caller's context to the
+    /// workflows and activities its handler starts (`converter.Context.nexus`); stable
+    /// releases do not yet.
+    pub const nexus_context_cli_version = "v1.9.3-nexus-serialization-context";
+
     /// `extra_args` that enable standalone activities (`Client.executeActivity`), which the
     /// dev server leaves off by default. Needs Temporal CLI 1.10.0 or later.
     pub const standalone_activity_args = [_][]const u8{
@@ -365,6 +370,9 @@ pub const WorkflowEnvironment = struct {
         /// Extra arguments for the dev server's `temporal server start-dev`, such as
         /// `DevServer.standalone_activity_args`.
         dev_server_extra_args: []const []const u8 = &.{},
+        /// The dev server's Temporal CLI version (`DevServer.Options.cli_version`), such as
+        /// `DevServer.nexus_context_cli_version`. Dev server only.
+        dev_server_cli_version: []const u8 = "default",
         /// The client's payload codecs (`client.Options.codecs`), which its worker and the
         /// replay of each finished workflow use too. Borrowed: they must outlive the
         /// environment.
@@ -419,6 +427,8 @@ pub const WorkflowEnvironment = struct {
             log.warn("WorkflowEnvironment.startTimeSkippingWithOptions: dev_server_extra_args ({d} arguments) applies only to the dev server (startWithOptions); the time-skipping test server takes none", .{options.dev_server_extra_args.len});
             return error.InvalidOptions;
         }
+        if (!std.mem.eql(u8, options.dev_server_cli_version, "default"))
+            log.warn("WorkflowEnvironment.startTimeSkippingWithOptions: dev_server_cli_version \"{s}\" applies only to the dev server (startWithOptions); the time-skipping test server ignores it", .{options.dev_server_cli_version});
         return create(gpa, io, .time_skipping, options);
     }
 
@@ -461,7 +471,7 @@ pub const WorkflowEnvironment = struct {
         env.time_lock_lost = false;
         var client_options = switch (kind) {
             .dev => blk: {
-                env.server = .{ .dev = try DevServer.start(gpa, io, .{ .search_attributes = &custom_search_attributes, .extra_args = options.dev_server_extra_args }) };
+                env.server = .{ .dev = try DevServer.start(gpa, io, .{ .search_attributes = &custom_search_attributes, .extra_args = options.dev_server_extra_args, .cli_version = options.dev_server_cli_version }) };
                 break :blk env.server.clientOptions();
             },
             .time_skipping => blk: {
@@ -1310,6 +1320,8 @@ pub const ActivityEnvironment = struct {
             },
         };
         ctx.converter_context_.values = &ctx.propagated_;
+        // As a worker does for an activity a Nexus handler started.
+        if (info.nexus_context) |n| ctx.result_converter_context_ = .{ .values = &ctx.propagated_, .namespace = info.workflow_namespace, .nexus = n };
         var run: Running = .{ .ctx = &ctx };
         {
             env.mutex.lockUncancelable(env.io);

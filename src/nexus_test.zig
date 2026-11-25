@@ -959,6 +959,15 @@ const ActivityFixtures = struct {
         return error.TestNeverCanceled;
     }
     const Beat = activity.Def("NexusTestBeat", beat);
+
+    /// Heartbeats "beat <name>", then returns the Nexus context it was started with.
+    fn contextual(ctx: *activity.Context, name: []const u8) ![]const u8 {
+        const beat_details = try std.fmt.allocPrint(ctx.allocator(), "beat {s}", .{name});
+        ctx.heartbeat(beat_details);
+        const n = ctx.info().nexus_context orelse return "no context";
+        return std.fmt.allocPrint(ctx.allocator(), "{s} {s} {s}/{s}", .{ name, n.endpoint, n.service, n.operation });
+    }
+    const Contextual = activity.Def("NexusTestContextual", contextual);
 };
 const activity = @import("activity.zig");
 
@@ -968,7 +977,8 @@ const BeatOp = nexus.OperationDef("beat", []const u8, []const u8);
 const SignalTwiceOp = nexus.OperationDef("signal-twice", []const u8, []const u8);
 const SignalFlakyOp = nexus.OperationDef("signal-flaky", []const u8, []const u8);
 const SignalWithStartOp = nexus.OperationDef("signal-with-start", []const u8, []const u8);
-const ActivityService = nexus.ServiceDef("zig-activity-service", .{ ComposeOp, RefuseOp, BeatOp, SignalTwiceOp, SignalFlakyOp, SignalWithStartOp });
+const ContextualOp = nexus.OperationDef("contextual", []const u8, []const u8);
+const ActivityService = nexus.ServiceDef("zig-activity-service", .{ ComposeOp, RefuseOp, BeatOp, SignalTwiceOp, SignalFlakyOp, SignalWithStartOp, ContextualOp });
 
 const Ping = workflow.SignalDef("ping", fn ([]const u8) void);
 
@@ -1010,6 +1020,10 @@ const ActivityHandlers = struct {
         return .{ .options = .{ .task_queue = "", .schedule_to_close_timeout = .fromSeconds(30) }, .args = .{name} };
     }
 
+    fn contextual(_: *ActivityHandlers, ctx: *nexus.Context, name: []const u8) !nexus.ActivityStart(ActivityFixtures.Contextual) {
+        return .{ .options = .{ .id = try std.fmt.allocPrint(ctx.allocator(), "contextual-{s}", .{name}), .task_queue = "", .start_to_close_timeout = .fromSeconds(30) }, .args = .{name} };
+    }
+
     fn beat(_: *ActivityHandlers, _: *nexus.Context, name: []const u8) !nexus.ActivityStart(ActivityFixtures.Beat) {
         return .{ .options = .{ .task_queue = "", .start_to_close_timeout = .fromSeconds(120), .heartbeat_timeout = .fromSeconds(10) }, .args = .{name} };
     }
@@ -1047,6 +1061,7 @@ const ActivityHandler = nexus.ServiceHandler(ActivityService, .{
     nexus.OperationHandler(SignalTwiceOp, ActivityHandlers.signalTwice),
     nexus.OperationHandler(SignalFlakyOp, ActivityHandlers.signalFlaky),
     nexus.OperationHandler(SignalWithStartOp, ActivityHandlers.signalWithStart),
+    nexus.OperationHandler(ContextualOp, ActivityHandlers.contextual),
 });
 
 /// Calls `operation` of `ActivityService` with `input`, and returns its output or "failed: "
@@ -1086,13 +1101,18 @@ const CancelBeat = workflow.Def("NexusTestCancelBeat", cancelBeat);
 /// `Setup` for the activity-run and signal tests: a dev server that lets standalone
 /// activities complete Nexus operations and returns links for signals.
 fn startActivitySetup(handlers: *ActivityHandlers) !Setup {
+    return startActivitySetupWith(handlers, .{});
+}
+
+/// `startActivitySetup` with `options`, whose `dev_server_extra_args` it sets.
+fn startActivitySetupWith(handlers: *ActivityHandlers, options: WorkflowEnvironment.Options) !Setup {
     ActivityFixtures.reset();
-    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
-        .dev_server_extra_args = &(testing_mod.DevServer.standalone_activity_args ++ testing_mod.DevServer.activity_callback_args ++ testing_mod.DevServer.signal_link_args),
-    });
+    var with_args = options;
+    with_args.dev_server_extra_args = &(testing_mod.DevServer.standalone_activity_args ++ testing_mod.DevServer.activity_callback_args ++ testing_mod.DevServer.signal_link_args);
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, with_args);
     errdefer env.deinit();
     inline for (.{ CallActivityService, CancelBeat, PingTarget }) |W| try env.registerWorkflow(W);
-    inline for (.{ ActivityFixtures.Compose, ActivityFixtures.Refuse, ActivityFixtures.Beat }) |A| try env.registerActivity(A);
+    inline for (.{ ActivityFixtures.Compose, ActivityFixtures.Refuse, ActivityFixtures.Beat, ActivityFixtures.Contextual }) |A| try env.registerActivity(A);
     try env.registerNexusServiceWith(ActivityHandler, handlers);
     var s: Setup = .{ .env = env, .endpoint = undefined, .arena = .init(testing.allocator) };
     errdefer s.arena.deinit();
@@ -1240,4 +1260,245 @@ test "nexus: a handler's signal-with-start needs a workflow ID, and with one sta
     // The retry finds the run the first attempt started, and its signal is dropped.
     try testing.expectEqualStrings("started=false on attempt 2", try s.run(CallActivityService, .{ s.endpoint, "signal-with-start", id }));
     try testing.expectEqualStrings("pings=1", try releasePings(&s, id));
+}
+
+// ---------------------------------------------------------------- serialization context
+
+/// Records the context and the plain data of every payload it encodes, and passes payloads
+/// through unchanged. Safe from the worker's and the client's threads.
+const NexusRecordingCodec = struct {
+    mutex: Io.Mutex = .init,
+    arena: std.heap.ArenaAllocator = .init(testing.allocator),
+    records: std.ArrayList(Record) = .empty,
+
+    const Record = struct { encode: bool, nexus: ?converter.NexusContext, workflow_id: []const u8, data: []const u8 };
+
+    fn codec(r: *NexusRecordingCodec) converter.PayloadCodec {
+        return .{ .ptr = r, .vtable = &.{ .encode = encode, .decode = decode, .encodeWithContext = encodeWithContext, .decodeWithContext = decodeWithContext } };
+    }
+
+    fn deinit(r: *NexusRecordingCodec) void {
+        r.arena.deinit();
+    }
+
+    fn encode(ptr: *anyopaque, arena: std.mem.Allocator, io: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return encodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn decode(ptr: *anyopaque, arena: std.mem.Allocator, io: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return decodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn encodeWithContext(ptr: *anyopaque, arena: std.mem.Allocator, io: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        try record(ptr, io, true, context, payloads);
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn decodeWithContext(ptr: *anyopaque, arena: std.mem.Allocator, io: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        try record(ptr, io, false, context, payloads);
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn record(ptr: *anyopaque, io: Io, encoding: bool, context: *const converter.Context, payloads: []const converter.Payload) error{OutOfMemory}!void {
+        const r: *NexusRecordingCodec = @ptrCast(@alignCast(ptr));
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        const a = r.arena.allocator();
+        const nexus_copy: ?converter.NexusContext = if (context.nexus) |n| .{
+            .endpoint = try a.dupe(u8, n.endpoint),
+            .service = try a.dupe(u8, n.service),
+            .operation = try a.dupe(u8, n.operation),
+        } else null;
+        for (payloads) |p| try r.records.append(a, .{ .encode = encoding, .nexus = nexus_copy, .workflow_id = try a.dupe(u8, context.workflow_id), .data = try a.dupe(u8, p.data) });
+    }
+
+    /// How many payloads holding `value`'s data were coded in the direction `encoding` with
+    /// the Nexus context of `operation` through `endpoint`, and how many without a Nexus
+    /// context, each of which must name one of `other_workflow_ids`.
+    fn count(r: *NexusRecordingCodec, encoding: bool, value: []const u8, endpoint: []const u8, service: []const u8, operation: []const u8, other_workflow_ids: []const []const u8) !struct { nexus: usize, other: usize } {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const want = (try converter.toPayload(scratch.allocator(), value)).data;
+        r.mutex.lockUncancelable(testing.io);
+        defer r.mutex.unlock(testing.io);
+        var nexus_count: usize = 0;
+        var other: usize = 0;
+        for (r.records.items) |rec| {
+            if (rec.encode != encoding or !std.mem.eql(u8, rec.data, want)) continue;
+            const n = rec.nexus orelse {
+                for (other_workflow_ids) |id| {
+                    if (std.mem.eql(u8, id, rec.workflow_id)) break;
+                } else {
+                    std.debug.print("\"{s}\" was coded without a Nexus context for workflow \"{s}\"\n", .{ value, rec.workflow_id });
+                    return error.TestUnexpectedContext;
+                }
+                other += 1;
+                continue;
+            };
+            try testing.expectEqualStrings(endpoint, n.endpoint);
+            try testing.expectEqualStrings(service, n.service);
+            try testing.expectEqualStrings(operation, n.operation);
+            try testing.expectEqualStrings("", rec.workflow_id);
+            nexus_count += 1;
+        }
+        return .{ .nexus = nexus_count, .other = other };
+    }
+};
+
+test "nexus: the caller's input and the backing workflow's result are coded with the endpoint's name, and both histories replay" {
+    var handlers: Handlers = .{ .io = testing.io };
+    var recording: NexusRecordingCodec = .{};
+    defer recording.deinit();
+    const codecs = [_]converter.PayloadCodec{recording.codec()};
+    var s = try Setup.start(&handlers, .{ .codecs = &codecs, .dev_server_cli_version = testing_mod.DevServer.nexus_context_cli_version });
+    defer s.deinit();
+    const a = s.arena.allocator();
+    const name = try uniqueName(a, "Zig");
+    var r = try s.env.startWorkflow(CallGreet, .{}, .{ s.endpoint, name });
+    defer r.deinit();
+    try expectContains(try s.env.getResult(CallGreet, &r, a, null), try std.fmt.allocPrint(a, "Hello, {s} (token of ", .{name}));
+
+    const greet_id = try std.fmt.allocPrint(a, "greet-{s}", .{name});
+    // The caller's schedule command encodes the input, and the handler's worker decodes it,
+    // with the operation's context. The handler's start encodes it again as the started
+    // workflow's argument, with that workflow's own context; the client encoded it as the
+    // caller's argument with the caller's.
+    const own = [_][]const u8{ r.id, greet_id };
+    const input_encoded = try recording.count(true, name, s.endpoint, Service.service_name, "greet", &own);
+    // (`getResult` replays the caller, coding its commands again.)
+    try testing.expect(input_encoded.nexus >= 1);
+    try testing.expectEqual(2, input_encoded.other);
+    try testing.expect((try recording.count(false, name, s.endpoint, Service.service_name, "greet", &own)).nexus >= 1);
+
+    // The workflow the handler started encodes its result with the caller's context, which
+    // the server propagated to it, and the caller decodes it with the same.
+    const result = try std.fmt.allocPrint(a, "Hello, {s}", .{name});
+    const result_encoded = try recording.count(true, result, s.endpoint, Service.service_name, "greet", &.{});
+    try testing.expect(result_encoded.nexus >= 1);
+    try testing.expectEqual(0, result_encoded.other);
+    try testing.expect((try recording.count(false, result, s.endpoint, Service.service_name, "greet", &own)).nexus >= 1);
+
+    try s.env.replayRun(greet_id, "");
+    try s.env.replayRun(r.id, r.run_id);
+}
+
+test "nexus: an activity a handler started sees the caller's context, and codes its result and heartbeats with it" {
+    var handlers: ActivityHandlers = .{};
+    var recording: NexusRecordingCodec = .{};
+    defer recording.deinit();
+    const codecs = [_]converter.PayloadCodec{recording.codec()};
+    var s = try startActivitySetupWith(&handlers, .{ .codecs = &codecs, .dev_server_cli_version = testing_mod.DevServer.nexus_context_cli_version });
+    defer s.deinit();
+    const a = s.arena.allocator();
+    const name = try uniqueName(a, "Zig");
+    var r = try s.env.startWorkflow(CallActivityService, .{}, .{ s.endpoint, "contextual", name });
+    defer r.deinit();
+    const result = try s.env.getResult(CallActivityService, &r, a, null);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s} {s} {s}/contextual", .{ name, s.endpoint, ActivityService.service_name }), result);
+
+    // The caller encodes the same value as its own result, with its own context.
+    const result_encoded = try recording.count(true, result, s.endpoint, ActivityService.service_name, "contextual", &.{r.id});
+    try testing.expect(result_encoded.nexus >= 1);
+    try testing.expect(result_encoded.other >= 1);
+    const beat = try recording.count(true, try std.fmt.allocPrint(a, "beat {s}", .{name}), s.endpoint, ActivityService.service_name, "contextual", &.{});
+    try testing.expect(beat.nexus >= 1);
+    try testing.expectEqual(0, beat.other);
+}
+
+/// Like a codec that encrypts with one key per Nexus endpoint: marks each payload with the
+/// key of its context (the endpoint for a Nexus payload, "default" otherwise), and refuses
+/// to decode a payload marked with another key, as decryption with the wrong key would.
+const EndpointKeyCodec = struct {
+    const key_metadata = "key-id";
+
+    fn codec() converter.PayloadCodec {
+        return .{ .ptr = undefined, .vtable = &.{ .encode = encode, .decode = decode, .encodeWithContext = encodeWithContext, .decodeWithContext = decodeWithContext } };
+    }
+
+    fn keyFor(context: *const converter.Context) []const u8 {
+        return if (context.nexus) |n| n.endpoint else "default";
+    }
+
+    fn encode(ptr: *anyopaque, arena: std.mem.Allocator, io: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return encodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn decode(ptr: *anyopaque, arena: std.mem.Allocator, io: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return decodeWithContext(ptr, arena, io, &.{}, payloads);
+    }
+
+    fn encodeWithContext(_: *anyopaque, arena: std.mem.Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const out = try arena.alloc(converter.Payload, payloads.len);
+        for (payloads, out) |p, *o| {
+            o.* = try p.dupe(arena);
+            try o.metadata.append(arena, .{ .key = key_metadata, .value = try arena.dupe(u8, keyFor(context)) });
+        }
+        return out;
+    }
+
+    fn decodeWithContext(_: *anyopaque, arena: std.mem.Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const out = try arena.alloc(converter.Payload, payloads.len);
+        for (payloads, out) |p, *o| {
+            o.* = try p.dupe(arena);
+            const index = for (o.metadata.items, 0..) |entry, i| {
+                if (std.mem.eql(u8, entry.key, key_metadata)) break i;
+            } else continue;
+            if (!std.mem.eql(u8, o.metadata.items[index].value, keyFor(context))) {
+                std.debug.print("EndpointKeyCodec: a payload encoded with key \"{s}\" was decoded with key \"{s}\" (workflow \"{s}\")\n", .{ o.metadata.items[index].value, keyFor(context), context.workflow_id });
+                return error.CodecFailed;
+            }
+            _ = o.metadata.orderedRemove(index);
+        }
+        return out;
+    }
+};
+
+test "nexus: with a codec keyed by Nexus endpoint, a caller's history still fetches and replays" {
+    var handlers: Handlers = .{ .io = testing.io };
+    const codecs = [_]converter.PayloadCodec{EndpointKeyCodec.codec()};
+    var s = try Setup.start(&handlers, .{ .codecs = &codecs });
+    defer s.deinit();
+    const a = s.arena.allocator();
+    var r = try s.env.startWorkflow(CallEcho, .{}, .{ s.endpoint, "hi" });
+    defer r.deinit();
+    // The run itself completes: its operation's input and result are coded with the
+    // endpoint's key on both workers. `getResult` then fetches its history, whose Nexus
+    // events hold those payloads, and replays it.
+    try expectContains(try s.env.getResult(CallEcho, &r, a, null), "hi op=zig-test-service/echo");
+    _ = try s.env.client.fetchHistory(a, r.id, r.run_id);
+}
+
+/// Reads every event of a run's history a page of one event at a time, so an operation's
+/// scheduled event and its completion arrive on different pages.
+fn readHistoryByEvent(c: *client_mod.Client, workflow_id: []const u8, run_id: []const u8) !usize {
+    var it = try c.historyIterator(workflow_id, run_id, .{ .page_size = 1 });
+    defer it.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    var n: usize = 0;
+    while (try it.next(scratch.allocator())) |_| n += 1;
+    return n;
+}
+
+test "nexus: with a codec keyed by Nexus endpoint, the caller's and the backing workflow's histories read page by page, results read through handles, and both replay" {
+    var handlers: Handlers = .{ .io = testing.io };
+    const codecs = [_]converter.PayloadCodec{EndpointKeyCodec.codec()};
+    var s = try Setup.start(&handlers, .{ .codecs = &codecs, .dev_server_cli_version = testing_mod.DevServer.nexus_context_cli_version });
+    defer s.deinit();
+    const a = s.arena.allocator();
+    const name = try uniqueName(a, "Zig");
+    var r = try s.env.startWorkflow(CallGreet, .{}, .{ s.endpoint, name });
+    defer r.deinit();
+    try expectContains(try s.env.getResult(CallGreet, &r, a, null), try std.fmt.allocPrint(a, "Hello, {s} (token of ", .{name}));
+    try testing.expect(try readHistoryByEvent(&s.env.client, r.id, r.run_id) > 0);
+
+    // The backing workflow encoded its result with the endpoint's key, as the server
+    // propagated the caller's context to it.
+    const greet_id = try std.fmt.allocPrint(a, "greet-{s}", .{name});
+    try testing.expect(try readHistoryByEvent(&s.env.client, greet_id, "") > 0);
+    var greeted = try s.env.client.getWorkflow([]const u8, greet_id, "");
+    defer greeted.deinit();
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "Hello, {s}", .{name}), try greeted.get(a));
+    try s.env.replayRun(greet_id, "");
+    try s.env.replayRun(r.id, r.run_id);
 }

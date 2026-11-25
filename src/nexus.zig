@@ -649,6 +649,18 @@ pub const Context = struct {
         return &ctx.propagated_;
     }
 
+    /// Experimental: the converter context of the request's payloads (input, synchronous
+    /// result, failure): the namespace, `propagated()`, and `nexus` from `info()`. The
+    /// workflow and activity fields are empty, since the caller is no workflow or activity
+    /// of this worker. Borrows `ctx`.
+    pub fn converterContext(ctx: *const Context) converter.Context {
+        return .{
+            .namespace = ctx.info_.namespace,
+            .values = &ctx.propagated_,
+            .nexus = .{ .endpoint = ctx.info_.endpoint, .service = ctx.info_.service, .operation = ctx.info_.operation },
+        };
+    }
+
     /// Why the request was canceled, or null if it hasn't been. Set before the cancel reaches
     /// the handler's `std.Io`.
     pub fn cancelReason(ctx: *const Context) ?CancelReason {
@@ -1006,21 +1018,15 @@ fn Implementation(comptime service: []const u8, comptime Op: type, comptime func
 
         fn encodeOutput(ctx: *Context, value: shape.Value) StartResult {
             const a = ctx.arena;
-            const payload = converter.toPayloadWithContext(a, &codecContext(ctx), value) catch return outOfMemory(what);
+            const payload = converter.toPayloadWithContext(a, &ctx.converterContext(), value) catch return outOfMemory(what);
             if (ctx.codecs.len == 0) return .{ .succeeded = .{ .result = payload, .links = ctx.response_links_.items } };
-            const encoded = converter.encodePayloadsWithContext(ctx.codecs, a, ctx.io_, &codecContext(ctx), &.{payload}) catch |err| return .{ .handler_error = .{
+            const encoded = converter.encodePayloadsWithContext(ctx.codecs, a, ctx.io_, &ctx.converterContext(), &.{payload}) catch |err| return .{ .handler_error = .{
                 .type = .internal,
                 .message = std.fmt.allocPrint(a, "{s}: encoding its output with the client's codecs failed: {t}", .{ what, err }) catch what ++ ": encoding its output with the client's codecs failed",
             } };
             return .{ .succeeded = .{ .result = encoded[0], .links = ctx.response_links_.items } };
         }
     };
-}
-
-// What the codecs and the payload converter see for a request: the namespace and the
-// propagated values, since the caller is no workflow or activity of this worker.
-fn codecContext(ctx: *const Context) converter.Context {
-    return .{ .namespace = ctx.info_.namespace, .values = &ctx.propagated_ };
 }
 
 /// Decodes `input` as `T`: through the context's codecs, then the payload converter. On
@@ -1034,13 +1040,13 @@ fn decodeInput(comptime T: type, comptime what: []const u8, ctx: *Context, input
         return error.Failed;
     };
     if (ctx.codecs.len > 0) {
-        const decoded = converter.decodePayloadsWithContext(ctx.codecs, a, ctx.io_, &codecContext(ctx), &.{payload}) catch |err| {
+        const decoded = converter.decodePayloadsWithContext(ctx.codecs, a, ctx.io_, &ctx.converterContext(), &.{payload}) catch |err| {
             failed.* = .{ .type = .internal, .message = std.fmt.allocPrint(a, "{s}: decoding its input with the client's codecs failed: {t}", .{ what, err }) catch what ++ ": decoding its input with the client's codecs failed" };
             return error.Failed;
         };
         payload = decoded[0];
     }
-    return converter.fromPayloadWithContext(T, a, &codecContext(ctx), payload) catch |err| {
+    return converter.fromPayloadWithContext(T, a, &ctx.converterContext(), payload) catch |err| {
         if (err == error.OutOfMemory) {
             failed.* = .{ .type = .internal, .message = what ++ ": out of memory decoding its input" };
             return error.Failed;
@@ -1082,6 +1088,7 @@ fn startWorkflow(comptime W: type, comptime what: []const u8, ctx: *Context, sta
         .callback_url = i.callback_url,
         .callback_headers = headers,
         .links = i.links,
+        .nexus_context = ctx.converterContext().nexus,
         .rejection = &rejected,
     }) catch |err| return .{ .handler_error = rpcError(a, what ++ ": starting workflow \"" ++ W.workflow_name ++ "\" failed", err, rejected) };
     const links = startedLinks(ctx, started.link) catch return outOfMemory(what);
@@ -1241,6 +1248,7 @@ fn startActivity(comptime A: type, comptime what: []const u8, ctx: *Context, sta
         .callback_url = i.callback_url,
         .callback_headers = headers,
         .links = i.links,
+        .nexus_context = ctx.converterContext().nexus,
         .rejection = &rejected,
     }) catch |err| return .{ .handler_error = rpcError(a, what ++ ": starting activity \"" ++ A.activity_name ++ "\" failed", err, rejected) };
     const token = encodeActivityToken(a, c.namespace, options.id, started.run_id) catch return outOfMemory(what);
@@ -1505,6 +1513,51 @@ test "the input and a synchronous result go through the context's codecs" {
     try testing.expectEqualStrings(converter.ZlibCodec.encoding, converter.encodingOf(result).?);
     const decoded = (try converter.decodePayloads(&codecs, a, testing.io, &.{result}))[0];
     try testing.expectEqualStrings("\"Hello Zig\"", decoded.data);
+}
+
+/// A value whose payload, and whose decoded text, name the Nexus context it was converted
+/// with.
+const ContextNamed = struct {
+    text: []const u8 = "",
+
+    fn describe(a: Allocator, context: *const converter.Context) error{OutOfMemory}![]const u8 {
+        const n = context.nexus orelse return "no nexus";
+        return std.fmt.allocPrint(a, "{s}/{s}/{s} ns={s} wf={s}", .{ n.endpoint, n.service, n.operation, context.namespace, context.workflow_id });
+    }
+
+    pub fn toPayloadWithContext(v: ContextNamed, a: Allocator, context: *const converter.Context) error{OutOfMemory}!Payload {
+        return converter.toPayload(a, try std.fmt.allocPrint(a, "{s} -> {s}", .{ v.text, try describe(a, context) }));
+    }
+
+    pub fn fromPayloadWithContext(a: Allocator, context: *const converter.Context, _: Payload) converter.DecodeError!ContextNamed {
+        return .{ .text = try describe(a, context) };
+    }
+};
+
+test "a request's input and synchronous result are converted with its endpoint, service and operation" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Named = OperationDef("named", ContextNamed, ContextNamed);
+    const S = ServiceDef("named-service", .{Named});
+    const H = ServiceHandler(S, .{OperationHandler(Named, struct {
+        fn f(_: *Context, in: ContextNamed) ContextNamed {
+            return in;
+        }
+    }.f)});
+
+    var ctx: Context = .{ .arena = a, .io_ = testing.io, .info_ = .{ .service = "named-service", .operation = "named", .namespace = "handler-ns", .endpoint = "ep" } };
+    const context = ctx.converterContext();
+    try testing.expectEqualStrings("ep", context.nexus.?.endpoint);
+    try testing.expectEqualStrings("named-service", context.nexus.?.service);
+    try testing.expectEqualStrings("named", context.nexus.?.operation);
+    try testing.expect(context.values == ctx.propagated());
+    const result = H.registered.find("named").?.start(&ctx, try converter.toPayload(a, @as([]const u8, "in"))).succeeded.result;
+    try testing.expectEqualStrings("\"ep/named-service/named ns=handler-ns wf= -> ep/named-service/named ns=handler-ns wf=\"", result.data);
+
+    // A request with no endpoint still carries the Nexus context, with an empty endpoint.
+    ctx.info_.endpoint = "";
+    try testing.expectEqualStrings("", ctx.converterContext().nexus.?.endpoint);
 }
 
 test "canceling a synchronous operation is not implemented" {

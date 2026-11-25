@@ -57,8 +57,9 @@
 //! instead, or as well: they take precedence over `toPayload` and `fromPayload`, with the same
 //! reach (the type and optionals of it, at the top level of a payload). Declaring only one of
 //! the two is a compile error. `Context` is what payload codecs receive too: the namespace,
-//! the workflow ID and type, for an activity's values the activity type and ID, and the
-//! propagated values. `toPayloadWithContext`, `fromPayloadWithContext`,
+//! the workflow ID and type, for an activity's values the activity type and ID, for a Nexus
+//! operation's values its endpoint, service and operation (`nexus`), and the propagated
+//! values. `toPayloadWithContext`, `fromPayloadWithContext`,
 //! `toPayloadsWithContext` and `fromPayloadsWithContext` convert with one; `toPayload`,
 //! `fromPayload`, `toPayloads` and `fromPayloads` pass the empty context (every string empty,
 //! no values). The SDK passes the context of the call a value belongs to:
@@ -76,8 +77,11 @@
 //! | workflow: activity and local activity arguments and results  | the run's, with the activity type and ID     |
 //! | workflow: child arguments, result and signals                | namespace, the child's workflow ID and type  |
 //! | workflow: external signal arguments                          | namespace, the target workflow ID            |
-//! | workflow and Nexus handler: Nexus input and result           | namespace and propagated values              |
-//! | activity: arguments, result, heartbeat details               | the activity's (`activity.Context.converterContext`) |
+//! | workflow and Nexus handler: Nexus input, result and failure  | namespace, propagated values, `nexus`        |
+//! | activity: arguments                                          | the activity's (`activity.Context.converterContext`) |
+//! | activity: result, failure, heartbeat details                 | `activity.Context.resultConverterContext`    |
+//! | run, update or activity a Nexus handler started: result,     | namespace, propagated values, the caller's   |
+//! |   failure (an activity's heartbeat details too)              |   `nexus`, when the server propagated it     |
 //!
 //! Payload codecs on the workflow's worker get the run's context for its whole activation
 //! and completion, except an activity's, local activity's or child's payloads: the schedule
@@ -85,6 +89,9 @@
 //! resolutions (result and failure) get the same context as that call's hooks, with the
 //! scheduled activity type and ID, or the child's workflow ID and type. So the activity's worker and the child's own
 //! worker decode with the context the workflow's worker encoded with, and the reverse.
+//! A Nexus operation's schedule command (input and summary) and its resolutions get the
+//! operation's context, with `nexus` set and no workflow fields, as the handler's worker
+//! decodes and encodes them; the operation a signal-with-start schedules keeps the run's.
 //! Signals to other workflows, children included, keep the run's context for codecs. A side
 //! effect's value is the run's own although an internal local activity records it: codecs
 //! code it with the run's identity, without propagated values, on both workers.
@@ -137,6 +144,7 @@ const codec = @import("converter/codec.zig");
 pub const CodecError = codec.CodecError;
 pub const PayloadCodec = codec.PayloadCodec;
 pub const Context = codec.Context;
+pub const NexusContext = codec.NexusContext;
 /// Deprecated: use `Context`.
 pub const CodecContext = Context;
 pub const ZlibCodec = codec.ZlibCodec;
