@@ -74,8 +74,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "nexus-context-propagation:starter")) return @import("nexus-context-propagation/starter.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-messaging:worker")) return @import("nexus-messaging/worker.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-messaging:starter")) return @import("nexus-messaging/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-messaging-temporal-operation:worker")) return @import("nexus-messaging-temporal-operation/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-messaging-temporal-operation:starter")) return @import("nexus-messaging-temporal-operation/starter.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-multiple-arguments:worker")) return @import("nexus-multiple-arguments/worker.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-multiple-arguments:starter")) return @import("nexus-multiple-arguments/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-standalone-activity:worker")) return @import("nexus-standalone-activity/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-standalone-activity:starter")) return @import("nexus-standalone-activity/starter.zig").main(init);
     if (std.mem.eql(u8, name, "polling:worker")) return @import("polling/worker.zig").main(init);
     if (std.mem.eql(u8, name, "polling:starter")) return @import("polling/starter.zig").main(init);
     if (std.mem.eql(u8, name, "pso:worker")) return @import("pso/worker.zig").main(init);

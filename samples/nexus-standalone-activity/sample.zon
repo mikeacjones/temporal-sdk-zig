@@ -1,0 +1,17 @@
+// How samples-test validates this sample: create the namespaces and the Nexus endpoint below
+// on the dev server, start the worker (the handler worker), run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The starter runs
+// the operation from client code in the caller namespace; the handler's standalone activity
+// completes it. worker.zig says how to set up a server by hand.
+.{
+    .expect = .{
+        "Started Greet operation OperationID=greeting-",
+        "Hello, World!",
+    },
+    .timeout_seconds = 60,
+    .tests = .{"handler_test.zig"},
+    .namespaces = .{ "nexus-standalone-activity-handler-namespace", "nexus-standalone-activity-caller-namespace" },
+    .nexus_endpoints = .{
+        .{ .name = "nexus-standalone-activity-endpoint", .namespace = "nexus-standalone-activity-handler-namespace", .task_queue = "nexus-standalone-activity-handler" },
+    },
+}

@@ -924,3 +924,320 @@ test "nexus: a request whose link isn't UTF-8 once percent-decoded starts its wo
     try testing.expectEqualStrings("Hello, Link", try greeted.get(a));
     try dropped.expectReasonContaining("its namespace is not valid UTF-8");
 }
+
+// ---------------------------------------------------------------- activity-run operations and signals
+
+const ActivityFixtures = struct {
+    var beat_entered: Io.Event = .unset;
+    var beat_canceled: Io.Event = .unset;
+
+    fn reset() void {
+        beat_entered = .unset;
+        beat_canceled = .unset;
+    }
+
+    fn compose(ctx: *activity.Context, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "Hello, {s}!", .{name});
+    }
+    const Compose = activity.Def("NexusTestCompose", compose);
+
+    fn refuse(ctx: *activity.Context, name: []const u8) ![]const u8 {
+        return ctx.fail(.{ .message = try std.fmt.allocPrint(ctx.allocator(), "no greeting for {s}", .{name}), .type = "NoGreeting", .non_retryable = true });
+    }
+    const Refuse = activity.Def("NexusTestRefuse", refuse);
+
+    /// Heartbeats until canceled, for at most 60 s.
+    fn beat(ctx: *activity.Context, _: []const u8) ![]const u8 {
+        beat_entered.set(testing.io);
+        for (0..1200) |_| {
+            ctx.heartbeat({});
+            ctx.io().sleep(.fromMilliseconds(50), .awake) catch |err| {
+                beat_canceled.set(testing.io);
+                return err;
+            };
+        }
+        return error.TestNeverCanceled;
+    }
+    const Beat = activity.Def("NexusTestBeat", beat);
+};
+const activity = @import("activity.zig");
+
+const ComposeOp = nexus.OperationDef("compose", []const u8, []const u8);
+const RefuseOp = nexus.OperationDef("refuse", []const u8, []const u8);
+const BeatOp = nexus.OperationDef("beat", []const u8, []const u8);
+const SignalTwiceOp = nexus.OperationDef("signal-twice", []const u8, []const u8);
+const SignalFlakyOp = nexus.OperationDef("signal-flaky", []const u8, []const u8);
+const SignalWithStartOp = nexus.OperationDef("signal-with-start", []const u8, []const u8);
+const ActivityService = nexus.ServiceDef("zig-activity-service", .{ ComposeOp, RefuseOp, BeatOp, SignalTwiceOp, SignalFlakyOp, SignalWithStartOp });
+
+const Ping = workflow.SignalDef("ping", fn ([]const u8) void);
+
+const Pings = struct {
+    count: u32 = 0,
+    released: bool = false,
+    fn ping(p: *Pings, _: []const u8) void {
+        p.count += 1;
+    }
+    fn release(p: *Pings) void {
+        p.released = true;
+    }
+    fn isReleased(p: *Pings) bool {
+        return p.released;
+    }
+};
+
+/// Counts `ping` signals until `release`, and returns the count.
+fn pingTarget(ctx: *workflow.Context) ![]const u8 {
+    const pings = try ctx.allocator().create(Pings);
+    pings.* = .{};
+    try ctx.setSignalHandler(Ping, pings, Pings.ping);
+    try ctx.setSignalHandler(Release, pings, Pings.release);
+    try ctx.await(pings, Pings.isReleased);
+    return std.fmt.allocPrint(ctx.allocator(), "pings={d}", .{pings.count});
+}
+const PingTarget = workflow.Def("NexusTestPingTarget", pingTarget);
+
+const ActivityHandlers = struct {
+    twice_calls: std.atomic.Value(u32) = .init(0),
+    flaky_calls: std.atomic.Value(u32) = .init(0),
+    sws_calls: std.atomic.Value(u32) = .init(0),
+
+    fn compose(_: *ActivityHandlers, ctx: *nexus.Context, name: []const u8) !nexus.ActivityStart(ActivityFixtures.Compose) {
+        return .{ .options = .{ .id = try std.fmt.allocPrint(ctx.allocator(), "compose-{s}", .{name}), .task_queue = "", .start_to_close_timeout = .fromSeconds(30) }, .args = .{name} };
+    }
+
+    fn refuse(_: *ActivityHandlers, _: *nexus.Context, name: []const u8) !nexus.ActivityStart(ActivityFixtures.Refuse) {
+        return .{ .options = .{ .task_queue = "", .schedule_to_close_timeout = .fromSeconds(30) }, .args = .{name} };
+    }
+
+    fn beat(_: *ActivityHandlers, _: *nexus.Context, name: []const u8) !nexus.ActivityStart(ActivityFixtures.Beat) {
+        return .{ .options = .{ .task_queue = "", .start_to_close_timeout = .fromSeconds(120), .heartbeat_timeout = .fromSeconds(10) }, .args = .{name} };
+    }
+
+    /// Signals `target` twice; the second is refused.
+    fn signalTwice(h: *ActivityHandlers, ctx: *nexus.Context, target: []const u8) ![]const u8 {
+        _ = h.twice_calls.fetchAdd(1, .monotonic);
+        try ctx.signalWorkflow(Ping, target, "", .{"once"});
+        try ctx.signalWorkflow(Ping, target, "", .{"twice"});
+        return "signaled twice";
+    }
+
+    /// Signals `target`, and fails its first attempt with a retryable handler error.
+    fn signalFlaky(h: *ActivityHandlers, ctx: *nexus.Context, target: []const u8) ![]const u8 {
+        const attempt = h.flaky_calls.fetchAdd(1, .monotonic) + 1;
+        try ctx.signalWorkflow(Ping, target, "", .{"flaky"});
+        if (attempt == 1) return ctx.handlerError(.{ .type = .unavailable, .message = "not yet" });
+        return std.fmt.allocPrint(ctx.allocator(), "signaled on attempt {d}", .{attempt});
+    }
+
+    /// Signal-with-starts `PingTarget` as workflow `id`, fails its first attempt with a
+    /// retryable handler error, and returns whether the second started the run.
+    fn signalWithStart(h: *ActivityHandlers, ctx: *nexus.Context, id: []const u8) ![]const u8 {
+        const r = try ctx.signalWithStartWorkflow(PingTarget, .{ .id = id }, .{}, Ping, .{"started"});
+        const attempt = h.sws_calls.fetchAdd(1, .monotonic) + 1;
+        if (attempt == 1) return ctx.handlerError(.{ .type = .unavailable, .message = "not yet" });
+        return std.fmt.allocPrint(ctx.allocator(), "started={} on attempt {d}", .{ r.started, attempt });
+    }
+};
+
+const ActivityHandler = nexus.ServiceHandler(ActivityService, .{
+    nexus.OperationHandler(ComposeOp, ActivityHandlers.compose),
+    nexus.OperationHandler(RefuseOp, ActivityHandlers.refuse),
+    nexus.OperationHandler(BeatOp, ActivityHandlers.beat),
+    nexus.OperationHandler(SignalTwiceOp, ActivityHandlers.signalTwice),
+    nexus.OperationHandler(SignalFlakyOp, ActivityHandlers.signalFlaky),
+    nexus.OperationHandler(SignalWithStartOp, ActivityHandlers.signalWithStart),
+});
+
+/// Calls `operation` of `ActivityService` with `input`, and returns its output or "failed: "
+/// and the failure's cause chain.
+fn callActivityService(ctx: *workflow.Context, endpoint: []const u8, operation: []const u8, input: []const u8) ![]const u8 {
+    var options = call_options;
+    options.endpoint = endpoint;
+    const f = ctx.executeNexusOperationByName([]const u8, ActivityService.service_name, operation, options, input);
+    return f.get() catch |err| switch (err) {
+        error.NexusOperationFailed => std.fmt.allocPrint(ctx.allocator(), "failed: {s}", .{try describe(ctx, f.failure())}),
+        else => err,
+    };
+}
+const CallActivityService = workflow.Def("NexusTestCallActivityService", callActivityService);
+
+const CancelNow = workflow.SignalDef("cancel-now", fn () void);
+
+/// Starts `beat`, cancels it once signaled `cancel-now`, and returns how it ended.
+fn cancelBeat(ctx: *workflow.Context, endpoint: []const u8) ![]const u8 {
+    var options = call_options;
+    options.endpoint = endpoint;
+    const latch = try ctx.allocator().create(Latch);
+    latch.* = .{};
+    try ctx.setSignalHandler(CancelNow, latch, Latch.set);
+    const f = ctx.executeNexusOperation(ActivityService, BeatOp, options, "beat");
+    _ = try f.started();
+    try ctx.await(latch, Latch.isOpen);
+    f.cancel();
+    const result = f.get() catch |err| switch (err) {
+        error.NexusOperationFailed => return std.fmt.allocPrint(ctx.allocator(), "failed: {s}", .{try describe(ctx, f.failure())}),
+        else => return err,
+    };
+    return std.fmt.allocPrint(ctx.allocator(), "completed: {s}", .{result});
+}
+const CancelBeat = workflow.Def("NexusTestCancelBeat", cancelBeat);
+
+/// `Setup` for the activity-run and signal tests: a dev server that lets standalone
+/// activities complete Nexus operations and returns links for signals.
+fn startActivitySetup(handlers: *ActivityHandlers) !Setup {
+    ActivityFixtures.reset();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .dev_server_extra_args = &(testing_mod.DevServer.standalone_activity_args ++ testing_mod.DevServer.activity_callback_args ++ testing_mod.DevServer.signal_link_args),
+    });
+    errdefer env.deinit();
+    inline for (.{ CallActivityService, CancelBeat, PingTarget }) |W| try env.registerWorkflow(W);
+    inline for (.{ ActivityFixtures.Compose, ActivityFixtures.Refuse, ActivityFixtures.Beat }) |A| try env.registerActivity(A);
+    try env.registerNexusServiceWith(ActivityHandler, handlers);
+    var s: Setup = .{ .env = env, .endpoint = undefined, .arena = .init(testing.allocator) };
+    errdefer s.arena.deinit();
+    s.endpoint = try uniqueName(s.arena.allocator(), "zig-activity-endpoint");
+    try env.createNexusEndpoint(s.endpoint, .{});
+    return s;
+}
+
+/// Releases the `PingTarget` workflow `id` and returns its result.
+fn releasePings(s: *Setup, id: []const u8) ![]const u8 {
+    try s.env.client.signalWorkflow(Release, id, "", .{});
+    var run = try s.env.client.getWorkflow([]const u8, id, "");
+    defer run.deinit();
+    return run.get(s.arena.allocator());
+}
+
+test "nexus: an activity-run operation completes with its activity's result, and the caller's history links to the activity" {
+    var handlers: ActivityHandlers = .{};
+    var s = try startActivitySetup(&handlers);
+    defer s.deinit();
+    const a = s.arena.allocator();
+    const name = try uniqueName(a, "Zig");
+    var r = try s.env.startWorkflow(CallActivityService, .{}, .{ s.endpoint, "compose", name });
+    defer r.deinit();
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "Hello, {s}!", .{name}), try s.env.getResult(CallActivityService, &r, a, null));
+
+    const activity_id = try std.fmt.allocPrint(a, "compose-{s}", .{name});
+    var handle = try s.env.client.getActivityHandle([]const u8, activity_id, "");
+    defer handle.deinit();
+    const described = try handle.describe(a);
+    try testing.expectEqualStrings(s.env.task_queue, described.task_queue);
+
+    // The caller's started event links to the activity.
+    const history = try s.env.client.fetchHistory(a, r.id, r.run_id);
+    var started = false;
+    for (history.events.items) |event| {
+        if (event.event_type != .EVENT_TYPE_NEXUS_OPERATION_STARTED) continue;
+        started = true;
+        try testing.expectEqual(1, event.links.items.len);
+        const link = event.links.items[0].variant.?.activity;
+        try testing.expectEqualStrings("default", link.namespace);
+        try testing.expectEqualStrings(activity_id, link.activity_id);
+        try testing.expectEqualStrings(described.run_id, link.run_id);
+    }
+    try testing.expect(started);
+
+    // The activity's completion callback carries the link back to the caller's scheduling event.
+    const raw = try s.env.client.callService(.workflow, "DescribeActivityExecution", a, .{ .namespace = "default", .activity_id = activity_id }, null);
+    try testing.expectEqual(1, raw.callbacks.items.len);
+    const callback = raw.callbacks.items[0].info.?.callback.?;
+    try testing.expectEqual(1, callback.links.items.len);
+    const back = callback.links.items[0].variant.?.workflow_event;
+    try testing.expectEqualStrings(r.id, back.workflow_id);
+    try testing.expectEqual(EventType.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED, back.reference.?.event_ref.event_type);
+}
+
+test "nexus: an activity-run operation whose activity fails fails with the activity's failure" {
+    var handlers: ActivityHandlers = .{};
+    var s = try startActivitySetup(&handlers);
+    defer s.deinit();
+    const result = try s.run(CallActivityService, .{ s.endpoint, "refuse", "Zig" });
+    try testing.expect(std.mem.startsWith(u8, result, "failed: "));
+    try expectContains(result, "no greeting for Zig [application NoGreeting]");
+}
+
+test "nexus: canceling an activity-run operation cancels its heartbeating activity, and the caller sees the cancellation" {
+    var handlers: ActivityHandlers = .{};
+    var s = try startActivitySetup(&handlers);
+    defer s.deinit();
+    var r = try s.env.startWorkflow(CancelBeat, .{}, .{s.endpoint});
+    defer r.deinit();
+    try waitFor(&ActivityFixtures.beat_entered);
+    try s.env.client.signalWorkflow(CancelNow, r.id, r.run_id, .{});
+    const result = try s.env.getResult(CancelBeat, &r, s.arena.allocator(), null);
+    try testing.expect(std.mem.startsWith(u8, result, "failed: "));
+    try expectContains(result, "[canceled_failure_info]");
+    try testing.expect(ActivityFixtures.beat_canceled.isSet());
+}
+
+test "nexus: a handler's second signal in one request is refused as a bad request, without retries, and the target gets one signal" {
+    var handlers: ActivityHandlers = .{};
+    var s = try startActivitySetup(&handlers);
+    defer s.deinit();
+    const a = s.arena.allocator();
+    const target = try uniqueName(a, "ping-twice");
+    var t = try s.env.startWorkflow(PingTarget, .{ .id = target }, .{});
+    defer t.deinit();
+    const result = try s.run(CallActivityService, .{ s.endpoint, "signal-twice", target });
+    try testing.expect(std.mem.startsWith(u8, result, "failed: "));
+    try expectContains(result, "SignalAlreadySent");
+    try expectContains(result, "[handler BAD_REQUEST]");
+    try testing.expectEqual(1, handlers.twice_calls.load(.monotonic));
+    try testing.expectEqualStrings("pings=1", try releasePings(&s, target));
+}
+
+test "nexus: a handler that signals and is retried delivers its signal once, and the signal links back to the caller" {
+    var handlers: ActivityHandlers = .{};
+    var s = try startActivitySetup(&handlers);
+    defer s.deinit();
+    const a = s.arena.allocator();
+    const target = try uniqueName(a, "ping-flaky");
+    var t = try s.env.startWorkflow(PingTarget, .{ .id = target }, .{});
+    defer t.deinit();
+    var r = try s.env.startWorkflow(CallActivityService, .{}, .{ s.endpoint, "signal-flaky", target });
+    defer r.deinit();
+    try testing.expectEqualStrings("signaled on attempt 2", try s.env.getResult(CallActivityService, &r, a, null));
+    try testing.expectEqual(2, handlers.flaky_calls.load(.monotonic));
+
+    // The signal's event links to the caller's scheduling event.
+    var signaled: ?proto.temporal.api.history.v1.HistoryEvent = null;
+    for ((try s.env.client.fetchHistory(a, target, "")).events.items) |event| {
+        if (event.event_type == .EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED) signaled = event;
+    }
+    const event = signaled orelse return error.TestSignalNotRecorded;
+    try testing.expectEqual(1, event.links.items.len);
+    const back = event.links.items[0].variant.?.workflow_event;
+    try testing.expectEqualStrings(r.id, back.workflow_id);
+    try testing.expectEqual(EventType.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED, back.reference.?.event_ref.event_type);
+    try testing.expectEqualStrings("pings=1", try releasePings(&s, target));
+
+    // The handler's response carried the server's link to the signal, which the caller's
+    // completed event records.
+    var completed_links: usize = 0;
+    for ((try s.env.client.fetchHistory(a, r.id, r.run_id)).events.items) |e| {
+        if (e.event_type != .EVENT_TYPE_NEXUS_OPERATION_COMPLETED) continue;
+        for (e.links.items) |link| {
+            const l = link.variant orelse continue;
+            if (l == .workflow_event and std.mem.eql(u8, l.workflow_event.workflow_id, target)) completed_links += 1;
+        }
+    }
+    try testing.expectEqual(1, completed_links);
+}
+
+test "nexus: a handler's signal-with-start needs a workflow ID, and with one starts and signals once across a retry" {
+    var handlers: ActivityHandlers = .{};
+    var s = try startActivitySetup(&handlers);
+    defer s.deinit();
+    const a = s.arena.allocator();
+    const refused = try s.run(CallActivityService, .{ s.endpoint, "signal-with-start", "" });
+    try testing.expect(std.mem.startsWith(u8, refused, "failed: "));
+    try expectContains(refused, "InvalidOptions");
+    try testing.expectEqual(0, handlers.sws_calls.load(.monotonic));
+
+    const id = try uniqueName(a, "ping-started");
+    // The retry finds the run the first attempt started, and its signal is dropped.
+    try testing.expectEqualStrings("started=false on attempt 2", try s.run(CallActivityService, .{ s.endpoint, "signal-with-start", id }));
+    try testing.expectEqualStrings("pings=1", try releasePings(&s, id));
+}
