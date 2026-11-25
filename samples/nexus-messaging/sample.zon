@@ -1,0 +1,34 @@
+// How samples-test validates this sample: create the namespaces and the two Nexus endpoints
+// below on the dev server, start the worker (all four workers in one process, after it starts
+// the caller pattern's greeting workflow for "default-user"), run the starter, and check that
+// the starter's output contains each `expect` line before `timeout_seconds`. The caller
+// pattern's lines come from messaging that already running workflow; the on-demand pattern's
+// from two greeting workflows its caller starts through Nexus, messages, and waits for.
+// worker.zig says how to set up a server by hand.
+.{
+    .expect = .{
+        "callerpattern [1] getLanguages returned 2 languages",
+        "callerpattern [2] setLanguage(Arabic) returned previous language: English",
+        "callerpattern [3] getLanguage returned: Arabic (confirmed Arabic)",
+        "callerpattern [4] approve sent successfully",
+        "ondemandpattern [1] started remote workflow one: nexus-messaging-greeting-one",
+        "ondemandpattern [2] started remote workflow two: nexus-messaging-greeting-two",
+        "ondemandpattern [3] getLanguages (one) returned 2 languages",
+        "ondemandpattern [4] getLanguages (two) with unsupported returned 7 languages",
+        "ondemandpattern [5] setLanguage(French) on one returned previous: English",
+        "ondemandpattern [6] setLanguage(Spanish) on two returned previous: English",
+        "ondemandpattern [7] getLanguage (one) = French",
+        "ondemandpattern [8] getLanguage (two) = Spanish",
+        "ondemandpattern [9] approved workflow one",
+        "ondemandpattern [10] approved workflow two",
+        "ondemandpattern [11] remote workflow one result: Bonjour, monde (approved by CallerRemoteWorkflow)",
+        "ondemandpattern [12] remote workflow two result: Hola, mundo (approved by CallerRemoteWorkflow)",
+    },
+    .timeout_seconds = 60,
+    .tests = .{ "callerpattern_test.zig", "ondemandpattern_test.zig" },
+    .namespaces = .{ "my-messaging-target-namespace", "my-messaging-caller-namespace" },
+    .nexus_endpoints = .{
+        .{ .name = "nexus-messaging-callerpattern-endpoint", .namespace = "my-messaging-target-namespace", .task_queue = "nexus-messaging-callerpattern-handler" },
+        .{ .name = "nexus-messaging-ondemandpattern-endpoint", .namespace = "my-messaging-target-namespace", .task_queue = "nexus-messaging-ondemandpattern-handler" },
+    },
+}

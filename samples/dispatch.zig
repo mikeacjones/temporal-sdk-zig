@@ -42,6 +42,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "expense:starter")) return @import("expense/starter.zig").main(init);
     if (std.mem.eql(u8, name, "external-env-conf:worker")) return @import("external-env-conf/worker.zig").main(init);
     if (std.mem.eql(u8, name, "external-env-conf:starter")) return @import("external-env-conf/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "fileprocessing:worker")) return @import("fileprocessing/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "fileprocessing:starter")) return @import("fileprocessing/starter.zig").main(init);
     if (std.mem.eql(u8, name, "greetings:worker")) return @import("greetings/worker.zig").main(init);
     if (std.mem.eql(u8, name, "greetings:starter")) return @import("greetings/starter.zig").main(init);
     if (std.mem.eql(u8, name, "greetingslocal:worker")) return @import("greetingslocal/worker.zig").main(init);
@@ -68,6 +70,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "nexus:starter")) return @import("nexus/starter.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-cancelation:worker")) return @import("nexus-cancelation/worker.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-cancelation:starter")) return @import("nexus-cancelation/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-context-propagation:worker")) return @import("nexus-context-propagation/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-context-propagation:starter")) return @import("nexus-context-propagation/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-messaging:worker")) return @import("nexus-messaging/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-messaging:starter")) return @import("nexus-messaging/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-multiple-arguments:worker")) return @import("nexus-multiple-arguments/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-multiple-arguments:starter")) return @import("nexus-multiple-arguments/starter.zig").main(init);
     if (std.mem.eql(u8, name, "polling:worker")) return @import("polling/worker.zig").main(init);
     if (std.mem.eql(u8, name, "polling:starter")) return @import("polling/starter.zig").main(init);
     if (std.mem.eql(u8, name, "pso:worker")) return @import("pso/worker.zig").main(init);
@@ -92,6 +100,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "schedule:starter")) return @import("schedule/starter.zig").main(init);
     if (std.mem.eql(u8, name, "searchattributes:worker")) return @import("searchattributes/worker.zig").main(init);
     if (std.mem.eql(u8, name, "searchattributes:starter")) return @import("searchattributes/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "session-failure:worker")) return @import("session-failure/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "session-failure:starter")) return @import("session-failure/starter.zig").main(init);
     if (std.mem.eql(u8, name, "shoppingcart:worker")) return @import("shoppingcart/worker.zig").main(init);
     if (std.mem.eql(u8, name, "shoppingcart:starter")) return @import("shoppingcart/starter.zig").main(init);
     if (std.mem.eql(u8, name, "sleep-for-days:worker")) return @import("sleep-for-days/worker.zig").main(init);

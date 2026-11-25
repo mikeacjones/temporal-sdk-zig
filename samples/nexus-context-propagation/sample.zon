@@ -1,0 +1,17 @@
+// How samples-test validates this sample: create the namespaces and the Nexus endpoint below
+// on the dev server, start the worker (the handler and caller workers in one process), run
+// the starter, and check that the starter's output contains the `expect` line before
+// `timeout_seconds`. The starter propagates caller-id: samples-zig to the caller workflow;
+// the greeting shows that the value crossed the Nexus call to the handler's workflow.
+// handler_worker and caller_worker run the two workers on their own; worker.zig says how to
+// set up a server by hand.
+.{
+    .expect = .{"Workflow result: ¡Hola! Nexus, caller-id: samples-zig 👋"},
+    .timeout_seconds = 60,
+    .tests = .{"caller_test.zig"},
+    .programs = .{ "handler_worker", "caller_worker" },
+    .namespaces = .{ "my-context-target-namespace", "my-context-caller-namespace" },
+    .nexus_endpoints = .{
+        .{ .name = "nexus-context-propagation-endpoint", .namespace = "my-context-target-namespace", .task_queue = "nexus-context-propagation-handler" },
+    },
+}
