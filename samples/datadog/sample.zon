@@ -1,0 +1,20 @@
+// How samples-test validates this sample: start an OTLP collector, then the worker, run the
+// starter, and check that the starter's output contains each `expect` line before
+// `timeout_seconds`. Both programs export their spans to the collector, which must then
+// hold the trace from the starter's span through the child workflow to the activity, each
+// span under its parent. The worker serves its metrics on a port no other sample uses; its
+// JSON log lines go to its own stderr.
+.{
+    .expect = .{"Workflow completed. Check worker logs."},
+    .worker_args = .{"127.0.0.1:19465"},
+    .imports = .{ "opentelemetry", "logadapter" },
+    .opentelemetry = true,
+    .otlp_spans = .{
+        .{ .name = "StartWorkflow:Workflow" },
+        .{ .name = "RunWorkflow:Workflow", .parent = "StartWorkflow:Workflow" },
+        .{ .name = "StartChildWorkflow:ChildWorkflow", .parent = "RunWorkflow:Workflow" },
+        .{ .name = "RunWorkflow:ChildWorkflow", .parent = "StartChildWorkflow:ChildWorkflow" },
+        .{ .name = "StartActivity:Activity", .parent = "RunWorkflow:ChildWorkflow" },
+        .{ .name = "RunActivity:Activity", .parent = "StartActivity:Activity" },
+    },
+}

@@ -144,12 +144,17 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&linux_tests.step);
     }
 
-    if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance);
-    if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters, hang_report);
+    // opentelemetry-zig is fetched only with -Dopentelemetry, or in a root checkout for the
+    // contrib tests and the samples that trace; null too while it is being fetched.
     const opentelemetry = b.option(bool, "opentelemetry", "Add the module temporal_opentelemetry (fetches open-telemetry/opentelemetry-zig)") orelse false;
     const contrib_tests = b.isRoot() and pathExists(b, "contrib/opentelemetry");
-    if (opentelemetry or contrib_tests) addOpenTelemetry(b, target, optimize, temporal, .{
-        .module = opentelemetry,
+    const otel: ?OpenTelemetryModules = if (opentelemetry or contrib_tests or (b.isRoot() and have_samples))
+        openTelemetryModules(b, target, optimize, temporal, opentelemetry)
+    else
+        null;
+    if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance, if (b.isRoot()) otel else null);
+    if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters, hang_report);
+    if (otel) |modules| addOpenTelemetry(b, target, optimize, temporal, modules, .{
         .tests = contrib_tests,
         .test_step = test_step,
         .test_filters = test_filters,
@@ -296,35 +301,64 @@ fn isMachineWatchStart(step: *const std.Build.Step) bool {
     return std.mem.startsWith(u8, step.name, machine_watch_start_prefix);
 }
 
-/// contrib/opentelemetry: the module `temporal_opentelemetry` when `-Dopentelemetry` is set,
-/// and its tests in a root checkout. Only then is opentelemetry-zig fetched (it is a lazy
-/// dependency), so a package that depends on the SDK without the option never fetches it.
+/// The modules of contrib/opentelemetry and of opentelemetry-zig that the contrib tests and the
+/// samples that trace use.
+const OpenTelemetryModules = struct {
+    /// contrib/opentelemetry/root.zig. One instance per build: a compilation that reached the
+    /// file through two modules would be rejected.
+    temporal_opentelemetry: *std.Build.Module,
+    /// opentelemetry-zig's SDK, imported as `opentelemetry-sdk`.
+    sdk: *std.Build.Module,
+    /// opentelemetry-zig's generated OTLP protobuf types, imported as `opentelemetry-proto`.
+    proto: *std.Build.Module,
+};
+
+/// Resolves the lazy dependency opentelemetry-zig, so a package that depends on the SDK
+/// without `-Dopentelemetry` never fetches it, and the module `temporal_opentelemetry`, which
+/// is published when `publish` (`-Dopentelemetry`) is set. Null while the dependency is being
+/// fetched.
+fn openTelemetryModules(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    temporal: *std.Build.Module,
+    publish: bool,
+) ?OpenTelemetryModules {
+    // Upstream declares no `optimize` option (its own is `release`), so only the target is
+    // passed; `grpc-provider` stays at its default, none.
+    const dep = b.lazyDependency("opentelemetry", .{ .target = target }) orelse return null;
+    const sdk = dep.module("sdk");
+    const options: std.Build.Module.CreateOptions = .{
+        .root_source_file = b.path("contrib/opentelemetry/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = b.allocator.dupe(std.Build.Module.Import, &.{
+            .{ .name = "temporal", .module = temporal },
+            .{ .name = "opentelemetry-sdk", .module = sdk },
+        }) catch @panic("OOM"),
+    };
+    return .{
+        .temporal_opentelemetry = if (publish) b.addModule("temporal_opentelemetry", options) else b.createModule(options),
+        .sdk = sdk,
+        .proto = dep.module("opentelemetry-proto"),
+    };
+}
+
+/// contrib/opentelemetry's tests, in a root checkout.
 fn addOpenTelemetry(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     temporal: *std.Build.Module,
+    modules: OpenTelemetryModules,
     in: struct {
-        module: bool,
         tests: bool,
         test_step: *std.Build.Step,
         test_filters: []const []const u8,
         hang_report: u32,
     },
 ) void {
-    // Upstream declares no `optimize` option (its own is `release`), so only the target is
-    // passed; `grpc-provider` stays at its default, none.
-    const dep = b.lazyDependency("opentelemetry", .{ .target = target }) orelse return;
-    const sdk = dep.module("sdk");
-    if (in.module) _ = b.addModule("temporal_opentelemetry", .{
-        .root_source_file = b.path("contrib/opentelemetry/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "temporal", .module = temporal },
-            .{ .name = "opentelemetry-sdk", .module = sdk },
-        },
-    });
+    const sdk = modules.sdk;
     if (in.tests) {
         const tests = b.addTest(.{
             .name = "contrib-opentelemetry-tests",
@@ -336,7 +370,7 @@ fn addOpenTelemetry(
                 .imports = &.{
                     .{ .name = "temporal", .module = temporal },
                     .{ .name = "opentelemetry-sdk", .module = sdk },
-                    .{ .name = "opentelemetry-proto", .module = dep.module("opentelemetry-proto") },
+                    .{ .name = "opentelemetry-proto", .module = modules.proto },
                 },
             }),
             .filters = in.test_filters,
@@ -1334,7 +1368,9 @@ fn findFuzzTargets(b: *std.Build) []const FuzzTarget {
     return targets.items;
 }
 
-fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8, have_conformance: bool) void {
+/// `otel` is null outside a root checkout and while opentelemetry-zig is being fetched; the
+/// samples that set `.opentelemetry` in sample.zon are then left out.
+fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, temporal: *std.Build.Module, test_step: *std.Build.Step, test_filters: []const []const u8, have_conformance: bool, otel: ?OpenTelemetryModules) void {
     // zig build fmt
     const fmt_paths = [_]std.Build.LazyPath{
         b.path("build.zig"),
@@ -1377,6 +1413,22 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     if (b.option([]const u8, "sample", "Only validate this sample in samples-test")) |only| run_samples.addArgs(&.{ "--only", only });
     samples_test_step.dependOn(&run_samples.step);
 
+    // The OTLP collector that receives the spans of the samples with `otlp_spans`.
+    if (otel) |modules| {
+        const collector = b.addExecutable(.{
+            .name = "otlp-collector",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/fixtures/otlp_collector.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "opentelemetry-proto", .module = modules.proto }},
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "otlp-collector", .root_module = collector.root_module, .filters = test_filters })).step);
+        run_samples.addArg("--otlp-collector");
+        run_samples.addArtifactArg(collector);
+    }
+
     // samples-test runs most samples' workers and starters from one program,
     // samples/dispatch.zig, which picks the one named in SAMPLE_PROGRAM: compiling each
     // separately took most of the suite's time. Its module is rooted at samples/, so a sample
@@ -1403,14 +1455,24 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     }) else null;
 
     for (samples) |sample| {
-        // The temporal module, plus other samples' modules this sample shares code with.
+        // The temporal module, the OpenTelemetry modules for a sample that traces, plus other
+        // samples' modules this sample shares code with, which get the same modules.
+        var base: std.ArrayList(std.Build.Module.Import) = .empty;
+        base.append(b.allocator, .{ .name = "temporal", .module = temporal }) catch @panic("OOM");
+        if (sample.opentelemetry) {
+            const modules = otel orelse continue;
+            base.appendSlice(b.allocator, &.{
+                .{ .name = "temporal_opentelemetry", .module = modules.temporal_opentelemetry },
+                .{ .name = "opentelemetry-sdk", .module = modules.sdk },
+            }) catch @panic("OOM");
+        }
         var imports: std.ArrayList(std.Build.Module.Import) = .empty;
-        imports.append(b.allocator, .{ .name = "temporal", .module = temporal }) catch @panic("OOM");
+        imports.appendSlice(b.allocator, base.items) catch @panic("OOM");
         for (sample.imports) |other| imports.append(b.allocator, .{ .name = other, .module = b.createModule(.{
             .root_source_file = b.path(b.fmt("samples/{s}/{s}.zig", .{ other, other })),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "temporal", .module = temporal }},
+            .imports = base.items,
         }) }) catch @panic("OOM");
 
         // The runner runs the worker and the starter; other programs (`programs` in
@@ -1430,7 +1492,7 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             samples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
             if (i >= run_programs.len) continue;
             run_samples.addArg(b.fmt("{s}:{s}", .{ sample.name, program }));
-            run_samples.addArtifactArg(if (dispatch != null and sample.imports.len == 0) dispatch.? else exe);
+            run_samples.addArtifactArg(if (dispatch != null and inDispatch(sample)) dispatch.? else exe);
         }
         for (sample.tests) |test_file| {
             const t = b.addTest(.{
@@ -1730,7 +1792,22 @@ fn findConformanceFeatures(b: *std.Build) []const []const u8 {
 /// A sample in samples/<name>: worker.zig, starter.zig, and sample.zon, whose `tests` are its
 /// test files, whose `imports` name other samples whose samples/<other>/<other>.zig it
 /// uses, and whose `programs` name extra programs (samples/<name>/<program>.zig) to build. The samples runner reads the rest of sample.zon.
-const Sample = struct { name: []const u8, tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{}, programs: []const []const u8 = &.{} };
+const Sample = struct {
+    name: []const u8,
+    tests: []const []const u8 = &.{},
+    imports: []const []const u8 = &.{},
+    programs: []const []const u8 = &.{},
+    /// The sample's programs and tests import `temporal_opentelemetry` and
+    /// `opentelemetry-sdk`, the sample keeps programs of its own (it is not in
+    /// samples/dispatch.zig), and it is built only in a root checkout.
+    opentelemetry: bool = false,
+};
+
+/// Whether samples/dispatch.zig runs the sample's programs: not when it imports another
+/// sample's module (a file can't be in two modules) or OpenTelemetry's.
+fn inDispatch(sample: Sample) bool {
+    return sample.imports.len == 0 and !sample.opentelemetry;
+}
 
 /// Every directory under samples/ with a sample.zon, by name. The listing and the manifests
 /// are configure inputs, so adding a sample or changing its manifest reconfigures the build.
@@ -1750,14 +1827,14 @@ fn findSamples(b: *std.Build) []const Sample {
             else => std.debug.panic("cannot read {s}: {t}", .{ manifest_path, err }),
         };
         var diag: std.zon.parse.Diagnostics = undefined;
-        const sample_manifest = std.zon.parse.fromSlice(struct { tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{}, programs: []const []const u8 = &.{} }, .{
+        const sample_manifest = std.zon.parse.fromSlice(struct { tests: []const []const u8 = &.{}, imports: []const []const u8 = &.{}, programs: []const []const u8 = &.{}, opentelemetry: bool = false }, .{
             .gpa = b.allocator,
             .arena = b.allocator,
             .source = source,
             .diagnostics = &diag,
             .ignore_unknown_fields = true,
         }) catch std.debug.panic("invalid {s}: {f}", .{ manifest_path, diag.fmt(manifest_path) });
-        found.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = sample_manifest.tests, .imports = sample_manifest.imports, .programs = sample_manifest.programs }) catch @panic("OOM");
+        found.append(b.allocator, .{ .name = b.dupe(entry.name), .tests = sample_manifest.tests, .imports = sample_manifest.imports, .programs = sample_manifest.programs, .opentelemetry = sample_manifest.opentelemetry }) catch @panic("OOM");
     }
     std.mem.sort(Sample, found.items, {}, struct {
         fn lessThan(_: void, a: Sample, c: Sample) bool {
@@ -1995,7 +2072,8 @@ fn linkCoreLib(m: *std.Build.Module, target: std.Build.ResolvedTarget, lib: std.
 }
 
 /// The source of samples/dispatch.zig: a program that runs the worker or starter of any sample
-/// that imports no other sample, chosen by SAMPLE_PROGRAM ("<sample>:worker").
+/// that imports no other sample and no OpenTelemetry module, chosen by SAMPLE_PROGRAM
+/// ("<sample>:worker").
 fn dispatchSource(b: *std.Build, samples: []const Sample) []const u8 {
     var out: std.Io.Writer.Allocating = .init(b.allocator);
     const w = &out.writer;
@@ -2011,7 +2089,7 @@ fn dispatchSource(b: *std.Build, samples: []const Sample) []const u8 {
         \\
     ) catch @panic("OOM");
     for (samples) |sample| {
-        if (sample.imports.len > 0) continue;
+        if (!inDispatch(sample)) continue;
         for ([_][]const u8{ "worker", "starter" }) |program| {
             w.print("    if (std.mem.eql(u8, name, \"{s}:{s}\")) return @import(\"{s}/{s}.zig\").main(init);\n", .{ sample.name, program, sample.name, program }) catch @panic("OOM");
         }

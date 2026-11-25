@@ -120,6 +120,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "standalone-activity:starter")) return @import("standalone-activity/starter.zig").main(init);
     if (std.mem.eql(u8, name, "synchronous-proxy:worker")) return @import("synchronous-proxy/worker.zig").main(init);
     if (std.mem.eql(u8, name, "synchronous-proxy:starter")) return @import("synchronous-proxy/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "temporal-fixtures:worker")) return @import("temporal-fixtures/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "temporal-fixtures:starter")) return @import("temporal-fixtures/starter.zig").main(init);
     if (std.mem.eql(u8, name, "timer:worker")) return @import("timer/worker.zig").main(init);
     if (std.mem.eql(u8, name, "timer:starter")) return @import("timer/starter.zig").main(init);
     if (std.mem.eql(u8, name, "updatabletimer:worker")) return @import("updatabletimer/worker.zig").main(init);
