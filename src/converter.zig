@@ -116,6 +116,8 @@
 //! Conversion turns values into payloads; payload codecs (`PayloadCodec`) then transform
 //! the payloads themselves, for example to compress or encrypt them. `codecHandler` serves
 //! codecs over HTTP, so the Web UI and CLI can show payloads only the codecs can decode.
+//! `RemoteCodec` is the client side of `codecHandler`: a codec that has a codec server do
+//! the work.
 //!
 //! Errors become failures (`Failure`) by a fixed step: an error's name, or the
 //! `failure.Application` given to `ctx.fail`. A `FailureConverter`, set with
@@ -149,6 +151,9 @@ const codec_handler = @import("converter/codec_handler.zig");
 pub const CodecHandler = codec_handler.CodecHandler;
 pub const CodecHandlerOptions = codec_handler.CodecHandlerOptions;
 pub const codecHandler = codec_handler.codecHandler;
+const remote_codec = @import("converter/remote_codec.zig");
+pub const RemoteCodec = remote_codec.RemoteCodec;
+pub const RemoteCodecOptions = remote_codec.RemoteCodecOptions;
 
 /// A Temporal failure, as `failure.Failure`.
 pub const Failure = proto.temporal.api.failure.v1.Failure;
@@ -991,6 +996,7 @@ const testing = std.testing;
 test {
     _ = codec;
     _ = codec_handler;
+    _ = remote_codec;
 }
 
 /// A point in time that encodes in JSON as an RFC 3339 string with up to nanosecond

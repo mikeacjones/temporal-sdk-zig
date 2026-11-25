@@ -164,6 +164,71 @@ test "converter: compress payloads with the zlib codec" {
     try testing.expectEqualStrings(try std.fmt.allocPrint(arena, "Hello, {s}!", .{name}), result);
 }
 
+/// Serves `converter.codecHandler` over `codecs` on `listener` until canceled, a task per
+/// connection.
+fn serveCodecs(io: std.Io, listener: *std.Io.net.Server, codecs: []const converter.PayloadCodec) void {
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    while (true) {
+        const stream = listener.accept(io) catch return;
+        group.concurrent(io, serveCodecConnection, .{ io, stream, codecs }) catch {
+            stream.close(io);
+            return;
+        };
+    }
+}
+
+fn serveCodecConnection(io: std.Io, stream: std.Io.net.Stream, codecs: []const converter.PayloadCodec) std.Io.Cancelable!void {
+    defer stream.close(io);
+    var recv_buffer: [8192]u8 = undefined;
+    var send_buffer: [4096]u8 = undefined;
+    var conn_reader = stream.reader(io, &recv_buffer);
+    var conn_writer = stream.writer(io, &send_buffer);
+    var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
+    while (server.reader.state == .ready) {
+        var request = server.receiveHead() catch return;
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        converter.codecHandler(codecs, .{}).handle(arena.allocator(), io, &request) catch return;
+    }
+}
+
+test "converter: a remote codec calls a codec server" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    // The codec server: codecHandler over a zlib codec, on a local port.
+    const zlib: converter.ZlibCodec = .{ .always_encode = true };
+    const server_codecs = [_]converter.PayloadCodec{zlib.codec()};
+    var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var serving = try io.concurrent(serveCodecs, .{ io, &listener, &server_codecs });
+    defer serving.cancel(io);
+    const endpoint = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/default", .{listener.socket.address.getPort()});
+
+    // example: converter-remote-codec
+    var remote = try converter.RemoteCodec.init(gpa, io, .{
+        .endpoint = endpoint,
+        .headers = &.{.{ .name = "authorization", .value = "Bearer codec-token" }},
+        .namespace = "default",
+        .timeout = .fromSeconds(5),
+    });
+    defer remote.deinit();
+    const codecs = [_]converter.PayloadCodec{remote.codec()};
+    const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, io, .{ .codecs = &codecs });
+    defer env.deinit();
+    // end-example
+    const encoded = try converter.encodePayloads(&codecs, arena, io, &.{try converter.toPayload(arena, "zig")});
+    try testing.expectEqualStrings("binary/zlib", converter.encodingOf(encoded[0]).?);
+    try env.registerWorkflow(Greeting);
+    try env.registerActivity(Greet);
+    const result = try env.executeWorkflow(Greeting, .{"remote codec"}, arena, null);
+    try testing.expectEqualStrings("Hello, remote codec!", result);
+}
+
 // example: converter-failures
 fn greet(ctx: *activity.Context, name: []const u8) ![]const u8 {
     if (name.len == 0) return ctx.fail(.{ .message = "name is empty", .type = "InvalidName", .non_retryable = true });

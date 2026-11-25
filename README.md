@@ -2113,7 +2113,7 @@ Notes:
 - A codec returns as many payloads as it was given and passes through payloads it didn't encode. It runs on many threads at once, never in workflow code.
 - Header fields skip the codecs on the way out unless the propagator that writes them sets `encode_fields` (see [Context propagation](#context-propagation)); fields an interceptor or other code writes into a header are sent as written. On the way in every header field goes through the codecs' decode, so a codec's `decode` must return a payload it didn't encode unchanged: a codec that fails on one fails the workflow task, activity task, or client call that carries it.
 - `encodeWithContext` and `decodeWithContext` give a codec the call's `converter.Context`: namespace, workflow, activity, and propagated values. On the workflow's worker a codec gets the run's context, except for an activity's, local activity's or child's arguments and results, which carry the activity's type and ID or the child's workflow ID and type, as on the worker that runs it; signals to other workflows carry the run's.
-- `converter.codecHandler(codecs, options)` serves `POST /encode` and `/decode` for the Temporal Web UI and CLI. It doesn't authenticate callers.
+- `converter.codecHandler(codecs, options)` serves `POST /encode` and `/decode` for the Temporal Web UI and CLI. It doesn't authenticate callers. A client or worker can call such a server with a [Remote codec client](#remote-codec-client).
 
 #### Failures
 
@@ -2324,9 +2324,33 @@ Not implemented yet.
 Drivers that store large payloads outside history behind reference payloads.
 
 #### Remote codec client
-<!-- stub: temporal-sdk-zig-d51.4.4 -->
-Not implemented yet.
-A `PayloadCodec` that calls a codec server's `/encode` and `/decode` endpoints over HTTP.
+
+`converter.RemoteCodec` is a payload codec that has a codec server do the work: it sends each payload list to the server's `/encode` or `/decode` over HTTP and uses the list the server answers with. It is the client side of `converter.codecHandler`, so an application can keep its codecs (and their keys) in one service that its clients, workers, the Web UI and the CLI all call.
+
+<!-- example: converter-remote-codec -->
+```zig
+var remote = try converter.RemoteCodec.init(gpa, io, .{
+    .endpoint = endpoint,
+    .headers = &.{.{ .name = "authorization", .value = "Bearer codec-token" }},
+    .namespace = "default",
+    .timeout = .fromSeconds(5),
+});
+defer remote.deinit();
+const codecs = [_]converter.PayloadCodec{remote.codec()};
+const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, io, .{ .codecs = &codecs });
+defer env.deinit();
+```
+
+Notes:
+
+- Each call is `POST <endpoint>/encode` or `POST <endpoint>/decode` with `content-type: application/json` and a body of ProtoJSON of a `temporal.api.common.v1.Payloads`, `{"payloads":[...]}`; the server answers with the same shape. One trailing `/` of the endpoint is ignored. An empty list makes no request.
+- `RemoteCodecOptions`: `endpoint` (an `http://` or `https://` URL, scheme in lower case, with a host name of letters, digits, `-` and `.` or an IPv4 address, not an IPv6 literal, and a path of visible ASCII (percent-encode anything else), and no query or fragment; a user and password in it, of any length, are sent as basic authorization and left out of logs), `headers` sent with every request (such as `authorization`, which replaces the endpoint's basic authorization, or `user-agent`; never logged), `namespace` sent as the `x-namespace` header when not empty, and `timeout` (10 s by default). `init` checks and copies them all and makes no network call; it returns `error.InvalidOptions`, logged naming the option, for a bad endpoint, a timeout that isn't positive, a header name or value that would break the request, a header given twice that may appear once (`authorization`, `user-agent`), or a header the codec sets itself (`content-type`, `content-length`, `transfer-encoding`, `host`, `connection`, `accept-encoding`, `x-namespace`: use `namespace` for the last).
+- Every failure is `error.CodecFailed`, logged under the `temporal` scope with the URL and the cause, and the input payloads are never passed through. Only an answer with status 200 succeeds: any other status (redirects are not followed), a body that isn't a payload list, or a list of another length than was sent fails. A cancel of the calling task returns `error.Canceled`.
+- Connections are kept open and reused. A transport failure (connecting, writing, or reading) is retried once at once, on a new connection, since a server may close idle connections without notice: before the retry the codec closes every idle connection it holds; an answer and a timeout are not retried.
+- `timeout` bounds a whole call, the retry included, except for looking up the endpoint's host name, which the Io may not be able to cut short (on macOS a lookup runs to its own end); `null` sets no limit. With a timeout, each call runs its request as a concurrent task on the `io` given to `init`, so that Io must be able to start one; when it refuses, the call fails with `error.CodecFailed`. The `io` a codec call is given is not used.
+- An `https` endpoint's certificate is checked against the system's trusted certificates, read on the first call, and as of the current time on every call. A change to the system's trusted certificates is seen after a restart.
+- The codec may be used from many threads at once; `gpa` must be thread-safe. Call `deinit` after the clients and workers that use the codec are closed.
+- No `converter.Context` is sent: a codec server that needs the namespace gets it from `namespace` or from the endpoint's path.
 
 ### Testing
 
