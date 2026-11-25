@@ -165,7 +165,6 @@ test "nexus: a synchronous operation runs from the handler's dispatch table, and
     try testing.expect(!failed.handler_error.retryable());
 }
 
-<<<<<<< HEAD
 // example: nexus-standalone
 /// Greets Ziggy through "greeting-endpoint" from a program, without a workflow.
 fn greetStandalone(client: *temporal.client.Client, arena: std.mem.Allocator) ![]const u8 {
@@ -209,7 +208,8 @@ test "nexus: a program greets through the Nexus endpoint without a workflow" {
     // Starts the environment's worker, which serves the endpoint.
     _ = try env.executeWorkflow(Greeting, .{"worker"}, a, null);
     try testing.expectEqualStrings("Hello, Ziggy!", try greetStandalone(&env.client, a));
-=======
+}
+
 test "nexus: an activity-run operation and signaling operations are bound by their handlers' return types" {
     _ = &registerComposeService;
     try testing.expectEqual(nexus.Operation.Kind.activity_run, ComposeHandler.registered.find("compose").?.operation.kind);
@@ -225,5 +225,4 @@ test "nexus: an activity-run operation and signaling operations are bound by the
     defer testing.log_level = .warn;
     const refused = ApprovalHandler.registered.find("approve").?.start(&ctx, input);
     try testing.expectEqualStrings("NoClient", refused.handler_error.cause.?.type);
->>>>>>> 8ea63ac0614d74b76d1825cf61af7e4ce15da578
 }
