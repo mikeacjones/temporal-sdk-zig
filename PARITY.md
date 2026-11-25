@@ -219,7 +219,7 @@ These aren't parity requirements. Each entry was checked against the other six o
 
 | Feature | SDK | Zig |
 |---------|-----|-----|
-| Sessions: activities pinned to one worker host | Go | Has them: [Sessions](README.md#sessions), [Sessions](README.md#sessions-1) under Workers |
+| Sessions: activities pinned to one worker host | Go | Has them: [Sessions](README.md#sessions), [Sessions](README.md#sessions-1) under Workers, [fileprocessing](samples/fileprocessing) |
 | Static determinism checker (workflowcheck) | Go | Planned (`temporal-sdk-zig-d51.13.6`); the analyzers for other languages are community projects, not part of an official SDK |
 
 The Zig SDK also has a feature no official SDK offers: a [workflow memory limit](README.md#workflow-memory-limit) per cached run.
@@ -259,7 +259,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | expense | [expense](samples/expense) | ported |
 | external-env-conf | [external-env-conf](samples/external-env-conf) | ported |
 | external-storage | | planned: `temporal-sdk-zig-d51.16.75` |
-| fileprocessing | | planned: `temporal-sdk-zig-d51.16.72` |
+| fileprocessing | [fileprocessing](samples/fileprocessing) | ported |
 | gcp | | planned: `temporal-sdk-zig-d51.16.80` |
 | googleadk | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
 | goroutine | [io-group](samples/io-group) | ported |
