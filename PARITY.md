@@ -202,7 +202,7 @@ Nexus is GA in Go, Java, and Python, and since August 2026 in TypeScript and .NE
 | Calling Nexus operations from workflows | Go, Java, Python, TypeScript, .NET | GA | supported | [Calling operations from workflows](README.md#calling-operations-from-workflows), [nexus](samples/nexus) |
 | Nexus operation cancellation types | Go, Java, Python, TypeScript, .NET | GA | supported | [Calling operations from workflows](README.md#calling-operations-from-workflows), [nexus-cancelation](samples/nexus-cancelation) |
 | Nexus endpoints and handlers in tests | Go, Java, Python, TypeScript, .NET | GA | supported | [Serving operations](README.md#serving-operations) |
-| Nexus serialization context: endpoint, service, and operation in the converter context (Nexus Per Endpoint Encryption, Public Preview) | Go, Java, Python, TypeScript, .NET | pre-release | supported | [Payload codecs](README.md#payload-codecs), [Nexus](README.md#nexus) |
+| Nexus serialization context: endpoint, service, and operation in the converter context (Nexus Per Endpoint Encryption, Public Preview) | Go, Java, Python, TypeScript, .NET | pre-release | supported | [Payload codecs](README.md#payload-codecs), [Nexus](README.md#nexus), [nexus-serialization-context](samples/nexus-serialization-context) |
 | Temporal operation handlers: operations that start workflows or standalone activities and signal workflows through a Temporal client (Pre-release) | Go, Java, Python, TypeScript, .NET | pre-release | supported | [Activity-backed operations and signals](README.md#activity-backed-operations-and-signals), [nexus-messaging-temporal-operation](samples/nexus-messaging-temporal-operation), [nexus-standalone-activity](samples/nexus-standalone-activity) |
 | Standalone Nexus operations from a client (Public Preview, November 2026) | Go, Java, Python, TypeScript, .NET | pre-release | partial | `temporal-sdk-zig-d51.5.12`. Missing: typed calls to start, describe, and cancel an operation, and their README.md section; today only raw WorkflowService calls through `(try client.currentConnection()).call` reach them. |
 
@@ -281,7 +281,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | nexus-messaging | [nexus-messaging](samples/nexus-messaging) | ported |
 | nexus-messaging-temporal-operation | [nexus-messaging-temporal-operation](samples/nexus-messaging-temporal-operation) | ported |
 | nexus-multiple-arguments | [nexus-multiple-arguments](samples/nexus-multiple-arguments) | ported |
-| nexus-serialization-context | | planned: `temporal-sdk-zig-d51.16.107` |
+| nexus-serialization-context | [nexus-serialization-context](samples/nexus-serialization-context) | ported |
 | nexus-standalone-activity | [nexus-standalone-activity](samples/nexus-standalone-activity) | ported |
 | nexus-standalone-operations | | planned: `temporal-sdk-zig-d51.16.71` |
 | opentelemetry | [opentelemetry](samples/opentelemetry) | ported |

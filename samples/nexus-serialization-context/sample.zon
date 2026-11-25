@@ -1,0 +1,30 @@
+// How samples-test validates this sample: start a dev server of the sample's own at the
+// Temporal CLI version below (stable releases don't yet keep a Nexus caller's context with
+// the workflow a handler starts, which the asynchronous results need), with the namespaces
+// and the Nexus endpoints below; start the worker (the caller and both handler workers in one
+// process), run the starter, and check that the starter's output contains each `expect` line
+// before `timeout_seconds`. caller_worker, compressed_encrypted_worker and encrypted_worker
+// run the three workers on their own; worker.zig says how to set up a server by hand.
+.{
+    .expect = .{
+        "nexus-serialization-compressed-encrypted-1: sync=\"Hello from Nexus\" async=\"Hello from Nexus\"",
+        "nexus-serialization-compressed-encrypted-2: sync=\"Hello from Nexus\" async=\"Hello from Nexus\"",
+        "nexus-serialization-encrypted-1: sync=\"Hello from Nexus\" async=\"Hello from Nexus\"",
+        "nexus-serialization-encrypted-2: sync=\"Hello from Nexus\" async=\"Hello from Nexus\"",
+    },
+    .timeout_seconds = 60,
+    .tests = .{ "codec_test.zig", "caller_test.zig" },
+    .programs = .{ "caller_worker", "compressed_encrypted_worker", "encrypted_worker" },
+    .dev_server = .{ .cli_version = "v1.9.3-nexus-serialization-context" },
+    .namespaces = .{
+        "nexus-serialization-caller",
+        "nexus-serialization-compressed-encrypted-handler",
+        "nexus-serialization-encrypted-handler",
+    },
+    .nexus_endpoints = .{
+        .{ .name = "nexus-serialization-compressed-encrypted-1", .namespace = "nexus-serialization-compressed-encrypted-handler", .task_queue = "nexus-serialization-compressed-encrypted-handler" },
+        .{ .name = "nexus-serialization-compressed-encrypted-2", .namespace = "nexus-serialization-compressed-encrypted-handler", .task_queue = "nexus-serialization-compressed-encrypted-handler" },
+        .{ .name = "nexus-serialization-encrypted-1", .namespace = "nexus-serialization-encrypted-handler", .task_queue = "nexus-serialization-encrypted-handler" },
+        .{ .name = "nexus-serialization-encrypted-2", .namespace = "nexus-serialization-encrypted-handler", .task_queue = "nexus-serialization-encrypted-handler" },
+    },
+}
