@@ -157,7 +157,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Payload codecs for compression and encryption | all | GA | supported | [Payload codecs](README.md#payload-codecs), [encryption](samples/encryption), [snappycompress](samples/snappycompress) |
 | Payload codecs on header fields, chosen by the field's producer | Go, Java, Python, TypeScript | GA | supported | [Context propagation](README.md#context-propagation) |
 | Codec server for the Web UI and CLI | Go, Java, Python, TypeScript, .NET | GA | supported | [Payload codecs](README.md#payload-codecs), [codec-server](samples/codec-server) |
-| Remote codec client: a payload codec that sends payloads to a codec server's `/encode` and `/decode` | Go, Java | GA, deferred | partial | `temporal-sdk-zig-d51.4.4`. Missing: a ready-made codec that calls a codec server; a `converter.PayloadCodec` can make those HTTP calls itself. |
+| Remote codec client: a payload codec that sends payloads to a codec server's `/encode` and `/decode` | Go, Java | GA | supported | [Remote codec client](README.md#remote-codec-client) |
 | Serialization context for converters and codecs | Go, Java, Python, TypeScript, .NET, PHP | GA | supported | [Payloads](README.md#payloads), [Payload codecs](README.md#payload-codecs) |
 | Failures with cause chains and kinds | all | GA | supported | [Failures](README.md#failures-1) |
 | Encoded failure attributes (message and stack trace through the codecs) | all | GA | supported | [Failures](README.md#failures-1) |

@@ -192,7 +192,7 @@ pub fn build(b: *std.Build) void {
         b.step("machine-watch-wiring-test", "Check that only test and core start the machine watch")
             .dependOn(&wiring_test.step);
     }
-    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, test_filters, hang_report, .{
+    if (have_conformance) addConformanceSteps(b, target, optimize, temporal, test_step, argsFileFilters(b, test_filters), hang_report, .{
         .core_lib = core_lib_opt,
         .core_bundle = core_bundle_opt,
         .protoc = protoc_opt,
@@ -1450,6 +1450,25 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
 const ConformanceForwarded = struct { core_lib: ?[]const u8, core_bundle: ?[]const u8, protoc: ?[]const u8 };
 
 const conformance_histories = "conformance/histories";
+
+/// `filters` with each one cut to its longest run without a "'": Zig 0.17.1 reads a "'"
+/// inside the quoted arguments of a compile's @args response file (used when its command line
+/// is long, as the conformance tests' are) as a quote, so a filter such as "a codec's retry"
+/// breaks the compile. The shorter filter matches every test the full one does.
+fn argsFileFilters(b: *std.Build, filters: []const []const u8) []const []const u8 {
+    const out = b.allocator.alloc([]const u8, filters.len) catch @panic("OOM");
+    for (filters, out) |filter, *cut| {
+        cut.* = filter;
+        if (std.mem.indexOfScalar(u8, filter, '\'') == null) continue;
+        var longest: []const u8 = "";
+        var it = std.mem.splitScalar(u8, filter, '\'');
+        while (it.next()) |part| if (part.len > longest.len) {
+            longest = part;
+        };
+        cut.* = longest;
+    }
+    return out;
+}
 
 fn addConformanceSteps(
     b: *std.Build,

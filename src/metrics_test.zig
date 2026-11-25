@@ -64,15 +64,6 @@ fn runFlow(client: *client_mod.Client, task_queue: []const u8) !void {
     try testing.expectEqual(10, try run.get(arena.allocator()));
 }
 
-/// A localhost port that was free a moment ago: the core's Prometheus exporter doesn't report
-/// the port it bound.
-fn freePort(io: Io) !u16 {
-    const any: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
-    var server = try any.listen(io, .{});
-    defer server.deinit(io);
-    return server.socket.address.getPort();
-}
-
 fn scrape(a: std.mem.Allocator, url: []const u8) ![]const u8 {
     var http: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
     defer http.deinit();
@@ -98,7 +89,9 @@ fn sample(body: []const u8, name: []const u8, labels: []const []const u8) ?[]con
 test "workflow, activity, and core metrics are scraped from the Prometheus exporter" {
     var server = try testing_mod.DevServer.start(testing.allocator, testing.io, .{});
     defer server.stop(testing.io);
-    const port = try freePort(testing.io);
+    // The core's Prometheus exporter doesn't report the port it bound, so it is given one that
+    // is reserved until it binds it (see reserveLoopbackPort).
+    const port = try bridge.EphemeralServer.reserveLoopbackPort();
     var addr_buf: [32]u8 = undefined;
     const bind_address = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{port});
     var options = server.clientOptions();
