@@ -146,6 +146,15 @@ pub fn build(b: *std.Build) void {
 
     if (have_samples) addSampleSteps(b, target, optimize, temporal, test_step, test_filters, have_conformance);
     if (pathExists(b, "examples/readme")) addReadmeSteps(b, target, optimize, temporal, test_step, test_filters, hang_report);
+    const opentelemetry = b.option(bool, "opentelemetry", "Add the module temporal_opentelemetry (fetches open-telemetry/opentelemetry-zig)") orelse false;
+    const contrib_tests = b.isRoot() and pathExists(b, "contrib/opentelemetry");
+    if (opentelemetry or contrib_tests) addOpenTelemetry(b, target, optimize, temporal, .{
+        .module = opentelemetry,
+        .tests = contrib_tests,
+        .test_step = test_step,
+        .test_filters = test_filters,
+        .hang_report = hang_report,
+    });
     if (pathExists(b, "tools/checks")) addCheckSteps(b, .{
         .target = target,
         .optimize = optimize,
@@ -287,6 +296,56 @@ fn isMachineWatchStart(step: *const std.Build.Step) bool {
     return std.mem.startsWith(u8, step.name, machine_watch_start_prefix);
 }
 
+/// contrib/opentelemetry: the module `temporal_opentelemetry` when `-Dopentelemetry` is set,
+/// and its tests in a root checkout. Only then is opentelemetry-zig fetched (it is a lazy
+/// dependency), so a package that depends on the SDK without the option never fetches it.
+fn addOpenTelemetry(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    temporal: *std.Build.Module,
+    in: struct {
+        module: bool,
+        tests: bool,
+        test_step: *std.Build.Step,
+        test_filters: []const []const u8,
+        hang_report: u32,
+    },
+) void {
+    // Upstream declares no `optimize` option (its own is `release`), so only the target is
+    // passed; `grpc-provider` stays at its default, none.
+    const dep = b.lazyDependency("opentelemetry", .{ .target = target }) orelse return;
+    const sdk = dep.module("sdk");
+    if (in.module) _ = b.addModule("temporal_opentelemetry", .{
+        .root_source_file = b.path("contrib/opentelemetry/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "temporal", .module = temporal },
+            .{ .name = "opentelemetry-sdk", .module = sdk },
+        },
+    });
+    if (in.tests) {
+        const tests = b.addTest(.{
+            .name = "contrib-opentelemetry-tests",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("contrib/opentelemetry/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .error_tracing = testErrorTracing(optimize),
+                .imports = &.{
+                    .{ .name = "temporal", .module = temporal },
+                    .{ .name = "opentelemetry-sdk", .module = sdk },
+                    .{ .name = "opentelemetry-proto", .module = dep.module("opentelemetry-proto") },
+                },
+            }),
+            .filters = in.test_filters,
+            .test_runner = testRunner(b),
+        });
+        in.test_step.dependOn(&runTests(b, tests, in.hang_report).step);
+    }
+}
+
 /// The files under examples/readme whose regions README.md copies, in a fixed order.
 const readme_example_files = [_][]const u8{
     "examples/readme/quickstart.zig",
@@ -298,6 +357,7 @@ const readme_example_files = [_][]const u8{
     "examples/readme/testing.zig",
     "examples/readme/observability.zig",
     "examples/readme/nexus.zig",
+    "examples/readme/tracing.zig",
 };
 
 /// README.md's code blocks are copies of regions in examples/readme, which `test` compiles and
@@ -1283,6 +1343,7 @@ fn addSampleSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         b.path("samples"),
         b.path("tools"),
         b.path("examples"),
+        b.path("contrib"),
         b.path("conformance"),
     };
     const fmt_step = b.step("fmt", "Check formatting");

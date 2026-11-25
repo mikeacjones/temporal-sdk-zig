@@ -73,6 +73,15 @@
             .hash = "zlinter-0.0.1-OjQ08aZsFgB3c_awcIosz3PylM-2Xui24XuPsEONY3n1",
             .lazy = true,
         },
+        // The OpenTelemetry SDK behind contrib/opentelemetry (module temporal_opentelemetry),
+        // fetched only with -Dopentelemetry or in a root checkout, for the contrib tests.
+        // Upstream has no tags yet: bump the commit by hand, after checking its
+        // minimum_zig_version.
+        .opentelemetry = .{
+            .url = "git+https://github.com/open-telemetry/opentelemetry-zig#64627959e72480505bdb46dc25764a211ab498bc",
+            .hash = "opentelemetry-0.0.1-U_uKJ5yaKwC1tcuszq7-Bu8-eOZkKXj3EZuaoR1mq8G_",
+            .lazy = true,
+        },
         .temporal_features = .{
             .url = "git+https://github.com/temporalio/features#a132d35815137c2e8fdc7767c52907c724f48c68",
             .hash = "N-V-__8AAAjTHwBqUsiPnovBfdL6f5C0iLALKgsMwLuJtn5U",
@@ -83,6 +92,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "contrib",
         "LICENSE",
         "CORE_VERSION",
         "deps/protos.zig",
