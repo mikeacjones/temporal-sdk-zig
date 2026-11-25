@@ -188,8 +188,13 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Client, workflow, and activity interceptors | all | GA | supported | [Interceptors](README.md#interceptors), [logger-interceptor](samples/logger-interceptor) |
 | Nexus interceptors | Go, Java, Python, TypeScript, .NET | GA | supported | [Interceptors](README.md#interceptors) |
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
+<<<<<<< HEAD
 | Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation) |
 | OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing), [opentelemetry](samples/opentelemetry) |
+=======
+| Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation), [nexus-context-propagation](samples/nexus-context-propagation) |
+| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing) |
+>>>>>>> a1fdb8ec76e462092e5df068480ab73c65925dd8
 
 ### Nexus
 
@@ -219,7 +224,7 @@ These aren't parity requirements. Each entry was checked against the other six o
 
 | Feature | SDK | Zig |
 |---------|-----|-----|
-| Sessions: activities pinned to one worker host | Go | Has them: [Sessions](README.md#sessions), [Sessions](README.md#sessions-1) under Workers |
+| Sessions: activities pinned to one worker host | Go | Has them: [Sessions](README.md#sessions), [Sessions](README.md#sessions-1) under Workers, [fileprocessing](samples/fileprocessing) |
 | Static determinism checker (workflowcheck) | Go | Planned (`temporal-sdk-zig-d51.13.6`); the analyzers for other languages are community projects, not part of an official SDK |
 
 The Zig SDK also has a feature no official SDK offers: a [workflow memory limit](README.md#workflow-memory-limit) per cached run.
@@ -259,7 +264,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | expense | [expense](samples/expense) | ported |
 | external-env-conf | [external-env-conf](samples/external-env-conf) | ported |
 | external-storage | | planned: `temporal-sdk-zig-d51.16.75` |
-| fileprocessing | | planned: `temporal-sdk-zig-d51.16.72` |
+| fileprocessing | [fileprocessing](samples/fileprocessing) | ported |
 | gcp | | planned: `temporal-sdk-zig-d51.16.80` |
 | googleadk | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
 | goroutine | [io-group](samples/io-group) | ported |
@@ -277,10 +282,10 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | mutex | [mutex](samples/mutex) | ported |
 | nexus | [nexus](samples/nexus) | ported |
 | nexus-cancelation | [nexus-cancelation](samples/nexus-cancelation) | ported |
-| nexus-context-propagation | | planned: `temporal-sdk-zig-d51.16.66` |
-| nexus-messaging | | planned: `temporal-sdk-zig-d51.16.67` |
+| nexus-context-propagation | [nexus-context-propagation](samples/nexus-context-propagation) | ported |
+| nexus-messaging | [nexus-messaging](samples/nexus-messaging) | ported |
 | nexus-messaging-temporal-operation | | planned: `temporal-sdk-zig-d51.16.68` |
-| nexus-multiple-arguments | | planned: `temporal-sdk-zig-d51.16.69` |
+| nexus-multiple-arguments | [nexus-multiple-arguments](samples/nexus-multiple-arguments) | ported |
 | nexus-serialization-context | | planned: `temporal-sdk-zig-d51.16.107` |
 | nexus-standalone-activity | | planned: `temporal-sdk-zig-d51.16.70` |
 | nexus-standalone-operations | | planned: `temporal-sdk-zig-d51.16.71` |
@@ -300,7 +305,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | schedule | [schedule](samples/schedule) | ported |
 | searchattributes | [searchattributes](samples/searchattributes) | ported |
 | serverjwtauth | [serverjwtauth](samples/serverjwtauth) | ported |
-| session-failure | | planned: `temporal-sdk-zig-d51.16.73` |
+| session-failure | [session-failure](samples/session-failure) | ported |
 | shoppingcart | [shoppingcart](samples/shoppingcart) | ported |
 | sleep-for-days | [sleep-for-days](samples/sleep-for-days) | ported |
 | slogadapter | [logadapter](samples/logadapter) | ported |
