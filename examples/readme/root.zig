@@ -12,4 +12,5 @@ test {
     _ = @import("converter.zig");
     _ = @import("testing.zig");
     _ = @import("observability.zig");
+    _ = @import("tracing.zig");
 }

@@ -189,7 +189,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Nexus interceptors | Go, Java, Python, TypeScript, .NET | GA | supported | [Interceptors](README.md#interceptors) |
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
 | Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation) |
-| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA, deferred | partial | `temporal-sdk-zig-d51.12.5`. Missing: a tracing interceptor and span export; the client and worker interceptors and context propagation it would use exist. |
+| OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing) |
 
 ### Nexus
 
