@@ -188,7 +188,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Client, workflow, and activity interceptors | all | GA | supported | [Interceptors](README.md#interceptors), [logger-interceptor](samples/logger-interceptor) |
 | Nexus interceptors | Go, Java, Python, TypeScript, .NET | GA | supported | [Interceptors](README.md#interceptors) |
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
-| Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation) |
+| Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation), [nexus-context-propagation](samples/nexus-context-propagation) |
 | OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing) |
 
 ### Nexus
@@ -277,7 +277,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | mutex | [mutex](samples/mutex) | ported |
 | nexus | [nexus](samples/nexus) | ported |
 | nexus-cancelation | [nexus-cancelation](samples/nexus-cancelation) | ported |
-| nexus-context-propagation | | planned: `temporal-sdk-zig-d51.16.66` |
+| nexus-context-propagation | [nexus-context-propagation](samples/nexus-context-propagation) | ported |
 | nexus-messaging | [nexus-messaging](samples/nexus-messaging) | ported |
 | nexus-messaging-temporal-operation | | planned: `temporal-sdk-zig-d51.16.68` |
 | nexus-multiple-arguments | [nexus-multiple-arguments](samples/nexus-multiple-arguments) | ported |

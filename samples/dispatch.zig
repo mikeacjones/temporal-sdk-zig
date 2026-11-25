@@ -68,6 +68,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "nexus:starter")) return @import("nexus/starter.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-cancelation:worker")) return @import("nexus-cancelation/worker.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-cancelation:starter")) return @import("nexus-cancelation/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-context-propagation:worker")) return @import("nexus-context-propagation/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-context-propagation:starter")) return @import("nexus-context-propagation/starter.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-messaging:worker")) return @import("nexus-messaging/worker.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-messaging:starter")) return @import("nexus-messaging/starter.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-multiple-arguments:worker")) return @import("nexus-multiple-arguments/worker.zig").main(init);
