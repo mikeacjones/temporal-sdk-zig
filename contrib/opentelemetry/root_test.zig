@@ -109,33 +109,61 @@ fn attribute(span: proto.trace_v1.Span, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// A provider exporting over OTLP HTTP/protobuf to a `Receiver`, and the tracer on it.
+/// Initialized in place, since the provider borrows `prng` and the tracer `t`.
+const Export = struct {
+    env_map: std.process.Environ.Map,
+    config: *otel.otlp.ConfigOptions,
+    endpoint_buffer: [32]u8,
+    exporter: *otel.trace.OTLPExporter,
+    processor: *otel.trace.BatchingProcessor,
+    prng: std.Random.DefaultPrng,
+    provider: *otel.trace.TracerProvider,
+    t: root.Tracer,
+
+    fn start(e: *Export, receiver: *const Receiver) !void {
+        const io = testing.io;
+        const gpa = testing.allocator;
+        e.env_map = .init(gpa);
+        errdefer e.env_map.deinit();
+        e.config = try otel.otlp.ConfigOptions.init(gpa, &e.env_map);
+        errdefer e.config.deinit();
+        e.config.endpoint = try std.fmt.bufPrint(&e.endpoint_buffer, "127.0.0.1:{d}", .{receiver.port()});
+        try testing.expectEqual(otel.otlp.Protocol.http_protobuf, e.config.protocol);
+        e.exporter = try otel.trace.OTLPExporter.init(gpa, io, e.config);
+        errdefer e.exporter.deinit();
+        e.processor = try otel.trace.BatchingProcessor.init(gpa, io, e.exporter.asSpanExporter(), .{});
+        errdefer e.processor.deinit();
+        e.prng = .init(0x7e57);
+        e.provider = try otel.trace.TracerProvider.init(gpa, io, .{ .Random = .init(e.prng.random()) });
+        errdefer e.provider.deinit();
+        try e.provider.addSpanProcessor(e.processor.asSpanProcessor());
+        e.t = .init(gpa, io, try e.provider.getTracer(.{ .name = "temporal-test" }));
+    }
+
+    /// Shuts the provider down, exporting what is left, and frees everything.
+    fn stop(e: *Export) void {
+        e.provider.shutdown();
+        e.t.deinit();
+        e.provider.deinit();
+        e.processor.deinit();
+        e.exporter.deinit();
+        e.config.deinit();
+        e.env_map.deinit();
+    }
+};
+
 test "spans started through temporal.tracing.Tracer arrive at an OTLP HTTP receiver with their parent, kind, attributes and status" {
     const io = testing.io;
     const gpa = testing.allocator;
     var receiver: Receiver = undefined;
     try receiver.start(io);
     defer receiver.stop();
-
-    var env_map: std.process.Environ.Map = .init(gpa);
-    defer env_map.deinit();
-    const config = try otel.otlp.ConfigOptions.init(gpa, &env_map);
-    defer config.deinit();
-    var endpoint_buffer: [32]u8 = undefined;
-    config.endpoint = try std.fmt.bufPrint(&endpoint_buffer, "127.0.0.1:{d}", .{receiver.port()});
-    try testing.expectEqual(otel.otlp.Protocol.http_protobuf, config.protocol);
-
-    const exporter = try otel.trace.OTLPExporter.init(gpa, io, config);
-    defer exporter.deinit();
-    const processor = try otel.trace.BatchingProcessor.init(gpa, io, exporter.asSpanExporter(), .{});
-    defer processor.deinit();
-    var prng: std.Random.DefaultPrng = .init(0x7e57);
-    const provider = try otel.trace.TracerProvider.init(gpa, io, .{ .Random = .init(prng.random()) });
-    defer provider.deinit();
-    try provider.addSpanProcessor(processor.asSpanProcessor());
-
-    var t: root.Tracer = .init(gpa, io, try provider.getTracer(.{ .name = "temporal-test" }));
-    defer t.deinit();
-    const tracer = t.tracer();
+    var e: Export = undefined;
+    try e.start(&receiver);
+    defer e.stop();
+    const provider = e.provider;
+    const tracer = e.t.tracer();
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -188,7 +216,45 @@ test "spans started through temporal.tracing.Tracer arrive at an OTLP HTTP recei
         try testing.expect(sent.status == null or sent.status.?.code != .STATUS_CODE_ERROR);
         try testing.expectEqual(@as(u32, 0), receiver.rejected);
     }
-    provider.shutdown();
+}
+
+test "a span workflow code started arrives with its bare name, its attributes, kind internal and its parent" {
+    const io = testing.io;
+    var receiver: Receiver = undefined;
+    try receiver.start(io);
+    defer receiver.stop();
+    var e: Export = undefined;
+    try e.start(&receiver);
+    defer e.stop();
+    const tracer = e.t.tracer();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const run = try tracer.startSpan(a, .{ .operation = .run_workflow, .name = "Order" });
+    const app = try tracer.startSpan(a, .{
+        .operation = .application,
+        .name = "workflow-operation",
+        .parent = run.context,
+        .tags = &.{ .{ .name = "step", .value = "charge" }, .{ .name = "temporalWorkflowID", .value = "order-1" }, .{ .name = "temporalRunID", .value = "run-1" } },
+    });
+    const activity = try tracer.startSpan(a, .{ .operation = .start_activity, .name = "Charge", .parent = app.context });
+    tracer.finishSpan(activity, .{});
+    tracer.finishSpan(app, .{});
+    tracer.finishSpan(run, .{});
+    try e.provider.forceFlush();
+
+    const ran = receiver.find("RunWorkflow:Order") orelse return error.TestSpanNotReceived;
+    const got = receiver.find("workflow-operation") orelse return error.TestSpanNotReceived;
+    const started = receiver.find("StartActivity:Charge") orelse return error.TestSpanNotReceived;
+    try testing.expectEqual(proto.trace_v1.Span.SpanKind.SPAN_KIND_INTERNAL, got.kind);
+    try testing.expectEqualStrings("charge", attribute(got, "step").?);
+    try testing.expectEqualStrings("order-1", attribute(got, "temporalWorkflowID").?);
+    try testing.expectEqualStrings("run-1", attribute(got, "temporalRunID").?);
+    try testing.expectEqualSlices(u8, ran.span_id, got.parent_span_id);
+    try testing.expectEqualSlices(u8, ran.trace_id, got.trace_id);
+    try testing.expectEqualSlices(u8, got.span_id, started.parent_span_id);
+    try testing.expectEqual(@as(u32, 0), receiver.rejected);
 }
 
 test "a traceparent round-trips through spanContext and fromSpanContext" {

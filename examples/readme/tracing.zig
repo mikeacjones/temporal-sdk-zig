@@ -87,3 +87,39 @@ test "observability: the activity's span descends from the client's" {
     try testing.expectEqualStrings("StartWorkflow:traced_greeting", chain[3]);
 }
 // end-example
+
+// example: observability-tracing-workflow-spans
+fn checkout(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    // A span of the workflow's own; the activity started inside it is its child.
+    const span = tracing.startSpan(ctx, "workflow-operation", .{
+        .attributes = &.{.{ .name = "customer", .value = name }},
+    });
+    defer span.end();
+    return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get();
+}
+const Checkout = workflow.Def("traced_checkout", checkout);
+
+test "observability: the activity's span descends from the workflow's own span" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var counting: CountingTracer = .{ .io = testing.io, .arena = arena.allocator() };
+    var traced: tracing.Interceptor = .init(tracing.Tracer.from(CountingTracer, &counting));
+    const client_interceptors = [_]temporal.interceptor.Client{traced.client()};
+    const worker_interceptors = [_]temporal.interceptor.Worker{traced.worker()};
+    const propagators = [_]temporal.propagation.ContextPropagator{traced.propagator()};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .interceptors = &client_interceptors,
+        .worker_interceptors = &worker_interceptors,
+        .propagators = &propagators,
+    });
+    defer env.deinit();
+    try env.registerWorkflow(Checkout);
+    try env.registerActivity(Greet);
+    _ = try env.executeWorkflow(Checkout, .{"Ziggy"}, arena.allocator(), null);
+
+    const chain = try ancestry(&counting, arena.allocator(), "RunActivity:traced_greet");
+    try testing.expectEqualStrings("StartActivity:traced_greet", chain[1]);
+    try testing.expectEqualStrings("workflow-operation", chain[2]);
+    try testing.expectEqualStrings("RunWorkflow:traced_checkout", chain[3]);
+}
+// end-example

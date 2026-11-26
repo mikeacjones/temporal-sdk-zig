@@ -190,6 +190,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
 | Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation), [nexus-context-propagation](samples/nexus-context-propagation) |
 | OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing), [opentelemetry](samples/opentelemetry) |
+| Spans started by workflow code: named spans with attributes from workflow, update handler and validator code, parenting the activities, children and signals started inside them (Go's v2 API is experimental) | Go, Python, TypeScript, .NET | pre-release | supported | [Tracing](README.md#tracing) |
 
 ### Nexus
 

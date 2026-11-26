@@ -14,9 +14,18 @@
 //! one Nexus header per context field. Inside an activity or a Nexus handler,
 //! `ctx.propagated().get(span_key)` is the running span's context.
 //!
-//! Workflow spans are replay-safe: no span is started for work replayed from history (queries
-//! and update validation, which never come from history, excepted), and nothing a tracer
-//! returns is read by workflow code, so tracing never makes a workflow nondeterministic.
+//! Workflow code (the workflow function, its signal and update handlers, update validators and
+//! query handlers) opens spans of its own with `startSpan`; while one is open, the activities,
+//! child workflows, signals and Nexus operations the same coroutine starts are its children:
+//!
+//!     const span = temporal.tracing.startSpan(ctx, "workflow-operation", .{});
+//!     defer span.end();
+//!
+//! Workflow spans are replay-safe: neither the interceptor nor `startSpan` starts a span for
+//! work replayed from history (queries and update validation, which never come from history,
+//! excepted), and nothing a tracer returns is read by workflow code, so tracing never makes a
+//! workflow nondeterministic, and a history recorded with or without `startSpan` calls or the
+//! interceptor replays the same.
 
 const std = @import("std");
 const converter = @import("converter.zig");
@@ -54,7 +63,7 @@ pub const SpanContext = struct {
 /// The key under which a span context lives in a `propagation.Values` store.
 pub const span_key = propagation.key(SpanContext, "temporal.tracing.span");
 
-pub const Kind = enum { client, server };
+pub const Kind = enum { client, server, internal };
 
 pub const Operation = enum {
     start_workflow,
@@ -73,9 +82,18 @@ pub const Operation = enum {
     run_activity,
     run_start_nexus_operation_handler,
     run_cancel_nexus_operation_handler,
+    /// Experimental: may change or be removed without notice. A span workflow code started
+    /// with `startSpan`; its span name is the caller's name alone.
+    application,
+    /// Experimental: may change or be removed without notice. A signal the workflow sends
+    /// with `ctx.signalExternalWorkflow` or `signalExternalWorkflowByName`.
+    signal_external_workflow,
+    /// Experimental: may change or be removed without notice. A signal the workflow sends
+    /// to its child with `ChildWorkflowFuture.signal`.
+    signal_child_workflow,
 
     /// The operation's text in span names, shared with the other SDKs, such as
-    /// "StartWorkflow" or "RunActivity".
+    /// "StartWorkflow" or "RunActivity"; empty for `.application`.
     pub fn text(op: Operation) []const u8 {
         return switch (op) {
             .start_workflow => "StartWorkflow",
@@ -94,11 +112,15 @@ pub const Operation = enum {
             .run_activity => "RunActivity",
             .run_start_nexus_operation_handler => "RunStartNexusOperationHandler",
             .run_cancel_nexus_operation_handler => "RunCancelNexusOperationHandler",
+            .application => "",
+            .signal_external_workflow => "SignalExternalWorkflow",
+            .signal_child_workflow => "SignalChildWorkflow",
         };
     }
 
     /// `.client` for the operations that send (start_*, signal_*, query_workflow,
-    /// update_workflow), `.server` for those that run or handle.
+    /// update_workflow), `.server` for those that run or handle, `.internal` for
+    /// `.application`.
     pub fn kind(op: Operation) Kind {
         return switch (op) {
             .start_workflow,
@@ -109,6 +131,8 @@ pub const Operation = enum {
             .start_activity,
             .start_child_workflow,
             .start_nexus_operation,
+            .signal_external_workflow,
+            .signal_child_workflow,
             => .client,
             .run_workflow,
             .handle_signal,
@@ -119,6 +143,7 @@ pub const Operation = enum {
             .run_start_nexus_operation_handler,
             .run_cancel_nexus_operation_handler,
             => .server,
+            .application => .internal,
         };
     }
 };
@@ -131,19 +156,21 @@ const tag_update_id = "temporalUpdateID";
 
 pub const StartSpanOptions = struct {
     operation: Operation,
-    /// The workflow type, activity type, signal name, query type, update name, or
-    /// "<service>/<operation>" for Nexus.
+    /// The workflow type, activity type, signal name, query type, update name,
+    /// "<service>/<operation>" for Nexus, or the name workflow code gave `startSpan`.
     name: []const u8,
     /// Null or empty: the span is a root.
     parent: ?SpanContext = null,
     /// Null: now, by the tracer's clock.
     start_time: ?std.Io.Timestamp = null,
     /// Tag names: "temporalWorkflowID", "temporalRunID", "temporalActivityID",
-    /// "temporalUpdateID".
+    /// "temporalUpdateID"; an `.application` span's attributes come first.
     tags: []const Field = &.{},
 
-    /// "<operation text>:<name>", allocated from `arena`. Tracers use it as the span name.
+    /// "<operation text>:<name>", or `name` alone for `.application`, allocated from
+    /// `arena`. Tracers use it as the span name.
     pub fn spanName(o: StartSpanOptions, arena: Allocator) error{OutOfMemory}![]const u8 {
+        if (o.operation == .application) return arena.dupe(u8, o.name);
         return std.mem.concat(arena, u8, &.{ o.operation.text(), ":", o.name });
     }
 };
@@ -275,6 +302,79 @@ fn setCurrent(arena: Allocator, values: *propagation.Values, context: SpanContex
     values.* = next;
 }
 
+/// Experimental: may change or be removed without notice. Options of `startSpan`.
+pub const WorkflowSpanOptions = struct {
+    /// The span's attributes, given to the tracer as tags ahead of temporalWorkflowID and
+    /// temporalRunID. Borrowed for the call only.
+    attributes: []const Field = &.{},
+};
+
+/// Experimental: may change or be removed without notice. Starts a span named `name` from
+/// workflow code: the workflow function, a signal or update handler, an update validator or a
+/// query handler. Its parent is the calling coroutine's newest open span (one it started
+/// with `startSpan`, or the span of the handler it runs in), else the run's `RunWorkflow`
+/// span. While it is open, the activities, local activities, child workflows, signals and
+/// Nexus operations the same coroutine starts are its children. End it with `end` or
+/// `endWithFailure`:
+///
+///     const span = temporal.tracing.startSpan(ctx, "workflow-operation", .{});
+///     defer span.end();
+///
+/// The span is inert (`.{}`, nothing is traced) when the run has no tracing `Interceptor`,
+/// while the run is evicted, once the workflow function has returned, and while the
+/// workflow replays history, except in update validators and query handlers, which never
+/// come from history. It never fails: without memory for it, it logs a warning and returns
+/// an inert span. It sends no command and reads nothing a tracer returns, so calls may be
+/// added or removed without breaking the replay of existing histories. A span still open
+/// when the workflow function returns is ended then, without a failure.
+///
+/// A coroutine started with `io.async`, `io.concurrent`, a `Group` or a `Select` does not
+/// see its starter's open span: its outbound calls are children of the `RunWorkflow` span.
+/// A span started while replaying and ended in live code is not emitted. Workflow code on
+/// the run's worker thread only; with two tracing interceptors on one worker, the last one
+/// installed gets the spans.
+pub fn startSpan(ctx: *workflow.Context, name: []const u8, options: WorkflowSpanOptions) WorkflowSpan {
+    const run = run_var.get(ctx) orelse return .{};
+    return run.startApplication(name, options.attributes);
+}
+
+/// Experimental: may change or be removed without notice. A span workflow code started with
+/// `startSpan`. A small value; copy freely: copies are the same span. `.{}` is inert.
+pub const WorkflowSpan = struct {
+    record: ?*Record = null,
+
+    /// Ends the span. A second call, or a call on an inert span, does nothing.
+    pub fn end(s: WorkflowSpan) void {
+        const r = s.record orelse return;
+        r.run.endFrame(r, .{});
+    }
+
+    /// Ends the span as failed; `failure` is borrowed for the call (it becomes
+    /// `FinishSpanOptions.failure`). While the run is evicted, the span ends without one.
+    pub fn endWithFailure(s: WorkflowSpan, failure: []const u8) void {
+        const r = s.record orelse return;
+        r.run.endFrame(r, r.run.finishFailure(failure));
+    }
+};
+
+/// An open span of a run's coroutine: an inbound call's, on that call's stack, or one
+/// `startSpan` started, in run arena memory never freed on its own. Linked into
+/// `WorkflowRun.newest` while open, so recording an inbound call's span allocates nothing:
+/// a query leaves no memory in the run.
+const Record = struct {
+    run: *WorkflowRun,
+    /// The `Scheduler.Fiber` ID of the coroutine that started it; 0 outside a coroutine.
+    owner: u32,
+    kind: enum { inbound, application },
+    span: Span,
+    ended: bool = false,
+    /// The next older open span of the run.
+    older: ?*Record = null,
+};
+
+/// The run `startSpan` traces into, set by `Interceptor.interceptWorkflow`.
+const run_var: workflow.LocalVar(?*WorkflowRun) = .{ .name = "temporal.tracing.run", .default = null };
+
 /// The tracing interceptor. Holds only the tracer; no allocation, no deinit. It is borrowed
 /// by everything it hands out, so it must not move and must outlive the client and workers.
 pub const Interceptor = struct {
@@ -385,6 +485,11 @@ pub const Interceptor = struct {
     fn interceptWorkflow(ptr: *anyopaque, ctx: *workflow.Context) error{OutOfMemory}!interceptor.Workflow {
         const run = try ctx.allocator().create(WorkflowRun);
         run.* = .{ .t = of(ptr), .ctx = ctx, .run_context = (try headerParent(ctx.allocator(), ctx.headers())) orelse .{} };
+        run_var.set(ctx, run) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Not reached: workflows are intercepted outside read-only code.
+            error.ReadOnly => {},
+        };
         return .{ .inbound = interceptor.WorkflowInbound.from(WorkflowRun, run), .outbound = interceptor.WorkflowOutbound.from(WorkflowRun, run) };
     }
 
@@ -408,6 +513,10 @@ const WorkflowRun = struct {
     /// The parent of the run's handler and outbound spans: the RunWorkflow span's context
     /// when that span was started in this process, else the start header's.
     run_context: SpanContext,
+    /// The newest open span of the run's coroutines; the others follow by `Record.older`.
+    newest: ?*Record = null,
+    /// Set once `executeWorkflow` has returned: `startSpan` is inert from then on.
+    closed: bool = false,
 
     fn tracer(r: *const WorkflowRun) Tracer {
         return r.t.tracer;
@@ -437,7 +546,97 @@ const WorkflowRun = struct {
         });
     }
 
+    /// The `Scheduler.Fiber` ID of the calling coroutine, or 0 outside one.
+    fn currentOwner(r: *const WorkflowRun) u32 {
+        return if (r.ctx.instance.sched.currentFiber()) |f| f.id else 0;
+    }
+
+    /// The calling coroutine's newest open frame, or null.
+    fn innermost(r: *const WorkflowRun) ?*Record {
+        const owner = r.currentOwner();
+        var at = r.newest;
+        while (at) |f| : (at = f.older) if (f.owner == owner) return f;
+        return null;
+    }
+
+    /// Links `f` as the newest open span, opened by the calling coroutine.
+    fn pushFrame(r: *WorkflowRun, f: *Record) void {
+        f.owner = r.currentOwner();
+        f.older = r.newest;
+        r.newest = f;
+    }
+
+    /// Records an inbound call's `span` as open in the calling coroutine, in `frame`, which
+    /// lives on the call's stack until `removeFrame`.
+    fn pushInbound(r: *WorkflowRun, frame: *Record, span: Span) *Record {
+        frame.* = .{ .run = r, .owner = 0, .kind = .inbound, .span = span };
+        r.pushFrame(frame);
+        return frame;
+    }
+
+    /// Unlinks `f`, found by identity, and marks it ended.
+    fn removeFrame(r: *WorkflowRun, f: *Record) void {
+        f.ended = true;
+        var link = &r.newest;
+        while (link.*) |item| : (link = &item.older) if (item == f) {
+            link.* = item.older;
+            return;
+        };
+    }
+
+    /// Ends an application span once: `WorkflowSpan.end` and `endWithFailure`.
+    fn endFrame(r: *WorkflowRun, f: *Record, options: FinishSpanOptions) void {
+        if (f.ended) return;
+        r.removeFrame(f);
+        r.tracer().finishSpan(f.span, options);
+    }
+
+    /// `startSpan` for this run; see there for when the span is inert.
+    fn startApplication(r: *WorkflowRun, name: []const u8, attributes: []const Field) WorkflowSpan {
+        const inst = r.ctx.instance;
+        if (inst.evicting or r.closed) return .{};
+        if (r.ctx.isReplaying() and inst.readOnly() == null) return .{};
+        const a = inst.arena();
+        const info = r.ctx.info();
+        const tags = a.alloc(Field, attributes.len + 2) catch return r.applicationOutOfMemory(name);
+        defer a.free(tags);
+        @memcpy(tags[0..attributes.len], attributes);
+        tags[attributes.len] = .{ .name = tag_workflow_id, .value = info.workflow_id };
+        tags[attributes.len + 1] = .{ .name = tag_run_id, .value = info.run_id };
+        const parent = if (r.innermost()) |f| f.span.context else r.run_context;
+        const frame = a.create(Record) catch return r.applicationOutOfMemory(name);
+        const span = r.tracer().startSpan(a, .{ .operation = .application, .name = name, .parent = parent, .tags = tags }) catch {
+            a.destroy(frame);
+            return r.applicationOutOfMemory(name);
+        };
+        frame.* = .{ .run = r, .owner = 0, .kind = .application, .span = span };
+        r.pushFrame(frame);
+        return .{ .record = frame };
+    }
+
+    fn applicationOutOfMemory(r: *WorkflowRun, name: []const u8) WorkflowSpan {
+        r.ctx.logger().warn("out of memory starting the tracing span; the workflow goes on untraced", .{ .Name = name });
+        return .{};
+    }
+
+    /// Ends every application span still open, without a failure, and makes `startSpan`
+    /// inert: the workflow function has returned, or its run is being evicted.
+    fn close(r: *WorkflowRun) void {
+        r.closed = true;
+        var link = &r.newest;
+        while (link.*) |f| {
+            if (f.kind != .application) {
+                link = &f.older;
+                continue;
+            }
+            link.* = f.older;
+            f.ended = true;
+            r.tracer().finishSpan(f.span, .{});
+        }
+    }
+
     pub fn executeWorkflow(r: *WorkflowRun, input: interceptor.ExecuteWorkflowInput, next: interceptor.WorkflowInbound.Next) anyerror!Payload {
+        defer r.close();
         // A run rebuilt from history after a first workflow task that sent no commands runs
         // its function live as far as the core is concerned, but the function already ran
         // once: a task completed before this one.
@@ -446,6 +645,9 @@ const WorkflowRun = struct {
         var failure: ?[]const u8 = null;
         defer r.tracer().finishSpan(span, r.finishFailure(failure));
         if (!span.context.isEmpty()) r.run_context = span.context;
+        var frame_memory: Record = undefined;
+        const frame = r.pushInbound(&frame_memory, span);
+        defer r.removeFrame(frame);
         return next.executeWorkflow(input) catch |err| {
             failure = failureOf(err);
             return err;
@@ -457,6 +659,9 @@ const WorkflowRun = struct {
         const span = try r.startInbound(r.ctx.allocator(), .handle_signal, input.signal_name, input.header, null, null);
         var failure: ?[]const u8 = null;
         defer r.tracer().finishSpan(span, r.finishFailure(failure));
+        var frame_memory: Record = undefined;
+        const frame = r.pushInbound(&frame_memory, span);
+        defer r.removeFrame(frame);
         return next.handleSignal(input) catch |err| {
             failure = failureOf(err);
             return err;
@@ -467,6 +672,9 @@ const WorkflowRun = struct {
         const span = try r.startInbound(input.arena, .handle_query, input.query_type, input.header, null, null);
         var failure: ?[]const u8 = null;
         defer r.tracer().finishSpan(span, .{ .failure = failure });
+        var frame_memory: Record = undefined;
+        const frame = r.pushInbound(&frame_memory, span);
+        defer r.removeFrame(frame);
         return next.handleQuery(input) catch |err| {
             failure = failureOf(err);
             return err;
@@ -477,6 +685,9 @@ const WorkflowRun = struct {
         const span = try r.startInbound(r.ctx.allocator(), .validate_update, input.update_name, input.header, input.update_id, null);
         var failure: ?[]const u8 = null;
         defer r.tracer().finishSpan(span, .{ .failure = failure });
+        var frame_memory: Record = undefined;
+        const frame = r.pushInbound(&frame_memory, span);
+        defer r.removeFrame(frame);
         return next.validateUpdate(input) catch |err| {
             failure = failureOf(err);
             return err;
@@ -488,6 +699,9 @@ const WorkflowRun = struct {
         const span = try r.startInbound(r.ctx.allocator(), .handle_update, input.update_name, input.header, input.update_id, null);
         var failure: ?[]const u8 = null;
         defer r.tracer().finishSpan(span, r.finishFailure(failure));
+        var frame_memory: Record = undefined;
+        const frame = r.pushInbound(&frame_memory, span);
+        defer r.removeFrame(frame);
         return next.executeUpdate(input) catch |err| {
             failure = failureOf(err);
             return err;
@@ -496,7 +710,9 @@ const WorkflowRun = struct {
 
     /// Starts the span of an outbound call, or returns null: while replaying, or when the
     /// span cannot be started for lack of memory (logged), in which case the call goes on
-    /// untraced, since tracing must not change what a workflow does.
+    /// untraced, since tracing must not change what a workflow does. Its parent is the
+    /// calling coroutine's newest open span when `startSpan` started that one, else the
+    /// run's context.
     fn startOutbound(r: *WorkflowRun, operation: Operation, name: []const u8) ?Span {
         if (r.ctx.isReplaying()) return null;
         const info = r.ctx.info();
@@ -504,7 +720,8 @@ const WorkflowRun = struct {
             .{ .name = tag_workflow_id, .value = info.workflow_id },
             .{ .name = tag_run_id, .value = info.run_id },
         };
-        return r.tracer().startSpan(r.ctx.allocator(), .{ .operation = operation, .name = name, .parent = r.run_context, .tags = &tags }) catch {
+        const parent = if (r.innermost()) |f| (if (f.kind == .application) f.span.context else r.run_context) else r.run_context;
+        return r.tracer().startSpan(r.ctx.allocator(), .{ .operation = operation, .name = name, .parent = parent, .tags = &tags }) catch {
             r.ctx.logger().warn("out of memory starting the tracing span; the call goes on untraced", .{ .Operation = operation.text(), .Name = name });
             return null;
         };
@@ -536,6 +753,14 @@ const WorkflowRun = struct {
         defer r.tracer().finishSpan(span, .{});
         r.writeOutbound(input.header, span);
         return next.executeChildWorkflow(input);
+    }
+
+    pub fn signalExternalWorkflow(r: *WorkflowRun, input: interceptor.SignalExternalInput, next: interceptor.WorkflowOutbound.Next) workflow.SignalExternalFuture {
+        const operation: Operation = if (input.child) .signal_child_workflow else .signal_external_workflow;
+        const span = r.startOutbound(operation, input.signal_name) orelse return next.signalExternalWorkflow(input);
+        defer r.tracer().finishSpan(span, .{});
+        r.writeOutbound(input.header, span);
+        return next.signalExternalWorkflow(input);
     }
 
     pub fn executeNexusOperation(r: *WorkflowRun, input: interceptor.NexusOperationInput, next: interceptor.WorkflowOutbound.Next) workflow.NexusOperationFuture(Payload) {
@@ -661,10 +886,20 @@ test "operations name themselves as the other SDKs do, and span names join opera
     try testing.expectEqual(Kind.client, Operation.start_activity.kind());
     try testing.expectEqual(Kind.client, Operation.update_workflow.kind());
     try testing.expectEqual(Kind.server, Operation.validate_update.kind());
+    try testing.expectEqualStrings("SignalExternalWorkflow", Operation.signal_external_workflow.text());
+    try testing.expectEqualStrings("SignalChildWorkflow", Operation.signal_child_workflow.text());
+    try testing.expectEqual(Kind.client, Operation.signal_external_workflow.kind());
+    try testing.expectEqual(Kind.client, Operation.signal_child_workflow.kind());
+    try testing.expectEqualStrings("", Operation.application.text());
+    try testing.expectEqual(Kind.internal, Operation.application.kind());
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const o: StartSpanOptions = .{ .operation = .run_activity, .name = "Charge" };
     try testing.expectEqualStrings("RunActivity:Charge", try o.spanName(arena.allocator()));
+    const app: StartSpanOptions = .{ .operation = .application, .name = "workflow-operation" };
+    try testing.expectEqualStrings("workflow-operation", try app.spanName(arena.allocator()));
+    const signal: StartSpanOptions = .{ .operation = .signal_child_workflow, .name = "go" };
+    try testing.expectEqualStrings("SignalChildWorkflow:go", try signal.spanName(arena.allocator()));
 }
 
 test "a span context round-trips through _tracer-data as a JSON object of strings" {
