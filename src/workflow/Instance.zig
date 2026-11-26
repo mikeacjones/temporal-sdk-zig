@@ -2317,6 +2317,10 @@ fn recordContinueAsNew(inst: *Instance, workflow_type: []const u8, options: work
         .workflow_task_timeout = proto_time.durationToProto(options.task_timeout),
     };
     if (options.retry_policy) |rp| cmd.retry_policy = try protoRetryPolicy(a, rp);
+    if (options.initial_versioning_behavior) |b| cmd.initial_versioning_behavior = switch (b) {
+        .auto_upgrade => .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE,
+        .ramping_version => .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION,
+    };
     // Core fills an empty memo with the memo this run started with, which would drop
     // `upsertMemo` changes; sending the current view keeps them. Core can't tell an empty
     // command memo from an unset one, so an empty option means "keep" too. A current memo
@@ -10771,8 +10775,18 @@ const Continue = struct {
         try ctx.upsertMemo(.{ .status = null });
         return ctx.continueAsNew(ClearedMemo, .{}, .{n + 1});
     }
+    /// Continues as new with the initial versioning behavior its argument names (0: null).
+    fn initialBehavior(ctx: *workflow.Context, choice: u32) !u32 {
+        const behavior: ?workflow.InitialVersioningBehavior = switch (choice) {
+            1 => .auto_upgrade,
+            2 => .ramping_version,
+            else => null,
+        };
+        return ctx.continueAsNew(InitialBehavior, .{ .initial_versioning_behavior = behavior }, .{choice});
+    }
     const WithOptions = workflow.Def("WithOptions", withOptions);
     const Defaults = workflow.Def("Defaults", defaults);
+    const InitialBehavior = workflow.Def("InitialBehavior", initialBehavior);
     const EmptyMemo = workflow.Def("EmptyMemo", emptyMemo);
     const ClearedMemo = workflow.Def("ClearedMemo", clearedMemo);
     const Bare = workflow.Def("Bare", bare);
@@ -10801,6 +10815,25 @@ test "continue-as-new: ContinueAsNewWorkflowExecution carries the type, argument
     try testing.expectEqual(@as(i32, 3), can.retry_policy.?.maximum_attempts);
     try testing.expectEqualStrings("Fatal", can.retry_policy.?.non_retryable_error_types.items[0]);
     try testing.expect(inst.finished);
+}
+
+test "continue-as-new: initial_versioning_behavior maps to the command's enum, and null to unspecified" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const Behavior = proto.temporal.api.enums.v1.ContinueAsNewVersioningBehavior;
+    const cases = [_]struct { choice: u32, want: Behavior }{
+        .{ .choice = 0, .want = .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED },
+        .{ .choice = 1, .want = .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE },
+        .{ .choice = 2, .want = .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION },
+    };
+    for (cases) |case| {
+        const inst = try create(testing.allocator, Continue.InitialBehavior.registered, .{ .task_queue = "tq" });
+        defer inst.destroy();
+        const cmds = commandsOf(try inst.activate(&try initActivation(a, "InitialBehavior", .{case.choice}), a));
+        try testing.expectEqual(@as(usize, 1), cmds.len);
+        try testing.expectEqual(case.want, cmds[0].variant.?.continue_as_new_workflow_execution.initial_versioning_behavior);
+    }
 }
 
 test "continue-as-new: default options keep the task queue, timeouts and retry policy, and send the current memo" {

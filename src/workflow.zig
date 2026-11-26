@@ -723,6 +723,17 @@ pub const NexusOperationOptions = struct {
     summary: []const u8 = "",
 };
 
+/// Experimental: how the server routes the first workflow task of the run a continue-as-new starts.
+pub const InitialVersioningBehavior = enum {
+    /// The new run starts as an auto-upgrade run: its first workflow task goes to the task
+    /// queue's current version (or, for its share of workflows, the ramping version). After that
+    /// task the run follows the versioning behavior its definition declares.
+    auto_upgrade,
+    /// The new run's first workflow task goes to the task queue's ramping version, or to the
+    /// current version when nothing is ramping. After that task the run follows its definition's behavior.
+    ramping_version,
+};
+
 /// How `Context.continueAsNew` starts the next run.
 /// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
 /// sent as the longest one it can; a negative one is sent as it is.
@@ -744,6 +755,10 @@ pub const ContinueAsNewOptions = struct {
     search_attributes: ?[]const search_attributes.Update = null,
     /// Null keeps this run's retry policy.
     retry_policy: ?RetryPolicy = null,
+    /// Experimental: null lets the server decide as before: a pinned run continues on its own
+    /// version, an auto-upgrade run moves only after the new run's first workflow task. A pinned
+    /// versioning override on the run is inherited by the new run and wins over this field.
+    initial_versioning_behavior: ?InitialVersioningBehavior = null,
 };
 
 /// How `Context.sleep` starts its timer. Only read while starting it; strings are copied.

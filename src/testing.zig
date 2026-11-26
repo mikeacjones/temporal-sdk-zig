@@ -4080,18 +4080,39 @@ const VersionFixtures = struct {
     const PinnedRollout = workflow.DefWithOptions("PinnedRollout", waitThenReport, .{ .versioning_behavior = .pinned });
     const AutoRollout = workflow.DefWithOptions("AutoRollout", waitThenReport, .{ .versioning_behavior = .auto_upgrade });
 
+    /// The first run (`previous` empty) waits for `Release`, then continues as new passing its
+    /// own build ID, choosing `.auto_upgrade` for the new run when `upgrade` is set. The second
+    /// run returns "<previous>-><the build ID running its first workflow task>".
+    fn continueUpgrade(ctx: *workflow.Context, previous: []const u8, upgrade: bool) ![]const u8 {
+        const on = if (ctx.currentDeploymentVersion()) |v| v.build_id else "none";
+        if (previous.len > 0) return std.fmt.allocPrint(ctx.allocator(), "{s}->{s}", .{ previous, on });
+        const state = try ctx.allocator().create(State);
+        state.* = .{ .started_on = on };
+        try ctx.setSignalHandler(Release, state, State.release);
+        try ctx.setQueryHandler(StartedOn, state, State.startedOn);
+        try ctx.await(state, State.isReleased);
+        return ctx.continueAsNew(ContinueUpgrade, .{
+            .initial_versioning_behavior = if (upgrade) .auto_upgrade else null,
+        }, .{ on, upgrade });
+    }
+    const ContinueUpgrade = workflow.DefWithOptions("ContinueUpgrade", continueUpgrade, .{ .versioning_behavior = .pinned });
+
     /// Starts a worker of version `build_id` of the "rollout" deployment on `task_queue`.
     const VersionWorker = struct {
         w: worker_mod.Worker,
         running: Io.Future(worker_mod.Worker.RunError!void) = undefined,
 
         fn start(vw: *VersionWorker, c: *client_mod.Client, task_queue: []const u8, build_id: []const u8) !void {
+            return vw.startWith(c, task_queue, build_id, .{ PinnedRollout, AutoRollout });
+        }
+
+        /// Like `start`, registering each workflow definition in the tuple `workflows`.
+        fn startWith(vw: *VersionWorker, c: *client_mod.Client, task_queue: []const u8, build_id: []const u8, comptime workflows: anytype) !void {
             vw.* = .{ .w = try .init(testing.allocator, testing.io, c, task_queue, .{
                 .deployment = .{ .deployment_name = "rollout", .build_id = build_id },
             }) };
             errdefer vw.w.deinit();
-            try vw.w.registerWorkflow(PinnedRollout);
-            try vw.w.registerWorkflow(AutoRollout);
+            inline for (workflows) |def| try vw.w.registerWorkflow(def);
             vw.running = try testing.io.concurrent(WorkflowEnvironment.runWorker, .{&vw.w});
         }
 
@@ -4205,6 +4226,53 @@ test "a worker that only reports its deployment version runs workflows that see 
     try testing.expectEqualStrings("reporting.b1", try run.get(arena.allocator()));
     try env.registerWorkflow(VersionFixtures.WhoRuns);
     try env.replayRun(run.id, run.run_id);
+}
+
+test "worker deployment: a pinned run that continues as new with auto_upgrade runs its first workflow task on the current version" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = &env.client;
+    const task_queue = "continue-upgrade";
+    var rollout = try c.workerDeployment("rollout");
+    defer rollout.deinit();
+
+    var v1: VersionFixtures.VersionWorker = undefined;
+    try v1.startWith(c, task_queue, "v1", .{VersionFixtures.ContinueUpgrade});
+    defer v1.stop();
+    try VersionFixtures.awaitVersion(&rollout, "v1");
+    try VersionFixtures.awaitPolled(&rollout, "v1", task_queue);
+    _ = try rollout.setCurrentVersion(a, "v1", .{});
+    try VersionFixtures.awaitRouting(&rollout);
+
+    var upgrading = try c.executeWorkflow(VersionFixtures.ContinueUpgrade, .{ .task_queue = task_queue }, .{ "", true });
+    defer upgrading.deinit();
+    var staying = try c.executeWorkflow(VersionFixtures.ContinueUpgrade, .{ .task_queue = task_queue }, .{ "", false });
+    defer staying.deinit();
+    // A query is answered once the first workflow task has run.
+    try testing.expectEqualStrings("v1", try c.queryWorkflow(VersionFixtures.StartedOn, a, upgrading.id, "", .{}));
+    try testing.expectEqualStrings("v1", try c.queryWorkflow(VersionFixtures.StartedOn, a, staying.id, "", .{}));
+    const first_upgrading_run = try a.dupe(u8, upgrading.run_id);
+    const first_staying_run = try a.dupe(u8, staying.run_id);
+
+    var v2: VersionFixtures.VersionWorker = undefined;
+    try v2.startWith(c, task_queue, "v2", .{VersionFixtures.ContinueUpgrade});
+    defer v2.stop();
+    try VersionFixtures.awaitVersion(&rollout, "v2");
+    try VersionFixtures.awaitPolled(&rollout, "v2", task_queue);
+    _ = try rollout.setCurrentVersion(a, "v2", .{});
+    try VersionFixtures.awaitRouting(&rollout);
+
+    try c.signalWorkflow(VersionFixtures.Release, upgrading.id, "", .{});
+    try c.signalWorkflow(VersionFixtures.Release, staying.id, "", .{});
+    try testing.expectEqualStrings("v1->v2", try upgrading.get(a));
+    try testing.expectEqualStrings("v1->v1", try staying.get(a));
+
+    try env.registerWorkflow(VersionFixtures.ContinueUpgrade);
+    try env.replayRun(upgrading.id, first_upgrading_run);
+    try env.replayRun(staying.id, first_staying_run);
 }
 
 test "worker deployment: a pinned run stays on its version across a rollout, an auto-upgrade run moves" {
