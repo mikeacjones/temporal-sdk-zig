@@ -112,7 +112,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Workflow metadata query and handler descriptions | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | supported | [Stack trace and metadata queries](README.md#stack-trace-and-metadata-queries) |
 | Event groups: tying a workflow's commands and their history events to a named group (experimental) | Go, TypeScript | pre-release | missing | `temporal-sdk-zig-d51.13.7`. Commands carry no event group markers, and workflow options have no field for them. |
 | Priority and fairness keys on workflows, activities, and children (Task Queue Priority and Fairness GA, Replay 2026) | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Activities and local activities](README.md#activities-and-local-activities), [Starting workflows](README.md#starting-workflows), [Child workflows](README.md#child-workflows) |
-| Versioning overrides on child workflows, and one-time overrides (experimental) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | partial | `temporal-sdk-zig-d51.7.48`. Client starts and `updateWorkflowExecutionOptions` take a `deployment.VersioningOverride` (`pinned` or `auto_upgrade`). Missing: a one-time override, and an override on `workflow.ChildWorkflowOptions`. |
+| Versioning overrides on child workflows, and one-time overrides (experimental) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | supported | [Worker deployments](README.md#worker-deployments), [Child workflows](README.md#child-workflows) |
 
 ### Activities
 

@@ -603,8 +603,9 @@ pub const ChildState = struct {
     run_id: ?[]const u8 = null,
     /// Set once the child closed, or failed to start (or was canceled before it started).
     outcome: ?Outcome = null,
-    /// The start failed because the workflow ID is taken.
-    already_started: bool = false,
+    /// Why the server refused the start, when the refusal has an error of its own: the
+    /// workflow ID is taken, or the versioning override is invalid.
+    start_refusal: enum { none, already_started, invalid_versioning_override } = .none,
     cancel_requested: bool = false,
     /// With `wait_cancellation_requested`: the RequestCancelExternalWorkflowExecution this
     /// workflow sent itself once the child started, whose resolution reports the cancellation.
@@ -1204,7 +1205,7 @@ const ReadOnlySection = struct {
     fn failureOf(r: *const ReadOnlySection, a: Allocator, err: anyerror) error{OutOfMemory}!Failure {
         switch (err) {
             error.ApplicationFailure => if (r.pending_failure) |p| return p.resolve(a, ""),
-            error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (r.last_failure) |f| return f.*,
+            error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ChildWorkflowInvalidVersioningOverride, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (r.last_failure) |f| return f.*,
             else => {},
         }
         return failure_mod.fromError(a, err);
@@ -1869,7 +1870,7 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
 fn updateFailure(a: Allocator, run: *const HandlerRun, err: anyerror) error{OutOfMemory}!Failure {
     switch (err) {
         error.ApplicationFailure => if (run.pending_failure) |p| return p.resolve(a, ""),
-        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (run.last_failure) |f| return f.*,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ChildWorkflowInvalidVersioningOverride, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (run.last_failure) |f| return f.*,
         else => {},
     }
     return failure_mod.fromError(a, err);
@@ -1880,7 +1881,7 @@ fn updateFailure(a: Allocator, run: *const HandlerRun, err: anyerror) error{OutO
 fn builtFromError(run: *const HandlerRun, err: anyerror) bool {
     switch (err) {
         error.ApplicationFailure => if (run.pending_failure) |p| return p == .application,
-        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (run.last_failure != null) return false,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ChildWorkflowInvalidVersioningOverride, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (run.last_failure != null) return false,
         else => {},
     }
     return true;
@@ -2274,7 +2275,7 @@ fn builtWorkflowFailure(inst: *Instance, out: Allocator, err: anyerror) !Failure
         .{ inst.ctx.pending_failure, inst.ctx.last_failure, inst.root_trace };
     if (pending) |p| return p.resolve(a, try inst.failureTraceText(out, addresses));
     switch (err) {
-        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (last) |f| return f.*,
+        error.ActivityFailed, error.SideEffectFailed, error.ChildWorkflowFailed, error.ChildWorkflowAlreadyStarted, error.ChildWorkflowInvalidVersioningOverride, error.ExternalWorkflowNotFound, error.ExternalWorkflowRequestFailed, error.SessionCreationFailed, error.NexusOperationFailed => if (last) |f| return f.*,
         // Only the workflow function's return of ctx.continueAsNew's error continues as new.
         error.ContinueAsNew => return failure_mod.application(a, .{
             .message = if (inst.continue_as_new == null)
@@ -3242,6 +3243,15 @@ fn startChildWorkflow(inst: *Instance, workflow_type: []const u8, options: workf
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidSearchAttribute => return error.InvalidOptions,
     };
+    // The command outlives the options: copy the version's strings into the run's arena.
+    if (options.versioning_override) |o| {
+        const copy: deployment.VersioningOverride = switch (o) {
+            .auto_upgrade => .auto_upgrade,
+            .pinned => |v| .{ .pinned = .{ .deployment_name = try a.dupe(u8, v.deployment_name), .build_id = try a.dupe(u8, v.build_id) } },
+            .one_time => |v| .{ .one_time = .{ .deployment_name = try a.dupe(u8, v.deployment_name), .build_id = try a.dupe(u8, v.build_id) } },
+        };
+        cmd.versioning_override = copy.toProto();
+    }
     const names = try inst.copyCodecFields(codec_fields);
     try inst.reserveCodecFields(names);
     try inst.children.put(a, state.seq, state);
@@ -3363,7 +3373,11 @@ fn resolveChildStart(inst: *Instance, r: *const act_pb.ResolveChildWorkflowExecu
         },
         .failed => |f| {
             _ = inst.children.remove(r.seq);
-            state.already_started = f.cause == .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS;
+            state.start_refusal = switch (f.cause) {
+                .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS => .already_started,
+                .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE => .invalid_versioning_override,
+                else => .none,
+            };
             state.outcome = .{ .failed = try startFailure(inst, state, f.cause) };
         },
         .cancelled => |c| {
@@ -9490,6 +9504,40 @@ const ChildWf = struct {
         try ctx.io().sleep(.fromSeconds(60), .awake);
     }
     const Unawaited = workflow.Def("UnawaitedChild", unawaited);
+
+    /// Starts `Kid` with the versioning override `kind` names ("none", "pinned",
+    /// "auto_upgrade" or "one_time"), then overwrites the version's strings, which the start
+    /// must have copied. With a "+unhandled" suffix the workflow returns `get`'s error;
+    /// otherwise it reports a refused start, and that `get` refuses it too.
+    fn overridden(ctx: *workflow.Context, mode: []const u8) ![]const u8 {
+        const a = ctx.allocator();
+        const unhandled = std.mem.endsWith(u8, mode, "+unhandled");
+        const kind = if (unhandled) mode[0 .. mode.len - "+unhandled".len] else mode;
+        const name = try a.dupe(u8, "rollout");
+        const build_id = try a.dupe(u8, "v1");
+        const version: deployment.Version = .{ .deployment_name = name, .build_id = build_id };
+        const override: ?deployment.VersioningOverride = if (std.mem.eql(u8, kind, "pinned"))
+            .{ .pinned = version }
+        else if (std.mem.eql(u8, kind, "one_time"))
+            .{ .one_time = version }
+        else if (std.mem.eql(u8, kind, "auto_upgrade"))
+            .auto_upgrade
+        else
+            null;
+        const f = ctx.executeChildWorkflow(Kid, .{ .id = "kid-1", .versioning_override = override }, .{"kid"});
+        @memset(name, 'x');
+        @memset(build_id, 'x');
+        if (unhandled) return f.get();
+        _ = f.started() catch |err| switch (err) {
+            error.ChildWorkflowInvalidVersioningOverride => {
+                if (f.get()) |_| return error.TestUnexpectedResult else |e| if (e != error.ChildWorkflowInvalidVersioningOverride) return e;
+                return std.fmt.allocPrint(a, "refused: {s}", .{f.failure().?.message});
+            },
+            else => return err,
+        };
+        return f.get();
+    }
+    const Overridden = workflow.Def("OverriddenChild", overridden);
 };
 
 /// Runs `DescribedChild` with `summary` and `details` and checks its StartChildWorkflowExecution
@@ -9604,6 +9652,79 @@ test "child workflow: a start failure on a taken ID returns error.ChildWorkflowA
     const result = done[0].variant.?.complete_workflow_execution.result.?.data;
     try testing.expect(std.mem.startsWith(u8, result, "\"already started: starting child workflow \\\"Kid\\\" with ID"));
     try testing.expect(std.mem.endsWith(u8, result, "failed: a workflow with this ID already exists\""));
+}
+
+test "child workflow: the start command carries the versioning override, copied, and none for null" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    for ([_][]const u8{ "none", "pinned", "auto_upgrade", "one_time" }) |kind| {
+        const inst = try create(testing.allocator, ChildWf.Overridden.registered, .{});
+        defer inst.destroy();
+        const first = commandsOf(try inst.activate(&try initActivation(a, "OverriddenChild", .{kind}), a));
+        try testing.expectEqual(@as(usize, 1), first.len);
+        const sent = first[0].variant.?.start_child_workflow_execution.versioning_override;
+        if (std.mem.eql(u8, kind, "none")) {
+            try testing.expect(sent == null);
+            continue;
+        }
+        const o = sent.?;
+        // Only the oneof, never the deprecated fields.
+        try testing.expect(o.behavior == .VERSIONING_BEHAVIOR_UNSPECIFIED);
+        try testing.expect(o.deployment == null);
+        try testing.expectEqualStrings("", o.pinned_version);
+        const want: deployment.VersioningOverride = if (std.mem.eql(u8, kind, "pinned"))
+            .{ .pinned = .{ .deployment_name = "rollout", .build_id = "v1" } }
+        else if (std.mem.eql(u8, kind, "one_time"))
+            .{ .one_time = .{ .deployment_name = "rollout", .build_id = "v1" } }
+        else
+            .auto_upgrade;
+        try testing.expectEqualDeep(@as(?deployment.VersioningOverride, want), deployment.VersioningOverride.fromProto(o));
+    }
+}
+
+test "child workflow: a start refused for its versioning override returns error.ChildWorkflowInvalidVersioningOverride from started and get" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Overridden.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "OverriddenChild", .{@as([]const u8, "pinned")}), a);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .resolve_child_workflow_execution_start = .{ .seq = 1, .status = .{ .failed = .{
+        .workflow_type = "Kid",
+        .cause = .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE,
+    } } } }), a));
+    try testing.expectEqualStrings("\"refused: starting child workflow \\\"Kid\\\" with ID \\\"kid-1\\\" failed: the versioning override is invalid\"", done[0].variant.?.complete_workflow_execution.result.?.data);
+}
+
+test "child workflow: a workflow that returns error.ChildWorkflowInvalidVersioningOverride fails with the start failure" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Overridden.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "OverriddenChild", .{@as([]const u8, "one_time+unhandled")}), a);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .resolve_child_workflow_execution_start = .{ .seq = 1, .status = .{ .failed = .{
+        .workflow_type = "Kid",
+        .cause = .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE,
+    } } } }), a));
+    const fail = done[0].variant.?.fail_workflow_execution.failure.?;
+    try testing.expectEqualStrings("starting child workflow \"Kid\" with ID \"kid-1\" failed: the versioning override is invalid", fail.message);
+    try testing.expectEqualStrings("Kid", fail.failure_info.?.child_workflow_execution_failure_info.workflow_type.?.name);
+}
+
+test "child workflow: other start failure causes stay error.ChildWorkflowFailed" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, ChildWf.Overridden.registered, .{});
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "OverriddenChild", .{@as([]const u8, "pinned")}), a);
+    const done = commandsOf(try inst.activate(&try oneJob(a, .{ .resolve_child_workflow_execution_start = .{ .seq = 1, .status = .{ .failed = .{
+        .workflow_type = "Kid",
+        .cause = .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND,
+    } } } }), a));
+    try testing.expectEqualStrings("starting child workflow \"Kid\" with ID \"kid-1\" failed: the namespace was not found", done[0].variant.?.fail_workflow_execution.failure.?.message);
 }
 
 test "child workflow: a failed child fails the parent with the child's failure" {

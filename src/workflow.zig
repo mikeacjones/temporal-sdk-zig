@@ -654,6 +654,12 @@ pub const ChildWorkflowOptions = struct {
     /// in `Info.priority`. The server checks the values: one it rejects fails the workflow
     /// task.
     priority: ?Priority = null,
+    /// Experimental: runs the child with a versioning behavior other than its definition's,
+    /// independent of the parent's version: pinned to a deployment version, auto-upgrading, or
+    /// routed once to a version (see `deployment.VersioningOverride`). Null sends none. Needs
+    /// Temporal Server 1.32.0 or later. An override the server refuses fails the future with
+    /// `error.ChildWorkflowInvalidVersioningOverride`. Only read while starting.
+    versioning_override: ?deployment.VersioningOverride = null,
 };
 
 /// What canceling a Nexus operation does: `NexusOperationFuture.cancel`, or canceling the
@@ -2071,8 +2077,10 @@ pub fn ActivityFuture(comptime T: type) type {
 /// `ChildWorkflowFailed`: read the failure with the future's `failure`.
 /// `ChildWorkflowAlreadyStarted`: a workflow with the child's ID is already running (or, per
 /// `id_reuse_policy`, has run); `failure` describes it too.
+/// `ChildWorkflowInvalidVersioningOverride`: experimental; the server refused to start the
+/// child because of `ChildWorkflowOptions.versioning_override`; `failure` describes it too.
 /// `InvalidOptions`: the options were rejected before starting (the worker logs why).
-pub const ChildWorkflowError = error{ ChildWorkflowFailed, ChildWorkflowAlreadyStarted, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
+pub const ChildWorkflowError = error{ ChildWorkflowFailed, ChildWorkflowAlreadyStarted, ChildWorkflowInvalidVersioningOverride, Canceled, OutOfMemory, InvalidOptions, InvalidPayload, UnknownEncoding, WrongArgumentCount };
 
 /// The pending start and result of a child workflow. `ChildWorkflowFuture(converter.Payload)`
 /// returns the result still encoded, as workflow interceptors handle it.
@@ -2086,8 +2094,10 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
 
         /// Waits until the server has started the child and returns its execution (arena
         /// memory of the parent run; the child runs in the parent's namespace). Returns
-        /// `error.ChildWorkflowAlreadyStarted` if its ID is taken, and `error.ChildWorkflowFailed`
-        /// if it could not start for another reason or was canceled before it started.
+        /// `error.ChildWorkflowAlreadyStarted` if its ID is taken,
+        /// `error.ChildWorkflowInvalidVersioningOverride` if the server refused its
+        /// `versioning_override`, and `error.ChildWorkflowFailed` if it could not start for
+        /// another reason or was canceled before it started.
         /// Canceling the calling coroutine cancels the child as `get` does.
         ///
         /// Any number of coroutines may wait on the same future; all of them return once it
@@ -2102,7 +2112,9 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
 
         /// Waits for the child to close and returns its result. On `error.ChildWorkflowFailed`
         /// (the child failed, timed out, was terminated or canceled, or never started), read
-        /// the failure with `failure`. If the calling coroutine is canceled while waiting (the
+        /// the failure with `failure`; a start refused for its ID or its versioning override
+        /// returns `error.ChildWorkflowAlreadyStarted` or
+        /// `error.ChildWorkflowInvalidVersioningOverride` as `started` does. If the calling coroutine is canceled while waiting (the
         /// workflow is canceled, or an enclosing future, `Select`, or `Group` is), the child's
         /// cancellation is requested and this returns `error.Canceled`: at once for
         /// `try_cancel` and `abandon`, once the server has recorded the request for
@@ -2129,7 +2141,11 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
 
         fn fail(f: Self, state: *const Instance.ChildState) ChildWorkflowError {
             f.ctx.instance.setLastFailure(f.failure());
-            return if (state.already_started) error.ChildWorkflowAlreadyStarted else error.ChildWorkflowFailed;
+            return switch (state.start_refusal) {
+                .none => error.ChildWorkflowFailed,
+                .already_started => error.ChildWorkflowAlreadyStarted,
+                .invalid_versioning_override => error.ChildWorkflowInvalidVersioningOverride,
+            };
         }
 
         /// The converter context of the child's result, failure and signals: the namespace,
@@ -2141,8 +2157,8 @@ pub fn ChildWorkflowFuture(comptime T: type) type {
             return &state.context;
         }
 
-        /// The child's failure, after `get` or `started` returned `error.ChildWorkflowFailed` or
-        /// `error.ChildWorkflowAlreadyStarted`.
+        /// The child's failure, after `get` or `started` returned `error.ChildWorkflowFailed`,
+        /// `error.ChildWorkflowAlreadyStarted` or `error.ChildWorkflowInvalidVersioningOverride`.
         pub fn failure(f: Self) ?*const failure_mod.Failure {
             const state = f.state catch return null;
             const outcome = state.outcome orelse return null;

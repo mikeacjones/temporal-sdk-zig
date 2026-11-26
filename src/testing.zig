@@ -4097,6 +4097,36 @@ const VersionFixtures = struct {
     }
     const ContinueUpgrade = workflow.DefWithOptions("ContinueUpgrade", continueUpgrade, .{ .versioning_behavior = .pinned });
 
+    /// Starts `WhoRuns` as a child with `override` and returns "<its own build ID>:<the
+    /// child's result>".
+    fn overrideParent(ctx: *workflow.Context, override: ?deployment_mod.VersioningOverride) ![]const u8 {
+        const on = if (ctx.currentDeploymentVersion()) |v| v.build_id else "none";
+        const child = try ctx.executeChildWorkflow(WhoRuns, .{ .versioning_override = override }, .{}).get();
+        return std.fmt.allocPrint(ctx.allocator(), "{s}:{s}", .{ on, child });
+    }
+    const OverrideParent = workflow.DefWithOptions("OverrideParent", overrideParent, .{ .versioning_behavior = .pinned });
+
+    /// Returns `error.SkipZigTest`, logging why, when the server `c` is connected to is older
+    /// than `minimum` (such as "1.32.0") or reports a version that doesn't parse. A
+    /// pre-release or build suffix is ignored: a "1.32.0-rc" server counts as 1.32.0.
+    /// `what` names the feature that needs it.
+    fn skipBeforeServer(c: *client_mod.Client, comptime minimum: []const u8, what: []const u8) !void {
+        const want = comptime std.SemanticVersion.parse(minimum) catch unreachable;
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const info = try c.callService(.workflow, "GetSystemInfo", arena.allocator(), .{}, null);
+        const server_version = info.server_version;
+        const have = std.SemanticVersion.parse(server_version) catch {
+            std.log.warn("skipping: {s} needs Temporal Server {s} or later, and the server reports a version that doesn't parse (\"{s}\")", .{ what, minimum, server_version });
+            return error.SkipZigTest;
+        };
+        const core: std.SemanticVersion = .{ .major = have.major, .minor = have.minor, .patch = have.patch };
+        if (core.order(want) == .lt) {
+            std.log.warn("skipping: {s} needs Temporal Server {s} or later, and the server is {s}", .{ what, minimum, server_version });
+            return error.SkipZigTest;
+        }
+    }
+
     /// Starts a worker of version `build_id` of the "rollout" deployment on `task_queue`.
     const VersionWorker = struct {
         w: worker_mod.Worker,
@@ -4273,6 +4303,87 @@ test "worker deployment: a pinned run that continues as new with auto_upgrade ru
     try env.registerWorkflow(VersionFixtures.ContinueUpgrade);
     try env.replayRun(upgrading.id, first_upgrading_run);
     try env.replayRun(staying.id, first_staying_run);
+}
+
+test "worker deployment: a child started with a pinned override runs on that version while its parent runs on another" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    const c = &env.client;
+    try VersionFixtures.skipBeforeServer(c, "1.32.0", "a versioning override on a child workflow");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const task_queue = "child-override";
+    var rollout = try c.workerDeployment("rollout");
+    defer rollout.deinit();
+
+    var v1: VersionFixtures.VersionWorker = undefined;
+    try v1.startWith(c, task_queue, "v1", .{ VersionFixtures.OverrideParent, VersionFixtures.WhoRuns });
+    defer v1.stop();
+    var v2: VersionFixtures.VersionWorker = undefined;
+    try v2.startWith(c, task_queue, "v2", .{ VersionFixtures.OverrideParent, VersionFixtures.WhoRuns });
+    defer v2.stop();
+    try VersionFixtures.awaitVersion(&rollout, "v1");
+    try VersionFixtures.awaitVersion(&rollout, "v2");
+    try VersionFixtures.awaitPolled(&rollout, "v1", task_queue);
+    try VersionFixtures.awaitPolled(&rollout, "v2", task_queue);
+    _ = try rollout.setCurrentVersion(a, "v2", .{});
+    try VersionFixtures.awaitRouting(&rollout);
+    try VersionFixtures.awaitPinnable(c, .{ .deployment_name = "rollout", .build_id = "v1" }, task_queue);
+
+    const v1_version: deployment_mod.Version = .{ .deployment_name = "rollout", .build_id = "v1" };
+    var run = try c.executeWorkflow(VersionFixtures.OverrideParent, .{ .task_queue = task_queue }, .{@as(?deployment_mod.VersioningOverride, .{ .pinned = v1_version })});
+    defer run.deinit();
+    try testing.expectEqualStrings("v2:rollout.v1", try run.get(a));
+    // Without an override the child follows its own definition: pinned, it starts on the
+    // current version.
+    var plain = try c.executeWorkflow(VersionFixtures.OverrideParent, .{ .task_queue = task_queue }, .{@as(?deployment_mod.VersioningOverride, null)});
+    defer plain.deinit();
+    try testing.expectEqualStrings("v2:rollout.v2", try plain.get(a));
+
+    try env.registerWorkflow(VersionFixtures.OverrideParent);
+    try env.replayRun(run.id, run.run_id);
+    try env.replayRun(plain.id, plain.run_id);
+}
+
+test "worker deployment: a client start with a one-time override runs its first workflow task on the named version" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    const c = &env.client;
+    try VersionFixtures.skipBeforeServer(c, "1.32.0", "a one-time versioning override");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const task_queue = "one-time-override";
+    var rollout = try c.workerDeployment("rollout");
+    defer rollout.deinit();
+
+    var v1: VersionFixtures.VersionWorker = undefined;
+    try v1.startWith(c, task_queue, "v1", .{VersionFixtures.WhoRuns});
+    defer v1.stop();
+    var v2: VersionFixtures.VersionWorker = undefined;
+    try v2.startWith(c, task_queue, "v2", .{VersionFixtures.WhoRuns});
+    defer v2.stop();
+    try VersionFixtures.awaitVersion(&rollout, "v1");
+    try VersionFixtures.awaitVersion(&rollout, "v2");
+    try VersionFixtures.awaitPolled(&rollout, "v1", task_queue);
+    try VersionFixtures.awaitPolled(&rollout, "v2", task_queue);
+    _ = try rollout.setCurrentVersion(a, "v2", .{});
+    try VersionFixtures.awaitRouting(&rollout);
+    try VersionFixtures.awaitPinnable(c, .{ .deployment_name = "rollout", .build_id = "v1" }, task_queue);
+
+    var run = try c.executeWorkflow(VersionFixtures.WhoRuns, .{
+        .task_queue = task_queue,
+        .versioning_override = .{ .one_time = .{ .deployment_name = "rollout", .build_id = "v1" } },
+    }, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("rollout.v1", try run.get(a));
+    const event = try StartOptionFixtures.startedEvent(c, a, run.id, run.run_id);
+    const sent = event.attributes.?.workflow_execution_started_event_attributes.versioning_override orelse return error.TestExpectedOverride;
+    const target = (sent.override orelse return error.TestExpectedOverride).one_time.target_deployment_version.?;
+    try testing.expectEqualStrings("rollout", target.deployment_name);
+    try testing.expectEqualStrings("v1", target.build_id);
+    try testing.expectEqualDeep(@as(?deployment_mod.VersioningOverride, .{ .one_time = .{ .deployment_name = "rollout", .build_id = "v1" } }), deployment_mod.VersioningOverride.fromProto(sent));
 }
 
 test "worker deployment: a pinned run stays on its version across a rollout, an auto-upgrade run moves" {
@@ -5985,7 +6096,7 @@ test "client: reset, terminate and execution options take the interceptor chain'
         .override = .{ .one_time = .{ .target_deployment_version = .{ .deployment_name = "rollout", .build_id = "v1" } } },
     } } };
     const one_time = try c.updateWorkflowExecutionOptions(a, "chain-options", "", .{ .versioning_override = .remove });
-    try testing.expect(one_time.versioning_override == null);
+    try testing.expectEqualDeep(@as(?deployment_mod.VersioningOverride, .{ .one_time = .{ .deployment_name = "rollout", .build_id = "v1" } }), one_time.versioning_override);
     const raw_override = (one_time.raw.workflow_execution_options orelse return error.TestUnexpectedResult).versioning_override orelse return error.TestUnexpectedResult;
     try testing.expect((raw_override.override orelse return error.TestUnexpectedResult) == .one_time);
     capture.options_answer = .{};

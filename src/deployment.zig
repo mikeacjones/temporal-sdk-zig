@@ -37,7 +37,11 @@ pub const Version = struct {
     }
 };
 
-/// Overrides the versioning behavior a workflow's definition declares, for one execution.
+/// Overrides the versioning behavior a workflow's definition declares, for one execution:
+/// pinned to a version, auto-upgrading, or routed once to a version. A client sets one on a
+/// start (`client.StartWorkflowOptions.versioning_override`) or on a running workflow
+/// (`client.Client.updateWorkflowExecutionOptions`), and a workflow on a child it starts
+/// (`workflow.ChildWorkflowOptions.versioning_override`).
 pub const VersioningOverride = union(enum) {
     /// Keeps the workflow on this version until the override is removed. The version need not
     /// be current or ramping.
@@ -45,17 +49,39 @@ pub const VersioningOverride = union(enum) {
     /// Moves the workflow to its deployment's current (or ramping) version at its next
     /// workflow task, like an auto-upgrade workflow.
     auto_upgrade,
+    /// Experimental: routes the workflow to this version until one workflow task completes
+    /// there. The server then clears the override and the workflow follows the versioning
+    /// behavior that worker reported. The version need not be current or ramping. Needs
+    /// Temporal Server 1.32.0 or later.
+    one_time: Version,
 
     /// The override a server message reports, or null for none and for a kind this SDK has no
     /// case for. Reads only the `override` oneof, never the deprecated fields beside it;
-    /// borrows `o`'s slices.
+    /// borrows `o`'s slices. A pinned or one-time override whose version has no build ID
+    /// reports null.
     pub fn fromProto(o: ?proto.temporal.api.workflow.v1.VersioningOverride) ?VersioningOverride {
         const override = (o orelse return null).override orelse return null;
         return switch (override) {
             .pinned => |p| .{ .pinned = Version.fromProto(p.version) orelse return null },
             .auto_upgrade => |on| if (on) .auto_upgrade else null,
-            .one_time => null,
+            .one_time => |t| .{ .one_time = Version.fromProto(t.target_deployment_version) orelse return null },
         };
+    }
+
+    /// The override as the server's requests and the start-child command carry it. Sets only
+    /// the `override` oneof, never the deprecated fields beside it; borrows `o`'s slices and
+    /// allocates nothing.
+    pub fn toProto(o: VersioningOverride) proto.temporal.api.workflow.v1.VersioningOverride {
+        return .{ .override = switch (o) {
+            .pinned => |v| .{ .pinned = .{
+                .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED,
+                .version = .{ .deployment_name = v.deployment_name, .build_id = v.build_id },
+            } },
+            .auto_upgrade => .{ .auto_upgrade = true },
+            .one_time => |v| .{ .one_time = .{
+                .target_deployment_version = .{ .deployment_name = v.deployment_name, .build_id = v.build_id },
+            } },
+        } };
     }
 };
 
@@ -331,7 +357,26 @@ test "versioning overrides map from the server's message; kinds with no case map
         .{ .from = .{ .override = .{ .pinned = .{ .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED, .version = .{ .deployment_name = "rollout" } } } }, .want = null },
         // A pin behavior this SDK doesn't know still pins.
         .{ .from = .{ .override = .{ .pinned = .{ .behavior = @fromBackingInt(7), .version = v1 } } }, .want = pinned_v1 },
-        .{ .from = .{ .override = .{ .one_time = .{ .target_deployment_version = v1 } } }, .want = null },
+        .{ .from = .{ .override = .{ .one_time = .{ .target_deployment_version = v1 } } }, .want = .{ .one_time = .{ .deployment_name = "rollout", .build_id = "v1" } } },
+        .{ .from = .{ .behavior = .VERSIONING_BEHAVIOR_PINNED, .override = .{ .one_time = .{ .target_deployment_version = v1 } } }, .want = .{ .one_time = .{ .deployment_name = "rollout", .build_id = "v1" } } },
+        // A one-time override without a version or a build ID.
+        .{ .from = .{ .override = .{ .one_time = .{} } }, .want = null },
+        .{ .from = .{ .override = .{ .one_time = .{ .target_deployment_version = .{ .deployment_name = "rollout" } } } }, .want = null },
     };
     for (cases) |case| try std.testing.expectEqualDeep(case.want, VersioningOverride.fromProto(case.from));
+}
+
+test "versioning overrides survive a round trip through the server's message, which carries only the oneof" {
+    const v: Version = .{ .deployment_name = "rollout", .build_id = "v1" };
+    const cases = [_]VersioningOverride{ .{ .pinned = v }, .auto_upgrade, .{ .one_time = v }, .{ .one_time = .{ .deployment_name = "", .build_id = "b" } } };
+    for (cases) |o| {
+        const p = o.toProto();
+        try std.testing.expectEqual(proto.temporal.api.enums.v1.VersioningBehavior.VERSIONING_BEHAVIOR_UNSPECIFIED, p.behavior);
+        try std.testing.expectEqual(@as(?pb.Deployment, null), p.deployment);
+        try std.testing.expectEqualStrings("", p.pinned_version);
+        try std.testing.expectEqualDeep(@as(?VersioningOverride, o), VersioningOverride.fromProto(p));
+    }
+    const one_time = (VersioningOverride{ .one_time = v }).toProto().override.?.one_time.target_deployment_version.?;
+    try std.testing.expectEqualStrings("rollout", one_time.deployment_name);
+    try std.testing.expectEqualStrings("v1", one_time.build_id);
 }

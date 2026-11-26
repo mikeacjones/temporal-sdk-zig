@@ -1672,7 +1672,7 @@ pub const Client = struct {
             .summary = if (options.static_summary.len > 0) try converter.toPayload(a, options.static_summary) else null,
             .details = if (options.static_details.len > 0) try converter.toPayload(a, options.static_details) else null,
         };
-        if (options.versioning_override) |o| request.versioning_override = versioningOverrideProto(o);
+        if (options.versioning_override) |o| request.versioning_override = o.toProto();
         if (options.priority) |p| request.priority = .{ .priority_key = p.priority_key, .fairness_key = p.fairness_key, .fairness_weight = p.fairness_weight };
         return request;
     }
@@ -3559,7 +3559,8 @@ pub const StartWorkflowOptions = struct {
     /// payload (through the codecs); empty sends none.
     static_details: []const u8 = "",
     /// Runs the workflow with a versioning behavior other than its definition's: pinned to a
-    /// worker deployment version, or auto-upgrading. Null keeps the definition's.
+    /// worker deployment version, auto-upgrading, or (experimental) routed to a version until
+    /// its first workflow task completes there, with `.one_time`. Null keeps the definition's.
     versioning_override: ?deployment.VersioningOverride = null,
     /// The workflow's task priority and fairness. Null uses the server's defaults.
     priority: ?workflow.Priority = null,
@@ -4285,7 +4286,8 @@ pub const WorkflowExecutionOptionsChanges = struct {
 pub const VersioningOverrideChange = union(enum) {
     /// Replaces the workflow's versioning override, if any, with this one. A pin needs a
     /// worker of that version to have polled the workflow's task queue; auto-upgrade needs
-    /// none.
+    /// none. A one-time override (experimental) routes the workflow's next workflow task to
+    /// its version, after which the server clears it.
     set: deployment.VersioningOverride,
     /// Clears the override: the workflow's definition decides its behavior again.
     remove,
@@ -4294,6 +4296,7 @@ pub const VersioningOverrideChange = union(enum) {
 /// A workflow run's execution options, as `Client.updateWorkflowExecutionOptions` returns
 /// them. Every slice borrows the arena passed to the call.
 pub const WorkflowExecutionOptions = struct {
+    /// The run's override: pinned, auto-upgrade, or one-time while that is still pending.
     /// Null when the run has no override, or one of a kind this SDK has no case for (read
     /// it from `raw`).
     versioning_override: ?deployment.VersioningOverride,
@@ -4377,17 +4380,6 @@ pub const WorkflowExecutionInfo = struct {
     }
 };
 
-/// The override as the server's requests carry it; borrows `o`'s slices.
-fn versioningOverrideProto(o: deployment.VersioningOverride) proto.temporal.api.workflow.v1.VersioningOverride {
-    return .{ .override = switch (o) {
-        .pinned => |v| .{ .pinned = .{
-            .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED,
-            .version = .{ .deployment_name = v.deployment_name, .build_id = v.build_id },
-        } },
-        .auto_upgrade => .{ .auto_upgrade = true },
-    } };
-}
-
 /// The execution options and update mask that apply `changes`, as the server's update and
 /// post-reset requests carry them; borrows `changes`' slices, and the mask's list is
 /// allocated from `arena`. The options are always present: the server requires them even
@@ -4397,7 +4389,7 @@ fn executionOptionsProto(arena: Allocator, changes: WorkflowExecutionOptionsChan
     var mask: proto.google.protobuf.FieldMask = .{};
     if (changes.versioning_override) |change| {
         options.versioning_override = switch (change) {
-            .set => |o| versioningOverrideProto(o),
+            .set => |o| o.toProto(),
             .remove => null,
         };
         try mask.paths.append(arena, "versioning_override");
