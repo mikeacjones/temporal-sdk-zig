@@ -33,7 +33,7 @@ pub const Logging = struct {
 
 /// A core log callback with its context. `func` runs on the core's threads, possibly several
 /// at once; `ctx` must stay valid until `Runtime.deinit` returns, which waits for calls in
-/// progress to finish.
+/// progress to finish. `func` runs with SIGPIPE blocked (see `init`).
 pub const Forward = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, record: *const LogRecord) void,
@@ -188,6 +188,13 @@ pub const InitError = error{
 /// message, allocated with `gpa`; the caller frees it. On `error.InvalidOptions` from a histogram
 /// bucket override, `failure` (if given) receives a message naming the metric, allocated with
 /// `gpa`.
+///
+/// Outside Windows, the core's threads run with SIGPIPE blocked, so a write by sdk-core to a
+/// connection its peer has closed fails with EPIPE instead of raising SIGPIPE, whose default
+/// action ends the process. The process's SIGPIPE disposition is not changed, and the calling
+/// thread's signal mask is the same when `init` returns as before. Code the core runs on its
+/// threads, such as a `Forward.func` or a custom metric meter's callbacks, runs with SIGPIPE
+/// blocked.
 pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtime {
     var custom_meter: ?*const c.TemporalCoreCustomMetricMeter = if (options.metrics) |m| switch (m.exporter) {
         .custom => |meter| meter,
@@ -277,7 +284,28 @@ pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtim
 
     // From here the core owns the custom meter, on failure too.
     custom_meter = null;
+    // sdk-core writes sockets with plain `writev`, which raises SIGPIPE when the peer has
+    // closed, and a process that doesn't ignore or handle SIGPIPE then dies (Linux; on macOS
+    // the core's sockets set SO_NOSIGPIPE). The process's disposition isn't the SDK's to
+    // change, so SIGPIPE is blocked on this thread while the core creates its runtime, and
+    // the core's threads inherit that mask, which makes such a write fail with EPIPE:
+    // - tokio's multi-thread runtime starts its worker threads in `build()`, here, from this
+    //   thread (tokio's worker.rs `launch`, through blocking/pool.rs `spawn_thread`), and the
+    //   C bridge builds it inside this call with no thread-start hook;
+    // - later blocking-pool threads are started by tasks already on those threads (the bridge
+    //   has no `block_on`, the core no `block_in_place`), so they inherit it too.
+    // Processes the core spawns (the dev and test servers) inherit it as well: Rust's
+    // `Command` resets the disposition but keeps the mask, and those servers handle EPIPE.
+    // The previous mask, not an unblock, is restored, so a caller that had SIGPIPE blocked
+    // keeps it blocked.
+    var previous: std.posix.sigset_t = undefined;
+    if (builtin.os.tag != .windows) {
+        var pipe = std.posix.sigemptyset();
+        std.posix.sigaddset(&pipe, .PIPE);
+        threadSigmask(std.posix.SIG.BLOCK, &pipe, &previous);
+    }
     const result = c.temporal_core_runtime_new(&core_options);
+    if (builtin.os.tag != .windows) threadSigmask(std.posix.SIG.SETMASK, &previous, null);
     const ptr = result.runtime orelse return error.RuntimeInitFailed;
     if (bytes.Owned.take(ptr, result.fail)) |fail| {
         // The core returns a runtime even on failure; it may only be used to free the message.
@@ -287,6 +315,16 @@ pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtim
         return error.RuntimeInitFailed;
     }
     return .{ .ptr = ptr, .forward_slot = forward_slot };
+}
+
+/// Changes this thread's signal mask only. On macOS, sigprocmask changes every thread's mask.
+fn threadSigmask(how: c_int, set: *const std.posix.sigset_t, old: ?*std.posix.sigset_t) void {
+    if (builtin.link_libc) {
+        var ignored: std.posix.sigset_t = undefined;
+        _ = std.c.pthread_sigmask(how, set, old orelse &ignored);
+    } else {
+        std.posix.sigprocmask(@intCast(how), set, old);
+    }
 }
 
 /// A core object sdk-core built holding a clone of a runtime.
@@ -625,5 +663,96 @@ test "release keeps a forwarding runtime's core objects until deinit, and frees 
             try testing.expectEqual(null, rt.forward_slot);
             rt.deinit();
         }
+    }
+}
+
+/// The test thread's signal mask, read without changing it.
+fn currentSigmask() std.posix.sigset_t {
+    var empty = std.posix.sigemptyset();
+    var mask: std.posix.sigset_t = undefined;
+    threadSigmask(std.posix.SIG.BLOCK, &empty, &mask);
+    return mask;
+}
+
+/// On its first call from a thread other than the test's, writes to a pipe whose reader has
+/// closed and records the errno.
+const ClosedPipeWrite = struct {
+    test_thread: std.Thread.Id,
+    taken: std.atomic.Value(bool) = .init(false),
+    /// The write's errno, or `unset` until it has run.
+    errno: std.atomic.Value(u16) = .init(unset),
+    /// Whether SIGPIPE was blocked on the thread that wrote.
+    blocked: std.atomic.Value(bool) = .init(false),
+
+    const unset = std.math.maxInt(u16);
+
+    fn func(ctx: *anyopaque, _: *const LogRecord) void {
+        const w: *ClosedPipeWrite = @ptrCast(@alignCast(ctx));
+        if (std.Thread.getCurrentId() == w.test_thread) return;
+        if (w.taken.swap(true, .seq_cst)) return;
+        const mask = currentSigmask();
+        w.blocked.store(std.posix.sigismember(&mask, .PIPE), .seq_cst);
+        var fds: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) {
+            w.errno.store(@backingInt(std.posix.errno(-1)), .seq_cst);
+            return;
+        }
+        _ = std.c.close(fds[0]);
+        const rc = std.c.write(fds[1], "x", 1);
+        const e: std.posix.E = if (rc < 0) std.posix.errno(rc) else .SUCCESS;
+        _ = std.c.close(fds[1]);
+        w.errno.store(@backingInt(e), .seq_cst);
+    }
+};
+
+test "a write on a core thread to a pipe whose reader has closed fails with EPIPE" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var w: ClosedPipeWrite = .{ .test_thread = std.Thread.getCurrentId() };
+    const before = currentSigmask();
+    const rt = try Runtime.init(testing.allocator, .{
+        .logging = .{ .filter = "hyper_util=TRACE", .forward = .{ .ctx = &w, .func = ClosedPipeWrite.func } },
+        .worker_heartbeat_interval_ms = 0,
+    }, null);
+    defer rt.deinit();
+    const after = currentSigmask();
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&before), std.mem.asBytes(&after));
+
+    // hyper_util logs on a core thread while it connects, and the core completes the connect
+    // only after that, so the write has run once `connect` returns. Nothing listens on port 1.
+    const Connection = @import("Connection.zig");
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    try testing.expectError(error.ConnectFailed, Connection.connect(testing.allocator, testing.io, rt, .{
+        .target_url = "http://127.0.0.1:1",
+        .identity = "sigpipe-test",
+    }, &failure));
+    try testing.expectEqual(@backingInt(std.posix.E.PIPE), w.errno.load(.seq_cst));
+    // While a test runs, the runner's `Io.Threaded` handles SIGPIPE with a handler that does
+    // nothing, so an unblocked SIGPIPE wouldn't end this process; what ends one is the
+    // default action, which the runner restores after each test while the core's threads may
+    // still write. The mask is what keeps the signal from them either way.
+    try testing.expect(w.blocked.load(.seq_cst));
+}
+
+test "Runtime.init leaves the calling thread's signal mask as it found it, on success and on failure" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // Once with SIGPIPE unblocked on this thread, once with it blocked.
+    var pipe = std.posix.sigemptyset();
+    std.posix.sigaddset(&pipe, .PIPE);
+    var entry: std.posix.sigset_t = undefined;
+    threadSigmask(std.posix.SIG.UNBLOCK, &pipe, &entry);
+    defer threadSigmask(std.posix.SIG.SETMASK, &entry, null);
+    for ([_]bool{ false, true }) |blocked| {
+        if (blocked) threadSigmask(std.posix.SIG.BLOCK, &pipe, null);
+        const before = currentSigmask();
+        const rt = try Runtime.init(testing.allocator, .{ .worker_heartbeat_interval_ms = 0 }, null);
+        rt.deinit();
+        var after = currentSigmask();
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&before), std.mem.asBytes(&after));
+        try testing.expectError(error.RuntimeInitFailed, Runtime.init(testing.allocator, .{
+            .metrics = .{ .exporter = .{ .prometheus = .{ .bind_address = "not an address" } } },
+        }, null));
+        after = currentSigmask();
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&before), std.mem.asBytes(&after));
     }
 }
