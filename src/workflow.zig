@@ -294,6 +294,7 @@ const search_attributes = @import("search_attributes.zig");
 const metrics_mod = @import("metrics.zig");
 const deployment = @import("deployment.zig");
 const nexus = @import("nexus.zig");
+const call_check = @import("nexus/call_check.zig");
 const system_nexus = @import("nexus/system.zig");
 const Instance = @import("workflow/Instance.zig");
 const WorkflowIo = @import("workflow/WorkflowIo.zig");
@@ -1384,7 +1385,7 @@ pub const Context = struct {
     /// a compile error at the call. The call passes through the workflow's outbound interceptors
     /// (`interceptor.WorkflowOutbound.executeNexusOperation`).
     pub fn executeNexusOperation(ctx: *Context, comptime Service: type, comptime Operation: type, options: NexusOperationOptions, input: Operation.Input) NexusOperationFuture(Operation.Output) {
-        if (comptime nexusCallError(Service, Operation)) |message| @compileError(message);
+        if (comptime call_check.callError("executeNexusOperation", Service, Operation)) |message| @compileError(message);
         return .{ .ctx = ctx, .state = ctx.instance.executeNexusOperation(Service.service_name, Operation.operation_name, options, input).state };
     }
 
@@ -2298,23 +2299,6 @@ pub fn NexusOperationFuture(comptime T: type) type {
             if (f.state) |s| f.ctx.instance.cancelNexusOperation(s) else |_| {}
         }
     };
-}
-
-/// Why `Operation` can't be called on `Service` with `Context.executeNexusOperation`, as the
-/// compile error reports, or null if it can.
-fn nexusCallError(comptime Service: type, comptime Operation: type) ?[]const u8 {
-    const is_service = @typeInfo(Service) == .@"struct" and @hasDecl(Service, "service_name") and @hasDecl(Service, "operation_defs");
-    if (!is_service) return "executeNexusOperation: Service must be a nexus.ServiceDef, not " ++ @typeName(Service);
-    const what = "executeNexusOperation on nexus service \"" ++ Service.service_name ++ "\"";
-    const is_operation = @typeInfo(Operation) == .@"struct" and @hasDecl(Operation, "operation_name") and @hasDecl(Operation, "Input") and @hasDecl(Operation, "Output");
-    if (!is_operation) return what ++ ": Operation must be a nexus.OperationDef, not " ++ @typeName(Operation);
-    if (Service.hasOperation(Operation)) return null;
-    const name = Operation.operation_name;
-    if (Service.operationNamed(name)) |D| return what ++ ": its operation \"" ++ name ++ "\" takes " ++ @typeName(D.Input) ++ " and returns " ++ @typeName(D.Output) ++
-        ", not " ++ @typeName(Operation.Input) ++ " and " ++ @typeName(Operation.Output) ++ "; call it with the service's own OperationDef";
-    var names: []const u8 = "";
-    for (Service.operation_defs, 0..) |D, i| names = names ++ (if (i > 0) ", " else "") ++ "\"" ++ D.operation_name ++ "\"";
-    return what ++ ": the service has no operation \"" ++ name ++ "\"; its operations are " ++ names;
 }
 
 /// `ExternalWorkflowNotFound`: the target workflow (or its namespace) doesn't exist, or it has
@@ -3616,22 +3600,22 @@ test "executeNexusOperation's compile errors name the service and the operation"
     const Service = nexus.ServiceDef("hello-service", .{ Echo, Ping });
     const T = StructDefTests;
 
-    try std.testing.expect(comptime nexusCallError(Service, Echo) == null);
-    try std.testing.expect(comptime nexusCallError(Service, Ping) == null);
+    try std.testing.expect(comptime call_check.callError("executeNexusOperation", Service, Echo) == null);
+    try std.testing.expect(comptime call_check.callError("executeNexusOperation", Service, Ping) == null);
     // An equal definition elsewhere is the same operation.
-    try std.testing.expect(comptime nexusCallError(Service, nexus.OperationDef("echo", In, []const u8)) == null);
+    try std.testing.expect(comptime call_check.callError("executeNexusOperation", Service, nexus.OperationDef("echo", In, []const u8)) == null);
 
-    try T.expectMessage(comptime nexusCallError(Service, nexus.OperationDef("shout", In, []const u8)), &.{
+    try T.expectMessage(comptime call_check.callError("executeNexusOperation", Service, nexus.OperationDef("shout", In, []const u8)), &.{
         "executeNexusOperation on nexus service \"hello-service\"",
         "has no operation \"shout\"",
         "its operations are \"echo\", \"ping\"",
     });
-    try T.expectMessage(comptime nexusCallError(Service, nexus.OperationDef("echo", u32, []const u8)), &.{
+    try T.expectMessage(comptime call_check.callError("executeNexusOperation", Service, nexus.OperationDef("echo", u32, []const u8)), &.{
         "nexus service \"hello-service\"",
         "its operation \"echo\" takes",
         "and returns []const u8, not u32 and []const u8",
         "call it with the service's own OperationDef",
     });
-    try T.expectMessage(comptime nexusCallError(u8, Echo), &.{"Service must be a nexus.ServiceDef, not u8"});
-    try T.expectMessage(comptime nexusCallError(Service, In), &.{ "nexus service \"hello-service\"", "Operation must be a nexus.OperationDef" });
+    try T.expectMessage(comptime call_check.callError("executeNexusOperation", u8, Echo), &.{"Service must be a nexus.ServiceDef, not u8"});
+    try T.expectMessage(comptime call_check.callError("executeNexusOperation", Service, In), &.{ "nexus service \"hello-service\"", "Operation must be a nexus.OperationDef" });
 }
