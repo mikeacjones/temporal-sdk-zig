@@ -135,6 +135,20 @@ child_codecs: std.AutoHashMapUnmanaged(u32, *const ChildState) = .empty,
 externals: std.AutoHashMapUnmanaged(u32, *ExternalState) = .empty,
 /// Nexus operations the core has not resolved, by seq.
 nexus_operations: std.AutoHashMapUnmanaged(u32, *NexusOperationState) = .empty,
+/// The Nexus operations whose payloads the worker's codecs code with the operation's own
+/// context (`nexusCodecContext`), by seq: each from its schedule command for the rest of the
+/// run. Unlike `child_codecs`, no resolution ends an entry: the core resolves an operation
+/// canceled before it started (`abandon`, `try_cancel`) at once, and still delivers its
+/// start and its result, with the handler's payloads, if it ends later. Seqs are never
+/// reused, and the states are arena memory. Operations on the system endpoint are not listed.
+nexus_codecs: std.AutoHashMapUnmanaged(u32, *const NexusOperationState) = .empty,
+/// For a run a Nexus handler started, whose start carries the caller's propagated context:
+/// the context its result and failure are converted and coded with (`resultCodecContext`).
+/// Null otherwise. Arena memory.
+result_context: ?*const converter.Context = null,
+/// For each `update_response` among `commands` that is coded with an update's own context,
+/// that context (`updateResponseCodecContext`). Cleared with `commands`. Arena memory.
+update_response_contexts: std.ArrayList(UpdateResponseContext) = .empty,
 /// Local activities waiting on a workflow timer before their next attempt, by timer seq.
 backoffs: std.AutoHashMapUnmanaged(u32, *ActivityState) = .empty,
 /// Coroutines blocked in `awaitCondition`, in the order they started waiting.
@@ -428,6 +442,14 @@ const Update = struct {
     args: []const converter.Payload,
     header: converter.Header,
     run_validator: bool,
+    /// The context of the update's responses (its result and rejections) when the update's
+    /// task carries a propagated Nexus context; null converts them with the run's.
+    result_context: ?*const converter.Context = null,
+
+    /// The context of the update's result and rejections.
+    fn responseContext(u: *const Update, inst: *const Instance) *const converter.Context {
+        return u.result_context orelse &inst.converter_context;
+    }
 
     fn input(u: *const Update, context: *const converter.Context) interceptor.UpdateInput {
         return .{ .update_name = u.name, .update_id = u.id, .args = .{ .payloads = u.args, .context = context }, .header = u.header };
@@ -436,7 +458,10 @@ const Update = struct {
 
 /// An update rejection `fillUpdateTraces` finishes: `addresses` is its stack trace (empty for
 /// none), and `err` the handler's error, for the failure converter.
-const UpdateTrace = struct { protocol_instance_id: []const u8, addresses: []const usize, err: anyerror };
+const UpdateTrace = struct { protocol_instance_id: []const u8, addresses: []const usize, err: anyerror, context: *const converter.Context };
+
+/// The context an emitted `update_response` is coded with, when not the run's.
+const UpdateResponseContext = struct { protocol_instance_id: []const u8, context: *const converter.Context };
 
 /// A running signal or update handler coroutine. Arena memory.
 const HandlerRun = struct {
@@ -611,6 +636,9 @@ pub const NexusOperationState = struct {
     service: []const u8,
     operation: []const u8,
     cancellation_type: workflow.NexusOperationCancellationType,
+    /// The context of the operation's input, result and failures: `Instance.nexusContext` of
+    /// its names. Arena memory.
+    context: converter.Context = .{},
     /// The coroutines blocked in `started` and in `get`.
     start_waiters: FutureWaiters = .{},
     result_waiters: FutureWaiters = .{},
@@ -775,6 +803,7 @@ pub fn teardown(inst: *Instance) usize {
     inst.log_silenced = true;
     inst.commands.clearRetainingCapacity();
     inst.command_codec_fields.clearRetainingCapacity();
+    inst.update_response_contexts.clearRetainingCapacity();
     // The root and handler coroutines may still be blocked even after the workflow finished
     // (a handler's error finishes it, and handlers outlive the root).
     if (inst.root) |root| inst.wio.cancelTask(root);
@@ -938,6 +967,7 @@ pub fn activate(inst: *Instance, act: *const act_pb.WorkflowActivation, out: All
     inst.log_silenced = act.is_replaying or inst.evicting;
     inst.commands.clearRetainingCapacity();
     inst.command_codec_fields.clearRetainingCapacity();
+    inst.update_response_contexts.clearRetainingCapacity();
     inst.task_failure = null;
     inst.task_failure_type = "UnsupportedJob";
     inst.accepted_update = false;
@@ -1655,7 +1685,8 @@ pub fn setUpdateHandler(inst: *Instance, name: []const u8, handler: UpdateHandle
 fn deliverUpdate(inst: *Instance, job: *const act_pb.DoUpdate) !void {
     const a = inst.arena();
     const protocol_instance_id = try a.dupe(u8, job.protocol_instance_id);
-    if (inst.finished) return inst.respondToUpdate(protocol_instance_id, .{ .rejected = try failure_mod.application(a, .{
+    const result_context = if (job.propagated_nexus_serialization_context) |n| try inst.propagatedContext(n) else null;
+    if (inst.finished) return inst.respondToUpdate(protocol_instance_id, result_context, .{ .rejected = try failure_mod.application(a, .{
         .message = try std.fmt.allocPrint(a, "update \"{s}\" arrived after workflow \"{s}\" finished", .{ job.name, inst.info.workflow_type }),
         .type = "WorkflowFinished",
     }) });
@@ -1669,6 +1700,7 @@ fn deliverUpdate(inst: *Instance, job: *const act_pb.DoUpdate) !void {
         .args = args,
         .header = try .fromEntries(a, job.headers.items),
         .run_validator = job.run_validator,
+        .result_context = result_context,
     };
     if (inst.update_handlers.get(update.name)) |handler| return inst.startUpdate(handler, update);
     if (inst.dynamic_update_handler) |handler| return inst.startUpdate(handler, update);
@@ -1701,13 +1733,13 @@ fn startUpdate(inst: *Instance, handler: UpdateHandler, update: *const Update) e
         inst.wio.beginReadOnly(&section.io);
         const result = inst.inboundNext().validateUpdate(update.input(&inst.converter_context));
         inst.wio.endReadOnly(&section.io);
-        if (section.io.refused) |call| return inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try readOnlyFailure(a, "update validator", update.name, call) });
+        if (section.io.refused) |call| return inst.respondToUpdate(update.protocol_instance_id, update.result_context, .{ .rejected = try readOnlyFailure(a, "update validator", update.name, call) });
         result catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try inst.sendFailure(a, &inst.converter_context, err, try section.failureOf(a, err)) }),
+            else => return inst.respondToUpdate(update.protocol_instance_id, update.result_context, .{ .rejected = try inst.sendFailure(a, update.responseContext(inst), err, try section.failureOf(a, err)) }),
         };
     }
-    try inst.respondToUpdate(update.protocol_instance_id, .{ .accepted = .{} });
+    try inst.respondToUpdate(update.protocol_instance_id, update.result_context, .{ .accepted = .{} });
     inst.accepted_update = true;
     const run = try a.create(HandlerRun);
     run.* = .{ .name = update.name, .kind = .{ .update = .{ .handler = handler, .update = update } } };
@@ -1721,18 +1753,45 @@ fn rejectUnhandledUpdates(inst: *Instance) error{OutOfMemory}!void {
     if (inst.buffered_updates.items.len == 0) return;
     const a = inst.arena();
     const names = try std.mem.join(a, ", ", inst.update_handlers.keys());
-    for (inst.buffered_updates.items) |update| try inst.respondToUpdate(update.protocol_instance_id, .{ .rejected = try failure_mod.application(a, .{
+    for (inst.buffered_updates.items) |update| try inst.respondToUpdate(update.protocol_instance_id, update.result_context, .{ .rejected = try failure_mod.application(a, .{
         .message = try std.fmt.allocPrint(a, "update \"{s}\" is not registered on workflow \"{s}\"; registered updates: [{s}]", .{ update.name, inst.info.workflow_type, names }),
         .type = "UpdateNotRegistered",
     }) });
     inst.buffered_updates.clearRetainingCapacity();
 }
 
-fn respondToUpdate(inst: *Instance, protocol_instance_id: []const u8, response: cmd_pb.UpdateResponse.response_union) error{OutOfMemory}!void {
+/// Emits an update response; `context`, when set, is what the worker's codecs code it with
+/// (`updateResponseCodecContext`).
+fn respondToUpdate(inst: *Instance, protocol_instance_id: []const u8, context: ?*const converter.Context, response: cmd_pb.UpdateResponse.response_union) error{OutOfMemory}!void {
+    if (context != null) try inst.update_response_contexts.ensureUnusedCapacity(inst.arena(), 1);
+    const emitted = inst.commands.items.len;
     try inst.emit(.{ .variant = .{ .update_response = .{
         .protocol_instance_id = protocol_instance_id,
         .response = response,
     } } });
+    if (context) |c| if (inst.commands.items.len > emitted)
+        inst.update_response_contexts.appendAssumeCapacity(.{ .protocol_instance_id = protocol_instance_id, .context = c });
+}
+
+/// The context the worker's codecs code the activation's `update_response` for
+/// `protocol_instance_id` with, when it is not the run's: that of an update whose task
+/// carried a propagated Nexus context. Null otherwise. Valid until the next activation.
+pub fn updateResponseCodecContext(inst: *const Instance, protocol_instance_id: []const u8) ?*const converter.Context {
+    for (inst.update_response_contexts.items) |r| if (std.mem.eql(u8, r.protocol_instance_id, protocol_instance_id)) return r.context;
+    return null;
+}
+
+/// A context with the run's namespace and propagated values and the Nexus operation `n`
+/// names, with `n`'s strings copied, in the run's arena.
+fn propagatedContext(inst: *Instance, n: proto.temporal.api.nexus.v1.PropagatedSerializationContext) error{OutOfMemory}!*const converter.Context {
+    const a = inst.arena();
+    const context = try a.create(converter.Context);
+    context.* = .{ .values = &inst.propagated, .namespace = inst.namespace, .nexus = .{
+        .endpoint = try a.dupe(u8, n.endpoint),
+        .service = try a.dupe(u8, n.service),
+        .operation = try a.dupe(u8, n.operation),
+    } };
+    return context;
 }
 
 /// Spawns a handler coroutine for `run` and tracks it in `handlers`, or holds it until
@@ -1792,13 +1851,13 @@ fn handlerMain(inst: *Instance, run: *HandlerRun) void {
                     return;
                 };
                 const addresses: []const usize = if (builtFromError(run, err)) run.trace else &.{};
-                if (addresses.len > 0 or inst.failure_converter != null) inst.update_traces.append(a, .{ .protocol_instance_id = u.update.protocol_instance_id, .addresses = addresses, .err = err }) catch {
+                if (addresses.len > 0 or inst.failure_converter != null) inst.update_traces.append(a, .{ .protocol_instance_id = u.update.protocol_instance_id, .addresses = addresses, .err = err, .context = u.update.responseContext(inst) }) catch {
                     inst.task_failure = "out of memory rejecting an update whose handler failed";
                     return;
                 };
                 break :rejected .{ .rejected = rejected };
             };
-            inst.respondToUpdate(u.update.protocol_instance_id, response) catch {
+            inst.respondToUpdate(u.update.protocol_instance_id, u.update.result_context, response) catch {
                 inst.task_failure = "out of memory completing an update";
             };
         },
@@ -1847,7 +1906,7 @@ fn fillUpdateTraces(inst: *Instance, out: Allocator) error{OutOfMemory}!void {
         } else continue;
         for (inst.update_traces.items) |t| if (std.mem.eql(u8, t.protocol_instance_id, response.protocol_instance_id)) {
             if (t.addresses.len > 0) rejected.stack_trace = try inst.failureTraceText(out, t.addresses);
-            rejected.* = try inst.sendFailure(out, &inst.converter_context, t.err, rejected.*);
+            rejected.* = try inst.sendFailure(out, t.context, t.err, rejected.*);
         };
     }
 }
@@ -2049,6 +2108,7 @@ fn initialize(inst: *Instance, init: *const act_pb.InitializeWorkflow, run_id: [
     try propagation.extractAll(inst.propagators, a, inst.header, &inst.propagated, "the workflow start");
     inst.converter_context.workflow_id = inst.info.workflow_id;
     inst.converter_context.workflow_type = inst.info.workflow_type;
+    if (init.propagated_nexus_serialization_context) |n| inst.result_context = try inst.propagatedContext(n);
     if (inst.previous_run_failure) |f| if (inst.failure_converter) |c| {
         const converted = try a.create(Failure);
         converted.* = try c.fromFailure(a, &inst.converter_context, f.*);
@@ -2090,6 +2150,19 @@ fn rootMain(inst: *Instance) void {
     // A signal handler's error may have finished the workflow first.
     if (inst.root_outcome == null) inst.root_outcome = outcome;
     inst.root = null; // the task frees itself when this returns
+}
+
+/// The context the worker's codecs code the run's `complete_workflow_execution` and
+/// `fail_workflow_execution` with, when it is not the run's: the caller's propagated Nexus
+/// context of a run a Nexus handler started. Null otherwise. Points into the run's arena.
+pub fn resultCodecContext(inst: *const Instance) ?*const converter.Context {
+    return inst.result_context;
+}
+
+/// The context the run's result and failure are converted with: `resultCodecContext`, or
+/// the run's own.
+pub fn resultConverterContext(inst: *const Instance) *const converter.Context {
+    return inst.result_context orelse &inst.converter_context;
 }
 
 /// Whether the worker's or the workflow definition's `task_failure_errors` list `err`, so
@@ -2188,7 +2261,7 @@ fn warnUnfinishedHandlers(inst: *Instance) error{OutOfMemory}!void {
 /// run's arena.
 fn workflowFailure(inst: *Instance, out: Allocator, err: anyerror) !Failure {
     if (err == error.ContinueAsNew) return inst.builtWorkflowFailure(out, err);
-    return inst.sendFailure(out, &inst.converter_context, err, try inst.builtWorkflowFailure(out, err));
+    return inst.sendFailure(out, inst.resultConverterContext(), err, try inst.builtWorkflowFailure(out, err));
 }
 
 /// `workflowFailure` as the SDK builds it, before the failure converter. The failure of an
@@ -2672,17 +2745,30 @@ pub fn signalWithStart(inst: *Instance, workflow_type: []const u8, options: work
 /// interceptors.
 pub fn executeNexusOperation(inst: *Instance, service: []const u8, operation: []const u8, options: workflow.NexusOperationOptions, input: anytype) workflow.NexusOperationFuture(converter.Payload) {
     if (inst.wio.refuse("executeNexusOperation")) return .{ .ctx = &inst.ctx, .state = error.InvalidOptions };
-    const context = inst.nexusContext();
+    const context = inst.nexusContext(options.endpoint, service, operation);
     const payload = converter.toPayloadWithContext(inst.arena(), &context, input) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
     var with_propagated = options;
     with_propagated.headers = inst.nexusHeadersWithPropagated(options.headers) catch return .{ .ctx = &inst.ctx, .state = error.OutOfMemory };
     return inst.outboundNext().executeNexusOperation(.{ .service = service, .operation = operation, .options = with_propagated, .payload = payload });
 }
 
-/// The converter context of a Nexus operation's input and result: the namespace and the
-/// propagated values only, since the handler is no workflow or activity of this run.
-pub fn nexusContext(inst: *const Instance) converter.Context {
-    return .{ .values = &inst.propagated, .namespace = inst.namespace };
+/// The converter context of the input, result and failures of the Nexus operation the names
+/// give: the namespace, the propagated values and the operation's names in `nexus`, without
+/// the run's workflow fields, since the handler is no workflow or activity of this run. An
+/// operation on the system endpoint (`nexus/system.zig`) gets no `nexus`. Borrows the names.
+pub fn nexusContext(inst: *const Instance, endpoint: []const u8, service: []const u8, operation: []const u8) converter.Context {
+    var context: converter.Context = .{ .values = &inst.propagated, .namespace = inst.namespace };
+    if (!std.mem.eql(u8, endpoint, system.endpoint)) context.nexus = .{ .endpoint = endpoint, .service = service, .operation = operation };
+    return context;
+}
+
+/// The converter context of the Nexus operation with sequence number `seq`, which the
+/// worker's codecs get for its schedule command and its resolutions, late ones included;
+/// null when no operation has that seq or it is on the system endpoint. Points into the
+/// run's arena.
+pub fn nexusCodecContext(inst: *const Instance, seq: u32) ?*const converter.Context {
+    const state = inst.nexus_codecs.get(seq) orelse return null;
+    return &state.context;
 }
 
 /// The caller's Nexus headers with the propagated values added: `headers` as given when the
@@ -2771,6 +2857,7 @@ pub fn rejectedNexusOperation(inst: *Instance, endpoint: []const u8, service: []
         .cancellation_type = .abandon,
         .outcome = .{ .failed = out },
     };
+    state.context = inst.nexusContext(state.endpoint, state.service, state.operation);
     return state;
 }
 
@@ -3349,6 +3436,7 @@ pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: [
         .operation = try a.dupe(u8, operation),
         .cancellation_type = options.cancellation_type,
     };
+    state.context = inst.nexusContext(state.endpoint, state.service, state.operation);
     var cmd: cmd_pb.ScheduleNexusOperation = .{
         .seq = state.seq,
         .endpoint = state.endpoint,
@@ -3368,6 +3456,7 @@ pub fn scheduleNexusOperation(inst: *Instance, service: []const u8, operation: [
     try cmd.nexus_header.ensureTotalCapacity(a, options.headers.len);
     for (options.headers) |h| cmd.nexus_header.appendAssumeCapacity(.{ .key = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) });
     try inst.nexus_operations.put(a, state.seq, state);
+    if (state.context.nexus != null) try inst.nexus_codecs.put(a, state.seq, state);
     inst.next_nexus_seq += 1;
     try inst.emit(.{
         .user_metadata = try summaryMetadata(a, options.summary),
@@ -3439,7 +3528,7 @@ fn resolveNexusOperationStart(inst: *Instance, r: *const act_pb.ResolveNexusOper
         .started_sync => state.started = true,
         .failed => |f| {
             _ = inst.nexus_operations.remove(r.seq);
-            const copy = try inst.receivedFailure(&inst.nexusContext(), f);
+            const copy = try inst.receivedFailure(&state.context, f);
             state.outcome = if (hasFailureInfo(copy, .canceled_failure_info))
                 .{ .canceled = copy }
             else if (hasFailureInfo(copy, .timeout_failure_info))
@@ -3471,9 +3560,9 @@ fn resolveNexusOperation(inst: *Instance, r: *const act_pb.ResolveNexusOperation
     };
     state.outcome = switch (status) {
         .completed => |p| .{ .completed = try p.dupe(a) },
-        .failed => |f| .{ .failed = try inst.receivedFailure(&inst.nexusContext(), f) },
-        .cancelled => |f| .{ .canceled = try inst.receivedFailure(&inst.nexusContext(), f) },
-        .timed_out => |f| .{ .timed_out = try inst.receivedFailure(&inst.nexusContext(), f) },
+        .failed => |f| .{ .failed = try inst.receivedFailure(&state.context, f) },
+        .cancelled => |f| .{ .canceled = try inst.receivedFailure(&state.context, f) },
+        .timed_out => |f| .{ .timed_out = try inst.receivedFailure(&state.context, f) },
     };
     state.wake(&inst.wio);
 }
@@ -3825,9 +3914,9 @@ fn rootValidateUpdate(ptr: *anyopaque, input: interceptor.UpdateInput, _: interc
 
 fn rootExecuteUpdate(ptr: *anyopaque, input: interceptor.UpdateInput, _: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
     const inst: *Instance = @ptrCast(@alignCast(ptr));
-    const handler = (try inst.handlerOfCaller(.update)).handler;
+    const run = try inst.handlerOfCaller(.update);
     const a = inst.arena();
-    return handler.call(handler.context, a, &inst.converter_context, try handler.decode(a, &inst.converter_context, input.update_name, input.args.payloads));
+    return run.handler.call(run.handler.context, a, run.update.responseContext(inst), try run.handler.decode(a, &inst.converter_context, input.update_name, input.args.payloads));
 }
 
 const outbound_root: interceptor.WorkflowOutbound.VTable = .{
@@ -12063,4 +12152,247 @@ test "signal-with-start: a valid retry policy with defaults is sent" {
     defer inst.destroy();
     const cmds = commandsOf(try inst.activate(&try initActivation(a, "ValidRetrySignalWithStart", .{}), a));
     try testing.expect(cmds[0].variant.? == .schedule_nexus_operation);
+}
+
+// ---------------------------------------------------------------- Nexus serialization context
+
+/// A value whose payload names the context it was encoded with, after `text`, and which
+/// decodes to the name of the context it was decoded with.
+const NexusTagged = struct {
+    text: []const u8 = "",
+
+    fn describe(a: Allocator, context: *const converter.Context) error{OutOfMemory}![]const u8 {
+        if (context.nexus) |n| return std.fmt.allocPrint(a, "nexus={s}/{s}/{s} wf={s} ns={s}", .{ n.endpoint, n.service, n.operation, context.workflow_id, context.namespace });
+        return std.fmt.allocPrint(a, "run wf={s}", .{context.workflow_id});
+    }
+
+    pub fn toPayloadWithContext(self: NexusTagged, out: Allocator, context: *const converter.Context) error{OutOfMemory}!converter.Payload {
+        return converter.toPayload(out, try std.fmt.allocPrint(out, "{s} -> {s}", .{ self.text, try describe(out, context) }));
+    }
+
+    pub fn fromPayloadWithContext(out: Allocator, context: *const converter.Context, _: converter.Payload) converter.DecodeError!NexusTagged {
+        return .{ .text = try describe(out, context) };
+    }
+};
+
+/// A failure converter that writes the context it was called with into the message.
+const NexusContextFailures = struct {
+    fn failureConverter() converter.FailureConverter {
+        return .{ .ptr = undefined, .vtable = &.{ .toFailure = toFailure, .fromFailure = fromFailure } };
+    }
+
+    fn toFailure(_: *anyopaque, a: Allocator, c: *const converter.Context, _: ?anyerror, f: Failure) error{OutOfMemory}!Failure {
+        var out = f;
+        out.message = try std.fmt.allocPrint(a, "to [{s}]: {s}", .{ try NexusTagged.describe(a, c), f.message });
+        return out;
+    }
+
+    fn fromFailure(_: *anyopaque, a: Allocator, c: *const converter.Context, f: Failure) error{OutOfMemory}!Failure {
+        var out = f;
+        out.message = try std.fmt.allocPrint(a, "from [{s}]: {s}", .{ try NexusTagged.describe(a, c), f.message });
+        return out;
+    }
+};
+
+const NexusContextWf = struct {
+    /// Calls operation "op" of "svc" through "ep" and returns what its result decoded with,
+    /// or the failure's message.
+    fn call(ctx: *workflow.Context) ![]const u8 {
+        const f = ctx.executeNexusOperationByName(NexusTagged, "svc", "op", .{ .endpoint = "ep", .summary = "s" }, NexusTagged{ .text = "in" });
+        const out = f.get() catch |err| switch (err) {
+            error.NexusOperationFailed => return f.failure().?.message,
+            else => return err,
+        };
+        return out.text;
+    }
+    const Call = workflow.Def("NexusContextCall", call);
+
+    /// Returns its argument as decoded, encoded again; fails when it decoded "fail".
+    fn echo(_: *workflow.Context, arg: NexusTagged) !NexusTagged {
+        return arg;
+    }
+    const Echo = workflow.Def("NexusContextEcho", echo);
+
+    fn failing(_: *workflow.Context) !NexusTagged {
+        return error.Boom;
+    }
+    const Failing = workflow.Def("NexusContextFailing", failing);
+
+    const Tag = workflow.UpdateDef("tag", fn (NexusTagged) NexusTagged);
+    fn tag(_: *workflow.Context, arg: NexusTagged) NexusTagged {
+        return arg;
+    }
+    fn updates(ctx: *workflow.Context) ![]const u8 {
+        try ctx.setUpdateHandler(Tag, ctx, tag);
+        try ctx.sleep(.fromSeconds(60), .{});
+        return "";
+    }
+    const Updates = workflow.Def("NexusContextUpdates", updates);
+
+    /// Signals-with-start, through the system endpoint, and doesn't wait.
+    fn systemCall(ctx: *workflow.Context) ![]const u8 {
+        _ = ctx.signalWithStartWorkflow(SignalWithStartWf.Target, .{ .id = "t" }, .{"go"}, SignalWithStartWf.Add, .{"one"});
+        try ctx.sleep(.fromSeconds(60), .{});
+        return "";
+    }
+    const SystemCall = workflow.Def("NexusContextSystem", systemCall);
+};
+
+fn expectNexusContext(context: ?*const converter.Context, endpoint: []const u8, service: []const u8, operation: []const u8) !void {
+    const c = context orelse return error.TestExpectedNexusContext;
+    try testing.expectEqualStrings(endpoint, c.nexus.?.endpoint);
+    try testing.expectEqualStrings(service, c.nexus.?.service);
+    try testing.expectEqualStrings(operation, c.nexus.?.operation);
+    try testing.expectEqualStrings("", c.workflow_id);
+    try testing.expectEqualStrings("", c.workflow_type);
+    try testing.expectEqualStrings("default", c.namespace);
+}
+
+fn propagatedNexus() proto.temporal.api.nexus.v1.PropagatedSerializationContext {
+    return .{ .endpoint = "caller-ep", .service = "caller-svc", .operation = "caller-op" };
+}
+
+test "nexus context: an operation's input, schedule command and resolutions get its context, which outlives its resolution" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusContextWf.Call.registered, .{ .namespace = "default" });
+    defer inst.destroy();
+
+    const cmd = commandsOf(try inst.activate(&try initActivation(a, "NexusContextCall", .{}), a))[0].variant.?.schedule_nexus_operation;
+    try testing.expectEqualStrings("\"in -> nexus=ep/svc/op wf= ns=default\"", cmd.input.?.data);
+    try expectNexusContext(inst.nexusCodecContext(1), "ep", "svc", "op");
+    const future: workflow.NexusOperationFuture(converter.Payload) = .{ .ctx = &inst.ctx, .state = inst.nexus_operations.get(1).? };
+    try expectNexusContext(future.converterContext(), "ep", "svc", "op");
+    try testing.expect(inst.nexusCodecContext(2) == null);
+    // The run's own context is unchanged.
+    try testing.expectEqualStrings("wf-1", inst.converter_context.workflow_id);
+    try testing.expect(inst.converter_context.nexus == null);
+
+    _ = try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+    try expectNexusContext(inst.nexusCodecContext(1), "ep", "svc", "op");
+    const done = try inst.activate(&try nexusResolved(a, 1, .{ .completed = try converter.toPayload(a, @as([]const u8, "out")) }), a);
+    // A later job for the seq still decodes with it.
+    try expectNexusContext(inst.nexusCodecContext(1), "ep", "svc", "op");
+    try testing.expectEqualStrings("\"nexus=ep/svc/op wf= ns=default\"", completedWith(done));
+}
+
+test "nexus context: a failed start's failure is read with the operation's context" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusContextWf.Call.registered, .{ .namespace = "default", .failure_converter = NexusContextFailures.failureConverter() });
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "NexusContextCall", .{}), a);
+    try expectNexusContext(inst.nexusCodecContext(1), "ep", "svc", "op");
+    const done = try inst.activate(&try nexusStart(a, 1, .{ .failed = .{ .message = "no" } }), a);
+    try expectNexusContext(inst.nexusCodecContext(1), "ep", "svc", "op");
+    try testing.expectEqualStrings("\"from [nexus=ep/svc/op wf= ns=default]: no\"", completedWith(done));
+}
+
+test "nexus context: a failed resolution is read with the operation's context" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusContextWf.Call.registered, .{ .namespace = "default", .failure_converter = NexusContextFailures.failureConverter() });
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "NexusContextCall", .{}), a);
+    _ = try inst.activate(&try nexusStart(a, 1, .{ .operation_token = "tok" }), a);
+    const done = try inst.activate(&try nexusResolved(a, 1, .{ .failed = .{ .message = "late" } }), a);
+    try expectNexusContext(inst.nexusCodecContext(1), "ep", "svc", "op");
+    try testing.expectEqualStrings("\"from [nexus=ep/svc/op wf= ns=default]: late\"", completedWith(done));
+}
+
+test "nexus context: an operation on the system endpoint keeps the run's context" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusContextWf.SystemCall.registered, .{ .namespace = "default" });
+    defer inst.destroy();
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "NexusContextSystem", .{}), a));
+    try testing.expectEqualStrings(system.endpoint, cmds[0].variant.?.schedule_nexus_operation.endpoint);
+    try testing.expect(inst.nexusCodecContext(1) == null);
+    try testing.expect(inst.nexus_operations.get(1).?.context.nexus == null);
+}
+
+test "nexus context: a run started with a propagated context encodes its result with it, and its arguments with its own" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    {
+        const inst = try create(testing.allocator, NexusContextWf.Echo.registered, .{ .namespace = "default" });
+        defer inst.destroy();
+        var act = try initActivation(a, "NexusContextEcho", .{NexusTagged{}});
+        act.jobs.items[0].variant.?.initialize_workflow.propagated_nexus_serialization_context = propagatedNexus();
+        const done = try inst.activate(&act, a);
+        try testing.expectEqualStrings("\"run wf=wf-1 -> nexus=caller-ep/caller-svc/caller-op wf= ns=default\"", completedWith(done));
+        try expectNexusContext(inst.resultCodecContext(), "caller-ep", "caller-svc", "caller-op");
+        try testing.expect(inst.resultCodecContext().?.values == &inst.propagated);
+        try testing.expect(inst.converter_context.nexus == null);
+    }
+    // Without one, the run's context throughout.
+    {
+        const inst = try create(testing.allocator, NexusContextWf.Echo.registered, .{ .namespace = "default" });
+        defer inst.destroy();
+        const done = try inst.activate(&try initActivation(a, "NexusContextEcho", .{NexusTagged{}}), a);
+        try testing.expectEqualStrings("\"run wf=wf-1 -> run wf=wf-1\"", completedWith(done));
+        try testing.expect(inst.resultCodecContext() == null);
+    }
+}
+
+test "nexus context: a run started with a propagated context sends its failure through the failure converter with it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusContextWf.Failing.registered, .{ .namespace = "default", .failure_converter = NexusContextFailures.failureConverter() });
+    defer inst.destroy();
+    var act = try initActivation(a, "NexusContextFailing", .{});
+    act.jobs.items[0].variant.?.initialize_workflow.propagated_nexus_serialization_context = propagatedNexus();
+    const cmds = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqualStrings("to [nexus=caller-ep/caller-svc/caller-op wf= ns=default]: Boom", cmds[cmds.len - 1].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+test "nexus context: an update with a propagated context answers with it for the activation, and its input keeps the run's" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, NexusContextWf.Updates.registered, .{ .namespace = "default", .failure_converter = NexusContextFailures.failureConverter() });
+    defer inst.destroy();
+    _ = try inst.activate(&try initActivation(a, "NexusContextUpdates", .{}), a);
+
+    var with = try updateJob(a, "u1", "tag", .{NexusTagged{}}, true);
+    with.do_update.propagated_nexus_serialization_context = propagatedNexus();
+    var act = try oneJob(a, with);
+    try act.jobs.append(a, .{ .variant = try updateJob(a, "u2", "tag", .{NexusTagged{}}, true) });
+    var missing = try updateJob(a, "u3", "missing", .{}, true);
+    missing.do_update.propagated_nexus_serialization_context = propagatedNexus();
+    try act.jobs.append(a, .{ .variant = missing });
+    const cmds = commandsOf(try inst.activate(&act, a));
+    try testing.expectEqual(@as(usize, 5), cmds.len);
+    var completed: usize = 0;
+    for (cmds) |cmd| {
+        const r = cmd.variant.?.update_response;
+        const context = inst.updateResponseCodecContext(r.protocol_instance_id);
+        if (std.mem.eql(u8, r.protocol_instance_id, "u2")) {
+            try testing.expect(context == null);
+            if (r.response.? == .completed) try testing.expectEqualStrings("\"run wf=wf-1 -> run wf=wf-1\"", r.response.?.completed.data);
+            continue;
+        }
+        try expectNexusContext(context, "caller-ep", "caller-svc", "caller-op");
+        switch (r.response.?) {
+            .accepted => {},
+            .completed => |p| {
+                completed += 1;
+                try testing.expectEqualStrings("\"run wf=wf-1 -> nexus=caller-ep/caller-svc/caller-op wf= ns=default\"", p.data);
+            },
+            .rejected => |f| {
+                try testing.expectEqualStrings("u3", r.protocol_instance_id);
+                try testing.expect(std.mem.find(u8, f.message, "not registered") != null);
+            },
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), completed);
+    // Cleared with the activation's commands.
+    _ = try inst.activate(&try oneJob(a, .{ .fire_timer = .{ .seq = 99 } }), a);
+    try testing.expect(inst.updateResponseCodecContext("u1") == null);
 }

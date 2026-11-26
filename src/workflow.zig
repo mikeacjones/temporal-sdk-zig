@@ -824,6 +824,11 @@ pub const Context = struct {
     /// effects are converted with. Encode failure details with it,
     /// `converter.toPayloadWithContext(arena, ctx.converterContext(), value)`. Valid for the
     /// run; workflow code only.
+    ///
+    /// A run a Nexus handler started, when the server propagated the caller's context to it,
+    /// converts its result and failure with that context instead (`converter.Context.nexus`),
+    /// as does an update whose task carries one for its result and rejections; this returns
+    /// the run's own context all the same.
     pub fn converterContext(ctx: *const Context) *const converter.Context {
         return &ctx.instance.converter_context;
     }
@@ -2215,8 +2220,7 @@ pub fn NexusOperationFuture(comptime T: type) type {
             switch (state.outcome.?) {
                 .completed => |p| {
                     if (T == void) return;
-                    const context = f.ctx.instance.nexusContext();
-                    return converter.fromPayloadWithContext(T, f.ctx.allocator(), &context, p);
+                    return converter.fromPayloadWithContext(T, f.ctx.allocator(), &state.context, p);
                 },
                 .failed, .canceled, .timed_out => return f.fail(),
             }
@@ -2243,6 +2247,16 @@ pub fn NexusOperationFuture(comptime T: type) type {
         pub fn isReady(f: Self) bool {
             const state = f.state catch return true;
             return state.outcome != null;
+        }
+
+        /// Experimental: the converter context of the operation's input, result and failure:
+        /// the namespace, `Context.propagated()` and the operation's names in `nexus`, as the
+        /// handler's worker converts them. Decode failure details with it:
+        /// `details.withContext(future.converterContext())`. The run's own context when
+        /// scheduling was refused. Valid for the run; workflow code only.
+        pub fn converterContext(f: Self) *const converter.Context {
+            const state = f.state catch return f.ctx.converterContext();
+            return &state.context;
         }
 
         /// Requests cancellation of the operation, as its `cancellation_type` says; `get`
@@ -2783,7 +2797,7 @@ pub fn DefWithOptions(comptime name: []const u8, comptime definition: anytype, c
         pub fn invoke(ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
             const args = try converter.fromPayloadsWithContext(Args, ctx.allocator(), ctx.converterContext(), payloads);
             const result = try @call(.auto, definition, .{ctx} ++ args);
-            return converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), result);
+            return converter.toPayloadWithContext(ctx.allocator(), ctx.instance.resultConverterContext(), result);
         }
 
         pub const versioning_behavior = options.versioning_behavior;
@@ -2818,7 +2832,7 @@ fn StructDef(comptime name: []const u8, comptime W: type, comptime options: DefO
             try ctx.instance.releaseHandlers();
             const w: *W = @ptrCast(@alignCast(state));
             const result = try @call(.auto, W.run, .{ w, ctx } ++ args);
-            return converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), result);
+            return converter.toPayloadWithContext(ctx.allocator(), ctx.instance.resultConverterContext(), result);
         }
 
         fn initRun(ctx: *Context) anyerror!*anyopaque {
@@ -3094,7 +3108,7 @@ pub fn DynamicDefWithOptions(comptime func: anytype, comptime options: DefOption
 
         pub fn invoke(ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
             const result = try func(ctx, .{ .payloads = payloads, .context = ctx.converterContext() });
-            return converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), result);
+            return converter.toPayloadWithContext(ctx.allocator(), ctx.instance.resultConverterContext(), result);
         }
 
         /// The registration. Its name is empty: it answers to every unregistered type.

@@ -21,6 +21,7 @@ const proto_time = @import("proto_time.zig");
 const converter = @import("converter.zig");
 /// For `encodeMessageWithHeaderFields`, which `converter` doesn't re-export.
 const codec_pass = @import("converter/codec.zig");
+const nexus_system = @import("nexus/system.zig");
 const search_attributes = @import("search_attributes.zig");
 const failure_mod = @import("failure.zig");
 const history_mod = @import("history.zig");
@@ -1589,6 +1590,7 @@ pub const Client = struct {
         }
         var request = try c.startRequest(arena, workflow_type, options.id, options, args);
         request.request_id = attach.request_id;
+        if (attach.nexus_context) |n| request.propagated_nexus_serialization_context = .{ .endpoint = n.endpoint, .service = n.service, .operation = n.operation };
         try request.links.appendSlice(arena, attach.links);
         if (attach.callback_url.len > 0) {
             var callback: proto.temporal.api.common.v1.Callback = .{ .variant = .{ .nexus = .{ .url = attach.callback_url } } };
@@ -2133,17 +2135,23 @@ pub const Client = struct {
     /// it handed off, with `result` (a value of the activity's result type, or `{}` for
     /// `void`). Returns `error.NotFound` when the activity is no longer waiting: it already
     /// completed, failed, or timed out, or its workflow closed. Safe to call from any process
-    /// that can reach the server, not only the worker's.
+    /// that can reach the server, not only the worker's. `completeActivityWithOptions` with
+    /// `.{}`.
     pub fn completeActivity(c: *Client, task_token: []const u8, result: anytype) ActivityCompletionError!void {
+        return c.completeActivityWithOptions(task_token, result, .{});
+    }
+
+    /// Experimental: `completeActivity`, converting as `options` says.
+    pub fn completeActivityWithOptions(c: *Client, task_token: []const u8, result: anytype, options: ActivityCompletionOptions) ActivityCompletionError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
         _ = try c.activityRpc(wfs.RespondActivityTaskCompletedResponse, "RespondActivityTaskCompleted", wfs.RespondActivityTaskCompletedRequest{
             .namespace = c.namespace,
             .task_token = task_token,
-            .result = try resultPayloads(a, &.{ .namespace = c.namespace }, result),
+            .result = try resultPayloads(a, &c.completionContext(null, options.nexus_context), result),
             .identity = c.identity,
-        }, a);
+        }, a, options.nexus_context);
     }
 
     /// `completeActivity` for the activity `id`.
@@ -2156,25 +2164,30 @@ pub const Client = struct {
             .workflow_id = id.workflow_id,
             .run_id = id.run_id,
             .activity_id = id.activity_id,
-            .result = try resultPayloads(a, &c.activityIdContext(id), result),
+            .result = try resultPayloads(a, &c.completionContext(id, id.nexus_context), result),
             .identity = c.identity,
-        }, a);
+        }, a, id.nexus_context);
     }
 
     /// Fails an activity that returned `ctx.completeAsync()` with the failure `f`. The
     /// activity's retry policy applies, as for a failure returned by the activity itself.
     /// Returns `error.NotFound` when the activity is no longer waiting. `f.cause` is read
-    /// until this returns.
+    /// until this returns. `failActivityWithOptions` with `.{}`.
     pub fn failActivity(c: *Client, task_token: []const u8, f: failure_mod.Application) ActivityCompletionError!void {
+        return c.failActivityWithOptions(task_token, f, .{});
+    }
+
+    /// Experimental: `failActivity`, converting as `options` says.
+    pub fn failActivityWithOptions(c: *Client, task_token: []const u8, f: failure_mod.Application, options: ActivityCompletionOptions) ActivityCompletionError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
         _ = try c.activityRpc(wfs.RespondActivityTaskFailedResponse, "RespondActivityTaskFailed", wfs.RespondActivityTaskFailedRequest{
             .namespace = c.namespace,
             .task_token = task_token,
-            .failure = try c.sentFailure(a, &.{ .namespace = c.namespace }, try failure_mod.application(a, f)),
+            .failure = try c.sentFailure(a, &c.completionContext(null, options.nexus_context), try failure_mod.application(a, f)),
             .identity = c.identity,
-        }, a);
+        }, a, options.nexus_context);
     }
 
     /// `failActivity` for the activity `id`.
@@ -2187,25 +2200,30 @@ pub const Client = struct {
             .workflow_id = id.workflow_id,
             .run_id = id.run_id,
             .activity_id = id.activity_id,
-            .failure = try c.sentFailure(a, &c.activityIdContext(id), try failure_mod.application(a, f)),
+            .failure = try c.sentFailure(a, &c.completionContext(id, id.nexus_context), try failure_mod.application(a, f)),
             .identity = c.identity,
-        }, a);
+        }, a, id.nexus_context);
     }
 
     /// Reports that an activity that returned `ctx.completeAsync()` was canceled, with
     /// `details` (any value the converter encodes, or `{}` for none). Call it after
     /// `recordActivityHeartbeat` returns true. Returns `error.NotFound` when the activity is
-    /// no longer waiting.
+    /// no longer waiting. `reportActivityCancellationWithOptions` with `.{}`.
     pub fn reportActivityCancellation(c: *Client, task_token: []const u8, details: anytype) ActivityCompletionError!void {
+        return c.reportActivityCancellationWithOptions(task_token, details, .{});
+    }
+
+    /// Experimental: `reportActivityCancellation`, converting as `options` says.
+    pub fn reportActivityCancellationWithOptions(c: *Client, task_token: []const u8, details: anytype, options: ActivityCompletionOptions) ActivityCompletionError!void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
         _ = try c.activityRpc(wfs.RespondActivityTaskCanceledResponse, "RespondActivityTaskCanceled", wfs.RespondActivityTaskCanceledRequest{
             .namespace = c.namespace,
             .task_token = task_token,
-            .details = try detailPayloads(a, &.{ .namespace = c.namespace }, details),
+            .details = try detailPayloads(a, &c.completionContext(null, options.nexus_context), details),
             .identity = c.identity,
-        }, a);
+        }, a, options.nexus_context);
     }
 
     /// `reportActivityCancellation` for the activity `id`.
@@ -2218,9 +2236,9 @@ pub const Client = struct {
             .workflow_id = id.workflow_id,
             .run_id = id.run_id,
             .activity_id = id.activity_id,
-            .details = try detailPayloads(a, &c.activityIdContext(id), details),
+            .details = try detailPayloads(a, &c.completionContext(id, id.nexus_context), details),
             .identity = c.identity,
-        }, a);
+        }, a, id.nexus_context);
     }
 
     /// Heartbeats an activity that returned `ctx.completeAsync()`, with progress `details`
@@ -2228,17 +2246,22 @@ pub const Client = struct {
     /// `ctx.heartbeatDetails`. Returns true when cancellation of the activity has been
     /// requested: finish it with `reportActivityCancellation` (or complete or fail it). Not
     /// throttled: each call is a request to the server. Returns `error.NotFound` when the
-    /// activity is no longer waiting.
+    /// activity is no longer waiting. `recordActivityHeartbeatWithOptions` with `.{}`.
     pub fn recordActivityHeartbeat(c: *Client, task_token: []const u8, details: anytype) ActivityCompletionError!bool {
+        return c.recordActivityHeartbeatWithOptions(task_token, details, .{});
+    }
+
+    /// Experimental: `recordActivityHeartbeat`, converting as `options` says.
+    pub fn recordActivityHeartbeatWithOptions(c: *Client, task_token: []const u8, details: anytype, options: ActivityCompletionOptions) ActivityCompletionError!bool {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
         const response = try c.activityRpc(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", wfs.RecordActivityTaskHeartbeatRequest{
             .namespace = c.namespace,
             .task_token = task_token,
-            .details = try detailPayloads(a, &.{ .namespace = c.namespace }, details),
+            .details = try detailPayloads(a, &c.completionContext(null, options.nexus_context), details),
             .identity = c.identity,
-        }, a);
+        }, a, options.nexus_context);
         return response.cancel_requested;
     }
 
@@ -2252,14 +2275,22 @@ pub const Client = struct {
             .workflow_id = id.workflow_id,
             .run_id = id.run_id,
             .activity_id = id.activity_id,
-            .details = try detailPayloads(a, &c.activityIdContext(id), details),
+            .details = try detailPayloads(a, &c.completionContext(id, id.nexus_context), details),
             .identity = c.identity,
-        }, a);
+        }, a, id.nexus_context);
         return response.cancel_requested;
     }
 
-    fn activityRpc(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator) ActivityCompletionError!Response {
-        return c.rpc(Response, method, request, arena) catch |err| switch (err) {
+    /// The converter context of an activity completion or heartbeat: `nexus` alone with the
+    /// namespace when set, otherwise the one `id` names (null for a task token's). Borrows
+    /// both.
+    fn completionContext(c: *const Client, id: ?ActivityId, nexus: ?converter.NexusContext) converter.Context {
+        if (nexus) |n| return .{ .namespace = c.namespace, .nexus = n };
+        return if (id) |i| c.activityIdContext(i) else .{ .namespace = c.namespace };
+    }
+
+    fn activityRpc(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, nexus: ?converter.NexusContext) ActivityCompletionError!Response {
+        return c.rpcCallCoded(Response, method, request, arena, null, null, null, &.{}, .decode, .{ .nexus = nexus }) catch |err| switch (err) {
             error.AlreadyExists => error.InvalidResponse,
             else => |e| e,
         };
@@ -2309,6 +2340,11 @@ pub const Client = struct {
             .workflow_type = try arena.dupe(u8, context.workflow_type),
             .activity_type = try arena.dupe(u8, context.activity_type),
             .activity_id = try arena.dupe(u8, context.activity_id),
+            .nexus = if (context.nexus) |n| .{
+                .endpoint = try arena.dupe(u8, n.endpoint),
+                .service = try arena.dupe(u8, n.service),
+                .operation = try arena.dupe(u8, n.operation),
+            } else null,
         };
         return out;
     }
@@ -2332,7 +2368,7 @@ pub const Client = struct {
     pub fn historyIterator(c: *Client, workflow_id: []const u8, run_id: []const u8, options: HistoryIteratorOptions) error{OutOfMemory}!HistoryIterator {
         const id = try c.gpa.dupe(u8, workflow_id);
         errdefer c.gpa.free(id);
-        return .{ .client = c, .workflow_id = id, .run_id = try c.gpa.dupe(u8, run_id), .options = options, .page = .init(c.gpa) };
+        return .{ .client = c, .workflow_id = id, .run_id = try c.gpa.dupe(u8, run_id), .options = options, .page = .init(c.gpa), .contexts = .{ .gpa = c.gpa } };
     }
 
     /// Describes a workflow run: its status, type, times, memo and search attributes. An
@@ -2517,6 +2553,7 @@ pub const Client = struct {
         const id = if (options.id.len > 0) options.id else try uuid(arena, c.io);
         var request = try c.startActivityRequest(arena, activity_type, id, options, args);
         request.request_id = attach.request_id;
+        if (attach.nexus_context) |n| request.propagated_nexus_serialization_context = .{ .endpoint = n.endpoint, .service = n.service, .operation = n.operation };
         const has_callback = attach.callback_url.len > 0;
         if (has_callback) {
             var callback: proto.temporal.api.common.v1.Callback = .{ .variant = .{ .nexus = .{ .url = attach.callback_url } } };
@@ -2971,7 +3008,7 @@ pub const Client = struct {
         const response = c.rpcCallCoded(wfs.ExecuteMultiOperationResponse, "ExecuteMultiOperation", wfs.ExecuteMultiOperationRequest{
             .namespace = c.namespace,
             .operations = operations,
-        }, a, &status, null, start_options.context, header_fields, .decode) catch |err| switch (err) {
+        }, a, &status, null, start_options.context, header_fields, .decode, .{}) catch |err| switch (err) {
             // The call fails with the failing operation's status code, and only the start
             // operation can fail with ALREADY_EXISTS.
             error.AlreadyExists => return error.WorkflowExecutionAlreadyStarted,
@@ -3056,7 +3093,7 @@ pub const Client = struct {
     fn updateUntilStage(c: *Client, a: Allocator, request: wfs.UpdateWorkflowExecutionRequest, header: ?*converter.HeaderWriter, header_fields: []const []const u8, values: ?*const propagation.Values) UpdateError!wfs.UpdateWorkflowExecutionResponse {
         const want: UpdateStage = if (request.wait_policy.?.lifecycle_stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED) .accepted else .completed;
         while (true) {
-            const response = c.rpcCallCoded(wfs.UpdateWorkflowExecutionResponse, "UpdateWorkflowExecution", request, a, null, header, values, header_fields, .decode) catch |err| switch (err) {
+            const response = c.rpcCallCoded(wfs.UpdateWorkflowExecutionResponse, "UpdateWorkflowExecution", request, a, null, header, values, header_fields, .decode, .{}) catch |err| switch (err) {
                 error.AlreadyExists => return error.InvalidResponse,
                 else => |e| return e,
             };
@@ -3133,7 +3170,7 @@ pub const Client = struct {
     /// not decoded by the codecs, so a payload they can't decode doesn't fail the call. The
     /// request is still encoded and the call still goes through the interceptors.
     fn rpcUndecoded(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator) RpcError!Response {
-        return c.rpcCallCoded(Response, method, request, arena, null, null, null, &.{}, .skip);
+        return c.rpcCallCoded(Response, method, request, arena, null, null, null, &.{}, .skip, .{});
     }
 
     /// Passes the call through the client's interceptors, which end in `send`. `header`, for
@@ -3141,14 +3178,15 @@ pub const Client = struct {
     /// `values` are the call's propagated values (its `.context`), which `send` hands the
     /// codecs.
     fn rpcCall(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter, values: ?*const propagation.Values) RpcError!Response {
-        return c.rpcCallCoded(Response, method, request, arena, status, header, values, &.{}, .decode);
+        return c.rpcCallCoded(Response, method, request, arena, status, header, values, &.{}, .decode, .{});
     }
 
     /// `rpcCall`, with `response_codecs` saying whether `send` decodes the response. The
     /// codecs encode the header fields the header writer at the end of the interceptor chain
     /// marks (`converter.HeaderWriter.codec_fields`), or with no writer there, those named in
     /// `header_fields` (sorted), for a request whose headers were built without the chain.
-    fn rpcCallCoded(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter, values: ?*const propagation.Values, header_fields: []const []const u8, response_codecs: ResponseCodecs) RpcError!Response {
+    /// `coding` says where the codec contexts come from when not from the request's fields.
+    fn rpcCallCoded(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, header: ?*converter.HeaderWriter, values: ?*const propagation.Values, header_fields: []const []const u8, response_codecs: ResponseCodecs, coding: CallCoding) RpcError!Response {
         const Request = @TypeOf(request);
         var req = request;
         var resp: Response = .{};
@@ -3167,6 +3205,7 @@ pub const Client = struct {
             values: ?*const propagation.Values,
             header_fields: []const []const u8,
             response_codecs: ResponseCodecs,
+            coding: CallCoding,
 
             const vtable: interceptor.Client.VTable = .{ .call = end };
 
@@ -3178,10 +3217,10 @@ pub const Client = struct {
                     setHeader(Request, r, try protoHeader(input.arena, w.*));
                     marked = w.codec_fields.items;
                 };
-                input.response(Response).?.* = try e.client.send(Response, method, r.*, input.arena, e.status, e.values, marked, e.response_codecs);
+                input.response(Response).?.* = try e.client.send(Response, method, r.*, input.arena, e.status, e.values, marked, e.response_codecs, e.coding);
             }
         };
-        var end: End = .{ .client = c, .status = status, .values = values, .header_fields = header_fields, .response_codecs = response_codecs };
+        var end: End = .{ .client = c, .status = status, .values = values, .header_fields = header_fields, .response_codecs = response_codecs, .coding = coding };
         const next: interceptor.Client.Next = .{ .chain = c.interceptors, .root = .{ .ptr = &end, .vtable = &End.vtable } };
         try next.call(&call);
         return resp;
@@ -3295,10 +3334,10 @@ pub const Client = struct {
     /// it fails as a server's INVALID_ARGUMENT (status 3) naming the field would. With
     /// `response_codecs` `.skip`, the response's payloads and failure attributes are left
     /// as the server sent them.
-    fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values, header_fields: []const []const u8, response_codecs: ResponseCodecs) RpcError!Response {
-        var codec_context: converter.Context = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace };
-        requestIdentity(@TypeOf(request), &request, &codec_context);
-        return c.sendInContext(Response, method, request, arena, status, &codec_context, header_fields, response_codecs);
+    fn send(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, values: ?*const propagation.Values, header_fields: []const []const u8, response_codecs: ResponseCodecs, coding: CallCoding) RpcError!Response {
+        var codec_context: converter.Context = .{ .values = values orelse &propagation.Values.empty, .namespace = c.namespace, .nexus = coding.nexus };
+        if (coding.nexus == null) requestIdentity(@TypeOf(request), &request, &codec_context);
+        return c.sendInContext(Response, method, request, arena, status, &codec_context, header_fields, response_codecs, coding.history);
     }
 
     /// For `worker.Worker`: records a heartbeat of the activity attempt `task_token` with
@@ -3313,10 +3352,12 @@ pub const Client = struct {
             try payloads.payloads.appendSlice(arena, details);
             request.details = payloads;
         }
-        return c.sendInContext(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", request, arena, null, context, &.{}, .decode);
+        return c.sendInContext(wfs.RecordActivityTaskHeartbeatResponse, "RecordActivityTaskHeartbeat", request, arena, null, context, &.{}, .decode, null);
     }
 
-    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.Context, header_fields: []const []const u8, response_codecs: ResponseCodecs) RpcError!Response {
+    /// `history` carries the Nexus contexts of a run's history across the pages of one
+    /// reading of it (`HistoryContexts`); null reads the page alone.
+    fn sendInContext(c: *Client, comptime Response: type, comptime method: []const u8, request: anytype, arena: Allocator, status: ?*?RpcStatus, codec_context: *const converter.Context, header_fields: []const []const u8, response_codecs: ResponseCodecs, history: ?*HistoryContexts) RpcError!Response {
         var coded = request;
         if (c.encode_failure_attributes) try failure_mod.encodeAttributes(@TypeOf(coded), &coded, arena);
         codec_pass.encodeMessageWithHeaderFields(@TypeOf(coded), &coded, c.codecs, arena, c.io, codec_context, header_fields) catch |err| {
@@ -3367,12 +3408,58 @@ pub const Client = struct {
         };
         if (comptime Response == wfs.GetWorkflowExecutionHistoryResponse) try liftRawHistory(arena, &coded, &response);
         if (response_codecs == .skip) return response;
-        converter.decodeMessage(Response, &response, c.codecs, arena, c.io, codec_context) catch |err| {
+        const decoded = if (comptime Response == wfs.GetWorkflowExecutionHistoryResponse)
+            c.decodeHistoryResponse(arena, &response, codec_context, history)
+        else
+            converter.decodeMessage(Response, &response, c.codecs, arena, c.io, codec_context);
+        decoded catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: decoding the response's payloads with the client's codecs failed", .{method});
             return err;
         };
         try failure_mod.decodeAttributes(Response, &response, arena);
         return response;
+    }
+
+    /// How `send` codes a call whose codec contexts don't all come from the request's fields.
+    const CallCoding = struct {
+        /// The context of the whole request and response instead of the request's fields
+        /// (see `ActivityCompletionOptions`).
+        nexus: ?converter.NexusContext = null,
+        /// For a GetWorkflowExecutionHistory call, the contexts collected from the pages of
+        /// the same history read before this one.
+        history: ?*HistoryContexts = null,
+    };
+
+    /// Decodes a history page. Each event is decoded with the context its payloads were
+    /// encoded with: a Nexus operation's scheduled event and its completion, failure,
+    /// cancellation, timeout and cancel-request failure events with the operation's Nexus
+    /// context (an operation on the system endpoint excepted); the close event of a run a
+    /// Nexus handler started, and the completion of an update whose request carried one,
+    /// with the propagated Nexus context; every other event, and the rest of the response,
+    /// with `base`. The contexts later events need are recorded in `history` (a page-local
+    /// record when null) as their first events are read.
+    fn decodeHistoryResponse(c: *Client, arena: Allocator, response: *wfs.GetWorkflowExecutionHistoryResponse, base: *const converter.Context, history: ?*HistoryContexts) converter.CodecError!void {
+        if (c.codecs.len == 0) return;
+        var local: HistoryContexts = .{ .gpa = arena };
+        const contexts = history orelse &local;
+        if (response.propagated_nexus_serialization_context) |n| try contexts.setRunResult(n);
+        const page = if (response.history) |*h| h else return converter.decodeMessage(wfs.GetWorkflowExecutionHistoryResponse, response, c.codecs, arena, c.io, base);
+        const events = try arena.dupe(HistoryEvent, page.events.items);
+        page.events = .fromOwnedSlice(events);
+        const Own = struct { index: usize, event: HistoryEvent };
+        var own: std.ArrayList(Own) = .empty;
+        for (events, 0..) |*event, i| {
+            const n = (try contexts.contextOf(event)) orelse continue;
+            const context: converter.Context = .{ .values = base.values, .namespace = base.namespace, .nexus = n };
+            var copy = event.*;
+            try converter.decodeMessage(HistoryEvent, &copy, c.codecs, arena, c.io, &context);
+            try own.append(arena, .{ .index = i, .event = copy });
+            event.* = .{};
+        }
+        try converter.decodeMessage(wfs.GetWorkflowExecutionHistoryResponse, response, c.codecs, arena, c.io, base);
+        // Decoding copied the list, keeping its length and order; the events decoded alone go
+        // back into the copy.
+        for (own.items) |o| response.history.?.events.items[o.index] = o.event;
     }
 
     /// A server set to send raw history for the namespace answers GetWorkflowExecutionHistory
@@ -3847,6 +3934,10 @@ pub const NexusWorkflowAttachments = struct {
     /// status here (null for a failure without one, such as a transport error) and is not
     /// logged, so the caller can map and report it. Its message comes from the call's arena.
     rejection: ?*?RpcRejection = null,
+    /// Experimental: the Nexus operation the workflow is started for, sent so the server
+    /// hands it to the workflow's run, which then converts its result and failure with it
+    /// (`converter.Context.nexus`). Null sends none.
+    nexus_context: ?converter.NexusContext = null,
 };
 
 /// The gRPC status of a call the server rejected: its code, and the server's message, which
@@ -3905,6 +3996,9 @@ pub const NexusActivityAttachments = struct {
     links: []const proto.temporal.api.common.v1.Link = &.{},
     /// As `NexusWorkflowAttachments.rejection`.
     rejection: ?*?RpcRejection = null,
+    /// Experimental: as `NexusWorkflowAttachments.nexus_context`, for the activity's result,
+    /// failure and heartbeat details (`activity.Info.nexus_context`).
+    nexus_context: ?converter.NexusContext = null,
 };
 
 /// Experimental: the activity `Client.startNexusActivity` started, or found already started
@@ -3947,6 +4041,18 @@ pub const ActivityId = struct {
     workflow_id: []const u8,
     run_id: []const u8 = "",
     activity_id: []const u8,
+    /// Experimental: as `ActivityCompletionOptions.nexus_context`, for the `...ById` calls.
+    nexus_context: ?converter.NexusContext = null,
+};
+
+/// Experimental: how the `...WithOptions` activity completion calls convert.
+pub const ActivityCompletionOptions = struct {
+    /// `activity.Info.nexus_context` of an activity a Nexus handler started. With it set,
+    /// the call's payloads, the failure converter and the codecs see the context
+    /// `.{ .namespace = <the client's>, .nexus = nexus_context }`, as the activity's worker
+    /// converts its result, failure and heartbeat details; null converts as the calls
+    /// without options do. Read during the call.
+    nexus_context: ?converter.NexusContext = null,
 };
 
 pub const ActivityCompletionError = error{
@@ -5992,6 +6098,79 @@ pub const HistoryIteratorOptions = struct {
     page_size: u31 = 0,
 };
 
+/// The codec contexts of a run's history that its events don't carry themselves, collected as
+/// its events are read in order, so the pages after the one that holds them decode with them:
+/// each Nexus operation's, from its scheduled event, for the events that end it; each update's
+/// whose request carried a propagated Nexus context, from its accepted event, for its
+/// completed event; and the propagated context of a run a Nexus handler started, from its
+/// started event or the response, for its close event. Strings are owned by `gpa`.
+const HistoryContexts = struct {
+    gpa: Allocator,
+    /// By the ID of the scheduled or accepted event.
+    by_event: std.AutoHashMapUnmanaged(i64, converter.NexusContext) = .empty,
+    run_result: ?converter.NexusContext = null,
+
+    fn deinit(h: *HistoryContexts) void {
+        var it = h.by_event.valueIterator();
+        while (it.next()) |n| freeNames(h.gpa, n.*);
+        h.by_event.deinit(h.gpa);
+        if (h.run_result) |n| freeNames(h.gpa, n);
+        h.* = undefined;
+    }
+
+    fn freeNames(gpa: Allocator, n: converter.NexusContext) void {
+        gpa.free(n.endpoint);
+        gpa.free(n.service);
+        gpa.free(n.operation);
+    }
+
+    fn dupeNames(h: *HistoryContexts, endpoint: []const u8, service: []const u8, operation: []const u8) error{OutOfMemory}!converter.NexusContext {
+        const e = try h.gpa.dupe(u8, endpoint);
+        errdefer h.gpa.free(e);
+        const s = try h.gpa.dupe(u8, service);
+        errdefer h.gpa.free(s);
+        return .{ .endpoint = e, .service = s, .operation = try h.gpa.dupe(u8, operation) };
+    }
+
+    fn put(h: *HistoryContexts, event_id: i64, endpoint: []const u8, service: []const u8, operation: []const u8) error{OutOfMemory}!converter.NexusContext {
+        if (h.by_event.get(event_id)) |n| return n;
+        try h.by_event.ensureUnusedCapacity(h.gpa, 1);
+        const n = try h.dupeNames(endpoint, service, operation);
+        h.by_event.putAssumeCapacity(event_id, n);
+        return n;
+    }
+
+    fn setRunResult(h: *HistoryContexts, p: proto.temporal.api.nexus.v1.PropagatedSerializationContext) error{OutOfMemory}!void {
+        if (h.run_result != null) return;
+        h.run_result = try h.dupeNames(p.endpoint, p.service, p.operation);
+    }
+
+    /// The Nexus context `event`'s payloads were encoded with, or null for its run's own;
+    /// records what the events after it need. Borrowed from `h`.
+    fn contextOf(h: *HistoryContexts, event: *const HistoryEvent) error{OutOfMemory}!?converter.NexusContext {
+        const attrs = event.attributes orelse return null;
+        switch (attrs) {
+            .workflow_execution_started_event_attributes => |a| if (a.propagated_nexus_serialization_context) |p| try h.setRunResult(p),
+            .workflow_execution_completed_event_attributes, .workflow_execution_failed_event_attributes => return h.run_result,
+            .nexus_operation_scheduled_event_attributes => |a| {
+                if (std.mem.eql(u8, a.endpoint, nexus_system.endpoint)) return null;
+                return try h.put(event.event_id, a.endpoint, a.service, a.operation);
+            },
+            .nexus_operation_completed_event_attributes => |a| return h.by_event.get(a.scheduled_event_id),
+            .nexus_operation_failed_event_attributes => |a| return h.by_event.get(a.scheduled_event_id),
+            .nexus_operation_canceled_event_attributes => |a| return h.by_event.get(a.scheduled_event_id),
+            .nexus_operation_timed_out_event_attributes => |a| return h.by_event.get(a.scheduled_event_id),
+            .nexus_operation_cancel_request_failed_event_attributes => |a| return h.by_event.get(a.scheduled_event_id),
+            .workflow_execution_update_accepted_event_attributes => |a| if (a.accepted_request) |r| if (r.propagated_nexus_serialization_context) |p| {
+                _ = try h.put(event.event_id, p.endpoint, p.service, p.operation);
+            },
+            .workflow_execution_update_completed_event_attributes => |a| return h.by_event.get(a.accepted_event_id),
+            else => {},
+        }
+        return null;
+    }
+};
+
 /// The events of a workflow run's history, from `Client.historyIterator`. Fetches a page
 /// from the server whenever `next` runs past the last one. Owns its memory with the client's
 /// allocator: free it with `deinit`. Not thread-safe.
@@ -6008,9 +6187,12 @@ pub const HistoryIterator = struct {
     /// allocator.
     next_page_token: []u8 = &.{},
     fetched: bool = false,
+    /// What the pages read so far tell the codecs about the pages after them.
+    contexts: HistoryContexts,
 
     pub fn deinit(it: *HistoryIterator) void {
         it.page.deinit();
+        it.contexts.deinit();
         const gpa = it.client.gpa;
         gpa.free(it.workflow_id);
         gpa.free(it.run_id);
@@ -6038,7 +6220,7 @@ pub const HistoryIterator = struct {
         it.index = 0;
         _ = it.page.reset(.retain_capacity);
         const a = it.page.allocator();
-        const response = c.rpc(wfs.GetWorkflowExecutionHistoryResponse, "GetWorkflowExecutionHistory", wfs.GetWorkflowExecutionHistoryRequest{
+        const response = c.rpcCallCoded(wfs.GetWorkflowExecutionHistoryResponse, "GetWorkflowExecutionHistory", wfs.GetWorkflowExecutionHistoryRequest{
             .namespace = c.namespace,
             .execution = .{ .workflow_id = it.workflow_id, .run_id = it.run_id },
             .maximum_page_size = it.options.page_size,
@@ -6049,7 +6231,7 @@ pub const HistoryIterator = struct {
                 .close_event => .HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT,
             },
             .skip_archival = true,
-        }, a) catch |err| switch (err) {
+        }, a, null, null, null, &.{}, .decode, .{ .history = &it.contexts }) catch |err| switch (err) {
             error.AlreadyExists => return error.InvalidResponse,
             else => |e| return e,
         };
@@ -6299,15 +6481,21 @@ pub fn WorkflowRun(comptime T: type) type {
                     closed_empty_pages = 0;
                     continue;
                 }
+                // A run a Nexus handler started encoded its result and failure with the
+                // caller's context, which the server sends with the page.
+                const result_context: converter.Context = if (response.propagated_nexus_serialization_context) |n|
+                    .{ .namespace = c.namespace, .nexus = .{ .endpoint = n.endpoint, .service = n.service, .operation = n.operation } }
+                else
+                    c.workflowContext(run.id, null);
                 switch (attrs) {
                     .workflow_execution_completed_event_attributes => |done| {
                         if (T == void) return;
                         const payloads = done.result orelse return error.InvalidPayload;
                         if (payloads.payloads.items.len == 0) return error.InvalidPayload;
-                        return converter.fromPayloadWithContext(T, arena, &c.workflowContext(run.id, null), payloads.payloads.items[0]);
+                        return converter.fromPayloadWithContext(T, arena, &result_context, payloads.payloads.items[0]);
                     },
                     .workflow_execution_failed_event_attributes => |failed| {
-                        run.failure_ = if (failed.failure) |f| try c.receivedFailure(arena, &c.workflowContext(run.id, null), f) else null;
+                        run.failure_ = if (failed.failure) |f| try c.receivedFailure(arena, &result_context, f) else null;
                         return error.WorkflowFailed;
                     },
                     .workflow_execution_canceled_event_attributes => return error.WorkflowCanceled,
@@ -8586,4 +8774,231 @@ test "a schedule update sends each start header field the callback left as descr
     try testing.expectEqual(edited.fields.items.ptr, (try none.restore(a, edited)).fields.items.ptr);
     const plain = try ScheduleHandle.StoredHeader.snapshot(a, stored, stored);
     try testing.expectEqualStrings("test/wrapped", converter.encodingOf((try plain.restore(a, stored)).fields.items[0].value.?).?);
+}
+
+/// Records, for every payload the codecs encode, the context's identity and Nexus endpoint
+/// and the payload's data.
+const CompletionContextCodec = struct {
+    arena: Allocator,
+    calls: std.ArrayList([]const u8) = .empty,
+
+    fn codec(r: *CompletionContextCodec) converter.PayloadCodec {
+        return .{ .ptr = r, .vtable = &.{ .encode = plain, .decode = plain, .encodeWithContext = encode } };
+    }
+
+    fn plain(_: *anyopaque, arena: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn encode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const r: *CompletionContextCodec = @ptrCast(@alignCast(ptr));
+        for (payloads) |p| try r.calls.append(r.arena, try std.fmt.allocPrint(r.arena, "{s} {s}", .{ try describeContext(r.arena, context), p.data }));
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn describeContext(a: Allocator, context: *const converter.Context) error{OutOfMemory}![]const u8 {
+        const n = context.nexus orelse return std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ context.namespace, context.workflow_id, context.activity_id });
+        return std.fmt.allocPrint(a, "{s}/{s}/{s} nexus={s}/{s}/{s}", .{ context.namespace, context.workflow_id, context.activity_id, n.endpoint, n.service, n.operation });
+    }
+};
+
+/// A value whose payload names the context its hook was called with.
+const CompletionTagged = struct {
+    pub fn toPayloadWithContext(_: CompletionTagged, a: Allocator, context: *const converter.Context) error{OutOfMemory}!converter.Payload {
+        return converter.toPayload(a, try CompletionContextCodec.describeContext(a, context));
+    }
+
+    pub fn fromPayloadWithContext(_: Allocator, _: *const converter.Context, _: converter.Payload) converter.DecodeError!CompletionTagged {
+        return .{};
+    }
+};
+
+test "the activity completion calls code with the Nexus context they are given, and with the activity's otherwise" {
+    // The failed connections are logged as warnings.
+    testing.log_level = .err;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recording: CompletionContextCodec = .{ .arena = a };
+    const codecs = [_]converter.PayloadCodec{recording.codec()};
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .namespace = "ns", .codecs = &codecs });
+    defer c.close();
+    const n: converter.NexusContext = .{ .endpoint = "ep", .service = "svc", .operation = "op" };
+    const options: ActivityCompletionOptions = .{ .nexus_context = n };
+    const id: ActivityId = .{ .workflow_id = "wf", .activity_id = "act" };
+    var by_id_nexus = id;
+    by_id_nexus.nexus_context = n;
+    const tagged: CompletionTagged = .{};
+
+    try testing.expectError(error.RpcFailed, c.completeActivityWithOptions("token", tagged, options));
+    try testing.expectError(error.RpcFailed, c.reportActivityCancellationWithOptions("token", tagged, options));
+    try testing.expect(c.recordActivityHeartbeatWithOptions("token", tagged, options) == error.RpcFailed);
+    try testing.expectError(error.RpcFailed, c.completeActivityById(by_id_nexus, tagged));
+    try testing.expectError(error.RpcFailed, c.reportActivityCancellationById(by_id_nexus, tagged));
+    try testing.expect(c.recordActivityHeartbeatById(by_id_nexus, tagged) == error.RpcFailed);
+    const with_nexus = "ns// nexus=ep/svc/op \"ns// nexus=ep/svc/op\"";
+    try testing.expectEqual(@as(usize, 6), recording.calls.items.len);
+    for (recording.calls.items) |call| try testing.expectEqualStrings(with_nexus, call);
+
+    recording.calls.clearRetainingCapacity();
+    try testing.expectError(error.RpcFailed, c.completeActivity("token", tagged));
+    try testing.expectError(error.RpcFailed, c.completeActivityWithOptions("token", tagged, .{}));
+    try testing.expectError(error.RpcFailed, c.completeActivityById(id, tagged));
+    try testing.expectEqualStrings("ns// \"ns//\"", recording.calls.items[0]);
+    try testing.expectEqualStrings("ns// \"ns//\"", recording.calls.items[1]);
+    try testing.expectEqualStrings("ns/wf/act \"ns/wf/act\"", recording.calls.items[2]);
+}
+
+test "the activity failure calls send the failure through the converter with the Nexus context they are given" {
+    testing.log_level = .err;
+    const Seen = struct {
+        var last: [64]u8 = undefined;
+        var len: usize = 0;
+        fn toFailure(_: *anyopaque, a: Allocator, context: *const converter.Context, _: ?anyerror, f: failure_mod.Failure) error{OutOfMemory}!failure_mod.Failure {
+            const text = try CompletionContextCodec.describeContext(a, context);
+            @memcpy(last[0..text.len], text);
+            len = text.len;
+            return f;
+        }
+        fn fromFailure(_: *anyopaque, _: Allocator, _: *const converter.Context, f: failure_mod.Failure) error{OutOfMemory}!failure_mod.Failure {
+            return f;
+        }
+    };
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .namespace = "ns", .failure_converter = .{ .ptr = undefined, .vtable = &.{ .toFailure = Seen.toFailure, .fromFailure = Seen.fromFailure } } });
+    defer c.close();
+    const n: converter.NexusContext = .{ .endpoint = "ep", .service = "svc", .operation = "op" };
+    try testing.expectError(error.RpcFailed, c.failActivityWithOptions("token", .{ .message = "no" }, .{ .nexus_context = n }));
+    try testing.expectEqualStrings("ns// nexus=ep/svc/op", Seen.last[0..Seen.len]);
+    try testing.expectError(error.RpcFailed, c.failActivityById(.{ .workflow_id = "wf", .activity_id = "act", .nexus_context = n }, .{ .message = "no" }));
+    try testing.expectEqualStrings("ns// nexus=ep/svc/op", Seen.last[0..Seen.len]);
+    try testing.expectError(error.RpcFailed, c.failActivityById(.{ .workflow_id = "wf", .activity_id = "act" }, .{ .message = "no" }));
+    try testing.expectEqualStrings("ns/wf/act", Seen.last[0..Seen.len]);
+    try testing.expectError(error.RpcFailed, c.failActivity("token", .{ .message = "no" }));
+    try testing.expectEqualStrings("ns//", Seen.last[0..Seen.len]);
+}
+
+test "dupeContext copies the Nexus context's names" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var endpoint = "ep".*;
+    const copy = try Client.dupeContext(arena.allocator(), .{ .namespace = "ns", .nexus = .{ .endpoint = &endpoint, .service = "svc", .operation = "op" } });
+    endpoint[0] = 'x';
+    try testing.expectEqualStrings("ep", copy.nexus.?.endpoint);
+    try testing.expectEqualStrings("svc", copy.nexus.?.service);
+    try testing.expectEqualStrings("op", copy.nexus.?.operation);
+    try testing.expect((try Client.dupeContext(arena.allocator(), .{})).nexus == null);
+}
+
+/// Records, for every payload the codecs decode, the context's Nexus endpoint (or its
+/// workflow ID) and the payload's data.
+const HistoryContextCodec = struct {
+    arena: Allocator,
+    calls: std.ArrayList([]const u8) = .empty,
+
+    fn codec(r: *HistoryContextCodec) converter.PayloadCodec {
+        return .{ .ptr = r, .vtable = &.{ .encode = plain, .decode = plain, .decodeWithContext = decode } };
+    }
+
+    fn plain(_: *anyopaque, arena: Allocator, _: Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn decode(ptr: *anyopaque, arena: Allocator, _: Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const r: *HistoryContextCodec = @ptrCast(@alignCast(ptr));
+        for (payloads) |p| {
+            const label = if (context.nexus) |n| try std.fmt.allocPrint(r.arena, "nexus={s}/{s}/{s}", .{ n.endpoint, n.service, n.operation }) else try std.fmt.allocPrint(r.arena, "wf={s}", .{context.workflow_id});
+            try r.calls.append(r.arena, try std.fmt.allocPrint(r.arena, "{s} {s}", .{ label, p.data }));
+        }
+        return arena.dupe(converter.Payload, payloads);
+    }
+};
+
+test "a history's Nexus, update and close events are decoded with the contexts they were encoded with, across pages" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var recording: HistoryContextCodec = .{ .arena = a };
+    const codecs = [_]converter.PayloadCodec{recording.codec()};
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .codecs = &codecs });
+    defer c.close();
+    const hist = proto.temporal.api.history.v1;
+    const payload = struct {
+        fn of(arena: Allocator, data: []const u8) !converter.Payload {
+            return .{ .data = try arena.dupe(u8, data) };
+        }
+        fn failure(arena: Allocator, data: []const u8) !failure_mod.Failure {
+            return .{ .message = "m", .encoded_attributes = try of(arena, data) };
+        }
+    };
+    const propagated: proto.temporal.api.nexus.v1.PropagatedSerializationContext = .{ .endpoint = "caller-ep", .service = "caller-svc", .operation = "caller-op" };
+
+    var first: hist.History = .{};
+    var started: hist.WorkflowExecutionStartedEventAttributes = .{ .propagated_nexus_serialization_context = propagated };
+    started.input = .{};
+    try started.input.?.payloads.append(a, try payload.of(a, "arg"));
+    try first.events.append(a, .{ .event_id = 1, .attributes = .{ .workflow_execution_started_event_attributes = started } });
+    try first.events.append(a, .{ .event_id = 2, .attributes = .{ .nexus_operation_scheduled_event_attributes = .{ .endpoint = "ep", .service = "svc", .operation = "op", .input = try payload.of(a, "in") } } });
+    try first.events.append(a, .{ .event_id = 3, .attributes = .{ .nexus_operation_scheduled_event_attributes = .{ .endpoint = nexus_system.endpoint, .service = "s", .operation = "o", .input = try payload.of(a, "sys-in") } } });
+    var accepted: hist.WorkflowExecutionUpdateAcceptedEventAttributes = .{ .accepted_request = .{ .propagated_nexus_serialization_context = .{ .endpoint = "update-ep", .service = "u-svc", .operation = "u-op" } } };
+    _ = &accepted;
+    try first.events.append(a, .{ .event_id = 4, .attributes = .{ .workflow_execution_update_accepted_event_attributes = accepted } });
+
+    var second: hist.History = .{};
+    try second.events.append(a, .{ .event_id = 5, .attributes = .{ .nexus_operation_completed_event_attributes = .{ .scheduled_event_id = 2, .result = try payload.of(a, "out") } } });
+    try second.events.append(a, .{ .event_id = 6, .attributes = .{ .nexus_operation_failed_event_attributes = .{ .scheduled_event_id = 2, .failure = try payload.failure(a, "failed") } } });
+    try second.events.append(a, .{ .event_id = 7, .attributes = .{ .nexus_operation_canceled_event_attributes = .{ .scheduled_event_id = 2, .failure = try payload.failure(a, "canceled") } } });
+    try second.events.append(a, .{ .event_id = 8, .attributes = .{ .nexus_operation_timed_out_event_attributes = .{ .scheduled_event_id = 2, .failure = try payload.failure(a, "timed-out") } } });
+    try second.events.append(a, .{ .event_id = 9, .attributes = .{ .nexus_operation_cancel_request_failed_event_attributes = .{ .scheduled_event_id = 2, .failure = try payload.failure(a, "cancel-failed") } } });
+    try second.events.append(a, .{ .event_id = 10, .attributes = .{ .nexus_operation_completed_event_attributes = .{ .scheduled_event_id = 3, .result = try payload.of(a, "sys-out") } } });
+    var update_outcome: proto.temporal.api.update.v1.Outcome = .{ .value = .{ .success = .{} } };
+    try update_outcome.value.?.success.payloads.append(a, try payload.of(a, "update-result"));
+    try second.events.append(a, .{ .event_id = 11, .attributes = .{ .workflow_execution_update_completed_event_attributes = .{ .accepted_event_id = 4, .outcome = update_outcome } } });
+    var completed: hist.WorkflowExecutionCompletedEventAttributes = .{ .result = .{} };
+    try completed.result.?.payloads.append(a, try payload.of(a, "result"));
+    try second.events.append(a, .{ .event_id = 12, .attributes = .{ .workflow_execution_completed_event_attributes = completed } });
+
+    var contexts: HistoryContexts = .{ .gpa = testing.allocator };
+    defer contexts.deinit();
+    const base: converter.Context = .{ .namespace = "default", .workflow_id = "wf" };
+    var page1: wfs.GetWorkflowExecutionHistoryResponse = .{ .history = first };
+    try c.decodeHistoryResponse(a, &page1, &base, &contexts);
+    var page2: wfs.GetWorkflowExecutionHistoryResponse = .{ .history = second };
+    try c.decodeHistoryResponse(a, &page2, &base, &contexts);
+
+    const want = [_][]const u8{
+        "wf=wf arg",
+        "nexus=ep/svc/op in",
+        "wf=wf sys-in",
+        "nexus=ep/svc/op out",
+        "nexus=ep/svc/op failed",
+        "nexus=ep/svc/op canceled",
+        "nexus=ep/svc/op timed-out",
+        "nexus=ep/svc/op cancel-failed",
+        "wf=wf sys-out",
+        "nexus=update-ep/u-svc/u-op update-result",
+        "nexus=caller-ep/caller-svc/caller-op result",
+    };
+    for (want) |w| {
+        for (recording.calls.items) |got| {
+            if (std.mem.eql(u8, got, w)) break;
+        } else {
+            std.debug.print("no decode \"{s}\" among:\n", .{w});
+            for (recording.calls.items) |got| std.debug.print("  {s}\n", .{got});
+            return error.TestExpectedDecode;
+        }
+    }
+    try testing.expectEqual(want.len, recording.calls.items.len);
+    // The events keep their order and their decoded payloads.
+    try testing.expectEqual(@as(i64, 2), page1.history.?.events.items[1].event_id);
+    try testing.expectEqualStrings("in", page1.history.?.events.items[1].attributes.?.nexus_operation_scheduled_event_attributes.input.?.data);
+
+    // A page read alone, as a handle's close-event read, takes the run's context from the
+    // response.
+    recording.calls.clearRetainingCapacity();
+    var close: hist.History = .{};
+    try close.events.append(a, .{ .event_id = 12, .attributes = .{ .workflow_execution_completed_event_attributes = completed } });
+    var alone: wfs.GetWorkflowExecutionHistoryResponse = .{ .history = close, .propagated_nexus_serialization_context = propagated };
+    try c.decodeHistoryResponse(a, &alone, &base, null);
+    try testing.expectEqualStrings("nexus=caller-ep/caller-svc/caller-op result", recording.calls.items[0]);
 }
