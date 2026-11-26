@@ -661,6 +661,8 @@ A Worker Deployment is a named set of workers that roll out workflow code a vers
 Notes:
 - `Client.workerDeployment(name)` returns a `client.WorkerDeploymentHandle` without a call. `describe`, `setCurrentVersion`, `setRampingVersion`, and the version methods manage routing.
 - `Client.listWorkerDeployments` lists them, and `StartWorkflowOptions.versioning_override` pins one workflow to a version. The server's refusals are `error.RpcFailed`, logged.
+- A `deployment.VersioningOverride` is `.pinned` (stays on a version until the override is removed), `.auto_upgrade`, or, experimental, `.one_time`: it routes the workflow to a version, current or not, until one workflow task completes there; the server then clears the override and the workflow follows the versioning behavior that worker reported. Set a one-time override at start with `StartWorkflowOptions.versioning_override` (signal-with-start and update-with-start send it too) or on a running workflow with `updateWorkflowExecutionOptions` (`.set = .{ .one_time = version }`), whose `WorkflowExecutionOptions.versioning_override` reports it while it is pending. It needs Temporal Server 1.32.0 or later; an older server, or a version it refuses, is `error.RpcFailed`, logged.
+- A workflow sets an override on a child it starts with `ChildWorkflowOptions.versioning_override` (experimental, any of the three kinds), which routes the child independently of the parent's version; see [Child workflows](#child-workflows).
 
 #### Workflow reset and execution options
 
@@ -1151,8 +1153,9 @@ pub const GreetFamily = workflow.Def("greet_family", greetFamily);
 ```
 
 Notes:
-- `started` returns the child's execution; `error.ChildWorkflowAlreadyStarted` means its ID is taken.
-- `get` returns `error.ChildWorkflowFailed` for a failed, timed-out, canceled, or terminated child, `future.failure()` saying which, and `error.ChildWorkflowAlreadyStarted` when the child's ID is taken.
+- `started` returns the child's execution; `error.ChildWorkflowAlreadyStarted` means its ID is taken, and `error.ChildWorkflowInvalidVersioningOverride` that the server refused the child's `versioning_override`.
+- `get` returns `error.ChildWorkflowFailed` for a failed, timed-out, canceled, or terminated child, `future.failure()` saying which, `error.ChildWorkflowAlreadyStarted` when the child's ID is taken, and `error.ChildWorkflowInvalidVersioningOverride` when the server refused its versioning override. After either start refusal `future.failure()` describes it.
+- `versioning_override` (experimental) runs the child with a versioning behavior other than its definition's, independent of the parent's version: `.{ .pinned = version }`, `.auto_upgrade`, or `.{ .one_time = version }` (see [Worker deployments](#worker-deployments)). Null sends none, and the child follows its definition. It needs Temporal Server 1.32.0 or later. The SDK sends the override as it is, without checking it.
 - `parent_close_policy` defaults to `.terminate`; `future.signal` signals the child and `future.cancel()` cancels it.
 - `priority` sets the child's priority key and fairness key and weight. Null uses the parent's priority; inside a set priority, each zero field inherits the parent's value. The child reads the result in `ctx.info().priority`.
 - `cancellation_type` says what canceling the child does, through `future.cancel()` or by canceling the coroutine waiting in its `get` (which then returns `error.Canceled`):
@@ -1227,6 +1230,7 @@ Notes:
 - Only the workflow function's return continues as new; from a handler the error fails the workflow or rejects the update.
 - `ctx.continueAsNewSuggested()` says when the server suggests it; `historyLength` and `historySizeBytes` give the size.
 - `ContinueAsNewOptions` fields left null keep this run's values; a client waiting on the result follows the chain.
+- Experimental: `ContinueAsNewOptions.initial_versioning_behavior` routes the new run's first workflow task on a task queue with worker deployments. `.auto_upgrade` sends it to the current version (or, for its share, the ramping one), and `.ramping_version` to the ramping version, or the current one when nothing ramps; after that task the run follows its definition's versioning behavior. Null lets the server decide: a pinned run continues on its own version, and an auto-upgrade run moves only after the new run's first workflow task. A pinned versioning override on the run is inherited by the new run regardless.
 - `ContinueAsNewOptions.memo` null or empty keeps this run's memo, `upsertMemo` changes included. If `upsertMemo` removed every key, the new run gets the memo this run started with instead: an empty memo on the command tells the core to keep the start memo, and no command can ask for an empty one.
 
 `workflow.Context.continueAsNewByName` continues as a workflow type named at run time, with the arguments as a tuple. A dynamic workflow uses it to continue under the type it runs as:

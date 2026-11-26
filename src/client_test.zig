@@ -20,6 +20,7 @@ const nexus = @import("nexus.zig");
 const testing_mod = @import("testing.zig");
 const worker_mod = @import("worker.zig");
 const workflow = @import("workflow.zig");
+const deployment = @import("deployment.zig");
 const Client = client_mod.Client;
 const GrpcRequest = bridge.Connection.GrpcRequest;
 
@@ -648,6 +649,44 @@ test "updateWorkflowExecutionOptions sends a priority with its mask path and ret
     // `.{}` is sent as a priority of default fields, which puts the server's back.
     try testing.expectEqual(0, second.workflow_execution_options.?.priority.?.priority_key);
     try testing.expectEqual(2, r.server.callCount());
+}
+
+test "a one-time versioning override is sent on starts, signal-with-starts and options updates, and reported back" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const v1: proto.temporal.api.deployment.v1.WorkerDeploymentVersion = .{ .deployment_name = "rollout", .build_id = "v1" };
+    const answers = [_]Answer{
+        .{ .rpc = "StartWorkflowExecution", .proto = try encodeMessage(arena, wfs.StartWorkflowExecutionResponse{ .run_id = "run-1" }) },
+        .{ .rpc = "SignalWithStartWorkflowExecution", .proto = try encodeMessage(arena, wfs.SignalWithStartWorkflowExecutionResponse{ .run_id = "run-2" }) },
+        .{ .rpc = options_rpc, .proto = try encodeMessage(arena, wfs.UpdateWorkflowExecutionOptionsResponse{ .workflow_execution_options = .{ .versioning_override = .{ .override = .{ .one_time = .{ .target_deployment_version = v1 } } } } }) },
+    };
+    var r: Recorded = undefined;
+    try r.start(&answers);
+    defer r.deinit();
+    const once: deployment.VersioningOverride = .{ .one_time = .{ .deployment_name = "rollout", .build_id = "v1" } };
+
+    var run = try r.client.executeWorkflowByName(void, "WhoRuns", .{ .id = "wf-once", .task_queue = "q", .versioning_override = once }, .{});
+    run.deinit();
+    var signaled = try r.client.signalWithStartWorkflowByName(void, "WhoRuns", .{ .id = "wf-once-2", .task_queue = "q", .versioning_override = once }, .{}, "go", .{});
+    signaled.deinit();
+    const reported = try r.client.updateWorkflowExecutionOptions(arena, "wf-once", "", .{ .versioning_override = .{ .set = once } });
+    try testing.expectEqualDeep(@as(?deployment.VersioningOverride, once), reported.versioning_override);
+
+    const start = try r.request(wfs.StartWorkflowExecutionRequest, arena, 0);
+    const signal_start = try r.request(wfs.SignalWithStartWorkflowExecutionRequest, arena, 1);
+    const update = try r.request(wfs.UpdateWorkflowExecutionOptionsRequest, arena, 2);
+    try expectPaths(&.{"versioning_override"}, update.update_mask);
+    for ([_]?proto.temporal.api.workflow.v1.VersioningOverride{ start.versioning_override, signal_start.versioning_override, update.workflow_execution_options.?.versioning_override }) |sent| {
+        const o = sent orelse return error.TestExpectedOverride;
+        // Only the oneof is set, never the deprecated fields.
+        try testing.expectEqual(enums.VersioningBehavior.VERSIONING_BEHAVIOR_UNSPECIFIED, o.behavior);
+        try testing.expectEqualStrings("", o.pinned_version);
+        const target = o.override.?.one_time.target_deployment_version.?;
+        try testing.expectEqualStrings("rollout", target.deployment_name);
+        try testing.expectEqualStrings("v1", target.build_id);
+    }
+    try testing.expectEqual(3, r.server.callCount());
 }
 
 test "reset and execution options that name no reset point, two, an empty build ID, or no change are error.InvalidOptions before any call" {
