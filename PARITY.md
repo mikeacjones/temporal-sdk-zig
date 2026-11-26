@@ -36,7 +36,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Client RPC retry policy and a client-wide RPC timeout | all | GA | supported | [Connecting](README.md#connecting) |
 | RPC timeout and gRPC metadata on a single call | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |
 | Environment configuration: profiles from a TOML file and environment variables | Go, Python, TypeScript, .NET, Ruby, Java | GA | supported | [Connecting](README.md#connecting), [external-env-conf](samples/external-env-conf) |
-| Environment configuration extensions: extension settings in a profile's ext tables (experimental) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | missing | `temporal-sdk-zig-d51.5.47`. `client.loadOptions` reads profiles through sdk-core and ignores their `ext` tables, so an extension can't reach its settings. |
+| Environment configuration extensions: extension settings in a profile's ext tables (experimental) | Go, Java, Python, TypeScript, .NET, Ruby | pre-release | supported | [Connecting](README.md#connecting) |
 | HTTP CONNECT proxy for the client connection | Python, TypeScript, .NET, Ruby, Go | GA | supported | [Proxy, keep-alive, and worker heartbeats](README.md#proxy-keep-alive-and-worker-heartbeats) |
 | gRPC keep-alive settings | Python, TypeScript, .NET, Ruby | GA | supported | [Proxy, keep-alive, and worker heartbeats](README.md#proxy-keep-alive-and-worker-heartbeats) |
 | Lazy connection, and changing the API key or headers on a connected client | Go, Python, TypeScript, .NET, Ruby | GA | supported | [Connecting](README.md#connecting) |
@@ -204,7 +204,7 @@ Nexus is GA in Go, Java, and Python, and since August 2026 in TypeScript and .NE
 | Nexus endpoints and handlers in tests | Go, Java, Python, TypeScript, .NET | GA | supported | [Serving operations](README.md#serving-operations) |
 | Nexus serialization context: endpoint, service, and operation in the converter context (Nexus Per Endpoint Encryption, Public Preview) | Go, Java, Python, TypeScript, .NET | pre-release | supported | [Payload codecs](README.md#payload-codecs), [Nexus](README.md#nexus), [nexus-serialization-context](samples/nexus-serialization-context) |
 | Temporal operation handlers: operations that start workflows or standalone activities and signal workflows through a Temporal client (Pre-release) | Go, Java, Python, TypeScript, .NET | pre-release | supported | [Activity-backed operations and signals](README.md#activity-backed-operations-and-signals), [nexus-messaging-temporal-operation](samples/nexus-messaging-temporal-operation), [nexus-standalone-activity](samples/nexus-standalone-activity) |
-| Standalone Nexus operations from a client (Public Preview, November 2026) | Go, Java, Python, TypeScript, .NET | pre-release | partial | `temporal-sdk-zig-d51.5.12`. Missing: typed calls to start, describe, and cancel an operation, and their README.md section; today only raw WorkflowService calls through `(try client.currentConnection()).call` reach them. |
+| Standalone Nexus operations from a client (Public Preview, November 2026) | Go, Java, Python, TypeScript, .NET | pre-release | supported | [Standalone operations](README.md#standalone-operations), [nexus-standalone-operations](samples/nexus-standalone-operations) |
 
 ### Others
 
@@ -283,7 +283,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | nexus-multiple-arguments | [nexus-multiple-arguments](samples/nexus-multiple-arguments) | ported |
 | nexus-serialization-context | [nexus-serialization-context](samples/nexus-serialization-context) | ported |
 | nexus-standalone-activity | [nexus-standalone-activity](samples/nexus-standalone-activity) | ported |
-| nexus-standalone-operations | | planned: `temporal-sdk-zig-d51.16.71` |
+| nexus-standalone-operations | [nexus-standalone-operations](samples/nexus-standalone-operations) | ported |
 | opentelemetry | [opentelemetry](samples/opentelemetry) | ported |
 | opentelemetry-v2 | | planned: `temporal-sdk-zig-d51.16.77` |
 | pickfirst | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |

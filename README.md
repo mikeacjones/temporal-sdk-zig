@@ -259,6 +259,36 @@ Notes:
 - `Options.rpc_timeout` (default 30 s) bounds each call, but not waits for a result. It also bounds `connect`: a server that hasn't answered by then, such as one that accepts the connection but never completes the TLS handshake, fails it with `error.ConnectFailed`, logged with the reason. `connect` copies `namespace` and `identity`; `codecs`, `logger`, `propagators`, `worker_interceptors`, and `interceptors` are borrowed and must outlive the client and its workers.
 - `Options.headers` are sent with every call. A name ending in `-bin` (any case) is a gRPC binary header, whose value may be any bytes (gRPC sends it base64-encoded); any other header's value must be visible ASCII, space, or tab. `connect`, `init`, and `reconnect` return `error.InvalidOptions`, logged with the header's name, for a value or name gRPC can't send or two names that differ only in case (a name repeated exactly sends its last value), whether the header was set in code or loaded from `TEMPORAL_GRPC_META_<NAME>` or a profile's `grpc_meta`.
 
+Experimental: separately packaged code can keep its settings in a profile, in a table `[profile.<name>.ext.<extension>]`, and adjust the loaded options with them, for example to fetch the API key from a secrets manager. Give `loadOptions` each such `client.ConfigExtension` in `LoadOptions.extensions`.
+
+<!-- example: client-config-extension -->
+```zig
+/// Sets the API key from the variable its table names:
+///   [profile.prod.ext.secrets]
+///   api_key_env = "MY_TEMPORAL_API_KEY"
+/// A real one might fetch the key from a secrets manager instead.
+fn applySecrets(_: ?*anyopaque, input: temporal.client.ConfigExtensionInput, options: *temporal.client.Options) anyerror!void {
+    const table = input.table orelse return; // this profile has no [ext.secrets] table
+    const name = table.get("api_key_env") orelse return error.MissingApiKeyEnv;
+    if (name != .string) return error.MissingApiKeyEnv;
+    const env = input.env orelse return error.EnvironmentDisabled;
+    const key = env.get(name.string) orelse return error.ApiKeyNotSet;
+    options.api_key = try input.arena.dupe(u8, key); // the env's bytes are borrowed
+    if (options.tls == null) options.tls = .{};
+}
+
+fn loadWithSecrets(arena: std.mem.Allocator) !temporal.client.Options {
+    return temporal.client.loadOptions(arena, .{
+        .profile = "prod",
+        .extensions = &.{.{ .name = "secrets", .apply = applySecrets }},
+    });
+}
+```
+Notes:
+- Extensions run in list order, after the profile and the environment were applied, each on the options the one before left. `apply` gets a `client.ConfigExtensionInput`: `loadOptions`'s arena, the profile's name, its own table as `std.json` values (TOML datetimes as strings; null when the profile has no such table or no config file was read), and a `client.ConfigEnv` that reads `LoadOptions.env` or the process's environment (null with `disable_env`). Values from `ConfigEnv.get` are borrowed: copy what you keep into the arena.
+- An extension that returns an error fails `loadOptions` with `error.InvalidConfig`, logged with its name and the error (`error.OutOfMemory` is returned as itself), and later extensions don't run. An empty name, or a name given twice, fails it the same way before anything is read, and a profile that fails to load fails before any extension runs.
+- `strict` accepts every key under `ext`, whether or not an extension reads it, and still rejects other unknown keys. `loadDefaultOptions` runs no extensions.
+
 `Client.init` takes the same options but connects on first use, so a process can build its client before the server is reachable. `Client.updateApiKey` and `Client.updateHeaders` rotate the API key and the gRPC headers of a client, connected or not.
 
 <!-- example: client-lazy -->
@@ -313,7 +343,7 @@ const running = try quick.countWorkflows("ExecutionStatus = 'Running'");
 Notes:
 - Every call made through the view sends its options: workflow start, signal, query, update, describe, list and count, cancel, terminate and reset, history, schedules, worker deployments, standalone activities, asynchronous activity completion and heartbeats, `checkHealth`, `callService`, and the calls of the handles and iterators the view returns.
 - A view is for single calls: build workers on the client, not on a view. A worker built on a view keeps the view, so `ctx.client()` in its activities and Nexus handlers returns the view and their calls send its timeout and metadata; on a client from `Client.init` that hasn't connected yet, the worker's first connection waits only as long as the view's timeout.
-- `RpcOptions.timeout` replaces `Options.rpc_timeout` for each call (null keeps it). A call that runs out fails with `error.RpcFailed`, logged with gRPC status 1 ("Timeout expired") or 4 (DEADLINE_EXCEEDED). As with `rpc_timeout`, calls that long-poll aren't limited by it: waiting for a workflow's or an activity's result with `get`, for an update to reach its stage or its outcome, and following history with `wait_new_event`. Cancel the calling task to stop those.
+- `RpcOptions.timeout` replaces `Options.rpc_timeout` for each call (null keeps it). A query (`queryWorkflow` and its variants) that runs out returns `error.DeadlineExceeded`, unlogged, so a query that no worker answered in time can be told apart from other failures; a `callService` call that runs out returns `error.DeadlineExceeded` too, logged as a warning unless its `failure` is given; any other call that runs out fails with `error.RpcFailed`, logged with gRPC status 1 ("Timeout expired") or 4 (DEADLINE_EXCEEDED). As with `rpc_timeout`, calls that long-poll aren't limited by it: waiting for a workflow's or an activity's result with `get`, for an update to reach its stage or its outcome, and following history with `wait_new_event`. Cancel the calling task to stop those.
 - `RpcOptions.retry`, when set, decides for every call through the view whether sdk-core retries it with the connection's retry policy (`Options.retry`). Null keeps each call's own choice: the client's operations retry, a workflow reset and `callService` don't. `retry = true` makes a reset retry too, which can reset the workflow twice.
 - `metadata` (ASCII) and `binary_metadata` (names ending in `-bin`, any bytes) are sent along with `Options.headers` and the API key, the long-polls included; for a name in both, the view's value is sent, and an `authorization` entry replaces the API key's. `withRpcOptions` returns `error.InvalidOptions`, logged, for a timeout that isn't positive or a name or value gRPC can't send.
 - The view borrows the client and the options' slices, which must outlive it and the handles it returns. It owns nothing: `close` on it does nothing. `forNamespace` on a view returns a full client without the view's options; a view of a client from `forNamespace` works in that client's namespace.
@@ -3225,9 +3255,46 @@ Notes:
 - `max_concurrent_nexus_task_executions` and `max_concurrent_nexus_task_pollers` bound the requests handled and the polls open at once (see [Options](#options)).
 
 #### Standalone operations
-<!-- stub: temporal-sdk-zig-d51.5.12 -->
-Not implemented yet.
-Planned: starting, describing, and canceling Nexus operations from a client, outside a workflow.
+
+Experimental: a program can start a Nexus operation through an endpoint without a workflow. `client.Client.executeNexusOperation` starts an operation of a service contract and returns a `client.NexusOperationHandle`. `getNexusOperationHandle` gives another handle to it by its operation ID, in this process or another. With a handle, `get` waits for the result, `describe` reports the operation's status, and `cancel` and `terminate` end it. `listNexusOperations` and `countNexusOperations` find operations with a visibility query.
+
+<!-- example: nexus-standalone -->
+```zig
+/// Greets Ziggy through "greeting-endpoint" from a program, without a workflow.
+fn greetStandalone(client: *temporal.client.Client, arena: std.mem.Allocator) ![]const u8 {
+    var started = try client.executeNexusOperation(GreetingService, Greet, .{
+        .id = "greet-ziggy",
+        .endpoint = "greeting-endpoint",
+        .schedule_to_close_timeout = .fromSeconds(60),
+        .summary = "greet Ziggy",
+    }, "Ziggy");
+    defer started.deinit();
+
+    // Any process can follow the operation by its ID.
+    var handle = try client.getNexusOperationHandle([]const u8, "greet-ziggy", "");
+    defer handle.deinit();
+    const result = try handle.get(arena);
+    const description = try handle.describe(arena);
+    std.log.info("{s} through {s}: {t}", .{ description.operation, description.endpoint, description.status });
+
+    var it = try client.listNexusOperations("Endpoint = 'greeting-endpoint'", .{});
+    defer it.deinit();
+    while (try it.next(arena)) |op| std.log.info("{s}: {t}", .{ op.operation_id, op.status });
+    std.log.info("{d} operations", .{try client.countNexusOperations("Endpoint = 'greeting-endpoint'")});
+    return result;
+}
+```
+
+Notes:
+
+- The server must offer standalone Nexus operations, as the dev server does. On a server without them, `executeNexusOperation` returns `error.RpcFailed` and logs the server's reason, as it does for any other option the server refuses (an empty `endpoint`, for one). An endpoint the server doesn't know returns `error.NotFound`.
+- `StartNexusOperationOptions.id` must be unique among the namespace's running standalone operations. An empty ID generates a UUID: read it from `handle.id`. `id_conflict_policy` `.fail` returns `error.NexusOperationExecutionAlreadyStarted` for an ID that is running, and `.use_existing` returns a handle to the running operation, with `handle.started` false. `id_reuse_policy` says whether the ID of a closed operation may be used again.
+- `schedule_to_close_timeout` bounds the whole operation, its start included. `schedule_to_start_timeout` bounds the time until the handler starts it, and `start_to_close_timeout` bounds an asynchronous operation's run. Each is optional. `headers`, `summary`, `search_attributes` and `context` work as they do for a workflow's Nexus calls and for `executeActivity`.
+- `executeNexusOperationByName` calls a service this program has no contract for, by service and operation name. A service that lacks the operation, or an operation whose types differ from the service's, is a compile error naming both.
+- `get` long-polls until the operation closes, however long that takes: `Options.rpc_timeout` and `RpcOptions.timeout` don't cut it short, and canceling the calling task stops it with `error.Canceled`. It returns the result, or `error.NexusOperationFailed`, `NexusOperationCanceled`, `NexusOperationTerminated` or `NexusOperationTimedOut`, with `handle.failure()` saying why. A workflow-run operation whose workflow was terminated or timed out returns the last two, though `describe` reports it `failed`. Each call asks the server again.
+- `cancel` sends the handler a cancel request. A workflow-run operation's workflow is canceled, and the operation ends canceled. An operation that no handler has started yet stays running, with `describe`'s `cancel_requested` true, until the request is delivered. Canceling a running operation again succeeds. `terminate` closes the operation at once, without telling the handler. Both return `error.NexusOperationClosed` when the server refuses because the operation has closed; the dev server still accepts terminating an operation that ended canceled. Every handle method returns `error.NotFound` for an operation that doesn't exist.
+- The input and result go through the payload converter and the client's codecs, in a converter context with the namespace and the call's propagated values.
+- List and count queries are eventually consistent. Operations that workflows call aren't listed. The handle and the iterator own their memory with the client's allocator, so free them with `deinit`. They aren't thread-safe.
 
 ### Contrib
 <!-- stub: temporal-sdk-zig-d51.13.2, temporal-sdk-zig-d51.13.4, temporal-sdk-zig-d51.13.5, temporal-sdk-zig-d51.13.6 -->

@@ -32,6 +32,7 @@ const log_mod = @import("log.zig");
 const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
+const call_check = @import("nexus/call_check.zig");
 const protobuf = @import("protobuf");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -141,14 +142,18 @@ pub const Options = struct {
     /// `.zero` for no heartbeats. Null is sdk-core's 60 s.
     worker_heartbeat_interval: ?Duration = null,
     /// The deadline of each call this client makes, including each retry attempt, and of
-    /// `Client.checkHealth`. A call that runs out fails with `error.RpcFailed`, logged with
-    /// gRPC status 1 (CANCELLED, "Timeout expired"), or 4 (DEADLINE_EXCEEDED) when the server
-    /// gives up first, and isn't retried. Calls that wait on the server, such as
-    /// waiting for a workflow's result or an update's outcome, aren't limited by it, and
-    /// workers' own calls aren't affected. It also bounds `Client.connect`, and the first
-    /// connection of a client from `Client.init`, which a call makes. `RpcOptions.timeout`
-    /// replaces it for the calls of a view from `Client.withRpcOptions`. Null keeps sdk-core's
-    /// default of 30 s. Must be positive; under 1 ms counts as 1 ms.
+    /// `Client.checkHealth`. A call that runs out isn't retried. A query (`queryWorkflow`,
+    /// `queryWorkflowWithOptions`, `queryWorkflowByName` and `queryWorkflowByNameWithOptions`)
+    /// then returns `error.DeadlineExceeded`, unlogged, and `Client.callService` returns
+    /// `error.DeadlineExceeded`, logged as a warning unless its `failure` is given; every
+    /// other call fails with `error.RpcFailed`, logged with gRPC status 1 (CANCELLED,
+    /// "Timeout expired"), or 4 (DEADLINE_EXCEEDED) when the server gives up first. Calls
+    /// that wait on the server, such as waiting for a workflow's result or an update's
+    /// outcome, aren't limited by it, and workers' own calls aren't affected. It also bounds
+    /// `Client.connect`, and the first connection of a client from `Client.init`, which a
+    /// call makes. `RpcOptions.timeout` replaces it for the calls of a view from
+    /// `Client.withRpcOptions`. Null keeps sdk-core's default of 30 s. Must be positive;
+    /// under 1 ms counts as 1 ms.
     rpc_timeout: ?Duration = null,
     /// Log a warning when a payload-carrying field of a request this client or its workers
     /// send is larger than this many bytes: one warning per such field, through `logger`,
@@ -914,13 +919,17 @@ pub const Client = struct {
     /// only as long as the view's timeout.
     ///
     /// `options.timeout` replaces `Options.rpc_timeout` for each call, as that option
-    /// applies: it is the deadline of each call and of each of its retries, a call that runs
-    /// out fails with `error.RpcFailed` (gRPC status 1, "Timeout expired", or 4,
-    /// DEADLINE_EXCEEDED, logged), and a first connection made by a call waits for it. Calls
-    /// that long-poll the server until something happens aren't limited by it: waiting for a
-    /// workflow's or an activity's result (`get` on the handles), for an update to reach its
-    /// wait stage or its outcome, and following history with `wait_new_event`. Cancel the
-    /// calling task to stop those. Null keeps `Options.rpc_timeout`.
+    /// applies: it is the deadline of each call and of each of its retries, and a first
+    /// connection made by a call waits for it. A query (`queryWorkflow`,
+    /// `queryWorkflowWithOptions`, `queryWorkflowByName` and `queryWorkflowByNameWithOptions`)
+    /// that runs out returns `error.DeadlineExceeded`, unlogged; a `callService` call that
+    /// runs out returns `error.DeadlineExceeded` too, logged as a warning unless its `failure`
+    /// is given; any other call that runs out fails with `error.RpcFailed` (gRPC status 1,
+    /// "Timeout expired", or 4, DEADLINE_EXCEEDED, logged). Calls that long-poll the server
+    /// until something happens aren't limited by it: waiting for a workflow's or an
+    /// activity's result (`get` on the handles), for an update to reach its wait stage or its
+    /// outcome, and following history with `wait_new_event`. Cancel the calling task to stop
+    /// those. Null keeps `Options.rpc_timeout`.
     ///
     /// `options.retry`, when set, decides for each call whether sdk-core retries it with
     /// `Options.retry`'s policy. `true` makes a workflow reset retry too, which can reset the
@@ -2632,6 +2641,117 @@ pub const Client = struct {
         };
     }
 
+    /// Experimental: starts `Operation` (a `nexus.OperationDef`) of `NexusService` (a
+    /// `nexus.ServiceDef`) through the endpoint `options.endpoint`, outside any workflow, and
+    /// returns a handle to it. The operation runs wherever the endpoint routes, as it does for
+    /// `workflow.Context.executeNexusOperation`; the handle waits for its result, describes
+    /// it, and cancels or terminates it. `input` is encoded by the payload converter and the
+    /// client's codecs. The server must offer standalone Nexus operations; otherwise, and for
+    /// options it refuses (such as an empty endpoint), the call returns `error.RpcFailed`,
+    /// logging the server's reason. An endpoint the server doesn't know is `error.NotFound`.
+    ///
+    /// `NexusService` must have `Operation`, with the same input and output types: otherwise this
+    /// is a compile error naming the service and the operation.
+    pub fn executeNexusOperation(c: *Client, comptime NexusService: type, comptime Operation: type, options: StartNexusOperationOptions, input: Operation.Input) StartNexusOperationError!NexusOperationHandle(Operation.Output) {
+        if (comptime call_check.callError("Client.executeNexusOperation", NexusService, Operation)) |message| @compileError(message);
+        return c.executeNexusOperationByName(Operation.Output, NexusService.service_name, Operation.operation_name, options, input);
+    }
+
+    /// Experimental: `executeNexusOperation` by service and operation name, for a service
+    /// this program has no contract for. `input` is any value the payload converter encodes;
+    /// `Output` is what the result decodes to (`void` to ignore it).
+    pub fn executeNexusOperationByName(c: *Client, comptime Output: type, service: []const u8, operation: []const u8, options: StartNexusOperationOptions, input: anytype) StartNexusOperationError!NexusOperationHandle(Output) {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const id = if (options.id.len > 0) options.id else try uuid(a, c.io);
+        const values = options.context orelse &propagation.Values.empty;
+        var request: wfs.StartNexusOperationExecutionRequest = .{
+            .namespace = c.namespace,
+            .identity = c.identity,
+            .request_id = try uuid(a, c.io),
+            .operation_id = id,
+            .endpoint = options.endpoint,
+            .service = service,
+            .operation = operation,
+            .schedule_to_close_timeout = proto_time.durationToProto(options.schedule_to_close_timeout),
+            .schedule_to_start_timeout = proto_time.durationToProto(options.schedule_to_start_timeout),
+            .start_to_close_timeout = proto_time.durationToProto(options.start_to_close_timeout),
+            .input = try converter.toPayloadWithContext(a, &.{ .values = values, .namespace = c.namespace }, input),
+            .id_reuse_policy = switch (options.id_reuse_policy) {
+                .unspecified => .NEXUS_OPERATION_ID_REUSE_POLICY_UNSPECIFIED,
+                .allow_duplicate => .NEXUS_OPERATION_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+                .allow_duplicate_failed_only => .NEXUS_OPERATION_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+                .reject_duplicate => .NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE,
+            },
+            .id_conflict_policy = switch (options.id_conflict_policy) {
+                .unspecified => .NEXUS_OPERATION_ID_CONFLICT_POLICY_UNSPECIFIED,
+                .fail => .NEXUS_OPERATION_ID_CONFLICT_POLICY_FAIL,
+                .use_existing => .NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING,
+            },
+        };
+        if (options.search_attributes.len > 0) request.search_attributes = try search_attributes.toProto(a, options.search_attributes, .start);
+        if (options.summary.len > 0) request.user_metadata = .{ .summary = try converter.toPayload(a, options.summary) };
+        // As a workflow's Nexus calls send them: the propagated values replace any header of
+        // their name.
+        const propagated = try propagation.injectNexusHeader(c.propagators, a, values);
+        try request.nexus_header.ensureTotalCapacity(a, options.headers.len + 1);
+        for (options.headers) |h| {
+            if (propagated != null and std.ascii.eqlIgnoreCase(h.name, propagation.nexus_header_name)) continue;
+            request.nexus_header.appendAssumeCapacity(.{ .key = h.name, .value = h.value });
+        }
+        if (propagated) |value| request.nexus_header.appendAssumeCapacity(.{ .key = propagation.nexus_header_name, .value = value });
+        var status: ?RpcStatus = null;
+        const response = c.rpcCall(wfs.StartNexusOperationExecutionResponse, "StartNexusOperationExecution", request, a, &status, null, options.context) catch |err| switch (err) {
+            error.AlreadyExists => return error.NexusOperationExecutionAlreadyStarted,
+            error.RpcFailed => {
+                const st = status orelse return error.RpcFailed;
+                log.err("starting Nexus operation {s} (operation \"{s}\" of service \"{s}\" through endpoint \"{s}\") failed: {s} (gRPC status {d})", .{ id, operation, service, options.endpoint, st.message, st.code });
+                return error.RpcFailed;
+            },
+            else => |e| return e,
+        };
+        var handle = try c.getNexusOperationHandle(Output, id, response.run_id);
+        handle.started = response.started;
+        return handle;
+    }
+
+    /// Experimental: a handle to a standalone Nexus operation started earlier, for example by
+    /// another process. An empty `run_id` follows the latest run of `operation_id`. No call is
+    /// made, so a missing operation shows up as `error.NotFound` from the handle's methods.
+    pub fn getNexusOperationHandle(c: *Client, comptime Output: type, operation_id: []const u8, run_id: []const u8) error{OutOfMemory}!NexusOperationHandle(Output) {
+        const id = try c.gpa.dupe(u8, operation_id);
+        errdefer c.gpa.free(id);
+        return .{ .client = c, .id = id, .run_id = try c.gpa.dupe(u8, run_id) };
+    }
+
+    /// Experimental: lists the standalone Nexus operations (those started with
+    /// `executeNexusOperation`) matching the visibility `query`, such as
+    /// `Endpoint = 'my-endpoint'`; an empty query lists them all. Operations called by
+    /// workflows aren't listed. Eventually consistent, like `listWorkflows`. The iterator
+    /// fetches a page at a time as `next` reaches it; nothing is fetched here. Free it with
+    /// `deinit`.
+    pub fn listNexusOperations(c: *Client, query: []const u8, options: ListNexusOperationsOptions) error{OutOfMemory}!NexusOperationExecutionIterator {
+        return .{ .client = c, .query = try c.gpa.dupe(u8, query), .page_size = options.page_size, .page = .init(c.gpa) };
+    }
+
+    /// Experimental: the number of standalone Nexus operations matching the visibility
+    /// `query` (see `listNexusOperations`); an empty query counts them all.
+    pub fn countNexusOperations(c: *Client, query: []const u8) ListError!u64 {
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var status: ?RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.CountNexusOperationExecutionsResponse, "CountNexusOperationExecutions", wfs.CountNexusOperationExecutionsRequest{
+            .namespace = c.namespace,
+            .query = query,
+        }, a, &status) catch |err| return visibilityError(err, status, "counting Nexus operations", query);
+        return std.math.cast(u64, response.count) orelse {
+            log.err("CountNexusOperationExecutions for query \"{s}\" returned the count {d}", .{ query, response.count });
+            return error.InvalidResponse;
+        };
+    }
+
     /// Creates the schedule `id` and returns a handle to it. Returns
     /// `error.ScheduleAlreadyExists` if a schedule with that ID exists. The server rejects an
     /// invalid spec or action with `error.RpcFailed`, logging why.
@@ -2698,14 +2818,17 @@ pub const Client = struct {
     /// handler's result, decoded into `arena`. An empty `run_id` queries the latest run. A
     /// closed workflow still answers: the server has a worker replay its history. The server
     /// holds a query sent before the workflow's first workflow task completes until it does;
-    /// with no worker polling, the call fails with `error.RpcFailed` when its deadline passes.
+    /// with no worker polling, the call fails with `error.DeadlineExceeded` when its deadline
+    /// (`RpcOptions.timeout` from `withRpcOptions`, or `Options.rpc_timeout`) passes. Any other
+    /// failed call is `error.RpcFailed`, logged.
     pub fn queryWorkflow(c: *Client, comptime Query: type, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: Query.Args) QueryError!Query.Result {
         return c.queryWorkflowWithOptions(Query, arena, workflow_id, run_id, args, .{});
     }
 
     /// `queryWorkflow` with options. Returns `error.QueryFailed` when the handler fails or
-    /// the workflow has no handler for the query type, and `error.QueryRejected` when
-    /// `options.reject_condition` matches the workflow's state.
+    /// the workflow has no handler for the query type, `error.QueryRejected` when
+    /// `options.reject_condition` matches the workflow's state, and `error.DeadlineExceeded`
+    /// when the call's deadline passes first, as in `queryWorkflow`.
     pub fn queryWorkflowWithOptions(c: *Client, comptime Query: type, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: Query.Args, options: QueryOptions) QueryError!Query.Result {
         const context = c.workflowContext(workflow_id, options.context);
         const result = try c.sendQuery(Query.query_name, arena, workflow_id, run_id, try converter.toPayloadsWithContext(arena, &context, args), options);
@@ -2717,23 +2840,37 @@ pub const Client = struct {
     /// with no `workflow.QueryDef`, and returns the handler's result undecoded: decode it
     /// with `get(T, arena)`. The value is absent when the server returns no result payload,
     /// as for a handler that returns nothing. The payload lives in `arena`. Otherwise
-    /// behaves as `queryWorkflow`.
+    /// behaves as `queryWorkflow`, `error.DeadlineExceeded` included.
     pub fn queryWorkflowByName(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: anytype) QueryError!converter.EncodedValue {
         return c.queryWorkflowByNameWithOptions(query_type, arena, workflow_id, run_id, args, .{});
     }
 
     /// `queryWorkflowByName` with options, which behave as in `queryWorkflowWithOptions`:
     /// `error.QueryFailed` when the handler fails or the workflow has no handler named
-    /// `query_type`, and `error.QueryRejected` when `options.reject_condition` matches.
+    /// `query_type`, `error.QueryRejected` when `options.reject_condition` matches, and
+    /// `error.DeadlineExceeded` when the call's deadline passes first.
     pub fn queryWorkflowByNameWithOptions(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, args: anytype, options: QueryOptions) QueryError!converter.EncodedValue {
         const context = try dupeContext(arena, c.workflowContext(workflow_id, options.context));
         return .{ .payload = try c.sendQuery(query_type, arena, workflow_id, run_id, try converter.toPayloadsWithContext(arena, context, args), options), .context = context };
+    }
+
+    /// Whether a query that failed with gRPC status `code` and `message` after `elapsed_ms`
+    /// ran out of its deadline `deadline_ms` (0 for none), by `callService`'s rule: sdk-core
+    /// reports its own deadline as CANCELLED with "Timeout expired", the server's is
+    /// DEADLINE_EXCEEDED, and the server's stream reset at the same deadline arrives as
+    /// CANCELLED without the message once the call has run for its whole deadline.
+    fn isQueryDeadline(code: u32, message: []const u8, deadline_ms: u32, elapsed_ms: i64) bool {
+        if (code == 4) return true;
+        if (code != 1) return false;
+        return std.mem.indexOf(u8, message, "Timeout expired") != null or (deadline_ms > 0 and elapsed_ms >= deadline_ms);
     }
 
     /// Sends a query and returns its first result payload, or null when there is none.
     fn sendQuery(c: *Client, query_type: []const u8, arena: Allocator, workflow_id: []const u8, run_id: []const u8, query_args: std.ArrayList(converter.Payload), options: QueryOptions) QueryError!?converter.Payload {
         var status: ?RpcStatus = null;
         var header = try c.outgoingHeader(arena, options.context);
+        const deadline_ms = c.callDeadlineMs();
+        const started = Io.Timestamp.now(c.io, .awake);
         const response = c.rpcCall(wfs.QueryWorkflowResponse, "QueryWorkflow", wfs.QueryWorkflowRequest{
             .namespace = c.namespace,
             .execution = .{ .workflow_id = workflow_id, .run_id = run_id },
@@ -2748,6 +2885,9 @@ pub const Client = struct {
             error.RpcFailed => {
                 const s = status orelse return error.RpcFailed;
                 if (options.failure_message) |m| m.* = s.message;
+                // Not logged: the caller asked for the deadline.
+                if (isQueryDeadline(s.code, s.message, deadline_ms, started.durationTo(Io.Timestamp.now(c.io, .awake)).toMilliseconds()))
+                    return error.DeadlineExceeded;
                 // The server reports a failed query (a handler error or an unknown query
                 // type) as INVALID_ARGUMENT carrying a QueryFailedFailure detail.
                 if (s.code == 3 and s.hasDetail("temporal.api.errordetails.v1.QueryFailedFailure", arena)) return error.QueryFailed;
@@ -3161,7 +3301,7 @@ pub const Client = struct {
     /// The deadline `send` gives a call: `rpc_timeout_ms`, or 0 (sdk-core's default) for a
     /// call that waits on the server for as long as it takes.
     fn callTimeoutMs(comptime Request: type, comptime method: []const u8, request: *const Request, rpc_timeout_ms: u32) u32 {
-        const waits = comptime for ([_][]const u8{ "UpdateWorkflowExecution", "ExecuteMultiOperation", "PollWorkflowExecutionUpdate", "PollActivityExecution" }) |m| {
+        const waits = comptime for ([_][]const u8{ "UpdateWorkflowExecution", "ExecuteMultiOperation", "PollWorkflowExecutionUpdate", "PollActivityExecution", "PollNexusOperationExecution" }) |m| {
             if (std.mem.eql(u8, m, method)) break true;
         } else false;
         if (waits) return 0;
@@ -4916,6 +5056,474 @@ pub const ActivityExecutionIterator = struct {
     }
 };
 
+/// Experimental: how `Client.executeNexusOperation` starts a standalone Nexus operation.
+/// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
+/// sent as the longest one it can; a negative one is sent as it is.
+pub const StartNexusOperationOptions = struct {
+    /// Operation ID, unique among the namespace's running standalone Nexus operations.
+    /// Empty generates a random UUID; read it from the handle.
+    id: []const u8 = "",
+    /// The name of the Nexus endpoint to call through. It must exist on the server: an
+    /// operator creates it, routing to a namespace and task queue (in tests,
+    /// `testing.WorkflowEnvironment.createNexusEndpoint`). One the server doesn't know is
+    /// `error.NotFound`; an empty one `error.RpcFailed`.
+    endpoint: []const u8,
+    /// How long the operation may take, its start included; the server retries the start
+    /// until then. Null leaves the server's limit.
+    schedule_to_close_timeout: ?Duration = null,
+    /// How long the handler may take to start the operation (or complete a synchronous one).
+    /// Null: no limit.
+    schedule_to_start_timeout: ?Duration = null,
+    /// How long an asynchronous operation may run once started. Null: no limit.
+    start_to_close_timeout: ?Duration = null,
+    /// Whether an ID of an operation that has closed may be reused.
+    id_reuse_policy: enum { unspecified, allow_duplicate, allow_duplicate_failed_only, reject_duplicate } = .unspecified,
+    /// What starting an ID that is still running does: `.fail` returns
+    /// `error.NexusOperationExecutionAlreadyStarted`, `.use_existing` returns a handle to the
+    /// running operation.
+    id_conflict_policy: enum { unspecified, fail, use_existing } = .unspecified,
+    /// Indexed values for `Client.listNexusOperations` queries, built with
+    /// `search_attributes.Key.set`; unsets are ignored. Only read while starting.
+    search_attributes: []const search_attributes.Update = &.{},
+    /// Nexus headers sent with the start request (names are case-insensitive), as
+    /// `workflow.NexusOperationOptions.headers`: they reach the handler as they are, without
+    /// the payload codecs, so don't put secrets in them. When the client's propagators write
+    /// values, the request carries these headers without any named
+    /// `propagation.nexus_header_name` (ignoring case), and that header holding the values.
+    /// The slice isn't modified.
+    headers: []const NexusHeader = &.{},
+    /// A single-line description of the operation for the UI and CLI, stored as a JSON
+    /// string payload (through the codecs); empty sends none. Read it back as
+    /// `NexusOperationDescription.summary`.
+    summary: []const u8 = "",
+    /// Values the client's propagators write into the request's Nexus header; the handler
+    /// reads them with `ctx.propagated()`. Only read during the call.
+    context: ?*const propagation.Values = null,
+};
+
+/// Experimental: the errors of `Client.executeNexusOperation`.
+pub const StartNexusOperationError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
+    OutOfMemory,
+    Canceled,
+    /// Also options or a server the call can't work with; the server's reason is logged.
+    RpcFailed,
+    /// The client's namespace or the endpoint doesn't exist.
+    NotFound,
+    InvalidResponse,
+    /// An operation with this ID is running and `id_conflict_policy` isn't `.use_existing`,
+    /// or `id_reuse_policy` refuses the ID of a closed one.
+    NexusOperationExecutionAlreadyStarted,
+    /// `StartNexusOperationOptions.search_attributes` holds a value the server can't index
+    /// (logged).
+    InvalidSearchAttribute,
+};
+
+/// Experimental: the errors of `NexusOperationHandle.get`.
+pub const NexusOperationResultError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    /// No such operation.
+    NotFound,
+    InvalidResponse,
+    InvalidPayload,
+    UnknownEncoding,
+    WrongArgumentCount,
+    /// The operation failed; read why with `failure()`.
+    NexusOperationFailed,
+    /// The operation was canceled, as `NexusOperationHandle.cancel` asks.
+    NexusOperationCanceled,
+    /// The operation, or the workflow of a workflow-run operation, was terminated.
+    NexusOperationTerminated,
+    /// A timeout of `StartNexusOperationOptions`, or of a workflow-run operation's workflow,
+    /// passed.
+    NexusOperationTimedOut,
+};
+
+/// Experimental: the errors of `NexusOperationHandle.describe`, `cancel` and `terminate`.
+pub const NexusOperationError = error{
+    /// A payload codec (`Options.codecs`) failed; logged.
+    CodecFailed,
+    OutOfMemory,
+    Canceled,
+    RpcFailed,
+    /// No such operation.
+    NotFound,
+    InvalidResponse,
+    /// `cancel` or `terminate` of an operation that has already closed. Not for a repeated
+    /// `cancel` of a running one, which succeeds.
+    NexusOperationClosed,
+};
+
+/// Experimental: where a standalone Nexus operation is in its lifecycle. Values match the
+/// server's; the enum is open so a status added by a newer server is kept rather than
+/// rejected.
+pub const NexusOperationExecutionStatus = enum(i32) {
+    unspecified = 0,
+    running = 1,
+    completed = 2,
+    failed = 3,
+    canceled = 4,
+    terminated = 5,
+    timed_out = 6,
+    _,
+};
+
+/// Experimental: a standalone Nexus operation as `NexusOperationHandle.describe` reports it.
+/// Every slice borrows the arena passed to `describe`.
+pub const NexusOperationDescription = struct {
+    operation_id: []const u8,
+    run_id: []const u8,
+    endpoint: []const u8,
+    service: []const u8,
+    operation: []const u8,
+    status: NexusOperationExecutionStatus,
+    /// Attempts made to deliver the start request, from 1.
+    attempt: i32,
+    schedule_time: ?Io.Timestamp,
+    /// Null while the operation is running.
+    close_time: ?Io.Timestamp,
+    /// Null when the server reports none.
+    schedule_to_close_timeout: ?Duration,
+    /// Set once an asynchronous operation has started; empty otherwise.
+    operation_token: []const u8,
+    /// Whether cancellation has been requested. An operation whose handler hasn't started it
+    /// stays running, with this true, until the request is delivered.
+    cancel_requested: bool,
+    /// Read a value with `search_attributes.get(arena, key)`.
+    search_attributes: search_attributes.View,
+    /// `StartNexusOperationOptions.summary`; empty without one.
+    summary: []const u8,
+    /// The server's record, with the last attempt's failure, for anything not lifted into the
+    /// fields above.
+    raw: proto.temporal.api.nexus.v1.NexusOperationExecutionInfo,
+};
+
+/// Experimental: how `Client.listNexusOperations` pages.
+pub const ListNexusOperationsOptions = struct {
+    /// Operations per page; 0 uses the server's default.
+    page_size: u31 = 0,
+};
+
+/// Experimental: a standalone Nexus operation as a visibility query
+/// (`Client.listNexusOperations`) reports it. Every slice borrows the arena passed to
+/// `NexusOperationExecutionIterator.next`.
+pub const NexusOperationExecutionInfo = struct {
+    operation_id: []const u8,
+    run_id: []const u8,
+    endpoint: []const u8,
+    service: []const u8,
+    operation: []const u8,
+    status: NexusOperationExecutionStatus,
+    schedule_time: ?Io.Timestamp,
+    /// Null while the operation is running.
+    close_time: ?Io.Timestamp,
+    /// Read a value with `search_attributes.get(arena, key)`.
+    search_attributes: search_attributes.View,
+    /// The server's record, for anything not lifted into the fields above.
+    raw: proto.temporal.api.nexus.v1.NexusOperationExecutionListInfo,
+};
+
+/// Experimental: a standalone Nexus operation, from `Client.executeNexusOperation` or
+/// `Client.getNexusOperationHandle`, whose result decodes as `T`. Owns its IDs with the
+/// client's allocator; free with `deinit`. Not thread-safe.
+pub fn NexusOperationHandle(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        client: *Client,
+        id: []u8,
+        /// Empty when the handle follows the latest run of `id`.
+        run_id: []u8,
+        /// From `Client.executeNexusOperation`: true when the call started a new operation,
+        /// false when `StartNexusOperationOptions.id_conflict_policy = .use_existing` returned
+        /// the one already running with the ID. Always false from
+        /// `Client.getNexusOperationHandle`.
+        started: bool = false,
+        failure_: ?failure_mod.Failure = null,
+
+        pub fn deinit(h: *Self) void {
+            h.client.gpa.free(h.id);
+            h.client.gpa.free(h.run_id);
+            h.* = undefined;
+        }
+
+        /// Waits for the operation to close and returns its result, decoded into `arena`
+        /// with any failure. The wait is not cut short by `Options.rpc_timeout` or
+        /// `RpcOptions.timeout`; cancel the calling task to stop it (`error.Canceled`). Each
+        /// call asks the server again.
+        pub fn get(h: *Self, arena: Allocator) NexusOperationResultError!T {
+            const c = h.client;
+            h.failure_ = null;
+            const outcome = while (true) {
+                // Each call is a long poll the server may end before the operation closes.
+                var status: ?Client.RpcStatus = null;
+                const response = c.rpcWithStatus(wfs.PollNexusOperationExecutionResponse, "PollNexusOperationExecution", wfs.PollNexusOperationExecutionRequest{
+                    .namespace = c.namespace,
+                    .operation_id = h.id,
+                    .run_id = h.run_id,
+                    .wait_stage = .NEXUS_OPERATION_WAIT_STAGE_CLOSED,
+                }, arena, &status) catch |err| switch (err) {
+                    error.AlreadyExists => return error.InvalidResponse,
+                    error.RpcFailed => {
+                        const s = status orelse return error.RpcFailed;
+                        // DEADLINE_EXCEEDED: the long poll ran out of time.
+                        if (s.code == 4) continue;
+                        log.err("waiting for the result of Nexus operation {s} failed: {s} (gRPC status {d})", .{ h.id, s.message, s.code });
+                        return error.RpcFailed;
+                    },
+                    else => |e| return e,
+                };
+                if (response.outcome) |o| break o;
+            };
+            const context: converter.Context = .{ .namespace = c.namespace };
+            switch (outcome) {
+                .result => |payload| {
+                    if (T == void) return;
+                    return converter.fromPayloadWithContext(T, arena, &context, payload);
+                },
+                .failure => |received| {
+                    const f = try c.receivedFailure(arena, &context, received);
+                    h.failure_ = f;
+                    return failureError(&f);
+                },
+            }
+        }
+
+        /// The error `get` returns for the operation's failure `f`. A failure wrapped as a
+        /// Nexus operation failure, as a workflow caller sees it, is classified by its cause.
+        fn failureError(f: *const failure_mod.Failure) NexusOperationResultError {
+            var info = f.failure_info orelse return error.NexusOperationFailed;
+            if (info == .nexus_operation_execution_failure_info) {
+                const cause = f.cause orelse return error.NexusOperationFailed;
+                info = cause.failure_info orelse return error.NexusOperationFailed;
+            }
+            return switch (info) {
+                .canceled_failure_info => error.NexusOperationCanceled,
+                .terminated_failure_info => error.NexusOperationTerminated,
+                .timeout_failure_info => error.NexusOperationTimedOut,
+                else => error.NexusOperationFailed,
+            };
+        }
+
+        /// Why the operation didn't complete, after `get` returned
+        /// `error.NexusOperationFailed`, `NexusOperationCanceled`, `NexusOperationTerminated` or
+        /// `NexusOperationTimedOut`. Borrows the arena passed to `get`.
+        pub fn failure(h: *const Self) ?*const failure_mod.Failure {
+            return if (h.failure_) |*f| f else null;
+        }
+
+        /// The operation's endpoint, service, status, attempt and times. The description
+        /// and all its memory come from `arena`.
+        pub fn describe(h: *const Self, arena: Allocator) NexusOperationError!NexusOperationDescription {
+            const c = h.client;
+            const response = c.rpc(wfs.DescribeNexusOperationExecutionResponse, "DescribeNexusOperationExecution", wfs.DescribeNexusOperationExecutionRequest{
+                .namespace = c.namespace,
+                .operation_id = h.id,
+                .run_id = h.run_id,
+            }, arena) catch |err| switch (err) {
+                error.AlreadyExists => return error.InvalidResponse,
+                else => |e| return e,
+            };
+            const info = response.info orelse {
+                log.err("DescribeNexusOperationExecution for Nexus operation {s} returned no operation info", .{h.id});
+                return error.InvalidResponse;
+            };
+            return .{
+                .operation_id = info.operation_id,
+                .run_id = info.run_id,
+                .endpoint = info.endpoint,
+                .service = info.service,
+                .operation = info.operation,
+                .status = @fromBackingInt(@intCast(@backingInt(info.status))),
+                .attempt = info.attempt,
+                .schedule_time = proto_time.timestampFromProto(info.schedule_time),
+                .close_time = proto_time.timestampFromProto(info.close_time),
+                .schedule_to_close_timeout = proto_time.durationFromProto(info.schedule_to_close_timeout),
+                .operation_token = info.operation_token,
+                .cancel_requested = info.cancellation_info != null,
+                .search_attributes = try .fromProto(arena, info.search_attributes),
+                .summary = summary: {
+                    const md = info.user_metadata orelse break :summary "";
+                    const p = md.summary orelse break :summary "";
+                    break :summary converter.fromPayload([]const u8, arena, p) catch |err| {
+                        log.err("DescribeNexusOperationExecution for Nexus operation {s} returned a summary that doesn't decode as a string: {t}", .{ h.id, err });
+                        return error.InvalidResponse;
+                    };
+                },
+                .raw = info,
+            };
+        }
+
+        /// Requests the operation's cancellation; the handler gets the request as a Nexus
+        /// cancel, and `get` returns `error.NexusOperationCanceled` once the operation ends
+        /// canceled. An operation whose handler hasn't started it stays running until the
+        /// request is delivered. `reason` is recorded with the request. Canceling a running
+        /// operation again succeeds without a new request. Returns
+        /// `error.NexusOperationClosed` if the operation has already closed.
+        pub fn cancel(h: *const Self, reason: []const u8) NexusOperationError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.RequestCancelNexusOperationExecutionResponse, "RequestCancelNexusOperationExecution", wfs.RequestCancelNexusOperationExecutionRequest{
+                .namespace = c.namespace,
+                .operation_id = h.id,
+                .run_id = h.run_id,
+                .identity = c.identity,
+                .request_id = try uuid(a, c.io),
+                .reason = reason,
+            }, a, &status) catch |err| return h.controlError(err, status, "canceling");
+        }
+
+        /// Terminates the operation: it closes at once, without telling the handler, and `get`
+        /// returns `error.NexusOperationTerminated`. `reason` is recorded. Returns
+        /// `error.NexusOperationClosed` when the server refuses because the operation has
+        /// closed; the dev server still accepts terminating one that ended canceled.
+        pub fn terminate(h: *const Self, reason: []const u8) NexusOperationError!void {
+            const c = h.client;
+            var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var status: ?Client.RpcStatus = null;
+            _ = c.rpcWithStatus(wfs.TerminateNexusOperationExecutionResponse, "TerminateNexusOperationExecution", wfs.TerminateNexusOperationExecutionRequest{
+                .namespace = c.namespace,
+                .operation_id = h.id,
+                .run_id = h.run_id,
+                .identity = c.identity,
+                .request_id = try uuid(a, c.io),
+                .reason = reason,
+            }, a, &status) catch |err| return h.controlError(err, status, "terminating");
+        }
+
+        /// The operation's status and whether its cancellation was requested, for
+        /// `controlError`. Unlike `describe`, nothing of the record's payloads is read or
+        /// decoded (its summary, search attributes, header or last failure), so the answer
+        /// doesn't depend on this client having the codecs or failure converter of the client
+        /// that started the operation.
+        fn lifecycle(h: *const Self, arena: Allocator) NexusOperationError!struct { status: NexusOperationExecutionStatus, cancel_requested: bool } {
+            const c = h.client;
+            const response = c.rpcUndecoded(wfs.DescribeNexusOperationExecutionResponse, "DescribeNexusOperationExecution", wfs.DescribeNexusOperationExecutionRequest{
+                .namespace = c.namespace,
+                .operation_id = h.id,
+                .run_id = h.run_id,
+            }, arena) catch |err| switch (err) {
+                error.AlreadyExists => return error.InvalidResponse,
+                else => |e| return e,
+            };
+            const info = response.info orelse {
+                log.err("DescribeNexusOperationExecution for Nexus operation {s} returned no operation info", .{h.id});
+                return error.InvalidResponse;
+            };
+            return .{ .status = @fromBackingInt(@intCast(@backingInt(info.status))), .cancel_requested = info.cancellation_info != null };
+        }
+
+        /// The outcome of a refused `cancel` or `terminate`. The server answers
+        /// FAILED_PRECONDITION both for a closed operation and for a cancel of a running one
+        /// whose cancellation was already requested, so the operation's status tells them
+        /// apart (read by `lifecycle`, without decoding the record): a repeated cancel
+        /// succeeds, as the request it asks for is recorded.
+        fn controlError(h: *const Self, err: Client.RpcError, status: ?Client.RpcStatus, comptime what: []const u8) NexusOperationError!void {
+            switch (err) {
+                error.AlreadyExists => return error.InvalidResponse,
+                error.RpcFailed => {
+                    const s = status orelse return error.RpcFailed;
+                    if (s.code != 9) {
+                        log.err(what ++ " Nexus operation {s} failed: {s} (gRPC status {d})", .{ h.id, s.message, s.code });
+                        return error.RpcFailed;
+                    }
+                    var arena_state: std.heap.ArenaAllocator = .init(h.client.gpa);
+                    defer arena_state.deinit();
+                    const state = try h.lifecycle(arena_state.allocator());
+                    switch (state.status) {
+                        .completed, .failed, .canceled, .terminated, .timed_out => return error.NexusOperationClosed,
+                        .running, .unspecified, _ => {
+                            if (comptime std.mem.eql(u8, what, "canceling")) if (state.cancel_requested) return;
+                            log.warn(what ++ " Nexus operation {s} failed: {s} (gRPC status {d})", .{ h.id, s.message, s.code });
+                            return error.RpcFailed;
+                        },
+                    }
+                },
+                else => |e| return e,
+            }
+        }
+    };
+}
+
+/// Experimental: the standalone Nexus operations matching a visibility query, from
+/// `Client.listNexusOperations`. Fetches a page from the server whenever `next` runs past the
+/// last one. Owns its memory with the client's allocator: free it with `deinit`. Not
+/// thread-safe.
+pub const NexusOperationExecutionIterator = struct {
+    client: *Client,
+    query: []u8,
+    page_size: u31,
+    /// Holds the current page.
+    page: std.heap.ArenaAllocator,
+    executions: []const proto.temporal.api.nexus.v1.NexusOperationExecutionListInfo = &.{},
+    index: usize = 0,
+    /// Where the next page starts; empty after the last page. Owned with the client's
+    /// allocator.
+    next_page_token: []u8 = &.{},
+    fetched: bool = false,
+
+    pub fn deinit(it: *NexusOperationExecutionIterator) void {
+        it.page.deinit();
+        it.client.gpa.free(it.query);
+        it.client.gpa.free(it.next_page_token);
+        it.* = undefined;
+    }
+
+    /// The next matching operation, copied into `arena`, or null after the last one. A
+    /// failed fetch can be retried by calling `next` again.
+    pub fn next(it: *NexusOperationExecutionIterator, arena: Allocator) ListError!?NexusOperationExecutionInfo {
+        // The server may return an empty page that still has a token.
+        while (it.index == it.executions.len) {
+            if (it.fetched and it.next_page_token.len == 0) return null;
+            try it.fetch();
+        }
+        const raw = try it.executions[it.index].dupe(arena);
+        it.index += 1;
+        return .{
+            .operation_id = raw.operation_id,
+            .run_id = raw.run_id,
+            .endpoint = raw.endpoint,
+            .service = raw.service,
+            .operation = raw.operation,
+            .status = @fromBackingInt(@intCast(@backingInt(raw.status))),
+            .schedule_time = proto_time.timestampFromProto(raw.schedule_time),
+            .close_time = proto_time.timestampFromProto(raw.close_time),
+            .search_attributes = try .fromProto(arena, raw.search_attributes),
+            .raw = raw,
+        };
+    }
+
+    fn fetch(it: *NexusOperationExecutionIterator) ListError!void {
+        const c = it.client;
+        it.executions = &.{};
+        it.index = 0;
+        _ = it.page.reset(.retain_capacity);
+        const a = it.page.allocator();
+        var status: ?Client.RpcStatus = null;
+        const response = c.rpcWithStatus(wfs.ListNexusOperationExecutionsResponse, "ListNexusOperationExecutions", wfs.ListNexusOperationExecutionsRequest{
+            .namespace = c.namespace,
+            .page_size = it.page_size,
+            .next_page_token = it.next_page_token,
+            .query = it.query,
+        }, a, &status) catch |err| return Client.visibilityError(err, status, "listing Nexus operations", it.query);
+        const token = try c.gpa.dupe(u8, response.next_page_token);
+        c.gpa.free(it.next_page_token);
+        it.next_page_token = token;
+        it.executions = response.operations.items;
+        it.fetched = true;
+    }
+};
+
 pub const CreateScheduleError = error{
     /// A payload codec (`Options.codecs`) failed; logged.
     CodecFailed,
@@ -5638,8 +6246,8 @@ pub const HistoryIterator = struct {
 pub const QueryOptions = struct {
     /// When the server rejects the query instead of sending it to the workflow.
     reject_condition: QueryRejectCondition = .none,
-    /// On `error.QueryFailed` (or `error.RpcFailed`), receives the server's message, allocated
-    /// from the query's arena: the handler's error name, or for an unknown query type a
+    /// On `error.QueryFailed` (or `error.RpcFailed` or `error.DeadlineExceeded`), receives the
+    /// server's or the transport's message, allocated from the query's arena: the handler's error name, or for an unknown query type a
     /// message listing the workflow's registered query types.
     failure_message: ?*[]const u8 = null,
     /// On `error.QueryRejected`, receives the workflow's status.
@@ -5673,6 +6281,9 @@ pub const QueryError = error{
     QueryFailed,
     /// The workflow's state matched `QueryOptions.reject_condition`.
     QueryRejected,
+    /// The call's deadline (`RpcOptions.timeout` or `Options.rpc_timeout`) passed before an
+    /// answer came, for example because no worker is polling.
+    DeadlineExceeded,
 };
 
 /// Where a workflow run is in its lifecycle. Values match the server's; the enum is open so
@@ -6060,6 +6671,8 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
 /// TEMPORAL_TLS_CLIENT_KEY_PATH (or `_DATA`) and TEMPORAL_GRPC_META_<NAME> override the
 /// profile's values. TEMPORAL_TLS must be `true`, `false`, `1` or `0`, in any case:
 /// `loadOptions` returns `error.InvalidConfig` for any other value instead of guessing.
+/// A profile may also hold tables `[profile.<name>.ext.<extension>]`, read only by the
+/// `extensions` given; `strict` accepts any key under `ext`.
 pub const LoadOptions = struct {
     /// The profile to read from the config file. Empty uses TEMPORAL_PROFILE, then "default";
     /// a profile named here or by TEMPORAL_PROFILE must exist, "default" need not.
@@ -6078,6 +6691,58 @@ pub const LoadOptions = struct {
     strict: bool = false,
     /// The environment variables to read instead of the process's.
     env: ?*const std.process.Environ.Map = null,
+    /// Experimental: may change or be removed without notice. Extensions run in order on the
+    /// loaded options, after the profile and the environment were applied. Only read during
+    /// the call.
+    extensions: []const ConfigExtension = &.{},
+};
+
+/// Experimental: may change or be removed without notice. A separately packaged reader of
+/// `[profile.<profile>.ext.<name>]`, which `loadOptions` runs when it is in
+/// `LoadOptions.extensions`, for example to fetch an API key from a secrets manager.
+pub const ConfigExtension = struct {
+    /// The key of its table under the profile's `ext`. Not empty, and unique in the list.
+    name: []const u8,
+    /// Passed to `apply`.
+    ptr: ?*anyopaque = null,
+    /// Reads `input` and changes `options`. An error fails `loadOptions`: `error.OutOfMemory`
+    /// as itself, any other as `error.InvalidConfig` with the extension's name and the error
+    /// logged.
+    apply: *const fn (ptr: ?*anyopaque, input: ConfigExtensionInput, options: *Options) anyerror!void,
+};
+
+/// Experimental: may change or be removed without notice. What `loadOptions` gives a
+/// `ConfigExtension`.
+pub const ConfigExtensionInput = struct {
+    /// `loadOptions`'s arena: allocate what is stored in `options` from it.
+    arena: Allocator,
+    /// The profile that was loaded: `LoadOptions.profile`, else TEMPORAL_PROFILE, else
+    /// "default".
+    profile: []const u8,
+    /// The extension's own table as parsed values (TOML datetimes are strings); null when the
+    /// profile has no `ext.<name>` table or no config file was read. Lives in `arena`.
+    table: ?std.json.ObjectMap,
+    /// The environment `loadOptions` reads; null with `LoadOptions.disable_env`.
+    env: ?ConfigEnv,
+};
+
+/// Experimental: may change or be removed without notice. The environment a
+/// `ConfigExtension` reads: `LoadOptions.env`, or the process's when that is null.
+pub const ConfigEnv = struct {
+    map: ?*const std.process.Environ.Map,
+
+    /// The value of the variable `name`, or null. Borrows the map or the process environment:
+    /// copy it into the arena before storing it in `Options`.
+    pub fn get(e: ConfigEnv, name: []const u8) ?[]const u8 {
+        if (e.map) |m| return m.get(name);
+        var i: usize = 0;
+        while (std.c.environ[i]) |line| : (i += 1) {
+            const kv = std.mem.span(line);
+            if (kv.len > name.len and kv[name.len] == '=' and std.mem.eql(u8, kv[0..name.len], name))
+                return kv[name.len + 1 ..];
+        }
+        return null;
+    }
 };
 
 pub const LoadError = error{ OutOfMemory, InvalidConfig };
@@ -6092,9 +6757,23 @@ pub const LoadError = error{ OutOfMemory, InvalidConfig };
 /// isn't UTF-8, return `error.InvalidConfig`, with the reason logged. Each
 /// TEMPORAL_GRPC_META_<NAME> becomes a header named <name> in lower case with `_` as `-`
 /// (an empty value removes the profile's header), its value kept as bytes, so it is checked
-/// with the other `Options.headers` when the client is created. Strings are allocated from
-/// `arena`.
+/// with the other `Options.headers` when the client is created. Then each of
+/// `options.extensions` runs, in order, on the options loaded so far (experimental): an
+/// extension with an empty name or a name given twice, checked before anything is read, and
+/// an extension that fails, return `error.InvalidConfig` (an extension's `error.OutOfMemory`
+/// returns `error.OutOfMemory`), with the reason logged, and later extensions don't run.
+/// Strings are allocated from `arena`.
 pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
+    for (options.extensions, 0..) |ext, i| {
+        if (ext.name.len == 0) {
+            log.warn("loading client configuration failed: the config extension at index {d} has an empty name", .{i});
+            return error.InvalidConfig;
+        }
+        for (options.extensions[0..i]) |earlier| if (std.mem.eql(u8, earlier.name, ext.name)) {
+            log.warn("loading client configuration failed: the config extension name \"{s}\" is given twice", .{ext.name});
+            return error.InvalidConfig;
+        };
+    }
     if (!options.disable_env) {
         const tls_env: ?[]const u8 = if (options.env) |env|
             env.get("TEMPORAL_TLS")
@@ -6145,11 +6824,38 @@ pub fn loadOptions(arena: Allocator, options: LoadOptions) LoadError!Options {
         return error.InvalidConfig;
     }
     var loaded: Options = .{};
+    var ext: ?std.json.Value = null;
     if (bridge.bytes.Owned.take(null, result.success)) |json| {
         defer json.deinit();
-        loaded = try profileOptions(arena, json.bytes());
+        loaded = try profileOptions(arena, json.bytes(), &ext);
     }
     if (!options.disable_env) loaded.headers = try grpcMetaHeaders(arena, loaded.headers, env);
+    if (options.extensions.len == 0) return loaded;
+
+    const profile: []const u8 = if (options.profile.len > 0) options.profile else for (env) |e| {
+        if (!options.disable_env and std.mem.eql(u8, e.key, "TEMPORAL_PROFILE") and e.value.len > 0) break e.value;
+    } else "default";
+    for (options.extensions) |extension| {
+        const table: ?std.json.ObjectMap = if (ext) |all| switch (all) {
+            .object => |o| if (o.get(extension.name)) |t| switch (t) {
+                .object => |table| table,
+                else => null,
+            } else null,
+            else => null,
+        } else null;
+        extension.apply(extension.ptr, .{
+            .arena = arena,
+            .profile = profile,
+            .table = table,
+            .env = if (options.disable_env) null else .{ .map = options.env },
+        }, &loaded) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.warn("loading client configuration failed: extension \"{s}\" failed: {t}", .{ extension.name, err });
+                return error.InvalidConfig;
+            },
+        };
+    }
     return loaded;
 }
 
@@ -6234,8 +6940,9 @@ pub fn loadDefaultOptions(arena: Allocator) LoadError!Options {
 }
 
 /// Options from sdk-core's JSON for a profile. A certificate's `data` is a JSON array of
-/// bytes.
-fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
+/// bytes. `ext` is set to the profile's `ext` object, its extensions' tables by name, if it
+/// has one.
+fn profileOptions(arena: Allocator, json: []const u8, ext: *?std.json.Value) LoadError!Options {
     const Source = struct { path: ?[]const u8 = null, data: ?[]const u8 = null };
     const Profile = struct {
         address: ?[]const u8 = null,
@@ -6249,6 +6956,7 @@ fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
             client_key: ?Source = null,
         } = null,
         grpc_meta: ?std.json.ArrayHashMap([]const u8) = null,
+        ext: ?std.json.Value = null,
     };
     const profile = std.json.parseFromSliceLeaky(Profile, arena, json, .{
         .allocate = .alloc_always,
@@ -6261,6 +6969,7 @@ fn profileOptions(arena: Allocator, json: []const u8) LoadError!Options {
         },
     };
 
+    ext.* = profile.ext;
     var options: Options = .{};
     if (profile.address) |v| options.host_port = v;
     if (profile.namespace) |v| options.namespace = v;
@@ -7088,6 +7797,55 @@ test "rpc_timeout cuts short a query the server holds" {
         return error.TestUnexpectedResult;
     }
     try testing.expect(waited.nanoseconds < 10 * std.time.ns_per_s);
+}
+
+test "a query past its RpcOptions.timeout returns error.DeadlineExceeded" {
+    var server = try @import("testing.zig").DevServer.start(testing.allocator, testing.io, .{});
+    defer server.stop(testing.io);
+    var c = try Client.connect(testing.allocator, testing.io, server.clientOptions());
+    defer c.close();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No worker polls this task queue, so the server holds a query until its deadline.
+    const id = try uuid(a, testing.io);
+    _ = try c.rpc(wfs.StartWorkflowExecutionResponse, "StartWorkflowExecution", wfs.StartWorkflowExecutionRequest{
+        .namespace = c.namespace,
+        .workflow_id = id,
+        .workflow_type = .{ .name = "Unpolled" },
+        .task_queue = .{ .name = try uuid(a, testing.io), .kind = .TASK_QUEUE_KIND_NORMAL },
+        .request_id = try uuid(a, testing.io),
+        .identity = c.identity,
+    }, a);
+    var short = try c.withRpcOptions(.{ .timeout = .fromMilliseconds(500) });
+    const start = Io.Timestamp.now(testing.io, .awake);
+    var message: []const u8 = "";
+    try testing.expectError(error.DeadlineExceeded, short.queryWorkflowByNameWithOptions("status", a, id, "", .{}, .{ .failure_message = &message }));
+    try testing.expect(start.durationTo(Io.Timestamp.now(testing.io, .awake)).nanoseconds < 10 * std.time.ns_per_s);
+    try testing.expect(message.len > 0);
+    try testing.expectError(error.DeadlineExceeded, short.queryWorkflowByName("status", a, id, "", .{}));
+
+    // A refusal that isn't the deadline keeps its own error, here a missing workflow.
+    try testing.expectError(error.NotFound, short.queryWorkflowByName("status", a, try uuid(a, testing.io), "", .{}));
+}
+
+test "only a deadline status makes a query error.DeadlineExceeded" {
+    // DEADLINE_EXCEEDED, and CANCELLED with sdk-core's message, whatever the timing.
+    try testing.expect(Client.isQueryDeadline(4, "", 0, 0));
+    try testing.expect(Client.isQueryDeadline(4, "deadline exceeded", 1000, 5));
+    try testing.expect(Client.isQueryDeadline(1, "Timeout expired", 0, 0));
+    try testing.expect(Client.isQueryDeadline(1, "status: Cancelled, message: \"Timeout expired\"", 1000, 5));
+    // CANCELLED without the message: the deadline only once the call ran for all of it.
+    try testing.expect(Client.isQueryDeadline(1, "stream reset", 1000, 1000));
+    try testing.expect(Client.isQueryDeadline(1, "stream reset", 1000, 1500));
+    try testing.expect(!Client.isQueryDeadline(1, "stream reset", 1000, 999));
+    try testing.expect(!Client.isQueryDeadline(1, "stream reset", 0, 60_000));
+    // Every other status stays error.RpcFailed (or QueryFailed), even after the deadline
+    // and with the message.
+    for ([_]u32{ 0, 2, 3, 5, 8, 9, 13, 14, 16 }) |code| {
+        try testing.expect(!Client.isQueryDeadline(code, "Timeout expired", 1000, 2000));
+    }
 }
 
 test "retry policy intervals and the OpenTelemetry periodicity are clamped, not narrowed" {

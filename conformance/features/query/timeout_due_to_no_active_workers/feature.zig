@@ -1,17 +1,12 @@
 //! With no worker polling, a query times out at the deadline the client gave it. The driver
 //! stops the worker, queries with a 1 s deadline and expects the call to fail when it
 //! passes with error.DeadlineExceeded, as the suite's feature.go checks, then starts a new
-//! worker and finishes the workflow with the "finish" signal.
-//!
-//! The client reports a deadline as error.RpcFailed, like any other gRPC failure, so this
-//! feature fails until bead temporal-sdk-zig-ad0 ("Client: report a query's deadline as
-//! error.DeadlineExceeded") is done. Every path out of `execute` terminates the run, because
-//! the worker may be stopped when the check fails and no signal could finish it.
-const std = @import("std");
+//! worker and finishes the workflow with the "finish" signal. Every path out of `execute`
+//! terminates the run, because the worker may be stopped when the check fails and no signal
+//! could finish it.
 const temporal = @import("temporal");
 const harness = @import("harness");
 
-const gap_bead = "temporal-sdk-zig-ad0";
 const workflow = temporal.workflow;
 
 const Workflow = workflow.Def("Workflow", runWorkflow);
@@ -64,10 +59,9 @@ fn execute(ctx: *harness.Context) !void {
     var message: []const u8 = "";
     const result = short.queryWorkflowWithOptions(SomeQuery, ctx.arena, run.id, run.run_id, .{}, .{ .failure_message = &message });
     if (result) |answer| {
-        return ctx.fail("query \"somequery\" with no worker answered {}; expected error.DeadlineExceeded at its 1s deadline (gap: " ++ gap_bead ++ ")", .{answer});
+        return ctx.fail("query \"somequery\" with no worker answered {}; expected error.DeadlineExceeded at its 1s deadline", .{answer});
     } else |err| {
-        // QueryError has no DeadlineExceeded member yet, so compare by name.
-        try ctx.expect(std.mem.eql(u8, @errorName(err), "DeadlineExceeded"), "query \"somequery\" with no worker returned error.{s} (\"{s}\"); expected error.DeadlineExceeded at its 1s deadline (gap: " ++ gap_bead ++ ")", .{ @errorName(err), message });
+        try ctx.expect(err == error.DeadlineExceeded, "query \"somequery\" with no worker returned error.{s} (\"{s}\"); expected error.DeadlineExceeded at its 1s deadline", .{ @errorName(err), message });
     }
 
     try ctx.startWorker();

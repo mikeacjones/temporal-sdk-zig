@@ -165,6 +165,51 @@ test "nexus: a synchronous operation runs from the handler's dispatch table, and
     try testing.expect(!failed.handler_error.retryable());
 }
 
+// example: nexus-standalone
+/// Greets Ziggy through "greeting-endpoint" from a program, without a workflow.
+fn greetStandalone(client: *temporal.client.Client, arena: std.mem.Allocator) ![]const u8 {
+    var started = try client.executeNexusOperation(GreetingService, Greet, .{
+        .id = "greet-ziggy",
+        .endpoint = "greeting-endpoint",
+        .schedule_to_close_timeout = .fromSeconds(60),
+        .summary = "greet Ziggy",
+    }, "Ziggy");
+    defer started.deinit();
+
+    // Any process can follow the operation by its ID.
+    var handle = try client.getNexusOperationHandle([]const u8, "greet-ziggy", "");
+    defer handle.deinit();
+    const result = try handle.get(arena);
+    const description = try handle.describe(arena);
+    std.log.info("{s} through {s}: {t}", .{ description.operation, description.endpoint, description.status });
+
+    var it = try client.listNexusOperations("Endpoint = 'greeting-endpoint'", .{});
+    defer it.deinit();
+    while (try it.next(arena)) |op| std.log.info("{s}: {t}", .{ op.operation_id, op.status });
+    std.log.info("{d} operations", .{try client.countNexusOperations("Endpoint = 'greeting-endpoint'")});
+    return result;
+}
+// end-example
+
+test "nexus: a program greets through the Nexus endpoint without a workflow" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var failure: ?temporal.client.RpcFailure = null;
+    _ = env.client.callService(.workflow, "CountNexusOperationExecutions", a, .{ .namespace = env.client.namespace }, &failure) catch |err| {
+        std.log.warn("skipping: the dev server doesn't offer standalone Nexus operations (CountNexusOperationExecutions returned {t})", .{err});
+        return error.SkipZigTest;
+    };
+    try env.registerWorkflow(Greeting);
+    try env.registerNexusService(GreetingHandler);
+    try env.createNexusEndpoint("greeting-endpoint", .{});
+    // Starts the environment's worker, which serves the endpoint.
+    _ = try env.executeWorkflow(Greeting, .{"worker"}, a, null);
+    try testing.expectEqualStrings("Hello, Ziggy!", try greetStandalone(&env.client, a));
+}
+
 test "nexus: an activity-run operation and signaling operations are bound by their handlers' return types" {
     _ = &registerComposeService;
     try testing.expectEqual(nexus.Operation.Kind.activity_run, ComposeHandler.registered.find("compose").?.operation.kind);

@@ -1084,3 +1084,908 @@ test "dev server: a reset reapplies a Nexus operation's completion after the res
     try testing.expectEqual(0, try ResetFixtures.countAfter(c, a, run.id, excluded, .EVENT_TYPE_NEXUS_OPERATION_COMPLETED, point));
     try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, (try c.describeWorkflow(a, run.id, excluded)).status);
 }
+
+// ---------------------------------------------------------------- standalone Nexus operations
+
+const call_check = @import("nexus/call_check.zig");
+const propagation = @import("propagation.zig");
+const failure_v1 = proto.temporal.api.failure.v1;
+
+const start_nexus_rpc = "StartNexusOperationExecution";
+const poll_nexus_rpc = "PollNexusOperationExecution";
+
+const NexusFixtures = struct {
+    const Echo = nexus.OperationDef("echo", []const u8, []const u8);
+    const Hold = nexus.OperationDef("hold", []const u8, []const u8);
+    const Service = nexus.ServiceDef("zig-client-standalone-service", .{ Echo, Hold });
+
+    fn echo(_: *nexus.Context, message: []const u8) ![]const u8 {
+        return message;
+    }
+
+    /// The handler workflow of `hold`: waits for `ResetFixtures.Finish`.
+    fn held(ctx: *workflow.Context, id: []const u8) ![]const u8 {
+        try ResetFixtures.awaitFinish(ctx);
+        return std.fmt.allocPrint(ctx.allocator(), "released {s}", .{id});
+    }
+    const Held = workflow.Def("ClientTestStandaloneHeld", held);
+
+    fn hold(_: *nexus.Context, id: []const u8) !nexus.WorkflowStart(Held) {
+        return .{ .options = .{ .id = id }, .args = .{id} };
+    }
+    const Handler = nexus.ServiceHandler(Service, .{
+        nexus.OperationHandler(Echo, echo),
+        nexus.OperationHandler(Hold, hold),
+    });
+
+    fn ready(_: *workflow.Context) !void {}
+    /// Run once so the environment's worker polls before the first operation starts.
+    const Ready = workflow.Def("ClientTestStandaloneReady", ready);
+
+    /// The environment with the service registered, its worker polling, and an endpoint
+    /// routed to it; null, after logging why, when the server offers no standalone Nexus
+    /// operations. Free with `deinit`.
+    fn start(a: Allocator, endpoint: *[]const u8) !*WorkflowEnvironment {
+        const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+        errdefer env.deinit();
+        try skipWithoutStandaloneNexus(&env.client);
+        try env.registerWorkflow(Held);
+        try env.registerWorkflow(Ready);
+        try env.registerNexusService(Handler);
+        endpoint.* = try ResetFixtures.uniqueName(a, "client-standalone-endpoint");
+        try env.createNexusEndpoint(endpoint.*, .{});
+        _ = try env.executeWorkflow(Ready, .{}, a, null);
+        return env;
+    }
+
+    /// Returns `error.SkipZigTest`, logging why, when `c`'s server doesn't answer
+    /// CountNexusOperationExecutions.
+    fn skipWithoutStandaloneNexus(c: *Client) !void {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var failure: ?client_mod.RpcFailure = null;
+        _ = c.callService(.workflow, "CountNexusOperationExecutions", arena.allocator(), .{ .namespace = c.namespace }, &failure) catch |err| {
+            const message = if (failure) |f| f.message else "";
+            std.log.warn("skipping: the dev server doesn't offer standalone Nexus operations (CountNexusOperationExecutions returned {t}: {s})", .{ err, message });
+            return error.SkipZigTest;
+        };
+    }
+
+    /// Describes `h` until its handler has started it (its operation token is set), for at
+    /// most 30 s.
+    fn awaitStarted(h: anytype) !void {
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const deadline = std.Io.Timestamp.now(testing.io, .awake).addDuration(.fromSeconds(30));
+        while (std.Io.Timestamp.now(testing.io, .awake).nanoseconds < deadline.nanoseconds) {
+            _ = scratch.reset(.retain_capacity);
+            const d = try h.describe(scratch.allocator());
+            if (d.operation_token.len > 0) return;
+            try testing.io.sleep(.fromMilliseconds(50), .awake);
+        }
+        std.debug.print("Nexus operation {s} did not start within 30 s\n", .{h.id});
+        return error.TestOperationNotStarted;
+    }
+};
+
+test "the standalone Nexus call check names the caller, the service and the operation" {
+    const Other = nexus.OperationDef("echo", i32, i32);
+    const Missing = nexus.OperationDef("missing", []const u8, []const u8);
+    const caller = "Client.executeNexusOperation";
+    try testing.expectEqual(@as(?[]const u8, null), comptime call_check.callError(caller, NexusFixtures.Service, NexusFixtures.Echo));
+    try testing.expectEqualStrings("Client.executeNexusOperation: Service must be a nexus.ServiceDef, not u8", comptime call_check.callError(caller, u8, NexusFixtures.Echo).?);
+    try testing.expectEqualStrings("Client.executeNexusOperation on nexus service \"zig-client-standalone-service\": Operation must be a nexus.OperationDef, not u8", comptime call_check.callError(caller, NexusFixtures.Service, u8).?);
+    try testing.expectEqualStrings("Client.executeNexusOperation on nexus service \"zig-client-standalone-service\": its operation \"echo\" takes []const u8 and returns []const u8, not i32 and i32; call it with the service's own OperationDef", comptime call_check.callError(caller, NexusFixtures.Service, Other).?);
+    try testing.expectEqualStrings("Client.executeNexusOperation on nexus service \"zig-client-standalone-service\": the service has no operation \"missing\"; its operations are \"echo\", \"hold\"", comptime call_check.callError(caller, NexusFixtures.Service, Missing).?);
+}
+
+test "executeNexusOperation sends the operation, its options, its input as one payload, and the propagated values in place of a caller's header of their name" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tenant = comptime propagation.key([]const u8, "tenant");
+    const propagators = [_]propagation.ContextPropagator{propagation.HeaderPropagator(tenant).propagator};
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .propagators = &propagators });
+    defer c.close();
+    const answers = [_]Answer{.{ .rpc = start_nexus_rpc, .proto = try encodeMessage(arena, wfs.StartNexusOperationExecutionResponse{ .run_id = "run-1", .started = true }) }};
+    var server: Server = .{ .answers = &answers, .record = arena };
+    try connectToServer(&c, &server);
+
+    var values: propagation.Values = .init(arena);
+    try values.put(tenant, "acme");
+    var handle = try c.executeNexusOperation(NexusFixtures.Service, NexusFixtures.Echo, .{
+        .id = "op-1",
+        .endpoint = "my-endpoint",
+        .schedule_to_close_timeout = .fromSeconds(60),
+        .schedule_to_start_timeout = .fromSeconds(5),
+        .start_to_close_timeout = .fromSeconds(30),
+        .id_reuse_policy = .reject_duplicate,
+        .id_conflict_policy = .use_existing,
+        .headers = &.{ .{ .name = "x-first", .value = "1" }, .{ .name = "Temporal-Zig-Context", .value = "stale" }, .{ .name = "x-last", .value = "2" } },
+        .summary = "echo it",
+        .context = &values,
+    }, "hi");
+    defer handle.deinit();
+    try testing.expectEqualStrings("op-1", handle.id);
+    try testing.expectEqualStrings("run-1", handle.run_id);
+    try testing.expect(handle.started);
+
+    const request = try decodeRequest(wfs.StartNexusOperationExecutionRequest, arena, server.requests.items[0]);
+    try testing.expectEqualStrings("default", request.namespace);
+    try testing.expectEqualStrings(c.identity, request.identity);
+    try testing.expectEqual(36, request.request_id.len);
+    try testing.expectEqualStrings("op-1", request.operation_id);
+    try testing.expectEqualStrings("my-endpoint", request.endpoint);
+    try testing.expectEqualStrings("zig-client-standalone-service", request.service);
+    try testing.expectEqualStrings("echo", request.operation);
+    try testing.expectEqual(60, request.schedule_to_close_timeout.?.seconds);
+    try testing.expectEqual(5, request.schedule_to_start_timeout.?.seconds);
+    try testing.expectEqual(30, request.start_to_close_timeout.?.seconds);
+    try testing.expectEqual(.NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE, request.id_reuse_policy);
+    try testing.expectEqual(.NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING, request.id_conflict_policy);
+    try testing.expectEqualStrings("hi", try converter.fromPayload([]const u8, arena, request.input.?));
+    try testing.expectEqualStrings("echo it", try converter.fromPayload([]const u8, arena, request.user_metadata.?.summary.?));
+    // A map on the wire: its entries' order isn't kept.
+    const headers = request.nexus_header.items;
+    try testing.expectEqual(3, headers.len);
+    const propagated = (try propagation.injectNexusHeader(&propagators, arena, &values)).?;
+    var found = [_]bool{ false, false, false };
+    for (headers) |h| {
+        if (std.mem.eql(u8, h.key, "x-first")) {
+            try testing.expectEqualStrings("1", h.value);
+            found[0] = true;
+        } else if (std.mem.eql(u8, h.key, "x-last")) {
+            try testing.expectEqualStrings("2", h.value);
+            found[1] = true;
+        } else {
+            try testing.expectEqualStrings(propagation.nexus_header_name, h.key);
+            try testing.expectEqualStrings(propagated, h.value);
+            found[2] = true;
+        }
+    }
+    try testing.expect(found[0] and found[1] and found[2]);
+}
+
+test "executeNexusOperation with no ID generates one, sends the caller's headers as they are without propagated values, and maps ALREADY_EXISTS" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const answers = [_]Answer{
+        .{ .rpc = start_nexus_rpc, .proto = try encodeMessage(arena, wfs.StartNexusOperationExecutionResponse{ .run_id = "run-2" }) },
+        .{ .rpc = start_nexus_rpc, .proto = "", .status_code = 6, .message = "operation already started" },
+    };
+    var r: Recorded = undefined;
+    try r.start(&answers);
+    defer r.deinit();
+
+    var handle = try r.client.executeNexusOperationByName(void, "svc", "op", .{ .endpoint = "e", .headers = &.{.{ .name = "temporal-zig-context", .value = "kept" }} }, @as(i32, 7));
+    defer handle.deinit();
+    try testing.expectEqual(36, handle.id.len);
+    try testing.expect(!handle.started);
+    const request = try r.request(wfs.StartNexusOperationExecutionRequest, arena, 0);
+    try testing.expectEqualStrings(handle.id, request.operation_id);
+    try testing.expect(request.schedule_to_close_timeout == null);
+    try testing.expect(request.user_metadata == null);
+    try testing.expectEqual(1, request.nexus_header.items.len);
+    try testing.expectEqualStrings("kept", request.nexus_header.items[0].value);
+    try testing.expectEqual(7, try converter.fromPayload(i32, arena, request.input.?));
+
+    try testing.expectError(error.NexusOperationExecutionAlreadyStarted, r.client.executeNexusOperationByName(void, "svc", "op", .{ .endpoint = "e", .id = handle.id }, {}));
+}
+
+fn pollAnswer(arena: Allocator, outcome: ?wfs.PollNexusOperationExecutionResponse.outcome_union) !Answer {
+    return .{ .rpc = poll_nexus_rpc, .proto = try encodeMessage(arena, wfs.PollNexusOperationExecutionResponse{ .run_id = "run-1", .outcome = outcome }) };
+}
+
+fn failureAnswer(arena: Allocator, info: failure_v1.Failure.failure_info_union, cause: ?failure_v1.Failure.failure_info_union) !Answer {
+    var f: failure_v1.Failure = .{ .message = "outer", .failure_info = info };
+    if (cause) |ci| {
+        const inner = try arena.create(failure_v1.Failure);
+        inner.* = .{ .message = "inner", .failure_info = ci };
+        f.cause = inner;
+    }
+    return pollAnswer(arena, .{ .failure = f });
+}
+
+test "NexusOperationHandle.get polls until an outcome, past a deadline status, and classifies failures through a Nexus operation failure's cause" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nexus_info: failure_v1.Failure.failure_info_union = .{ .nexus_operation_execution_failure_info = .{} };
+    const answers = [_]Answer{
+        .{ .rpc = poll_nexus_rpc, .proto = "", .status_code = 4, .message = "the long poll ran out of time" },
+        try pollAnswer(arena, null),
+        try pollAnswer(arena, .{ .result = try converter.toPayload(arena, @as([]const u8, "done")) }),
+        try failureAnswer(arena, .{ .canceled_failure_info = .{} }, null),
+        try failureAnswer(arena, nexus_info, .{ .canceled_failure_info = .{} }),
+        try failureAnswer(arena, .{ .terminated_failure_info = .{} }, null),
+        try failureAnswer(arena, .{ .timeout_failure_info = .{} }, null),
+        try failureAnswer(arena, nexus_info, .{ .timeout_failure_info = .{} }),
+        try failureAnswer(arena, .{ .application_failure_info = .{} }, null),
+        try failureAnswer(arena, nexus_info, .{ .application_failure_info = .{} }),
+        try failureAnswer(arena, nexus_info, null),
+        try pollAnswer(arena, .{ .result = try converter.toPayload(arena, @as([]const u8, "again")) }),
+    };
+    var r: Recorded = undefined;
+    try r.start(&answers);
+    defer r.deinit();
+
+    var h = try r.client.getNexusOperationHandle([]const u8, "op-1", "");
+    defer h.deinit();
+    try testing.expect(!h.started);
+    try testing.expectEqualStrings("done", try h.get(arena));
+    try testing.expect(h.failure() == null);
+    for (0..3) |i| {
+        const request = try r.request(wfs.PollNexusOperationExecutionRequest, arena, i);
+        try testing.expectEqualStrings("op-1", request.operation_id);
+        try testing.expectEqualStrings("", request.run_id);
+        try testing.expectEqual(.NEXUS_OPERATION_WAIT_STAGE_CLOSED, request.wait_stage);
+    }
+    try testing.expectError(error.NexusOperationCanceled, h.get(arena));
+    try testing.expectEqualStrings("outer", h.failure().?.message);
+    try testing.expectError(error.NexusOperationCanceled, h.get(arena));
+    // The stored failure is the whole one, not its cause.
+    try testing.expectEqualStrings("outer", h.failure().?.message);
+    try testing.expectEqualStrings("inner", h.failure().?.cause.?.message);
+    try testing.expectError(error.NexusOperationTerminated, h.get(arena));
+    try testing.expectError(error.NexusOperationTimedOut, h.get(arena));
+    try testing.expectError(error.NexusOperationTimedOut, h.get(arena));
+    try testing.expectError(error.NexusOperationFailed, h.get(arena));
+    try testing.expectError(error.NexusOperationFailed, h.get(arena));
+    try testing.expectError(error.NexusOperationFailed, h.get(arena));
+    // Each call asks again, and a success clears the earlier failure.
+    try testing.expectEqualStrings("again", try h.get(arena));
+    try testing.expect(h.failure() == null);
+    try testing.expectEqual(answers.len, r.server.callCount());
+}
+
+fn describeNexusAnswer(arena: Allocator, status: proto.temporal.api.enums.v1.NexusOperationExecutionStatus, cancel_requested: bool) ![]const u8 {
+    return encodeMessage(arena, wfs.DescribeNexusOperationExecutionResponse{ .run_id = "run-1", .info = .{
+        .operation_id = "op-1",
+        .run_id = "run-1",
+        .status = status,
+        .cancellation_info = if (cancel_requested) .{} else null,
+    } });
+}
+
+test "NexusOperationHandle cancel and terminate send the reason, and are error.NexusOperationClosed on a closed operation, success for a repeated cancel, and error.NotFound on a missing one" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const answers = [_]Answer{
+        .{ .rpc = "RequestCancelNexusOperationExecution", .proto = try encodeMessage(arena, wfs.RequestCancelNexusOperationExecutionResponse{}) },
+        .{ .rpc = "TerminateNexusOperationExecution", .proto = try encodeMessage(arena, wfs.TerminateNexusOperationExecutionResponse{}) },
+        .{ .rpc = "RequestCancelNexusOperationExecution", .proto = "", .status_code = 9, .message = "operation already completed" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = try describeNexusAnswer(arena, .NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED, false) },
+        .{ .rpc = "TerminateNexusOperationExecution", .proto = "", .status_code = 9, .message = "already terminated" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = try describeNexusAnswer(arena, .NEXUS_OPERATION_EXECUTION_STATUS_TERMINATED, false) },
+        // The same status for a running operation: a repeated cancel succeeds, anything else
+        // is error.RpcFailed.
+        .{ .rpc = "RequestCancelNexusOperationExecution", .proto = "", .status_code = 9, .message = "cancellation already requested" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = try describeNexusAnswer(arena, .NEXUS_OPERATION_EXECUTION_STATUS_RUNNING, true) },
+        .{ .rpc = "RequestCancelNexusOperationExecution", .proto = "", .status_code = 9, .message = "not cancelable" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = try describeNexusAnswer(arena, .NEXUS_OPERATION_EXECUTION_STATUS_RUNNING, false) },
+        .{ .rpc = "TerminateNexusOperationExecution", .proto = "", .status_code = 9, .message = "not terminable" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = try describeNexusAnswer(arena, .NEXUS_OPERATION_EXECUTION_STATUS_RUNNING, true) },
+        .{ .rpc = "RequestCancelNexusOperationExecution", .proto = "", .status_code = 5, .message = "operation not found" },
+        .{ .rpc = "TerminateNexusOperationExecution", .proto = "", .status_code = 5, .message = "operation not found" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = "", .status_code = 5, .message = "operation not found" },
+    };
+    var r: Recorded = undefined;
+    try r.start(&answers);
+    defer r.deinit();
+
+    var h = try r.client.getNexusOperationHandle(void, "op-1", "run-1");
+    defer h.deinit();
+    try h.cancel("no longer needed");
+    try h.terminate("stuck");
+    const cancel = try r.request(wfs.RequestCancelNexusOperationExecutionRequest, arena, 0);
+    try testing.expectEqualStrings("op-1", cancel.operation_id);
+    try testing.expectEqualStrings("run-1", cancel.run_id);
+    try testing.expectEqualStrings("no longer needed", cancel.reason);
+    try testing.expectEqualStrings(r.client.identity, cancel.identity);
+    try testing.expectEqual(36, cancel.request_id.len);
+    const terminate = try r.request(wfs.TerminateNexusOperationExecutionRequest, arena, 1);
+    try testing.expectEqualStrings("stuck", terminate.reason);
+    try testing.expectEqual(36, terminate.request_id.len);
+    try testing.expectError(error.NexusOperationClosed, h.cancel(""));
+    try testing.expectError(error.NexusOperationClosed, h.terminate(""));
+    try h.cancel("again");
+    try testing.expectError(error.RpcFailed, h.cancel(""));
+    try testing.expectError(error.RpcFailed, h.terminate(""));
+    try testing.expectError(error.NotFound, h.cancel(""));
+    try testing.expectError(error.NotFound, h.terminate(""));
+    try testing.expectError(error.NotFound, h.describe(arena));
+}
+
+/// A DescribeNexusOperationExecution response for run-1 of op-1 in `status`, whose summary
+/// was encoded by a codec this client doesn't have.
+fn describeNexusAnswerWithForeignSummary(arena: Allocator, status: proto.temporal.api.enums.v1.NexusOperationExecutionStatus, cancel_requested: bool) ![]const u8 {
+    return encodeMessage(arena, wfs.DescribeNexusOperationExecutionResponse{ .run_id = "run-1", .info = .{
+        .operation_id = "op-1",
+        .run_id = "run-1",
+        .status = status,
+        .cancellation_info = if (cancel_requested) .{} else null,
+        .user_metadata = .{ .summary = try converter.payloadWithEncoding(arena, "binary/encrypted", "\x00\x01opaque") },
+    } });
+}
+
+test "NexusOperationHandle cancel and terminate tell a closed operation and a repeated cancel apart without decoding the operation's payloads" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The operation was started, with a summary, by a client whose codecs this one lacks,
+    // such as an operator's tool canceling another process's operation by ID.
+    const answers = [_]Answer{
+        .{ .rpc = "RequestCancelNexusOperationExecution", .proto = "", .status_code = 9, .message = "operation already completed" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = try describeNexusAnswerWithForeignSummary(arena, .NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED, false) },
+        .{ .rpc = "TerminateNexusOperationExecution", .proto = "", .status_code = 9, .message = "already terminated" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = try describeNexusAnswerWithForeignSummary(arena, .NEXUS_OPERATION_EXECUTION_STATUS_TERMINATED, false) },
+        .{ .rpc = "RequestCancelNexusOperationExecution", .proto = "", .status_code = 9, .message = "cancellation already requested" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = try describeNexusAnswerWithForeignSummary(arena, .NEXUS_OPERATION_EXECUTION_STATUS_RUNNING, true) },
+    };
+    var r: Recorded = undefined;
+    try r.start(&answers);
+    defer r.deinit();
+
+    var h = try r.client.getNexusOperationHandle(void, "op-1", "");
+    defer h.deinit();
+    try testing.expectError(error.NexusOperationClosed, h.cancel("after it closed"));
+    try testing.expectError(error.NexusOperationClosed, h.terminate("after it closed"));
+    try h.cancel("again");
+}
+
+test "NexusOperationHandle cancel and terminate read a closed operation's state whatever its record holds that the client's codecs refuse" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var poisoned: common.Payload = .{ .data = "written by another codec" };
+    try poisoned.metadata.append(arena, .{ .key = "encoding", .value = "binary/poison" });
+    var details: common.Payloads = .{};
+    try details.payloads.append(arena, poisoned);
+    var attributes: common.SearchAttributes = .{};
+    try attributes.indexed_fields.append(arena, .{ .key = "CustomKeywordField", .value = poisoned });
+    const record = try encodeMessage(arena, wfs.DescribeNexusOperationExecutionResponse{ .run_id = "run-1", .info = .{
+        .operation_id = "op-1",
+        .run_id = "run-1",
+        .status = .NEXUS_OPERATION_EXECUTION_STATUS_FAILED,
+        .user_metadata = .{ .summary = poisoned },
+        .search_attributes = attributes,
+        .last_attempt_failure = .{ .message = "boom", .failure_info = .{ .application_failure_info = .{ .details = details } } },
+    } });
+    const codecs = [_]converter.PayloadCodec{PoisonCodec.codec()};
+    var c = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .codecs = &codecs });
+    defer c.close();
+    const answers = [_]Answer{
+        .{ .rpc = "RequestCancelNexusOperationExecution", .proto = "", .status_code = 9, .message = "operation already completed" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = record },
+        .{ .rpc = "TerminateNexusOperationExecution", .proto = "", .status_code = 9, .message = "operation already completed" },
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = record },
+    };
+    var server: Server = .{ .answers = &answers };
+    try connectToServer(&c, &server);
+    var h = try c.getNexusOperationHandle(void, "op-1", "");
+    defer h.deinit();
+    try testing.expectError(error.NexusOperationClosed, h.cancel(""));
+    try testing.expectError(error.NexusOperationClosed, h.terminate(""));
+    try testing.expectEqual(answers.len, server.callCount());
+}
+
+test "NexusOperationHandle.describe lifts the server's record" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nexus_v1 = proto.temporal.api.nexus.v1;
+    const info: nexus_v1.NexusOperationExecutionInfo = .{
+        .operation_id = "op-1",
+        .run_id = "run-1",
+        .endpoint = "e",
+        .service = "svc",
+        .operation = "op",
+        .status = .NEXUS_OPERATION_EXECUTION_STATUS_RUNNING,
+        .attempt = 2,
+        .schedule_time = .{ .seconds = 100 },
+        .schedule_to_close_timeout = .{ .seconds = 60 },
+        .operation_token = "token",
+        .cancellation_info = .{ .reason = "stop" },
+        .user_metadata = .{ .summary = try converter.toPayload(arena, @as([]const u8, "a summary")) },
+    };
+    const answers = [_]Answer{
+        .{ .rpc = "DescribeNexusOperationExecution", .proto = try encodeMessage(arena, wfs.DescribeNexusOperationExecutionResponse{ .run_id = "run-1", .info = info }) },
+    };
+    var r: Recorded = undefined;
+    try r.start(&answers);
+    defer r.deinit();
+
+    var h = try r.client.getNexusOperationHandle(void, "op-1", "");
+    defer h.deinit();
+    const d = try h.describe(arena);
+    try testing.expectEqualStrings("op-1", d.operation_id);
+    try testing.expectEqualStrings("run-1", d.run_id);
+    try testing.expectEqualStrings("e", d.endpoint);
+    try testing.expectEqualStrings("svc", d.service);
+    try testing.expectEqualStrings("op", d.operation);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.running, d.status);
+    try testing.expectEqual(2, d.attempt);
+    try testing.expectEqual(100 * std.time.ns_per_s, d.schedule_time.?.nanoseconds);
+    try testing.expect(d.close_time == null);
+    try testing.expectEqual(60 * std.time.ns_per_s, d.schedule_to_close_timeout.?.nanoseconds);
+    try testing.expectEqualStrings("token", d.operation_token);
+    try testing.expect(d.cancel_requested);
+    try testing.expectEqualStrings("a summary", d.summary);
+    const request = try r.request(wfs.DescribeNexusOperationExecutionRequest, arena, 0);
+    try testing.expect(!request.include_input and !request.include_outcome);
+}
+
+test "listNexusOperations follows page tokens past an empty page, and countNexusOperations returns the server's count" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nexus_v1 = proto.temporal.api.nexus.v1;
+    var first: wfs.ListNexusOperationExecutionsResponse = .{ .next_page_token = "page-2" };
+    try first.operations.append(arena, .{ .operation_id = "op-1", .endpoint = "e", .service = "svc", .operation = "op", .status = .NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED, .close_time = .{ .seconds = 5 } });
+    var third: wfs.ListNexusOperationExecutionsResponse = .{};
+    try third.operations.append(arena, nexus_v1.NexusOperationExecutionListInfo{ .operation_id = "op-2", .status = .NEXUS_OPERATION_EXECUTION_STATUS_RUNNING });
+    const answers = [_]Answer{
+        .{ .rpc = "ListNexusOperationExecutions", .proto = try encodeMessage(arena, first) },
+        .{ .rpc = "ListNexusOperationExecutions", .proto = try encodeMessage(arena, wfs.ListNexusOperationExecutionsResponse{ .next_page_token = "page-3" }) },
+        .{ .rpc = "ListNexusOperationExecutions", .proto = try encodeMessage(arena, third) },
+        .{ .rpc = "CountNexusOperationExecutions", .proto = try encodeMessage(arena, wfs.CountNexusOperationExecutionsResponse{ .count = 2 }) },
+    };
+    var r: Recorded = undefined;
+    try r.start(&answers);
+    defer r.deinit();
+
+    var it = try r.client.listNexusOperations("Endpoint = 'e'", .{ .page_size = 1 });
+    defer it.deinit();
+    const one = (try it.next(arena)).?;
+    try testing.expectEqualStrings("op-1", one.operation_id);
+    try testing.expectEqualStrings("e", one.endpoint);
+    try testing.expectEqualStrings("svc", one.service);
+    try testing.expectEqualStrings("op", one.operation);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.completed, one.status);
+    try testing.expectEqual(5 * std.time.ns_per_s, one.close_time.?.nanoseconds);
+    const two = (try it.next(arena)).?;
+    try testing.expectEqualStrings("op-2", two.operation_id);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.running, two.status);
+    try testing.expect(try it.next(arena) == null);
+    for (0..3) |i| {
+        const request = try r.request(wfs.ListNexusOperationExecutionsRequest, arena, i);
+        try testing.expectEqualStrings("Endpoint = 'e'", request.query);
+        try testing.expectEqual(1, request.page_size);
+        try testing.expectEqualStrings(([_][]const u8{ "", "page-2", "page-3" })[i], request.next_page_token);
+    }
+
+    try testing.expectEqual(2, try r.client.countNexusOperations("Endpoint = 'e'"));
+    try testing.expectEqualStrings("Endpoint = 'e'", (try r.request(wfs.CountNexusOperationExecutionsRequest, arena, 3)).query);
+}
+
+test "dev server: standalone Nexus operations, a synchronous and a workflow-run one, are read through handles obtained by ID, described, listed and counted" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var endpoint: []const u8 = undefined;
+    const env = try NexusFixtures.start(a, &endpoint);
+    defer env.deinit();
+    const c = &env.client;
+    const echo_id = try ResetFixtures.uniqueName(a, "client-standalone-echo");
+    const hold_id = try ResetFixtures.uniqueName(a, "client-standalone-hold");
+    const held_id = try ResetFixtures.uniqueName(a, "client-standalone-held");
+
+    var echo = try c.executeNexusOperation(NexusFixtures.Service, NexusFixtures.Echo, .{
+        .id = echo_id,
+        .endpoint = endpoint,
+        .schedule_to_close_timeout = .fromSeconds(60),
+        .summary = "echo it",
+    }, "hello");
+    defer echo.deinit();
+    try testing.expect(echo.started);
+    try testing.expect(echo.run_id.len > 0);
+    var echo_by_id = try c.getNexusOperationHandle([]const u8, echo_id, "");
+    defer echo_by_id.deinit();
+    try testing.expectEqualStrings("hello", try echo_by_id.get(a));
+    const echo_description = try echo_by_id.describe(a);
+    try testing.expectEqualStrings(echo_id, echo_description.operation_id);
+    try testing.expectEqualStrings(echo.run_id, echo_description.run_id);
+    try testing.expectEqualStrings(endpoint, echo_description.endpoint);
+    try testing.expectEqualStrings("zig-client-standalone-service", echo_description.service);
+    try testing.expectEqualStrings("echo", echo_description.operation);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.completed, echo_description.status);
+    try testing.expect(echo_description.attempt >= 1);
+    try testing.expect(echo_description.schedule_time != null);
+    try testing.expect(echo_description.close_time != null);
+    try testing.expectEqualStrings("echo it", echo_description.summary);
+    try testing.expect(!echo_description.cancel_requested);
+
+    var hold = try c.executeNexusOperation(NexusFixtures.Service, NexusFixtures.Hold, .{ .id = hold_id, .endpoint = endpoint, .schedule_to_close_timeout = .fromSeconds(600) }, held_id);
+    defer hold.deinit();
+    defer c.terminateWorkflow(held_id, "", "test cleanup") catch {};
+    try NexusFixtures.awaitStarted(&hold);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.running, (try hold.describe(a)).status);
+    try c.signalWorkflow(ResetFixtures.Finish, held_id, "", .{});
+    var hold_by_id = try c.getNexusOperationHandle([]const u8, hold_id, hold.run_id);
+    defer hold_by_id.deinit();
+    const expected = try std.fmt.allocPrint(a, "released {s}", .{held_id});
+    try testing.expectEqualStrings(expected, try hold_by_id.get(a));
+    const hold_description = try hold_by_id.describe(a);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.completed, hold_description.status);
+    try testing.expect(hold_description.operation_token.len > 0);
+
+    // Visibility catches up eventually: wait for both, for at most 30 s.
+    const query = try std.fmt.allocPrint(a, "Endpoint = '{s}'", .{endpoint});
+    const deadline = std.Io.Timestamp.now(testing.io, .awake).addDuration(.fromSeconds(30));
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    while (true) {
+        _ = scratch.reset(.retain_capacity);
+        var seen_echo = false;
+        var seen_hold = false;
+        var listed: usize = 0;
+        var it = try c.listNexusOperations(query, .{});
+        defer it.deinit();
+        while (try it.next(scratch.allocator())) |info| {
+            listed += 1;
+            if (info.status != .completed) continue;
+            if (std.mem.eql(u8, info.operation_id, echo_id)) {
+                try testing.expectEqualStrings("echo", info.operation);
+                seen_echo = true;
+            }
+            if (std.mem.eql(u8, info.operation_id, hold_id)) {
+                try testing.expectEqualStrings("hold", info.operation);
+                seen_hold = true;
+            }
+        }
+        if (seen_echo and seen_hold and listed == 2 and try c.countNexusOperations(query) == 2) break;
+        if (std.Io.Timestamp.now(testing.io, .awake).nanoseconds >= deadline.nanoseconds) {
+            std.debug.print("after 30 s the query {s} listed {d} operations, echo {}, hold {}\n", .{ query, listed, seen_echo, seen_hold });
+            return error.TestOperationsNotListed;
+        }
+        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+}
+
+test "dev server: standalone Nexus operations, a canceled workflow-run operation ends canceled" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var endpoint: []const u8 = undefined;
+    const env = try NexusFixtures.start(a, &endpoint);
+    defer env.deinit();
+    const c = &env.client;
+    const hold_id = try ResetFixtures.uniqueName(a, "client-standalone-cancel");
+    const held_id = try ResetFixtures.uniqueName(a, "client-standalone-cancel-held");
+
+    var hold = try c.executeNexusOperation(NexusFixtures.Service, NexusFixtures.Hold, .{ .id = hold_id, .endpoint = endpoint, .schedule_to_close_timeout = .fromSeconds(600) }, held_id);
+    defer hold.deinit();
+    defer c.terminateWorkflow(held_id, "", "test cleanup") catch {};
+    try NexusFixtures.awaitStarted(&hold);
+    var by_id = try c.getNexusOperationHandle([]const u8, hold_id, "");
+    defer by_id.deinit();
+    try by_id.cancel("no longer needed");
+    try testing.expectError(error.NexusOperationCanceled, by_id.get(a));
+    try testing.expect(by_id.failure() != null);
+    const d = try by_id.describe(a);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.canceled, d.status);
+    try testing.expect(d.cancel_requested);
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.canceled, (try c.describeWorkflow(a, held_id, "")).status);
+}
+
+test "dev server: standalone Nexus operations, terminate, a closed operation, an ID conflict and an unknown endpoint" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var endpoint: []const u8 = undefined;
+    const env = try NexusFixtures.start(a, &endpoint);
+    defer env.deinit();
+    const c = &env.client;
+    // Nothing polls this endpoint's task queue, so its operations stay unstarted.
+    const unpolled = try ResetFixtures.uniqueName(a, "client-standalone-unpolled");
+    try env.createNexusEndpoint(unpolled, .{ .task_queue = try ResetFixtures.uniqueName(a, "client-standalone-nobody") });
+    const id = try ResetFixtures.uniqueName(a, "client-standalone-terminate");
+
+    var first = try c.executeNexusOperation(NexusFixtures.Service, NexusFixtures.Echo, .{ .id = id, .endpoint = unpolled }, "never");
+    defer first.deinit();
+    try testing.expect(first.started);
+    try testing.expectError(error.NexusOperationExecutionAlreadyStarted, c.executeNexusOperation(NexusFixtures.Service, NexusFixtures.Echo, .{ .id = id, .endpoint = unpolled, .id_conflict_policy = .fail }, "again"));
+    var existing = try c.executeNexusOperation(NexusFixtures.Service, NexusFixtures.Echo, .{ .id = id, .endpoint = unpolled, .id_conflict_policy = .use_existing }, "again");
+    defer existing.deinit();
+    try testing.expect(!existing.started);
+    try testing.expectEqualStrings(first.run_id, existing.run_id);
+
+    // A cancel the handler can't receive leaves the operation running, with the request recorded.
+    try existing.cancel("before it started");
+    const pending = try existing.describe(a);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.running, pending.status);
+    try testing.expect(pending.cancel_requested);
+
+    try first.terminate("test");
+    try testing.expectError(error.NexusOperationTerminated, first.get(a));
+    try testing.expect(first.failure() != null);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.terminated, (try first.describe(a)).status);
+    try testing.expectError(error.NexusOperationClosed, first.cancel("after it closed"));
+    try testing.expectError(error.NexusOperationClosed, first.terminate("after it closed"));
+
+    var missing = try c.getNexusOperationHandle(void, "client-standalone-no-such-operation", "");
+    defer missing.deinit();
+    try testing.expectError(error.NotFound, missing.describe(a));
+    try testing.expectError(error.NotFound, missing.get(a));
+    try testing.expectError(error.NotFound, missing.cancel(""));
+
+    try testing.expectError(error.NotFound, c.executeNexusOperation(NexusFixtures.Service, NexusFixtures.Echo, .{ .endpoint = "client-standalone-no-such-endpoint" }, "x"));
+}
+
+test "dev server: standalone Nexus operations, a second cancel of a running operation is not error.NexusOperationClosed" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var endpoint: []const u8 = undefined;
+    const env = try NexusFixtures.start(a, &endpoint);
+    defer env.deinit();
+    const c = &env.client;
+    // Nothing polls this endpoint's task queue, so the operation stays running with its
+    // cancellation requested but undelivered.
+    const unpolled = try ResetFixtures.uniqueName(a, "client-standalone-recancel");
+    try env.createNexusEndpoint(unpolled, .{ .task_queue = try ResetFixtures.uniqueName(a, "client-standalone-recancel-nobody") });
+    var h = try c.executeNexusOperation(NexusFixtures.Service, NexusFixtures.Echo, .{ .endpoint = unpolled }, "never");
+    defer h.deinit();
+    defer h.terminate("test cleanup") catch {};
+
+    try h.cancel("first");
+    // The server refuses a repeated cancel with FAILED_PRECONDITION ("cancellation already
+    // requested"), the status it also gives a closed operation; this one is still running.
+    if (h.cancel("second")) |_| {} else |err| try testing.expect(err != error.NexusOperationClosed);
+    const d = try h.describe(a);
+    try testing.expectEqual(client_mod.NexusOperationExecutionStatus.running, d.status);
+    try testing.expect(d.cancel_requested);
+}
+
+/// A config extension for the tests below: it records what `loadOptions` gave it, and sets
+/// `Options.api_key` from its table's `api_key`, or from the variable its table's `api_key_env`
+/// names, or fails with `error.NoApiKey` when its table has `fail = true`.
+const RecordingExtension = struct {
+    calls: usize = 0,
+    profile: []const u8 = "",
+    had_table: bool = false,
+    had_env: bool = false,
+    seen_api_key: []const u8 = "",
+
+    fn extension(r: *RecordingExtension, name: []const u8) client_mod.ConfigExtension {
+        return .{ .name = name, .ptr = r, .apply = apply };
+    }
+
+    fn apply(ptr: ?*anyopaque, input: client_mod.ConfigExtensionInput, options: *client_mod.Options) anyerror!void {
+        const r: *RecordingExtension = @ptrCast(@alignCast(ptr.?));
+        r.calls += 1;
+        r.profile = input.profile;
+        r.had_table = input.table != null;
+        r.had_env = input.env != null;
+        r.seen_api_key = options.api_key;
+        const table = input.table orelse return;
+        if (table.get("fail")) |f| if (f == .bool and f.bool) return error.NoApiKey;
+        if (table.get("api_key")) |v| options.api_key = try input.arena.dupe(u8, v.string);
+        if (table.get("api_key_env")) |v| {
+            const value = (input.env orelse return error.NoEnvironment).get(v.string) orelse return error.NoApiKey;
+            options.api_key = try input.arena.dupe(u8, value);
+        }
+    }
+};
+
+test "a config extension sets the API key from its own ext table" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var secrets: RecordingExtension = .{};
+    var other: RecordingExtension = .{};
+    const options = try client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .profile = "prod",
+        .config_data =
+        \\[profile.prod]
+        \\address = "prod.example.com:7233"
+        \\api_key = "from-profile"
+        \\[profile.prod.ext.secrets]
+        \\api_key = "from-extension"
+        \\rotated = 1979-05-27T07:32:00Z
+        \\[profile.prod.ext.other]
+        \\api_key = "from-other"
+        ,
+        .extensions = &.{ secrets.extension("secrets"), other.extension("other") },
+    });
+    try testing.expectEqualStrings("from-other", options.api_key);
+    try testing.expectEqualStrings("prod.example.com:7233", options.host_port);
+    try testing.expect(options.tls != null);
+    try testing.expectEqual(1, secrets.calls);
+    try testing.expectEqualStrings("prod", secrets.profile);
+    try testing.expect(secrets.had_table);
+    try testing.expect(!secrets.had_env);
+    // Extensions run in order, each on the options the previous one left.
+    try testing.expectEqualStrings("from-profile", secrets.seen_api_key);
+    try testing.expectEqualStrings("from-extension", other.seen_api_key);
+}
+
+test "a config extension's table holds parsed values, datetimes as strings" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const Check = struct {
+        fn apply(_: ?*anyopaque, input: client_mod.ConfigExtensionInput, _: *client_mod.Options) anyerror!void {
+            const table = input.table orelse return error.NoTable;
+            try testing.expectEqualStrings("value", table.get("str").?.string);
+            try testing.expectEqual(5, table.get("int").?.integer);
+            try testing.expect(table.get("flag").?.bool);
+            try testing.expectEqualStrings("1979-05-27T07:32:00Z", table.get("when").?.string);
+            try testing.expectEqual(2, table.get("list").?.array.items.len);
+            try testing.expectEqualStrings("inner", table.get("nested").?.object.get("key").?.string);
+        }
+    };
+    _ = try client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data =
+        \\[profile.default.ext.check]
+        \\str = "value"
+        \\int = 5
+        \\flag = true
+        \\when = 1979-05-27T07:32:00Z
+        \\list = [1, "two"]
+        \\nested = { key = "inner" }
+        ,
+        .extensions = &.{.{ .name = "check", .apply = Check.apply }},
+    });
+}
+
+test "a config extension whose profile has no table for it gets null" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var secrets: RecordingExtension = .{};
+    const options = try client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data =
+        \\[profile.default]
+        \\api_key = "from-profile"
+        \\[profile.default.ext.someone_else]
+        \\api_key = "not-ours"
+        ,
+        .extensions = &.{secrets.extension("secrets")},
+    });
+    try testing.expectEqual(1, secrets.calls);
+    try testing.expect(!secrets.had_table);
+    try testing.expectEqualStrings("default", secrets.profile);
+    try testing.expectEqualStrings("from-profile", options.api_key);
+
+    // No config file at all: the extension still runs, with no table.
+    var empty: std.process.Environ.Map = .init(testing.allocator);
+    defer empty.deinit();
+    var env_only: RecordingExtension = .{};
+    _ = try client_mod.loadOptions(arena.allocator(), .{ .env = &empty, .disable_file = true, .extensions = &.{env_only.extension("secrets")} });
+    try testing.expectEqual(1, env_only.calls);
+    try testing.expect(!env_only.had_table);
+    try testing.expect(env_only.had_env);
+}
+
+test "strict loadOptions accepts keys under ext and still rejects other unknown keys" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var secrets: RecordingExtension = .{};
+    const options = try client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .strict = true,
+        .config_data =
+        \\[profile.default]
+        \\address = "localhost:7233"
+        \\[profile.default.ext.secrets]
+        \\api_key = "from-extension"
+        \\anything = { goes = "here" }
+        \\[profile.default.ext.not_loaded]
+        \\whatever = 1
+        ,
+        .extensions = &.{secrets.extension("secrets")},
+    });
+    try testing.expectEqualStrings("from-extension", options.api_key);
+
+    // Without the extension, strict still accepts the tables.
+    _ = try client_mod.loadOptions(arena.allocator(), .{ .disable_env = true, .strict = true, .config_data =
+        \\[profile.default.ext.not_loaded]
+        \\whatever = 1
+    });
+
+    var never: RecordingExtension = .{};
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .strict = true,
+        .config_data =
+        \\[profile.default]
+        \\adress = "typo:7233"
+        \\[profile.default.ext.secrets]
+        \\api_key = "from-extension"
+        ,
+        .extensions = &.{never.extension("secrets")},
+    }));
+    // A bad core config fails before any extension runs.
+    try testing.expectEqual(0, never.calls);
+}
+
+test "a config extension that fails fails loadOptions, and later extensions don't run" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var failing: RecordingExtension = .{};
+    var after: RecordingExtension = .{};
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data =
+        \\[profile.default.ext.failing]
+        \\fail = true
+        ,
+        .extensions = &.{ failing.extension("failing"), after.extension("after") },
+    }));
+    try testing.expectEqual(1, failing.calls);
+    try testing.expectEqual(0, after.calls);
+
+    const OutOfMemory = struct {
+        fn apply(_: ?*anyopaque, _: client_mod.ConfigExtensionInput, _: *client_mod.Options) anyerror!void {
+            return error.OutOfMemory;
+        }
+    };
+    try testing.expectError(error.OutOfMemory, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data = "",
+        .extensions = &.{.{ .name = "oom", .apply = OutOfMemory.apply }},
+    }));
+}
+
+test "config extensions with an empty or repeated name fail loadOptions before any runs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var a: RecordingExtension = .{};
+    var b: RecordingExtension = .{};
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data = "",
+        .extensions = &.{ a.extension("secrets"), b.extension("") },
+    }));
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{
+        .disable_env = true,
+        .config_data = "",
+        .extensions = &.{ a.extension("secrets"), b.extension("other"), b.extension("secrets") },
+    }));
+    try testing.expectEqual(0, a.calls);
+    try testing.expectEqual(0, b.calls);
+}
+
+test "a config extension reads LoadOptions.env, and none with disable_env" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("TEMPORAL_PROFILE", "staging");
+    try env.put("MY_SECRET", "from-env");
+    const toml =
+        \\[profile.staging.ext.secrets]
+        \\api_key_env = "MY_SECRET"
+        \\[profile.default.ext.secrets]
+        \\api_key_env = "MY_SECRET"
+    ;
+    var secrets: RecordingExtension = .{};
+    const options = try client_mod.loadOptions(arena.allocator(), .{ .env = &env, .config_data = toml, .extensions = &.{secrets.extension("secrets")} });
+    try testing.expectEqualStrings("from-env", options.api_key);
+    try testing.expectEqualStrings("staging", secrets.profile);
+    try testing.expect(secrets.had_env);
+
+    // With disable_env the extension gets no environment, and TEMPORAL_PROFILE isn't read.
+    var no_env: RecordingExtension = .{};
+    try testing.expectError(error.InvalidConfig, client_mod.loadOptions(arena.allocator(), .{ .env = &env, .config_data = toml, .disable_env = true, .extensions = &.{no_env.extension("secrets")} }));
+    try testing.expectEqualStrings("default", no_env.profile);
+    try testing.expect(!no_env.had_env);
+}
+
+test "ConfigEnv reads a map, or the process environment without one" {
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("SOME_VAR", "x");
+    const from_map: client_mod.ConfigEnv = .{ .map = &env };
+    try testing.expectEqualStrings("x", from_map.get("SOME_VAR").?);
+    try testing.expect(from_map.get("SOME") == null);
+
+    const process: client_mod.ConfigEnv = .{ .map = null };
+    const path = std.mem.span(std.c.getenv("PATH") orelse return error.SkipZigTest);
+    try testing.expectEqualStrings(path, process.get("PATH").?);
+    try testing.expect(process.get("PAT") == null);
+    try testing.expect(process.get("temporal-sdk-zig no such variable") == null);
+}
