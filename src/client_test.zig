@@ -1989,3 +1989,349 @@ test "ConfigEnv reads a map, or the process environment without one" {
     try testing.expect(process.get("PAT") == null);
     try testing.expect(process.get("temporal-sdk-zig no such variable") == null);
 }
+
+// ---------------------------------------------------------------- Nexus contexts of client reads
+
+const failure_mod = @import("failure.zig");
+const nexus_system = @import("nexus/system.zig");
+
+/// A codec for the Nexus endpoint `endpoint`. It decodes a payload of encoding `binary/nexus`
+/// only with a context whose Nexus endpoint is `endpoint`, giving it encoding `json/plain`,
+/// and any other payload only with a context without Nexus; otherwise it fails with
+/// `error.CodecFailed`. It records each payload's context: `nexus=<endpoint>`,
+/// `wf=<workflow ID>` or `act=<activity ID>`.
+const NexusEndpointCodec = struct {
+    arena: Allocator,
+    endpoint: []const u8,
+    seen: std.ArrayList([]const u8) = .empty,
+
+    fn codec(r: *NexusEndpointCodec) converter.PayloadCodec {
+        return .{ .ptr = r, .vtable = &.{ .encode = plain, .decode = plain, .decodeWithContext = decode } };
+    }
+
+    fn plain(_: *anyopaque, arena: Allocator, _: std.Io, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        return arena.dupe(converter.Payload, payloads);
+    }
+
+    fn decode(ptr: *anyopaque, arena: Allocator, _: std.Io, context: *const converter.Context, payloads: []const converter.Payload) converter.CodecError![]converter.Payload {
+        const r: *NexusEndpointCodec = @ptrCast(@alignCast(ptr));
+        const out = try arena.dupe(converter.Payload, payloads);
+        for (out) |*p| {
+            try r.seen.append(r.arena, try contextLabel(r.arena, context));
+            const marked = std.mem.eql(u8, converter.encodingOf(p.*) orelse "", "binary/nexus");
+            const ours = if (context.nexus) |n| std.mem.eql(u8, n.endpoint, r.endpoint) else false;
+            if (marked != ours) return error.CodecFailed;
+            if (marked) p.* = try withEncoding(arena, p.*, "json/plain");
+        }
+        return out;
+    }
+
+    fn count(r: *const NexusEndpointCodec, label: []const u8) usize {
+        var n: usize = 0;
+        for (r.seen.items) |s| n += @intFromBool(std.mem.eql(u8, s, label));
+        return n;
+    }
+};
+
+fn contextLabel(arena: Allocator, context: *const converter.Context) error{OutOfMemory}![]const u8 {
+    if (context.nexus) |n| return std.fmt.allocPrint(arena, "nexus={s}", .{n.endpoint});
+    if (context.activity_id.len > 0) return std.fmt.allocPrint(arena, "act={s}", .{context.activity_id});
+    return std.fmt.allocPrint(arena, "wf={s}", .{context.workflow_id});
+}
+
+/// A failure converter that records the context of each failure it is given, as
+/// `contextLabel` writes it, and returns the failure as it is.
+const RecordingFailureConverter = struct {
+    arena: Allocator,
+    seen: std.ArrayList([]const u8) = .empty,
+
+    fn converter_(r: *RecordingFailureConverter) converter.FailureConverter {
+        return .{ .ptr = r, .vtable = &.{ .toFailure = toFailure, .fromFailure = fromFailure } };
+    }
+
+    fn toFailure(_: *anyopaque, _: Allocator, _: *const converter.Context, _: ?anyerror, f: failure_v1.Failure) error{OutOfMemory}!failure_v1.Failure {
+        return f;
+    }
+
+    fn fromFailure(ptr: *anyopaque, _: Allocator, context: *const converter.Context, f: failure_v1.Failure) error{OutOfMemory}!failure_v1.Failure {
+        const r: *RecordingFailureConverter = @ptrCast(@alignCast(ptr));
+        try r.seen.append(r.arena, try contextLabel(r.arena, context));
+        return f;
+    }
+};
+
+fn withEncoding(arena: Allocator, p: converter.Payload, encoding: []const u8) error{OutOfMemory}!converter.Payload {
+    var out: converter.Payload = .{ .data = p.data };
+    try out.metadata.append(arena, .{ .key = "encoding", .value = encoding });
+    return out;
+}
+
+/// The JSON string `text` as a payload a codec for the endpoint must decode (`nexus`) or as
+/// a plain one.
+fn stringPayload(arena: Allocator, text: []const u8, nexus_encoded: bool) !converter.Payload {
+    const p = try converter.toPayload(arena, text);
+    return if (nexus_encoded) withEncoding(arena, p, "binary/nexus") else p;
+}
+
+/// An application failure whose message is in its encoded attributes, which are encoded for
+/// the endpoint (`nexus`) or plain.
+fn encodedFailure(arena: Allocator, message: []const u8, nexus_encoded: bool) !failure_v1.Failure {
+    var f: failure_v1.Failure = .{ .message = message, .failure_info = .{ .application_failure_info = .{} } };
+    try failure_mod.encodeAttributes(failure_v1.Failure, &f, arena);
+    if (nexus_encoded) f.encoded_attributes = try withEncoding(arena, f.encoded_attributes.?, "binary/nexus");
+    return f;
+}
+
+const caller_context: proto.temporal.api.nexus.v1.PropagatedSerializationContext = .{ .endpoint = "caller-ep", .service = "caller-svc", .operation = "caller-op" };
+
+const NexusReadFixture = struct {
+    arena_state: std.heap.ArenaAllocator,
+    codec: NexusEndpointCodec,
+    failures: RecordingFailureConverter,
+    codecs: [1]converter.PayloadCodec,
+    client: Client,
+    server: Server,
+
+    fn init(f: *NexusReadFixture, answers: []const Answer) !void {
+        f.arena_state = .init(testing.allocator);
+        errdefer f.arena_state.deinit();
+        const a = f.arena_state.allocator();
+        f.codec = .{ .arena = a, .endpoint = caller_context.endpoint };
+        f.failures = .{ .arena = a };
+        f.codecs = .{f.codec.codec()};
+        f.client = try Client.init(testing.allocator, testing.io, .{ .host_port = closed_port, .core_log_level = null, .codecs = &f.codecs, .failure_converter = f.failures.converter_() });
+        errdefer f.client.close();
+        f.server = .{ .answers = answers };
+        try connectToServer(&f.client, &f.server);
+    }
+
+    fn deinit(f: *NexusReadFixture) void {
+        f.client.close();
+        f.arena_state.deinit();
+    }
+};
+
+fn updateOutcome(arena: Allocator, success: bool, nexus_encoded: bool) !proto.temporal.api.update.v1.Outcome {
+    if (!success) return .{ .value = .{ .failure = try encodedFailure(arena, "update failed", nexus_encoded) } };
+    var payloads: common.Payloads = .{};
+    try payloads.payloads.append(arena, try stringPayload(arena, "done", nexus_encoded));
+    return .{ .value = .{ .success = payloads } };
+}
+
+fn updateResponse(arena: Allocator, success: bool, propagated: bool) !wfs.UpdateWorkflowExecutionResponse {
+    return .{
+        .update_ref = .{ .workflow_execution = .{ .workflow_id = "wf-u", .run_id = "run-1" }, .update_id = "upd-1" },
+        .outcome = try updateOutcome(arena, success, propagated),
+        .stage = .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED,
+        .propagated_nexus_serialization_context = if (propagated) caller_context else null,
+    };
+}
+
+fn pollUpdateAnswer(arena: Allocator, success: bool, propagated: bool) !Answer {
+    return .{ .rpc = "PollWorkflowExecutionUpdate", .proto = try encodeMessage(arena, wfs.PollWorkflowExecutionUpdateResponse{
+        .outcome = try updateOutcome(arena, success, propagated),
+        .stage = .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED,
+        .propagated_nexus_serialization_context = if (propagated) caller_context else null,
+    }) };
+}
+
+fn multiOperationAnswer(arena: Allocator, success: bool, propagated: bool) !Answer {
+    var response: wfs.ExecuteMultiOperationResponse = .{};
+    try response.responses.append(arena, .{ .response = .{ .start_workflow = .{ .run_id = "run-1", .started = true } } });
+    try response.responses.append(arena, .{ .response = .{ .update_workflow = try updateResponse(arena, success, propagated) } });
+    return .{ .rpc = "ExecuteMultiOperation", .proto = try encodeMessage(arena, response) };
+}
+
+fn pollActivityAnswer(arena: Allocator, success: bool, propagated: bool) !Answer {
+    const outcome: proto.temporal.api.activity.v1.ActivityExecutionOutcome = if (success) blk: {
+        var payloads: common.Payloads = .{};
+        try payloads.payloads.append(arena, try stringPayload(arena, "done", propagated));
+        break :blk .{ .value = .{ .result = payloads } };
+    } else .{ .value = .{ .failure = try encodedFailure(arena, "activity failed", propagated) } };
+    return .{ .rpc = "PollActivityExecution", .proto = try encodeMessage(arena, wfs.PollActivityExecutionResponse{
+        .run_id = "act-run",
+        .outcome = outcome,
+        .propagated_nexus_serialization_context = if (propagated) caller_context else null,
+    }) };
+}
+
+test "describeWorkflow decodes a pending Nexus operation's last failures with the operation's context, and the rest with the workflow's" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var memo: common.Memo = .{};
+    try memo.fields.append(a, .{ .key = "note", .value = try stringPayload(a, "memo", false) });
+    var response: wfs.DescribeWorkflowExecutionResponse = .{ .workflow_execution_info = .{
+        .execution = .{ .workflow_id = "wf-d", .run_id = "run-1" },
+        .status = .WORKFLOW_EXECUTION_STATUS_RUNNING,
+        .memo = memo,
+    } };
+    try response.pending_nexus_operations.append(a, .{ .endpoint = nexus_system.endpoint, .service = "s", .operation = "o", .last_attempt_failure = try encodedFailure(a, "system failed", false) });
+    try response.pending_nexus_operations.append(a, .{
+        .endpoint = caller_context.endpoint,
+        .service = caller_context.service,
+        .operation = caller_context.operation,
+        .last_attempt_failure = try encodedFailure(a, "start failed", true),
+        .cancellation_info = .{ .last_attempt_failure = try encodedFailure(a, "cancel failed", true) },
+    });
+    const answers = [_]Answer{.{ .rpc = describe_rpc, .proto = try encodeMessage(a, response) }};
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+
+    const d = try f.client.describeWorkflow(a, "wf-d", "run-1");
+    const ops = d.raw.pending_nexus_operations.items;
+    try testing.expectEqual(@as(usize, 2), ops.len);
+    try testing.expectEqualStrings(nexus_system.endpoint, ops[0].endpoint);
+    try testing.expectEqualStrings("system failed", ops[0].last_attempt_failure.?.message);
+    try testing.expectEqualStrings(caller_context.endpoint, ops[1].endpoint);
+    try testing.expectEqualStrings("start failed", ops[1].last_attempt_failure.?.message);
+    try testing.expect(ops[1].last_attempt_failure.?.encoded_attributes == null);
+    try testing.expectEqualStrings("cancel failed", ops[1].cancellation_info.?.last_attempt_failure.?.message);
+    try testing.expectEqualStrings("memo", (try d.memoValue([]const u8, a, "note")).?);
+    // Each payload is decoded once: the operation's two with its context, the system
+    // operation's and the memo with the workflow's.
+    try testing.expectEqual(@as(usize, 2), f.codec.count("nexus=caller-ep"));
+    try testing.expectEqual(@as(usize, 2), f.codec.count("wf=wf-d"));
+    try testing.expectEqual(@as(usize, 4), f.codec.seen.items.len);
+}
+
+test "an update handle from updateWorkflowByName decodes its result and failure with the propagated Nexus context" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{
+        .{ .rpc = "UpdateWorkflowExecution", .proto = try encodeMessage(a, try updateResponse(a, true, true)) },
+        .{ .rpc = "UpdateWorkflowExecution", .proto = try encodeMessage(a, try updateResponse(a, false, true)) },
+    };
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+
+    var ok = try f.client.updateWorkflowByName([]const u8, "upd", "wf-u", "run-1", .{}, .{});
+    defer ok.deinit();
+    try testing.expectEqualStrings(caller_context.operation, ok.outcome_nexus_context.?.operation);
+    try testing.expectEqualStrings("done", try ok.get(a));
+
+    var failed = try f.client.updateWorkflowByName([]const u8, "upd", "wf-u", "run-1", .{}, .{});
+    defer failed.deinit();
+    try testing.expectError(error.UpdateFailed, failed.get(a));
+    try testing.expectEqualStrings("update failed", failed.failure().?.message);
+    try testing.expectEqual(@as(usize, 1), f.failures.seen.items.len);
+    try testing.expectEqualStrings("nexus=caller-ep", f.failures.seen.items[0]);
+}
+
+test "an update handle from getWorkflowUpdateHandle decodes a polled result and failure with the propagated Nexus context" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{ try pollUpdateAnswer(a, true, true), try pollUpdateAnswer(a, false, true) };
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+
+    var ok = try f.client.getWorkflowUpdateHandle([]const u8, "wf-u", "run-1", "upd-1");
+    defer ok.deinit();
+    try testing.expect(ok.outcome_nexus_context == null);
+    try testing.expectEqualStrings("done", try ok.get(a));
+
+    var failed = try f.client.getWorkflowUpdateHandle([]const u8, "wf-u", "run-1", "upd-1");
+    defer failed.deinit();
+    try testing.expectError(error.UpdateFailed, failed.get(a));
+    try testing.expectEqualStrings("update failed", failed.failure().?.message);
+    try testing.expectEqualStrings("nexus=caller-ep", f.failures.seen.items[0]);
+}
+
+test "an update-with-start handle decodes its result and failure with the propagated Nexus context of the update's response" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{ try multiOperationAnswer(a, true, true), try multiOperationAnswer(a, false, true) };
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+    const start: client_mod.StartWorkflowOptions = .{ .id = "wf-u", .task_queue = "tq", .id_conflict_policy = .use_existing };
+
+    var ok = try f.client.updateWithStartWorkflowByName([]const u8, "Wf", start, .{}, "upd", .{}, .{});
+    defer ok.deinit();
+    try testing.expectEqualStrings("done", try ok.get(a));
+
+    var failed = try f.client.updateWithStartWorkflowByName([]const u8, "Wf", start, .{}, "upd", .{}, .{});
+    defer failed.deinit();
+    try testing.expectError(error.UpdateFailed, failed.get(a));
+    try testing.expectEqualStrings("update failed", failed.failure().?.message);
+    try testing.expectEqualStrings("nexus=caller-ep", f.failures.seen.items[0]);
+}
+
+test "a standalone activity handle decodes its result and failure with the propagated Nexus context" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{ try pollActivityAnswer(a, true, true), try pollActivityAnswer(a, false, true) };
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+
+    var ok = try f.client.getActivityHandle([]const u8, "act-1", "");
+    defer ok.deinit();
+    try testing.expectEqualStrings("done", try ok.get(a));
+
+    var failed = try f.client.getActivityHandle([]const u8, "act-1", "");
+    defer failed.deinit();
+    try testing.expectError(error.ActivityFailed, failed.get(a));
+    try testing.expectEqualStrings("activity failed", failed.failure().?.message);
+    try testing.expectEqualStrings("nexus=caller-ep", f.failures.seen.items[0]);
+}
+
+test "update and standalone activity handles decode with the workflow's or activity's context when the server sends no propagated Nexus context" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{
+        .{ .rpc = "UpdateWorkflowExecution", .proto = try encodeMessage(a, try updateResponse(a, true, false)) },
+        try pollUpdateAnswer(a, false, false),
+        try multiOperationAnswer(a, true, false),
+        try pollActivityAnswer(a, true, false),
+        try pollActivityAnswer(a, false, false),
+    };
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+
+    var updated = try f.client.updateWorkflowByName([]const u8, "upd", "wf-u", "run-1", .{}, .{});
+    defer updated.deinit();
+    try testing.expect(updated.outcome_nexus_context == null);
+    try testing.expectEqualStrings("done", try updated.get(a));
+
+    var polled = try f.client.getWorkflowUpdateHandle([]const u8, "wf-u", "run-1", "upd-1");
+    defer polled.deinit();
+    try testing.expectError(error.UpdateFailed, polled.get(a));
+    try testing.expectEqualStrings("update failed", polled.failure().?.message);
+
+    var with_start = try f.client.updateWithStartWorkflowByName([]const u8, "Wf", .{ .id = "wf-u", .task_queue = "tq", .id_conflict_policy = .use_existing }, .{}, "upd", .{}, .{});
+    defer with_start.deinit();
+    try testing.expectEqualStrings("done", try with_start.get(a));
+
+    var activity = try f.client.getActivityHandle([]const u8, "act-1", "");
+    defer activity.deinit();
+    try testing.expectEqualStrings("done", try activity.get(a));
+    var failed_activity = try f.client.getActivityHandle([]const u8, "act-1", "");
+    defer failed_activity.deinit();
+    try testing.expectError(error.ActivityFailed, failed_activity.get(a));
+
+    // Five payloads, none decoded with a Nexus context. (A polled update's codec context
+    // names no workflow: its request names it only inside `update_ref`.)
+    try testing.expectEqual(@as(usize, 5), f.codec.seen.items.len);
+    for (f.codec.seen.items) |label| try testing.expect(!std.mem.startsWith(u8, label, "nexus="));
+    try testing.expectEqual(@as(usize, 2), f.codec.count("wf=wf-u"));
+    try testing.expectEqual(@as(usize, 2), f.codec.count("act=act-1"));
+    try testing.expectEqual(@as(usize, 2), f.failures.seen.items.len);
+    try testing.expectEqualStrings("wf=wf-u", f.failures.seen.items[0]);
+    try testing.expectEqualStrings("act=act-1", f.failures.seen.items[1]);
+}
