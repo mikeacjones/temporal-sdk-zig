@@ -2373,7 +2373,10 @@ pub const Client = struct {
 
     /// Describes a workflow run: its status, type, times, memo and search attributes. An
     /// empty `run_id` describes the latest run. Returns `error.NotFound` if no such workflow
-    /// exists. The description and all its memory come from `arena`.
+    /// exists. The description and all its memory come from `arena`. Experimental: the
+    /// codecs decode each pending Nexus operation's last attempt failures
+    /// (`raw.pending_nexus_operations`) with that operation's Nexus context, except an
+    /// operation on the system endpoint, as history reads decode the operation's events.
     pub fn describeWorkflow(c: *Client, arena: Allocator, workflow_id: []const u8, run_id: []const u8) DescribeError!WorkflowDescription {
         const response = c.rpc(wfs.DescribeWorkflowExecutionResponse, "DescribeWorkflowExecution", wfs.DescribeWorkflowExecutionRequest{
             .namespace = c.namespace,
@@ -2927,13 +2930,13 @@ pub const Client = struct {
         var header = try c.outgoingHeader(a, options.context);
         const response = try c.updateUntilStage(a, request, &header, &.{}, options.context);
         const ref_run_id = if (response.update_ref) |r| if (r.workflow_execution) |e| e.run_id else "" else "";
-        return .init(c, workflow_id, if (ref_run_id.len > 0) ref_run_id else run_id, request.request.?.meta.?.update_id, response.outcome);
+        return .init(c, workflow_id, if (ref_run_id.len > 0) ref_run_id else run_id, request.request.?.meta.?.update_id, response.outcome, response.propagated_nexus_serialization_context);
     }
 
     /// A handle to the update `update_id` already sent to a workflow, for example by another
     /// process. `get` waits for its outcome. An empty `run_id` targets the latest run.
     pub fn getWorkflowUpdateHandle(c: *Client, comptime Result: type, workflow_id: []const u8, run_id: []const u8, update_id: []const u8) error{OutOfMemory}!WorkflowUpdateHandle(Result) {
-        return .init(c, workflow_id, run_id, update_id, null);
+        return .init(c, workflow_id, run_id, update_id, null, null);
     }
 
     /// A handle to an existing workflow, for waiting for its result with `get`. An empty
@@ -3034,7 +3037,7 @@ pub const Client = struct {
             update.workflow_execution.?.run_id = started.run_id;
             updated = try c.updateUntilStage(a, update, null, update_header.codec_fields.items, update_options.context);
         }
-        return .init(c, id, started.run_id, update.request.?.meta.?.update_id, updated.outcome);
+        return .init(c, id, started.run_id, update.request.?.meta.?.update_id, updated.outcome, updated.propagated_nexus_serialization_context);
     }
 
     /// Maps a failed ExecuteMultiOperation to an error, logging which operation failed.
@@ -3411,7 +3414,7 @@ pub const Client = struct {
         const decoded = if (comptime Response == wfs.GetWorkflowExecutionHistoryResponse)
             c.decodeHistoryResponse(arena, &response, codec_context, history)
         else
-            converter.decodeMessage(Response, &response, c.codecs, arena, c.io, codec_context);
+            c.decodeResponse(Response, arena, &response, codec_context);
         decoded catch |err| {
             if (err == error.CodecFailed) log.warn("{s} failed: decoding the response's payloads with the client's codecs failed", .{method});
             return err;
@@ -3460,6 +3463,65 @@ pub const Client = struct {
         // Decoding copied the list, keeping its length and order; the events decoded alone go
         // back into the copy.
         for (own.items) |o| response.history.?.events.items[o.index] = o.event;
+    }
+
+    /// Decodes a response other than a history page with the codecs. Each part is decoded with
+    /// the context its payloads were encoded with: an update's or a standalone activity's
+    /// outcome with the propagated Nexus context the response carries with it; a described
+    /// workflow's pending Nexus operation (one on the system endpoint excepted) with the
+    /// operation's Nexus context; everything else with `base`, the request's context.
+    fn decodeResponse(c: *Client, comptime Response: type, arena: Allocator, response: *Response, base: *const converter.Context) converter.CodecError!void {
+        if (c.codecs.len == 0) return;
+        if (comptime Response == wfs.UpdateWorkflowExecutionResponse or Response == wfs.PollWorkflowExecutionUpdateResponse or Response == wfs.PollActivityExecutionResponse) {
+            // `outcome` holds the response's only payloads.
+            const context = if (response.propagated_nexus_serialization_context) |p| propagatedContext(base, p) else base.*;
+            return converter.decodeMessage(Response, response, c.codecs, arena, c.io, &context);
+        }
+        if (comptime Response == wfs.ExecuteMultiOperationResponse) {
+            const Entry = wfs.ExecuteMultiOperationResponse.Response;
+            const entries = try arena.dupe(Entry, response.responses.items);
+            response.responses = .fromOwnedSlice(entries);
+            const Own = struct { index: usize, entry: Entry };
+            var own: std.ArrayList(Own) = .empty;
+            for (entries, 0..) |*entry, i| {
+                const r = if (entry.response) |*r| r else continue;
+                if (r.* != .update_workflow or r.update_workflow.propagated_nexus_serialization_context == null) continue;
+                var copy = entry.*;
+                try c.decodeResponse(wfs.UpdateWorkflowExecutionResponse, arena, &copy.response.?.update_workflow, base);
+                try own.append(arena, .{ .index = i, .entry = copy });
+                entry.* = .{};
+            }
+            try converter.decodeMessage(Response, response, c.codecs, arena, c.io, base);
+            // Decoding copied the list, keeping its length and order; the entries decoded
+            // alone go back into the copy.
+            for (own.items) |o| response.responses.items[o.index] = o.entry;
+            return;
+        }
+        if (comptime Response == wfs.DescribeWorkflowExecutionResponse) {
+            const Pending = proto.temporal.api.workflow.v1.PendingNexusOperationInfo;
+            const pending = try arena.dupe(Pending, response.pending_nexus_operations.items);
+            response.pending_nexus_operations = .fromOwnedSlice(pending);
+            const Own = struct { index: usize, operation: Pending };
+            var own: std.ArrayList(Own) = .empty;
+            for (pending, 0..) |*op, i| {
+                if (std.mem.eql(u8, op.endpoint, nexus_system.endpoint)) continue;
+                const context: converter.Context = .{ .values = base.values, .namespace = base.namespace, .nexus = .{ .endpoint = op.endpoint, .service = op.service, .operation = op.operation } };
+                var copy = op.*;
+                try converter.decodeMessage(Pending, &copy, c.codecs, arena, c.io, &context);
+                try own.append(arena, .{ .index = i, .operation = copy });
+                op.* = .{};
+            }
+            try converter.decodeMessage(Response, response, c.codecs, arena, c.io, base);
+            for (own.items) |o| response.pending_nexus_operations.items[o.index] = o.operation;
+            return;
+        }
+        return converter.decodeMessage(Response, response, c.codecs, arena, c.io, base);
+    }
+
+    /// `base` with `nexus` set to `p`'s names and the workflow and activity fields empty.
+    /// Borrows `p` and `base`.
+    fn propagatedContext(base: *const converter.Context, p: proto.temporal.api.nexus.v1.PropagatedSerializationContext) converter.Context {
+        return .{ .values = base.values, .namespace = base.namespace, .nexus = .{ .endpoint = p.endpoint, .service = p.service, .operation = p.operation } };
     }
 
     /// A server set to send raw history for the namespace answers GetWorkflowExecutionHistory
@@ -4665,7 +4727,8 @@ pub fn ActivityHandle(comptime T: type) type {
         /// already running with the ID. Always false from `Client.getActivityHandle`.
         started: bool = false,
         /// The activity's type, from `Client.executeActivity`; `get` decodes the result and
-        /// any failure with it in the converter context. Empty from
+        /// any failure with it in the converter context, unless the server sent a propagated
+        /// Nexus context with them. Empty from
         /// `Client.getActivityHandle`, which doesn't know it.
         activity_type: []u8 = &.{},
         failure_: ?failure_mod.Failure = null,
@@ -4678,9 +4741,14 @@ pub fn ActivityHandle(comptime T: type) type {
         }
 
         /// Waits for the activity to close and returns its result. The result and any
-        /// failure are allocated from `arena`.
+        /// failure are allocated from `arena`. Experimental: when the server sent a
+        /// propagated Nexus serialization context with the outcome (an activity a Nexus
+        /// handler started), the codecs, the payload converter and the failure converter
+        /// decode the result and failure with that context instead of the activity's.
         pub fn get(h: *Self, arena: Allocator) ActivityResultError!T {
             const c = h.client;
+            // Borrows the response in `arena`.
+            var nexus: ?converter.NexusContext = null;
             const outcome = while (true) {
                 // Each call is a long poll the server may end before the activity closes.
                 var status: ?Client.RpcStatus = null;
@@ -4699,9 +4767,12 @@ pub fn ActivityHandle(comptime T: type) type {
                     },
                     else => |e| return e,
                 };
-                if (response.outcome) |o| break o;
+                if (response.outcome) |o| {
+                    if (response.propagated_nexus_serialization_context) |p| nexus = .{ .endpoint = p.endpoint, .service = p.service, .operation = p.operation };
+                    break o;
+                }
             };
-            const context = h.converterContext();
+            const context: converter.Context = if (nexus) |n| .{ .namespace = c.namespace, .nexus = n } else h.converterContext();
             switch (outcome.value orelse return error.InvalidResponse) {
                 .result => |payloads| {
                     if (T == void) return;
@@ -4722,8 +4793,8 @@ pub fn ActivityHandle(comptime T: type) type {
             }
         }
 
-        /// The converter context `get` decodes the result and any failure with. Borrows the
-        /// handle.
+        /// The converter context `get` decodes the result and any failure with when the server
+        /// sent no propagated Nexus context with them. Borrows the handle.
         fn converterContext(h: *const Self) converter.Context {
             return .{ .namespace = h.client.namespace, .activity_id = h.id, .activity_type = h.activity_type };
         }
@@ -6098,6 +6169,23 @@ pub const HistoryIteratorOptions = struct {
     page_size: u31 = 0,
 };
 
+/// A Nexus context with copies of the three names, owned by `gpa`; free with
+/// `freeNexusContext`.
+fn dupeNexusContext(gpa: Allocator, endpoint: []const u8, service: []const u8, operation: []const u8) error{OutOfMemory}!converter.NexusContext {
+    const e = try gpa.dupe(u8, endpoint);
+    errdefer gpa.free(e);
+    const s = try gpa.dupe(u8, service);
+    errdefer gpa.free(s);
+    return .{ .endpoint = e, .service = s, .operation = try gpa.dupe(u8, operation) };
+}
+
+/// Frees the names of a context from `dupeNexusContext`.
+fn freeNexusContext(gpa: Allocator, n: converter.NexusContext) void {
+    gpa.free(n.endpoint);
+    gpa.free(n.service);
+    gpa.free(n.operation);
+}
+
 /// The codec contexts of a run's history that its events don't carry themselves, collected as
 /// its events are read in order, so the pages after the one that holds them decode with them:
 /// each Nexus operation's, from its scheduled event, for the events that end it; each update's
@@ -6112,37 +6200,23 @@ const HistoryContexts = struct {
 
     fn deinit(h: *HistoryContexts) void {
         var it = h.by_event.valueIterator();
-        while (it.next()) |n| freeNames(h.gpa, n.*);
+        while (it.next()) |n| freeNexusContext(h.gpa, n.*);
         h.by_event.deinit(h.gpa);
-        if (h.run_result) |n| freeNames(h.gpa, n);
+        if (h.run_result) |n| freeNexusContext(h.gpa, n);
         h.* = undefined;
-    }
-
-    fn freeNames(gpa: Allocator, n: converter.NexusContext) void {
-        gpa.free(n.endpoint);
-        gpa.free(n.service);
-        gpa.free(n.operation);
-    }
-
-    fn dupeNames(h: *HistoryContexts, endpoint: []const u8, service: []const u8, operation: []const u8) error{OutOfMemory}!converter.NexusContext {
-        const e = try h.gpa.dupe(u8, endpoint);
-        errdefer h.gpa.free(e);
-        const s = try h.gpa.dupe(u8, service);
-        errdefer h.gpa.free(s);
-        return .{ .endpoint = e, .service = s, .operation = try h.gpa.dupe(u8, operation) };
     }
 
     fn put(h: *HistoryContexts, event_id: i64, endpoint: []const u8, service: []const u8, operation: []const u8) error{OutOfMemory}!converter.NexusContext {
         if (h.by_event.get(event_id)) |n| return n;
         try h.by_event.ensureUnusedCapacity(h.gpa, 1);
-        const n = try h.dupeNames(endpoint, service, operation);
+        const n = try dupeNexusContext(h.gpa, endpoint, service, operation);
         h.by_event.putAssumeCapacity(event_id, n);
         return n;
     }
 
     fn setRunResult(h: *HistoryContexts, p: proto.temporal.api.nexus.v1.PropagatedSerializationContext) error{OutOfMemory}!void {
         if (h.run_result != null) return;
-        h.run_result = try h.dupeNames(p.endpoint, p.service, p.operation);
+        h.run_result = try dupeNexusContext(h.gpa, p.endpoint, p.service, p.operation);
     }
 
     /// The Nexus context `event`'s payloads were encoded with, or null for its run's own;
@@ -6586,15 +6660,22 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
         update_id: []u8,
         /// The encoded outcome when the update call already returned one.
         outcome: ?[]u8,
+        /// Experimental: the Nexus context the server sent with `outcome` (the update's
+        /// propagated serialization context), which `get` decodes the stored outcome with;
+        /// null when the server sent none or there is no stored outcome. Its strings are
+        /// owned with the client's allocator and freed by `deinit`.
+        outcome_nexus_context: ?converter.NexusContext = null,
         failure_: ?failure_mod.Failure = null,
 
-        fn init(c: *Client, workflow_id: []const u8, run_id: []const u8, update_id: []const u8, outcome: ?proto.temporal.api.update.v1.Outcome) error{OutOfMemory}!Self {
+        fn init(c: *Client, workflow_id: []const u8, run_id: []const u8, update_id: []const u8, outcome: ?proto.temporal.api.update.v1.Outcome, propagated: ?proto.temporal.api.nexus.v1.PropagatedSerializationContext) error{OutOfMemory}!Self {
             const wid = try c.gpa.dupe(u8, workflow_id);
             errdefer c.gpa.free(wid);
             const rid = try c.gpa.dupe(u8, run_id);
             errdefer c.gpa.free(rid);
             const uid = try c.gpa.dupe(u8, update_id);
             errdefer c.gpa.free(uid);
+            const nexus: ?converter.NexusContext = if (outcome != null) if (propagated) |p| try dupeNexusContext(c.gpa, p.endpoint, p.service, p.operation) else null else null;
+            errdefer if (nexus) |n| freeNexusContext(c.gpa, n);
             var encoded: ?[]u8 = null;
             if (outcome) |o| {
                 var w: Io.Writer.Allocating = .init(c.gpa);
@@ -6606,7 +6687,7 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
                 o.encode(&w.writer, scratch.allocator()) catch return error.OutOfMemory;
                 encoded = try w.toOwnedSlice();
             }
-            return .{ .client = c, .workflow_id = wid, .run_id = rid, .update_id = uid, .outcome = encoded };
+            return .{ .client = c, .workflow_id = wid, .run_id = rid, .update_id = uid, .outcome = encoded, .outcome_nexus_context = nexus };
         }
 
         pub fn deinit(h: *Self) void {
@@ -6615,13 +6696,19 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
             gpa.free(h.run_id);
             gpa.free(h.update_id);
             if (h.outcome) |o| gpa.free(o);
+            if (h.outcome_nexus_context) |n| freeNexusContext(gpa, n);
             h.* = undefined;
         }
 
         /// Waits for the update to complete and returns its result. The result and any failure
-        /// are allocated from `arena`.
+        /// are allocated from `arena`. Experimental: when the server sent the update's
+        /// propagated Nexus serialization context with the outcome, the codecs, the payload
+        /// converter and the failure converter decode the result and failure with that
+        /// context, as `WorkflowRun.get` does for a run a Nexus handler started.
         pub fn get(h: *Self, arena: Allocator) UpdateResultError!T {
             const c = h.client;
+            // Borrows the handle, or the response in `arena`.
+            var nexus: ?converter.NexusContext = h.outcome_nexus_context;
             const outcome: proto.temporal.api.update.v1.Outcome = if (h.outcome) |bytes| blk: {
                 var reader: Io.Reader = .fixed(try arena.dupe(u8, bytes));
                 break :blk proto.temporal.api.update.v1.Outcome.decode(&reader, arena) catch |err| switch (err) {
@@ -6639,16 +6726,20 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
                     error.AlreadyExists => return error.InvalidResponse,
                     else => |e| return e,
                 };
-                if (response.outcome) |o| break o;
+                if (response.outcome) |o| {
+                    if (response.propagated_nexus_serialization_context) |p| nexus = .{ .endpoint = p.endpoint, .service = p.service, .operation = p.operation };
+                    break o;
+                }
             };
+            const context: converter.Context = if (nexus) |n| .{ .namespace = c.namespace, .nexus = n } else c.workflowContext(h.workflow_id, null);
             switch (outcome.value orelse return error.InvalidResponse) {
                 .success => |payloads| {
                     if (T == void) return;
                     if (payloads.payloads.items.len == 0) return error.InvalidPayload;
-                    return converter.fromPayloadWithContext(T, arena, &c.workflowContext(h.workflow_id, null), payloads.payloads.items[0]);
+                    return converter.fromPayloadWithContext(T, arena, &context, payloads.payloads.items[0]);
                 },
                 .failure => |f| {
-                    h.failure_ = try c.receivedFailure(arena, &c.workflowContext(h.workflow_id, null), f);
+                    h.failure_ = try c.receivedFailure(arena, &context, f);
                     return error.UpdateFailed;
                 },
             }
