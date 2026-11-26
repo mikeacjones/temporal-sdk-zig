@@ -4128,7 +4128,8 @@ const VersionFixtures = struct {
     }
 
     /// Waits until version `build_id` of `h`'s deployment has polled `task_queue` for
-    /// workflow tasks: the server pins a workflow only to a version that has.
+    /// workflow tasks. That is necessary for the server to pin a workflow to the version on
+    /// `task_queue`, not sufficient: see `awaitPinnable`.
     fn awaitPolled(h: *const client_mod.WorkerDeploymentHandle, build_id: []const u8, task_queue: []const u8) !void {
         while (true) {
             var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -4142,6 +4143,44 @@ const VersionFixtures = struct {
                 if (q.type == .workflow and std.mem.eql(u8, q.name, task_queue)) return;
             };
             try testing.io.sleep(.fromMilliseconds(100), .awake);
+        }
+    }
+
+    /// Waits until the server accepts a workflow pinned to `version` on `task_queue`.
+    /// `describeVersion` lists a task queue from the version's own state, before the version has
+    /// reached the task queue's matching-side record, which is what the server checks when it
+    /// accepts a pin. Nothing read-only shows that record, so this asks the question itself: it
+    /// starts a workflow pinned to `version` that never runs (one-hour start delay), and
+    /// terminates it once the start is accepted.
+    fn awaitPinnable(c: *client_mod.Client, version: deployment_mod.Version, task_queue: []const u8) !void {
+        while (true) {
+            var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const workflow_id = try std.fmt.allocPrint(arena, "pinnable-probe-{s}", .{try client_mod.uuid(arena, testing.io)});
+            var failure: ?client_mod.RpcFailure = null;
+            const started = c.callService(.workflow, "StartWorkflowExecution", arena, .{
+                .namespace = c.namespace,
+                .workflow_id = workflow_id,
+                .workflow_type = .{ .name = AutoRollout.workflow_name },
+                .task_queue = .{ .name = task_queue, .kind = .TASK_QUEUE_KIND_NORMAL },
+                .request_id = try client_mod.uuid(arena, testing.io),
+                // No worker ever receives a task of the probe.
+                .workflow_start_delay = .{ .seconds = 3600 },
+                .versioning_override = .{ .override = .{ .pinned = .{
+                    .behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED,
+                    .version = .{ .deployment_name = version.deployment_name, .build_id = version.build_id },
+                } } },
+            }, &failure) catch |err| switch (err) {
+                // The server's own key for this refusal (ErrPinnedVersionNotInTaskQueueSubstring).
+                error.FailedPrecondition => if (std.mem.indexOf(u8, failure.?.message, "is not present in task queue") != null) {
+                    try testing.io.sleep(.fromMilliseconds(100), .awake);
+                    continue;
+                } else return err,
+                else => return err,
+            };
+            try c.terminateWorkflow(workflow_id, started.run_id, "pinnable probe");
+            return;
         }
     }
 };
@@ -5355,23 +5394,8 @@ test "client: summary, details, priority and a versioning override set at start 
     try v1.start(&env.client, "start-override", "v1");
     defer v1.stop();
     try VersionFixtures.awaitVersion(&rollout, "v1");
-    while (true) {
-        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
-        defer scratch.deinit();
-        // The version can be missing here for a moment after the deployment lists it.
-        const version = rollout.describeVersion(scratch.allocator(), "v1") catch |err| switch (err) {
-            error.NotFound => {
-                try testing.io.sleep(.fromMilliseconds(100), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        const polled = for (version.task_queues) |q| {
-            if (q.type == .workflow and std.mem.eql(u8, q.name, "start-override")) break true;
-        } else false;
-        if (polled) break;
-        try testing.io.sleep(.fromMilliseconds(100), .awake);
-    }
+    try VersionFixtures.awaitPolled(&rollout, "v1", "start-override");
+    try VersionFixtures.awaitPinnable(&env.client, .{ .deployment_name = "rollout", .build_id = "v1" }, "start-override");
 
     // The auto-upgrade workflow is pinned, the pinned one auto-upgrades. Both wait for a
     // signal that never comes; the started event is all the test needs.
@@ -6261,6 +6285,7 @@ test "client: execution options: set a pinned, then an auto-upgrade override, th
     defer v1.stop();
     try VersionFixtures.awaitVersion(&rollout, "v1");
     try VersionFixtures.awaitPolled(&rollout, "v1", "options-override");
+    try VersionFixtures.awaitPinnable(c, .{ .deployment_name = "rollout", .build_id = "v1" }, "options-override");
 
     // v1 isn't current and no unversioned worker polls, so the first workflow task waits
     // until the pin sends it to v1.

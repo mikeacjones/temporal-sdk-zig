@@ -96,7 +96,12 @@ test "the workflow recovers in a new session when its host stops" {
     defer run.deinit();
     try Doubles.holding.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } });
 
-    var second = try temporal.worker.Worker.init(testing.allocator, testing.io, &env.client, env.task_queue, .{ .sessions = .{} });
+    // A second host is a second process with its own client. One client cannot hold two
+    // workers that poll the same kinds of tasks on one task queue: sdk-core refuses the second
+    // ("Registration of multiple workers with overlapping worker task types").
+    var second_client = try temporal.client.Client.connect(testing.allocator, testing.io, env.server.dev.clientOptions());
+    defer second_client.close();
+    var second = try temporal.worker.Worker.init(testing.allocator, testing.io, &second_client, env.task_queue, .{ .sessions = .{} });
     defer second.deinit();
     try second.registerActivity(Doubles.Prepare);
     try second.registerActivity(Doubles.LongQuick);
@@ -105,6 +110,7 @@ test "the workflow recovers in a new session when its host stops" {
         second.stop();
         second_running.await(testing.io) catch {};
     }
+    try second.waitUntilRunning();
 
     // The first host goes away while the long activity runs on it: its session fails.
     first.stop();
