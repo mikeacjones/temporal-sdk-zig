@@ -190,7 +190,7 @@ A status counts every public declaration in `src/`, documented or not. A feature
 | Context propagation through headers | all | GA | supported | [Context propagation](README.md#context-propagation), [ctxpropagation](samples/ctxpropagation) |
 | Context propagation over Nexus calls | Go, Java | GA | supported | [Context propagation](README.md#context-propagation), [nexus-context-propagation](samples/nexus-context-propagation) |
 | OpenTelemetry tracing | Go, Java, Python, TypeScript, .NET, Ruby | GA | supported | [Tracing](README.md#tracing), [opentelemetry](samples/opentelemetry) |
-| Spans started by workflow code: named spans with attributes from workflow, update handler and validator code, parenting the activities, children and signals started inside them (Go's v2 API is experimental) | Go, Python, TypeScript, .NET | pre-release | supported | [Tracing](README.md#tracing) |
+| Spans started by workflow code: named spans with attributes from workflow, update handler and validator code, parenting the activities, children and signals started inside them (Go's v2 API is experimental) | Go, Python, TypeScript, .NET | pre-release | supported | [Tracing](README.md#tracing), [opentelemetry-v2](samples/opentelemetry-v2) |
 
 ### Nexus
 
@@ -286,7 +286,7 @@ Each Zig sample lives in [samples](samples) and is validated against a dev serve
 | nexus-standalone-activity | [nexus-standalone-activity](samples/nexus-standalone-activity) | ported |
 | nexus-standalone-operations | [nexus-standalone-operations](samples/nexus-standalone-operations) | ported |
 | opentelemetry | [opentelemetry](samples/opentelemetry) | ported |
-| opentelemetry-v2 | | planned: `temporal-sdk-zig-d51.16.77` |
+| opentelemetry-v2 | [opentelemetry-v2](samples/opentelemetry-v2) | ported |
 | pickfirst | | not applicable: see [Samples with no Zig equivalent](#samples-with-no-zig-equivalent) |
 | polling | [polling](samples/polling) | ported |
 | pso | [pso](samples/pso) | ported |
