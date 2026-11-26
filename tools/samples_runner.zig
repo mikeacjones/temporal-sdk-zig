@@ -1459,6 +1459,31 @@ test "spans that form the declared chain satisfy it, whatever else was received"
     try testing.expectEqual(null, checkSpans(arena.allocator(), &.{}, &.{}));
 }
 
+test "a span received several times satisfies its declaration when any copy has a parent of the declared name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // Two workflows of the same type, one running its activity inside an application span:
+    // the first copies received of StartActivity and RunWorkflow don't satisfy the chain.
+    const declared = [_]ExpectedSpan{
+        .{ .name = "RunWorkflow:Workflow" },
+        .{ .name = "workflow-operation", .parent = "RunWorkflow:Workflow" },
+        .{ .name = "StartActivity:Activity", .parent = "workflow-operation" },
+    };
+    const spans = [_]ReceivedSpan{
+        receivedSpan("RunWorkflow:Workflow", trace_a, "0000000000000001", ""),
+        receivedSpan("StartActivity:Activity", trace_a, "0000000000000002", "0000000000000001"),
+        receivedSpan("RunWorkflow:Workflow", trace_b, "0000000000000011", ""),
+        receivedSpan("workflow-operation", trace_b, "0000000000000012", "0000000000000011"),
+        receivedSpan("StartActivity:Activity", trace_b, "0000000000000013", "0000000000000012"),
+    };
+    try testing.expectEqual(null, checkSpans(arena.allocator(), &spans, &declared));
+    // Without the second workflow's activity, no StartActivity copy is under workflow-operation.
+    try testing.expectEqualStrings(
+        "span \"StartActivity:Activity\" is not a child of \"workflow-operation\"",
+        checkSpans(arena.allocator(), spans[0..4], &declared).?,
+    );
+}
+
 test "a missing span, a wrong parent, a root with a parent and a parent in another trace are named" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

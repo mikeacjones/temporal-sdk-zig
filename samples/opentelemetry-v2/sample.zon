@@ -1,0 +1,32 @@
+// How samples-test validates this sample: start an OTLP collector, then the worker, run the
+// starter, and check that the starter's output contains each `expect` line before
+// `timeout_seconds`. Both programs export their spans to the collector, which must then hold
+// the trace from the workflow's `workflow-operation` span to the activity's own span, and the
+// trace from the starter's `send-update` span to the update's validator and handler spans,
+// each span under its parent. The worker serves its metrics on a port no other sample uses.
+.{
+    .expect = .{
+        "automatic-instrumentation result: Hello, Temporal!",
+        "workflow-activity-propagation result: Hello, Temporal!",
+        "Update result: Hello, Temporal!",
+        "Workflow result: Hello, Temporal!",
+    },
+    .worker_args = .{"127.0.0.1:19466"},
+    .tests = .{"workflow_test.zig"},
+    .imports = .{"opentelemetry"},
+    .opentelemetry = true,
+    .otlp_spans = .{
+        .{ .name = "StartWorkflow:Workflow" },
+        .{ .name = "RunWorkflow:Workflow", .parent = "StartWorkflow:Workflow" },
+        .{ .name = "workflow-operation", .parent = "RunWorkflow:Workflow" },
+        .{ .name = "StartActivity:Activity", .parent = "workflow-operation" },
+        .{ .name = "RunActivity:Activity", .parent = "StartActivity:Activity" },
+        .{ .name = "activity-operation", .parent = "RunActivity:Activity" },
+        .{ .name = "send-update" },
+        .{ .name = "UpdateWorkflow:greet", .parent = "send-update" },
+        .{ .name = "ValidateUpdate:greet", .parent = "UpdateWorkflow:greet" },
+        .{ .name = "validate-update", .parent = "ValidateUpdate:greet" },
+        .{ .name = "HandleUpdate:greet", .parent = "UpdateWorkflow:greet" },
+        .{ .name = "handle-update", .parent = "HandleUpdate:greet" },
+    },
+}
