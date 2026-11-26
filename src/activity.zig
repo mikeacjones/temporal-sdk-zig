@@ -31,7 +31,8 @@
 //!
 //! An activity that finishes elsewhere (a person approves it, another system calls back)
 //! returns `ctx.completeAsync()` after handing `ctx.info().task_token` to whatever completes
-//! it through the client.
+//! it through the client, with `ctx.info().nexus_context` too when a Nexus handler started it
+//! (`client.Client.completeActivityWithOptions`).
 //!
 //! Activities that share state (a client, a connection pool, configuration) are methods taking the state first and the context second. The worker binds them to an
 //! instance with `registerActivityWith`; workflows call them through the same `Def`:
@@ -110,6 +111,11 @@ pub const Info = struct {
     /// The priority the activity was scheduled with. All fields are zero when it carried
     /// none, which means the server's default.
     priority: workflow.Priority = .{},
+    /// Experimental: the Nexus operation whose handler started this standalone activity,
+    /// as the server propagated it; null otherwise. Borrowed like `task_token`: hand a
+    /// copy to whoever completes or heartbeats the activity asynchronously
+    /// (`client.ActivityCompletionOptions.nexus_context`).
+    nexus_context: ?converter.NexusContext = null,
 
     /// When this attempt must finish: the earlier of `scheduled_time` plus
     /// `schedule_to_close_timeout` and `started_time` plus `start_to_close_timeout`, or null
@@ -166,6 +172,10 @@ pub const Context = struct {
     /// namespace, the workflow ID and type (empty for a standalone activity), the activity
     /// type and ID, and `values` pointing at `propagated_`.
     converter_context_: converter.Context = .{},
+    /// The context of the activity's result, failure and heartbeat details
+    /// (`resultConverterContext`) when `info_.nexus_context` is set, set by the SDK: the
+    /// namespace, `values` pointing at `propagated_`, and that Nexus context.
+    result_converter_context_: converter.Context = .{},
     /// The attempt's outbound interceptors (`interceptor.ActivityOutbound`).
     outbound: []const interceptor.ActivityOutbound = &.{},
     /// Records with the activity's attributes; the worker frees it after the activity.
@@ -274,13 +284,23 @@ pub const Context = struct {
         return &ctx.propagated_;
     }
 
-    /// The activity's converter context, as its arguments, result and heartbeat details are
-    /// converted with: the namespace, the workflow ID and type (empty for a standalone
-    /// activity), the activity type and ID, and `propagated()`. Encode failure details with
-    /// it, `converter.toPayloadWithContext(ctx.allocator(), ctx.converterContext(), value)`.
-    /// Valid for the attempt.
+    /// The activity's converter context, as its arguments are converted with: the
+    /// namespace, the workflow ID and type (empty for a standalone activity), the activity
+    /// type and ID, and `propagated()`. Its result and heartbeat details are converted with
+    /// it too, except for an activity a Nexus handler started: encode failure details with
+    /// `resultConverterContext()`, `converter.toPayloadWithContext(ctx.allocator(),
+    /// ctx.resultConverterContext(), value)`. Valid for the attempt.
     pub fn converterContext(ctx: *const Context) *const converter.Context {
         return &ctx.converter_context_;
+    }
+
+    /// Experimental: the context the activity's result, failure and heartbeat details are
+    /// converted with: `converterContext()` unless `info().nexus_context` is set, then the
+    /// namespace, `propagated()` and that Nexus context, since those payloads go back to the
+    /// Nexus caller. Valid for the attempt.
+    pub fn resultConverterContext(ctx: *const Context) *const converter.Context {
+        if (ctx.info_.nexus_context == null) return &ctx.converter_context_;
+        return &ctx.result_converter_context_;
     }
 
     /// Records metrics through the client's exporter (`client.Options.metrics`) with
@@ -363,7 +383,7 @@ pub const Context = struct {
         var scratch: std.heap.ArenaAllocator = .init(sink.gpa);
         defer scratch.deinit();
         if (@TypeOf(details) == void) return ctx.outboundNext().heartbeat(.{ .details = &.{} });
-        const payload = converter.toPayloadWithContext(scratch.allocator(), ctx.converterContext(), details) catch {
+        const payload = converter.toPayloadWithContext(scratch.allocator(), ctx.resultConverterContext(), details) catch {
             ctx.logger_.warn("dropping a heartbeat: its details could not be encoded", .{});
             return;
         };
@@ -382,7 +402,7 @@ pub const Context = struct {
         // Cancels blocked, as in `heartbeat`: the decode can't return the error.
         const prev = ctx.io_.swapCancelProtection(.blocked);
         defer _ = ctx.io_.swapCancelProtection(prev);
-        return converter.fromPayloadWithContext(T, ctx.arena, ctx.converterContext(), ctx.heartbeat_details[0]) catch |err| switch (err) {
+        return converter.fromPayloadWithContext(T, ctx.arena, ctx.resultConverterContext(), ctx.heartbeat_details[0]) catch |err| switch (err) {
             error.WrongArgumentCount => error.InvalidPayload,
             else => |e| e,
         };
@@ -394,7 +414,7 @@ pub const Context = struct {
     /// reads only the first. The payloads live as long as the activity's memory; decode each
     /// with `get(T, ctx.allocator(), index)`.
     pub fn encodedHeartbeatDetails(ctx: *const Context) converter.EncodedValues {
-        return .{ .payloads = ctx.heartbeat_details, .context = ctx.converterContext() };
+        return .{ .payloads = ctx.heartbeat_details, .context = ctx.resultConverterContext() };
     }
 };
 
@@ -451,7 +471,7 @@ pub fn Def(comptime name: []const u8, comptime func: anytype) type {
                 defer _ = ctx.io_.swapCancelProtection(prev);
                 break :blk try converter.fromPayloadsWithContext(Args, ctx.arena, ctx.converterContext(), payloads);
             };
-            return converter.toPayloadWithContext(ctx.arena, ctx.converterContext(), try call(receiver, ctx, args));
+            return converter.toPayloadWithContext(ctx.arena, ctx.resultConverterContext(), try call(receiver, ctx, args));
         }
 
         /// Calls the function directly (receiver ignored for plain functions).
@@ -599,7 +619,7 @@ pub fn DynamicDef(comptime func: anytype) type {
         };
 
         pub fn invoke(receiver: ?*anyopaque, ctx: *Context, payloads: []const converter.Payload) anyerror!converter.Payload {
-            return converter.toPayloadWithContext(ctx.arena, ctx.converterContext(), try call(receiver, ctx, .{ .payloads = payloads, .context = ctx.converterContext() }));
+            return converter.toPayloadWithContext(ctx.arena, ctx.resultConverterContext(), try call(receiver, ctx, .{ .payloads = payloads, .context = ctx.converterContext() }));
         }
 
         /// Calls the function directly (receiver ignored for plain functions).

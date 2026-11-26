@@ -78,6 +78,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, name, "nexus-messaging-temporal-operation:starter")) return @import("nexus-messaging-temporal-operation/starter.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-multiple-arguments:worker")) return @import("nexus-multiple-arguments/worker.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-multiple-arguments:starter")) return @import("nexus-multiple-arguments/starter.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-serialization-context:worker")) return @import("nexus-serialization-context/worker.zig").main(init);
+    if (std.mem.eql(u8, name, "nexus-serialization-context:starter")) return @import("nexus-serialization-context/starter.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-standalone-activity:worker")) return @import("nexus-standalone-activity/worker.zig").main(init);
     if (std.mem.eql(u8, name, "nexus-standalone-activity:starter")) return @import("nexus-standalone-activity/starter.zig").main(init);
     if (std.mem.eql(u8, name, "polling:worker")) return @import("polling/worker.zig").main(init);

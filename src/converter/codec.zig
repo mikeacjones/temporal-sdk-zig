@@ -30,6 +30,11 @@ pub const CodecError = error{ OutOfMemory, Canceled, CodecFailed };
 /// it sets `propagation.ContextPropagator.encode_fields`; such a field is encoded alone, with
 /// the context of the message it travels in. On the way in every header field is given to
 /// the codecs' decode. A codec reads propagated values from `values`, not from the header.
+/// A Nexus operation's payloads (its input, result, failure and summary, on the caller's
+/// side and on the handler's) carry `nexus` instead of the workflow and activity fields, so
+/// both sides see the same context: `namespace` is the local client's or worker's and
+/// differs between them.
+///
 /// Everything is borrowed for the duration of the codec or hook call only.
 pub const Context = struct {
     /// The call's propagated values (`temporal.propagation`): a client call's `.context`, the
@@ -63,6 +68,21 @@ pub const Context = struct {
     /// For an activity's or local activity's payloads, the activity ID, set as
     /// `activity_type` is; empty otherwise.
     activity_id: []const u8 = "",
+    /// Experimental: set for a Nexus payload; null otherwise. With it set, `workflow_id`,
+    /// `workflow_type`, `activity_type` and `activity_id` are empty. Set for the caller
+    /// workflow's operation input and summary, its result and failure; for the handler's
+    /// input, synchronous result and failure; and for the result and failure of a workflow
+    /// run, update or activity a Nexus handler started (an activity's heartbeat details too),
+    /// when the server propagated the caller's context to it.
+    nexus: ?NexusContext = null,
+};
+
+/// Experimental: the Nexus operation a payload belongs to.
+pub const NexusContext = struct {
+    /// The endpoint the caller called through; empty when the server named none.
+    endpoint: []const u8 = "",
+    service: []const u8 = "",
+    operation: []const u8 = "",
 };
 
 /// Deprecated: use `converter.Context`.
@@ -820,6 +840,7 @@ const RecordingCodec = struct {
         namespace: []const u8,
         workflow_id: []const u8,
         workflow_type: []const u8,
+        nexus: ?NexusContext,
         count: usize,
     };
 
@@ -842,6 +863,7 @@ const RecordingCodec = struct {
             .namespace = context.namespace,
             .workflow_id = context.workflow_id,
             .workflow_type = context.workflow_type,
+            .nexus = context.nexus,
             .count = count,
         });
     }
@@ -885,6 +907,12 @@ const RecordingCodec = struct {
             try testing.expect(rec.values == want.values);
             try testing.expectEqualStrings(want.namespace, rec.namespace);
             try testing.expectEqualStrings(want.workflow_type, rec.workflow_type);
+            try testing.expectEqual(want.nexus == null, rec.nexus == null);
+            if (want.nexus) |w| {
+                try testing.expectEqualStrings(w.endpoint, rec.nexus.?.endpoint);
+                try testing.expectEqualStrings(w.service, rec.nexus.?.service);
+                try testing.expectEqualStrings(w.operation, rec.nexus.?.operation);
+            }
             n += rec.count;
         }
         return n;

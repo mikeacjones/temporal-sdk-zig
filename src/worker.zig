@@ -2101,26 +2101,33 @@ fn noHeaderCodecFields(_: *const Instance, _: *const act_pb.WorkflowActivationJo
     return &.{};
 }
 
-/// The codec context of an activation job that resolves an activity or a child workflow:
-/// that call's, as the payload hooks get it. Null for every other job.
+/// The codec context of an activation job that resolves an activity, a child workflow or a
+/// Nexus operation: that call's, as the payload hooks get it. Null for every other job.
 fn jobCodecContext(inst: *const Instance, job: *const act_pb.WorkflowActivationJob) ?*const converter.Context {
     const variant = job.variant orelse return null;
     return switch (variant) {
         .resolve_activity => |j| inst.activityCodecContext(j.seq),
         .resolve_child_workflow_execution_start => |j| inst.childCodecContext(j.seq),
         .resolve_child_workflow_execution => |j| inst.childCodecContext(j.seq),
+        .resolve_nexus_operation_start => |j| inst.nexusCodecContext(j.seq),
+        .resolve_nexus_operation => |j| inst.nexusCodecContext(j.seq),
         else => null,
     };
 }
 
-/// The codec context of a command that schedules an activity or local activity or starts a
-/// child workflow: that call's, as its payload hooks got it. Null for every other command.
+/// The codec context of a command that schedules an activity, local activity or Nexus
+/// operation or starts a child workflow: that call's, as its payload hooks got it. For the
+/// run's closing command and an update's response, the propagated Nexus context they are
+/// converted with, when there is one. Null for every other command.
 fn commandCodecContext(inst: *const Instance, cmd: *const proto.coresdk.workflow_commands.WorkflowCommand) ?*const converter.Context {
     const variant = cmd.variant orelse return null;
     return switch (variant) {
         .schedule_activity => |c| inst.activityCodecContext(c.seq),
         .schedule_local_activity => |c| inst.activityCodecContext(c.seq),
         .start_child_workflow_execution => |c| inst.childCodecContext(c.seq),
+        .schedule_nexus_operation => |c| inst.nexusCodecContext(c.seq),
+        .complete_workflow_execution, .fail_workflow_execution => inst.resultCodecContext(),
+        .update_response => |c| inst.updateResponseCodecContext(c.protocol_instance_id),
         else => null,
     };
 }
@@ -2213,8 +2220,19 @@ const RunningActivity = struct {
     /// What the codecs see for this activity's payloads: its identity, set when the Start task
     /// is received, and once its header is decoded, `ctx.propagated_`.
     codec_context: converter.Context = .{},
+    /// For an activity whose Start carries the caller's propagated Nexus context, what the
+    /// codecs see for its result, failure and heartbeat details (`resultCodecContext`): the
+    /// namespace, that Nexus context, and once its header is decoded, `ctx.propagated_`.
+    /// Unused (`.nexus` null) otherwise. Written before the activity's task starts, as
+    /// `codec_context` is.
+    result_codec_context: converter.Context = .{},
     /// Set when the activity returns or a cancel arrives; wakes the supervisor.
     wake: Io.Event = .unset,
+
+    /// The codec context of the activity's result, failure and heartbeat details.
+    fn resultCodecContext(run: *const RunningActivity) *const converter.Context {
+        return if (run.result_codec_context.nexus != null) &run.result_codec_context else &run.codec_context;
+    }
 
     fn destroy(run: *RunningActivity, gpa: Allocator) void {
         run.arena.deinit();
@@ -2385,6 +2403,7 @@ fn receiveActivityTask(w: *Worker, core: bridge.Worker, running: *RunningActivit
         run.codec_context.activity_type = "";
         run.codec_context.activity_id = "";
     }
+    if (activityNexusContext(&run.start)) |n| run.result_codec_context = .{ .namespace = w.client.namespace, .nexus = n };
     const tracked = tracked: {
         running.mutex.lockUncancelable(w.io);
         defer running.mutex.unlock(w.io);
@@ -2463,7 +2482,7 @@ fn finishActivity(w: *Worker, core: bridge.Worker, running: *RunningActivities, 
     var result = outcome catch return reportOutOfMemory(w, core, run);
     if (w.client.encode_failure_attributes) failure_mod.encodeAttributes(result_pb.ActivityExecutionResult, &result, a) catch
         return reportOutOfMemory(w, core, run);
-    converter.encodeMessage(result_pb.ActivityExecutionResult, &result, w.client.codecs, a, w.io, &run.codec_context) catch |err| {
+    converter.encodeMessage(result_pb.ActivityExecutionResult, &result, w.client.codecs, a, w.io, run.resultCodecContext()) catch |err| {
         if (err == error.OutOfMemory) return reportOutOfMemory(w, core, run);
         // Report a failure without the payloads that couldn't be encoded.
         result = .{ .status = .{ .failed = .{ .failure = failure_mod.application(a, .{
@@ -2586,6 +2605,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
     };
     // The payload converter sees what the codecs see, propagated values included.
     ctx.converter_context_ = run.codec_context;
+    ctx.result_converter_context_ = run.resultCodecContext().*;
     const side_effect = start.is_local and std.mem.eql(u8, start.activity_type, Instance.side_effect_activity_type);
     const session_entry = if (start.is_local) null else if (w.session_host) |h| h.registered(start.activity_type) else null;
     const internal = side_effect or session_entry != null;
@@ -2621,7 +2641,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
         .workflow_type = start.workflow_type,
     });
     defer ctx.metrics_.deinit();
-    var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token, .codec_context = &run.codec_context, .last = start.heartbeat_details.items, .last_arena = .init(w.gpa) };
+    var heartbeats: Heartbeats = .{ .w = w, .core = core, .task_token = run.task_token, .codec_context = run.resultCodecContext(), .last = start.heartbeat_details.items, .last_arena = .init(w.gpa) };
     defer heartbeats.deinit();
     ctx.heartbeat_details = start.heartbeat_details.items;
     // The core keeps no heartbeat state for local activities and warns on each heartbeat.
@@ -2681,7 +2701,7 @@ fn executeActivity(w: *Worker, core: bridge.Worker, run: *RunningActivity) !resu
             ctx.logger_.debug("Activity failed", .{ .Error = f.message })
         else
             ctx.logger_.warn("Activity failed", .{ .Error = f.message });
-        if (w.client.failure_converter) |c| f = try c.toFailure(a, ctx.converterContext(), err, f);
+        if (w.client.failure_converter) |c| f = try c.toFailure(a, ctx.resultConverterContext(), err, f);
         return .{ .status = .{ .failed = .{ .failure = f } } };
     };
     return .{ .status = .{ .completed = .{ .result = payload } } };
@@ -2744,11 +2764,21 @@ fn activityInfo(start: *const task_pb.Start, task_queue: []const u8, task_token:
             .fairness_key = p.fairness_key,
             .fairness_weight = p.fairness_weight,
         } else .{},
+        .nexus_context = activityNexusContext(start),
     };
 }
 
+/// The caller's Nexus context the server propagated to an activity a Nexus handler started,
+/// or null. A local activity never carries one. Borrows `start`'s memory.
+fn activityNexusContext(start: *const task_pb.Start) ?converter.NexusContext {
+    if (start.is_local) return null;
+    const n = start.propagated_nexus_serialization_context orelse return null;
+    return .{ .endpoint = n.endpoint, .service = n.service, .operation = n.operation };
+}
+
 /// Decodes the activity's header, extracts its propagated values into `run.ctx`, and decodes
-/// the rest of its Start task with them in `run.codec_context`.
+/// the rest of its Start task with them in `run.codec_context`, except the previous attempt's
+/// heartbeat details, decoded apart with `run.resultCodecContext()`, as they were encoded.
 fn decodeActivityStart(w: *Worker, run: *RunningActivity) converter.CodecError!void {
     const a = run.arena.allocator();
     const start = &run.start;
@@ -2757,9 +2787,17 @@ fn decodeActivityStart(w: *Worker, run: *RunningActivity) converter.CodecError!v
     run.ctx.header_ = try .fromEntries(a, start.header_fields.items);
     try propagation.extractAll(w.client.propagators, a, run.ctx.header_, &run.ctx.propagated_, "an activity task");
     run.codec_context.values = &run.ctx.propagated_;
+    run.result_codec_context.values = &run.ctx.propagated_;
     const header_fields = start.header_fields;
     start.header_fields = .empty;
     defer start.header_fields = header_fields;
+    if (run.result_codec_context.nexus != null) {
+        try converter.decodeMessage(@TypeOf(start.heartbeat_details), &start.heartbeat_details, codecs, a, w.io, &run.result_codec_context);
+        const heartbeat_details = start.heartbeat_details;
+        start.heartbeat_details = .empty;
+        defer start.heartbeat_details = heartbeat_details;
+        return converter.decodeMessage(task_pb.Start, start, codecs, a, w.io, &run.codec_context);
+    }
     try converter.decodeMessage(task_pb.Start, start, codecs, a, w.io, &run.codec_context);
 }
 
@@ -3241,7 +3279,7 @@ fn completeNexusRequest(w: *Worker, core: bridge.Worker, req: *NexusRequest, out
 /// (when the handler's own error built it), then encodes its attributes and payloads with the
 /// client's codecs. A synchronous result is already encoded (by `nexus.Operation.start`).
 fn encodeNexusFailure(w: *Worker, a: Allocator, completion: *wire.Completion, ctx: *const nexus.Context) converter.CodecError!void {
-    const context: converter.Context = .{ .namespace = ctx.info_.namespace, .values = ctx.propagated() };
+    const context = ctx.converterContext();
     const status = if (completion.status) |*st| st else return;
     const f: *failure_mod.Failure = switch (status.*) {
         .failure => |*f| f,
@@ -6542,7 +6580,8 @@ const ContextRecordingCodec = struct {
 
     fn record(ptr: *anyopaque, what: []const u8, context: *const converter.Context) !void {
         const r: *ContextRecordingCodec = @ptrCast(@alignCast(ptr));
-        const call = try std.fmt.allocPrint(r.arena, "{s} tenant={s} {s}/{s}/{s}", .{ what, context.values.get(tenant) orelse "-", context.namespace, context.workflow_type, context.workflow_id });
+        var call = try std.fmt.allocPrint(r.arena, "{s} tenant={s} {s}/{s}/{s}", .{ what, context.values.get(tenant) orelse "-", context.namespace, context.workflow_type, context.workflow_id });
+        if (context.nexus) |n| call = try std.fmt.allocPrint(r.arena, "{s} nexus={s}/{s}/{s}", .{ call, n.endpoint, n.service, n.operation });
         try r.calls.append(r.arena, call);
     }
 };
@@ -6824,6 +6863,165 @@ test "the workflow runner encodes a Nexus operation's input and decodes its resu
     const result = second.status.?.successful.commands.items[0].variant.?.complete_workflow_execution.result.?;
     // The workflow saw the decoded result; its own result is encoded again.
     try testing.expectEqualStrings("\"hi back\"", (try converter.decodePayloads(&codecs, a, testing.io, &.{result}))[0].data);
+}
+
+fn expectCall(recorder: *const ContextRecordingCodec, want: []const u8) !void {
+    for (recorder.calls.items) |c| if (std.mem.eql(u8, c, want)) return;
+    std.debug.print("no codec call \"{s}\" among:\n", .{want});
+    for (recorder.calls.items) |c| std.debug.print("  {s}\n", .{c});
+    return error.TestExpectedCodecCall;
+}
+
+fn expectNoCall(recorder: *const ContextRecordingCodec, unwanted: []const u8) !void {
+    for (recorder.calls.items) |c| if (std.mem.eql(u8, c, unwanted)) {
+        std.debug.print("unexpected codec call \"{s}\"\n", .{unwanted});
+        return error.TestUnexpectedCodecCall;
+    };
+}
+
+test "the workflow runner codes a Nexus operation's schedule command and resolutions with the operation's context" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recorder: ContextRecordingCodec = .{ .arena = a };
+    const codecs = [_]converter.PayloadCodec{recorder.codec()};
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, NexusCodecTest.Call.workflow_name, NexusCodecTest.Call.registered);
+    var runner: WorkflowRunner = .{
+        .gpa = testing.allocator,
+        .workflows = &workflows,
+        .task_queue = "tq",
+        .namespace = "ns",
+        .stack_size = 256 * 1024,
+        .codecs = &codecs,
+    };
+    defer runner.deinit();
+
+    const init: act_pb.InitializeWorkflow = .{ .workflow_type = "CallNexus", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+    try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+    var bytes: Io.Writer.Allocating = .init(a);
+    try act.encode(&bytes.writer, a);
+    _ = try runner.handle(bytes.written(), a, testing.io);
+    const operation = "encode tenant=- ns// nexus=ep/hello-service/echo";
+    try expectCall(&recorder, operation);
+    try expectNoCall(&recorder, "encode tenant=- ns/CallNexus/wf-1");
+
+    recorder.calls.clearRetainingCapacity();
+    var resolve: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_001 } };
+    try resolve.jobs.append(a, .{ .variant = .{ .resolve_nexus_operation_start = .{ .seq = 1, .status = .{ .started_sync = true } } } });
+    try resolve.jobs.append(a, .{ .variant = .{ .resolve_nexus_operation = .{ .seq = 1, .result = .{ .status = .{ .completed = try converter.toPayload(a, @as([]const u8, "hi back")) } } } } });
+    bytes.clearRetainingCapacity();
+    try resolve.encode(&bytes.writer, a);
+    const second = (try runner.handle(bytes.written(), a, testing.io)).completion;
+    try testing.expectEqualStrings("\"hi back\"", second.status.?.successful.commands.items[0].variant.?.complete_workflow_execution.result.?.data);
+    try expectCall(&recorder, "decode tenant=- ns// nexus=ep/hello-service/echo");
+    // The run's own result keeps the run's context.
+    try expectCall(&recorder, "encode tenant=- ns/CallNexus/wf-1");
+    try expectNoCall(&recorder, operation);
+}
+
+test "the workflow runner codes the result of a run started with a propagated Nexus context with it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recorder: ContextRecordingCodec = .{ .arena = a };
+    const codecs = [_]converter.PayloadCodec{recorder.codec()};
+    const propagators = [_]propagation.ContextPropagator{propagation.HeaderPropagator(ContextRecordingCodec.tenant).propagator};
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, CodecContextTest.Echo.workflow_name, CodecContextTest.Echo.registered);
+    var runner: WorkflowRunner = .{
+        .gpa = testing.allocator,
+        .workflows = &workflows,
+        .task_queue = "tq",
+        .namespace = "ns",
+        .stack_size = 256 * 1024,
+        .codecs = &codecs,
+        .propagators = &propagators,
+    };
+    defer runner.deinit();
+
+    var init: act_pb.InitializeWorkflow = .{ .workflow_type = "Echo", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    init.arguments = try converter.toPayloads(a, .{@as([]const u8, "hi")});
+    try init.headers.append(a, .{ .key = "tenant", .value = try converter.toPayload(a, @as([]const u8, "acme")) });
+    init.propagated_nexus_serialization_context = .{ .endpoint = "caller-ep", .service = "caller-svc", .operation = "caller-op" };
+    var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 } };
+    try act.jobs.append(a, .{ .variant = .{ .initialize_workflow = init } });
+    var bytes: Io.Writer.Allocating = .init(a);
+    try act.encode(&bytes.writer, a);
+    const completion = (try runner.handle(bytes.written(), a, testing.io)).completion;
+    try testing.expectEqualStrings("\"hi\"", completion.status.?.successful.commands.items[0].variant.?.complete_workflow_execution.result.?.data);
+    try expectCall(&recorder, "decode tenant=acme ns/Echo/wf-1");
+    try expectCall(&recorder, "encode tenant=acme ns// nexus=caller-ep/caller-svc/caller-op");
+    try expectNoCall(&recorder, "encode tenant=acme ns/Echo/wf-1");
+}
+
+const AbandonedNexusTest = struct {
+    /// Starts an operation that it abandons after a timer, then keeps running.
+    fn call(ctx: *workflow.Context) ![]const u8 {
+        const f = ctx.executeNexusOperation(NexusCodecTest.Service, NexusCodecTest.Echo, .{ .endpoint = "ep", .cancellation_type = .abandon }, "hi");
+        try ctx.sleep(.fromSeconds(1), .{});
+        f.cancel();
+        _ = f.get() catch {};
+        try ctx.sleep(.fromSeconds(60), .{});
+        return "done";
+    }
+    const Call = workflow.Def("AbandonNexus", call);
+};
+
+test "the workflow runner decodes the late resolutions of an abandoned Nexus operation with the operation's context" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recorder: ContextRecordingCodec = .{ .arena = a };
+    const codecs = [_]converter.PayloadCodec{recorder.codec()};
+    var workflows: std.StringHashMapUnmanaged(workflow.Registered) = .empty;
+    defer workflows.deinit(testing.allocator);
+    try workflows.put(testing.allocator, AbandonedNexusTest.Call.workflow_name, AbandonedNexusTest.Call.registered);
+    var runner: WorkflowRunner = .{
+        .gpa = testing.allocator,
+        .workflows = &workflows,
+        .task_queue = "tq",
+        .namespace = "ns",
+        .stack_size = 256 * 1024,
+        .codecs = &codecs,
+    };
+    defer runner.deinit();
+
+    var bytes: Io.Writer.Allocating = .init(a);
+    const Step = struct {
+        fn run(r: *WorkflowRunner, b: *Io.Writer.Allocating, arena_: Allocator, second: i64, jobs: []const act_pb.WorkflowActivationJob) !done_pb.WorkflowActivationCompletion {
+            var act: act_pb.WorkflowActivation = .{ .run_id = "run-1", .timestamp = .{ .seconds = 1_700_000_000 + second } };
+            try act.jobs.appendSlice(arena_, jobs);
+            b.clearRetainingCapacity();
+            try act.encode(&b.writer, arena_);
+            return (try r.handle(b.written(), arena_, testing.io)).completion;
+        }
+    };
+    // Scheduled, and a timer.
+    const init: act_pb.InitializeWorkflow = .{ .workflow_type = "AbandonNexus", .workflow_id = "wf-1", .randomness_seed = 7, .attempt = 1 };
+    const first = try Step.run(&runner, &bytes, a, 0, &.{.{ .variant = .{ .initialize_workflow = init } }});
+    const first_cmds = first.status.?.successful.commands.items;
+    try testing.expect(first_cmds[0].variant.? == .schedule_nexus_operation);
+    const timer = first_cmds[1].variant.?.start_timer.seq;
+    // The timer fires: the workflow abandons the operation, and the core resolves it as
+    // canceled at once, before the server recorded any start.
+    const second = try Step.run(&runner, &bytes, a, 1, &.{.{ .variant = .{ .fire_timer = .{ .seq = timer } } }});
+    try testing.expect(second.status.?.successful.commands.items[0].variant.? == .request_cancel_nexus_operation);
+    _ = try Step.run(&runner, &bytes, a, 2, &.{.{ .variant = .{ .resolve_nexus_operation = .{ .seq = 1, .result = .{ .status = .{ .cancelled = .{ .message = "Nexus operation cancelled after starting" } } } } } }});
+
+    // The abandoned operation goes on and completes; the core still hands its result over,
+    // which the handler encoded with the operation's context.
+    recorder.calls.clearRetainingCapacity();
+    const late = try Step.run(&runner, &bytes, a, 3, &.{
+        .{ .variant = .{ .resolve_nexus_operation_start = .{ .seq = 1, .status = .{ .started_sync = true } } } },
+        .{ .variant = .{ .resolve_nexus_operation = .{ .seq = 1, .result = .{ .status = .{ .completed = try converter.toPayload(a, @as([]const u8, "hi back")) } } } } },
+    });
+    try testing.expect(late.status.? == .successful);
+    try expectCall(&recorder, "decode tenant=- ns// nexus=ep/hello-service/echo");
+    try expectNoCall(&recorder, "decode tenant=- ns/AbandonNexus/wf-1");
 }
 
 /// Workflows that call `hook` from their code, so a test can hold an activation in workflow

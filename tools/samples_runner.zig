@@ -15,7 +15,9 @@
 //!
 //! A sample whose sample.zon sets `.docker_server` runs against its own Temporal server in a
 //! Docker container instead (see `DockerServer`), and is reported as skipped when Docker isn't
-//! available.
+//! available. A sample that sets `.dev_server` runs against a dev server of its own, at the
+//! Temporal CLI version it names, started with its namespaces and given its Nexus endpoints
+//! (see `OwnDevServer`).
 //!
 //! The runner reads the manifests before it starts the dev server, so that the server starts
 //! with every namespace the selected samples declare, and then creates the Nexus endpoints
@@ -50,16 +52,22 @@ const Manifest = struct {
     programs: []const []const u8 = &.{},
     /// Run against a server in Docker with TLS rather than the shared dev server.
     docker_server: ?DockerServer = null,
-    /// Namespaces the sample's programs use besides "default". The shared dev server starts
-    /// with them (`--namespace`), so every part of the server knows them before any program
-    /// starts; a namespace registered on a running server may reach its services one by one.
-    /// Several samples may declare the same namespace. A sample with `docker_server` can't
-    /// declare any: its server is its own, and the runner registers only "default" there.
+    /// Run against a dev server of the sample's own, at this Temporal CLI version, started
+    /// with the sample's `namespaces` and given its `nexus_endpoints`, rather than the shared
+    /// dev server. Not with `docker_server`.
+    dev_server: ?OwnDevServer = null,
+    /// Namespaces the sample's programs use besides "default". The shared dev server (or the
+    /// sample's own, with `dev_server`) starts with them (`--namespace`), so every part of the
+    /// server knows them before any program starts; a namespace registered on a running
+    /// server may reach its services one by one. Several samples may declare the same
+    /// namespace. A sample with `docker_server` can't declare any: its server is its own, and
+    /// the runner registers only "default" there.
     namespaces: []const []const u8 = &.{},
-    /// Nexus endpoints the runner creates on the shared dev server before the sample's
-    /// programs start. Each routes to "default" or one of the sample's own `namespaces`.
-    /// Several samples may declare an endpoint of the same name only with the same target. A
-    /// sample with `docker_server` can't declare any.
+    /// Nexus endpoints the runner creates on the shared dev server (or the sample's own, with
+    /// `dev_server`) before the sample's programs start. Each routes to "default" or one of
+    /// the sample's own `namespaces`. Several samples on the shared server may declare an
+    /// endpoint of the same name only with the same target. A sample with `docker_server`
+    /// can't declare any.
     nexus_endpoints: []const NexusEndpoint = &.{},
     /// Read by build.zig: the sample's programs and tests import `temporal_opentelemetry`
     /// (contrib/opentelemetry) and `opentelemetry-sdk`, the sample keeps programs of its own
@@ -85,6 +93,18 @@ const NexusEndpoint = struct {
     name: []const u8,
     namespace: []const u8,
     task_queue: []const u8,
+};
+
+/// A dev server for one sample, for a sample that needs a Temporal CLI version other than the
+/// shared server's. The worker and starter get its address in TEMPORAL_ADDRESS and
+/// TEMPORAL_NAMESPACE "default", as on the shared server. The server is started when the
+/// sample's turn comes and stopped once its programs have exited, however they ended.
+const OwnDevServer = struct {
+    /// `temporal.testing.DevServer.Options.cli_version`, such as
+    /// "v1.9.3-nexus-serialization-context".
+    cli_version: []const u8,
+    /// More arguments for `temporal server start-dev`, after the `--namespace` ones.
+    extra_args: []const []const u8 = &.{},
 };
 
 /// A temporalio/server container for one sample: in-memory SQLite and frontend TLS with the
@@ -329,8 +349,12 @@ fn parseManifest(gpa: Allocator, arena: Allocator, source: [:0]const u8, path: [
 
 /// Why `manifest`'s namespaces, endpoints or spans can't be satisfied, or null if they can.
 fn checkManifest(arena: Allocator, manifest: Manifest) ?[]const u8 {
+    if (manifest.docker_server != null and manifest.dev_server != null)
+        return "sample.zon sets both docker_server and dev_server; a sample runs against one server of its own";
     if (manifest.docker_server != null and (manifest.namespaces.len > 0 or manifest.nexus_endpoints.len > 0))
-        return "sample.zon sets docker_server with namespaces or nexus_endpoints, which only the shared dev server supports";
+        return "sample.zon sets docker_server with namespaces or nexus_endpoints, which only a dev server supports";
+    if (manifest.dev_server) |own| if (own.cli_version.len == 0)
+        return "sample.zon sets dev_server with an empty cli_version; name a Temporal CLI version such as \"default\"";
     for (manifest.namespaces) |ns| if (ns.len == 0) return "sample.zon declares an empty namespace";
     for (manifest.nexus_endpoints, 0..) |e, i| {
         if (e.name.len == 0 or e.namespace.len == 0 or e.task_queue.len == 0)
@@ -357,13 +381,20 @@ fn checkManifest(arena: Allocator, manifest: Manifest) ?[]const u8 {
     return null;
 }
 
+/// Whether `sample` runs on the shared dev server, so its namespaces and endpoints go there.
+fn onSharedServer(sample: Sample) bool {
+    const m = sample.manifest orelse return false;
+    return m.dev_server == null and m.docker_server == null;
+}
+
 /// Why an endpoint of `samples[i]` conflicts with another sample's endpoint of the same name
-/// and another target, or null if none does.
+/// and another target on the shared dev server, or null if none does.
 fn endpointConflict(arena: Allocator, samples: []const Sample, i: usize) ?[]const u8 {
-    const mine = samples[i].manifest orelse return null;
+    if (!onSharedServer(samples[i])) return null;
+    const mine = samples[i].manifest.?;
     for (mine.nexus_endpoints) |e| for (samples, 0..) |other, j| {
-        if (j == i) continue;
-        const theirs = other.manifest orelse continue;
+        if (j == i or !onSharedServer(other)) continue;
+        const theirs = other.manifest.?;
         for (theirs.nexus_endpoints) |o| {
             if (!std.mem.eql(u8, e.name, o.name)) continue;
             if (std.mem.eql(u8, e.namespace, o.namespace) and std.mem.eql(u8, e.task_queue, o.task_queue)) continue;
@@ -373,13 +404,13 @@ fn endpointConflict(arena: Allocator, samples: []const Sample, i: usize) ?[]cons
     return null;
 }
 
-/// The namespaces besides "default" that the samples not already failed declare, each once,
-/// in the order declared.
+/// The namespaces besides "default" that the samples on the shared dev server not already
+/// failed declare, each once, in the order declared.
 fn serverNamespaces(arena: Allocator, samples: []const Sample) error{OutOfMemory}![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     for (samples) |sample| {
-        if (sample.setup_failure != null) continue;
-        const m = sample.manifest orelse continue;
+        if (sample.setup_failure != null or !onSharedServer(sample)) continue;
+        const m = sample.manifest.?;
         for (m.namespaces) |ns| {
             if (std.mem.eql(u8, ns, "default") or contains(list.items, ns)) continue;
             try list.append(arena, ns);
@@ -406,36 +437,40 @@ fn startDevServer(gpa: Allocator, io: Io, arena: Allocator, samples: []const Sam
     return temporal.testing.DevServer.start(gpa, io, .{ .search_attributes = &temporal.testing.custom_search_attributes, .extra_args = args.items });
 }
 
-/// Creates the Nexus endpoints the samples not already failed declare, and fails a sample
-/// whose endpoint can't be created. An endpoint that exists already was created for another
-/// sample with the same target (`endpointConflict` failed the others).
+/// Creates the Nexus endpoints the samples on the shared dev server not already failed
+/// declare, and fails a sample whose endpoint can't be created. An endpoint that exists
+/// already was created for another sample with the same target (`endpointConflict` failed the
+/// others).
 fn createNexusEndpoints(gpa: Allocator, io: Io, server: *const temporal.testing.DevServer, samples: []Sample, arenas: []std.heap.ArenaAllocator) void {
     var client: ?temporal.client.Client = null;
     defer if (client) |*c| c.close();
     for (samples, arenas) |*sample, *a| {
-        if (sample.setup_failure != null) continue;
-        const m = sample.manifest orelse continue;
-        for (m.nexus_endpoints) |e| {
-            if (client == null) client = temporal.client.Client.connect(gpa, io, server.clientOptions()) catch |err| {
-                std.log.err("connecting to the dev server to create Nexus endpoints failed: {t}", .{err});
-                sample.setup_failure = std.fmt.allocPrint(a.allocator(), "cannot connect to the dev server to create Nexus endpoint {s}: {t}", .{ e.name, err }) catch "out of memory";
-                break;
-            };
-            temporal.testing.createNexusEndpoint(&client.?, e.name, .{ .namespace = e.namespace, .task_queue = e.task_queue }) catch |err| switch (err) {
-                error.AlreadyExists => {},
-                else => {
-                    sample.setup_failure = std.fmt.allocPrint(a.allocator(), "cannot create Nexus endpoint {s} (namespace {s}, task queue {s}): {t}; the server's reason is logged", .{ e.name, e.namespace, e.task_queue, err }) catch "out of memory";
-                    break;
-                },
-            };
-        }
+        if (sample.setup_failure != null or !onSharedServer(sample.*)) continue;
+        sample.setup_failure = createEndpoints(gpa, io, a.allocator(), server, &client, sample.manifest.?.nexus_endpoints);
     }
 }
 
-/// Runs one sample, against its own Docker server if its manifest asks for one.
+/// Creates `endpoints` on `server` through `client`, which it connects first if it is null.
+/// Returns null once every endpoint exists, or why one could not be created.
+fn createEndpoints(gpa: Allocator, io: Io, arena: Allocator, server: *const temporal.testing.DevServer, client: *?temporal.client.Client, endpoints: []const NexusEndpoint) ?[]const u8 {
+    for (endpoints) |e| {
+        if (client.* == null) client.* = temporal.client.Client.connect(gpa, io, server.clientOptions()) catch |err| {
+            std.log.err("connecting to the dev server to create Nexus endpoints failed: {t}", .{err});
+            return std.fmt.allocPrint(arena, "cannot connect to the dev server to create Nexus endpoint {s}: {t}", .{ e.name, err }) catch "out of memory";
+        };
+        temporal.testing.createNexusEndpoint(&client.*.?, e.name, .{ .namespace = e.namespace, .task_queue = e.task_queue }) catch |err| switch (err) {
+            error.AlreadyExists => {},
+            else => return std.fmt.allocPrint(arena, "cannot create Nexus endpoint {s} (namespace {s}, task queue {s}): {t}; the server's reason is logged", .{ e.name, e.namespace, e.task_queue, err }) catch "out of memory",
+        };
+    }
+    return null;
+}
+
+/// Runs one sample, against its own dev server or Docker server if its manifest asks for one.
 fn validate(gpa: Allocator, io: Io, arena: Allocator, queue: *const Queue, sample: Sample) Outcome {
     const manifest = sample.manifest orelse return .{ .fail = "missing or invalid sample.zon" };
     if (sample.setup_failure) |reason| return .{ .fail = reason };
+    if (manifest.dev_server) |own| return failure(runOnOwnDevServer(gpa, io, arena, queue, sample, manifest, own));
     const options = manifest.docker_server orelse
         return failure(runPrograms(gpa, io, arena, queue.work, queue.work_path, queue.env, queue.otlp_collector, sample, manifest));
     switch (queue.docker) {
@@ -451,6 +486,40 @@ fn validate(gpa: Allocator, io: Io, arena: Allocator, queue: *const Queue, sampl
     const result = runPrograms(gpa, io, arena, queue.work, queue.work_path, &env, queue.otlp_collector, sample, manifest);
     if (result != null) showServerLog(gpa, io, container);
     return failure(result);
+}
+
+/// Starts `sample`'s own dev server as `own` and `manifest` say, creates the sample's Nexus
+/// endpoints there, runs its programs against it, and stops it on every path. Returns null on
+/// success or a short reason on failure, as `runPrograms` does.
+fn runOnOwnDevServer(gpa: Allocator, io: Io, arena: Allocator, queue: *const Queue, sample: Sample, manifest: Manifest, own: OwnDevServer) ?[]const u8 {
+    const oom = "out of memory";
+    const args = ownDevServerArgs(arena, manifest, own) catch return oom;
+    var server = temporal.testing.DevServer.start(gpa, io, .{ .cli_version = own.cli_version, .extra_args = args }) catch |err| {
+        std.log.err("{s}: starting the sample's own dev server (Temporal CLI {s}) failed: {t}", .{ sample.name, own.cli_version, err });
+        return std.fmt.allocPrint(arena, "cannot start the sample's own dev server (Temporal CLI {s}): {t}; the server's reason is logged", .{ own.cli_version, err }) catch oom;
+    };
+    defer server.stop(io);
+    {
+        var client: ?temporal.client.Client = null;
+        defer if (client) |*c| c.close();
+        if (createEndpoints(gpa, io, arena, &server, &client, manifest.nexus_endpoints)) |reason| return reason;
+    }
+    var env = queue.env.clone(arena) catch return oom;
+    env.put("TEMPORAL_ADDRESS", server.address()) catch return oom;
+    return runPrograms(gpa, io, arena, queue.work, queue.work_path, &env, queue.otlp_collector, sample, manifest);
+}
+
+/// The `temporal server start-dev` arguments of a sample's own dev server: a `--namespace`
+/// for each of its namespaces besides "default" (which the server has already), once each,
+/// then `own.extra_args`.
+fn ownDevServerArgs(arena: Allocator, manifest: Manifest, own: OwnDevServer) error{OutOfMemory}![]const []const u8 {
+    var args: std.ArrayList([]const u8) = .empty;
+    for (manifest.namespaces, 0..) |ns, i| {
+        if (std.mem.eql(u8, ns, "default") or contains(manifest.namespaces[0..i], ns)) continue;
+        try args.appendSlice(arena, &.{ "--namespace", ns });
+    }
+    try args.appendSlice(arena, own.extra_args);
+    return args.items;
 }
 
 fn failure(reason: ?[]const u8) Outcome {
@@ -1456,4 +1525,64 @@ test "the collector's address is its first whole line" {
     try testing.expectEqual(null, Collector.printedAddress("127.0.0.1:43"));
     try testing.expectEqual(null, Collector.printedAddress("error: cannot listen on 127.0.0.1: AddressInUse\n"));
     try testing.expectEqual(null, Collector.printedAddress("127.0.0.1:99999\n"));
+}
+
+test "a manifest declares a dev server of its own with its CLI version and arguments" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const m = try testManifest(a,
+        \\.{
+        \\    .expect = .{"done"},
+        \\    .dev_server = .{ .cli_version = "v1.9.3-nexus-serialization-context", .extra_args = .{ "--log-level", "warn" } },
+        \\    .namespaces = .{ "caller", "handler", "caller", "default" },
+        \\    .nexus_endpoints = .{.{ .name = "endpoint", .namespace = "handler", .task_queue = "handler" }},
+        \\}
+    );
+    try testing.expectEqualStrings("v1.9.3-nexus-serialization-context", m.dev_server.?.cli_version);
+    try testing.expectEqual(null, checkManifest(a, m));
+    const args = try ownDevServerArgs(a, m, m.dev_server.?);
+    const want = [_][]const u8{ "--namespace", "caller", "--namespace", "handler", "--log-level", "warn" };
+    try testing.expectEqual(want.len, args.len);
+    for (want, args) |w, got| try testing.expectEqualStrings(w, got);
+
+    const plain = try testManifest(a, ".{ .expect = .{\"done\"}, .dev_server = .{ .cli_version = \"default\" } }");
+    try testing.expectEqual(0, plain.dev_server.?.extra_args.len);
+    try testing.expectEqual(0, (try ownDevServerArgs(a, plain, plain.dev_server.?)).len);
+    try testing.expectEqual(null, (try testManifest(a, ".{ .expect = .{\"done\"} }")).dev_server);
+}
+
+test "a manifest whose own dev server can't be started is rejected with the reason" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "sample.zon sets both docker_server and dev_server; a sample runs against one server of its own",
+        checkManifest(a, .{ .expect = &.{}, .docker_server = .{}, .dev_server = .{ .cli_version = "default" } }).?,
+    );
+    try testing.expectStringStartsWith(checkManifest(a, .{ .expect = &.{}, .dev_server = .{ .cli_version = "" } }).?, "sample.zon sets dev_server with an empty cli_version");
+    // Its endpoints must route to its own namespaces, as on the shared server.
+    try testing.expectStringStartsWith(
+        checkManifest(a, .{ .expect = &.{}, .dev_server = .{ .cli_version = "default" }, .nexus_endpoints = &.{.{ .name = "endpoint", .namespace = "elsewhere", .task_queue = "handlers" }} }).?,
+        "sample.zon's Nexus endpoint endpoint routes to namespace elsewhere",
+    );
+}
+
+test "a sample with its own dev server adds no namespaces to the shared one and conflicts with no endpoint there" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const endpoint: NexusEndpoint = .{ .name = "endpoint", .namespace = "target", .task_queue = "handlers" };
+    const elsewhere: NexusEndpoint = .{ .name = "endpoint", .namespace = "own", .task_queue = "own" };
+    const samples = [_]Sample{
+        .{ .name = "shared", .manifest = .{ .expect = &.{}, .namespaces = &.{"target"}, .nexus_endpoints = &.{endpoint} } },
+        .{ .name = "own", .manifest = .{ .expect = &.{}, .dev_server = .{ .cli_version = "default" }, .namespaces = &.{"own"}, .nexus_endpoints = &.{elsewhere} } },
+    };
+    const namespaces = try serverNamespaces(a, &samples);
+    try testing.expectEqual(1, namespaces.len);
+    try testing.expectEqualStrings("target", namespaces[0]);
+    try testing.expectEqual(null, endpointConflict(a, &samples, 0));
+    try testing.expectEqual(null, endpointConflict(a, &samples, 1));
+    try testing.expect(onSharedServer(samples[0]));
+    try testing.expect(!onSharedServer(samples[1]));
 }
