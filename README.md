@@ -3039,7 +3039,7 @@ test "observability: the activity's span descends from the client's" {
 Spans are named `<operation>:<name>`, such as `StartWorkflow:greeting` or `RunActivity:greet`, and tagged with `temporalWorkflowID`, `temporalRunID`, `temporalActivityID` and `temporalUpdateID` where they apply:
 
 - On the client: `StartWorkflow`, `SignalWorkflow`, `SignalWithStartWorkflow`, `QueryWorkflow` and `UpdateWorkflow`, one span per request sent. A client waiting for an update's outcome sends the request again, so a long update shows several `UpdateWorkflow` spans, each a child of the caller's context. A context put under `tracing.span_key` in the call's `.context` is the parent.
-- In a workflow: `RunWorkflow`, `HandleSignal`, `HandleQuery`, `ValidateUpdate` and `HandleUpdate`, each the child of the client span whose header reached it; and `StartActivity` (local activities too), `StartChildWorkflow` and `StartNexusOperation`, children of the run's `RunWorkflow` span.
+- In a workflow: `RunWorkflow`, `HandleSignal`, `HandleQuery`, `ValidateUpdate` and `HandleUpdate`, each the child of the client span whose header reached it; and `StartActivity` (local activities too), `StartChildWorkflow`, `StartNexusOperation`, `SignalExternalWorkflow` (`ctx.signalExternalWorkflow`) and `SignalChildWorkflow` (`ChildWorkflowFuture.signal`), children of the run's `RunWorkflow` span, or of the workflow code's own span open around the call (below).
 - In an activity and a Nexus handler: `RunActivity`, `RunStartNexusOperationHandler` and `RunCancelNexusOperationHandler`. While one runs, `ctx.propagated().get(tracing.span_key)` is its span's context, and a client call given `.context = ctx.propagated()` continues the trace.
 
 Notes:
@@ -3047,9 +3047,52 @@ Notes:
 - The span context travels in the header field `tracing.header_key` (`_tracer-data`), a JSON object of the tracer's fields, which the other Temporal SDKs read and write too. Over Nexus each field becomes a Nexus header of its own, such as `traceparent`, replacing a caller's header of the same name.
 - Replay starts no span: a workflow's spans are started only for work that is not replayed from history, except `HandleQuery` and `ValidateUpdate`, which never come from history. Nothing a tracer returns is read by workflow code, so a tracer cannot make a workflow nondeterministic, and a history recorded with tracing replays without it.
 - A run rebuilt from history after its worker dropped it from the cache emits no second `RunWorkflow` span: its later spans have the client's start span as their parent. That holds even when the run's first workflow task sent no commands, which sdk-core then runs again as live work, as long as the server records SDK metadata on completed workflow tasks (current Temporal servers and Temporal Cloud do). A `RunWorkflow` span still open when its run is dropped is finished then, without a failure.
-- Spans of a signal or update handler's own calls have the `RunWorkflow` span as their parent, not the handler's span. Signals and signal-with-start sent by a workflow, continue-as-new, update-with-start and schedules carry the context but open no span.
+- Spans of a signal or update handler's own calls have the `RunWorkflow` span as their parent, not the handler's span, unless the handler opened a span of its own around them. Signal-with-start sent by a workflow, external cancellation, continue-as-new, update-with-start and schedules carry the context but open no span.
 - A span ends with a failure when its call returns an error, named by the error (a Nexus handler error by its type and message); continue-as-new and an activity's asynchronous completion are not failures.
 - A tracer is called from client, activity, Nexus and workflow threads at once, and may be asked to finish a span on another thread than started it, so it must be thread-safe. It runs on workflow threads too, so it should not block: export spans in the background. Out of memory starting a span fails the call, except a workflow's own activity, child or Nexus call, which goes on untraced with a warning.
+
+Workflow code opens spans of its own with `tracing.startSpan(ctx, name, .{ .attributes = ... })`, from the workflow function, a signal or update handler, an update validator or a query handler, and ends them with `end` or `endWithFailure` (experimental). While one is open, the activities, child workflows, signals and Nexus operations the same coroutine starts are its children:
+
+<!-- example: observability-tracing-workflow-spans -->
+```zig
+fn checkout(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+    // A span of the workflow's own; the activity started inside it is its child.
+    const span = tracing.startSpan(ctx, "workflow-operation", .{
+        .attributes = &.{.{ .name = "customer", .value = name }},
+    });
+    defer span.end();
+    return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{name}).get();
+}
+const Checkout = workflow.Def("traced_checkout", checkout);
+
+test "observability: the activity's span descends from the workflow's own span" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var counting: CountingTracer = .{ .io = testing.io, .arena = arena.allocator() };
+    var traced: tracing.Interceptor = .init(tracing.Tracer.from(CountingTracer, &counting));
+    const client_interceptors = [_]temporal.interceptor.Client{traced.client()};
+    const worker_interceptors = [_]temporal.interceptor.Worker{traced.worker()};
+    const propagators = [_]temporal.propagation.ContextPropagator{traced.propagator()};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .interceptors = &client_interceptors,
+        .worker_interceptors = &worker_interceptors,
+        .propagators = &propagators,
+    });
+    defer env.deinit();
+    try env.registerWorkflow(Checkout);
+    try env.registerActivity(Greet);
+    _ = try env.executeWorkflow(Checkout, .{"Ziggy"}, arena.allocator(), null);
+
+    const chain = try ancestry(&counting, arena.allocator(), "RunActivity:traced_greet");
+    try testing.expectEqualStrings("StartActivity:traced_greet", chain[1]);
+    try testing.expectEqualStrings("workflow-operation", chain[2]);
+    try testing.expectEqualStrings("RunWorkflow:traced_checkout", chain[3]);
+}
+```
+
+- The span's name is the name given, with no `<operation>:` prefix, and its parent is the coroutine's newest open span: one it started, or the span of the handler it runs in (`ValidateUpdate:<name>`, `HandleUpdate:<name>`), else `RunWorkflow`. Attributes are strings, given to the tracer as tags ahead of `temporalWorkflowID` and `temporalRunID`; `temporal_opentelemetry` exports such a span with kind internal.
+- `startSpan` never fails and never changes what the workflow does: without the tracing interceptor on the worker, while the workflow replays history (except in update validators and query handlers, which never come from history), while the run is evicted, after the workflow function has returned, or without memory for it (logged), it returns an inert span whose `end` does nothing. It sends no command, so `startSpan` calls may be added to or removed from a workflow without breaking the replay of its histories. A span started while replaying and ended in live code is not emitted, and a run whose first workflow task sent no commands and that is rebuilt from history may emit a span from its opening code a second time.
+- The open span belongs to the coroutine that started it: a coroutine started with `io.async`, `io.concurrent`, a `Group` or a `Select` does not see it, and its calls are children of `RunWorkflow`. `end` and `endWithFailure` may be called in any order across spans; a second `end` does nothing. A span still open when the workflow function returns is ended then without a failure, as is one ended while its run is evicted.
 
 The module `temporal_opentelemetry` exports spans to OpenTelemetry through the OpenTelemetry Zig SDK (open-telemetry/opentelemetry-zig, alpha, pinned to a commit). Add it with the option `-Dopentelemetry`: `b.dependency("temporal", .{ .opentelemetry = true }).module("temporal_opentelemetry")`. Without the option the OpenTelemetry SDK is never fetched. Build the OpenTelemetry side with its own types: a `trace.TracerProvider` from `TracerProvider.init(gpa, io, id_generator)`, with a thread-safe `std.Random` behind its `IDGenerator`, since spans start on many threads; an `otlp.ConfigOptions` (OTLP over HTTP/protobuf to `localhost:4318` unless the `OTEL_EXPORTER_OTLP_*` variables of the environment map it is given say otherwise); a `trace.OTLPExporter`; and a `trace.BatchingProcessor` added with `addSpanProcessor`. Use the batching processor: the simple one exports on the thread that ends the span, which may be a workflow's. Then `temporal_opentelemetry.Tracer.init(gpa, io, try provider.getTracer(.{ .name = "my-app" }))` gives the tracer, and its `tracer()` the interface for `tracing.Interceptor.init`. Span contexts are W3C trace context, `traceparent` and `tracestate`; `temporal_opentelemetry.spanContext` and `fromSpanContext` convert them for code with spans of its own.
 

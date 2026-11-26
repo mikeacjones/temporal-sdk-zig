@@ -86,6 +86,7 @@ pub const Tracer = struct {
             .kind = switch (options.operation.kind()) {
                 .client => .Client,
                 .server => .Server,
+                .internal => .Internal,
             },
             .attributes = attributes,
             .start_timestamp = if (options.start_time) |ts| std.math.cast(u64, ts.nanoseconds) else null,

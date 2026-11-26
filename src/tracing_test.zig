@@ -480,3 +480,250 @@ test "tracing: a run rebuilt from history for an update after its first workflow
     if (runs != 1) t.dumpLocked();
     try testing.expectEqual(@as(usize, 1), runs);
 }
+
+const AppSpans = struct {
+    const Outside = activity.Def("TracedOutside", Fixtures.hello);
+
+    /// Counts the `go` signals it gets, and returns once it has two.
+    fn waiter(ctx: *workflow.Context) ![]const u8 {
+        const n = try ctx.allocator().create(u32);
+        n.* = 0;
+        try ctx.setSignalHandler(Fixtures.Go, n, struct {
+            fn go(c: *u32) void {
+                c.* += 1;
+            }
+        }.go);
+        try ctx.await(n, struct {
+            fn two(c: *u32) bool {
+                return c.* >= 2;
+            }
+        }.two);
+        return ctx.allocator().dupe(u8, "signaled");
+    }
+    const Waiter = workflow.Def("TracedWaiter", waiter);
+
+    /// Inside `workflow-operation`: an activity, a child and an external signal to it. After
+    /// it ends: another activity and a signal through the child's future.
+    fn operation(ctx: *workflow.Context) ![]const u8 {
+        const child_id = try std.fmt.allocPrint(ctx.allocator(), "{s}-child", .{ctx.info().workflow_id});
+        const span = tracing.startSpan(ctx, "workflow-operation", .{ .attributes = &.{.{ .name = "step", .value = "one" }} });
+        _ = try ctx.executeActivity(Fixtures.Hello, .{ .start_to_close_timeout = .fromSeconds(30) }, .{"inside"}).get();
+        const child = ctx.executeChildWorkflow(Waiter, .{ .id = child_id }, .{});
+        _ = try child.started();
+        try ctx.signalExternalWorkflow(Fixtures.Go, child_id, "", .{}).get();
+        span.end();
+        span.end();
+        _ = try ctx.executeActivity(Outside, .{ .start_to_close_timeout = .fromSeconds(30) }, .{"outside"}).get();
+        try (try child.signal(Fixtures.Go, .{})).get();
+        return child.get();
+    }
+    const Operation = workflow.Def("TracedOperation", operation);
+
+    const Greet = workflow.UpdateDef("greet", fn ([]const u8) []const u8);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        greeted: ?[]const u8 = null,
+
+        fn greet(s: *State, name: []const u8) ![]const u8 {
+            const span = tracing.startSpan(s.ctx, "handle-update", .{});
+            defer span.end();
+            const inner = tracing.startSpan(s.ctx, "handle-update-inner", .{});
+            inner.endWithFailure("Inner");
+            const got = try s.ctx.executeActivity(Fixtures.Hello, .{ .start_to_close_timeout = .fromSeconds(30) }, .{name}).get();
+            s.greeted = got;
+            return got;
+        }
+        fn validate(s: *State, name: []const u8) error{EmptyName}!void {
+            const span = tracing.startSpan(s.ctx, "validate-update", .{ .attributes = &.{.{ .name = "name", .value = name }} });
+            defer span.end();
+            if (name.len == 0) return error.EmptyName;
+        }
+        fn done(s: *State) bool {
+            return s.greeted != null;
+        }
+    };
+
+    fn greeter(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setUpdateHandlerWithValidator(Greet, s, State.greet, State.validate);
+        try ctx.await(s, State.done);
+        // Left open: the safety net ends it when the workflow function returns.
+        _ = tracing.startSpan(ctx, "never-ended", .{});
+        return s.greeted.?;
+    }
+    const Greeter = workflow.Def("TracedGreeter", greeter);
+
+    /// Whether `startSpan` gave a live span.
+    fn probe(ctx: *workflow.Context) ![]const u8 {
+        const span = tracing.startSpan(ctx, "probe", .{});
+        defer span.end();
+        return if (span.record == null) "inert" else "live";
+    }
+    const Probe = workflow.Def("TracedProbe", probe);
+};
+
+test "tracing: outbound calls made while an application span is open are its children, and after it ends the run's" {
+    const s = try Setup.start();
+    defer s.deinit();
+    try s.env.registerWorkflow(AppSpans.Operation);
+    try s.env.registerWorkflow(AppSpans.Waiter);
+    try s.env.registerActivity(Fixtures.Hello);
+    try s.env.registerActivity(AppSpans.Outside);
+
+    var run = try s.env.startWorkflow(AppSpans.Operation, .{}, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("signaled", try s.env.getResult(AppSpans.Operation, &run, s.arena.allocator(), null));
+
+    const t = &s.tracer;
+    const op = try t.expectChild("workflow-operation", "RunWorkflow:TracedOperation");
+    const recorded = t.get(op);
+    try testing.expectEqual(tracing.Kind.internal, recorded.kind);
+    try testing.expectEqualStrings("step", recorded.tags[0].name);
+    try testing.expectEqualStrings("one", recorded.tags[0].value);
+    try testing.expectEqualStrings(run.id, tagValue(recorded.tags, "temporalWorkflowID").?);
+    try testing.expectEqualStrings(run.run_id, tagValue(recorded.tags, "temporalRunID").?);
+    _ = try t.expectChild("StartActivity:TracedHello", "workflow-operation");
+    _ = try t.expectChild("RunActivity:TracedHello", "StartActivity:TracedHello");
+    _ = try t.expectChild("StartChildWorkflow:TracedWaiter", "workflow-operation");
+    _ = try t.expectChild("SignalExternalWorkflow:go", "workflow-operation");
+    _ = try t.expectChild("StartActivity:TracedOutside", "RunWorkflow:TracedOperation");
+    const child_signal = try t.expectChild("SignalChildWorkflow:go", "RunWorkflow:TracedOperation");
+    try testing.expectEqual(tracing.Kind.client, t.get(child_signal).kind);
+    // Each signal span is the parent of the handler span it reached.
+    const handled = blk: {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        var parents: [2][]const u8 = undefined;
+        var n: usize = 0;
+        for (t.spans.items) |span| if (std.mem.eql(u8, span.name, "HandleSignal:go")) {
+            if (n < 2) parents[n] = span.parent orelse "none";
+            n += 1;
+        };
+        try testing.expectEqual(@as(usize, 2), n);
+        break :blk parents;
+    };
+    const external = try t.find("SignalExternalWorkflow:go");
+    try testing.expectEqualStrings(try std.fmt.allocPrint(s.arena.allocator(), "{d}", .{external}), handled[0]);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(s.arena.allocator(), "{d}", .{child_signal}), handled[1]);
+    try t.expectAllFinished();
+
+    // The replayer coverage: replaying the history starts no span, application spans included.
+    const before = t.count();
+    try s.env.replayRun(run.id, run.run_id);
+    try testing.expectEqual(before, t.count());
+    try t.expectAllFinished();
+}
+
+test "tracing: spans of an update's validator and handler nest under ValidateUpdate and HandleUpdate, and one left open ends with the workflow" {
+    const s = try Setup.start();
+    defer s.deinit();
+    try s.env.registerWorkflow(AppSpans.Greeter);
+    try s.env.registerActivity(Fixtures.Hello);
+    const a = s.arena.allocator();
+
+    var run = try s.env.startWorkflow(AppSpans.Greeter, .{}, .{});
+    defer run.deinit();
+    try testing.expectError(error.UpdateFailed, s.env.updateWorkflow(AppSpans.Greet, a, run.id, .{""}, null));
+    const greeted = try s.env.updateWorkflow(AppSpans.Greet, a, run.id, .{"Temporal"}, null);
+    try testing.expectEqualStrings(greeted, try s.env.getResult(AppSpans.Greeter, &run, a, null));
+
+    const t = &s.tracer;
+    const validated = try t.expectChild("validate-update", "ValidateUpdate:greet");
+    try testing.expectEqualStrings("", tagValue(t.get(validated).tags, "name").?);
+    const handled = try t.expectChild("handle-update", "HandleUpdate:greet");
+    try testing.expectEqual(@as(?[]const u8, null), t.get(handled).failure);
+    const inner = try t.expectChild("handle-update-inner", "handle-update");
+    try testing.expectEqualStrings("Inner", t.get(inner).failure.?);
+    _ = try t.expectChild("StartActivity:TracedHello", "handle-update");
+    _ = try t.expectChild("never-ended", "RunWorkflow:TracedGreeter");
+    // Two validations ran, the rejected one and the accepted one, each with its span.
+    var validations: usize = 0;
+    {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        for (t.spans.items) |span| if (std.mem.eql(u8, span.name, "validate-update")) {
+            validations += 1;
+        };
+    }
+    try testing.expectEqual(@as(usize, 2), validations);
+    try t.expectAllFinished();
+
+    const before = t.count();
+    try s.env.replayRun(run.id, run.run_id);
+    try testing.expectEqual(before, t.count());
+    try t.expectAllFinished();
+}
+
+test "tracing: startSpan is inert on a run without the tracing interceptor" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(AppSpans.Probe);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var run = try env.startWorkflow(AppSpans.Probe, .{}, .{});
+    defer run.deinit();
+    try testing.expectEqualStrings("inert", try env.getResult(AppSpans.Probe, &run, arena.allocator(), null));
+    // An inert span ends without effect.
+    const inert: tracing.WorkflowSpan = .{};
+    inert.end();
+    inert.endWithFailure("ignored");
+
+    // With the interceptor, the same workflow gets a live span.
+    const s = try Setup.start();
+    defer s.deinit();
+    try s.env.registerWorkflow(AppSpans.Probe);
+    var traced = try s.env.startWorkflow(AppSpans.Probe, .{}, .{});
+    defer traced.deinit();
+    try testing.expectEqualStrings("live", try s.env.getResult(AppSpans.Probe, &traced, s.arena.allocator(), null));
+    _ = try s.tracer.expectChild("probe", "RunWorkflow:TracedProbe");
+}
+
+/// A run that answers `held` with the bytes it holds in its arena, and returns on `stop`.
+const QueryMemory = struct {
+    const Held = workflow.QueryDef("held", fn () u64);
+    const Stop = workflow.SignalDef("stop", fn () void);
+
+    const State = struct {
+        ctx: *workflow.Context,
+        stopped: bool = false,
+        fn held(s: *State) u64 {
+            return s.ctx.instance.allocated;
+        }
+        fn stop(s: *State) void {
+            s.stopped = true;
+        }
+        fn done(s: *State) bool {
+            return s.stopped;
+        }
+    };
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const s = try ctx.allocator().create(State);
+        s.* = .{ .ctx = ctx };
+        try ctx.setQueryHandler(Held, s, State.held);
+        try ctx.setSignalHandler(Stop, s, State.stop);
+        try ctx.await(s, State.done);
+        return ctx.allocator().dupe(u8, "stopped");
+    }
+    const Def = workflow.Def("TracedQueryMemory", run);
+};
+
+test "tracing: queries answered on a traced run leave no memory in the run's arena" {
+    const s = try Setup.start();
+    defer s.deinit();
+    try s.env.registerWorkflow(QueryMemory.Def);
+    const a = s.arena.allocator();
+    var run = try s.env.startWorkflow(QueryMemory.Def, .{}, .{});
+    defer run.deinit();
+    // Queries are not in history, so what they leave in the run's arena differs between the
+    // live run and its replay, and on a long-lived run that is queried often it only grows.
+    const first = try s.env.queryWorkflow(QueryMemory.Held, a, run.id, .{});
+    var last = first;
+    for (0..20) |_| last = try s.env.queryWorkflow(QueryMemory.Held, a, run.id, .{});
+    try s.env.signalWorkflow(QueryMemory.Stop, run.id, .{});
+    try testing.expectEqualStrings("stopped", try s.env.getResult(QueryMemory.Def, &run, a, null));
+    _ = try s.tracer.expectChild("HandleQuery:held", "QueryWorkflow:held");
+    try testing.expectEqual(first, last);
+}
