@@ -63,11 +63,12 @@ read_only: bool = false,
 /// The first coroutine start that failed. Sticky: never cleared, since the run already went
 /// on differently than it would have with the coroutine started.
 start_failure: ?StartFailure = null,
-/// While set, a coroutine whose futures or group members are still running doesn't go on
-/// from a wait (or `checkCancel`), however it is woken or canceled, until they have all
-/// exited: it can't return, so their pointers into its stack (a Select's cases put their
-/// results into the Select, usually on the stack of the coroutine that started them) stay
-/// valid. One whose child never exits is never resumed. Set by eviction, after which the run
+/// While set, a coroutine doesn't go on from a wait (or `checkCancel`), however it is woken
+/// or canceled, while any live coroutine it started is still running: one it started
+/// directly, or one started through coroutines that have since finished (`Task.starter`). It
+/// can't return, so their pointers into its stack (a Select's cases put their results into
+/// the Select, usually on the stack of the coroutine that started them, or of the one that
+/// started the helper adding them) stay valid. One whose child never exits is never resumed. Set by eviction, after which the run
 /// never goes on normally; see `holdWhileChildrenRun`.
 hold_starters: bool = false,
 /// How many cancel requests a coroutine's wait has taken (returned `error.Canceled`), for
@@ -303,10 +304,12 @@ pub const Task = struct {
     waiting_on: ?*const Wait = null,
     group: ?*GroupState = null,
     group_next: ?*Task = null,
-    /// The coroutine that started this one, while both are running; null for a top-level
-    /// task, and cleared when the starter finishes first.
+    /// The nearest unfinished coroutine that started this one, directly or through
+    /// coroutines that have since finished (a finishing task hands its running children to
+    /// its own starter); null for a top-level task and for the children of a finished
+    /// top-level task.
     starter: ?*Task = null,
-    /// How many coroutines this one started are still running.
+    /// How many running coroutines have this one as `starter`.
     running_children: usize = 0,
     /// Blocked in `holdWhileChildrenRun`: the last child to exit wakes it.
     held: bool = false,
@@ -482,19 +485,24 @@ fn taskMain(w: *WorkflowIo, task: *Task) void {
     task.start(task.context.ptr, task.result.ptr);
     w.settleOwedWake();
     task.done = true;
+    if (task.running_children > 0) {
+        // The children outlive this Task block, which may be freed below, and may still
+        // point into the stack of this task's own starter (a Select case that a helper added
+        // to its starter's Select): they count toward that starter from here on, or toward
+        // nobody for a top-level task.
+        var it = w.scheduler.firstLive();
+        while (it) |f| : (it = f.live_next) {
+            const child: *Task = @ptrCast(@alignCast(f.user orelse continue));
+            if (child.starter != task) continue;
+            child.starter = task.starter;
+            if (task.starter) |starter| starter.running_children += 1;
+        }
+        task.running_children = 0;
+    }
     if (task.starter) |starter| {
         starter.running_children -= 1;
         if (starter.running_children == 0 and starter.held and starter.fiber.state == .blocked)
             w.scheduler.wake(starter.fiber);
-    }
-    if (task.running_children > 0) {
-        // The children outlive this Task block, which may be freed below.
-        var it = w.scheduler.firstLive();
-        while (it) |f| : (it = f.live_next) {
-            const child: *Task = @ptrCast(@alignCast(f.user orelse continue));
-            if (child.starter == task) child.starter = null;
-        }
-        task.running_children = 0;
     }
     switch (task.kind) {
         .future => if (task.awaiter) |a| w.wakeWait(a),
@@ -574,11 +582,11 @@ fn block(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void {
     }
 }
 
-/// With `hold_starters` set, blocks the running coroutine while futures or group members it
-/// started are still running; wakes meanwhile (its own wait's, a cancel's) only bring it
-/// back here. Every way a coroutine goes on from a wait, or from `checkCancel`, passes
-/// through this first, so during eviction no coroutine runs on, and so can't return, while
-/// its children run.
+/// With `hold_starters` set, blocks the running coroutine while any live coroutine it
+/// started, directly or through coroutines that have since finished, is still running; wakes
+/// meanwhile (its own wait's, a cancel's) only bring it back here. Every way a coroutine goes
+/// on from a wait, or from `checkCancel`, passes through this first, so during eviction no
+/// coroutine runs on, and so can't return, while its children run.
 fn holdWhileChildrenRun(w: *WorkflowIo) void {
     if (!w.hold_starters) return;
     const t = w.currentTask() orelse return;
@@ -1583,6 +1591,45 @@ test "with hold_starters, a canceled coroutine goes on only once the Select case
     var order: Trace = .{};
     _ = try wio.spawn("wf", SelectExits.starter, .{ wio.io(), &order });
     wio.run();
+    wio.hold_starters = true;
+    wio.cancelAll();
+    wio.run();
+    try testing.expectEqual(@as(usize, 0), sched.live);
+    try testing.expectEqualSlices(u32, &.{ 2, 1 }, order.items());
+    sched.deinit();
+}
+
+const HelperCase = struct {
+    /// Adds a case to its starter's Select, then returns while the case runs.
+    fn helper(sel: *Io.Select(SelectExits.Case), i: Io, order: *Trace) void {
+        sel.async(.slept, SelectExits.case, .{ i, order });
+    }
+
+    /// Owns the Select, has a helper add its case, and returns on the cancel without
+    /// canceling the case.
+    fn root(i: Io, order: *Trace) void {
+        defer order.add(1);
+        var buf: [1]SelectExits.Case = undefined;
+        var select: Io.Select(SelectExits.Case) = .init(i, &buf);
+        var h = i.async(helper, .{ &select, i, order });
+        h.await(i);
+        _ = select.await() catch return;
+    }
+};
+
+test "with hold_starters, a coroutine goes on only once a case its finished helper added exits" {
+    var sched: Scheduler = .init(testing.allocator, .{ .stack_size = 256 * 1024 });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    var wio: WorkflowIo = .init(memory.allocator(), &sched, fake.host(), 42);
+    var order: Trace = .{};
+    const root = try wio.spawn("wf", HelperCase.root, .{ wio.io(), &order });
+    wio.run();
+    // The helper finished and handed its case to the root.
+    try testing.expectEqual(@as(usize, 2), sched.live);
+    try testing.expectEqual(@as(usize, 1), root.running_children);
     wio.hold_starters = true;
     wio.cancelAll();
     wio.run();
