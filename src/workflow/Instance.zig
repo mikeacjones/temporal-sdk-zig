@@ -6364,6 +6364,52 @@ test "eviction stops canceling a coroutine that restarts its work after max_evic
     try testing.expectEqualStrings("2", recorder.get("count").?);
 }
 
+// A Select case whose cleanup waits again after the cancel, in a workflow that, like
+// TimerRace, returns from a canceled `select.await()` without canceling its cases. The first
+// eviction round ends the root and frees its stack, which holds the Select; the second round
+// must not let the case put its result into that stack.
+const SelectCleanup = struct {
+    const Done = union(enum) { slept: std.Io.Cancelable!void };
+
+    fn case(io: std.Io) std.Io.Cancelable!void {
+        io.sleep(.fromSeconds(60), .awake) catch |err| {
+            io.sleep(.fromSeconds(1), .awake) catch {};
+            return err;
+        };
+    }
+
+    fn noop() void {}
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var buf: [1]Done = undefined;
+        var select: std.Io.Select(Done) = .init(io, &buf);
+        select.async(.slept, case, .{io});
+        // Coroutines that finish fill the stack pool, as a run that has done some work has,
+        // so a stack released from here on is unmapped.
+        var fill: [16]std.Io.Future(void) = undefined;
+        for (&fill) |*f| f.* = io.async(noop, .{});
+        for (&fill) |*f| f.await(io);
+        _ = try select.await();
+        return "done";
+    }
+};
+const SelectCleanupWf = workflow.Def("SelectCleanup", SelectCleanup.run);
+
+test "eviction does not let a Select case that waits again write into its returned starter's stack" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, SelectCleanupWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
+    _ = try inst.activate(&try initActivation(a, "SelectCleanup", .{}), a);
+    try testing.expectEqual(@as(usize, 2), inst.sched.live);
+    try testing.expectEqual(@as(usize, 0), inst.teardown());
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 0), recorder.count);
+}
+
 // ctx.sleep with a summary: alone, as an io.async coroutine that is canceled, and racing an
 // activity in a Select.
 const SummaryTimers = struct {
