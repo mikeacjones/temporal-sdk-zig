@@ -1632,3 +1632,83 @@ test "nexus: with a codec keyed by Nexus endpoint, the caller's and the backing 
     try s.env.replayRun(greet_id, "");
     try s.env.replayRun(r.id, r.run_id);
 }
+
+// ---------------------------------------------------------------- outcome errors
+
+/// A handler that waits on a client call whose outcome is a failure, such as an update whose
+/// handler's activity failed for good.
+const OutcomeFixtures = struct {
+    const ChargeOp = nexus.OperationDef("charge", []const u8, []const u8);
+    const OutcomeService = nexus.ServiceDef("zig-outcome-service", .{ChargeOp});
+    const Charge = workflow.UpdateDef("charge", fn ([]const u8) []const u8);
+
+    const State = struct {
+        /// The Nexus handler's attempts, and the update activity's.
+        handler_calls: std.atomic.Value(u32) = .init(0),
+        activity_calls: std.atomic.Value(u32) = .init(0),
+
+        fn declineCard(s: *State, ctx: *activity.Context, item: []const u8) ![]const u8 {
+            _ = s.activity_calls.fetchAdd(1, .monotonic);
+            return ctx.fail(.{ .message = try std.fmt.allocPrint(ctx.allocator(), "card declined for {s}", .{item}), .type = "CardDeclined", .non_retryable = true });
+        }
+
+        /// Sends `Charge` to the workflow `workflow_id` and returns the update's outcome as it is.
+        fn charge(s: *State, ctx: *nexus.Context, workflow_id: []const u8) ![]const u8 {
+            _ = s.handler_calls.fetchAdd(1, .monotonic);
+            const c = try ctx.client();
+            var handle = try c.updateWorkflow(Charge, workflow_id, "", .{"socks"}, .{ .wait_for_stage = .completed });
+            defer handle.deinit();
+            return handle.get(ctx.allocator());
+        }
+    };
+    const DeclineCard = activity.Def("NexusTestDeclineCard", State.declineCard);
+
+    fn chargeUpdate(ctx: *workflow.Context, item: []const u8) ![]const u8 {
+        return ctx.executeActivity(DeclineCard, .{ .start_to_close_timeout = .fromSeconds(10), .retry_policy = .{ .maximum_attempts = 1 } }, .{item}).get();
+    }
+
+    /// Runs `Charge` updates until `release`.
+    fn target(ctx: *workflow.Context) !void {
+        const latch = try ctx.allocator().create(Latch);
+        latch.* = .{};
+        try ctx.setSignalHandler(Release, latch, Latch.set);
+        try ctx.setUpdateHandler(Charge, ctx, chargeUpdate);
+        try ctx.await(latch, Latch.isOpen);
+    }
+    const Target = workflow.Def("NexusTestChargeTarget", target);
+
+    const Handler = nexus.ServiceHandler(OutcomeService, .{nexus.OperationHandler(ChargeOp, State.charge)});
+};
+
+test "nexus: a handler returning a failed update's error fails the operation once, promptly, with the update's failure in the cause chain" {
+    var state: OutcomeFixtures.State = .{};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{});
+    defer env.deinit();
+    inline for (.{ CallService, OutcomeFixtures.Target }) |W| try env.registerWorkflow(W);
+    try env.registerActivityWith(OutcomeFixtures.DeclineCard, &state);
+    try env.registerNexusServiceWith(OutcomeFixtures.Handler, &state);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const endpoint = try uniqueName(a, "zig-outcome-endpoint");
+    try env.createNexusEndpoint(endpoint, .{});
+
+    var t = try env.startWorkflow(OutcomeFixtures.Target, .{}, .{});
+    defer t.deinit();
+    const started = Io.Timestamp.now(testing.io, .awake);
+    // `CallService` gives the operation 60 s; a retried handler error would take all of it.
+    var r = try env.startWorkflow(CallService, .{}, .{ endpoint, OutcomeFixtures.OutcomeService.service_name, "charge", t.id });
+    defer r.deinit();
+    const result = try env.getResult(CallService, &r, a, null);
+    const elapsed = started.durationTo(Io.Timestamp.now(testing.io, .awake));
+
+    try testing.expect(std.mem.startsWith(u8, result, "failed: "));
+    try expectContains(result, "failed: UpdateFailed: Activity task failed [handler INTERNAL]");
+    try expectContains(result, "card declined for socks [application CardDeclined]");
+    try testing.expectEqual(1, state.handler_calls.load(.monotonic));
+    try testing.expectEqual(1, state.activity_calls.load(.monotonic));
+    try testing.expect(elapsed.toSeconds() < 30);
+
+    try env.client.signalWorkflow(Release, t.id, "", .{});
+    try env.getResult(OutcomeFixtures.Target, &t, a, null);
+}

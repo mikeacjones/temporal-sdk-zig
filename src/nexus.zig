@@ -36,6 +36,7 @@
 const std = @import("std");
 const converter = @import("converter.zig");
 const client_mod = @import("client.zig");
+const outcome = @import("nexus/outcome.zig");
 const failure_mod = @import("failure.zig");
 const interceptor = @import("interceptor.zig");
 const log = @import("log.zig");
@@ -645,7 +646,15 @@ pub const CancelReason = enum(u8) {
 /// `error.SignalAlreadySent` (a second signal, see `signalWorkflowByName`) is `bad_request`,
 /// not retried; and `error.WorkflowExecutionAlreadyStarted`,
 /// `error.ActivityExecutionAlreadyStarted`, `error.InvalidOptions` and
-/// `error.InvalidSearchAttribute` are a non-retryable `internal`. Errors from starting or
+/// `error.InvalidSearchAttribute` are a non-retryable `internal`. So is a definitive outcome
+/// of waiting on a workflow, update, activity, or Nexus operation, which asking again cannot
+/// change: `error.UpdateFailed`, `WorkflowFailed`, `WorkflowCanceled`, `WorkflowTerminated`,
+/// `WorkflowTimedOut`, `WorkflowContinuedAsNew`, `ActivityFailed`, `ActivityCanceled`,
+/// `ActivityTerminated`, `ActivityTimedOut`, `NexusOperationFailed`,
+/// `NexusOperationCanceled`, `NexusOperationTerminated` and `NexusOperationTimedOut`. When the
+/// wait that returned it (such as `WorkflowUpdateHandle.get`) was given `ctx.allocator()`, the
+/// outcome's failure is the cause of the error's cause, and its message ends the handler
+/// error's message. Errors from starting or
 /// canceling an asynchronous operation's workflow or activity map the same way, and a start
 /// or cancel the server rejects maps by its gRPC status: INVALID_ARGUMENT is `bad_request`; ALREADY_EXISTS,
 /// FAILED_PRECONDITION and OUT_OF_RANGE a non-retryable `internal`; ABORTED and UNAVAILABLE
@@ -691,12 +700,15 @@ pub const Context = struct {
     /// The links of what the handler signaled, allocated from `arena` by the task that holds
     /// `signaled_`; read once the handler has returned.
     response_links_: std.ArrayList(Link) = .empty,
+    /// The failure behind the last outcome error (such as `error.UpdateFailed`) of a client
+    /// wait given `allocator()`; `allocator()` is this slot's allocator over `arena`.
+    outcome_: outcome.Slot = .{},
 
     const not_canceled = std.math.maxInt(u8);
 
     /// Memory that lives until the request's response has been sent.
     pub fn allocator(ctx: *Context) Allocator {
-        return ctx.arena;
+        return ctx.outcome_.allocator(ctx.arena);
     }
 
     /// The worker's Io. Handlers may block, sleep, and do I/O on it. A cancel of the request
@@ -904,7 +916,13 @@ pub const Context = struct {
             .operation => |o| if (err == error.OperationFailed or err == error.OperationCanceled) return .{ .operation_error = o },
             .handler => |h| if (err == error.HandlerError) return .{ .handler_error = h },
         };
-        return .{ .handler_error = plainError(ctx.arena, "nexus operation \"" ++ operation ++ "\" of service \"" ++ service ++ "\" failed", err) };
+        const what = "nexus operation \"" ++ operation ++ "\" of service \"" ++ service ++ "\" failed";
+        var e = plainError(ctx.arena, what, err);
+        if (isOutcomeError(err)) if (ctx.outcome_.failureFor(err)) |f| {
+            e.cause.?.cause = f;
+            e.message = std.fmt.allocPrint(ctx.arena, "{s}: {t}: {s}", .{ what, err, f.message }) catch e.message;
+        };
+        return .{ .handler_error = e };
     }
 };
 
@@ -915,11 +933,24 @@ fn plainError(arena: Allocator, what: []const u8, err: anyerror) HandlerError {
     return rpcError(arena, what, err, null);
 }
 
+/// Whether `err` is a definitive outcome of waiting on a workflow, update, activity, or Nexus
+/// operation: it ended this way, and asking again cannot change that.
+fn isOutcomeError(err: anyerror) bool {
+    const outcome_errors = [_]anyerror{
+        error.UpdateFailed,             error.WorkflowFailed,         error.WorkflowCanceled,
+        error.WorkflowTerminated,       error.WorkflowTimedOut,       error.WorkflowContinuedAsNew,
+        error.ActivityFailed,           error.ActivityCanceled,       error.ActivityTerminated,
+        error.ActivityTimedOut,         error.NexusOperationFailed,   error.NexusOperationCanceled,
+        error.NexusOperationTerminated, error.NexusOperationTimedOut,
+    };
+    return std.mem.indexOfScalar(anyerror, &outcome_errors, err) != null;
+}
+
 /// The handler error for `err` from a client call, which the server rejected with gRPC
 /// status `rejected` when `err` is `error.RpcFailed` and the status is known (see `Context`).
 /// Its message carries the server's.
 fn rpcError(arena: Allocator, what: []const u8, err: anyerror, rejected: ?client_mod.RpcRejection) HandlerError {
-    const plain = err == error.WorkflowExecutionAlreadyStarted or err == error.ActivityExecutionAlreadyStarted or err == error.InvalidOptions or err == error.InvalidSearchAttribute;
+    const plain = err == error.WorkflowExecutionAlreadyStarted or err == error.ActivityExecutionAlreadyStarted or err == error.InvalidOptions or err == error.InvalidSearchAttribute or isOutcomeError(err);
     var e: HandlerError = .{
         .type = if (err == error.NotFound) .not_found else if (err == error.SignalAlreadySent) .bad_request else .internal,
         .message = std.fmt.allocPrint(arena, "{s}: {t}", .{ what, err }) catch @errorName(err),
@@ -2085,6 +2116,50 @@ const ShoutActivity = struct {
     const Handler = ServiceHandler(Service, .{ OperationHandler(Run, run), OperationHandler(Untimed, untimed) });
 };
 
+test "an outcome error a handler returns is a non-retryable internal error, with the failure its wait recorded as cause" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const outcome_errors = [_]anyerror{
+        error.UpdateFailed,             error.WorkflowFailed,         error.WorkflowCanceled,
+        error.WorkflowTerminated,       error.WorkflowTimedOut,       error.WorkflowContinuedAsNew,
+        error.ActivityFailed,           error.ActivityCanceled,       error.ActivityTerminated,
+        error.ActivityTimedOut,         error.NexusOperationFailed,   error.NexusOperationCanceled,
+        error.NexusOperationTerminated, error.NexusOperationTimedOut,
+    };
+    for (outcome_errors) |err| {
+        const e = rpcError(a, "w", err, null);
+        try testing.expectEqual(HandlerErrorType.internal, e.type);
+        try testing.expect(!e.retryable());
+        try testing.expectEqualStrings(@errorName(err), e.cause.?.type);
+    }
+
+    // Without a recorded failure: the bare mapping.
+    var ctx = testContext(a, "o");
+    const bare = ctx.errorResult("s", "o", error.UpdateFailed).handler_error;
+    try testing.expect(!bare.retryable());
+    try testing.expectEqualStrings("nexus operation \"o\" of service \"s\" failed: UpdateFailed", bare.message);
+    try testing.expectEqual(null, bare.cause.?.cause);
+
+    // A wait given ctx.allocator() records its failure; a wait given another allocator doesn't.
+    const f: failure_mod.Failure = .{ .message = "card declined" };
+    outcome.Slot.note(a, error.UpdateFailed, &f);
+    try testing.expectEqual(null, ctx.errorResult("s", "o", error.UpdateFailed).handler_error.cause.?.cause);
+    outcome.Slot.note(ctx.allocator(), error.UpdateFailed, &f);
+    const caused = ctx.errorResult("s", "o", error.UpdateFailed).handler_error;
+    try testing.expect(!caused.retryable());
+    try testing.expectEqualStrings("nexus operation \"o\" of service \"s\" failed: UpdateFailed: card declined", caused.message);
+    try testing.expectEqualStrings("UpdateFailed", caused.cause.?.message);
+    try testing.expectEqualStrings("card declined", caused.cause.?.cause.?.message);
+    // The failure belongs to the error it was recorded for.
+    const other = ctx.errorResult("s", "o", error.WorkflowFailed).handler_error;
+    try testing.expectEqual(null, other.cause.?.cause);
+    try testing.expect(!other.retryable());
+    // Other errors keep their mappings.
+    try testing.expect(ctx.errorResult("s", "o", error.Canceled).handler_error.retryable());
+    try testing.expectEqual(HandlerErrorType.not_found, ctx.errorResult("s", "o", error.NotFound).handler_error.type);
+}
+
 test "an activity-run token has the shared JSON layout, with or without its run ID, and malformed tokens are rejected" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -2357,4 +2432,5 @@ test "compile errors name the operation, the service, and what to fix" {
 
 test {
     _ = @import("nexus/wire.zig");
+    _ = @import("nexus/outcome.zig");
 }

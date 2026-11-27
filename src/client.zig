@@ -33,6 +33,7 @@ const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const call_check = @import("nexus/call_check.zig");
+const nexus_outcome = @import("nexus/outcome.zig");
 const protobuf = @import("protobuf");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -4774,13 +4775,14 @@ pub fn ActivityHandle(comptime T: type) type {
                 .failure => |received| {
                     const f = try c.receivedFailure(arena, &context, received);
                     h.failure_ = f;
-                    const info = f.failure_info orelse return error.ActivityFailed;
-                    return switch (info) {
+                    const err: ActivityResultError = if (f.failure_info) |info| switch (info) {
                         .canceled_failure_info => error.ActivityCanceled,
                         .terminated_failure_info => error.ActivityTerminated,
                         .timeout_failure_info => error.ActivityTimedOut,
                         else => error.ActivityFailed,
-                    };
+                    } else error.ActivityFailed;
+                    nexus_outcome.Slot.note(arena, err, &h.failure_.?);
+                    return err;
                 },
             }
         }
@@ -5352,7 +5354,9 @@ pub fn NexusOperationHandle(comptime T: type) type {
                 .failure => |received| {
                     const f = try c.receivedFailure(arena, &context, received);
                     h.failure_ = f;
-                    return failureError(&f);
+                    const err = failureError(&f);
+                    nexus_outcome.Slot.note(arena, err, &h.failure_.?);
+                    return err;
                 },
             }
         }
@@ -6562,6 +6566,7 @@ pub fn WorkflowRun(comptime T: type) type {
                     },
                     .workflow_execution_failed_event_attributes => |failed| {
                         run.failure_ = if (failed.failure) |f| try c.receivedFailure(arena, &result_context, f) else null;
+                        if (run.failure_) |*f| nexus_outcome.Slot.note(arena, error.WorkflowFailed, f);
                         return error.WorkflowFailed;
                     },
                     .workflow_execution_canceled_event_attributes => return error.WorkflowCanceled,
@@ -6732,6 +6737,7 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
                 },
                 .failure => |f| {
                     h.failure_ = try c.receivedFailure(arena, &context, f);
+                    nexus_outcome.Slot.note(arena, error.UpdateFailed, &h.failure_.?);
                     return error.UpdateFailed;
                 },
             }
