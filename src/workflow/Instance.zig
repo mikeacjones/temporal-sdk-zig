@@ -6551,6 +6551,70 @@ test "eviction does not let a starter that an operation's waiters wake return wh
     try testing.expectEqual(@as(usize, 0), recorder.count);
 }
 
+// A coroutine whose cleanup, after the eviction cancel, waits without a cancel point for
+// something its starter does as it unwinds: a lock its starter holds across a wait, or an
+// event its starter sets in a defer. Both live in the run's arena, so the starter may return
+// first. Holding the starter in its wait until the coroutine exits leaves both blocked.
+const StarterReleases = struct {
+    fn locker(io: std.Io, mutex: *std.Io.Mutex, count: *u32) void {
+        defer {
+            mutex.lockUncancelable(io);
+            count.* += 1;
+            mutex.unlock(io);
+        }
+        io.sleep(.fromSeconds(60), .awake) catch {};
+    }
+
+    fn lockHeld(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const mutex = try ctx.allocator().create(std.Io.Mutex);
+        mutex.* = .init;
+        const count = try ctx.allocator().create(u32);
+        count.* = 0;
+        try mutex.lock(io);
+        defer mutex.unlock(io);
+        _ = io.async(locker, .{ io, mutex, count });
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get();
+    }
+
+    fn waiter(io: std.Io, stop: *std.Io.Event) void {
+        io.sleep(.fromSeconds(60), .awake) catch {};
+        stop.waitUncancelable(io);
+    }
+
+    fn eventSet(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const stop = try ctx.allocator().create(std.Io.Event);
+        stop.* = .unset;
+        defer stop.set(io);
+        _ = io.async(waiter, .{ io, stop });
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get();
+    }
+};
+const StarterReleasesLockWf = workflow.Def("StarterReleasesLock", StarterReleases.lockHeld);
+const StarterReleasesEventWf = workflow.Def("StarterReleasesEvent", StarterReleases.eventSet);
+
+test "eviction lets a coroutine whose cleanup waits on its starter's unwinding exit" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const cases = .{
+        .{ StarterReleasesLockWf.registered, "StarterReleasesLock" },
+        .{ StarterReleasesEventWf.registered, "StarterReleasesEvent" },
+    };
+    inline for (cases) |case| {
+        var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+        defer recorder.arena.deinit();
+        const inst = try create(testing.allocator, case[0], .{ .logger = recorder.sink() });
+        _ = try inst.activate(&try initActivation(a, case[1], .{}), a);
+        try testing.expectEqual(@as(usize, 2), inst.sched.live);
+        const left = inst.teardown();
+        inst.destroy();
+        try testing.expectEqual(@as(usize, 0), left);
+        try testing.expectEqual(@as(usize, 0), recorder.count);
+    }
+}
+
 // ctx.sleep with a summary: alone, as an io.async coroutine that is canceled, and racing an
 // activity in a Select.
 const SummaryTimers = struct {
