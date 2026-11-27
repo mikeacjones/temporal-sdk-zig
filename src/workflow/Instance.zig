@@ -770,10 +770,11 @@ pub fn create(gpa: Allocator, entry: workflow.Registered, options: Options) !*In
     return inst;
 }
 
-/// Tears the run down: cancels its coroutines, lets them exit, and frees everything. A
-/// coroutine that refuses to exit keeps its stack mapped (it is never resumed), unless a
-/// coroutine start of the run failed (see `teardown`); the rest of the run, including that
-/// coroutine's Task block, is freed.
+/// Tears the run down: cancels every coroutine, lets them exit, and frees everything. A
+/// coroutine that refuses to exit, and every coroutine that started it (held so that it
+/// can't return from under it, see `teardown`), keeps its stack mapped (it is never
+/// resumed), unless a coroutine start of the run failed; the rest of the run, including those
+/// coroutines' Task blocks, is freed.
 pub fn destroy(inst: *Instance) void {
     const stuck = inst.teardown();
     const gpa = inst.gpa;
@@ -793,8 +794,8 @@ pub fn destroy(inst: *Instance) void {
     gpa.destroy(inst);
 }
 
-/// The most rounds of cancel and run `teardown` goes on for without the number of live
-/// coroutines falling below its lowest so far.
+/// `teardown` stops when a round changes nothing, or after this many rounds in a row with no
+/// new low of `sched.live`.
 const max_eviction_rounds = 16;
 
 /// The first half of `destroy`: marks the run evicting, so `emit` drops every command from
@@ -802,12 +803,12 @@ const max_eviction_rounds = 16;
 /// Select cases nobody awaited), wakes waits that ignore cancellation, and runs the scheduler
 /// so they exit and their defers run. No coroutine goes on from a wait while futures or group
 /// members it started still run (`WorkflowIo.hold_starters`), so none returns from under
-/// them, until nothing else can move (`WorkflowIo.releaseHeldStarters`); the stacks of
-/// coroutines that exit stay mapped and unused until the end. This takes rounds, which go on
-/// while each changes something, until `max_eviction_rounds` in a row leave no fewer
-/// coroutines than before. Returns how many coroutines are still alive,
-/// which is always 0 for a run whose coroutine start failed (see the end). Calling it again
-/// returns that count without doing anything else.
+/// them; one whose child never exits (cancel protection on, a circular or uncancelable wait,
+/// a cancel swallowed in a loop) is never resumed, and both are counted. This takes rounds:
+/// it stops when a round changes nothing (no coroutine exits and no wait takes a cancel), or
+/// after `max_eviction_rounds` rounds in a row with no new low of `sched.live`. Returns how
+/// many coroutines are still alive, which is always 0 for a run whose coroutine start failed
+/// (see the end). Calling it again returns that count without doing anything else.
 pub fn teardown(inst: *Instance) usize {
     if (inst.evicting) return inst.sched.live;
     inst.evicting = true;
@@ -821,18 +822,13 @@ pub fn teardown(inst: *Instance) usize {
     // canceled. A round cancels them all and lets them exit; a coroutine whose children still
     // run is held in its wait until they have exited, however it is woken (a cancel, a
     // child's result, an operation's waiters below), since their pointers into its stack (a
-    // Select's cases into the Select) must stay valid. When nothing moves, a held starter's
-    // child may be waiting for what the starter does as it unwinds (a lock it holds, an event
-    // it sets in a defer), so the innermost held starters are let go; their stacks, like
-    // every stack of a coroutine that exits here, stay mapped and unused until the rounds end,
-    // so a child that still points into one writes into memory nothing else uses. The next
-    // round reaches coroutines that took the cancel and wait again, or were started
-    // meanwhile. Rounds stop when one changes nothing (no coroutine exits, no wait takes a
-    // cancel and no held starter is left to let go), or once
-    // `max_eviction_rounds` in a row leave no fewer coroutines than the fewest so far: a
-    // coroutine may swallow the cancel and start its work again forever.
+    // Select's cases into the Select) must stay valid; one whose child never exits is never
+    // resumed, and both are left to `destroy`. The next round reaches coroutines that took
+    // the cancel and wait again, or were started meanwhile. Rounds stop when one changes
+    // nothing (no coroutine exits and no wait takes a cancel), or after
+    // `max_eviction_rounds` rounds in a row with no new low of `sched.live`: a coroutine may
+    // swallow the cancel and start its work again forever.
     inst.wio.hold_starters = true;
-    inst.sched.keep_finished_stacks = true;
     var fewest = inst.sched.live;
     var stale_rounds: usize = 0;
     while (inst.sched.live > 0 and stale_rounds < max_eviction_rounds) {
@@ -855,21 +851,14 @@ pub fn teardown(inst: *Instance) usize {
         var externals = inst.externals.valueIterator();
         while (externals.next()) |state| state.*.waiters.wakeAll(&inst.wio);
         inst.wio.run();
-        if (live_before + (inst.sched.next_id - id_before) == inst.sched.live and
-            inst.wio.cancels_delivered == delivered_before)
-        {
-            // Nothing moved. A held starter's child may be waiting for what the starter does
-            // as it unwinds; let the innermost held starters go on.
-            if (inst.wio.releaseHeldStarters() == 0) break;
-            inst.wio.run();
-        }
+        const spawned: usize = inst.sched.next_id - id_before;
+        const exited = live_before + spawned - inst.sched.live;
+        if (exited == 0 and inst.wio.cancels_delivered == delivered_before) break;
         if (inst.sched.live < fewest) {
             fewest = inst.sched.live;
             stale_rounds = 0;
         } else stale_rounds += 1;
     }
-    // What is still alive is never resumed, so nothing writes into the kept stacks any more.
-    inst.sched.releaseKeptStacks();
     std.debug.assert(inst.commands.items.len == 0);
     if (inst.wio.start_failure != null and inst.sched.live > 0) {
         // A failed coroutine start ran its function inline in the coroutine that started it,
@@ -6609,7 +6598,7 @@ const StarterReleases = struct {
 const StarterReleasesLockWf = workflow.Def("StarterReleasesLock", StarterReleases.lockHeld);
 const StarterReleasesEventWf = workflow.Def("StarterReleasesEvent", StarterReleases.eventSet);
 
-test "eviction lets a coroutine whose cleanup waits on its starter's unwinding exit" {
+test "eviction holds a starter whose coroutine's cleanup waits on its unwinding, and reports both" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -6625,13 +6614,16 @@ test "eviction lets a coroutine whose cleanup waits on its starter's unwinding e
         try testing.expectEqual(@as(usize, 2), inst.sched.live);
         const left = inst.teardown();
         inst.destroy();
-        try testing.expectEqual(@as(usize, 0), left);
-        try testing.expectEqual(@as(usize, 0), recorder.count);
+        // The starter is never resumed while the coroutine it started runs, and that one
+        // waits for the starter: both are left, reported once and leaked.
+        try testing.expectEqual(@as(usize, 2), left);
+        try testing.expectEqual(@as(usize, 1), recorder.count);
+        try testing.expectEqualStrings("2", recorder.get("count").?);
     }
 }
 
 // A root waiting on an activity beside a child that sleeps with cancel protection on, so
-// eviction can't end it. Holding the root until the child exits would leak the root too.
+// eviction can't end it. The root is held while the child runs, so both are left.
 const ProtectedChild = struct {
     fn sleepProtected(io: std.Io) void {
         _ = io.swapCancelProtection(.blocked);
@@ -6646,7 +6638,7 @@ const ProtectedChild = struct {
 };
 const ProtectedChildWf = workflow.Def("ProtectedChild", ProtectedChild.run);
 
-test "eviction lets a starter go once only its child that refuses to exit is left" {
+test "a child that refuses to exit on eviction keeps its starter, and both are reported" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -6655,10 +6647,10 @@ test "eviction lets a starter go once only its child that refuses to exit is lef
     const inst = try create(testing.allocator, ProtectedChildWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
     _ = try inst.activate(&try initActivation(a, "ProtectedChild", .{}), a);
     try testing.expectEqual(@as(usize, 2), inst.sched.live);
-    try testing.expectEqual(@as(usize, 1), inst.teardown());
+    try testing.expectEqual(@as(usize, 2), inst.teardown());
     inst.destroy();
     try testing.expectEqual(@as(usize, 1), recorder.count);
-    try testing.expectEqualStrings("1", recorder.get("count").?);
+    try testing.expectEqualStrings("2", recorder.get("count").?);
 }
 
 // A Select case whose cleanup locks a mutex its starter holds across `select.await()`, so it

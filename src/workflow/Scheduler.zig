@@ -38,11 +38,6 @@ ready_head: ?*Fiber = null,
 ready_tail: ?*Fiber = null,
 /// Stacks of finished fibers, reused by later spawns.
 free_stacks: std.ArrayList(Stack) = .empty,
-/// While set, a fiber that finishes keeps its stack mapped, unused, in `kept_stacks` instead
-/// of pooling or unmapping it, until `releaseKeptStacks`: something that still points into
-/// it (another fiber that is yet to run) then writes into memory nothing else uses.
-keep_finished_stacks: bool = false,
-kept_stacks: std.ArrayList(Stack) = .empty,
 /// Fibers spawned and not yet finished.
 live: usize = 0,
 /// The unfinished fibers in spawn order, linked through `Fiber.live_next`.
@@ -103,7 +98,6 @@ pub fn init(gpa: Allocator, options: Options) Scheduler {
 pub fn deinit(s: *Scheduler) void {
     assert(s.live == 0);
     assert(s.current == null);
-    s.releaseKeptStacks();
     for (s.free_stacks.items) |stack| stack.unmap();
     s.free_stacks.deinit(s.gpa);
     s.* = undefined;
@@ -142,7 +136,6 @@ pub fn deinitLeakingLive(s: *Scheduler) void {
         var it = s.live_head;
         while (it) |f| : (it = f.live_next) tsan.destroy(f.tsan_fiber);
     }
-    s.releaseKeptStacks();
     for (s.free_stacks.items) |stack| stack.unmap();
     s.free_stacks.deinit(s.gpa);
     s.* = undefined;
@@ -155,18 +148,9 @@ pub fn stackBytes(s: *const Scheduler) usize {
     return s.stackCount() * s.options.stack_size;
 }
 
-/// Stacks the scheduler holds: unfinished fibers plus pooled and kept stacks.
+/// Stacks the scheduler holds: unfinished fibers plus pooled stacks.
 pub fn stackCount(s: *const Scheduler) usize {
-    return s.live + s.free_stacks.items.len + s.kept_stacks.items.len;
-}
-
-/// Ends `keep_finished_stacks`: the kept stacks are pooled or unmapped, as finishing would
-/// have done.
-pub fn releaseKeptStacks(s: *Scheduler) void {
-    s.keep_finished_stacks = false;
-    for (s.kept_stacks.items) |stack| s.releaseStack(stack);
-    s.kept_stacks.deinit(s.gpa);
-    s.kept_stacks = .empty;
+    return s.live + s.free_stacks.items.len;
 }
 
 /// Creates a fiber that will call `func` with `args` and puts it at the back of the ready
@@ -559,12 +543,6 @@ fn takeStack(s: *Scheduler) !Stack {
 }
 
 fn releaseStack(s: *Scheduler, stack: Stack) void {
-    if (s.keep_finished_stacks) {
-        // Without memory to remember it, the stack stays mapped for good rather than be
-        // reused or unmapped under a fiber that may still write into it.
-        s.kept_stacks.append(s.gpa, stack) catch {};
-        return;
-    }
     if (s.free_stacks.items.len < s.options.max_pooled_stacks) {
         if (s.free_stacks.append(s.gpa, stack)) |_| return else |_| {}
     }
@@ -865,28 +843,6 @@ test "deinitLeakingLive frees the pool and leaves a blocked fiber's stack mapped
     // the test process doesn't keep it.
     try testing.expectEqual(Fiber.State.blocked, stuck.state);
     stuck.stack.unmap();
-}
-
-test "keep_finished_stacks keeps a finished fiber's stack out of the pool until releaseKeptStacks" {
-    var s: Scheduler = .init(testing.allocator, .{ .stack_size = 64 * 1024 });
-    defer s.deinit();
-    s.keep_finished_stacks = true;
-    var first: usize = 0;
-    _ = try s.spawn("a", recordStack, .{&first});
-    s.run();
-    try testing.expectEqual(@as(usize, 0), s.free_stacks.items.len);
-    try testing.expectEqual(@as(usize, 1), s.kept_stacks.items.len);
-    try testing.expectEqual(@as(usize, 1), s.stackCount());
-    // A fiber spawned meanwhile gets a stack of its own, not the kept one.
-    var second: usize = 0;
-    _ = try s.spawn("b", recordStack, .{&second});
-    s.run();
-    try testing.expect(first != second);
-    try testing.expectEqual(@as(usize, 2), s.kept_stacks.items.len);
-    s.releaseKeptStacks();
-    try testing.expect(!s.keep_finished_stacks);
-    try testing.expectEqual(@as(usize, 0), s.kept_stacks.items.len);
-    try testing.expectEqual(@as(usize, 2), s.free_stacks.items.len);
 }
 
 test "a fiber can use most of its stack" {
