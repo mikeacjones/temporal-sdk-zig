@@ -33,7 +33,7 @@ pub const Logging = struct {
 
 /// A core log callback with its context. `func` runs on the core's threads, possibly several
 /// at once; `ctx` must stay valid until `Runtime.deinit` returns, which waits for calls in
-/// progress to finish. `func` runs with SIGPIPE blocked (see `init`).
+/// progress to finish. On the core's threads, `func` runs with SIGPIPE blocked (see `init`).
 pub const Forward = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, record: *const LogRecord) void,
