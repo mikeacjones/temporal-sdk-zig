@@ -7395,6 +7395,39 @@ test "eviction ends a wait for an activity's cancellation to complete" {
     running.destroy();
 }
 
+// A workflow canceled while its activity's cancellation has yet to complete, whose error path
+// starts a cleanup coroutine and awaits it. At eviction, the wake of the activity's waiters
+// (not a cancel) ends that wait, so the workflow starts the cleanup with eviction's cancel
+// still pending, and its await must pass that cancel on, or a later round must cancel the
+// cleanup: nothing else ever does.
+const CancelCleanup = struct {
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10), .cancellation_type = .wait_cancellation_completed }, .{"x"}).get() catch |err| {
+            var cleanup = io.async(std.Io.sleep, .{ io, .fromSeconds(1), .awake });
+            cleanup.await(io) catch {};
+            return err;
+        };
+    }
+};
+const CancelCleanupWf = workflow.Def("CancelCleanup", CancelCleanup.run);
+
+test "eviction cancels a cleanup coroutine a canceled workflow starts once its activity's waiters are woken" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, CancelCleanupWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
+    _ = try inst.activate(&try initActivation(a, "CancelCleanup", .{}), a);
+    _ = try inst.activate(&try oneJob(a, .{ .cancel_workflow = .{} }), a);
+    try testing.expectEqual(@as(usize, 1), inst.sched.live);
+    const left = inst.teardown();
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 0), left);
+    try testing.expectEqual(@as(usize, 0), recorder.count);
+}
+
 // Two coroutines wait on one future: first a coroutine started with `io.async`, which nothing
 // cancels, then the workflow function. The workflow returns the order they returned in and
 // what each got: "<first> <second>: async=<outcome> root=<outcome>", an outcome being the
