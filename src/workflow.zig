@@ -426,7 +426,8 @@ pub const VersioningIntent = enum { unspecified, compatible, default };
 pub const ActivityCancellationType = enum { try_cancel, wait_cancellation_completed, abandon };
 
 /// How an activity is scheduled. At least one of `start_to_close_timeout` and
-/// `schedule_to_close_timeout` is required.
+/// `schedule_to_close_timeout` is required: without either, the future's `get` returns
+/// `error.InvalidOptions` (logged); the activity isn't scheduled.
 /// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
 /// sent as the longest one it can; a negative one is sent as it is.
 pub const ActivityOptions = struct {
@@ -1510,7 +1511,7 @@ pub const Context = struct {
 
     pub const SetQueryHandlerError = error{
         OutOfMemory,
-        /// `context` points into the calling coroutine's stack (logged with the query type).
+        /// `context` points into a live workflow coroutine's stack (logged with the query type).
         QueryContextOnStack,
     };
 
@@ -1540,8 +1541,8 @@ pub const Context = struct {
     /// `ctx.allocator()` while the handler runs.
     ///
     /// `context` is usually a pointer to the state the handler reads. It must outlive the run,
-    /// so allocate it with `ctx.allocator()` (or point to a global); a pointer into the calling
-    /// coroutine's stack returns `error.QueryContextOnStack`.
+    /// so allocate it with `ctx.allocator()` (or point to a global); a pointer into a live
+    /// workflow coroutine's stack returns `error.QueryContextOnStack`.
     ///
     ///     const state = try ctx.allocator().create(State);
     ///     try ctx.setQueryHandler(GetStatus, state, State.status);
@@ -1594,7 +1595,7 @@ pub const Context = struct {
     /// `__temporal...` types fail with `QueryNotRegistered`.
     ///
     /// The handler is read-only and its `context` must outlive the run, as in
-    /// `setQueryHandler`; a pointer into the calling coroutine's stack returns
+    /// `setQueryHandler`; a pointer into a live workflow coroutine's stack returns
     /// `error.QueryContextOnStack`.
     ///
     ///     fn anyQuery(s: *State, name: []const u8, args: temporal.converter.EncodedValues) ![]const u8 {
@@ -1622,7 +1623,7 @@ pub const Context = struct {
 
     pub const SetSignalHandlerError = error{
         OutOfMemory,
-        /// `context` points into the calling coroutine's stack (logged with the signal name).
+        /// `context` points into a live workflow coroutine's stack (logged with the signal name).
         SignalContextOnStack,
     };
 
@@ -1640,8 +1641,8 @@ pub const Context = struct {
     /// it (`error.Canceled` cancels it), unless the workflow has already finished.
     ///
     /// `context` is usually a pointer to the state the handler changes. It must outlive the
-    /// run, so allocate it with `ctx.allocator()` (or point to a global); a pointer into the
-    /// calling coroutine's stack returns `error.SignalContextOnStack`. Decoded arguments live
+    /// run, so allocate it with `ctx.allocator()` (or point to a global); a pointer into a live
+    /// workflow coroutine's stack returns `error.SignalContextOnStack`. Decoded arguments live
     /// in `ctx.allocator()`, so the handler may keep them.
     ///
     ///     const state = try ctx.allocator().create(State);
@@ -1799,7 +1800,7 @@ pub const Context = struct {
 
     pub const SetUpdateHandlerError = error{
         OutOfMemory,
-        /// `context` points into the calling coroutine's stack (logged with the update name).
+        /// `context` points into a live workflow coroutine's stack (logged with the update name).
         UpdateContextOnStack,
     };
 
@@ -1816,7 +1817,7 @@ pub const Context = struct {
     /// blocked are rejected, so register handlers before the workflow function first blocks. An update whose arguments don't decode as
     /// the handler's parameters is rejected.
     ///
-    /// `context` must outlive the run, as for `setSignalHandler`; a pointer into the calling
+    /// `context` must outlive the run, as for `setSignalHandler`; a pointer into a live workflow
     /// coroutine's stack returns `error.UpdateContextOnStack`. Decoded arguments live in
     /// `ctx.allocator()`.
     pub fn setUpdateHandler(ctx: *Context, comptime Update: type, context: anytype, comptime handler: anytype) SetUpdateHandlerError!void {

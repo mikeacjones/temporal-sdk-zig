@@ -38,7 +38,8 @@ test "the cart adds and removes items, rejects an unknown action, and completes 
 
     var failure: ?temporal.Failure = null;
     try testing.expectError(error.UpdateFailed, env.updateWorkflow(shoppingcart.UpdateCart, a, handle.workflow_id, .{ "invalid", "apple" }, &failure));
-    try testing.expectEqualStrings("UnsupportedActionType", failure.?.message);
+    try testing.expectEqualStrings("unsupported action type: invalid", failure.?.message);
+    try testing.expectEqualStrings("UnsupportedActionType", temporal.failure.applicationType(failure.?).?);
 
     try env.signalWorkflow(shoppingcart.Checkout, handle.workflow_id, .{});
     var run = try env.client.getWorkflow(void, handle.workflow_id, handle.run_id);

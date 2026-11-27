@@ -840,7 +840,7 @@ pub const GreetTwice = workflow.Def("greet_twice", greetTwice);
 ```
 
 Notes:
-- `start_to_close_timeout` or `schedule_to_close_timeout` is required. Without either, a local activity's `get` returns `error.InvalidOptions` (logged); `executeActivity` doesn't check and sends the command as given, leaving validation to the server.
+- `start_to_close_timeout` or `schedule_to_close_timeout` is required. Without either, the activity isn't scheduled and its future's `get` returns `error.InvalidOptions` (logged), for `executeActivity`, `executeActivityByName` and `executeLocalActivity` alike. The workflow task doesn't fail, so the workflow can handle the error and go on.
 - On `error.ActivityFailed`, `future.failure()` has the failure; returning the error fails the workflow with that failure.
 - `future.cancel()`, or canceling the waiting coroutine, cancels the activity as `cancellation_type` says.
 - Any number of coroutines may wait on the same future, of any kind: an activity's or local activity's, a child workflow's or Nexus operation's (`get` and `started`), or a signal or cancellation request to another workflow. All of them return once it resolves, in the order they began waiting. Canceling one of them still requests the operation's cancellation, which the others then see in its outcome.
@@ -1029,7 +1029,7 @@ pub const LobbyWorkflow = workflow.Def("lobby", lobby);
 
 Notes:
 - A handler registered for a query type with `setQueryHandler` (or a struct workflow's `queries`) still answers that type. Without a dynamic handler, a query of an unregistered type fails with `QueryNotRegistered`, naming the registered types.
-- An error from the handler, or an argument that doesn't decode, fails the query with the error's name. Registering again replaces the dynamic handler; its context must outlive the run, and one on the calling coroutine's stack returns `error.QueryContextOnStack`.
+- An error from the handler, or an argument that doesn't decode, fails the query with the error's name. Registering again replaces the dynamic handler; its context must outlive the run, and one on a live workflow coroutine's stack returns `error.QueryContextOnStack`.
 - Query handlers and update validators must not change workflow state: history doesn't record queries or rejected updates, so a change would make the run differ from its replay. A call from one that would start an activity, timer, child workflow or any other command (`executeActivity`, `sleep`, `executeChildWorkflow`, `signalExternalWorkflow`, `upsertMemo`, `completeSession`, ...), register or remove a handler (`setSignalHandler`, `signalChannel`, `setUpdateHandler`, ...), take a signal from a channel (`receive`, `tryReceive`), change the run's settings (`setVersioningBehavior`), start a coroutine (`io.concurrent`), or block (`ctx.await`, a pending future's `get`) is refused: it returns `error.InvalidOptions` or `error.Canceled` (or does nothing, where it can't fail), the query fails or the update is rejected with a `ReadOnlyViolation` failure whose message names the call, whatever the handler returns, no command is sent, and the workflow task doesn't fail. A zero `sleep` returns at once, `io.async` runs its function inline, and `io.random` draws without moving the workflow's random sequence. `ctx.fail` and `ctx.failWith` describe the query's failure or the update's rejection, not the workflow's.
 - `setCoroutineName` does nothing in a query handler or a validator run on delivery, which run outside any coroutine, so the query or update goes on. It is refused like the calls above in a validator that runs in a coroutine, which happens when the workflow function or a handler registers the handler of an update that is waiting for one: it would otherwise rename that coroutine.
 - Query types Temporal's tools send (`__stack_trace`, `__enhanced_stack_trace`, and those starting with `__temporal`) don't go to the dynamic handler. The worker answers `__stack_trace`, `__enhanced_stack_trace` and `__temporal_workflow_metadata` itself (see [Stack trace query](#stack-trace-query) and [Stack trace and metadata queries](#stack-trace-and-metadata-queries)); other `__temporal` types fail with `QueryNotRegistered`.
@@ -1038,6 +1038,45 @@ Notes:
 - A handler or validator that wakes a workflow coroutine through `std.Io` (`Event.set`, `Condition.signal`, `Queue.put`, `Mutex.unlock` on something a coroutine waits for) also fails the query or has the update rejected with `ReadOnlyViolation`. The wake itself still happens, since `std.Io` has already changed the primitive: the woken coroutine runs in the next workflow task that runs workflow code.
 - The SDK can't undo a change a handler makes to workflow data or to a `std.Io` primitive, and doesn't detect one that wakes nothing; keeping to reads is the handler's job.
 - The rules apply only to the handler's or validator's own code: other coroutines, including ones that run while a validator is blocked, are unaffected. A validator run in a coroutine neither sees nor uses up that coroutine's cancellation: `io.checkCancel` and a zero `sleep` return normally, and the cancel stays for the coroutine's own code.
+
+A validator that returns an error rejects the update with the error's name as its message. To say why, return `ctx.fail(...)` from the validator: the update is rejected with that application failure, its message and type, and the caller's `failure` gets them. The message must outlive the run, so format it in `ctx.allocator()`:
+
+<!-- example: workflow-update-validator -->
+```zig
+pub const SetLimit = workflow.UpdateDef("set_limit", fn (limit: i64) i64);
+const Limits = struct {
+    ctx: *workflow.Context,
+    limit: i64 = 10,
+    set: bool = false,
+    fn setLimit(l: *Limits, limit: i64) i64 {
+        defer l.set = true;
+        const old = l.limit;
+        l.limit = limit;
+        return old;
+    }
+    // Rejects with a message and a failure type, not only an error name. The message must
+    // outlive the run, so it lives in `ctx.allocator()`.
+    fn checkLimit(l: *Limits, limit: i64) error{ ApplicationFailure, OutOfMemory }!void {
+        if (limit > 0) return;
+        return l.ctx.fail(.{
+            .message = try std.fmt.allocPrint(l.ctx.allocator(), "limit must be positive, got {d}", .{limit}),
+            .type = "InvalidLimit",
+        });
+    }
+    fn isSet(l: *Limits) bool {
+        return l.set;
+    }
+};
+fn limits(ctx: *workflow.Context) !i64 {
+    const l = try ctx.allocator().create(Limits); // outlives the workflow function
+    l.* = .{ .ctx = ctx };
+    try ctx.setUpdateHandlerWithValidator(SetLimit, l, Limits.setLimit, Limits.checkLimit);
+    try ctx.await(l, Limits.isSet);
+    try ctx.await(ctx, workflow.Context.allHandlersFinished);
+    return l.limit;
+}
+pub const LimitsWorkflow = workflow.Def("limits", limits);
+```
 
 `ctx.setDynamicUpdateHandler(context, handler)` takes every update that has no handler of its own, and `ctx.setDynamicUpdateHandlerWithValidator(context, handler, validator)` checks it first. Both get the update name and the arguments still encoded (`converter.EncodedValues`), and the handler returns the update's result:
 
@@ -1085,7 +1124,7 @@ pub const TallyWorkflow = workflow.Def("tally", tally);
 Notes:
 - The handler runs in a coroutine of its own, like a typed update handler: it may block, and `ctx.currentUpdate()` names the update there and in the validator. Its error rejects the update after acceptance, with the failure described as for a typed handler; the validator's error rejects it before acceptance, leaving no trace in history.
 - A handler registered for an update name with `setUpdateHandler` (or a struct workflow's `updates`) still takes that name. Updates delivered before the dynamic handler is registered, in the same workflow task, reach it in arrival order. Without one, an update of an unregistered name is rejected with `UpdateNotRegistered`.
-- An argument that doesn't decode is the handler's error (or the validator's) to return. Registering again replaces the dynamic handler; its context must outlive the run, and one on the calling coroutine's stack returns `error.UpdateContextOnStack`.
+- An argument that doesn't decode is the handler's error (or the validator's) to return. Registering again replaces the dynamic handler; its context must outlive the run, and one on a live workflow coroutine's stack returns `error.UpdateContextOnStack`.
 
 A workflow that completes, is canceled, or continues as new while signal or update handlers are still running cuts them short: their coroutines never resume, and an unfinished update gets no result. The SDK then logs one warning naming them, with the update names and IDs and the signal names. Wait for them with `try ctx.await(ctx, workflow.Context.allHandlersFinished)` before returning, or register a handler whose work may be cut short with `.unfinished_policy = .abandon` to leave it out of the warning:
 - `ctx.setSignalHandlerWithOptions`, `setSignalHandlerByNameWithOptions`, `setDynamicSignalHandlerWithOptions`, `setUpdateHandlerWithOptions`, and `setDynamicUpdateHandlerWithOptions` take a `workflow.HandlerOptions` last; the update ones take the validator, or `null`, before it.
@@ -1528,6 +1567,7 @@ Notes:
 - Answering is read-only: it emits no command and changes no workflow state, so it works at any point of a run, and a run restored from history (after eviction, or on another worker) answers as the run that first got there did.
 - Once the workflow has closed by returning (completed, failed, canceled, or continued as new), the answer is one line saying how: `workflow "order" has completed and closed: no coroutine is waiting`. A workflow closed from outside its code (terminated, or timed out) answers with the coroutines that were waiting when it closed.
 - An activity's type is named when the wait began in the workflow task that scheduled it, and cut to 64 bytes; a future awaited in a later task names the activity by its sequence number instead (`waits on activity (seq 2)`), since the type name the workflow passed is only borrowed for the task that scheduled it. An entry lists at most 16 call sites, innermost first, and says so when it leaves deeper ones out.
+- The answer's text is limited to 256 KiB, so a run with thousands of coroutines still gets an answer under the server's message size limit. The first line still counts every coroutine; entries that don't fit are left out, from the last started, and the answer's last line says how many: `1200 more coroutines not shown: the answer is limited to 262144 bytes`.
 - A handler the workflow registers for `__stack_trace` with `ctx.setQueryHandler` (or in a struct workflow's `queries`) answers instead of the worker. A dynamic query handler never gets `__stack_trace`.
 - When no query comes, the cost is a few stores at each wait, recording what it waits on, plus copying up to 64 bytes of an activity's type name to the waiting coroutine's stack; nothing is allocated, so a long run grows no more than it would without the query. Stacks are unwound and debug info is read only to answer, on the worker's thread; the first answer in a process reads the executable's debug info from disk.
 - Paths are those of the build machine, as in failure stack traces.
