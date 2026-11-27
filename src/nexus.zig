@@ -151,9 +151,12 @@ fn isServiceDef(comptime T: type) bool {
 /// The workflow is started through the worker's client with `options` and `args`, carrying
 /// the Nexus request ID as the start's request ID, the caller's completion callback, and the
 /// caller's links; a retried start with the same request ID finds the workflow the first one
-/// started. An empty `options.id` uses the request ID, and an empty `options.task_queue` the
-/// worker's task queue. With `options.id_conflict_policy = .use_existing`, a start that finds
-/// the workflow running attaches the operation to it instead of failing.
+/// started. The callback carries the operation token in two headers, `nexus-operation-token`
+/// and `nexus-operation-id`, the second for servers older than 1.27, in place of any the
+/// caller's callback headers held. An empty `options.id` uses the request ID, and an empty
+/// `options.task_queue` the worker's task queue. With `options.id_conflict_policy =
+/// .use_existing`, a start that finds the workflow running attaches the operation to it
+/// instead of failing.
 /// `options.enable_eager_start` and `options.error_when_already_started` are ignored.
 /// A null `options.context` starts the workflow with the request's propagated values
 /// (`Context.propagated`), so it carries them on; a handler that sets `options.context` keeps
@@ -214,6 +217,64 @@ fn isWorkflowStart(comptime T: type) bool {
     return T == WorkflowStart(W);
 }
 
+/// Whether a synchronous handler's value of type `From` may stand for an output of type `To`.
+/// Zig has no comptime test of coercion, so this lists the coercions accepted: equal types,
+/// `From` coercing to `C` for `To` of `?C`, integers and floats that widen without losing
+/// values, pointers that only add `const`, drop a sentinel or lower the alignment, and a
+/// pointer to an array as a slice of its elements. Of the optionals, `?F` coerces to `?C`
+/// only when `F` and `C` are such pointers of the same size class, as Zig allows. Nothing
+/// else.
+fn coercesTo(comptime From: type, comptime To: type) bool {
+    if (From == To) return true;
+    const to = @typeInfo(To);
+    const from = @typeInfo(From);
+    if (to == .optional) {
+        if (from == .optional) {
+            const f = @typeInfo(from.optional.child);
+            const t = @typeInfo(to.optional.child);
+            return f == .pointer and t == .pointer and samePointerCoerces(f.pointer, t.pointer);
+        }
+        return coercesTo(From, to.optional.child);
+    }
+    switch (to) {
+        .int => |t| if (from == .int) {
+            const f = from.int;
+            if (f.signedness == t.signedness) return t.bits >= f.bits;
+            return f.signedness == .unsigned and t.bits > f.bits;
+        },
+        .float => |t| if (from == .float) return t.bits >= from.float.bits,
+        .pointer => |t| if (from == .pointer) {
+            const f = from.pointer;
+            if (f.size == t.size and f.child == t.child) return samePointerCoerces(f, t);
+            if (f.size == .one and t.size == .slice and @typeInfo(f.child) == .array) {
+                const arr = @typeInfo(f.child).array;
+                if (arr.child != t.child or !pointerAttrsCoerce(f, t)) return false;
+                return t.sentinel_ptr == null or (arr.sentinel_ptr != null and std.meta.eql(arr.sentinel().?, t.sentinel().?));
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Whether a pointer `from` coerces to `to` of the same size class: the same child, and only
+/// `const` added, a sentinel dropped or the alignment lowered.
+fn samePointerCoerces(comptime from: std.builtin.Type.Pointer, comptime to: std.builtin.Type.Pointer) bool {
+    if (from.size != to.size or from.child != to.child or !pointerAttrsCoerce(from, to)) return false;
+    return to.sentinel_ptr == null or (from.sentinel_ptr != null and std.meta.eql(from.sentinel().?, to.sentinel().?));
+}
+
+/// Whether a pointer with `from`'s attributes coerces to one with `to`'s: it may only gain
+/// `const` or lose alignment.
+fn pointerAttrsCoerce(comptime from: std.builtin.Type.Pointer, comptime to: std.builtin.Type.Pointer) bool {
+    const f = from.attrs;
+    const t = to.attrs;
+    if (f.@"const" and !t.@"const") return false;
+    if (f.@"volatile" != t.@"volatile" or f.@"allowzero" != t.@"allowzero" or f.@"addrspace" != t.@"addrspace") return false;
+    if (f.@"align" == null and t.@"align" == null) return true;
+    return (f.@"align" orelse @alignOf(from.child)) >= (t.@"align" orelse @alignOf(to.child));
+}
+
 /// Binds operation `Op` (an `OperationDef`) to `func`, for `ServiceHandler`. `func` is one of
 ///
 ///     fn (ctx: *nexus.Context, input: Op.Input) !Op.Output             // synchronous
@@ -223,7 +284,14 @@ fn isWorkflowStart(comptime T: type) bool {
 /// or the same with a receiver first, `fn (self: *T, ctx: *nexus.Context, input: Op.Input)`,
 /// for handlers that share state; `ServiceHandler` binds them to one instance. For an
 /// operation whose input is `void`, the input parameter may be left out. The return type may
-/// be an error union or not. `ServiceHandler` checks the shape and reports a mismatch as a
+/// be an error union or not. A synchronous handler may return any type that coerces to
+/// `Op.Output` (equal types; `T` for `?T`, and `?P` for `?Q` when pointer `P` coerces to a
+/// pointer `Q` of the same size class, such as `?[]u8` for `?[]const u8`; an
+/// integer or float for a wider one that holds all its values; a pointer that only adds
+/// `const`, drops a sentinel or lowers the alignment, such as `[]u8` for `[]const u8`; a
+/// pointer to an array for a slice of its elements); the value is coerced to `Op.Output` and
+/// encoded as that type. A workflow-run or activity-run handler's workflow or activity result
+/// type must equal `Op.Output`. `ServiceHandler` checks the shape and reports a mismatch as a
 /// compile error naming the service and the operation.
 pub fn OperationHandler(comptime Op: type, comptime func: anytype) type {
     return struct {
@@ -253,7 +321,7 @@ const Shape = struct {
 fn handlerShape(comptime service: []const u8, comptime Op: type, comptime func: anytype) union(enum) { ok: Shape, bad: []const u8 } {
     const what = "nexus service \"" ++ service ++ "\" operation \"" ++ Op.operation_name ++ "\"";
     const expected = "fn (ctx: *nexus.Context, input: " ++ @typeName(Op.Input) ++ ") !" ++ @typeName(Op.Output) ++
-        ", !nexus.WorkflowStart(W) or !nexus.ActivityStart(A), optionally with a receiver pointer first";
+        " (or a type that coerces to it), !nexus.WorkflowStart(W) or !nexus.ActivityStart(A), optionally with a receiver pointer first";
     const F = @TypeOf(func);
     const f = switch (@typeInfo(F)) {
         .@"fn" => |f| f,
@@ -294,8 +362,8 @@ fn handlerShape(comptime service: []const u8, comptime Op: type, comptime func: 
             if (A.Result != Op.Output)
                 return .{ .bad = what ++ ": the handler starts activity \"" ++ A.activity_name ++ "\", whose result type " ++ @typeName(A.Result) ++ " is not the operation's output type " ++ @typeName(Op.Output) };
         },
-        .sync => if (Value != Op.Output) {
-            return .{ .bad = what ++ ": the handler returns " ++ @typeName(Value) ++ ", not the operation's output type " ++ @typeName(Op.Output) ++ ", a nexus.WorkflowStart of a workflow with that result, or a nexus.ActivityStart of an activity with that result" };
+        .sync => if (!coercesTo(Value, Op.Output)) {
+            return .{ .bad = what ++ ": the handler returns " ++ @typeName(Value) ++ ", which does not coerce to the operation's output type " ++ @typeName(Op.Output) ++ "; return that type or one that coerces to it, a nexus.WorkflowStart of a workflow with that result, or a nexus.ActivityStart of an activity with that result" };
         },
     }
     return .{ .ok = .{ .bound = bound, .takes_input = rest.len == 1, .Receiver = Receiver, .Return = Return, .Value = Value, .kind = kind } };
@@ -309,8 +377,9 @@ fn handlerShape(comptime service: []const u8, comptime Op: type, comptime func: 
 /// Compile errors, each naming the service and the operation: an operation with no handler,
 /// two handlers for one operation, a handler for an operation the service doesn't have (or
 /// with other input or output types than the service's operation of that name), a handler
-/// whose function doesn't fit its operation (see `OperationHandler`), and handlers taking
-/// receivers of different types.
+/// whose function doesn't fit its operation (see `OperationHandler`; a synchronous handler's
+/// return type must coerce to the operation's output type), and handlers taking receivers of
+/// different types.
 pub fn ServiceHandler(comptime Service: type, comptime handlers: anytype) type {
     if (comptime serviceHandlerError(Service, handlers)) |message| @compileError(message);
     const service = Service.service_name;
@@ -1016,7 +1085,7 @@ fn Implementation(comptime service: []const u8, comptime Op: type, comptime func
             return .{ .handler_error = .{ .type = .not_implemented, .message = what ++ " is synchronous: it finishes in its start, so there is nothing to cancel" } };
         }
 
-        fn encodeOutput(ctx: *Context, value: shape.Value) StartResult {
+        fn encodeOutput(ctx: *Context, value: Op.Output) StartResult {
             const a = ctx.arena;
             const payload = converter.toPayloadWithContext(a, &ctx.converterContext(), value) catch return outOfMemory(what);
             if (ctx.codecs.len == 0) return .{ .succeeded = .{ .result = payload, .links = ctx.response_links_.items } };
@@ -1063,6 +1132,8 @@ fn decodeInput(comptime T: type, comptime what: []const u8, ctx: *Context, input
 // ---------------------------------------------------------------- workflow-run operations
 
 const token_header = "nexus-operation-token";
+/// The operation token's header name before server 1.27, which workflow-run callbacks carry too.
+const legacy_operation_id_header = "nexus-operation-id";
 
 /// Starts the workflow `start` describes for a workflow-run operation, and returns its
 /// operation token and a link to its start event.
@@ -1080,7 +1151,7 @@ fn startWorkflow(comptime W: type, comptime what: []const u8, ctx: *Context, sta
     if (options.id.len == 0) options.id = request_id;
     if (options.task_queue.len == 0) options.task_queue = i.task_queue;
     const token = encodeWorkflowToken(a, c.namespace, options.id) catch return outOfMemory(what);
-    const headers = callbackHeaders(ctx, token) catch return outOfMemory(what);
+    const headers = callbackHeaders(ctx, token, true) catch return outOfMemory(what);
 
     var rejected: ?client_mod.RpcRejection = null;
     const started = c.startNexusWorkflow(a, W.workflow_name, options, start.args, .{
@@ -1101,13 +1172,19 @@ fn startedLinks(ctx: *Context, own: Link) error{OutOfMemory}![]const Link {
 }
 
 /// The callback headers of an asynchronous start: the caller's, with `token` in place of
-/// any operation token they carry.
-fn callbackHeaders(ctx: *Context, token: []const u8) error{OutOfMemory}![]const Header {
+/// any operation token they carry. With `legacy_operation_id`, `token` also replaces any
+/// `nexus-operation-id` header, which servers older than 1.27 read instead.
+fn callbackHeaders(ctx: *Context, token: []const u8, legacy_operation_id: bool) error{OutOfMemory}![]const Header {
     const i = &ctx.info_;
     if (i.callback_url.len == 0) return &.{};
     var headers: std.ArrayList(Header) = .empty;
-    try headers.ensureTotalCapacity(ctx.arena, i.callback_headers.len + 1);
-    for (i.callback_headers) |h| if (!std.ascii.eqlIgnoreCase(h.name, token_header)) headers.appendAssumeCapacity(h);
+    try headers.ensureTotalCapacity(ctx.arena, i.callback_headers.len + 2);
+    for (i.callback_headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, token_header)) continue;
+        if (legacy_operation_id and std.ascii.eqlIgnoreCase(h.name, legacy_operation_id_header)) continue;
+        headers.appendAssumeCapacity(h);
+    }
+    if (legacy_operation_id) headers.appendAssumeCapacity(.{ .name = legacy_operation_id_header, .value = token });
     headers.appendAssumeCapacity(.{ .name = token_header, .value = token });
     return headers.items;
 }
@@ -1240,7 +1317,7 @@ fn startActivity(comptime A: type, comptime what: []const u8, ctx: *Context, sta
     if (options.task_queue.len == 0) options.task_queue = i.task_queue;
     // The run ID is not known before the start, so the callback's token names none.
     const callback_token = encodeActivityToken(a, c.namespace, options.id, "") catch return outOfMemory(what);
-    const headers = callbackHeaders(ctx, callback_token) catch return outOfMemory(what);
+    const headers = callbackHeaders(ctx, callback_token, false) catch return outOfMemory(what);
 
     var rejected: ?client_mod.RpcRejection = null;
     const started = c.startNexusActivity(a, A.activity_name, options, start.args, .{
@@ -1405,6 +1482,154 @@ test "a synchronous operation decodes its input, runs, and encodes its output, a
     try testing.expectEqualStrings("\"Hello Temporal\"", greeted.succeeded.result.data);
     try testing.expectEqual(1, greeter.calls);
     try testing.expect(reg.find("nope") == null);
+}
+
+test "a synchronous handler may return a type that coerces to its operation's output type" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Upper = OperationDef("upper", []const u8, []const u8);
+    const Fixed = OperationDef("fixed", void, []const u8);
+    const Wide = OperationDef("wide", void, ?i64);
+    const Maybe = OperationDef("maybe", []const u8, ?[]const u8);
+    const H = struct {
+        fn upper(ctx: *Context, input: []const u8) ![]u8 {
+            return std.ascii.allocUpperString(ctx.allocator(), input);
+        }
+        fn fixed(_: *Context) *const [5:0]u8 {
+            return "fixed";
+        }
+        fn wide(_: *Context) !u32 {
+            return 4_000_000_000;
+        }
+        fn maybe(ctx: *Context, input: []const u8) !?[]u8 {
+            if (input.len == 0) return null;
+            return try ctx.allocator().dupe(u8, input);
+        }
+    };
+    const Svc = ServiceDef("coercing", .{ Upper, Fixed, Wide, Maybe });
+    const Handler = ServiceHandler(Svc, .{
+        OperationHandler(Upper, H.upper),
+        OperationHandler(Fixed, H.fixed),
+        OperationHandler(Wide, H.wide),
+        OperationHandler(Maybe, H.maybe),
+    });
+    const reg = Handler.registered;
+
+    // The result encodes as the output type: a JSON string, not an array of bytes.
+    const upper = try startOp(a, &reg, "upper", @as([]const u8, "quiet"));
+    try testing.expectEqualStrings("\"QUIET\"", upper.succeeded.result.data);
+    try testing.expectEqualStrings("QUIET", try converter.fromPayload([]const u8, a, upper.succeeded.result));
+    const fixed = try startOp(a, &reg, "fixed", null);
+    try testing.expectEqualStrings("\"fixed\"", fixed.succeeded.result.data);
+    const wide = try startOp(a, &reg, "wide", null);
+    try testing.expectEqual(@as(?i64, 4_000_000_000), try converter.fromPayload(?i64, a, wide.succeeded.result));
+    const some = try startOp(a, &reg, "maybe", @as([]const u8, "x"));
+    try testing.expectEqualStrings("\"x\"", some.succeeded.result.data);
+    const none = try startOp(a, &reg, "maybe", @as([]const u8, ""));
+    try testing.expect((try converter.fromPayload(?[]const u8, a, none.succeeded.result)) == null);
+}
+
+test "coercesTo accepts the coercions it lists and nothing else" {
+    const yes = .{
+        .{ []u8, []const u8 },   .{ [:0]u8, []const u8 },         .{ [:0]u8, [:0]const u8 },
+        .{ *u32, *const u32 },   .{ *align(8) u32, *const u32 },  .{ [*]u8, [*]const u8 },
+        .{ *[3]u8, []const u8 }, .{ *const [3:0]u8, []const u8 }, .{ *const [3:0]u8, [:0]const u8 },
+        .{ *[3]u8, []u8 },       .{ u8, u16 },                    .{ u8, i9 },
+        .{ i8, i64 },            .{ u32, u32 },                   .{ f32, f64 },
+        .{ []u8, ?[]const u8 },  .{ ?[]u8, ?[]const u8 },         .{ u8, ?u64 },
+        .{ ?*u32, ?*const u32 }, .{ ?[:0]u8, ?[]const u8 },       .{ EchoOutput, ?EchoOutput },
+    };
+    inline for (yes) |pair| {
+        // Each listed pair really coerces: this line fails to compile otherwise.
+        const coerced: pair[1] = @as(pair[0], undefined);
+        _ = coerced;
+    }
+    inline for (yes) |pair| if (!comptime coercesTo(pair[0], pair[1])) {
+        std.debug.print("{s} should coerce to {s}\n", .{ @typeName(pair[0]), @typeName(pair[1]) });
+        return error.TestUnexpectedResult;
+    };
+    const no = .{
+        .{ []const u8, []u8 },     .{ []const u8, [:0]const u8 },     .{ [:1]u8, [:0]const u8 },
+        .{ *const u32, *u32 },     .{ *u32, *align(8) const u32 },    .{ []u8, [*]const u8 },
+        .{ *u8, []const u8 },      .{ *[3]u8, []const u16 },          .{ *const [3]u8, []u8 },
+        .{ *[3]u8, [:0]const u8 }, .{ *const [3:1]u8, [:0]const u8 }, .{ u16, u8 },
+        .{ i8, u64 },              .{ u8, i8 },                       .{ f64, f32 },
+        .{ u8, f32 },              .{ ?u8, u8 },                      .{ ?[]const u8, ?[]u8 },
+        .{ ?u32, ?u64 },           .{ ?f32, ?f64 },                   .{ ?*const [3]u8, ?[]const u8 },
+        .{ []u16, []const u8 },    .{ *volatile u8, *const u8 },      .{ EchoInput, EchoOutput },
+        .{ [3]u8, []const u8 },
+    };
+    inline for (no) |pair| if (comptime coercesTo(pair[0], pair[1])) {
+        std.debug.print("{s} should not coerce to {s}\n", .{ @typeName(pair[0]), @typeName(pair[1]) });
+        return error.TestUnexpectedResult;
+    };
+}
+
+test "a handler returning an optional that Zig won't coerce to the output's optional is a compile error naming the operation" {
+    // Zig coerces ?F to ?C only for pointers that differ in const, sentinel or alignment, so
+    // ?u32 for ?u64, ?f32 for ?f64 and ?*const [3]u8 for ?[]const u8 must be refused by
+    // handlerShape, not left to fail inside the SDK with no service or operation named.
+    const H = struct {
+        fn int(_: *Context) !?u32 {
+            return 3;
+        }
+        fn float(_: *Context) !?f32 {
+            return 1.5;
+        }
+        fn array(_: *Context) !?*const [3]u8 {
+            return "abc";
+        }
+    };
+    inline for (.{
+        .{ OperationDef("int", void, ?u64), H.int, "returns ?u32" },
+        .{ OperationDef("float", void, ?f64), H.float, "returns ?f32" },
+        .{ OperationDef("array", void, ?[]const u8), H.array, "returns ?*const [3]u8" },
+    }) |case| switch (comptime handlerShape("svc", case[0], case[1])) {
+        .ok => {
+            std.debug.print("handlerShape accepted {s} for {s}\n", .{ case[2], @typeName(case[0].Output) });
+            return error.TestExpectedCompileError;
+        },
+        .bad => |m| inline for (.{ "nexus service \"svc\" operation \"" ++ case[0].operation_name ++ "\"", case[2], "which does not coerce" }) |part| {
+            if (std.mem.indexOf(u8, m, part) == null) {
+                std.debug.print("message {s}\n  lacks {s}\n", .{ m, part });
+                return error.TestUnexpectedMessage;
+            }
+        },
+    };
+}
+
+test "a callback's operation token headers replace the caller's, with the legacy operation ID only when asked" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var ctx = testContext(arena.allocator(), "run");
+    ctx.info_.callback_url = "http://caller/callback";
+    ctx.info_.callback_headers = &.{
+        .{ .name = "Nexus-Operation-Id", .value = "stale-id" },
+        .{ .name = "caller-header", .value = "caller-value" },
+        .{ .name = "NEXUS-OPERATION-TOKEN", .value = "stale-token" },
+    };
+    const legacy = try callbackHeaders(&ctx, "the-token", true);
+    try testing.expectEqual(3, legacy.len);
+    try testing.expectEqualStrings("caller-header", legacy[0].name);
+    try testing.expectEqualStrings("caller-value", legacy[0].value);
+    try testing.expectEqualStrings(legacy_operation_id_header, legacy[1].name);
+    try testing.expectEqualStrings("the-token", legacy[1].value);
+    try testing.expectEqualStrings(token_header, legacy[2].name);
+    try testing.expectEqualStrings("the-token", legacy[2].value);
+
+    // Without it, a caller's own nexus-operation-id passes through untouched.
+    const plain = try callbackHeaders(&ctx, "the-token", false);
+    try testing.expectEqual(3, plain.len);
+    try testing.expectEqualStrings("Nexus-Operation-Id", plain[0].name);
+    try testing.expectEqualStrings("stale-id", plain[0].value);
+    try testing.expectEqualStrings("caller-header", plain[1].name);
+    try testing.expectEqualStrings(token_header, plain[2].name);
+    try testing.expectEqualStrings("the-token", plain[2].value);
+
+    // With no callback URL there is no callback, so no headers.
+    ctx.info_.callback_url = "";
+    try testing.expectEqual(0, (try callbackHeaders(&ctx, "the-token", true)).len);
 }
 
 test "an operation with void input and output takes no payload and returns a null payload" {
@@ -1688,7 +1913,11 @@ test "a workflow-run operation starts its workflow with the request ID, callback
         .operation = "run",
         .request_id = "nexus-request-1",
         .callback_url = "temporal://system",
-        .callback_headers = &.{.{ .name = "caller-header", .value = "caller-value" }},
+        .callback_headers = &.{
+            .{ .name = "caller-header", .value = "caller-value" },
+            .{ .name = "Nexus-Operation-Token", .value = "stale-token" },
+            .{ .name = "Nexus-Operation-Id", .value = "stale-id" },
+        },
         .links = &.{caller_link},
         .namespace = "default",
         .task_queue = env.task_queue,
@@ -1721,13 +1950,24 @@ test "a workflow-run operation starts its workflow with the request ID, callback
     try testing.expectEqual(1, callbacks.len);
     const nexus_callback = callbacks[0].callback.?.variant.?.nexus;
     try testing.expectEqualStrings("temporal://system", nexus_callback.url);
-    var saw_token = false;
+    // Exactly one of each token header, both the token, whatever the caller's headers held.
+    var tokens: u32 = 0;
+    var operation_ids: u32 = 0;
     var saw_caller_header = false;
     for (nexus_callback.header.items) |h| {
-        if (std.ascii.eqlIgnoreCase(h.key, token_header)) saw_token = std.mem.eql(u8, h.value, first.token);
+        if (std.ascii.eqlIgnoreCase(h.key, token_header)) {
+            tokens += 1;
+            try testing.expectEqualStrings(first.token, h.value);
+        }
+        if (std.ascii.eqlIgnoreCase(h.key, legacy_operation_id_header)) {
+            operation_ids += 1;
+            try testing.expectEqualStrings(first.token, h.value);
+        }
         if (std.ascii.eqlIgnoreCase(h.key, "caller-header")) saw_caller_header = std.mem.eql(u8, h.value, "caller-value");
     }
-    try testing.expect(saw_token and saw_caller_header);
+    try testing.expectEqual(1, tokens);
+    try testing.expectEqual(1, operation_ids);
+    try testing.expect(saw_caller_header);
     var saw_request_id = false;
     if (described.raw.workflow_extended_info) |ext| for (ext.request_id_infos.items) |entry| {
         if (std.mem.eql(u8, entry.key, "nexus-request-1")) saw_request_id = true;
@@ -2093,7 +2333,17 @@ test "compile errors name the operation, the service, and what to fix" {
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.echo), OperationHandler(Ping, H.ping), OperationHandler(Ping, H.ping) }), &.{"nexus service \"svc\" operation \"ping\" has two handlers"});
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(OperationDef("echo", []const u8, EchoOutput), H.wrongInput), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\" takes", "bound to an OperationDef of that name" });
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.wrongInput), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "input type []const u8 is not the operation's input type" });
-    try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.wrongOutput), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "returns []const u8, not the operation's output type" });
+    try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.wrongOutput), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "returns []const u8, which does not coerce to the operation's output type nexus.EchoOutput" });
+    const Narrow = OperationDef("narrow", void, []u8);
+    const narrowing = struct {
+        fn f(_: *Context) ![]const u8 {
+            return "";
+        }
+    }.f;
+    switch (comptime handlerShape("svc", Narrow, narrowing)) {
+        .ok => return error.TestExpectedCompileError,
+        .bad => |m| try expectMessage(m, &.{ "nexus service \"svc\" operation \"narrow\"", "returns []const u8, which does not coerce to the operation's output type []u8" }),
+    }
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.noInput), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "takes no input" });
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.noContext), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "*nexus.Context first" });
     try expectMessage(comptime serviceHandlerError(Svc, .{ OperationHandler(Echo, H.wrongWorkflow), OperationHandler(Ping, H.ping) }), &.{ "nexus service \"svc\" operation \"echo\"", "starts workflow \"NexusWaiting\"", "result type []const u8", "output type" });
