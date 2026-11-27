@@ -1,0 +1,1 @@
+**Experimental**: `workflow.ContinueAsNewOptions.initial_versioning_behavior` chooses how the server routes the first workflow task of the new run: `.auto_upgrade` moves a pinned run to the current deployment version at once, `.ramping_version` to the ramping version.

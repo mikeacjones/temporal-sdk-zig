@@ -206,21 +206,58 @@ pub const HeaderRefresher = struct {
         return list.items;
     }
 
-    /// Until canceled: sleeps `config.expiration - leeway`, then `c.updateHeaders(headers)`.
+    /// The clock a refresh is due by: the one `JwtConfig.mint` stamps `exp` with. It keeps
+    /// counting while the machine sleeps.
+    pub const clock: Io.Clock = .real;
+
+    /// The longest `run` sleeps before it reads `clock` again, so a machine that wakes past
+    /// the deadline refreshes within this long.
+    pub const check_interval: Io.Duration = .fromSeconds(1);
+
+    /// When the token minted at `minted_at` is due to be replaced: `minted_at + config.expiration - leeway`.
+    /// Asserts `minted_at.clock == clock`. The result is on `clock`.
+    pub fn refreshAt(r: *const HeaderRefresher, minted_at: Io.Clock.Timestamp) Io.Clock.Timestamp {
+        std.debug.assert(minted_at.clock == clock);
+        return minted_at
+            .addDuration(.{ .raw = r.config.expiration, .clock = clock })
+            .subDuration(.{ .raw = r.leeway, .clock = clock });
+    }
+
+    /// How long to sleep at `now` before checking again for a refresh due at `due`: zero when
+    /// `now` is at or past `due` (refresh now), else the time left, at most `check_interval`.
+    /// Asserts both timestamps are on `clock`.
+    pub fn sleepBefore(due: Io.Clock.Timestamp, now: Io.Clock.Timestamp) Io.Duration {
+        std.debug.assert(due.clock == clock and now.clock == clock);
+        const left = now.durationTo(due).raw.toNanoseconds();
+        if (left <= 0) return .zero;
+        return .fromNanoseconds(@min(left, check_interval.toNanoseconds()));
+    }
+
+    /// Until canceled: refreshes once when it starts (`c.updateHeaders(headers)`), and then
+    /// whenever the real-time clock (`clock`) reaches `refreshAt` of the last refresh.
+    ///
+    /// It reads that clock at least every `check_interval` instead of sleeping the whole
+    /// interval, because a sleep's timer may stop while the machine sleeps but the token's
+    /// `exp` does not; a worker that wakes past the deadline refreshes within `check_interval`.
+    ///
     /// A failed mint or update is logged as a warning and retried after 1 s; the client keeps
     /// sending the previous token meanwhile.
     pub fn run(r: *const HeaderRefresher, gpa: Allocator, io: Io, c: *temporal.client.Client) Io.Cancelable!void {
         std.debug.assert(r.leeway.toNanoseconds() < r.config.expiration.toNanoseconds());
-        const interval: Io.Duration = .fromNanoseconds(r.config.expiration.toNanoseconds() - r.leeway.toNanoseconds());
-        var delay = interval;
+        var due: Io.Clock.Timestamp = .now(io, clock);
         while (true) {
-            try io.sleep(delay, .awake);
+            while (true) {
+                const d = sleepBefore(due, .now(io, clock));
+                if (d.toNanoseconds() <= 0) break;
+                try io.sleep(d, .awake);
+            }
+            const started: Io.Clock.Timestamp = .now(io, clock);
             r.refresh(gpa, io, c) catch |err| {
                 std.log.warn("Unable to refresh the JWT, will retry in 1s: {t}", .{err});
-                delay = retry_delay;
+                due = started.addDuration(.{ .raw = retry_delay, .clock = clock });
                 continue;
             };
-            delay = interval;
+            due = r.refreshAt(started);
         }
     }
 

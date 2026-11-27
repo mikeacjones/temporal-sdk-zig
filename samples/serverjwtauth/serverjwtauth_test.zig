@@ -283,3 +283,50 @@ test "the refresher's headers keep the base headers and add one authorization he
     try testing.expectEqual(1, only.len);
     try testing.expectEqualStrings("authorization", only[0].key);
 }
+
+fn realAt(nanoseconds: i96) std.Io.Clock.Timestamp {
+    return .{ .raw = .{ .nanoseconds = nanoseconds }, .clock = serverjwtauth.HeaderRefresher.clock };
+}
+
+test "the refresher is due by the real-time clock, which counts system sleep" {
+    try testing.expectEqual(std.Io.Clock.real, serverjwtauth.HeaderRefresher.clock);
+}
+
+test "a refresh is due expiration minus leeway after the token was minted" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = try serverjwtauth.generateKey(a, testing.io);
+    const permissions = try serverjwtauth.namespacePermissions(a, "default");
+    const minted = realAt(1_700_000_000 * std.time.ns_per_s + 123);
+
+    const defaults: serverjwtauth.HeaderRefresher = .{ .config = .{ .key = key, .permissions = permissions } };
+    const due = defaults.refreshAt(minted);
+    try testing.expectEqual(std.Io.Clock.real, due.clock);
+    try testing.expectEqual(minted.raw.nanoseconds + 540 * std.time.ns_per_s, due.raw.nanoseconds);
+
+    const custom: serverjwtauth.HeaderRefresher = .{
+        .config = .{ .key = key, .permissions = permissions, .expiration = .fromSeconds(30) },
+        .leeway = .fromMilliseconds(2500),
+    };
+    const custom_due = custom.refreshAt(minted);
+    try testing.expectEqual(std.Io.Clock.real, custom_due.clock);
+    try testing.expectEqual(minted.raw.nanoseconds + 27_500 * std.time.ns_per_ms, custom_due.raw.nanoseconds);
+}
+
+test "the refresher sleeps at most check_interval, and only until the refresh is due" {
+    const R = serverjwtauth.HeaderRefresher;
+    const due = realAt(1_000 * std.time.ns_per_s);
+    try testing.expectEqual(R.check_interval, R.sleepBefore(due, realAt(due.raw.nanoseconds - 500 * std.time.ns_per_s)));
+    try testing.expectEqual(R.check_interval, R.sleepBefore(due, realAt(due.raw.nanoseconds - std.time.ns_per_s)));
+    try testing.expectEqual(std.Io.Duration.fromMilliseconds(250), R.sleepBefore(due, realAt(due.raw.nanoseconds - 250 * std.time.ns_per_ms)));
+    try testing.expectEqual(std.Io.Duration.fromNanoseconds(1), R.sleepBefore(due, realAt(due.raw.nanoseconds - 1)));
+    try testing.expectEqual(std.Io.Duration.zero, R.sleepBefore(due, due));
+}
+
+test "a refresh is due at once when the machine wakes hours past the deadline" {
+    const R = serverjwtauth.HeaderRefresher;
+    const due = realAt(1_000 * std.time.ns_per_s);
+    try testing.expectEqual(std.Io.Duration.zero, R.sleepBefore(due, realAt(due.raw.nanoseconds + 1)));
+    try testing.expectEqual(std.Io.Duration.zero, R.sleepBefore(due, realAt(due.raw.nanoseconds + 3 * std.time.ns_per_hour)));
+}
