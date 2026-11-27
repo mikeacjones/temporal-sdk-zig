@@ -793,11 +793,16 @@ pub fn destroy(inst: *Instance) void {
     gpa.destroy(inst);
 }
 
+/// The most rounds of cancel and run `teardown` does while coroutines keep exiting.
+const max_eviction_rounds = 16;
+
 /// The first half of `destroy`: marks the run evicting, so `emit` drops every command from
-/// here on, cancels the root and handler coroutines, wakes waits that ignore cancellation,
-/// and runs the scheduler so they exit and their defers run. Returns how many coroutines are
-/// still alive, which is always 0 for a run whose coroutine start failed (see the end). Calling
-/// it again returns that count without doing anything else.
+/// here on, cancels every live coroutine (the root, handlers, and futures, group members and
+/// Select cases nobody awaited), wakes waits that ignore cancellation, and runs the scheduler
+/// so they exit and their defers run, in rounds while a round lets one exit (at most
+/// `max_eviction_rounds`). Returns how many coroutines are still alive, which is always 0 for
+/// a run whose coroutine start failed (see the end). Calling it again returns that count
+/// without doing anything else.
 pub fn teardown(inst: *Instance) usize {
     if (inst.evicting) return inst.sched.live;
     inst.evicting = true;
@@ -805,25 +810,36 @@ pub fn teardown(inst: *Instance) usize {
     inst.commands.clearRetainingCapacity();
     inst.command_codec_fields.clearRetainingCapacity();
     inst.update_response_contexts.clearRetainingCapacity();
-    // The root and handler coroutines may still be blocked even after the workflow finished
-    // (a handler's error finishes it, and handlers outlive the root).
-    if (inst.root) |root| inst.wio.cancelTask(root);
-    for (inst.handlers.items) |run| inst.wio.cancelTask(run.task);
-    // Coroutines already waiting for an operation's cancellation to complete don't see the
-    // cancel above, and neither do coroutines it doesn't reach (one waiter of several on a
-    // shared future); wake every waiter. The order doesn't matter: nothing they do is sent to
-    // the core.
-    var pending = inst.activities.valueIterator();
-    while (pending.next()) |state| state.*.waiters.wakeAll(&inst.wio);
-    var backing_off = inst.backoffs.valueIterator();
-    while (backing_off.next()) |state| state.*.waiters.wakeAll(&inst.wio);
-    var children = inst.children.valueIterator();
-    while (children.next()) |state| state.*.wake(&inst.wio);
-    var operations = inst.nexus_operations.valueIterator();
-    while (operations.next()) |state| state.*.wake(&inst.wio);
-    var externals = inst.externals.valueIterator();
-    while (externals.next()) |state| state.*.waiters.wakeAll(&inst.wio);
-    inst.wio.run();
+    // Any coroutine may still be blocked, even after the workflow finished: the root and
+    // handlers (a handler's error finishes it, and handlers outlive the root), and futures,
+    // group members and Select cases that the coroutine starting them never awaited or
+    // canceled. A round cancels them all and lets them exit; another round reaches one that
+    // waits again, or is started, while another unwinds. Rounds stop when one lets nothing
+    // exit, or after `max_eviction_rounds`, since a coroutine may swallow the cancel and
+    // start its work again forever.
+    var rounds: usize = 0;
+    while (inst.sched.live > 0 and rounds < max_eviction_rounds) : (rounds += 1) {
+        const live_before = inst.sched.live;
+        const id_before = inst.sched.next_id;
+        inst.wio.cancelAll();
+        // Coroutines already waiting for an operation's cancellation to complete don't see
+        // the cancel, and neither do coroutines it doesn't reach (one waiter of several on a
+        // shared future); wake every waiter. The order doesn't matter: nothing they do is sent
+        // to the core.
+        var pending = inst.activities.valueIterator();
+        while (pending.next()) |state| state.*.waiters.wakeAll(&inst.wio);
+        var backing_off = inst.backoffs.valueIterator();
+        while (backing_off.next()) |state| state.*.waiters.wakeAll(&inst.wio);
+        var children = inst.children.valueIterator();
+        while (children.next()) |state| state.*.wake(&inst.wio);
+        var operations = inst.nexus_operations.valueIterator();
+        while (operations.next()) |state| state.*.wake(&inst.wio);
+        var externals = inst.externals.valueIterator();
+        while (externals.next()) |state| state.*.waiters.wakeAll(&inst.wio);
+        inst.wio.run();
+        const spawned: usize = inst.sched.next_id - id_before;
+        if (live_before + spawned == inst.sched.live) break;
+    }
     std.debug.assert(inst.commands.items.len == 0);
     if (inst.wio.start_failure != null and inst.sched.live > 0) {
         // A failed coroutine start ran its function inline in the coroutine that started it,
@@ -6258,6 +6274,94 @@ test "a timer that wins the race runs the fallback activity" {
     try testing.expectEqual(@as(usize, 2), done.len);
     try testing.expectEqual(@as(u32, 1), done[0].variant.?.request_cancel_activity.seq);
     try testing.expectEqualStrings("\"slow\"", done[1].variant.?.complete_workflow_execution.result.?.data);
+}
+
+// Coroutines the workflow starts and never awaits or cancels, left blocked at eviction.
+const Abandoned = struct {
+    /// Returns while an io.async sleeper and a Select case still sleep.
+    fn returns(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        _ = io.async(std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+        // The Select must outlive its case, which puts its result into it.
+        const select = try ctx.allocator().create(std.Io.Select(TimerRace.Done));
+        const buf = try ctx.allocator().alloc(TimerRace.Done, 1);
+        select.* = .init(io, buf);
+        select.async(.timer, std.Io.sleep, .{ io, .fromSeconds(90), .awake });
+        return "left";
+    }
+
+    /// Waits for an activity beside an io.concurrent sleeper it never awaits.
+    fn waits(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        _ = try io.concurrent(std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get();
+    }
+
+    /// Restarts its sleeping child whenever it ends, the cancel included, forever.
+    fn supervises(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        while (true) {
+            var child = io.async(std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+            child.await(io) catch {};
+        }
+    }
+};
+const AbandonedReturnsWf = workflow.Def("AbandonedReturns", Abandoned.returns);
+const AbandonedWaitsWf = workflow.Def("AbandonedWaits", Abandoned.waits);
+const AbandonedSupervisesWf = workflow.Def("AbandonedSupervises", Abandoned.supervises);
+
+test "eviction cancels the coroutines a finished workflow never awaited" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, AbandonedReturnsWf.registered, .{ .logger = recorder.sink() });
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "AbandonedReturns", .{}), a));
+    try testing.expectEqual(@as(usize, 3), cmds.len);
+    try testing.expect(cmds[2].variant.? == .complete_workflow_execution);
+    try testing.expectEqual(@as(usize, 2), inst.sched.live);
+    try testing.expectEqual(@as(usize, 0), inst.teardown());
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 0), recorder.count);
+}
+
+test "eviction mid-wait cancels the coroutines the workflow never awaited" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const cases = .{
+        // Blocked in select.await: the cancel returns from the root, leaving the timer case.
+        .{ TimerRaceWf.registered, "TimerRace", .{@as(i64, 3)}, 3 },
+        .{ AbandonedWaitsWf.registered, "AbandonedWaits", .{}, 2 },
+    };
+    inline for (cases) |case| {
+        var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+        defer recorder.arena.deinit();
+        const inst = try create(testing.allocator, case[0], .{ .logger = recorder.sink() });
+        _ = try inst.activate(&try initActivation(a, case[1], case[2]), a);
+        try testing.expectEqual(@as(usize, case[3]), inst.sched.live);
+        try testing.expectEqual(@as(usize, 0), inst.teardown());
+        inst.destroy();
+        try testing.expectEqual(@as(usize, 0), recorder.count);
+    }
+}
+
+test "eviction stops canceling a coroutine that restarts its work after max_eviction_rounds" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, AbandonedSupervisesWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
+    _ = try inst.activate(&try initActivation(a, "AbandonedSupervises", .{}), a);
+    const first_id = inst.sched.next_id;
+    // The supervisor and its newest child stay; each round let one child exit.
+    try testing.expectEqual(@as(usize, 2), inst.teardown());
+    try testing.expect(inst.sched.next_id - first_id >= max_eviction_rounds);
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+    try testing.expectEqualStrings("2", recorder.get("count").?);
 }
 
 // ctx.sleep with a summary: alone, as an io.async coroutine that is canceled, and racing an
