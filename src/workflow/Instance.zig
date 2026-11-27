@@ -800,12 +800,12 @@ const max_eviction_rounds = 16;
 /// The first half of `destroy`: marks the run evicting, so `emit` drops every command from
 /// here on, cancels every live coroutine (the root, handlers, and futures, group members and
 /// Select cases nobody awaited), wakes waits that ignore cancellation, and runs the scheduler
-/// so they exit and their defers run. A coroutine is canceled and woken only once the
-/// coroutines it started have exited, so it never returns from under them; this takes rounds,
-/// which go on while each changes something, until `max_eviction_rounds` in a row leave no
-/// fewer coroutines than before. Returns how many coroutines are still alive, which is always 0 for
-/// a run whose coroutine start failed (see the end). Calling it again returns that count
-/// without doing anything else.
+/// so they exit and their defers run. No coroutine goes on from a wait while coroutines it
+/// started still run (`WorkflowIo.hold_starters`), so none returns from under them. This
+/// takes rounds, which go on while each changes something, until `max_eviction_rounds` in a
+/// row leave no fewer coroutines than before. Returns how many coroutines are still alive,
+/// which is always 0 for a run whose coroutine start failed (see the end). Calling it again
+/// returns that count without doing anything else.
 pub fn teardown(inst: *Instance) usize {
     if (inst.evicting) return inst.sched.live;
     inst.evicting = true;
@@ -816,12 +816,15 @@ pub fn teardown(inst: *Instance) usize {
     // Any coroutine may still be blocked, even after the workflow finished: the root and
     // handlers (a handler's error finishes it, and handlers outlive the root), and futures,
     // group members and Select cases that the coroutine starting them never awaited or
-    // canceled. A round cancels the coroutines with no running children of their own and lets
-    // them exit (see `WorkflowIo.cancelAll`); the next round reaches their starters, and
-    // coroutines that took the cancel and wait again, or were started meanwhile. Rounds stop
+    // canceled. A round cancels them all and lets them exit; a coroutine whose children still
+    // run is held in its wait until they have exited, however it is woken (a cancel, a
+    // child's result, an operation's waiters below), since their pointers into its stack (a
+    // Select's cases into the Select) must stay valid. The next round reaches coroutines that
+    // took the cancel and wait again, or were started meanwhile. Rounds stop
     // when one changes nothing (no coroutine exits and no wait takes a cancel), or once
     // `max_eviction_rounds` in a row leave no fewer coroutines than the fewest so far: a
     // coroutine may swallow the cancel and start its work again forever.
+    inst.wio.hold_starters = true;
     var fewest = inst.sched.live;
     var stale_rounds: usize = 0;
     while (inst.sched.live > 0 and stale_rounds < max_eviction_rounds) {
@@ -831,9 +834,8 @@ pub fn teardown(inst: *Instance) usize {
         inst.wio.cancelAll();
         // Coroutines already waiting for an operation's cancellation to complete don't see
         // the cancel, and neither do coroutines it doesn't reach (one waiter of several on a
-        // shared future); wake every waiter, except those with running children, as for the
-        // cancel. The order doesn't matter: nothing they do is sent to the core.
-        inst.wio.wake_leaves_only = true;
+        // shared future); wake every waiter. The order doesn't matter: nothing they do is sent
+        // to the core.
         var pending = inst.activities.valueIterator();
         while (pending.next()) |state| state.*.waiters.wakeAll(&inst.wio);
         var backing_off = inst.backoffs.valueIterator();
@@ -844,7 +846,6 @@ pub fn teardown(inst: *Instance) usize {
         while (operations.next()) |state| state.*.wake(&inst.wio);
         var externals = inst.externals.valueIterator();
         while (externals.next()) |state| state.*.waiters.wakeAll(&inst.wio);
-        inst.wio.wake_leaves_only = false;
         inst.wio.run();
         const spawned: usize = inst.sched.next_id - id_before;
         const exited = live_before + spawned - inst.sched.live;
@@ -6506,6 +6507,45 @@ test "eviction does not let a Select case write into the stack of a starter its 
     const inst = try create(testing.allocator, SelectWokenByCaseWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
     _ = try inst.activate(&try initActivation(a, "SelectWokenByCase", .{}), a);
     try testing.expectEqual(@as(usize, 3), inst.sched.live);
+    try testing.expectEqual(@as(usize, 0), inst.teardown());
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 0), recorder.count);
+}
+
+// A coroutine that writes through a pointer into its starter's stack after taking the cancel
+// and waiting once more, started by a root that waits on an activity and returns without
+// awaiting it. Eviction's wake of the activity's waiters must not let the root go on, and
+// return, while the coroutine runs.
+const StackWriter = struct {
+    fn write(io: std.Io, slot: *u64) void {
+        io.sleep(.fromSeconds(60), .awake) catch {
+            io.sleep(.fromSeconds(1), .awake) catch {};
+        };
+        slot.* += 1;
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var slot: u64 = 0;
+        _ = io.async(write, .{ io, &slot });
+        // Fill the stack pool, so a stack released from here on is unmapped.
+        var fill: [16]std.Io.Future(void) = undefined;
+        for (&fill) |*f| f.* = io.async(SelectCleanup.noop, .{});
+        for (&fill) |*f| f.await(io);
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get();
+    }
+};
+const StackWriterWf = workflow.Def("StackWriter", StackWriter.run);
+
+test "eviction does not let a starter that an operation's waiters wake return while its child still uses its stack" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, StackWriterWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
+    _ = try inst.activate(&try initActivation(a, "StackWriter", .{}), a);
+    try testing.expectEqual(@as(usize, 2), inst.sched.live);
     try testing.expectEqual(@as(usize, 0), inst.teardown());
     inst.destroy();
     try testing.expectEqual(@as(usize, 0), recorder.count);
