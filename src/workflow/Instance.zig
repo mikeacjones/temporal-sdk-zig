@@ -196,6 +196,8 @@ failed_handler: ?*HandlerRun = null,
 root_trace: []const usize = &.{},
 /// See `Options.failure_stack_traces`.
 failure_stack_traces: bool = true,
+/// The most bytes of text the `__stack_trace` answer holds. Tests lower it.
+stack_trace_limit: usize = max_stack_trace_bytes,
 /// See `Options.task_failure_errors`. Borrowed.
 task_failure_errors: []const anyerror = &.{},
 /// See `Options.failure_converter`. Borrowed.
@@ -1312,6 +1314,13 @@ pub const workflow_metadata_query = "__temporal_workflow_metadata";
 /// workflow code (see `call_sites`). Once the workflow has closed, the answer says so in one
 /// line instead. Memory comes from `out`.
 ///
+/// The text is at most `max_stack_trace_bytes` long (`stack_trace_limit`), so that a run
+/// with thousands of coroutines still gets an answer under the server's gRPC message limit
+/// (the JSON payload is at most about twice the text). The header still counts every
+/// coroutine; entries are written in start order until the next one would pass the limit,
+/// and the coroutines after it aren't unwound. The answer's last line then says how many
+/// were left out: "N more coroutines not shown: the answer is limited to L bytes".
+///
 /// Read-only: it reads the coroutines' recorded waits and unwinds their stacks, and changes
 /// nothing, so a replayed run answers as the run that first got there did. Recording costs
 /// each wait a few stores (`WorkflowIo.Wait.Reason` and `Task.waiting_on`), and an activity's
@@ -1328,13 +1337,20 @@ pub const workflow_metadata_query = "__temporal_workflow_metadata";
 fn stackTrace(inst: *Instance, out: Allocator) error{OutOfMemory}![]const u8 {
     var text: std.Io.Writer.Allocating = .init(out);
     errdefer text.deinit();
-    inst.writeStackTrace(out, &text.writer) catch |err| switch (err) {
+    inst.writeStackTrace(out, &text) catch |err| switch (err) {
         error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
     };
     return text.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{OutOfMemory} || std.Io.Writer.Error)!void {
+/// The text of the `__stack_trace` answer holds at most this many bytes (see `stackTrace`).
+pub const max_stack_trace_bytes: usize = 256 * 1024;
+
+/// Bytes of `stack_trace_limit` kept for the line saying how many coroutines were left out.
+const stack_trace_closing_reserve = 128;
+
+fn writeStackTrace(inst: *Instance, out: Allocator, text: *std.Io.Writer.Allocating) (error{OutOfMemory} || std.Io.Writer.Error)!void {
+    const w = &text.writer;
     if (inst.finished) {
         const how = switch (inst.root_outcome orelse return w.print("workflow \"{f}\" has closed: no coroutine is waiting\n", .{call_sites.text(inst.info.workflow_type)})) {
             .completed => "completed",
@@ -1357,8 +1373,11 @@ fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{Ou
     defer if (sdk_work) inst.sched.sdk_work.store(false, .release);
     var reader = try call_sites.Reader.init(out);
     defer if (reader) |*r| r.deinit();
+    const entries_end = inst.stack_trace_limit -| stack_trace_closing_reserve;
+    var shown: usize = 0;
     it = inst.sched.firstLive();
     while (it) |f| : (it = f.live_next) {
+        const start = text.written().len;
         try w.print("\ncoroutine {d} \"{f}\", ", .{ f.id, call_sites.text(f.name) });
         try inst.writeCoroutineRole(w, f);
         const task: ?*const WorkflowIo.Task = @ptrCast(@alignCast(f.user));
@@ -1371,6 +1390,15 @@ fn writeStackTrace(inst: *Instance, out: Allocator, w: *std.Io.Writer) (error{Ou
             try w.writeAll(", waits\n");
         }
         try call_sites.write(if (reader) |*r| r else null, w, f, "  ");
+        if (text.written().len > entries_end) {
+            text.shrinkRetainingCapacity(start);
+            break;
+        }
+        shown += 1;
+    }
+    if (shown < count) {
+        const left = count - shown;
+        try w.print("\n{d} more coroutine{s} not shown: the answer is limited to {d} bytes\n", .{ left, if (left == 1) "" else "s", inst.stack_trace_limit });
     }
 }
 

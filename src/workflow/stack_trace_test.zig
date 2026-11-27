@@ -316,6 +316,62 @@ test "__stack_trace names signal channels, std.Io primitives and child workflows
     _ = try entry(text, "coroutine 3 \"group\", started in a std.Io.Group, waits on a std.Io Mutex, Condition, Event, Semaphore or Queue");
 }
 
+const fan_out = 40;
+
+const FanOut = workflow.Def("FanOut", struct {
+    fn nap(ctx: *workflow.Context) void {
+        ctx.sleep(.fromSeconds(60), .{}) catch {};
+    }
+    /// Starts `fan_out` coroutines that each wait on a timer, and waits on one itself.
+    fn run(ctx: *workflow.Context) !void {
+        const io = ctx.io();
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (0..fan_out) |_| group.async(io, nap, .{ctx});
+        try ctx.sleep(.fromSeconds(60), .{});
+    }
+}.run);
+
+test "__stack_trace: the answer is cut at stack_trace_limit, and its last line says how many coroutines were left out" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try Instance.create(testing.allocator, FanOut.registered, .{});
+    defer inst.destroy();
+    try testing.expectEqual(@as(usize, fan_out + 1), commandsOf(try inst.activate(&try initActivation(a, "FanOut"), a)).len);
+
+    // With the default limit every coroutine is shown and there is no closing line.
+    const full = try stackTrace(inst, a);
+    try testing.expectEqual(Instance.max_stack_trace_bytes, inst.stack_trace_limit);
+    try testing.expect(std.mem.startsWith(u8, full, "workflow \"FanOut\": 41 coroutines\n"));
+    try testing.expect(std.mem.find(u8, full, "not shown") == null);
+    try testing.expectEqual(@as(usize, fan_out + 1), std.mem.count(u8, full, "\ncoroutine "));
+    try testing.expect(full.len > 2048);
+
+    inst.stack_trace_limit = 2048;
+    const cut = try stackTrace(inst, a);
+    try testing.expect(cut.len <= inst.stack_trace_limit);
+    // The header still counts every coroutine.
+    try testing.expect(std.mem.startsWith(u8, cut, "workflow \"FanOut\": 41 coroutines\n"));
+    // The entries shown are the first ones of the full answer, whole and in order.
+    const shown = std.mem.count(u8, cut, "\ncoroutine ");
+    try testing.expect(shown > 0 and shown < fan_out + 1);
+    const closing = try std.fmt.allocPrint(a, "\n{d} more coroutines not shown: the answer is limited to 2048 bytes\n", .{fan_out + 1 - shown});
+    try testing.expect(std.mem.endsWith(u8, cut, closing));
+    try testing.expect(std.mem.startsWith(u8, full, cut[0 .. cut.len - closing.len]));
+    try testing.expectEqual(@as(u8, '\n'), full[cut.len - closing.len]);
+
+    // A limit that leaves room for no entry still answers with the header and the count.
+    inst.stack_trace_limit = 160;
+    const none = try stackTrace(inst, a);
+    try testing.expect(none.len <= inst.stack_trace_limit);
+    try testing.expectEqualStrings("workflow \"FanOut\": 41 coroutines\n\n41 more coroutines not shown: the answer is limited to 160 bytes\n", none);
+
+    // Asking changed nothing: with the default limit back, the answer is the full one again.
+    inst.stack_trace_limit = Instance.max_stack_trace_bytes;
+    try testing.expectEqualStrings(full, try stackTrace(inst, a));
+}
+
 /// Runs `activity_type` activities one after another for as long as the run lasts.
 fn ActivityLoop(comptime activity_type: []const u8) type {
     return workflow.Def("ActivityLoop", struct {
