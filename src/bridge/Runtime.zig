@@ -31,9 +31,18 @@ pub const Logging = struct {
     forward: ?Forward = null,
 };
 
-/// A core log callback with its context. `func` runs on the core's threads, possibly several
-/// at once; `ctx` must stay valid until `Runtime.deinit` returns, which waits for calls in
-/// progress to finish. On the core's threads, `func` runs with SIGPIPE blocked (see `init`).
+/// A core log callback with its context. The core calls `func` on whichever thread emits the
+/// record: one of the core's own threads, or the thread that is inside a call into the bridge
+/// (creating or shutting down a worker, for example), which may be the caller's own. `func`
+/// may run on several threads at once, so it must be thread-safe and must not assume it runs
+/// off the caller's thread. `ctx` must stay valid until `Runtime.deinit` returns, which waits
+/// for calls in progress to finish.
+///
+/// Outside Windows, `func` runs with SIGPIPE blocked only when it runs on one of the core's
+/// threads (see `init`). On a thread that called into the bridge it runs with that thread's
+/// own signal mask, which the SDK does not change. A `func` that writes to a pipe or socket
+/// therefore cannot rely on a closed peer giving EPIPE: unless the process ignores or handles
+/// SIGPIPE, or the caller blocks it on its own threads, such a write can raise SIGPIPE.
 pub const Forward = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, record: *const LogRecord) void,
@@ -192,9 +201,10 @@ pub const InitError = error{
 /// Outside Windows, the core's threads run with SIGPIPE blocked, so a write by sdk-core to a
 /// connection its peer has closed fails with EPIPE instead of raising SIGPIPE, whose default
 /// action ends the process. The process's SIGPIPE disposition is not changed, and the calling
-/// thread's signal mask is the same when `init` returns as before. Code the core runs on its
-/// threads, such as a `Forward.func` or a custom metric meter's callbacks, runs with SIGPIPE
-/// blocked.
+/// thread's signal mask is the same when `init` returns as before. Only code that runs on the
+/// core's threads gets that mask. The core also calls back, for example a `Forward.func` or a
+/// custom metric meter's callbacks, on a thread that is inside a call into the bridge; there the
+/// callback runs with that thread's own signal mask, so it must not rely on SIGPIPE being blocked.
 pub fn init(gpa: Allocator, options: Options, failure: ?*?[]u8) InitError!Runtime {
     var custom_meter: ?*const c.TemporalCoreCustomMetricMeter = if (options.metrics) |m| switch (m.exporter) {
         .custom => |meter| meter,
