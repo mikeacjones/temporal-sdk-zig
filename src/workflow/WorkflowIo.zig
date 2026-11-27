@@ -175,6 +175,30 @@ pub fn cancelTask(w: *WorkflowIo, task: *Task) void {
     w.requestCancel(task);
 }
 
+/// Requests cancellation of every coroutine started through this Io that hasn't finished:
+/// top-level tasks, futures (io.async, io.concurrent) and group members (std.Io.Group, a
+/// Select's cases). Call it outside any coroutine; `run` lets them exit.
+///
+/// The requests go newest first, so the coroutines they wake run newest first: a coroutine
+/// runs before the one that started it, while that one's stack is still in use. A Select
+/// case finishing puts its result into the Select, which usually lives on the stack of the
+/// coroutine that started it; woken oldest first, that coroutine could return (a canceled
+/// `select.await()` returns without canceling the cases) and its stack go back to the pool
+/// before the case writes into it.
+pub fn cancelAll(w: *WorkflowIo) void {
+    assert(w.scheduler.currentFiber() == null);
+    var last = w.scheduler.firstLive();
+    while (last) |f| {
+        if (f.live_next == null) break;
+        last = f.live_next;
+    }
+    var it = last;
+    while (it) |f| : (it = f.live_prev) {
+        const task: *Task = @ptrCast(@alignCast(f.user orelse continue));
+        w.requestCancel(task);
+    }
+}
+
 /// A blocking point for SDK code built on this Io (activity futures, signals): create it on
 /// the waiting coroutine with `newWait`, block with `waitFor`, and resume it with `wake`.
 /// `reason` says what it waits on, for `Task.waiting_on`.
@@ -1449,6 +1473,73 @@ test "cancelTask delivers cancellation to a top-level coroutine" {
     e.fake.runAll(&e.wio);
     try testing.expectEqual(@as(?anyerror, error.Canceled), result);
     try testing.expectEqual(@as(usize, 0), e.sched.live);
+}
+
+/// Starts an `io.async` sleeper and a group member that sleeps, then returns without
+/// awaiting or canceling either.
+fn abandonSleepers(i: Io, future_result: *?anyerror, member_result: *?anyerror) void {
+    _ = i.async(sleepForever, .{ i, future_result });
+    var g: Io.Group = .init;
+    g.async(i, sleepForever, .{ i, member_result });
+}
+
+test "cancelAll cancels futures and group members their starter left behind" {
+    var sched: Scheduler = .init(testing.allocator, .{ .stack_size = 256 * 1024 });
+    // The Task block of the future nobody awaits, and the group's state, are freed with the
+    // memory, as a run's arena frees them.
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    var wio: WorkflowIo = .init(memory.allocator(), &sched, fake.host(), 42);
+    var future_result: ?anyerror = error.Unset;
+    var member_result: ?anyerror = error.Unset;
+    _ = try wio.spawn("wf", abandonSleepers, .{ wio.io(), &future_result, &member_result });
+    wio.run();
+    try testing.expectEqual(@as(usize, 2), sched.live);
+    wio.cancelAll();
+    wio.run();
+    try testing.expectEqual(@as(usize, 0), sched.live);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), future_result);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), member_result);
+    try testing.expectEqual(@as(u32, 2), fake.canceled);
+    sched.deinit();
+}
+
+const SelectExits = struct {
+    const Case = union(enum) { slept: Io.Cancelable!void };
+
+    fn case(i: Io, order: *Trace) Io.Cancelable!void {
+        defer order.add(2);
+        try i.sleep(.fromSeconds(3600), .awake);
+    }
+
+    /// Returns on the cancel without canceling the case, which then puts its result into
+    /// `select` on this coroutine's stack.
+    fn starter(i: Io, order: *Trace) void {
+        defer order.add(1);
+        var buf: [1]Case = undefined;
+        var select: Io.Select(Case) = .init(i, &buf);
+        select.async(.slept, case, .{ i, order });
+        _ = select.await() catch return;
+    }
+};
+
+test "cancelAll runs a Select's case before the coroutine whose stack holds the Select" {
+    var sched: Scheduler = .init(testing.allocator, .{ .stack_size = 256 * 1024 });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    var fake: FakeHost = .{};
+    defer fake.deinit();
+    var wio: WorkflowIo = .init(memory.allocator(), &sched, fake.host(), 42);
+    var order: Trace = .{};
+    _ = try wio.spawn("wf", SelectExits.starter, .{ wio.io(), &order });
+    wio.run();
+    wio.cancelAll();
+    wio.run();
+    try testing.expectEqual(@as(usize, 0), sched.live);
+    try testing.expectEqualSlices(u32, &.{ 2, 1 }, order.items());
+    sched.deinit();
 }
 
 const SemaphoreState = struct {
