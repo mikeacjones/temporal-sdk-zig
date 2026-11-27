@@ -1,0 +1,1 @@
+The completion callback of a workflow-run Nexus operation (`nexus.WorkflowStart`) carries the operation token in a `nexus-operation-id` header beside `nexus-operation-token`, so servers older than 1.27 can complete the operation.

@@ -2374,3 +2374,221 @@ test "update and standalone activity handles decode with the workflow's or activ
     try testing.expectEqualStrings("wf=wf-u", f.failures.seen.items[0]);
     try testing.expectEqualStrings("act=act-1", f.failures.seen.items[1]);
 }
+
+/// A string the payload converter decodes with a context hook, recording the context's
+/// label (`contextLabel`) beside it.
+const LabeledText = struct {
+    text: []const u8,
+    label: []const u8,
+
+    pub fn toPayloadWithContext(v: LabeledText, arena: Allocator, _: *const converter.Context) error{OutOfMemory}!converter.Payload {
+        return converter.toPayload(arena, v.text);
+    }
+
+    pub fn fromPayloadWithContext(arena: Allocator, context: *const converter.Context, p: converter.Payload) converter.DecodeError!LabeledText {
+        return .{ .text = try converter.fromPayload([]const u8, arena, p), .label = try contextLabel(arena, context) };
+    }
+};
+
+fn describeActivityAnswer(arena: Allocator, propagated: bool) !Answer {
+    var details: common.Payloads = .{};
+    try details.payloads.append(arena, try stringPayload(arena, "halfway", propagated));
+    // The summary is the starter's, encoded with the activity's context either way.
+    const info: proto.temporal.api.activity.v1.ActivityExecutionInfo = .{
+        .activity_id = "act-1",
+        .run_id = "act-run",
+        .activity_type = .{ .name = "Act" },
+        .heartbeat_details = details,
+        .last_failure = try encodedFailure(arena, "attempt failed", propagated),
+        .user_metadata = .{ .summary = try stringPayload(arena, "the summary", false) },
+        .propagated_nexus_serialization_context = if (propagated) caller_context else null,
+    };
+    return .{ .rpc = "DescribeActivityExecution", .proto = try encodeMessage(arena, wfs.DescribeActivityExecutionResponse{ .info = info }) };
+}
+
+test "ActivityHandle.describe decodes the heartbeat details and last failure of a Nexus-started activity with the propagated Nexus context" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{try describeActivityAnswer(a, true)};
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+
+    var h = try f.client.getActivityHandle([]const u8, "act-1", "");
+    defer h.deinit();
+    const d = try h.describe(a);
+    const n = d.heartbeat_details.context.nexus.?;
+    try testing.expectEqualStrings(caller_context.endpoint, n.endpoint);
+    try testing.expectEqualStrings(caller_context.service, n.service);
+    try testing.expectEqualStrings(caller_context.operation, n.operation);
+    try testing.expectEqualStrings("", d.heartbeat_details.context.activity_id);
+    const progress = try d.heartbeat_details.get(LabeledText, a, 0);
+    try testing.expectEqualStrings("halfway", progress.text);
+    try testing.expectEqualStrings("nexus=caller-ep", progress.label);
+    try testing.expectEqualStrings("attempt failed", d.raw.last_failure.?.message);
+    try testing.expectEqualStrings("the summary", d.summary);
+    // The details and the failure's attributes with the Nexus context, the summary with the
+    // activity's; the failure converter saw the failure with the Nexus context.
+    try testing.expectEqual(@as(usize, 2), f.codec.count("nexus=caller-ep"));
+    try testing.expectEqual(@as(usize, 1), f.codec.count("act=act-1"));
+    try testing.expectEqual(@as(usize, 3), f.codec.seen.items.len);
+    try testing.expectEqual(@as(usize, 1), f.failures.seen.items.len);
+    try testing.expectEqualStrings("nexus=caller-ep", f.failures.seen.items[0]);
+}
+
+test "ActivityHandle.describe decodes with the activity's context when the server sends no propagated Nexus context" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{try describeActivityAnswer(a, false)};
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+
+    var h = try f.client.getActivityHandle([]const u8, "act-1", "");
+    defer h.deinit();
+    const d = try h.describe(a);
+    try testing.expect(d.heartbeat_details.context.nexus == null);
+    try testing.expectEqualStrings("act-1", d.heartbeat_details.context.activity_id);
+    try testing.expectEqualStrings("Act", d.heartbeat_details.context.activity_type);
+    const progress = try d.heartbeat_details.get(LabeledText, a, 0);
+    try testing.expectEqualStrings("halfway", progress.text);
+    try testing.expectEqualStrings("act=act-1", progress.label);
+    try testing.expectEqualStrings("attempt failed", d.raw.last_failure.?.message);
+    try testing.expectEqualStrings("the summary", d.summary);
+    try testing.expectEqual(@as(usize, 3), f.codec.count("act=act-1"));
+    try testing.expectEqual(@as(usize, 3), f.codec.seen.items.len);
+    try testing.expectEqual(@as(usize, 1), f.failures.seen.items.len);
+    try testing.expectEqualStrings("act=act-1", f.failures.seen.items[0]);
+}
+
+fn pollNexusOperationAnswer(arena: Allocator, success: bool, nexus_encoded: bool, propagated: ?proto.temporal.api.nexus.v1.PropagatedSerializationContext) !Answer {
+    const Response = wfs.PollNexusOperationExecutionResponse;
+    const outcome: Response.outcome_union = if (success)
+        .{ .result = try stringPayload(arena, "done", nexus_encoded) }
+    else
+        .{ .failure = try encodedFailure(arena, "operation failed", nexus_encoded) };
+    return .{ .rpc = "PollNexusOperationExecution", .proto = try encodeMessage(arena, Response{
+        .run_id = "op-run",
+        .wait_stage = .NEXUS_OPERATION_WAIT_STAGE_CLOSED,
+        .outcome = outcome,
+        .propagated_nexus_serialization_context = propagated,
+    }) };
+}
+
+fn startNexusOperationAnswer(arena: Allocator) !Answer {
+    return .{ .rpc = "StartNexusOperationExecution", .proto = try encodeMessage(arena, wfs.StartNexusOperationExecutionResponse{ .run_id = "op-run", .started = true }) };
+}
+
+test "NexusOperationHandle.get decodes its result and failure with the propagated Nexus context the server sends" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{
+        try pollNexusOperationAnswer(a, true, true, caller_context),
+        try pollNexusOperationAnswer(a, false, true, caller_context),
+        try startNexusOperationAnswer(a),
+        try pollNexusOperationAnswer(a, true, true, caller_context),
+    };
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+
+    var ok = try f.client.getNexusOperationHandle(LabeledText, "op-1", "");
+    defer ok.deinit();
+    try testing.expect(ok.nexus_context == null);
+    const result = try ok.get(a);
+    try testing.expectEqualStrings("done", result.text);
+    try testing.expectEqualStrings("nexus=caller-ep", result.label);
+
+    var failed = try f.client.getNexusOperationHandle([]const u8, "op-1", "");
+    defer failed.deinit();
+    try testing.expectError(error.NexusOperationFailed, failed.get(a));
+    try testing.expectEqualStrings("operation failed", failed.failure().?.message);
+    try testing.expectEqualStrings("nexus=caller-ep", f.failures.seen.items[0]);
+
+    // The response's context wins over the names the handle has from the start.
+    var started = try f.client.executeNexusOperationByName([]const u8, "other-svc", "other-op", .{ .endpoint = "other-ep", .id = "op-2" }, "input");
+    defer started.deinit();
+    try testing.expectEqualStrings("other-ep", started.nexus_context.?.endpoint);
+    try testing.expectEqualStrings("done", try started.get(a));
+    try testing.expectEqual(@as(usize, 3), f.codec.count("nexus=caller-ep"));
+    try testing.expectEqual(@as(usize, 3), f.codec.seen.items.len);
+}
+
+test "NexusOperationHandle.get from executeNexusOperation decodes with the start's endpoint, service and operation when the server sends no context" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{
+        try startNexusOperationAnswer(a),
+        try pollNexusOperationAnswer(a, true, true, null),
+        try startNexusOperationAnswer(a),
+        try pollNexusOperationAnswer(a, false, true, null),
+    };
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+    const options: client_mod.StartNexusOperationOptions = .{ .endpoint = caller_context.endpoint, .id = "op-1" };
+
+    var ok = try f.client.executeNexusOperationByName(LabeledText, caller_context.service, caller_context.operation, options, "input");
+    defer ok.deinit();
+    const n = ok.nexus_context.?;
+    try testing.expectEqualStrings(caller_context.endpoint, n.endpoint);
+    try testing.expectEqualStrings(caller_context.service, n.service);
+    try testing.expectEqualStrings(caller_context.operation, n.operation);
+    const result = try ok.get(a);
+    try testing.expectEqualStrings("done", result.text);
+    try testing.expectEqualStrings("nexus=caller-ep", result.label);
+
+    var failed = try f.client.executeNexusOperationByName([]const u8, caller_context.service, caller_context.operation, options, "input");
+    defer failed.deinit();
+    try testing.expectError(error.NexusOperationFailed, failed.get(a));
+    try testing.expectEqualStrings("operation failed", failed.failure().?.message);
+    try testing.expectEqual(@as(usize, 1), f.failures.seen.items.len);
+    try testing.expectEqualStrings("nexus=caller-ep", f.failures.seen.items[0]);
+    try testing.expectEqual(@as(usize, 2), f.codec.count("nexus=caller-ep"));
+}
+
+test "NexusOperationHandle.get decodes with the namespace alone when neither the server nor the handle has a Nexus context" {
+    testing.log_level = .err;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const answers = [_]Answer{
+        try pollNexusOperationAnswer(a, true, false, null),
+        try pollNexusOperationAnswer(a, false, false, null),
+        try startNexusOperationAnswer(a),
+        try pollNexusOperationAnswer(a, true, false, null),
+    };
+    var f: NexusReadFixture = undefined;
+    try f.init(&answers);
+    defer f.deinit();
+
+    var ok = try f.client.getNexusOperationHandle(LabeledText, "op-1", "");
+    defer ok.deinit();
+    const result = try ok.get(a);
+    try testing.expectEqualStrings("done", result.text);
+    try testing.expectEqualStrings("wf=", result.label);
+
+    var failed = try f.client.getNexusOperationHandle([]const u8, "op-1", "");
+    defer failed.deinit();
+    try testing.expectError(error.NexusOperationFailed, failed.get(a));
+    try testing.expectEqualStrings("operation failed", failed.failure().?.message);
+
+    // An operation on the system endpoint is the SDK's own and keeps no Nexus context.
+    var system = try f.client.executeNexusOperationByName([]const u8, "s", "o", .{ .endpoint = nexus_system.endpoint, .id = "op-2" }, "input");
+    defer system.deinit();
+    try testing.expect(system.nexus_context == null);
+    try testing.expectEqualStrings("done", try system.get(a));
+
+    try testing.expectEqual(@as(usize, 3), f.codec.seen.items.len);
+    for (f.codec.seen.items) |label| try testing.expectEqualStrings("wf=", label);
+    try testing.expectEqual(@as(usize, 1), f.failures.seen.items.len);
+    try testing.expectEqualStrings("wf=", f.failures.seen.items[0]);
+}

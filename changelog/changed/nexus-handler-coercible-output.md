@@ -1,0 +1,1 @@
+`nexus.ServiceHandler` accepts a synchronous handler whose return type coerces to its operation's output type, such as `![]u8` for a `[]const u8` output, and encodes the value as the output type; a return type that doesn't coerce is still a compile error naming the service and the operation.

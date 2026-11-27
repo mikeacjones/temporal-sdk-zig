@@ -28,7 +28,9 @@ const Flaky = nexus.OperationDef("flaky", []const u8, []const u8);
 const Refuse = nexus.OperationDef("refuse", []const u8, []const u8);
 const LongId = nexus.OperationDef("long-id", []const u8, []const u8);
 const Block = nexus.OperationDef("block", []const u8, []const u8);
-const Service = nexus.ServiceDef("zig-test-service", .{ Echo, Greet, Hold, Fail, Flaky, Refuse, LongId, Block });
+const Late = nexus.OperationDef("late", []const u8, []const u8);
+const FailWithDetails = nexus.OperationDef("fail-with-details", []const u8, []const u8);
+const Service = nexus.ServiceDef("zig-test-service", .{ Echo, Greet, Hold, Fail, Flaky, Refuse, LongId, Block, Late, FailWithDetails });
 
 fn greetWorkflow(ctx: *workflow.Context, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(ctx.allocator(), "Hello, {s}", .{name});
@@ -77,6 +79,10 @@ const Handlers = struct {
     entered: Io.Event = .unset,
     canceled: Io.Event = .unset,
     reason: std.atomic.Value(u8) = .init(no_reason),
+    /// `late`'s attempts, and its first attempts that saw the worker's cancel and still
+    /// returned, indexed by `lateMode`.
+    late_calls: [2]std.atomic.Value(u32) = .{ .init(0), .init(0) },
+    late_returned: [2]Io.Event = .{ .unset, .unset },
 
     /// Returns the input with what the handler knows about its request.
     fn echo(_: *Handlers, ctx: *nexus.Context, input: []const u8) ![]const u8 {
@@ -132,6 +138,29 @@ const Handlers = struct {
         return "woke";
     }
 
+    /// Its first attempt waits for the worker's cancel (at the request's deadline) and then
+    /// returns anyway: a result for "result", an operation failure for "error". Later
+    /// attempts return at once.
+    fn late(h: *Handlers, ctx: *nexus.Context, mode: []const u8) ![]const u8 {
+        const m = lateMode(mode);
+        const attempt = h.late_calls[m].fetchAdd(1, .monotonic) + 1;
+        if (attempt > 1) return std.fmt.allocPrint(ctx.allocator(), "on time {s} on attempt {d}", .{ mode, attempt });
+        ctx.io().sleep(.fromSeconds(3600), .awake) catch {};
+        defer if (ctx.cancelReason() != null) h.late_returned[m].set(h.io);
+        if (m == 1) return ctx.fail(.{ .message = "late failure", .type = "Late", .non_retryable = true });
+        return "late result";
+    }
+
+    fn lateMode(mode: []const u8) usize {
+        return @intFromBool(std.mem.eql(u8, mode, "error"));
+    }
+
+    /// Fails the operation with `input` as the failure's detail.
+    fn failWithDetails(_: *Handlers, ctx: *nexus.Context, input: []const u8) ![]const u8 {
+        const detail = try converter.toPayload(ctx.allocator(), input);
+        return ctx.fail(.{ .message = "failed with details", .type = "Detailed", .details = &.{detail} });
+    }
+
     fn cancelReason(h: *const Handlers) ?nexus.CancelReason {
         const r = h.reason.load(.acquire);
         return if (r == no_reason) null else @fromBackingInt(@intCast(r));
@@ -147,6 +176,8 @@ const Handler = nexus.ServiceHandler(Service, .{
     nexus.OperationHandler(Refuse, Handlers.refuse),
     nexus.OperationHandler(LongId, Handlers.longId),
     nexus.OperationHandler(Block, Handlers.block),
+    nexus.OperationHandler(Late, Handlers.late),
+    nexus.OperationHandler(FailWithDetails, Handlers.failWithDetails),
 });
 
 // ---------------------------------------------------------------- caller side
@@ -187,6 +218,18 @@ fn callByName(ctx: *workflow.Context, endpoint: []const u8, operation: []const u
     };
 }
 const CallByName = workflow.Def("NexusTestCallByName", callByName);
+
+/// Calls `operation` of `service` by name, as `callByName` does.
+fn callService(ctx: *workflow.Context, endpoint: []const u8, service: []const u8, operation: []const u8, input: []const u8) ![]const u8 {
+    var options = call_options;
+    options.endpoint = endpoint;
+    const f = ctx.executeNexusOperationByName([]const u8, service, operation, options, input);
+    return f.get() catch |err| switch (err) {
+        error.NexusOperationFailed => std.fmt.allocPrint(ctx.allocator(), "failed: {s}", .{try describe(ctx, f.failure())}),
+        else => err,
+    };
+}
+const CallService = workflow.Def("NexusTestCallService", callService);
 
 /// Calls `Echo` through its contract.
 fn callEcho(ctx: *workflow.Context, endpoint: []const u8, input: []const u8) ![]const u8 {
@@ -252,7 +295,7 @@ const Setup = struct {
     fn start(handlers: *Handlers, options: WorkflowEnvironment.Options) !Setup {
         const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, options);
         errdefer env.deinit();
-        inline for (.{ CallByName, CallEcho, CallGreet, CancelHold, AbandonHold, GreetWorkflow, HoldWorkflow }) |W| try env.registerWorkflow(W);
+        inline for (.{ CallByName, CallService, CallEcho, CallGreet, CancelHold, AbandonHold, GreetWorkflow, HoldWorkflow }) |W| try env.registerWorkflow(W);
         try env.registerNexusServiceWith(Handler, handlers);
         var s: Setup = .{ .env = env, .endpoint = undefined, .arena = .init(testing.allocator) };
         errdefer s.arena.deinit();
@@ -425,6 +468,48 @@ test "nexus: an operation the service doesn't have fails as not found, naming th
     try expectContains(result, "[handler NOT_FOUND]");
 }
 
+test "nexus: a service the worker hasn't registered fails as not found, naming the service and operation" {
+    var handlers: Handlers = .{ .io = testing.io };
+    var s = try Setup.start(&handlers, .{});
+    defer s.deinit();
+    const result = try s.run(CallService, .{ s.endpoint, "no-such-service", "echo", "x" });
+    try testing.expect(std.mem.startsWith(u8, result, "failed: "));
+    try expectContains(result, "Nexus service \"no-such-service\" is not registered on the worker");
+    try expectContains(result, "its operation \"echo\"");
+    try expectContains(result, "[handler NOT_FOUND]");
+}
+
+test "nexus: a handler that returns a result or a failure after the worker canceled it neither crashes the worker nor completes the operation" {
+    var handlers: Handlers = .{ .io = testing.io };
+    var s = try Setup.start(&handlers, .{});
+    defer s.deinit();
+    const a = s.arena.allocator();
+    // The first attempt of each outlives its deadline; the server retries it.
+    var runs: [2]client_mod.WorkflowRun([]const u8) = undefined;
+    const modes = [2][]const u8{ "result", "error" };
+    for (&runs, modes, 0..) |*r, mode, i| {
+        errdefer for (runs[0..i]) |*done| done.deinit();
+        r.* = try s.env.startWorkflow(CallByName, .{}, .{ s.endpoint, "late", mode });
+    }
+    defer for (&runs) |*r| r.deinit();
+    for (&runs, modes) |*r, mode| {
+        const result = try s.env.getResult(CallByName, r, a, null);
+        try testing.expectEqualStrings(try std.fmt.allocPrint(a, "on time {s} on attempt 2", .{mode}), result);
+        try waitFor(&handlers.late_returned[Handlers.lateMode(mode)]);
+        try testing.expectEqual(2, handlers.late_calls[Handlers.lateMode(mode)].load(.monotonic));
+        // The operation completed once, with the second attempt's result.
+        var completed: u32 = 0;
+        for ((try s.env.client.fetchHistory(a, r.id, r.run_id)).events.items) |event| switch (event.event_type) {
+            .EVENT_TYPE_NEXUS_OPERATION_COMPLETED => completed += 1,
+            .EVENT_TYPE_NEXUS_OPERATION_FAILED, .EVENT_TYPE_NEXUS_OPERATION_CANCELED, .EVENT_TYPE_NEXUS_OPERATION_TIMED_OUT => return error.TestUnexpectedResult,
+            else => {},
+        };
+        try testing.expectEqual(1, completed);
+    }
+    // The worker still serves requests after sending the late responses.
+    try expectContains(try s.run(CallEcho, .{ s.endpoint, "still here" }), "still here op=zig-test-service/echo");
+}
+
 test "nexus: a canceled workflow-run operation cancels its workflow, and the caller resolves as each cancellation type says" {
     var handlers: Handlers = .{ .io = testing.io };
     var s = try Setup.start(&handlers, .{});
@@ -518,6 +603,51 @@ test "nexus: the client's codecs encode an operation's input and result on the w
         else => {},
     };
     try testing.expectEqual(2, checked);
+}
+
+/// The first detail of the first application failure in `f`'s cause chain.
+fn applicationDetail(f: ?*const failure_mod.Failure) ?converter.Payload {
+    var it = f;
+    while (it) |cur| : (it = cur.cause) if (cur.failure_info) |info| switch (info) {
+        .application_failure_info => |app| {
+            const details = app.details orelse return null;
+            return if (details.payloads.items.len > 0) details.payloads.items[0] else null;
+        },
+        else => {},
+    };
+    return null;
+}
+
+test "nexus: the client's codecs encode a handler failure's details on the wire" {
+    var handlers: Handlers = .{ .io = testing.io };
+    const zlib: converter.ZlibCodec = .{ .always_encode = true };
+    const codecs = [_]converter.PayloadCodec{zlib.codec()};
+    var s = try Setup.start(&handlers, .{ .codecs = &codecs });
+    defer s.deinit();
+    const a = s.arena.allocator();
+    var r = try s.env.startWorkflow(CallByName, .{}, .{ s.endpoint, "fail-with-details", "the detail" });
+    defer r.deinit();
+    const result = try s.env.getResult(CallByName, &r, a, null);
+    try expectContains(result, "failed with details [application Detailed]");
+
+    // Only the handling worker wrote the failure the caller's history holds: a client
+    // without codecs sees its detail as the codec encoded it, and the environment's client
+    // decodes it back.
+    var raw = try client_mod.Client.connect(testing.allocator, testing.io, s.env.server.dev.clientOptions());
+    defer raw.close();
+    for ([_]*client_mod.Client{ &raw, &s.env.client }, [_]bool{ true, false }) |c, on_wire| {
+        const history = try c.fetchHistory(a, r.id, r.run_id);
+        const failed = for (history.events.items) |event| switch (event.attributes.?) {
+            .nexus_operation_failed_event_attributes => |attrs| break attrs,
+            else => {},
+        } else return error.TestExpectedFailedEvent;
+        const detail = applicationDetail(if (failed.failure) |*f| f else null) orelse return error.TestExpectedDetails;
+        if (on_wire) {
+            try testing.expectEqualStrings(converter.ZlibCodec.encoding, converter.encodingOf(detail).?);
+        } else {
+            try testing.expectEqualStrings("the detail", try converter.fromPayload([]const u8, a, detail));
+        }
+    }
 }
 
 test "nexus: a workflow start the server rejects as an invalid argument fails the operation as a bad request, without retries" {
@@ -1501,4 +1631,84 @@ test "nexus: with a codec keyed by Nexus endpoint, the caller's and the backing 
     try testing.expectEqualStrings(try std.fmt.allocPrint(a, "Hello, {s}", .{name}), try greeted.get(a));
     try s.env.replayRun(greet_id, "");
     try s.env.replayRun(r.id, r.run_id);
+}
+
+// ---------------------------------------------------------------- outcome errors
+
+/// A handler that waits on a client call whose outcome is a failure, such as an update whose
+/// handler's activity failed for good.
+const OutcomeFixtures = struct {
+    const ChargeOp = nexus.OperationDef("charge", []const u8, []const u8);
+    const OutcomeService = nexus.ServiceDef("zig-outcome-service", .{ChargeOp});
+    const Charge = workflow.UpdateDef("charge", fn ([]const u8) []const u8);
+
+    const State = struct {
+        /// The Nexus handler's attempts, and the update activity's.
+        handler_calls: std.atomic.Value(u32) = .init(0),
+        activity_calls: std.atomic.Value(u32) = .init(0),
+
+        fn declineCard(s: *State, ctx: *activity.Context, item: []const u8) ![]const u8 {
+            _ = s.activity_calls.fetchAdd(1, .monotonic);
+            return ctx.fail(.{ .message = try std.fmt.allocPrint(ctx.allocator(), "card declined for {s}", .{item}), .type = "CardDeclined", .non_retryable = true });
+        }
+
+        /// Sends `Charge` to the workflow `workflow_id` and returns the update's outcome as it is.
+        fn charge(s: *State, ctx: *nexus.Context, workflow_id: []const u8) ![]const u8 {
+            _ = s.handler_calls.fetchAdd(1, .monotonic);
+            const c = try ctx.client();
+            var handle = try c.updateWorkflow(Charge, workflow_id, "", .{"socks"}, .{ .wait_for_stage = .completed });
+            defer handle.deinit();
+            return handle.get(ctx.allocator());
+        }
+    };
+    const DeclineCard = activity.Def("NexusTestDeclineCard", State.declineCard);
+
+    fn chargeUpdate(ctx: *workflow.Context, item: []const u8) ![]const u8 {
+        return ctx.executeActivity(DeclineCard, .{ .start_to_close_timeout = .fromSeconds(10), .retry_policy = .{ .maximum_attempts = 1 } }, .{item}).get();
+    }
+
+    /// Runs `Charge` updates until `release`.
+    fn target(ctx: *workflow.Context) !void {
+        const latch = try ctx.allocator().create(Latch);
+        latch.* = .{};
+        try ctx.setSignalHandler(Release, latch, Latch.set);
+        try ctx.setUpdateHandler(Charge, ctx, chargeUpdate);
+        try ctx.await(latch, Latch.isOpen);
+    }
+    const Target = workflow.Def("NexusTestChargeTarget", target);
+
+    const Handler = nexus.ServiceHandler(OutcomeService, .{nexus.OperationHandler(ChargeOp, State.charge)});
+};
+
+test "nexus: a handler returning a failed update's error fails the operation once, promptly, with the update's failure in the cause chain" {
+    var state: OutcomeFixtures.State = .{};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{});
+    defer env.deinit();
+    inline for (.{ CallService, OutcomeFixtures.Target }) |W| try env.registerWorkflow(W);
+    try env.registerActivityWith(OutcomeFixtures.DeclineCard, &state);
+    try env.registerNexusServiceWith(OutcomeFixtures.Handler, &state);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const endpoint = try uniqueName(a, "zig-outcome-endpoint");
+    try env.createNexusEndpoint(endpoint, .{});
+
+    var t = try env.startWorkflow(OutcomeFixtures.Target, .{}, .{});
+    defer t.deinit();
+    const started = Io.Timestamp.now(testing.io, .awake);
+    // `CallService` gives the operation 60 s; a retried handler error would take all of it.
+    var r = try env.startWorkflow(CallService, .{}, .{ endpoint, OutcomeFixtures.OutcomeService.service_name, "charge", t.id });
+    defer r.deinit();
+    const result = try env.getResult(CallService, &r, a, null);
+    const elapsed = started.durationTo(Io.Timestamp.now(testing.io, .awake));
+
+    try testing.expect(std.mem.startsWith(u8, result, "failed: "));
+    try expectContains(result, "failed: UpdateFailed: Activity task failed [handler INTERNAL]");
+    try expectContains(result, "card declined for socks [application CardDeclined]");
+    try testing.expectEqual(1, state.handler_calls.load(.monotonic));
+    try testing.expectEqual(1, state.activity_calls.load(.monotonic));
+    try testing.expect(elapsed.toSeconds() < 30);
+
+    try env.client.signalWorkflow(Release, t.id, "", .{});
+    try env.getResult(OutcomeFixtures.Target, &t, a, null);
 }

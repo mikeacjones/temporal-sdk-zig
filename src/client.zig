@@ -33,6 +33,7 @@ const propagation = @import("propagation.zig");
 const interceptor = @import("interceptor.zig");
 const metrics_mod = @import("metrics.zig");
 const call_check = @import("nexus/call_check.zig");
+const nexus_outcome = @import("nexus/outcome.zig");
 const protobuf = @import("protobuf");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -2715,7 +2716,10 @@ pub const Client = struct {
             else => |e| return e,
         };
         var handle = try c.getNexusOperationHandle(Output, id, response.run_id);
+        errdefer handle.deinit();
         handle.started = response.started;
+        // The system endpoint's operations are the SDK's own, coded without a Nexus context.
+        if (!std.mem.eql(u8, options.endpoint, nexus_system.endpoint)) handle.nexus_context = try dupeNexusContext(c.gpa, options.endpoint, service, operation);
         return handle;
     }
 
@@ -3466,16 +3470,35 @@ pub const Client = struct {
     }
 
     /// Decodes a response other than a history page with the codecs. Each part is decoded with
-    /// the context its payloads were encoded with: an update's or a standalone activity's
-    /// outcome with the propagated Nexus context the response carries with it; a described
-    /// workflow's pending Nexus operation (one on the system endpoint excepted) with the
-    /// operation's Nexus context; everything else with `base`, the request's context.
+    /// the context its payloads were encoded with: an update's, a standalone activity's or a
+    /// standalone Nexus operation's outcome, and a described standalone activity's heartbeat
+    /// details and last failure (not its summary), with the propagated Nexus context the
+    /// response carries with them; a described workflow's pending Nexus operation (one on the system endpoint
+    /// excepted) with the operation's Nexus context; everything else with `base`, the
+    /// request's context.
     fn decodeResponse(c: *Client, comptime Response: type, arena: Allocator, response: *Response, base: *const converter.Context) converter.CodecError!void {
         if (c.codecs.len == 0) return;
-        if (comptime Response == wfs.UpdateWorkflowExecutionResponse or Response == wfs.PollWorkflowExecutionUpdateResponse or Response == wfs.PollActivityExecutionResponse) {
+        if (comptime Response == wfs.UpdateWorkflowExecutionResponse or Response == wfs.PollWorkflowExecutionUpdateResponse or Response == wfs.PollActivityExecutionResponse or Response == wfs.PollNexusOperationExecutionResponse) {
             // `outcome` holds the response's only payloads.
             const context = if (response.propagated_nexus_serialization_context) |p| propagatedContext(base, p) else base.*;
             return converter.decodeMessage(Response, response, c.codecs, arena, c.io, &context);
+        }
+        if (comptime Response == wfs.DescribeActivityExecutionResponse) {
+            const info = if (response.info) |*i| i else return converter.decodeMessage(Response, response, c.codecs, arena, c.io, base);
+            const p = info.propagated_nexus_serialization_context orelse return converter.decodeMessage(Response, response, c.codecs, arena, c.io, base);
+            // The activity's worker encoded its heartbeat details and failure with the
+            // propagated context; its starter encoded its summary with the activity's.
+            var details = info.heartbeat_details;
+            var last_failure = info.last_failure;
+            info.heartbeat_details = null;
+            info.last_failure = null;
+            try converter.decodeMessage(Response, response, c.codecs, arena, c.io, base);
+            const context = propagatedContext(base, p);
+            if (details) |*d| try converter.decodeMessage(proto.temporal.api.common.v1.Payloads, d, c.codecs, arena, c.io, &context);
+            if (last_failure) |*f| try converter.decodeMessage(failure_mod.Failure, f, c.codecs, arena, c.io, &context);
+            response.info.?.heartbeat_details = details;
+            response.info.?.last_failure = last_failure;
+            return;
         }
         if (comptime Response == wfs.ExecuteMultiOperationResponse) {
             const Entry = wfs.ExecuteMultiOperationResponse.Response;
@@ -4678,7 +4701,8 @@ pub const ActivityDescription = struct {
     /// `StartActivityOptions.summary`; empty without one.
     summary: []const u8,
     /// The server's record, with the last attempt's failure, for anything not lifted into the
-    /// fields above.
+    /// fields above. `last_failure` has been through `Options.failure_converter`, with
+    /// `heartbeat_details.context`.
     raw: proto.temporal.api.activity.v1.ActivityExecutionInfo,
 };
 
@@ -4774,13 +4798,14 @@ pub fn ActivityHandle(comptime T: type) type {
                 .failure => |received| {
                     const f = try c.receivedFailure(arena, &context, received);
                     h.failure_ = f;
-                    const info = f.failure_info orelse return error.ActivityFailed;
-                    return switch (info) {
+                    const err: ActivityResultError = if (f.failure_info) |info| switch (info) {
                         .canceled_failure_info => error.ActivityCanceled,
                         .terminated_failure_info => error.ActivityTerminated,
                         .timeout_failure_info => error.ActivityTimedOut,
                         else => error.ActivityFailed,
-                    };
+                    } else error.ActivityFailed;
+                    nexus_outcome.Slot.note(arena, err, &h.failure_.?);
+                    return err;
                 },
             }
         }
@@ -4799,7 +4824,11 @@ pub fn ActivityHandle(comptime T: type) type {
         }
 
         /// The activity's status, type, attempt and times. The description and all its
-        /// memory come from `arena`.
+        /// memory come from `arena`. Experimental: as in `get`, when the server sends a
+        /// propagated Nexus serialization context with the activity (one a Nexus handler
+        /// started), the codecs, the payload converter (through `heartbeat_details.context`)
+        /// and the failure converter see the heartbeat details and the last failure with that
+        /// context instead of the activity's.
         pub fn describe(h: *const Self, arena: Allocator) ActivityError!ActivityDescription {
             const c = h.client;
             const response = c.rpc(wfs.DescribeActivityExecutionResponse, "DescribeActivityExecution", wfs.DescribeActivityExecutionRequest{
@@ -4812,10 +4841,17 @@ pub fn ActivityHandle(comptime T: type) type {
                 error.AlreadyExists => return error.InvalidResponse,
                 else => |e| return e,
             };
-            const info = response.info orelse {
+            var info = response.info orelse {
                 log.err("DescribeActivityExecution for activity {s} returned no activity info", .{h.id});
                 return error.InvalidResponse;
             };
+            // As `get`: a Nexus-started activity's heartbeat details and failure carry the
+            // caller's context, which the codecs decoded them with too (`decodeResponse`).
+            const context = try Client.dupeContext(arena, if (info.propagated_nexus_serialization_context) |p|
+                Client.propagatedContext(&.{ .namespace = c.namespace }, p)
+            else
+                .{ .namespace = c.namespace, .activity_id = info.activity_id, .activity_type = if (info.activity_type) |t| t.name else "" });
+            if (info.last_failure) |f| info.last_failure = try c.receivedFailure(arena, context, f);
             return .{
                 .activity_id = info.activity_id,
                 .run_id = info.run_id,
@@ -4829,7 +4865,7 @@ pub fn ActivityHandle(comptime T: type) type {
                 .search_attributes = try .fromProto(arena, info.search_attributes),
                 .heartbeat_details = .{
                     .payloads = if (info.heartbeat_details) |d| d.payloads.items else &.{},
-                    .context = try Client.dupeContext(arena, .{ .namespace = c.namespace, .activity_id = info.activity_id, .activity_type = if (info.activity_type) |t| t.name else "" }),
+                    .context = context,
                 },
                 .last_heartbeat_time = proto_time.timestampFromProto(info.last_heartbeat_time),
                 .start_delay = if (proto_time.durationFromProto(info.start_delay)) |d| if (d.nanoseconds == 0) null else d else null,
@@ -5307,30 +5343,46 @@ pub fn NexusOperationHandle(comptime T: type) type {
         /// the one already running with the ID. Always false from
         /// `Client.getNexusOperationHandle`.
         started: bool = false,
+        /// Experimental: the operation's endpoint, service and operation, from
+        /// `Client.executeNexusOperation`, which `get` decodes the result and failure with
+        /// when the server sends no propagated Nexus context with them. Null from
+        /// `Client.getNexusOperationHandle`, which doesn't know them, and for an operation
+        /// on the system endpoint. Its strings are owned with the client's allocator and
+        /// freed by `deinit`.
+        nexus_context: ?converter.NexusContext = null,
         failure_: ?failure_mod.Failure = null,
 
         pub fn deinit(h: *Self) void {
             h.client.gpa.free(h.id);
             h.client.gpa.free(h.run_id);
+            if (h.nexus_context) |n| freeNexusContext(h.client.gpa, n);
             h.* = undefined;
         }
 
         /// Waits for the operation to close and returns its result, decoded into `arena`
         /// with any failure. The wait is not cut short by `Options.rpc_timeout` or
         /// `RpcOptions.timeout`; cancel the calling task to stop it (`error.Canceled`). Each
-        /// call asks the server again.
+        /// call asks the server again. Experimental: the codecs, the payload converter and
+        /// the failure converter decode the result and failure with `converter.Context.nexus`
+        /// set to the propagated Nexus context the server sends with them, or without one to
+        /// `nexus_context`; with neither, with the namespace alone.
         pub fn get(h: *Self, arena: Allocator) NexusOperationResultError!T {
             const c = h.client;
             h.failure_ = null;
+            // Borrows the response in `arena`, or the handle.
+            var nexus: ?converter.NexusContext = h.nexus_context;
             const outcome = while (true) {
                 // Each call is a long poll the server may end before the operation closes.
                 var status: ?Client.RpcStatus = null;
-                const response = c.rpcWithStatus(wfs.PollNexusOperationExecutionResponse, "PollNexusOperationExecution", wfs.PollNexusOperationExecutionRequest{
+                const request: wfs.PollNexusOperationExecutionRequest = .{
                     .namespace = c.namespace,
                     .operation_id = h.id,
                     .run_id = h.run_id,
                     .wait_stage = .NEXUS_OPERATION_WAIT_STAGE_CLOSED,
-                }, arena, &status) catch |err| switch (err) {
+                };
+                // The codecs decode the outcome with the response's propagated context, or
+                // with `coding.nexus` without one (`decodeResponse`).
+                const response = c.rpcCallCoded(wfs.PollNexusOperationExecutionResponse, "PollNexusOperationExecution", request, arena, &status, null, null, &.{}, .decode, .{ .nexus = h.nexus_context }) catch |err| switch (err) {
                     error.AlreadyExists => return error.InvalidResponse,
                     error.RpcFailed => {
                         const s = status orelse return error.RpcFailed;
@@ -5341,9 +5393,12 @@ pub fn NexusOperationHandle(comptime T: type) type {
                     },
                     else => |e| return e,
                 };
-                if (response.outcome) |o| break o;
+                if (response.outcome) |o| {
+                    if (response.propagated_nexus_serialization_context) |p| nexus = .{ .endpoint = p.endpoint, .service = p.service, .operation = p.operation };
+                    break o;
+                }
             };
-            const context: converter.Context = .{ .namespace = c.namespace };
+            const context: converter.Context = .{ .namespace = c.namespace, .nexus = nexus };
             switch (outcome) {
                 .result => |payload| {
                     if (T == void) return;
@@ -5352,7 +5407,9 @@ pub fn NexusOperationHandle(comptime T: type) type {
                 .failure => |received| {
                     const f = try c.receivedFailure(arena, &context, received);
                     h.failure_ = f;
-                    return failureError(&f);
+                    const err = failureError(&f);
+                    nexus_outcome.Slot.note(arena, err, &h.failure_.?);
+                    return err;
                 },
             }
         }
@@ -6562,6 +6619,7 @@ pub fn WorkflowRun(comptime T: type) type {
                     },
                     .workflow_execution_failed_event_attributes => |failed| {
                         run.failure_ = if (failed.failure) |f| try c.receivedFailure(arena, &result_context, f) else null;
+                        if (run.failure_) |*f| nexus_outcome.Slot.note(arena, error.WorkflowFailed, f);
                         return error.WorkflowFailed;
                     },
                     .workflow_execution_canceled_event_attributes => return error.WorkflowCanceled,
@@ -6732,6 +6790,7 @@ pub fn WorkflowUpdateHandle(comptime T: type) type {
                 },
                 .failure => |f| {
                     h.failure_ = try c.receivedFailure(arena, &context, f);
+                    nexus_outcome.Slot.note(arena, error.UpdateFailed, &h.failure_.?);
                     return error.UpdateFailed;
                 },
             }

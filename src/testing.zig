@@ -1156,8 +1156,10 @@ pub const WorkflowEnvironment = struct {
     /// through it (`workflow.Context.executeNexusOperation` with `.endpoint = name`). The
     /// server accepts names of ASCII letters, digits, `-` and `_`, starting with a letter.
     /// The endpoint lasts as long as the server; nothing has to poll its task queue for it
-    /// to exist. `name` and `target` are only read during the call. Tested against the dev
-    /// server (`start`); a server without Nexus endpoints returns `error.RpcFailed`.
+    /// to exist. `name` and `target` are only read during the call. Both servers keep
+    /// endpoints: the dev server (`start`) and the time-skipping test server
+    /// (`startTimeSkipping`) create one and return `error.AlreadyExists` for a second
+    /// endpoint of the same name. A server without Nexus endpoints returns `error.RpcFailed`.
     pub fn createNexusEndpoint(env: *WorkflowEnvironment, name: []const u8, target: NexusEndpointTarget) CreateNexusEndpointError!void {
         return testing_ns.createNexusEndpoint(&env.client, name, .{
             .namespace = if (target.namespace.len > 0) target.namespace else env.client.namespace,
@@ -3394,6 +3396,14 @@ test "DevServer honors namespace, port and search attribute options" {
     var client = try client_mod.Client.connect(testing.allocator, testing.io, server.clientOptions());
     defer client.close();
     try testing.expectEqualStrings("zig-tests", client.namespace);
+}
+
+test "WorkflowEnvironment.createNexusEndpoint creates an endpoint on the time-skipping server, and reports a duplicate" {
+    const env = try WorkflowEnvironment.startTimeSkipping(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.createNexusEndpoint("zig-endpoint", .{});
+    try testing.expectError(error.AlreadyExists, env.createNexusEndpoint("zig-endpoint", .{ .task_queue = "other" }));
+    try env.createNexusEndpoint("zig-other-endpoint", .{ .task_queue = "other" });
 }
 
 test "createNexusEndpoint creates an endpoint on a DevServer that routes to another namespace, and reports a duplicate" {
