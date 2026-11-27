@@ -6713,6 +6713,77 @@ test "eviction does not let a held starter go while its Select case still puts i
     try testing.expectEqual(@as(usize, if (left == 0) 0 else 1), recorder.count);
 }
 
+// A Select on the root's stack whose case a helper coroutine (an io.async future, or another
+// case of the same Select) adds before it returns: the case's starter has finished, so
+// nothing ties the case to the root, whose stack holds the Select. The root, like TimerRace,
+// returns from a canceled `select.await()` without canceling the case; eviction must not let
+// the case put its result into the root's stack once the root has returned.
+const SelectCaseAddedByHelper = struct {
+    const Done = union(enum) { slept: std.Io.Cancelable!void };
+
+    fn addCase(io: std.Io, select: *std.Io.Select(Done)) void {
+        select.async(.slept, SelectCleanup.case, .{io});
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var buf: [1]Done = undefined;
+        var select: std.Io.Select(Done) = .init(io, &buf);
+        var helper = io.async(addCase, .{ io, &select });
+        helper.await(io);
+        // Fill the stack pool, so a stack released from here on is unmapped.
+        var fill: [16]std.Io.Future(void) = undefined;
+        for (&fill) |*f| f.* = io.async(SelectCleanup.noop, .{});
+        for (&fill) |*f| f.await(io);
+        _ = try select.await();
+        return "done";
+    }
+
+    const FanOut = union(enum) { added: void, slept: std.Io.Cancelable!void };
+
+    /// A case that adds a sibling case to its own Select (which `Select.async` allows from
+    /// any coroutine) and returns.
+    fn fanOut(io: std.Io, select: *std.Io.Select(FanOut)) void {
+        select.async(.slept, SelectCleanup.case, .{io});
+    }
+
+    fn runFanOut(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var buf: [2]FanOut = undefined;
+        var select: std.Io.Select(FanOut) = .init(io, &buf);
+        select.async(.added, fanOut, .{ io, &select });
+        var fill: [16]std.Io.Future(void) = undefined;
+        for (&fill) |*f| f.* = io.async(SelectCleanup.noop, .{});
+        for (&fill) |*f| f.await(io);
+        // The first result is the fan-out case's; the root then waits for the sleeper.
+        _ = try select.await();
+        _ = try select.await();
+        return "done";
+    }
+};
+const SelectCaseAddedByHelperWf = workflow.Def("SelectCaseAddedByHelper", SelectCaseAddedByHelper.run);
+const SelectCaseAddedByCaseWf = workflow.Def("SelectCaseAddedByCase", SelectCaseAddedByHelper.runFanOut);
+
+test "eviction does not let a Select case added by a helper that returned write into its owner's stack" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const cases = .{
+        .{ SelectCaseAddedByHelperWf.registered, "SelectCaseAddedByHelper" },
+        .{ SelectCaseAddedByCaseWf.registered, "SelectCaseAddedByCase" },
+    };
+    inline for (cases) |case| {
+        var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+        defer recorder.arena.deinit();
+        const inst = try create(testing.allocator, case[0], .{ .stack_size = hog_stack, .logger = recorder.sink() });
+        _ = try inst.activate(&try initActivation(a, case[1], .{}), a);
+        try testing.expectEqual(@as(usize, 2), inst.sched.live);
+        try testing.expectEqual(@as(usize, 0), inst.teardown());
+        inst.destroy();
+        try testing.expectEqual(@as(usize, 0), recorder.count);
+    }
+}
+
 // ctx.sleep with a summary: alone, as an io.async coroutine that is canceled, and racing an
 // activity in a Select.
 const SummaryTimers = struct {
