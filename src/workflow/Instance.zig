@@ -6661,6 +6661,60 @@ test "eviction lets a starter go once only its child that refuses to exit is lef
     try testing.expectEqualStrings("1", recorder.get("count").?);
 }
 
+// A Select case whose cleanup locks a mutex its starter holds across `select.await()`, so it
+// can't exit before its starter unwinds, and which then puts its result into the Select on
+// its starter's stack. The starter is itself a Select case of the root. When eviction lets
+// the held starter go, the starter returns, and what runs after it on its stack (the end of
+// its coroutine) overwrites the Select before the case puts its result into it.
+const SelectCaseNeedsStarterUnlock = struct {
+    const Inner = union(enum) { worked: u64 };
+    const Outer = union(enum) { started: std.Io.Cancelable!void };
+
+    fn worker(io: std.Io, mutex: *std.Io.Mutex) u64 {
+        defer {
+            mutex.lockUncancelable(io);
+            mutex.unlock(io);
+        }
+        io.sleep(.fromSeconds(60), .awake) catch {};
+        return 7;
+    }
+
+    fn starter(io: std.Io, mutex: *std.Io.Mutex) std.Io.Cancelable!void {
+        try mutex.lock(io);
+        defer mutex.unlock(io);
+        var buf: [1]Inner = undefined;
+        var select: std.Io.Select(Inner) = .init(io, &buf);
+        select.async(.worked, worker, .{ io, mutex });
+        _ = try select.await();
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        const mutex = try ctx.allocator().create(std.Io.Mutex);
+        mutex.* = .init;
+        const outer = try ctx.allocator().create(std.Io.Select(Outer));
+        outer.* = .init(io, try ctx.allocator().alloc(Outer, 1));
+        outer.async(.started, starter, .{ io, mutex });
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(10) }, .{"x"}).get();
+    }
+};
+const SelectCaseNeedsStarterUnlockWf = workflow.Def("SelectCaseNeedsStarterUnlock", SelectCaseNeedsStarterUnlock.run);
+
+test "eviction does not let a held starter go while its Select case still puts into its stack" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, SelectCaseNeedsStarterUnlockWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
+    _ = try inst.activate(&try initActivation(a, "SelectCaseNeedsStarterUnlock", .{}), a);
+    try testing.expectEqual(@as(usize, 3), inst.sched.live);
+    // Whatever eviction can't end safely is reported and leaked, not resumed into a dead frame.
+    const left = inst.teardown();
+    inst.destroy();
+    try testing.expectEqual(@as(usize, if (left == 0) 0 else 1), recorder.count);
+}
+
 // ctx.sleep with a summary: alone, as an io.async coroutine that is canceled, and racing an
 // activity in a Select.
 const SummaryTimers = struct {
