@@ -63,11 +63,12 @@ read_only: bool = false,
 /// The first coroutine start that failed. Sticky: never cleared, since the run already went
 /// on differently than it would have with the coroutine started.
 start_failure: ?StartFailure = null,
-/// While set, a coroutine that coroutines it started are still running doesn't go on from a
-/// wait (or `checkCancel`), however it is woken or canceled, until they have all exited: it
-/// can't return, so their pointers into its stack (a Select's cases put their results into
-/// the Select, usually on the stack of the coroutine that started them) stay valid. Set by
-/// eviction, after which the run never goes on normally; see `holdWhileChildrenRun`.
+/// While set, a coroutine whose futures or group members are still running doesn't go on
+/// from a wait (or `checkCancel`), however it is woken or canceled, until they have all
+/// exited or `releaseHeldStarters` lets it go: it can't return, so their pointers into its
+/// stack (a Select's cases put their results into the Select, usually on the stack of the
+/// coroutine that started them) stay valid. Set by eviction, after which the run never goes
+/// on normally; see `holdWhileChildrenRun`.
 hold_starters: bool = false,
 /// How many cancel requests a coroutine's wait has taken (returned `error.Canceled`), for
 /// eviction to see that its cancels still change something.
@@ -309,6 +310,10 @@ pub const Task = struct {
     running_children: usize = 0,
     /// Blocked in `holdWhileChildrenRun`: the last child to exit wakes it.
     held: bool = false,
+    /// Let go by `releaseHeldStarters`: no longer held, whatever its children do.
+    hold_released: bool = false,
+    /// Scratch for `releaseHeldStarters`.
+    has_held_child: bool = false,
     /// Allocation backing this Task, its context, and its result.
     memory: []u8,
     memory_align: Alignment,
@@ -383,10 +388,12 @@ fn createTask(
     errdefer w.destroyTask(task);
     task.fiber = w.scheduler.spawn(name, taskMain, .{ w, task }) catch return error.StackUnavailable;
     task.fiber.user = task;
-    if (w.currentTask()) |starter| {
+    // A top-level task (a handler, spawned while the root runs) holds no pointer into the
+    // stack of the coroutine running when it starts.
+    if (kind != .detached) if (w.currentTask()) |starter| {
         task.starter = starter;
         starter.running_children += 1;
-    }
+    };
     return task;
 }
 
@@ -571,19 +578,54 @@ fn block(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void {
     }
 }
 
-/// With `hold_starters` set, blocks the running coroutine while coroutines it started are
-/// still running; wakes meanwhile (its own wait's, a cancel's) only bring it back here. Every
-/// way a coroutine goes on from a wait, or from `checkCancel`, passes through this first, so
-/// during eviction no coroutine runs on, and so can't return, while its children run.
+/// With `hold_starters` set, blocks the running coroutine while futures or group members it
+/// started are still running, unless `releaseHeldStarters` let it go; wakes meanwhile (its
+/// own wait's, a cancel's) only bring it back here. Every way a coroutine goes on from a
+/// wait, or from `checkCancel`, passes through this first, so during eviction no coroutine
+/// runs on, and so can't return, while its children run, until nothing else can move.
 fn holdWhileChildrenRun(w: *WorkflowIo) void {
     if (!w.hold_starters) return;
     const t = w.currentTask() orelse return;
-    while (t.running_children > 0) {
+    while (t.running_children > 0 and !t.hold_released) {
         t.held = true;
         w.settleOwedWake();
         w.scheduler.block();
     }
     t.held = false;
+}
+
+/// Lets go every coroutine held in `holdWhileChildrenRun` that has no held child of its own,
+/// and returns how many. For eviction once nothing else moves: a child can be waiting,
+/// without a cancel point, for what its held starter does as it unwinds (a lock it holds, an
+/// event it sets in a defer), and it then runs only after its starter returned. With the
+/// Scheduler's `keep_finished_stacks` set, the starter's stack stays mapped and unused, so
+/// such a child that still points into it writes into memory nothing else uses. Innermost
+/// first, so a starter whose child is itself held stays held until that child is let go
+/// and exits. Call it outside any coroutine; `run` lets them go on.
+pub fn releaseHeldStarters(w: *WorkflowIo) usize {
+    assert(w.scheduler.currentFiber() == null);
+    var it = w.scheduler.firstLive();
+    while (it) |f| : (it = f.live_next) {
+        const t: *Task = @ptrCast(@alignCast(f.user orelse continue));
+        t.has_held_child = false;
+    }
+    it = w.scheduler.firstLive();
+    while (it) |f| : (it = f.live_next) {
+        const t: *Task = @ptrCast(@alignCast(f.user orelse continue));
+        if (t.held and !t.hold_released) if (t.starter) |starter| {
+            starter.has_held_child = true;
+        };
+    }
+    var released: usize = 0;
+    it = w.scheduler.firstLive();
+    while (it) |f| : (it = f.live_next) {
+        const t: *Task = @ptrCast(@alignCast(f.user orelse continue));
+        if (!t.held or t.hold_released or t.has_held_child) continue;
+        t.hold_released = true;
+        released += 1;
+        if (f.state == .blocked) w.scheduler.wake(f);
+    }
+    return released;
 }
 
 fn newWait(w: *WorkflowIo, reason: Wait.Reason) Wait {
