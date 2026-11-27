@@ -6598,7 +6598,9 @@ const StarterReleases = struct {
 const StarterReleasesLockWf = workflow.Def("StarterReleasesLock", StarterReleases.lockHeld);
 const StarterReleasesEventWf = workflow.Def("StarterReleasesEvent", StarterReleases.eventSet);
 
-test "eviction holds a starter whose coroutine's cleanup waits on its unwinding, and reports both" {
+// Named for the round-3 finding; as ruled for this bead, the starter is held and never
+// resumed while the coroutine it started runs, so both are reported and leaked.
+test "eviction lets a coroutine whose cleanup waits on its starter's unwinding exit" {
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
     const a = scratch.allocator();
