@@ -840,7 +840,7 @@ pub const GreetTwice = workflow.Def("greet_twice", greetTwice);
 ```
 
 Notes:
-- `start_to_close_timeout` or `schedule_to_close_timeout` is required. Without either, a local activity's `get` returns `error.InvalidOptions` (logged); `executeActivity` doesn't check and sends the command as given, leaving validation to the server.
+- `start_to_close_timeout` or `schedule_to_close_timeout` is required. Without either, the activity isn't scheduled and its future's `get` returns `error.InvalidOptions` (logged), for `executeActivity`, `executeActivityByName` and `executeLocalActivity` alike. The workflow task doesn't fail, so the workflow can handle the error and go on.
 - On `error.ActivityFailed`, `future.failure()` has the failure; returning the error fails the workflow with that failure.
 - `future.cancel()`, or canceling the waiting coroutine, cancels the activity as `cancellation_type` says.
 - Any number of coroutines may wait on the same future, of any kind: an activity's or local activity's, a child workflow's or Nexus operation's (`get` and `started`), or a signal or cancellation request to another workflow. All of them return once it resolves, in the order they began waiting. Canceling one of them still requests the operation's cancellation, which the others then see in its outcome.

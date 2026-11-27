@@ -2885,6 +2885,11 @@ fn newActivity(inst: *Instance, activity_type: []const u8, cancellation_type: Ac
 }
 
 fn scheduleActivity(inst: *Instance, activity_type: []const u8, options: workflow.ActivityOptions, args: []const converter.Payload, header: converter.Header, codec_fields: []const []const u8) ScheduleError!*ActivityState {
+    // Checked before `newActivity`, so a refused call takes no sequence number.
+    if (options.start_to_close_timeout == null and options.schedule_to_close_timeout == null) {
+        inst.logger.warn("activity options need start_to_close_timeout or schedule_to_close_timeout", .{ .ActivityType = activity_type });
+        return error.InvalidOptions;
+    }
     const a = inst.arena();
     const state = try inst.newActivity(activity_type, options.cancellation_type);
     const seq = state.seq;
@@ -7312,6 +7317,38 @@ test "local activity without close timeouts: get returns error.InvalidOptions" {
     const cmds = commandsOf(try inst.activate(&try initActivation(a, "LocalGreet", .{@as([]const u8, "no_timeouts")}), a));
     try testing.expectEqual(@as(usize, 1), cmds.len);
     try testing.expectEqualStrings("InvalidOptions", cmds[0].variant.?.fail_workflow_execution.failure.?.message);
+}
+
+// Schedules two remote activities without a close timeout, each of which must fail with
+// error.InvalidOptions, then a valid one.
+const RemoteNoTimeouts = struct {
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        if (ctx.executeActivity(Greet, .{}, .{"x"}).get()) |_| return error.Unexpected else |err| if (err != error.InvalidOptions) return err;
+        var by_name = ctx.executeActivityByName([]const u8, "Elsewhere", .{ .heartbeat_timeout = .fromSeconds(5) }, .{"y"});
+        // `get` returns the error each time.
+        for (0..2) |_| if (by_name.get()) |_| return error.Unexpected else |err| if (err != error.InvalidOptions) return err;
+        return ctx.executeActivity(Greet, .{ .start_to_close_timeout = .fromSeconds(5) }, .{"z"}).get();
+    }
+};
+const RemoteNoTimeoutsWf = workflow.Def("RemoteNoTimeouts", RemoteNoTimeouts.run);
+
+test "activity without close timeouts: get returns error.InvalidOptions and nothing is scheduled" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, RemoteNoTimeoutsWf.registered, .{ .logger = recorder.sink() });
+    defer inst.destroy();
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "RemoteNoTimeouts", .{}), a));
+    // The refused calls took no sequence number: the valid activity is the first.
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    const sched = cmds[0].variant.?.schedule_activity;
+    try testing.expectEqual(@as(u32, 1), sched.seq);
+    try testing.expectEqualStrings("Activity", sched.activity_type);
+    try testing.expectEqual(@as(usize, 2), recorder.count);
+    try testing.expectEqualStrings("activity options need start_to_close_timeout or schedule_to_close_timeout", recorder.message);
+    try testing.expectEqualStrings("Elsewhere", recorder.get("ActivityType").?);
 }
 
 // Each mode passes options that the session API rejects before scheduling anything.

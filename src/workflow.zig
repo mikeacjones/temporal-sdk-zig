@@ -426,7 +426,8 @@ pub const VersioningIntent = enum { unspecified, compatible, default };
 pub const ActivityCancellationType = enum { try_cancel, wait_cancellation_completed, abandon };
 
 /// How an activity is scheduled. At least one of `start_to_close_timeout` and
-/// `schedule_to_close_timeout` is required.
+/// `schedule_to_close_timeout` is required: without either, the future's `get` returns
+/// `error.InvalidOptions` (logged); the activity isn't scheduled.
 /// A duration longer than protobuf can carry (about 10,000 years), such as `Duration.max`, is
 /// sent as the longest one it can; a negative one is sent as it is.
 pub const ActivityOptions = struct {
