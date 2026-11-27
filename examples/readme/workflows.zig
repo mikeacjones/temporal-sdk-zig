@@ -280,6 +280,59 @@ test "workflows: signal, query, and update handlers of a struct workflow" {
     try testing.expectEqual(1, try env.queryWorkflow(GuestCount, a, run.id, .{}));
 }
 
+// example: workflow-update-validator
+pub const SetLimit = workflow.UpdateDef("set_limit", fn (limit: i64) i64);
+const Limits = struct {
+    ctx: *workflow.Context,
+    limit: i64 = 10,
+    set: bool = false,
+    fn setLimit(l: *Limits, limit: i64) i64 {
+        defer l.set = true;
+        const old = l.limit;
+        l.limit = limit;
+        return old;
+    }
+    // Rejects with a message and a failure type, not only an error name. The message must
+    // outlive the run, so it lives in `ctx.allocator()`.
+    fn checkLimit(l: *Limits, limit: i64) error{ ApplicationFailure, OutOfMemory }!void {
+        if (limit > 0) return;
+        return l.ctx.fail(.{
+            .message = try std.fmt.allocPrint(l.ctx.allocator(), "limit must be positive, got {d}", .{limit}),
+            .type = "InvalidLimit",
+        });
+    }
+    fn isSet(l: *Limits) bool {
+        return l.set;
+    }
+};
+fn limits(ctx: *workflow.Context) !i64 {
+    const l = try ctx.allocator().create(Limits); // outlives the workflow function
+    l.* = .{ .ctx = ctx };
+    try ctx.setUpdateHandlerWithValidator(SetLimit, l, Limits.setLimit, Limits.checkLimit);
+    try ctx.await(l, Limits.isSet);
+    try ctx.await(ctx, workflow.Context.allHandlersFinished);
+    return l.limit;
+}
+pub const LimitsWorkflow = workflow.Def("limits", limits);
+// end-example
+
+test "workflows: an update validator rejects with a described failure" {
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(LimitsWorkflow);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = try env.startWorkflow(LimitsWorkflow, .{}, .{});
+    defer run.deinit();
+    var failure: ?temporal.Failure = null;
+    try testing.expectError(error.UpdateFailed, env.updateWorkflow(SetLimit, a, run.id, .{-1}, &failure));
+    try testing.expectEqualStrings("limit must be positive, got -1", failure.?.message);
+    try testing.expectEqual(10, try env.updateWorkflow(SetLimit, a, run.id, .{5}, null));
+    try testing.expectEqual(5, try env.getResult(LimitsWorkflow, &run, a, null));
+}
+
 // example: workflow-dynamic-query
 const Lobby = struct {
     ctx: *workflow.Context,

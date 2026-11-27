@@ -1039,6 +1039,45 @@ Notes:
 - The SDK can't undo a change a handler makes to workflow data or to a `std.Io` primitive, and doesn't detect one that wakes nothing; keeping to reads is the handler's job.
 - The rules apply only to the handler's or validator's own code: other coroutines, including ones that run while a validator is blocked, are unaffected. A validator run in a coroutine neither sees nor uses up that coroutine's cancellation: `io.checkCancel` and a zero `sleep` return normally, and the cancel stays for the coroutine's own code.
 
+A validator that returns an error rejects the update with the error's name as its message. To say why, return `ctx.fail(...)` from the validator: the update is rejected with that application failure, its message and type, and the caller's `failure` gets them. The message must outlive the run, so format it in `ctx.allocator()`:
+
+<!-- example: workflow-update-validator -->
+```zig
+pub const SetLimit = workflow.UpdateDef("set_limit", fn (limit: i64) i64);
+const Limits = struct {
+    ctx: *workflow.Context,
+    limit: i64 = 10,
+    set: bool = false,
+    fn setLimit(l: *Limits, limit: i64) i64 {
+        defer l.set = true;
+        const old = l.limit;
+        l.limit = limit;
+        return old;
+    }
+    // Rejects with a message and a failure type, not only an error name. The message must
+    // outlive the run, so it lives in `ctx.allocator()`.
+    fn checkLimit(l: *Limits, limit: i64) error{ ApplicationFailure, OutOfMemory }!void {
+        if (limit > 0) return;
+        return l.ctx.fail(.{
+            .message = try std.fmt.allocPrint(l.ctx.allocator(), "limit must be positive, got {d}", .{limit}),
+            .type = "InvalidLimit",
+        });
+    }
+    fn isSet(l: *Limits) bool {
+        return l.set;
+    }
+};
+fn limits(ctx: *workflow.Context) !i64 {
+    const l = try ctx.allocator().create(Limits); // outlives the workflow function
+    l.* = .{ .ctx = ctx };
+    try ctx.setUpdateHandlerWithValidator(SetLimit, l, Limits.setLimit, Limits.checkLimit);
+    try ctx.await(l, Limits.isSet);
+    try ctx.await(ctx, workflow.Context.allHandlersFinished);
+    return l.limit;
+}
+pub const LimitsWorkflow = workflow.Def("limits", limits);
+```
+
 `ctx.setDynamicUpdateHandler(context, handler)` takes every update that has no handler of its own, and `ctx.setDynamicUpdateHandlerWithValidator(context, handler, validator)` checks it first. Both get the update name and the arguments still encoded (`converter.EncodedValues`), and the handler returns the update's result:
 
 <!-- example: workflow-dynamic-update -->

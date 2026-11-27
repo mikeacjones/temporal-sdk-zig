@@ -1,9 +1,9 @@
 //! Shopping cart: one long-running workflow per shopping session holds the cart. Clients change
 //! it with the "shopping-cart" update, sent with update-with-start so that the first action
 //! creates the cart and later ones reuse it; the update's validator rejects unknown actions
-//! before they reach history. The "checkout" signal ends the workflow. When the server suggests
-//! continuing as new, the workflow lets running handlers finish and continues as new with the
-//! cart.
+//! before they reach history, with a failure that names the action. The "checkout" signal
+//! ends the workflow. When the server suggests continuing as new, the workflow lets running
+//! handlers finish and continues as new with the cart.
 
 const std = @import("std");
 const temporal = @import("temporal");
@@ -50,13 +50,19 @@ const Cart = struct {
         return c.state;
     }
 
-    fn validate(c: *Cart, action_type: []const u8, item_id: []const u8) error{ ItemIdRequired, UnsupportedActionType }!void {
+    /// Rejects an update before it reaches history. A bare error rejects with its name; an
+    /// unsupported action is rejected through `ctx.fail` with a message saying which, whose
+    /// text lives in `ctx.allocator()` as `fail` requires.
+    fn validate(c: *Cart, action_type: []const u8, item_id: []const u8) error{ ItemIdRequired, ApplicationFailure, OutOfMemory }!void {
         if (std.mem.eql(u8, action_type, "add") or std.mem.eql(u8, action_type, "remove")) {
             if (item_id.len == 0) return error.ItemIdRequired;
         } else if (std.mem.eql(u8, action_type, "list")) {
             if (item_id.len > 0) c.ctx.logger().warn("item_id is not needed for the \"list\" action", .{ .item_id = item_id });
         } else {
-            return error.UnsupportedActionType;
+            return c.ctx.fail(.{
+                .message = try std.fmt.allocPrint(c.ctx.allocator(), "unsupported action type: {s}", .{action_type}),
+                .type = "UnsupportedActionType",
+            });
         }
     }
 
