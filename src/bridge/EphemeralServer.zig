@@ -158,9 +158,17 @@ pub fn deinit(s: *EphemeralServer) void {
 /// that overlaps a redirected one inherits the redirected fds. Other threads' output is
 /// redirected for as long as any start is running.
 pub const ServerOutput = enum {
-    /// Drop it. A server that outlives this process (if the process crashes) then holds no
-    /// pipe of its parent's open; `zig build` waits for a test's output pipes to close, so an
-    /// inherited pipe turns a crashed test into a hung build.
+    /// Keep it out of this process's output. While the server starts, fds 1 and 2 point at an
+    /// unnamed (already unlinked) temporary file, and on a failed start the last part of what
+    /// it holds (at most 4 KiB) is appended to the failure message. The file is shared by every
+    /// start that overlaps in this process, so the reported text can hold another server's
+    /// lines and is not guaranteed to be this server's output alone. The server keeps the file
+    /// as its stdout and stderr for its whole life: output it writes after startup stays in the
+    /// unlinked file (emptied of the startup output once the start ends) until the server
+    /// exits. If the file cannot be created, output goes to /dev/null instead. A server that
+    /// outlives this process (if the process crashes) holds no pipe of its parent's open
+    /// either way; `zig build` waits for a test's output pipes to close, so an inherited pipe
+    /// turns a crashed test into a hung build.
     discard,
     /// Send the server's stdout (its startup banner and logs) to this process's stderr. Never
     /// leave it on stdout when stdout carries data: the Zig test runner uses it for its
@@ -180,6 +188,27 @@ const RedirectState = struct {
     /// /dev/null fd are close-on-exec, so a server child inherits only fds 1 and 2.
     saved_out: c_int = -1,
     saved_err: c_int = -1,
+    /// The `.discard` capture file of this overlap window (3 or above, close-on-exec,
+    /// O_RDWR | O_APPEND, already unlinked), or -1.
+    capture_fd: c_int = -1,
+};
+/// The most bytes of server output a failure message reports.
+const capture_tail_max = 4096;
+/// Makes capture file names unique within the process. Guarded by `redirect_mutex`.
+var capture_seq: u32 = 0;
+// Test hook, read only when builtin.is_test. Tests that set it reset it.
+/// The directory the capture file is created in, instead of TMPDIR or /tmp.
+var test_capture_dir: ?[*:0]const u8 = null;
+
+/// What `OutputRedirect.readTail` found.
+const CaptureTail = union(enum) {
+    /// The start was not a `.discard` start: no output is reported.
+    no_capture_file,
+    /// A `.discard` start whose capture file could not be made or read.
+    not_captured,
+    /// The last part of the capture file (trailing whitespace removed, and cut forward to a
+    /// line start when the file was longer than `capture_tail_max`) and the file's size.
+    text: struct { bytes: []const u8, total: u64 },
 };
 /// A `RedirectState.saved_out` / `saved_err` value: that fd was closed before the start
 /// redirected it, so `restore` closes it again instead of putting a copy back.
@@ -192,6 +221,8 @@ var redirect_state: RedirectState = .{};
 const OutputRedirect = struct {
     /// True when this start holds a count in `redirect_state`. `end` then releases it.
     counted: bool = false,
+    /// True for a `.discard` start, whose failure reports the capture file's tail.
+    discard: bool = false,
 
     /// `.inherit` takes no part. Any other mode joins the redirect: the first start of an
     /// overlap points fds 1 and 2 by its mode, and later ones only count themselves in.
@@ -201,15 +232,16 @@ const OutputRedirect = struct {
         defer unlock();
         if (redirect_state.active == 0) {
             const saved = redirectLocked(mode);
-            redirect_state = .{ .active = 1, .saved_out = saved.out, .saved_err = saved.err };
+            redirect_state = .{ .active = 1, .saved_out = saved.out, .saved_err = saved.err, .capture_fd = saved.capture };
         } else {
             redirect_state.active += 1;
         }
-        return .{ .counted = true };
+        return .{ .counted = true, .discard = mode == .discard };
     }
 
     /// The last start of an overlap to end restores fds 1 and 2 to what they were before the
-    /// first one began.
+    /// first one began, and lets go of the capture file. Its truncate drops the startup output;
+    /// a server still running keeps the file, and O_APPEND puts its later writes at offset 0.
     fn end(r: OutputRedirect) void {
         if (!r.counted) return;
         lock();
@@ -217,8 +249,43 @@ const OutputRedirect = struct {
         std.debug.assert(redirect_state.active > 0);
         redirect_state.active -= 1;
         if (redirect_state.active > 0) return;
+        const capture = redirect_state.capture_fd;
+        if (capture >= 0) _ = std.c.ftruncate(capture, 0);
         restore(redirect_state.saved_out, redirect_state.saved_err);
+        if (capture >= 0) _ = std.c.close(capture);
         redirect_state = .{};
+    }
+
+    /// The tail of the capture file, read into `buf`. Writes are O_APPEND, so the pread moves
+    /// no offset another start relies on.
+    fn readTail(r: *const OutputRedirect, buf: *[capture_tail_max]u8) CaptureTail {
+        if (!r.counted or !r.discard) return .no_capture_file;
+        lock();
+        defer unlock();
+        const fd = redirect_state.capture_fd;
+        if (fd < 0) return .not_captured;
+        const end_offset = std.c.lseek(fd, 0, std.c.SEEK.END);
+        if (end_offset < 0) return .not_captured;
+        const total: u64 = @intCast(end_offset);
+        const want: usize = @intCast(@min(total, capture_tail_max));
+        var got: usize = 0;
+        while (got < want) {
+            const offset: std.c.off_t = @intCast(total - want + got);
+            const n = std.c.pread(fd, buf[got..].ptr, want - got, offset);
+            if (n > 0) {
+                got += @intCast(n);
+            } else if (n == 0) {
+                break;
+            } else if (std.c.errno(n) != .INTR) {
+                return .not_captured;
+            }
+        }
+        var text: []const u8 = buf[0..got];
+        if (total > capture_tail_max) {
+            if (std.mem.indexOfScalar(u8, text, '\n')) |nl| text = text[nl + 1 ..];
+        }
+        text = std.mem.trimEnd(u8, text, &std.ascii.whitespace);
+        return .{ .text = .{ .bytes = text, .total = total } };
     }
 
     fn lock() void {
@@ -230,9 +297,11 @@ const OutputRedirect = struct {
     }
 
     /// Points fds 1 and 2 by `mode` and returns copies of the fds it replaced (-1 for one it
-    /// left alone). On failure it falls back from `.discard` to `.stderr` to nothing, closing
-    /// what it opened. Writes to no global; the caller holds `redirect_mutex`.
-    fn redirectLocked(mode: ServerOutput) struct { out: c_int, err: c_int } {
+    /// left alone) and the capture file it opened (-1 for none). On failure it falls back from
+    /// the capture file to /dev/null, from `.discard` to `.stderr`, and then to nothing,
+    /// closing what it opened. Writes to no global but `capture_seq`; the caller holds
+    /// `redirect_mutex`.
+    fn redirectLocked(mode: ServerOutput) struct { out: c_int, err: c_int, capture: c_int = -1 } {
         switch (mode) {
             .inherit => return .{ .out = -1, .err = -1 },
             .stderr => {
@@ -245,7 +314,7 @@ const OutputRedirect = struct {
                 return .{ .out = saved, .err = -1 };
             },
             .discard => {
-                // Record fds 1 and 2 before opening /dev/null: with one of them closed, open
+                // Record fds 1 and 2 before opening anything: with one of them closed, open
                 // would take that number and the check would see it open.
                 const out = saveFd(1);
                 const err = saveFd(2);
@@ -254,33 +323,74 @@ const OutputRedirect = struct {
                     dropSaved(err);
                     return redirectLocked(.stderr);
                 }
-                const null_fd = nullFd: {
-                    const low = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
-                    if (low < 0 or low >= 3) break :nullFd low;
-                    // Keep it off 0-2, so its close below can never close fd 1 or 2.
-                    const high = dupCloexec(low);
-                    _ = std.c.close(low);
-                    break :nullFd high;
+                const capture = openCaptureFile();
+                const target = if (capture >= 0) capture else keepAbove2(std.c.open("/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }));
+                if (target < 0) {
+                    dropSaved(out);
+                    dropSaved(err);
+                    return redirectLocked(.stderr);
+                }
+                // The capture file stays open until `end`; /dev/null is not needed after.
+                defer if (capture < 0) {
+                    _ = std.c.close(target);
                 };
-                if (null_fd < 0) {
+                if (std.c.dup2(target, 1) < 0) {
+                    if (capture >= 0) _ = std.c.close(capture);
                     dropSaved(out);
                     dropSaved(err);
                     return redirectLocked(.stderr);
                 }
-                defer _ = std.c.close(null_fd);
-                if (std.c.dup2(null_fd, 1) < 0) {
-                    dropSaved(out);
-                    dropSaved(err);
-                    return redirectLocked(.stderr);
-                }
-                if (std.c.dup2(null_fd, 2) < 0) {
+                if (std.c.dup2(target, 2) < 0) {
                     restore(out, -1);
+                    if (capture >= 0) _ = std.c.close(capture);
                     dropSaved(err);
                     return redirectLocked(.stderr);
                 }
-                return .{ .out = out, .err = err };
+                return .{ .out = out, .err = err, .capture = capture };
             },
         }
+    }
+
+    /// `fd` moved to a close-on-exec number of 3 or above, so that closing it can never close
+    /// fd 1 or 2. Negative stays negative.
+    fn keepAbove2(fd: c_int) c_int {
+        if (fd < 0 or fd >= 3) return fd;
+        const high = dupCloexec(fd);
+        _ = std.c.close(fd);
+        return high;
+    }
+
+    /// Creates and unlinks the `.discard` capture file, `<TMPDIR or /tmp>/temporal-zig-server-
+    /// output-<pid>-<seq>`: O_EXCL and O_NOFOLLOW so that no file or link someone else put
+    /// there is used, mode 0600, up to 8 names tried. -1 when none could be made. Allocates
+    /// nothing: the caller holds `redirect_mutex`.
+    fn openCaptureFile() c_int {
+        const dir: []const u8 = dir: {
+            if (builtin.is_test) if (test_capture_dir) |d| break :dir std.mem.span(d);
+            if (std.c.getenv("TMPDIR")) |d| {
+                const trimmed = std.mem.trimEnd(u8, std.mem.span(d), "/");
+                if (trimmed.len > 0) break :dir trimmed;
+            }
+            break :dir "/tmp";
+        };
+        var path_buf: [1024]u8 = undefined;
+        for (0..8) |_| {
+            capture_seq +%= 1;
+            const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/temporal-zig-server-output-{d}-{d}", .{ dir, std.c.getpid(), capture_seq }, 0) catch return -1;
+            const flags: std.c.O = .{ .ACCMODE = .RDWR, .APPEND = true, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true };
+            const fd = keepAbove2(std.c.open(path.ptr, flags, @as(c_uint, 0o600)));
+            if (fd < 0) {
+                if (std.c.errno(fd) == .EXIST) continue;
+                return -1;
+            }
+            if (std.c.unlink(path.ptr) != 0) {
+                // A named file would outlive the start; do without it.
+                _ = std.c.close(fd);
+                return -1;
+            }
+            return fd;
+        }
+        return -1;
     }
 
     /// A close-on-exec copy of `fd`, made in one call. A plain dup survives exec, so a server
@@ -362,11 +472,14 @@ fn freeOwned(o: ?bytes.Owned) void {
     if (o) |v| v.deinit();
 }
 
-fn finishStart(gpa: Allocator, runtime: Runtime, result: StartResult, failure: ?*?[]u8) StartError!EphemeralServer {
+fn finishStart(gpa: Allocator, runtime: Runtime, result: StartResult, tail: CaptureTail, failure: ?*?[]u8) StartError!EphemeralServer {
     defer if (result.fail) |f| f.deinit();
     defer if (result.target) |t| t.deinit();
     const server = result.server orelse {
-        if (failure) |f| f.* = if (result.fail) |msg| msg.dupe(gpa) catch null else null;
+        if (failure) |f| f.* = if (result.fail) |msg|
+            failureMessage(gpa, msg.bytes(), tail) catch msg.dupe(gpa) catch null
+        else
+            null;
         return error.StartFailed;
     };
     const target = gpa.dupe(u8, if (result.target) |t| t.bytes() else "") catch {
@@ -404,8 +517,28 @@ const Start = union(enum) {
     test_server: *const c.TemporalCoreTestServerOptions,
 };
 
+/// The core's start failure followed by what `tail` holds, in one of the forms
+/// `ServerOutput.discard` documents; a copy of `core_message` alone for `.no_capture_file`.
+fn failureMessage(gpa: Allocator, core_message: []const u8, tail: CaptureTail) error{OutOfMemory}![]u8 {
+    const heading = "\nserver output (stdout and stderr";
+    return switch (tail) {
+        .no_capture_file => gpa.dupe(u8, core_message),
+        .not_captured => std.mem.concat(gpa, u8, &.{ core_message, heading ++ "): not captured" }),
+        .text => |t| if (t.total == 0)
+            std.mem.concat(gpa, u8, &.{ core_message, heading ++ "): none; nothing was written before the start failed" })
+        else if (t.total <= capture_tail_max)
+            std.fmt.allocPrint(gpa, "{s}" ++ heading ++ ", {d} bytes):\n{s}", .{ core_message, t.total, t.bytes })
+        else
+            std.fmt.allocPrint(gpa, "{s}" ++ heading ++ ", the last {d} of {d} bytes):\n{s}", .{ core_message, t.bytes.len, t.total, t.bytes }),
+    };
+}
+
+/// One attempt's result and, for a failed `.discard` start that was not a download failure,
+/// the tail of the server's output, which points into the caller's buffer.
+const Attempt = struct { result: StartResult, tail: CaptureTail };
+
 /// Makes one start through the core and waits for its callback.
-fn startOnce(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput, start: Start) error{OutOfMemory}!StartResult {
+fn startOnce(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput, start: Start, tail_buf: *[capture_tail_max]u8) error{OutOfMemory}!Attempt {
     const done = try Completion(StartResult).create(gpa, io, StartResult.free);
     // `onStart` carries the runtime over into its result, for `StartResult.free`.
     done.result = .{ .server = null, .target = null, .fail = null, .runtime = runtime };
@@ -418,7 +551,11 @@ fn startOnce(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput, sta
     }
     // Uncancelable: the core reads the options from `arena` until it calls back, and startup
     // is bounded by its timeout.
-    return done.waitUncancelable();
+    const result = done.waitUncancelable();
+    // The core kills the server and waits for it before it reports a failed start, so its
+    // output is complete here. The capture file goes in `redirect.end()`, after this.
+    const failed = result.server == null and if (result.fail) |f| !isDownloadFailure(f.bytes()) else false;
+    return .{ .result = result, .tail = if (failed) redirect.readTail(tail_buf) else .no_capture_file };
 }
 
 // Test hook, read only when builtin.is_test. Tests that set it reset it.
@@ -445,6 +582,7 @@ fn takeInjectedFailure() bool {
 
 /// The retry loop that startDevServer and startTestServer both end in.
 fn startRetrying(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput, start: Start, failure: ?*?[]u8) StartError!EphemeralServer {
+    var tail_buf: [capture_tail_max]u8 = undefined;
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         const last = attempt == max_start_attempts;
@@ -460,11 +598,13 @@ fn startRetrying(gpa: Allocator, io: Io, runtime: Runtime, output: ServerOutput,
                 continue;
             }
         }
-        const result = try startOnce(gpa, io, runtime, output, start);
+        const once = try startOnce(gpa, io, runtime, output, start, &tail_buf);
+        const result = once.result;
+        // Decided on the core's own message: the server's output never makes a start retry.
         const retry = !last and result.server == null and
             if (result.fail) |f| isDownloadFailure(f.bytes()) else false;
         // A result with a server never retries, so freeing it below never drops a server.
-        if (!retry or !backoff(io, attempt)) return finishStart(gpa, runtime, result, failure);
+        if (!retry or !backoff(io, attempt)) return finishStart(gpa, runtime, result, once.tail, failure);
         result.free();
     }
 }
@@ -931,7 +1071,36 @@ test "a missing executable fails with the core's message" {
     try testing.expectError(error.StartFailed, startDevServer(testing.allocator, testing.io, rt, .{
         .executable = .{ .existing_path = "/nonexistent/temporal" },
     }, &failure));
-    try testing.expect(failure != null and failure.?.len > 0);
+    try testing.expect(failure != null);
+    // The core's message, then the capture file's report: nothing was ever spawned.
+    const none = "\nserver output (stdout and stderr): none; nothing was written before the start failed";
+    try testing.expect(std.mem.endsWith(u8, failure.?, none));
+    try testing.expect(failure.?.len > none.len);
+}
+
+test "a dev server start on a port another socket holds reports the server's own error" {
+    // The CLI exits at once on the taken port and sdk-core, which does not watch it, reports
+    // only its 5 s timeout; the server's own words come from the capture file.
+    const listener = socketCloexec(std.c.AF.INET) orelse return error.TestUnexpectedResult;
+    defer _ = std.c.close(listener);
+    var addr: std.c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try testing.expectEqual(0, std.c.bind(listener, @ptrCast(&addr), len));
+    try testing.expectEqual(0, std.c.listen(listener, 1));
+    try testing.expectEqual(0, std.c.getsockname(listener, @ptrCast(&addr), &len));
+
+    const rt = try Runtime.init(testing.allocator, .{}, null);
+    defer rt.deinit();
+    var failure: ?[]u8 = null;
+    defer if (failure) |f| testing.allocator.free(f);
+    try testing.expectError(error.StartFailed, startDevServer(testing.allocator, testing.io, rt, .{
+        .port = std.mem.bigToNative(u16, addr.port),
+    }, &failure));
+    const message = failure orelse return error.TestUnexpectedResult;
+    errdefer std.debug.print("failure: {s}\n", .{message});
+    try testing.expect(std.mem.indexOf(u8, message, "\nserver output (stdout and stderr") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "address already in use") != null or
+        std.mem.indexOf(u8, message, "can't set frontend port") != null);
 }
 
 test "arguments with newlines are rejected" {
@@ -1295,7 +1464,7 @@ test "overlapping output redirects restore fds 1 and 2 in either order" {
             a.end();
         }
         const ok = first_mode_held and fdIs(1, before_out) and fdIs(2, before_err) and redirect_state.active == 0 and
-            redirect_state.saved_out == -1 and redirect_state.saved_err == -1;
+            redirect_state.saved_out == -1 and redirect_state.saved_err == -1 and redirect_state.capture_fd == -1;
         if (!ok) {
             _ = std.c.dup2(repair_out, 1);
             _ = std.c.dup2(repair_err, 2);
@@ -1319,15 +1488,18 @@ test "every fd an output redirect saves is close-on-exec" {
         const r: OutputRedirect = .begin(mode);
         const saved_out = redirect_state.saved_out;
         const saved_err = redirect_state.saved_err;
-        // A `.discard` start that fell back to `.stderr` saves no copy of fd 2 and fails here.
-        var ok = saved_out >= 0 and (if (mode == .discard) saved_err >= 0 else saved_err == -1);
-        for ([_]c_int{ saved_out, saved_err }) |fd| {
+        const capture = redirect_state.capture_fd;
+        // A `.discard` start that fell back to `.stderr` saves no copy of fd 2 and fails here,
+        // and one that fell back to /dev/null has no capture file.
+        var ok = saved_out >= 0 and (if (mode == .discard) saved_err >= 0 and capture >= 3 else saved_err == -1 and capture == -1);
+        for ([_]c_int{ saved_out, saved_err, capture }) |fd| {
             if (fd < 0) continue;
             const flags = std.c.fcntl(fd, std.c.F.GETFD);
             ok = ok and flags >= 0 and flags & std.c.FD_CLOEXEC != 0;
         }
         r.end();
-        ok = ok and fdIs(1, before_out) and fdIs(2, before_err);
+        ok = ok and fdIs(1, before_out) and fdIs(2, before_err) and redirect_state.capture_fd == -1 and
+            (capture < 0 or std.c.fcntl(capture, std.c.F.GETFD) < 0);
         if (!ok) {
             _ = std.c.dup2(repair_out, 1);
             _ = std.c.dup2(repair_err, 2);
@@ -1336,8 +1508,9 @@ test "every fd an output redirect saves is close-on-exec" {
     }
 }
 
-/// Closes `fd` (1 or 2), runs a `.discard` redirect and checks that /dev/null is on fds 1 and 2
-/// meanwhile and that afterwards `fd` is closed again and the other fd is what it was.
+/// Closes `fd` (1 or 2), runs a `.discard` redirect and checks that the capture file is on fds 1
+/// and 2 meanwhile (not close-on-exec there, so a server inherits it) and that afterwards `fd`
+/// is closed again and the other fd is what it was.
 fn checkDiscardWithClosed(fd: c_int) !void {
     // Repair copies: the runner's stdout protocol and stderr must come back on every path,
     // success included, since this closes one of them on purpose.
@@ -1349,17 +1522,13 @@ fn checkDiscardWithClosed(fd: c_int) !void {
     defer _ = std.c.close(repair_err);
     const other: c_int = if (fd == 1) 2 else 1;
     const other_id = fdId(other) orelse return error.TestUnexpectedResult;
-    const null_id = null_id: {
-        const n = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
-        try testing.expect(n >= 0);
-        defer _ = std.c.close(n);
-        break :null_id fdId(n) orelse return error.TestUnexpectedResult;
-    };
 
     // No `try` from here until the repair.
     _ = std.c.close(fd);
     const r: OutputRedirect = .begin(.discard);
-    var ok = fdIs(1, null_id) and fdIs(2, null_id);
+    const capture = redirect_state.capture_fd;
+    const capture_id = if (capture >= 3) fdId(capture) else null;
+    var ok = capture_id != null and fdIs(1, capture_id.?) and fdIs(2, capture_id.?);
     for ([_]c_int{ 1, 2 }) |f| {
         const flags = std.c.fcntl(f, std.c.F.GETFD);
         ok = ok and flags >= 0 and flags & std.c.FD_CLOEXEC == 0;
@@ -1371,10 +1540,156 @@ fn checkDiscardWithClosed(fd: c_int) !void {
     if (!ok) return error.TestUnexpectedResult;
 }
 
-test "a discard redirect keeps a closed fd 1 closed and puts /dev/null on it meanwhile" {
+test "a discard redirect keeps a closed fd 1 closed and puts the capture file on it meanwhile" {
     try checkDiscardWithClosed(1);
 }
 
-test "a discard redirect keeps a closed fd 2 closed and puts /dev/null on it meanwhile" {
+test "a discard redirect keeps a closed fd 2 closed and puts the capture file on it meanwhile" {
     try checkDiscardWithClosed(2);
+}
+
+/// How many names `fd`'s file has: 0 for an unlinked one. Null when it cannot be read.
+fn linkCount(fd: c_int) ?u64 {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var stx: linux.Statx = undefined;
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .NLINK = true }, &stx)) != .SUCCESS) return null;
+        if (!stx.mask.NLINK) return null;
+        return stx.nlink;
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return null;
+    return @intCast(st.nlink);
+}
+
+/// Runs `body` inside a `.discard` redirect with repair copies of fds 1 and 2, which are put
+/// back whatever `body` returns, so the runner's stdout protocol and stderr survive a failure.
+/// `body` gets the redirect and must not `end` it.
+fn withDiscardRedirect(body: anytype, args: anytype) !void {
+    const repair_out = std.c.dup(1);
+    try testing.expect(repair_out >= 0);
+    defer _ = std.c.close(repair_out);
+    const repair_err = std.c.dup(2);
+    try testing.expect(repair_err >= 0);
+    defer _ = std.c.close(repair_err);
+    const r: OutputRedirect = .begin(.discard);
+    const result = @call(.auto, body, .{&r} ++ args);
+    r.end();
+    _ = std.c.dup2(repair_out, 1);
+    _ = std.c.dup2(repair_err, 2);
+    return result;
+}
+
+fn writeAll(fd: c_int, data: []const u8) !void {
+    var rest = data;
+    while (rest.len > 0) {
+        const n = std.c.write(fd, rest.ptr, rest.len);
+        if (n <= 0) return error.TestUnexpectedResult;
+        rest = rest[@intCast(n)..];
+    }
+}
+
+fn checkCapturesInOrder(r: *const OutputRedirect) !void {
+    const capture = redirect_state.capture_fd;
+    if (capture < 3) return error.TestUnexpectedResult;
+    // Unlinked from the start, so a crashed process leaves no file behind.
+    if (linkCount(capture) != 0) return error.TestUnexpectedResult;
+    try writeAll(1, "to stdout\n");
+    try writeAll(2, "to stderr\n");
+    try writeAll(1, "stdout again\n\n");
+    var buf: [capture_tail_max]u8 = undefined;
+    const tail = r.readTail(&buf);
+    if (tail != .text) return error.TestUnexpectedResult;
+    // Threads left over from earlier tests may log meanwhile, and their lines land in the
+    // file too; this test's writes must be there in order, and the trailing blank line gone.
+    if (tail.text.total < 34) return error.TestUnexpectedResult;
+    var at: usize = 0;
+    for ([_][]const u8{ "to stdout\n", "to stderr\n", "stdout again" }) |piece| {
+        at = (std.mem.indexOfPos(u8, tail.text.bytes, at, piece) orelse return error.TestUnexpectedResult) + piece.len;
+    }
+    if (std.ascii.isWhitespace(tail.text.bytes[tail.text.bytes.len - 1])) return error.TestUnexpectedResult;
+}
+
+test "a discard redirect captures writes to fds 1 and 2 in order in an unlinked file" {
+    try withDiscardRedirect(checkCapturesInOrder, .{});
+    try testing.expectEqual(-1, redirect_state.capture_fd);
+}
+
+fn checkLongTail(r: *const OutputRedirect) !void {
+    // 300 lines of 20 bytes: 6000 bytes, more than the tail holds.
+    var line_buf: [32]u8 = undefined;
+    for (0..300) |i| try writeAll(if (i % 2 == 0) 1 else 2, std.fmt.bufPrint(&line_buf, "line {d:0>4} of output\n", .{i}) catch unreachable);
+    var buf: [capture_tail_max]u8 = undefined;
+    const tail = r.readTail(&buf);
+    if (tail != .text) return error.TestUnexpectedResult;
+    const text = tail.text.bytes;
+    if (tail.text.total < 6000 or text.len > capture_tail_max) return error.TestUnexpectedResult;
+    if (std.mem.indexOf(u8, text, "line 0299 of output") == null) return error.TestUnexpectedResult;
+    // Threads left over from earlier tests may log into the file too, so the expected cut is
+    // worked out from the whole file: a suffix of it without trailing whitespace, starting
+    // right after a newline.
+    const file = try testing.allocator.alloc(u8, @intCast(tail.text.total));
+    defer testing.allocator.free(file);
+    if (std.c.pread(redirect_state.capture_fd, file.ptr, file.len, 0) != file.len) return error.TestUnexpectedResult;
+    const whole = std.mem.trimEnd(u8, file, &std.ascii.whitespace);
+    if (!std.mem.endsWith(u8, whole, text) or whole.len == text.len) return error.TestUnexpectedResult;
+    if (whole[whole.len - text.len - 1] != '\n') return error.TestUnexpectedResult;
+    // The cut drops at most one line's start: these lines are 20 bytes.
+    if (file.len - (whole.len - text.len) > capture_tail_max + 20) return error.TestUnexpectedResult;
+}
+
+test "a capture tail over 4096 bytes starts at a line start" {
+    try withDiscardRedirect(checkLongTail, .{});
+}
+
+test "failure messages give the server output in each form" {
+    const gpa = testing.allocator;
+    const core = "Connection failed: ephemeral server did not start";
+    const cases = [_]struct { tail: CaptureTail, want: []const u8 }{
+        .{ .tail = .no_capture_file, .want = core },
+        .{ .tail = .not_captured, .want = core ++ "\nserver output (stdout and stderr): not captured" },
+        .{ .tail = .{ .text = .{ .bytes = "", .total = 0 } }, .want = core ++ "\nserver output (stdout and stderr): none; nothing was written before the start failed" },
+        .{ .tail = .{ .text = .{ .bytes = "Error: bind", .total = 12 } }, .want = core ++ "\nserver output (stdout and stderr, 12 bytes):\nError: bind" },
+        .{ .tail = .{ .text = .{ .bytes = "last line", .total = 9000 } }, .want = core ++ "\nserver output (stdout and stderr, the last 9 of 9000 bytes):\nlast line" },
+    };
+    for (cases) |case| {
+        const got = try failureMessage(gpa, core, case.tail);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(case.want, got);
+    }
+}
+
+fn checkFallbackToNull(r: *const OutputRedirect, null_id: FdId) !void {
+    if (redirect_state.capture_fd != -1) return error.TestUnexpectedResult;
+    if (!fdIs(1, null_id) or !fdIs(2, null_id)) return error.TestUnexpectedResult;
+    var buf: [capture_tail_max]u8 = undefined;
+    const tail = r.readTail(&buf);
+    if (tail != .not_captured) return error.TestUnexpectedResult;
+    const message = try failureMessage(testing.allocator, "core", tail);
+    defer testing.allocator.free(message);
+    if (!std.mem.eql(u8, message, "core\nserver output (stdout and stderr): not captured")) return error.TestUnexpectedResult;
+}
+
+test "a discard redirect whose capture file cannot be made falls back to /dev/null" {
+    const null_id = null_id: {
+        const n = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        try testing.expect(n >= 0);
+        defer _ = std.c.close(n);
+        break :null_id fdId(n) orelse return error.TestUnexpectedResult;
+    };
+    test_capture_dir = "/nonexistent/temporal-sdk-zig-capture-dir";
+    defer test_capture_dir = null;
+    try withDiscardRedirect(checkFallbackToNull, .{null_id});
+}
+
+test "a stderr or inherit redirect reports no server output" {
+    for ([_]ServerOutput{ .stderr, .inherit }) |mode| {
+        const r: OutputRedirect = .begin(mode);
+        var buf: [capture_tail_max]u8 = undefined;
+        const tail = r.readTail(&buf);
+        const capture = redirect_state.capture_fd;
+        r.end();
+        try testing.expect(tail == .no_capture_file);
+        try testing.expectEqual(-1, capture);
+    }
 }

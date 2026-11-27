@@ -1,5 +1,6 @@
-//! A test that points file descriptor 2 at /dev/null, as src/bridge/EphemeralServer.zig's
-//! OutputRedirect does while a dev server downloads and starts, and then never ends, for the
+//! A test that points file descriptor 2 away from the runner's stderr, as
+//! src/bridge/EphemeralServer.zig's OutputRedirect does (to a temporary file, or /dev/null)
+//! while a dev server downloads and starts, and then never ends, for the
 //! "check hang report names a test whose stderr is redirected" case: the report must still
 //! reach the stderr the process had when the runner started. The check kills the process.
 

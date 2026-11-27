@@ -8,8 +8,8 @@
 //! documents the format.
 //!
 //! "Stderr" here is the one the process had when `start` ran: the report writes to a copy of
-//! file descriptor 2 taken then, so a test that points fd 2 at /dev/null while it starts a dev
-//! server still gets its report seen.
+//! file descriptor 2 taken then, so a test that points fd 2 elsewhere (at a temporary file or
+//! /dev/null) while it starts a dev server still gets its report seen.
 //!
 //! Stacks are read by freezing one thread at a time: SIGURG is sent to it, its handler copies
 //! the interrupted registers into a global slot and spins until the watchdog lets it go.
@@ -178,7 +178,7 @@ fn currentThreadId() u64 {
 
 /// Where the report is written: a close-on-exec copy of file descriptor 2 taken by `start`,
 /// before any test runs, so that a test that points fd 2 elsewhere (as
-/// src/bridge/EphemeralServer.zig's OutputRedirect does, to /dev/null, while a dev server
+/// src/bridge/EphemeralServer.zig's OutputRedirect does, to a temporary file, while a dev server
 /// downloads and starts) does not send the report there too. Fd 2 itself if the copy failed.
 var report_fd: posix.fd_t = posix.STDERR_FILENO;
 
