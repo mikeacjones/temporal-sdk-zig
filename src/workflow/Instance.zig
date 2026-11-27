@@ -805,8 +805,10 @@ const max_eviction_rounds = 16;
 /// members it started still run (`WorkflowIo.hold_starters`), so none returns from under
 /// them; one whose child never exits (cancel protection on, a circular or uncancelable wait,
 /// a cancel swallowed in a loop) is never resumed, and both are counted. This takes rounds:
-/// it stops when a round changes nothing (no coroutine exits and no wait takes a cancel), or
-/// after `max_eviction_rounds` rounds in a row with no new low of `sched.live`. Returns how
+/// it stops when a round changes nothing (no coroutine exited, none was started and no wait
+/// took a cancel), or after `max_eviction_rounds` rounds in a row with no new low of
+/// `sched.live`. It stops for "no change" only after a round in which no coroutine was
+/// started, so every coroutine alive at that end has been sent a cancel. Returns how
 /// many coroutines are still alive, which is always 0 for a run whose coroutine start failed
 /// (see the end). Calling it again returns that count without doing anything else.
 pub fn teardown(inst: *Instance) usize {
@@ -825,7 +827,7 @@ pub fn teardown(inst: *Instance) usize {
     // Select's cases into the Select) must stay valid; one whose child never exits is never
     // resumed, and both are left to `destroy`. The next round reaches coroutines that took
     // the cancel and wait again, or were started meanwhile. Rounds stop when one changes
-    // nothing (no coroutine exits and no wait takes a cancel), or after
+    // nothing (no coroutine exited, none was started and no wait took a cancel), or after
     // `max_eviction_rounds` rounds in a row with no new low of `sched.live`: a coroutine may
     // swallow the cancel and start its work again forever.
     inst.wio.hold_starters = true;
@@ -853,7 +855,9 @@ pub fn teardown(inst: *Instance) usize {
         inst.wio.run();
         const spawned: usize = inst.sched.next_id - id_before;
         const exited = live_before + spawned - inst.sched.live;
-        if (exited == 0 and inst.wio.cancels_delivered == delivered_before) break;
+        // A coroutine started in this round (by one that a wake below let go on) hasn't been
+        // sent a cancel yet; the next round's `cancelAll` does that.
+        if (exited == 0 and spawned == 0 and inst.wio.cancels_delivered == delivered_before) break;
         if (inst.sched.live < fewest) {
             fewest = inst.sched.live;
             stale_rounds = 0;
