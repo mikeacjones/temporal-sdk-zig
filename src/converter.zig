@@ -376,29 +376,47 @@ pub const Direction = enum { encode, decode };
 /// handle, such as a function pointer, an `anyopaque`, or an untagged union. Lets callers
 /// reject a type with an error that names it instead of one deep inside `std.json`.
 pub fn unconvertibleType(comptime T: type, comptime direction: Direction) ?type {
+    comptime {
+        var proved: ConvertibleTypes = .{};
+        return unconvertibleTypeShared(T, direction, &proved);
+    }
+}
+
+/// The types one direction's walks have proved convertible, and the work done so far.
+/// Comptime only. Keep one per `Direction`; discard it after a walk returns non-null.
+pub const ConvertibleTypes = struct {
+    types: []const type = &.{},
+    work: usize = 0,
+};
+
+/// `unconvertibleType`, sharing `proved` with earlier calls of the same direction: a type
+/// already in `proved` is not walked again, and the branch quota is raised from
+/// `proved.work`, the work of all walks so far, not this walk's alone.
+pub fn unconvertibleTypeShared(comptime T: type, comptime direction: Direction, comptime proved: *ConvertibleTypes) ?type {
     if (T == Payload or T == void or T == @TypeOf(null) or T == Bytes) return null;
     if (comptime hasContextHooks(T) or hasPayloadHooks(T) or isProtoMessage(T)) return null;
-    if (@typeInfo(T) == .optional) return unconvertibleType(@typeInfo(T).optional.child, direction);
-    return jsonUnconvertible(T, direction);
+    if (@typeInfo(T) == .optional) return unconvertibleTypeShared(@typeInfo(T).optional.child, direction, proved);
+    return jsonUnconvertible(T, direction, proved);
 }
 
 // Mirrors the type switches of std.json's Stringify.write and innerParse. A depth-first
 // worklist that visits each type once, so shared subtypes are walked once and recursive types
-// terminate. Callers check many methods in one comptime evaluation, so the quota is raised
-// with a wide base plus the walk's own work rather than left at the default 1000.
-fn jsonUnconvertible(comptime Root: type, comptime direction: Direction) ?type {
+// terminate. Zig counts backward branches over the whole comptime evaluation, not per call,
+// so the quota is raised from `proved.work`, the cumulative work of every walk sharing the
+// set, on a wide base rather than left at the default 1000. Callers with many walks
+// (activity.zig, one per parameter and result of every method) share one set per direction
+// inside one container-level constant, which is its own evaluation with its own count.
+fn jsonUnconvertible(comptime Root: type, comptime direction: Direction, comptime proved: *ConvertibleTypes) ?type {
     comptime {
         const hook = if (direction == .encode) "jsonStringify" else "jsonParse";
-        var visited: []const type = &.{};
         var stack: []const type = &.{Root};
-        var work: usize = 0;
         while (stack.len > 0) {
-            work += visited.len + 8;
-            @setEvalBranchQuota(100_000 + 8 * work);
+            proved.work += proved.types.len + 8;
+            @setEvalBranchQuota(100_000 + 8 * proved.work);
             const T = stack[stack.len - 1];
             stack = stack[0 .. stack.len - 1];
-            if (std.mem.indexOfScalar(type, visited, T) != null) continue;
-            visited = visited ++ .{T};
+            if (std.mem.indexOfScalar(type, proved.types, T) != null) continue;
+            proved.types = proved.types ++ .{T};
             var children: []const type = &.{};
             switch (@typeInfo(T)) {
                 .bool, .int, .float, .@"enum" => {},
@@ -431,7 +449,7 @@ fn jsonUnconvertible(comptime Root: type, comptime direction: Direction) ?type {
                 },
                 else => return T,
             }
-            work += children.len;
+            proved.work += children.len;
             // Pushed in reverse so the first field is walked first, as a recursive walk would.
             var i = children.len;
             while (i > 0) {
