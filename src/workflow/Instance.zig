@@ -1117,12 +1117,13 @@ fn setDeploymentVersion(inst: *Instance, v: ?proto.coresdk.common.WorkerDeployme
 
 /// Registers `handler` for queries of type `name`, replacing any handler registered under it.
 /// `name` and the handler's context must outlive the run. `context_addr` is the address the
-/// context points to, if it is a pointer: one into the calling coroutine's stack is rejected,
-/// since that stack is reused once the coroutine returns and queries can arrive after that.
+/// context points to, if it is a pointer: one into a live workflow coroutine's stack (the
+/// caller's or another's) is rejected, since that stack is reused once its coroutine returns
+/// and queries can arrive after that.
 pub fn setQueryHandler(inst: *Instance, name: []const u8, handler: QueryHandler, context_addr: ?usize) error{ OutOfMemory, QueryContextOnStack }!void {
     if (inst.wio.refuse("setQueryHandler")) return;
-    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
-        inst.logger.warn("setQueryHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{ .QueryType = name });
+    if (context_addr) |addr| if (inst.sched.onLiveStack(addr)) {
+        inst.logger.warn("setQueryHandler: the handler context points into a workflow coroutine's stack, which is gone once that coroutine returns; allocate it with ctx.allocator()", .{ .QueryType = name });
         return error.QueryContextOnStack;
     };
     try inst.queries.put(inst.arena(), name, handler);
@@ -1133,8 +1134,8 @@ pub fn setQueryHandler(inst: *Instance, name: []const u8, handler: QueryHandler,
 /// `setQueryHandler`.
 pub fn setDynamicQueryHandler(inst: *Instance, handler: DynamicQueryHandler, context_addr: ?usize) error{QueryContextOnStack}!void {
     if (inst.wio.refuse("setDynamicQueryHandler")) return;
-    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
-        inst.logger.warn("setDynamicQueryHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{});
+    if (context_addr) |addr| if (inst.sched.onLiveStack(addr)) {
+        inst.logger.warn("setDynamicQueryHandler: the handler context points into a workflow coroutine's stack, which is gone once that coroutine returns; allocate it with ctx.allocator()", .{});
         return error.QueryContextOnStack;
     };
     inst.dynamic_query_handler = handler;
@@ -1506,8 +1507,8 @@ fn writeCoroutineRole(inst: *const Instance, w: *std.Io.Writer, f: *const Schedu
 pub fn setSignalHandler(inst: *Instance, name: []const u8, handler: SignalHandler, context_addr: ?usize) error{ OutOfMemory, SignalContextOnStack }!void {
     // Registering can start buffered signals' handler coroutines.
     if (inst.wio.refuse("setSignalHandler")) return;
-    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
-        inst.logger.warn("setSignalHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{ .SignalName = name });
+    if (context_addr) |addr| if (inst.sched.onLiveStack(addr)) {
+        inst.logger.warn("setSignalHandler: the handler context points into a workflow coroutine's stack, which is gone once that coroutine returns; allocate it with ctx.allocator()", .{ .SignalName = name });
         return error.SignalContextOnStack;
     };
     try inst.signal_handlers.put(inst.arena(), name, handler);
@@ -1529,8 +1530,8 @@ pub fn setSignalHandler(inst: *Instance, name: []const u8, handler: SignalHandle
 /// `setSignalHandler`.
 pub fn setDynamicSignalHandler(inst: *Instance, handler: SignalHandler, context_addr: ?usize) error{ OutOfMemory, SignalContextOnStack }!void {
     if (inst.wio.refuse("setDynamicSignalHandler")) return;
-    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
-        inst.logger.warn("setDynamicSignalHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{});
+    if (context_addr) |addr| if (inst.sched.onLiveStack(addr)) {
+        inst.logger.warn("setDynamicSignalHandler: the handler context points into a workflow coroutine's stack, which is gone once that coroutine returns; allocate it with ctx.allocator()", .{});
         return error.SignalContextOnStack;
     };
     inst.dynamic_signal_handler = handler;
@@ -1663,8 +1664,8 @@ fn startSignalHandler(inst: *Instance, handler: SignalHandler, signal: *const Si
 pub fn setUpdateHandler(inst: *Instance, name: []const u8, handler: UpdateHandler, context_addr: ?usize) error{ OutOfMemory, UpdateContextOnStack }!void {
     // Registering can validate and accept buffered updates and start their coroutines.
     if (inst.wio.refuse("setUpdateHandler")) return;
-    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
-        inst.logger.warn("setUpdateHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{ .UpdateName = name });
+    if (context_addr) |addr| if (inst.sched.onLiveStack(addr)) {
+        inst.logger.warn("setUpdateHandler: the handler context points into a workflow coroutine's stack, which is gone once that coroutine returns; allocate it with ctx.allocator()", .{ .UpdateName = name });
         return error.UpdateContextOnStack;
     };
     try inst.update_handlers.put(inst.arena(), name, handler);
@@ -1713,8 +1714,8 @@ fn deliverUpdate(inst: *Instance, job: *const act_pb.DoUpdate) !void {
 /// context must outlive the run; `context_addr` is checked as in `setUpdateHandler`.
 pub fn setDynamicUpdateHandler(inst: *Instance, handler: UpdateHandler, context_addr: ?usize) error{ OutOfMemory, UpdateContextOnStack }!void {
     if (inst.wio.refuse("setDynamicUpdateHandler")) return;
-    if (context_addr) |addr| if (inst.sched.onCurrentStack(addr)) {
-        inst.logger.warn("setDynamicUpdateHandler: the handler context points into the workflow coroutine's stack, which is gone once the coroutine returns; allocate it with ctx.allocator()", .{});
+    if (context_addr) |addr| if (inst.sched.onLiveStack(addr)) {
+        inst.logger.warn("setDynamicUpdateHandler: the handler context points into a workflow coroutine's stack, which is gone once that coroutine returns; allocate it with ctx.allocator()", .{});
         return error.UpdateContextOnStack;
     };
     inst.dynamic_update_handler = handler;
@@ -8199,6 +8200,59 @@ test "query: a handler context on the workflow coroutine's stack is rejected" {
     const done = commandsOf(try inst.activate(&try initActivation(a, "OnStack", .{}), a));
     try testing.expectEqualStrings("\"QueryContextOnStack\"", done[0].variant.?.complete_workflow_execution.result.?.data);
     try testing.expectEqual(@as(usize, 0), inst.queries.count());
+}
+
+// A coroutine registers handlers with a context on another live coroutine's stack: the
+// root's local, which is gone once the root returns while the handlers would stay.
+const CrossStackWf = struct {
+    const Status = workflow.QueryDef("status", fn () i64);
+    const Bump = workflow.SignalDef("bump", fn () void);
+    const Set = workflow.UpdateDef("set", fn () i64);
+
+    const State = struct {
+        value: i64 = 0,
+
+        fn status(s: *State) i64 {
+            return s.value;
+        }
+        fn bump(s: *State) void {
+            s.value += 1;
+        }
+        fn set(s: *State) i64 {
+            return s.value;
+        }
+    };
+
+    /// Registers a query, a signal and an update handler with `s`, a pointer into the
+    /// root's stack, and returns the three outcomes joined by ",".
+    fn register(ctx: *workflow.Context, s: *State) error{OutOfMemory}![]const u8 {
+        const q: []const u8 = if (ctx.setQueryHandler(Status, s, State.status)) "accepted" else |err| @errorName(err);
+        const g: []const u8 = if (ctx.setSignalHandler(Bump, s, State.bump)) "accepted" else |err| @errorName(err);
+        const u: []const u8 = if (ctx.setUpdateHandler(Set, s, State.set)) "accepted" else |err| @errorName(err);
+        return std.mem.join(ctx.allocator(), ",", &.{ q, g, u });
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        var s: State = .{};
+        var f = ctx.io().async(register, .{ ctx, &s });
+        return f.await(ctx.io());
+    }
+};
+const CrossStackDef = workflow.Def("CrossStack", CrossStackWf.run);
+
+test "handler contexts on another live coroutine's stack are rejected" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const inst = try create(testing.allocator, CrossStackDef.registered, .{});
+    defer inst.destroy();
+    try testing.expectEqualStrings(
+        "\"QueryContextOnStack,SignalContextOnStack,UpdateContextOnStack\"",
+        completedWith(try inst.activate(&try initActivation(a, "CrossStack", .{}), a)),
+    );
+    try testing.expectEqual(@as(usize, 0), inst.queries.count());
+    try testing.expectEqual(@as(usize, 0), inst.signal_handlers.count());
+    try testing.expectEqual(@as(usize, 0), inst.update_handlers.count());
 }
 
 // The dynamic update handler. `State.log` records each update the dynamic handler ran.
