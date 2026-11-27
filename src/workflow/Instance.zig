@@ -6784,6 +6784,47 @@ test "eviction does not let a Select case added by a helper that returned write 
     }
 }
 
+// A workflow that completes normally from `select.await()` with the first result and forgets
+// `select.cancelDiscard()`, leaving the other case blocked: the bead's own case of "a
+// workflow that returned while a Select case was still blocked", with the Select on the
+// root's stack as TimerRace keeps it. Before eviction canceled that case it stayed blocked
+// and its stack leaked; eviction must not now make it put its result into the stack of the
+// root, which returned (and released its stack) before the eviction began.
+const SelectForgotten = struct {
+    const Done = union(enum) { quick: std.Io.Cancelable!void, slow: std.Io.Cancelable!void };
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var buf: [2]Done = undefined;
+        var select: std.Io.Select(Done) = .init(io, &buf);
+        select.async(.quick, std.Io.sleep, .{ io, .fromSeconds(0), .awake });
+        select.async(.slow, std.Io.sleep, .{ io, .fromSeconds(60), .awake });
+        // Fill the stack pool, so a stack released from here on is unmapped.
+        var fill: [16]std.Io.Future(void) = undefined;
+        for (&fill) |*f| f.* = io.async(SelectCleanup.noop, .{});
+        for (&fill) |*f| f.await(io);
+        _ = try select.await();
+        return "done";
+    }
+};
+const SelectForgottenWf = workflow.Def("SelectForgotten", SelectForgotten.run);
+
+test "eviction does not let a Select case write into the stack of a workflow that completed before it" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, SelectForgottenWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
+    const cmds = commandsOf(try inst.activate(&try initActivation(a, "SelectForgotten", .{}), a));
+    try testing.expect(cmds[cmds.len - 1].variant.? == .complete_workflow_execution);
+    // Only the slow case is left; the root has returned.
+    try testing.expectEqual(@as(usize, 1), inst.sched.live);
+    try testing.expectEqual(@as(usize, 0), inst.teardown());
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 0), recorder.count);
+}
+
 // ctx.sleep with a summary: alone, as an io.async coroutine that is canceled, and racing an
 // activity in a Select.
 const SummaryTimers = struct {
