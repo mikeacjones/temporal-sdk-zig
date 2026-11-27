@@ -1,0 +1,1 @@
+On Linux, a process using the SDK no longer dies of SIGPIPE when a server or proxy closes a connection that sdk-core then writes to: the write fails with an error instead. The SDK blocks SIGPIPE only on sdk-core's threads; the process's own SIGPIPE handling is unchanged.
