@@ -229,11 +229,15 @@ pub fn currentFiber(s: *const Scheduler) ?*Fiber {
     return s.current;
 }
 
-/// Whether `addr` lies in the stack of the fiber currently executing. False outside a fiber.
-pub fn onCurrentStack(s: *const Scheduler, addr: usize) bool {
-    const f = s.current orelse return false;
-    const start = @intFromPtr(f.stack.memory.ptr);
-    return addr >= start and addr < start + f.stack.memory.len;
+/// Whether `addr` lies in the stack of any unfinished fiber (running, ready or blocked).
+/// Callable inside or outside a fiber.
+pub fn onLiveStack(s: *const Scheduler, addr: usize) bool {
+    var it = s.live_head;
+    while (it) |f| : (it = f.live_next) {
+        const start = @intFromPtr(f.stack.memory.ptr);
+        if (addr >= start and addr < start + f.stack.memory.len) return true;
+    }
+    return false;
 }
 
 /// The oldest unfinished fiber; `Fiber.live_next` gives the rest in spawn order.
@@ -734,10 +738,22 @@ fn recordStack(out: *usize) void {
     out.* = @intFromPtr(&local);
 }
 
-fn checkOnStack(s: *const Scheduler, heap_addr: usize, out: *[2]bool) void {
+/// Publishes the address of a local of its own stack, then blocks until `release` wakes it.
+fn holdStackLocal(s: *Scheduler, published: *usize, self: *?*Fiber) void {
     var local: u8 = 0;
     std.mem.doNotOptimizeAway(&local);
-    out.* = .{ s.onCurrentStack(@intFromPtr(&local)), s.onCurrentStack(heap_addr) };
+    published.* = @intFromPtr(&local);
+    self.* = s.currentFiber();
+    s.block();
+}
+
+/// Checks another fiber's published local, its own local and a heap address, then wakes
+/// the other fiber.
+fn checkOnStack(s: *Scheduler, other_addr: *const usize, other: *const ?*Fiber, heap_addr: usize, out: *[3]bool) void {
+    var local: u8 = 0;
+    std.mem.doNotOptimizeAway(&local);
+    out.* = .{ s.onLiveStack(other_addr.*), s.onLiveStack(@intFromPtr(&local)), s.onLiveStack(heap_addr) };
+    s.wake(other.*.?);
 }
 
 test "spawn returns StackTooSmall for a zero stack size" {
@@ -785,16 +801,28 @@ test "stackMappingLen rounds up to whole pages plus a guard page, or is null on 
     try testing.expectEqual(@as(?usize, null), stackMappingLen(largest_len - page + 1));
 }
 
-test "onCurrentStack tells the running fiber's stack from other memory" {
+test "onLiveStack tells every live fiber's stack from other memory" {
     var s: Scheduler = .init(testing.allocator, .{ .stack_size = 64 * 1024 });
     defer s.deinit();
     const heap = try testing.allocator.create(u8);
     defer testing.allocator.destroy(heap);
-    var seen: [2]bool = .{ false, true };
-    _ = try s.spawn("check", checkOnStack, .{ &s, @intFromPtr(heap), &seen });
+    var held: usize = 0;
+    var holder: ?*Fiber = null;
+    _ = try s.spawn("hold", holdStackLocal, .{ &s, &held, &holder });
+    s.run(); // the holder publishes its local and blocks
+    try testing.expect(holder != null);
+    // Outside any fiber: the blocked fiber's stack still counts, the heap doesn't.
+    try testing.expect(s.onLiveStack(held));
+    try testing.expect(!s.onLiveStack(@intFromPtr(heap)));
+    try testing.expect(!s.onLiveStack(@intFromPtr(&held)));
+    var seen: [3]bool = .{ false, false, true };
+    _ = try s.spawn("check", checkOnStack, .{ &s, &held, &holder, @intFromPtr(heap), &seen });
     s.run();
-    try testing.expectEqual([2]bool{ true, false }, seen);
-    try testing.expect(!s.onCurrentStack(@intFromPtr(&seen))); // outside any fiber
+    try testing.expectEqual([3]bool{ true, true, false }, seen);
+    try testing.expectEqual(@as(usize, 0), s.live);
+    // Both finished: their stacks are no longer live.
+    try testing.expect(!s.onLiveStack(held));
+    try testing.expect(!s.onLiveStack(@intFromPtr(heap)));
 }
 
 test "finished fiber stacks are reused" {
