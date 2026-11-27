@@ -63,6 +63,12 @@ read_only: bool = false,
 /// The first coroutine start that failed. Sticky: never cleared, since the run already went
 /// on differently than it would have with the coroutine started.
 start_failure: ?StartFailure = null,
+/// While set, `wake` and `wakeFirst` skip a wait whose coroutine has started coroutines that
+/// are still running (see `cancelAll`). Set by eviction around its wakes of operation waiters.
+wake_leaves_only: bool = false,
+/// How many cancel requests a coroutine's wait has taken (returned `error.Canceled`), for
+/// eviction to see that its cancels still change something.
+cancels_delivered: u64 = 0,
 
 /// Read-only code (a query handler, an update validator) run by the host between
 /// `beginReadOnly` and `endReadOnly`. The section belongs to the coroutine it began on, or to
@@ -175,27 +181,23 @@ pub fn cancelTask(w: *WorkflowIo, task: *Task) void {
     w.requestCancel(task);
 }
 
-/// Requests cancellation of every coroutine started through this Io that hasn't finished:
-/// top-level tasks, futures (io.async, io.concurrent) and group members (std.Io.Group, a
-/// Select's cases). Call it outside any coroutine; `run` lets them exit.
+/// Requests cancellation of every coroutine started through this Io that hasn't finished and
+/// has no coroutine of its own still running, in start order: top-level tasks, futures
+/// (io.async, io.concurrent) and group members (std.Io.Group, a Select's cases). Call it
+/// outside any coroutine; `run` lets them exit. Call it again after `run` to reach the
+/// coroutines whose children have exited since.
 ///
-/// The requests go newest first, so the coroutines they wake run newest first: a coroutine
-/// runs before the one that started it, while that one's stack is still in use. A Select
-/// case finishing puts its result into the Select, which usually lives on the stack of the
-/// coroutine that started it; woken oldest first, that coroutine could return (a canceled
-/// `select.await()` returns without canceling the cases) and its stack go back to the pool
-/// before the case writes into it.
+/// A coroutine with running children is left alone because they may still write into its
+/// stack: a Select case puts its result into the Select, which usually lives on the stack of
+/// the coroutine that started it, and a canceled `select.await()` returns without canceling
+/// the cases. Canceling the starter would let it return, and its stack be unmapped, before
+/// the case finishes.
 pub fn cancelAll(w: *WorkflowIo) void {
     assert(w.scheduler.currentFiber() == null);
-    var last = w.scheduler.firstLive();
-    while (last) |f| {
-        if (f.live_next == null) break;
-        last = f.live_next;
-    }
-    var it = last;
-    while (it) |f| : (it = f.live_prev) {
+    var it = w.scheduler.firstLive();
+    while (it) |f| : (it = f.live_next) {
         const task: *Task = @ptrCast(@alignCast(f.user orelse continue));
-        w.requestCancel(task);
+        if (task.running_children == 0) w.requestCancel(task);
     }
 }
 
@@ -214,12 +216,19 @@ pub fn waitFor(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void
 
 /// Wakes a coroutine blocked in `waitFor`. Safe to call more than once.
 pub fn wake(w: *WorkflowIo, wait: *Wait) void {
+    if (w.holdsWake(wait)) return;
     w.wakeWait(wait);
+}
+
+fn holdsWake(w: *const WorkflowIo, wait: *const Wait) bool {
+    if (!w.wake_leaves_only) return false;
+    const task: *const Task = @ptrCast(@alignCast(wait.fiber.user orelse return false));
+    return task.running_children > 0;
 }
 
 /// `wake`, but a coroutine that this wakes runs before the others that are ready.
 pub fn wakeFirst(w: *WorkflowIo, wait: *Wait) void {
-    if (wait.woken) return;
+    if (wait.woken or w.holdsWake(wait)) return;
     wait.woken = true;
     if (wait.fiber.state == .blocked) w.scheduler.wakeFirst(wait.fiber);
 }
@@ -303,6 +312,11 @@ pub const Task = struct {
     waiting_on: ?*const Wait = null,
     group: ?*GroupState = null,
     group_next: ?*Task = null,
+    /// The coroutine that started this one, while both are running; null for a top-level
+    /// task, and cleared when the starter finishes first.
+    starter: ?*Task = null,
+    /// How many coroutines this one started are still running.
+    running_children: usize = 0,
     /// Allocation backing this Task, its context, and its result.
     memory: []u8,
     memory_align: Alignment,
@@ -377,6 +391,10 @@ fn createTask(
     errdefer w.destroyTask(task);
     task.fiber = w.scheduler.spawn(name, taskMain, .{ w, task }) catch return error.StackUnavailable;
     task.fiber.user = task;
+    if (w.currentTask()) |starter| {
+        task.starter = starter;
+        starter.running_children += 1;
+    }
     return task;
 }
 
@@ -469,6 +487,16 @@ fn taskMain(w: *WorkflowIo, task: *Task) void {
     task.start(task.context.ptr, task.result.ptr);
     w.settleOwedWake();
     task.done = true;
+    if (task.starter) |starter| starter.running_children -= 1;
+    if (task.running_children > 0) {
+        // The children outlive this Task block, which may be freed below.
+        var it = w.scheduler.firstLive();
+        while (it) |f| : (it = f.live_next) {
+            const child: *Task = @ptrCast(@alignCast(f.user orelse continue));
+            if (child.starter == task) child.starter = null;
+        }
+        task.running_children = 0;
+    }
     switch (task.kind) {
         .future => if (task.awaiter) |a| w.wakeWait(a),
         .group => {
@@ -528,6 +556,7 @@ fn block(w: *WorkflowIo, wait: *Wait, cancelable: bool) Io.Cancelable!void {
         if (cancelable) if (task) |t| {
             if (t.cancel_requested and t.cancel_protection == .unblocked) {
                 t.cancel_requested = false;
+                w.cancels_delivered += 1;
                 return error.Canceled;
             }
         };
@@ -843,6 +872,7 @@ fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
     const t = w.ownCancelTask() orelse return;
     if (t.cancel_requested and t.cancel_protection == .unblocked) {
         t.cancel_requested = false;
+        w.cancels_delivered += 1;
         return error.Canceled;
     }
 }
@@ -1525,7 +1555,7 @@ const SelectExits = struct {
     }
 };
 
-test "cancelAll runs a Select's case before the coroutine whose stack holds the Select" {
+test "cancelAll leaves the coroutine whose stack holds a Select alone until its case exits" {
     var sched: Scheduler = .init(testing.allocator, .{ .stack_size = 256 * 1024 });
     var memory: std.heap.ArenaAllocator = .init(testing.allocator);
     defer memory.deinit();
@@ -1536,6 +1566,8 @@ test "cancelAll runs a Select's case before the coroutine whose stack holds the 
     _ = try wio.spawn("wf", SelectExits.starter, .{ wio.io(), &order });
     wio.run();
     wio.cancelAll();
+    const starter: *Task = @ptrCast(@alignCast(sched.firstLive().?.user.?));
+    try testing.expect(!starter.cancel_requested);
     wio.run();
     try testing.expectEqual(@as(usize, 0), sched.live);
     try testing.expectEqualSlices(u32, &.{ 2, 1 }, order.items());

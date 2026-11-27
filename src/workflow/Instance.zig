@@ -793,14 +793,17 @@ pub fn destroy(inst: *Instance) void {
     gpa.destroy(inst);
 }
 
-/// The most rounds of cancel and run `teardown` does while coroutines keep exiting.
+/// The most rounds of cancel and run `teardown` goes on for without the number of live
+/// coroutines falling below its lowest so far.
 const max_eviction_rounds = 16;
 
 /// The first half of `destroy`: marks the run evicting, so `emit` drops every command from
 /// here on, cancels every live coroutine (the root, handlers, and futures, group members and
 /// Select cases nobody awaited), wakes waits that ignore cancellation, and runs the scheduler
-/// so they exit and their defers run, in rounds while a round lets one exit (at most
-/// `max_eviction_rounds`). Returns how many coroutines are still alive, which is always 0 for
+/// so they exit and their defers run. A coroutine is canceled and woken only once the
+/// coroutines it started have exited, so it never returns from under them; this takes rounds,
+/// which go on while each changes something, until `max_eviction_rounds` in a row leave no
+/// fewer coroutines than before. Returns how many coroutines are still alive, which is always 0 for
 /// a run whose coroutine start failed (see the end). Calling it again returns that count
 /// without doing anything else.
 pub fn teardown(inst: *Instance) usize {
@@ -813,19 +816,24 @@ pub fn teardown(inst: *Instance) usize {
     // Any coroutine may still be blocked, even after the workflow finished: the root and
     // handlers (a handler's error finishes it, and handlers outlive the root), and futures,
     // group members and Select cases that the coroutine starting them never awaited or
-    // canceled. A round cancels them all and lets them exit; another round reaches one that
-    // waits again, or is started, while another unwinds. Rounds stop when one lets nothing
-    // exit, or after `max_eviction_rounds`, since a coroutine may swallow the cancel and
-    // start its work again forever.
-    var rounds: usize = 0;
-    while (inst.sched.live > 0 and rounds < max_eviction_rounds) : (rounds += 1) {
+    // canceled. A round cancels the coroutines with no running children of their own and lets
+    // them exit (see `WorkflowIo.cancelAll`); the next round reaches their starters, and
+    // coroutines that took the cancel and wait again, or were started meanwhile. Rounds stop
+    // when one changes nothing (no coroutine exits and no wait takes a cancel), or once
+    // `max_eviction_rounds` in a row leave no fewer coroutines than the fewest so far: a
+    // coroutine may swallow the cancel and start its work again forever.
+    var fewest = inst.sched.live;
+    var stale_rounds: usize = 0;
+    while (inst.sched.live > 0 and stale_rounds < max_eviction_rounds) {
         const live_before = inst.sched.live;
         const id_before = inst.sched.next_id;
+        const delivered_before = inst.wio.cancels_delivered;
         inst.wio.cancelAll();
         // Coroutines already waiting for an operation's cancellation to complete don't see
         // the cancel, and neither do coroutines it doesn't reach (one waiter of several on a
-        // shared future); wake every waiter. The order doesn't matter: nothing they do is sent
-        // to the core.
+        // shared future); wake every waiter, except those with running children, as for the
+        // cancel. The order doesn't matter: nothing they do is sent to the core.
+        inst.wio.wake_leaves_only = true;
         var pending = inst.activities.valueIterator();
         while (pending.next()) |state| state.*.waiters.wakeAll(&inst.wio);
         var backing_off = inst.backoffs.valueIterator();
@@ -836,9 +844,15 @@ pub fn teardown(inst: *Instance) usize {
         while (operations.next()) |state| state.*.wake(&inst.wio);
         var externals = inst.externals.valueIterator();
         while (externals.next()) |state| state.*.waiters.wakeAll(&inst.wio);
+        inst.wio.wake_leaves_only = false;
         inst.wio.run();
         const spawned: usize = inst.sched.next_id - id_before;
-        if (live_before + spawned == inst.sched.live) break;
+        const exited = live_before + spawned - inst.sched.live;
+        if (exited == 0 and inst.wio.cancels_delivered == delivered_before) break;
+        if (inst.sched.live < fewest) {
+            fewest = inst.sched.live;
+            stale_rounds = 0;
+        } else stale_rounds += 1;
     }
     std.debug.assert(inst.commands.items.len == 0);
     if (inst.wio.start_failure != null and inst.sched.live > 0) {
@@ -6405,6 +6419,52 @@ test "eviction does not let a Select case that waits again write into its return
     const inst = try create(testing.allocator, SelectCleanupWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
     _ = try inst.activate(&try initActivation(a, "SelectCleanup", .{}), a);
     try testing.expectEqual(@as(usize, 2), inst.sched.live);
+    try testing.expectEqual(@as(usize, 0), inst.teardown());
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 0), recorder.count);
+}
+
+// A Select case in an uncancelable wait that its sibling case's defer ends, in a workflow
+// that returns from a canceled `select.await()`. Both cases use the root's stack (the Select
+// and the event), so the root must not return before they exit.
+const SelectSibling = struct {
+    const Done = union(enum) { waited: void, slept: std.Io.Cancelable!void };
+
+    fn waiter(io: std.Io, event: *std.Io.Event) void {
+        event.waitUncancelable(io);
+    }
+
+    fn sleeper(io: std.Io, event: *std.Io.Event) std.Io.Cancelable!void {
+        defer event.set(io);
+        try io.sleep(.fromSeconds(60), .awake);
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var event: std.Io.Event = .unset;
+        var buf: [2]Done = undefined;
+        var select: std.Io.Select(Done) = .init(io, &buf);
+        select.async(.waited, waiter, .{ io, &event });
+        select.async(.slept, sleeper, .{ io, &event });
+        // Fill the stack pool, so a stack released from here on is unmapped.
+        var fill: [16]std.Io.Future(void) = undefined;
+        for (&fill) |*f| f.* = io.async(SelectCleanup.noop, .{});
+        for (&fill) |*f| f.await(io);
+        _ = try select.await();
+        return "done";
+    }
+};
+const SelectSiblingWf = workflow.Def("SelectSibling", SelectSibling.run);
+
+test "eviction does not let a Select case its sibling wakes write into its returned starter's stack" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, SelectSiblingWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
+    _ = try inst.activate(&try initActivation(a, "SelectSibling", .{}), a);
+    try testing.expectEqual(@as(usize, 3), inst.sched.live);
     try testing.expectEqual(@as(usize, 0), inst.teardown());
     inst.destroy();
     try testing.expectEqual(@as(usize, 0), recorder.count);
