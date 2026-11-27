@@ -6470,6 +6470,47 @@ test "eviction does not let a Select case its sibling wakes write into its retur
     try testing.expectEqual(@as(usize, 0), recorder.count);
 }
 
+// A workflow that, like TimerRace, returns from `select.await()` without canceling its cases,
+// but here the await returns normally: the eviction cancel ends one case, whose result wakes
+// the root, while the other case takes the cancel and waits again. The root then returns and
+// frees its stack, which holds the Select, before the second case puts its result into it.
+const SelectWokenByCase = struct {
+    const Done = union(enum) { quick: std.Io.Cancelable!void, slow: std.Io.Cancelable!void };
+
+    fn quick(io: std.Io) std.Io.Cancelable!void {
+        try io.sleep(.fromSeconds(60), .awake);
+    }
+
+    fn run(ctx: *workflow.Context) ![]const u8 {
+        const io = ctx.io();
+        var buf: [2]Done = undefined;
+        var select: std.Io.Select(Done) = .init(io, &buf);
+        select.async(.quick, quick, .{io});
+        select.async(.slow, SelectCleanup.case, .{io});
+        // Fill the stack pool, so a stack released from here on is unmapped.
+        var fill: [16]std.Io.Future(void) = undefined;
+        for (&fill) |*f| f.* = io.async(SelectCleanup.noop, .{});
+        for (&fill) |*f| f.await(io);
+        _ = try select.await();
+        return "done";
+    }
+};
+const SelectWokenByCaseWf = workflow.Def("SelectWokenByCase", SelectWokenByCase.run);
+
+test "eviction does not let a Select case write into the stack of a starter its sibling's result woke" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var recorder: LogRecorder = .{ .arena = .init(testing.allocator), .min = .warn };
+    defer recorder.arena.deinit();
+    const inst = try create(testing.allocator, SelectWokenByCaseWf.registered, .{ .stack_size = hog_stack, .logger = recorder.sink() });
+    _ = try inst.activate(&try initActivation(a, "SelectWokenByCase", .{}), a);
+    try testing.expectEqual(@as(usize, 3), inst.sched.live);
+    try testing.expectEqual(@as(usize, 0), inst.teardown());
+    inst.destroy();
+    try testing.expectEqual(@as(usize, 0), recorder.count);
+}
+
 // ctx.sleep with a summary: alone, as an io.async coroutine that is canceled, and racing an
 // activity in a Select.
 const SummaryTimers = struct {
