@@ -546,21 +546,35 @@ pub fn MethodDefs(comptime T: type, comptime options: StructOptions) type {
 }
 
 fn activityMethodNames(comptime T: type) []const []const u8 {
-    const info = switch (@typeInfo(T)) {
-        .@"struct" => |s| s,
-        else => @compileError("activity.defs and registerActivities take a struct type, not " ++ @typeName(T)),
+    return ActivityMethods(T).names;
+}
+
+/// T's activity method names, found and checked in a container-level constant so the
+/// check is one comptime evaluation with a branch budget of its own.
+fn ActivityMethods(comptime T: type) type {
+    return struct {
+        const names: []const []const u8 = blk: {
+            const info = switch (@typeInfo(T)) {
+                .@"struct" => |s| s,
+                else => @compileError("activity.defs and registerActivities take a struct type, not " ++ @typeName(T)),
+            };
+            // One set per direction across all methods: a type proved convertible for one
+            // method isn't walked again for the next.
+            var decoded: converter.ConvertibleTypes = .{};
+            var encoded: converter.ConvertibleTypes = .{};
+            var found: []const []const u8 = &.{};
+            for (info.decl_names) |name| {
+                const F = @TypeOf(@field(T, name));
+                if (!isActivityMethod(T, F)) continue;
+                checkConvertible(T, name, F, &decoded, &encoded);
+                found = found ++ .{name};
+            }
+            if (found.len == 0)
+                @compileError(@typeName(T) ++ " has no activity methods: give it a pub fn (*" ++ @typeName(T) ++ ", *temporal.activity.Context, args...) !Result");
+            const array = found[0..found.len].*;
+            break :blk &array;
+        };
     };
-    var names: []const []const u8 = &.{};
-    for (info.decl_names) |name| {
-        const F = @TypeOf(@field(T, name));
-        if (!isActivityMethod(T, F)) continue;
-        checkConvertible(T, name, F);
-        names = names ++ .{name};
-    }
-    if (names.len == 0)
-        @compileError(@typeName(T) ++ " has no activity methods: give it a pub fn (*" ++ @typeName(T) ++ ", *temporal.activity.Context, args...) !Result");
-    const array = names[0..names.len].*;
-    return &array;
 }
 
 fn isActivityMethod(comptime T: type, comptime F: type) bool {
@@ -574,18 +588,18 @@ fn isActivityMethod(comptime T: type, comptime F: type) bool {
     return fallible and !dynamic and (f.param_types[0] == *T or f.param_types[0] == *const T) and f.param_types[1] == *Context;
 }
 
-fn checkConvertible(comptime T: type, comptime method: []const u8, comptime F: type) void {
+fn checkConvertible(comptime T: type, comptime method: []const u8, comptime F: type, comptime decoded: *converter.ConvertibleTypes, comptime encoded: *converter.ConvertibleTypes) void {
     const f = @typeInfo(F).@"fn";
     const what = @typeName(T) ++ "." ++ method;
     const fix = "; if it is a helper rather than an activity, make it non-pub";
     for (f.param_types[2..], 3..) |P, i| {
-        if (converter.unconvertibleType(P.?, .decode)) |bad| @compileError(std.fmt.comptimePrint(
+        if (converter.unconvertibleTypeShared(P.?, .decode, decoded)) |bad| @compileError(std.fmt.comptimePrint(
             "activity method {s}: parameter {d} type {s} can't be decoded by the payload converter (because of {s}){s}",
             .{ what, i, @typeName(P.?), @typeName(bad), fix },
         ));
     }
     const R = @typeInfo(f.return_type.?).error_union.payload;
-    if (converter.unconvertibleType(R, .encode)) |bad| @compileError(std.fmt.comptimePrint(
+    if (converter.unconvertibleTypeShared(R, .encode, encoded)) |bad| @compileError(std.fmt.comptimePrint(
         "activity method {s}: result type {s} can't be encoded by the payload converter (because of {s}){s}",
         .{ what, @typeName(R), @typeName(bad), fix },
     ));
@@ -901,6 +915,115 @@ test "defs checks methods sharing a large nested record without raising the bran
     const shipped = try converter.fromPayload(Order, a, try shipping.invoke(shipping.receiver, &ctx, args.items));
     try std.testing.expectEqual(.shipped, shipped.status);
     try std.testing.expectEqualStrings("Widget", shipped.items[0].name);
+}
+
+// A record of about 80 distinct nested types: each level is a struct of its own holding a
+// pointer to the next. `tag` keeps two roots distinct so neither check is memoized away.
+fn TestNode(comptime tag: u8, comptime n: usize) type {
+    if (n == 0) return struct { leaf: u8 };
+    return struct {
+        id: u32,
+        name: []const u8,
+        next: ?*const TestNode(tag, n - 1),
+    };
+}
+
+// About 20 activity methods taking and returning the record of `TestNode(tag, 79)`.
+fn ManyMethods(comptime tag: u8) type {
+    return struct {
+        const R = TestNode(tag, 79);
+        fn same(r: R) R {
+            return r;
+        }
+        pub fn m01(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m02(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m03(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m04(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m05(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m06(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m07(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m08(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m09(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m10(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m11(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m12(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m13(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m14(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m15(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m16(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m17(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m18(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m19(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+        pub fn m20(_: *@This(), _: *Context, r: R) !R {
+            return same(r);
+        }
+    };
+}
+
+test "defs checks about 20 methods sharing a record of about 80 nested types" {
+    const Big = ManyMethods(1);
+    const acts = defs(Big, .{ .prefix = "Big." });
+    try std.testing.expectEqual(20, @typeInfo(@TypeOf(acts)).@"struct".field_names.len);
+    try std.testing.expectEqualStrings("Big.m20", acts.m20.activity_name);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var impl: Big = .{};
+    var ctx: Context = .{ .arena = a, .io_ = std.testing.io, .info_ = undefined, .logger_ = .{} };
+    const leaf: TestNode(1, 77) = .{ .id = 77, .name = "leaf", .next = null };
+    const root: Big.R = .{ .id = 79, .name = "root", .next = &.{ .id = 78, .name = "mid", .next = &leaf } };
+    const args = try converter.toPayloads(a, .{root});
+    const reg = acts.m07.with(&impl);
+    const back = try converter.fromPayload(Big.R, a, try reg.invoke(reg.receiver, &ctx, args.items));
+    try std.testing.expectEqual(79, back.id);
+    try std.testing.expectEqualStrings("root", back.name);
+    try std.testing.expectEqualStrings("leaf", back.next.?.next.?.name);
+}
+
+test "defs checks two large structs registered in one function" {
+    const first = defs(ManyMethods(2), .{ .prefix = "First." });
+    const second = defs(ManyMethods(3), .{ .prefix = "Second." });
+    try std.testing.expectEqualStrings("First.m01", first.m01.activity_name);
+    try std.testing.expectEqualStrings("Second.m20", second.m20.activity_name);
 }
 
 test "heartbeats reach the sink and details decode" {
