@@ -1,0 +1,2 @@
+A `ResolveNexusOperationStart` or `ResolveChildWorkflowExecutionStart` activation job without a status now fails the workflow task with an application failure of type `MalformedActivationJob`, instead of being ignored and leaving the workflow waiting on `NexusOperationFuture.started`, `NexusOperationFuture.get` or the child's start.
+The warnings for an empty `NexusOperationOptions.endpoint` and a negative timeout name `workflow.Context.executeNexusOperationByName` when that function was called, not `executeNexusOperation`.

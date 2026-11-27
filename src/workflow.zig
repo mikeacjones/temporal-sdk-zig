@@ -1387,7 +1387,7 @@ pub const Context = struct {
     /// (`interceptor.WorkflowOutbound.executeNexusOperation`).
     pub fn executeNexusOperation(ctx: *Context, comptime Service: type, comptime Operation: type, options: NexusOperationOptions, input: Operation.Input) NexusOperationFuture(Operation.Output) {
         if (comptime call_check.callError("executeNexusOperation", Service, Operation)) |message| @compileError(message);
-        return .{ .ctx = ctx, .state = ctx.instance.executeNexusOperation(Service.service_name, Operation.operation_name, options, input).state };
+        return .{ .ctx = ctx, .state = ctx.instance.executeNexusOperation(false, Service.service_name, Operation.operation_name, options, input).state };
     }
 
     /// Schedules a Nexus operation by its service and operation names, for a service this
@@ -1396,7 +1396,7 @@ pub const Context = struct {
     /// copied. An empty service or operation name makes the future return
     /// `error.InvalidOptions` (logged).
     pub fn executeNexusOperationByName(ctx: *Context, comptime Output: type, service: []const u8, operation: []const u8, options: NexusOperationOptions, input: anytype) NexusOperationFuture(Output) {
-        return .{ .ctx = ctx, .state = ctx.instance.executeNexusOperation(service, operation, options, input).state };
+        return .{ .ctx = ctx, .state = ctx.instance.executeNexusOperation(true, service, operation, options, input).state };
     }
 
     /// Sends `Signal` (a `SignalDef`) with `args` to the workflow `workflow_id` and returns a
