@@ -883,7 +883,11 @@ pub const WorkflowEnvironment = struct {
     /// is only guaranteed to be no earlier than the close. For the close time, use
     /// `close_time` from `env.client.describeWorkflow(arena, run.id, run.run_id)`, or
     /// `ctx.now()` inside the workflow. A child or cron run can start in that window too: a
-    /// parent's cron child can run once more before the parent-close policy terminates it.
+    /// parent's cron child can run once more before this returns. The time-skipping server
+    /// doesn't apply a parent-close policy, so a child of a closed run, cron or not, keeps
+    /// running and runs again on every later time skip (`env.sleep`, a later `getResult`);
+    /// read a child's run count right after its parent's result, or terminate the child
+    /// through `env.client`. The dev server applies the policy.
     pub fn getResult(
         env: *WorkflowEnvironment,
         comptime Workflow: type,
@@ -8841,8 +8845,8 @@ test "time-skipping WorkflowEnvironment: a cron child runs at most once more aft
     // schedule time; it ran if the server scheduled it a workflow task. The time-skipping
     // server runs the first at once, so starting at half past the hour the parent's two hours
     // cover that run and two hourly ones. A run after the close is one the server started
-    // between the close and the re-lock in `getResult`, before the parent-close policy
-    // terminated the child.
+    // between the close and the re-lock in `getResult`. The server applies no parent-close
+    // policy, so the child keeps running; the count is read before anything else skips time.
     var before: usize = 0;
     var after: usize = 0;
     var run_id = child.?.run_id;
@@ -8865,9 +8869,13 @@ test "time-skipping WorkflowEnvironment: a cron child runs at most once more aft
         run_id = next;
     }
     try testing.expectEqual(3, before);
-    // The extra run happens (it did on every try when this test was written), but nothing
-    // promises it: it depends on when the server terminates the child.
+    // The extra run happened on every try when this test was written, but it depends on the
+    // server firing the child's next schedule time before the re-lock arrives.
     try testing.expect(after <= 1);
+
+    // The time-skipping server applies no parent-close policy: the child's latest run is still
+    // open, not terminated, after its parent closed. The dev server would have terminated it.
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.running, (try env.client.describeWorkflow(a, child_id, "")).status);
 
     // The worker started the parent and the child's three runs live, and at most the extra run.
     try testing.expect(watch.count(false) >= 4 and watch.count(false) <= 5);
