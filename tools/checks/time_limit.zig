@@ -10,6 +10,11 @@
 //!     and whatever it started (such as the symbolizer), prints
 //!     `time-limit: <case>: <program> did not end within <seconds> s and was killed` to
 //!     stderr and exits 124. SIGINT, SIGTERM and SIGHUP kill the group the same way.
+//!     When a signal that neither of those kills sent ended the program (one from outside,
+//!     such as the system's SIGKILL under memory pressure, or the program's own SIGABRT),
+//!     prints `time-limit: <case>: ended by signal <N> (SIG<NAME>)` to stderr before
+//!     exiting 128 + N, so that a case failing that way shows why even when the program
+//!     printed nothing. A timeout prints only its own message.
 //!
 //! The program may replace itself (see `tsan-suppressions exec`); it keeps the group.
 
@@ -56,14 +61,35 @@ pub fn main(init: std.process.Init) !void {
     watchdog.detach();
 
     const term = child.wait(init.io) catch |err| fatal("{s}: cannot wait for {s}: {t}", .{ case, argv[0], err });
-    std.process.exit(statusAfterWait(term));
+    // One load decides both the line and the status, so they cannot disagree.
+    const forced = forced_status.load(.acquire);
+    if (try signalLine(arena, case, term, forced)) |line|
+        std.Io.File.stderr().writeStreamingAll(init.io, line) catch {};
+    std.process.exit(statusFor(term, forced));
 }
 
 /// The status to exit with once the program has ended: the one the watchdog or a signal
 /// handler recorded before killing the group, or else the program's own.
 pub fn statusAfterWait(term: std.process.Child.Term) u8 {
-    const forced = forced_status.load(.acquire);
+    return statusFor(term, forced_status.load(.acquire));
+}
+
+/// `statusAfterWait` given the forced status it read.
+fn statusFor(term: std.process.Child.Term, forced: u8) u8 {
     return if (forced != 0) forced else exitStatus(term);
+}
+
+/// The line naming the signal that ended the program, or null when no signal did, or
+/// when this process killed the group (`forced` is not 0): then the timeout message or
+/// the signal sent to this process already explains the end.
+fn signalLine(gpa: std.mem.Allocator, case: []const u8, term: std.process.Child.Term, forced: u8) error{OutOfMemory}!?[]u8 {
+    if (forced != 0) return null;
+    const sig = switch (term) {
+        .signal => |sig| sig,
+        else => return null,
+    };
+    const prefix: []const u8, const name: []const u8 = if (std.enums.tagName(posix.SIG, sig)) |n| .{ "SIG", n } else .{ "", "unnamed" };
+    return try std.fmt.allocPrint(gpa, "time-limit: {s}: ended by signal {d} ({s}{s})\n", .{ case, @backingInt(sig), prefix, name });
 }
 
 /// Ends this process with `timeout_status` after `seconds`, having killed the group. The
@@ -137,6 +163,29 @@ test "after a timeout or a signal killed the group, the recorded status wins ove
     forced_status.store(timeout_status, .release);
     try testing.expectEqual(@as(u8, timeout_status), statusAfterWait(.{ .signal = .KILL }));
     try testing.expectEqual(@as(u8, timeout_status), statusAfterWait(.{ .exited = 0 }));
+}
+
+test "a signal from outside is named, with 128 plus the signal as the status" {
+    const line = (try signalLine(testing.allocator, "tsan race", .{ .signal = .KILL }, 0)).?;
+    defer testing.allocator.free(line);
+    try testing.expectEqualStrings("time-limit: tsan race: ended by signal 9 (SIGKILL)\n", line);
+    try testing.expectEqual(@as(u8, 128 + 9), statusFor(.{ .signal = .KILL }, 0));
+
+    const abort = (try signalLine(testing.allocator, "c", .{ .signal = .ABRT }, 0)).?;
+    defer testing.allocator.free(abort);
+    try testing.expectEqualStrings("time-limit: c: ended by signal 6 (SIGABRT)\n", abort);
+}
+
+test "after a timeout or a forwarded signal, and after an exit, no signal is named" {
+    // The watchdog's kill: only its timeout message, and 124.
+    try testing.expectEqual(@as(?[]u8, null), try signalLine(testing.allocator, "c", .{ .signal = .KILL }, timeout_status));
+    try testing.expectEqual(@as(u8, timeout_status), statusFor(.{ .signal = .KILL }, timeout_status));
+    // SIGTERM to this process, which killed the group.
+    try testing.expectEqual(@as(?[]u8, null), try signalLine(testing.allocator, "c", .{ .signal = .KILL }, 128 + 15));
+    // The program's own exit, clean or not.
+    try testing.expectEqual(@as(?[]u8, null), try signalLine(testing.allocator, "c", .{ .exited = 0 }, 0));
+    try testing.expectEqual(@as(u8, 0), statusFor(.{ .exited = 0 }, 0));
+    try testing.expectEqual(@as(?[]u8, null), try signalLine(testing.allocator, "c", .{ .exited = 66 }, 0));
 }
 
 test "the exit status is the program's, or 128 plus the signal that ended it" {
