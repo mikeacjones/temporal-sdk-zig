@@ -77,39 +77,27 @@ test "workflow fails when no schedule started it" {
     try testing.expectEqual(0, Recorder.len);
 }
 
-fn runWorker(w: *temporal.worker.Worker) temporal.worker.Worker.RunError!void {
-    return w.run();
-}
-
 test "a triggered schedule runs the workflow, which hands the schedule ID to the activity" {
     Recorder.reset();
-    var server = try temporal.testing.DevServer.start(testing.allocator, testing.io, .{});
-    defer server.stop(testing.io);
-    var client = try temporal.client.Client.connect(testing.allocator, testing.io, server.clientOptions());
-    defer client.close();
-
-    var w = try temporal.worker.Worker.init(testing.allocator, testing.io, &client, "schedule", .{});
-    defer w.deinit();
-    try w.registerWorkflow(sample.SampleScheduleWorkflow);
-    try w.registerActivity(temporal.activity.Def(sample.DoSomething.activity_name, Recorder.doSomething));
-    var running = try testing.io.concurrent(runWorker, .{&w});
-    defer {
-        w.stop();
-        running.await(testing.io) catch {};
-    }
+    const env = try temporal.testing.WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(sample.SampleScheduleWorkflow);
+    try env.registerActivityAs(sample.DoSomething, Recorder.doSomething);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var handle = try client.createSchedule("schedule_test", .{ .schedule = .{
+    // The schedule starts its workflow on the environment's task queue, through its client.
+    var handle = try env.client.createSchedule("schedule_test", .{ .schedule = .{
         .action = try schedule.startWorkflow(a, sample.SampleScheduleWorkflow, .{}, .{
             .id = "schedule_workflow",
-            .task_queue = "schedule",
+            .task_queue = env.task_queue,
         }),
         .spec = .{},
     } });
     defer handle.deinit();
     defer handle.delete() catch {};
+    try env.startWorker();
     try handle.trigger(.allow_all);
 
     // Wait, for at most 30 s, until the schedule has started the workflow.
@@ -120,20 +108,14 @@ test "a triggered schedule runs the workflow, which hands the schedule ID to the
         if (polls == 300) return error.TestUnexpectedResult;
         try testing.io.sleep(.fromMilliseconds(100), .awake);
     };
-    var run = try client.getWorkflow(void, action.workflow.workflow_id, action.workflow.run_id);
+    // getResultByName waits for the run and replays its history.
+    var run = try env.client.getWorkflow(void, action.workflow.workflow_id, action.workflow.run_id);
     defer run.deinit();
-    try run.get(a);
+    try env.getResultByName(void, &run, a, null);
 
     const by, const at = try Recorder.only(testing.io);
     try testing.expectEqualStrings("schedule_test", by);
-    // The search attribute holds the scheduled time to the second.
+    // The server truncates the scheduled time to the second in the search attribute.
     const ns_per_s = std.time.ns_per_s;
     try testing.expectEqual(@divFloor(action.scheduled_at.?.nanoseconds, ns_per_s), @divFloor(at.unix_ns, ns_per_s));
-
-    // The scheduled run replays its own history.
-    var replayer = temporal.testing.WorkflowReplayer.init(testing.allocator, testing.io);
-    defer replayer.deinit();
-    try replayer.registerWorkflow(sample.SampleScheduleWorkflow);
-    const replayed = try replayer.replayWorkflowExecution(a, &client, run.id, run.run_id);
-    try testing.expectEqual(null, replayed.err);
 }

@@ -30,7 +30,8 @@ const common = proto.temporal.api.common.v1;
 const log = std.log.scoped(.temporal);
 
 /// The search attribute the server sets on each workflow a schedule starts: the time the
-/// action was scheduled for (before jitter).
+/// action was scheduled for (before jitter). The server truncates it to the second, so it
+/// can be up to a second before the action's `scheduled_at` in `Description.info`.
 pub const scheduled_start_time = search_attributes.key(.datetime, "TemporalScheduledStartTime");
 /// The search attribute the server sets on each workflow a schedule starts: the schedule's
 /// ID.

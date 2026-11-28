@@ -1,0 +1,1 @@
+`testing.WorkflowEnvironment.startWorker` starts the environment's worker for runs a test starts from `env.client` or from a schedule on `env.task_queue`, whose results `getResultByName` then reads and replays.

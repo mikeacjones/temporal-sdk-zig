@@ -628,7 +628,7 @@ pub const WorkflowEnvironment = struct {
         args: Workflow.Args,
     ) !client_mod.WorkflowRun(Workflow.Result) {
         try env.checkTimeLock();
-        try env.ensureWorker();
+        try env.startWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
         return env.client.executeWorkflow(Workflow, try env.startOptions(Workflow.workflow_name, options, &generated_id), args);
@@ -661,7 +661,7 @@ pub const WorkflowEnvironment = struct {
         args: anytype,
     ) !client_mod.WorkflowRun(Result) {
         try env.checkTimeLock();
-        try env.ensureWorker();
+        try env.startWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
         return env.client.executeWorkflowByName(Result, workflow_type, try env.startOptions(workflow_type, options, &generated_id), args);
@@ -680,7 +680,7 @@ pub const WorkflowEnvironment = struct {
     /// without the timer firing.
     pub fn queryWorkflow(env: *WorkflowEnvironment, comptime Query: type, arena: Allocator, workflow_id: []const u8, args: Query.Args) !Query.Result {
         try env.checkTimeLock();
-        try env.ensureWorker();
+        try env.startWorker();
         return env.client.queryWorkflow(Query, arena, workflow_id, "", args);
     }
 
@@ -704,7 +704,7 @@ pub const WorkflowEnvironment = struct {
         failure: ?*?failure_mod.Failure,
     ) !Update.Result {
         try env.checkTimeLock();
-        try env.ensureWorker();
+        try env.startWorker();
         var handle = try env.client.updateWorkflow(Update, workflow_id, "", args, .{});
         defer handle.deinit();
         return handle.get(arena) catch |err| {
@@ -728,7 +728,7 @@ pub const WorkflowEnvironment = struct {
         signal_args: Signal.Args,
     ) !client_mod.WorkflowRun(Workflow.Result) {
         try env.checkTimeLock();
-        try env.ensureWorker();
+        try env.startWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
         return env.client.signalWithStartWorkflow(Workflow, try env.startOptions(Workflow.workflow_name, options, &generated_id), args, Signal, signal_args);
@@ -751,20 +751,32 @@ pub const WorkflowEnvironment = struct {
         update_options: client_mod.UpdateOptions,
     ) !client_mod.WorkflowUpdateHandle(Update.Result) {
         try env.checkTimeLock();
-        try env.ensureWorker();
+        try env.startWorker();
         var generated_id: ?[]u8 = null;
         defer if (generated_id) |id| env.gpa.free(id);
         return env.client.updateWithStartWorkflow(Workflow, try env.startOptions(Workflow.workflow_name, options, &generated_id), args, Update, update_args, update_options);
     }
 
-    /// Starts the worker if it isn't running, and waits until it polls (so an eager start
-    /// reaches it). A worker that fails to start returns its error here.
-    fn ensureWorker(env: *WorkflowEnvironment) !void {
+    /// Starts the environment's worker if it isn't running, and waits until it polls (so an
+    /// eager start reaches it). It is idempotent: once the worker runs, it returns at once.
+    /// The `start*`, `execute*`, `signalWithStart*` and `updateWithStart*` helpers call it.
+    ///
+    /// Call it for runs a test starts some other way, from a client or a schedule:
+    /// `env.task_queue` is the queue the worker polls and `env.client` the client to start
+    /// them with (`env.client.executeWorkflow`, or a schedule action with
+    /// `.task_queue = env.task_queue` through `env.client.createSchedule`). Wait for such a
+    /// run with `getResultByName` (or `getResult`) on `env.client.getWorkflow(...)`.
+    ///
+    /// It returns `error.NothingRegistered` when nothing is registered; the environment can
+    /// then register and call it again. A worker that fails to start returns its error here.
+    /// It does not touch the time-skipping server's time lock. Not thread-safe, like the rest
+    /// of the environment; the worker is owned by the environment and stopped in `deinit`.
+    pub fn startWorker(env: *WorkflowEnvironment) !void {
         if (env.running != null) return;
         const w = &env.worker;
         // Begin the run's generation before spawning it: the task may not have entered `run`
         // when `waitUntilRunning` below takes the mutex, and on a reused worker (a first
-        // `ensureWorker` that returned NothingRegistered) it would then report the previous
+        // `startWorker` that returned NothingRegistered) it would then report the previous
         // run's failed start, and the `await` below would wait for a run that polls. `run`
         // raises the generation again and settles the one it ends at, which this waits for.
         {
@@ -2606,7 +2618,7 @@ const GateFixtures = struct {
         var id_buf: [64]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buf, "gate-{t}-{s}-{s}", .{ call, if (bounded) "bounded" else "canceled", env.task_queue });
         const update_id = "pass-ann";
-        try env.ensureWorker();
+        try env.startWorker();
         if (call != .update_with_start) {
             var run = try env.startWorkflow(Gate, .{ .id = id, .task_queue = "" }, .{});
             run.deinit();
@@ -3284,9 +3296,9 @@ test "WorkflowEnvironment runs a workflow with a test double for its activity" {
 test "WorkflowEnvironment runs a workflow after its first start failed with NothingRegistered" {
     const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
-    try testing.expectError(error.NothingRegistered, env.ensureWorker());
+    try testing.expectError(error.NothingRegistered, env.startWorker());
     try testing.expect(env.running == null);
-    // Without the generation begun before the spawn, `ensureWorker` saw the first run's failed
+    // Without the generation begun before the spawn, `startWorker` saw the first run's failed
     // start and then awaited the new run, which polls until stopped. The bound stops the
     // worker, so that shows as `error.WorkerFailedToStart` here rather than a hung suite.
     const Bound = struct {
@@ -7523,7 +7535,7 @@ test "client: create, describe, update, pause, trigger, backfill, list and delet
     const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
     defer env.deinit();
     try env.registerWorkflow(ScheduleFixtures.ScheduledBy);
-    try env.ensureWorker();
+    try env.startWorker();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -7635,6 +7647,40 @@ test "client: create, describe, update, pause, trigger, backfill, list and delet
     try handle.delete();
     try testing.expectError(error.NotFound, handle.describe(a));
     try testing.expectError(error.NotFound, handle.trigger(.unspecified));
+}
+
+test "WorkflowEnvironment.startWorker serves a run a schedule starts on env.task_queue" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    // Before anything is registered there is nothing to serve, and the environment stays usable.
+    try testing.expectError(error.NothingRegistered, env.startWorker());
+    try env.registerWorkflow(ScheduleFixtures.ScheduledBy);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = try std.fmt.allocPrint(a, "start-worker-{s}", .{env.task_queue});
+
+    // No spec: the schedule only takes the action it is triggered for.
+    var handle = try env.client.createSchedule(id, .{ .schedule = .{
+        .action = try schedule.startWorkflowByName(a, "ScheduledBy", .{"triggered"}, .{
+            .id = "start-worker-run",
+            .task_queue = env.task_queue,
+            .run_timeout = .fromSeconds(30),
+        }),
+        .spec = .{},
+    } });
+    defer handle.deinit();
+    defer handle.delete() catch {};
+    try env.startWorker();
+    try env.startWorker();
+    try handle.trigger(.unspecified);
+
+    const d = try ScheduleFixtures.waitForActions(&handle, a, 1);
+    const started = d.info.recent_actions[0].workflow;
+    var run = try env.client.getWorkflow([]const u8, started.workflow_id, started.run_id);
+    defer run.deinit();
+    const want = try std.fmt.allocPrint(a, "triggered from {s}, scheduled time known: true", .{id});
+    try testing.expectEqualStrings(want, try env.getResultByName([]const u8, &run, a, null));
 }
 
 test "an activity signals its own workflow through ctx.client()" {
@@ -7969,7 +8015,7 @@ test "client: standalone activities run without a workflow; get, describe, cance
     defer StandaloneFixtures.stop(env);
     try env.registerActivity(StandaloneFixtures.Charge);
     try env.registerActivity(StandaloneFixtures.Hold);
-    try env.ensureWorker();
+    try env.startWorker();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -8135,7 +8181,7 @@ test "client: a standalone activity's handle decodes its result and failure with
     defer env.deinit();
     try env.registerActivity(StandaloneContextFixtures.Echo);
     try env.registerActivity(StandaloneContextFixtures.Refuse);
-    try env.ensureWorker();
+    try env.startWorker();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -8166,7 +8212,7 @@ test "client: a standalone activity starts with a delay, a priority and a summar
     defer StandaloneFixtures.stop(env);
     try env.registerActivity(StandaloneFixtures.Charge);
     try env.registerActivity(StandaloneFixtures.Hold);
-    try env.ensureWorker();
+    try env.startWorker();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -8234,7 +8280,7 @@ test "client: a standalone activity can be paused, unpaused and deleted, and rep
     defer StandaloneFixtures.stop(env);
     try env.registerActivity(StandaloneFollowUpFixtures.Beat);
     try env.registerActivity(StandaloneFixtures.Charge);
-    try env.ensureWorker();
+    try env.startWorker();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -8378,7 +8424,7 @@ test "client: cancelling a standalone activity while its pause reaches the runni
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args });
     defer StandaloneFixtures.stop(env);
     try env.registerActivity(PauseThenCancelFixtures.Hold);
-    try env.ensureWorker();
+    try env.startWorker();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
