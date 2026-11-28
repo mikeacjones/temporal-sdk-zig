@@ -3297,7 +3297,13 @@ const SecondQueueFixtures = struct {
     const task_queue = "doubles-second-queue";
 
     fn hello(ctx: *workflow.Context, name: []const u8) ![]const u8 {
-        const greeting = ctx.executeActivity(Fixtures.Greet, .{ .task_queue = task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{name});
+        // The schedule-to-close timeout bounds the test: if the second worker never polls,
+        // the activity times out and the workflow fails instead of waiting forever.
+        const greeting = ctx.executeActivity(Fixtures.Greet, .{
+            .task_queue = task_queue,
+            .start_to_close_timeout = .fromSeconds(10),
+            .schedule_to_close_timeout = .fromSeconds(30),
+        }, .{name});
         return greeting.get();
     }
     const Hello = workflow.Def("HelloOnSecondQueue", hello);

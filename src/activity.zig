@@ -442,8 +442,9 @@ pub const Registered = struct {
 ///   `error.AlreadyRegistered`.
 /// - Names starting with "__temporal_" belong to the SDK and return
 ///   `error.ReservedActivityName`.
-/// - `Worker.registerActivityImpl` and `testing.WorkflowEnvironment.registerActivityAs`
-///   register another implementation under an existing Def's name, such as a test double.
+/// - `Worker.registerActivityAs`, `Worker.registerActivityImpl` and
+///   `testing.WorkflowEnvironment.registerActivityAs` register another implementation under
+///   an existing Def's name, such as a test double.
 /// - `defs` names each activity method of a struct as the prefix plus the method name, and
 ///   `Worker.registerActivities` registers the names of that same `defs` value.
 pub fn Def(comptime name: []const u8, comptime func: anytype) type {
