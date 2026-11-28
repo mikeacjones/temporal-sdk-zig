@@ -1482,6 +1482,51 @@ pub const LogRecorder = struct {
     }
 };
 
+/// A thread-safe `metrics.Handler` that keeps every metric and value recorded through it.
+///
+/// Give its `handler()` to `ActivityEnvironment.metrics`, or to a client or environment as
+/// `.metrics = .{ .exporter = .{ .custom = r.handler() } }`, and a test can read back what a
+/// workflow, an activity or sdk-core recorded. Every method but `init` and `deinit` may be
+/// called from any thread: sdk-core records from threads of its own.
+pub const MetricsRecorder = struct {
+    recorder: bridge.metric.TestRecorder,
+
+    /// One recorded value: `metric.definition` (name, description, unit, kind), `value`,
+    /// and `attributes` flattened, later keys replacing earlier ones. `get(key)` returns the
+    /// value of the last attribute named `key`, as a `metrics.AttributeValue`, or null.
+    pub const Record = bridge.metric.TestRecorder.Record;
+
+    pub fn init(gpa: Allocator) MetricsRecorder {
+        return .{ .recorder = .init(gpa) };
+    }
+
+    /// Frees every metric and record. Call it after the client or environment using the
+    /// handler is closed: the core frees its metric and attribute handles into the recorder
+    /// while closing.
+    pub fn deinit(r: *MetricsRecorder) void {
+        r.recorder.deinit();
+        r.* = undefined;
+    }
+
+    /// For `ActivityEnvironment.metrics`, or `.metrics = .{ .exporter = .{ .custom = r.handler() } }`.
+    /// Borrowed: the recorder must outlive the client or environment, and must not move after
+    /// this call, since the handler holds its address. Every copy shares this one recorder.
+    pub fn handler(r: *MetricsRecorder) metrics_mod.Handler {
+        return .{ .ptr = &r.recorder, .vtable = &bridge.metric.TestRecorder.vtable };
+    }
+
+    /// The records of the metric named `name`, oldest first. The slice comes from `arena`;
+    /// what it points to is the recorder's, valid until `deinit`.
+    pub fn recordsOf(r: *MetricsRecorder, arena: Allocator, name: []const u8) error{OutOfMemory}![]Record {
+        return r.recorder.recordsOf(arena, name);
+    }
+
+    /// Whether a metric named `name` was created, recorded to or not.
+    pub fn hasMetric(r: *MetricsRecorder, name: []const u8) bool {
+        return r.recorder.hasMetric(name);
+    }
+};
+
 /// Replays recorded histories against registered workflows.
 pub const WorkflowReplayer = struct {
     gpa: Allocator,

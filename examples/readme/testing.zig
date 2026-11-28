@@ -11,6 +11,7 @@ const WorkflowEnvironment = temporal.testing.WorkflowEnvironment;
 const ActivityEnvironment = temporal.testing.ActivityEnvironment;
 const WorkflowReplayer = temporal.testing.WorkflowReplayer;
 const LogRecorder = temporal.testing.LogRecorder;
+const MetricsRecorder = temporal.testing.MetricsRecorder;
 
 fn greet(ctx: *activity.Context, name: []const u8) ![]const u8 {
     if (name.len == 0) return ctx.fail(.{ .message = "name is empty", .type = "InvalidName", .non_retryable = true });
@@ -234,6 +235,39 @@ test "testing: a workflow that logs an error" {
     for (try recorder.records(arena.allocator())) |rec| {
         if (rec.level == .err) try testing.expectEqualStrings("checkout", rec.get("WorkflowType").?);
     }
+}
+// end-example
+
+// example: testing-metrics-recorder
+fn ship(ctx: *workflow.Context, items: u32) !u32 {
+    const shipped = try ctx.metrics().counter("orders_shipped", .{ .description = "Orders shipped" });
+    defer shipped.deinit();
+    shipped.add(1, .{ .carrier = "zigpost" });
+    return items;
+}
+const Ship = workflow.Def("ship", ship);
+
+test "testing: check what a workflow records" {
+    // Declared before the environment, so it outlives it.
+    var recorder: MetricsRecorder = .init(testing.allocator);
+    defer recorder.deinit();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .metrics = .{ .exporter = .{ .custom = recorder.handler() } },
+    });
+    defer env.deinit();
+    try env.registerWorkflow(Ship);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(3, try env.executeWorkflow(Ship, .{3}, arena.allocator(), null));
+    // Once, though getResult replayed the run: a replaying workflow records nothing.
+    const shipped = try recorder.recordsOf(arena.allocator(), "orders_shipped");
+    try testing.expectEqual(1, shipped.len);
+    try testing.expectEqual(temporal.metrics.Value{ .unsigned = 1 }, shipped[0].value);
+    try testing.expectEqualStrings("zigpost", shipped[0].get("carrier").?.string);
+    try testing.expectEqualStrings("ship", shipped[0].get("workflow_type").?.string);
+    // sdk-core's own metrics arrive too, with the default `temporal_` prefix.
+    try testing.expect(recorder.hasMetric("temporal_workflow_completed"));
 }
 // end-example
 

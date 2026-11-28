@@ -181,14 +181,115 @@ test "a custom handler receives sdk-core's metrics and the workflow's and activi
 }
 
 test "an activity environment hands its activity the configured handler" {
-    var recorder: bridge.metric.TestRecorder = .init(testing.allocator);
+    var recorder: testing_mod.MetricsRecorder = .init(testing.allocator);
     defer recorder.deinit();
     var env: testing_mod.ActivityEnvironment = .init(testing.io);
-    env.metrics = .{ .ptr = &recorder, .vtable = &bridge.metric.TestRecorder.vtable };
+    env.metrics = recorder.handler();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try testing.expectEqual(4, try env.executeActivity(Fixtures.Work, .{2}, arena.allocator()));
     const calls = try recorder.recordsOf(arena.allocator(), "zig_activity_calls");
     try testing.expectEqual(1, calls.len);
     try testing.expectEqualStrings("ok", calls[0].get("outcome").?.string);
+    try testing.expectEqualStrings("Activity calls", calls[0].metric.definition.description);
+    try testing.expectEqual(metrics.Value{ .unsigned = 1 }, calls[0].value);
+    try testing.expect(recorder.hasMetric("zig_activity_latency"));
+    try testing.expect(!recorder.hasMetric("zig_workflow_runs"));
+    try testing.expectEqual(0, (try recorder.recordsOf(arena.allocator(), "zig_workflow_runs")).len);
+}
+
+test "a workflow environment with a MetricsRecorder records the workflow's, activity's and sdk-core's metrics once" {
+    var recorder: testing_mod.MetricsRecorder = .init(testing.allocator);
+    defer recorder.deinit();
+    {
+        const env = try testing_mod.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+            .metrics = .{ .exporter = .{ .custom = recorder.handler() } },
+        });
+        defer env.deinit();
+        try env.registerWorkflow(Fixtures.Flow);
+        try env.registerActivity(Fixtures.Work);
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectEqual(10, try env.executeWorkflow(Fixtures.Flow, .{5}, arena.allocator(), null));
+    }
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Once, though getResult replayed the run: a replaying workflow records nothing.
+    const runs = try recorder.recordsOf(a, "zig_workflow_runs");
+    try testing.expectEqual(1, runs.len);
+    try testing.expectEqualStrings("MetricsWorkflow", runs[0].get("workflow_type").?.string);
+    try testing.expectEqualStrings("main", runs[0].get("branch").?.string);
+    const items = try recorder.recordsOf(a, "zig_workflow_items");
+    try testing.expectEqual(1, items.len);
+    try testing.expectEqual(metrics.Value{ .unsigned = 5 }, items[0].value);
+    const calls = try recorder.recordsOf(a, "zig_activity_calls");
+    try testing.expectEqual(1, calls.len);
+    try testing.expectEqualStrings("MetricsWork", calls[0].get("activity_type").?.string);
+    try testing.expect(recorder.hasMetric("temporal_workflow_completed"));
+    try testing.expectEqual(1, (try recorder.recordsOf(a, "temporal_workflow_completed")).len);
+}
+
+/// Adds `n` to a counter 100 times through its own handler copy, tagged with `task = n`.
+/// Sets `failed` when the counter cannot be created.
+fn recordMany(h: metrics.Handler, n: u64, failed: *std.atomic.Value(bool)) void {
+    const c = h.counter("zig_concurrent", .{}) catch return failed.store(true, .release);
+    defer c.deinit();
+    for (0..100) |_| c.add(n, .{ .task = n });
+}
+
+test "MetricsRecorder keeps every value recorded from several tasks at once" {
+    var recorder: testing_mod.MetricsRecorder = .init(testing.allocator);
+    defer recorder.deinit();
+    var failed: std.atomic.Value(bool) = .init(false);
+    var group: Io.Group = .init;
+    defer group.cancel(testing.io);
+    for (1..5) |n| try group.concurrent(testing.io, recordMany, .{ recorder.handler(), @as(u64, n), &failed });
+    try group.await(testing.io);
+    try testing.expect(!failed.load(.acquire));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const records = try recorder.recordsOf(arena.allocator(), "zig_concurrent");
+    try testing.expectEqual(400, records.len);
+    var per_task: [5]usize = @splat(0);
+    for (records) |rec| {
+        const n = rec.value.unsigned;
+        try testing.expectEqual(@as(i64, @intCast(n)), rec.get("task").?.int);
+        per_task[n] += 1;
+    }
+    try testing.expectEqualSlices(usize, &.{ 0, 100, 100, 100, 100 }, &per_task);
+}
+
+test "MetricsRecorder frees everything recorded through both environments" {
+    // On testing.allocator, whose leak check fails the test if `deinit` leaves anything. The
+    // recorder is deinitialized below, after both environments are closed.
+    var recorder: testing_mod.MetricsRecorder = .init(testing.allocator);
+    {
+        errdefer recorder.deinit();
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var act: testing_mod.ActivityEnvironment = .init(testing.io);
+        act.metrics = recorder.handler();
+        try testing.expectEqual(4, try act.executeActivity(Fixtures.Work, .{2}, arena.allocator()));
+
+        const env = try testing_mod.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+            .metrics = .{ .exporter = .{ .custom = recorder.handler() } },
+        });
+        defer env.deinit();
+        try env.registerWorkflow(Fixtures.Flow);
+        try env.registerActivity(Fixtures.Work);
+        try testing.expectEqual(10, try env.executeWorkflow(Fixtures.Flow, .{5}, arena.allocator(), null));
+    }
+    {
+        errdefer recorder.deinit();
+        try testing.expect(recorder.hasMetric("zig_workflow_runs"));
+        const calls = try recorder.recordsOf(testing.allocator, "zig_activity_calls");
+        defer testing.allocator.free(calls);
+        try testing.expectEqual(2, calls.len);
+        // Closing the environment freed every handle the core held.
+        try testing.expectEqual(0, recorder.recorder.live_metrics);
+        try testing.expectEqual(0, recorder.recorder.live_attributes);
+    }
+    recorder.deinit();
 }

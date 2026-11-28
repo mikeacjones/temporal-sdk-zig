@@ -2842,9 +2842,50 @@ Notes:
 - The SDK's own error logs, such as a worker's poll or shutdown failures or a lost time-skipping lock, go to `std.log` and not to the sink, so they still fail the test that causes them.
 
 #### Metrics recorder
-<!-- stub: temporal-sdk-zig-d51.11.15 -->
-Not implemented yet.
-A thread-safe `testing.MetricsRecorder` handler that keeps recorded metrics for tests to check.
+
+A test that checks what a workflow or activity records gives the environment a `testing.MetricsRecorder`'s handler; the recorder keeps every metric created through it and every value recorded, for the test to read back:
+
+<!-- example: testing-metrics-recorder -->
+```zig
+fn ship(ctx: *workflow.Context, items: u32) !u32 {
+    const shipped = try ctx.metrics().counter("orders_shipped", .{ .description = "Orders shipped" });
+    defer shipped.deinit();
+    shipped.add(1, .{ .carrier = "zigpost" });
+    return items;
+}
+const Ship = workflow.Def("ship", ship);
+
+test "testing: check what a workflow records" {
+    // Declared before the environment, so it outlives it.
+    var recorder: MetricsRecorder = .init(testing.allocator);
+    defer recorder.deinit();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .metrics = .{ .exporter = .{ .custom = recorder.handler() } },
+    });
+    defer env.deinit();
+    try env.registerWorkflow(Ship);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(3, try env.executeWorkflow(Ship, .{3}, arena.allocator(), null));
+    // Once, though getResult replayed the run: a replaying workflow records nothing.
+    const shipped = try recorder.recordsOf(arena.allocator(), "orders_shipped");
+    try testing.expectEqual(1, shipped.len);
+    try testing.expectEqual(temporal.metrics.Value{ .unsigned = 1 }, shipped[0].value);
+    try testing.expectEqualStrings("zigpost", shipped[0].get("carrier").?.string);
+    try testing.expectEqualStrings("ship", shipped[0].get("workflow_type").?.string);
+    // sdk-core's own metrics arrive too, with the default `temporal_` prefix.
+    try testing.expect(recorder.hasMetric("temporal_workflow_completed"));
+}
+```
+
+Notes:
+
+- `WorkflowEnvironment.startWithOptions` and `startTimeSkippingWithOptions` take the handler as `.metrics = .{ .exporter = .{ .custom = recorder.handler() } }`, and so does `client.Options.metrics`; it receives the workflow's, the activity's, and sdk-core's metrics. `ActivityEnvironment` takes it as `env.metrics = recorder.handler()`.
+- `recordsOf(arena, name)` returns the values recorded to the metric named `name`, oldest first. Each record has `metric.definition` (name, description, unit, kind), `value`, and `attributes`, flattened with later keys replacing earlier ones; `rec.get(key)` returns an attribute's `metrics.AttributeValue` or null. The slice comes from `arena`; what it points to is the recorder's and stays valid until `deinit`.
+- `hasMetric(name)` says whether a metric with that name was created, whether or not anything was recorded to it.
+- A replaying workflow records nothing, so a value recorded once is kept once, although `getResult` replays the run.
+- The recorder is thread-safe: sdk-core records from threads of its own. It is borrowed, so declare it before the environment or client and `deinit` it after closing them, since closing frees the core's metric handles into it. It must not move once `handler()` was called, and every copy of the handler shares the one recorder.
 
 ### Observability
 
