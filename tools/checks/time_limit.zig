@@ -15,6 +15,9 @@
 //!     prints `time-limit: <case>: ended by signal <N> (SIG<NAME>)` to stderr before
 //!     exiting 128 + N, so that a case failing that way shows why even when the program
 //!     printed nothing. A timeout prints only its own message.
+//!     Whenever the program ends, by exiting or by any signal, kills what is left of its
+//!     group before exiting, so that no process it started (such as a stuck symbolizer
+//!     holding stderr open) outlives this one.
 //!
 //! The program may replace itself (see `tsan-suppressions exec`); it keeps the group.
 
@@ -60,12 +63,23 @@ pub fn main(init: std.process.Init) !void {
     const watchdog = try std.Thread.spawn(.{}, watch, .{ init.io, seconds, message });
     watchdog.detach();
 
-    const term = child.wait(init.io) catch |err| fatal("{s}: cannot wait for {s}: {t}", .{ case, argv[0], err });
+    const term = waitThenKillGroup(init.io, &child) catch |err| fatal("{s}: cannot wait for {s}: {t}", .{ case, argv[0], err });
     // One load decides both the line and the status, so they cannot disagree.
     const forced = forced_status.load(.acquire);
     if (try signalLine(arena, case, term, forced)) |line|
         std.Io.File.stderr().writeStreamingAll(init.io, line) catch {};
     std.process.exit(statusFor(term, forced));
+}
+
+/// Waits for the program to end, then kills what is left of its group, so that a process
+/// it started cannot keep running, or keep this process's stderr open for a reader
+/// waiting on its end, after this process exits. The group outlives the program while
+/// any member does, and its ID is not reused while it exists; when no member is left the
+/// kill fails with ESRCH, which `killGroup` ignores.
+fn waitThenKillGroup(io: std.Io, child: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
+    const term = try child.wait(io);
+    killGroup();
+    return term;
 }
 
 /// The status to exit with once the program has ended: the one the watchdog or a signal
@@ -186,6 +200,48 @@ test "after a timeout or a forwarded signal, and after an exit, no signal is nam
     try testing.expectEqual(@as(?[]u8, null), try signalLine(testing.allocator, "c", .{ .exited = 0 }, 0));
     try testing.expectEqual(@as(u8, 0), statusFor(.{ .exited = 0 }, 0));
     try testing.expectEqual(@as(?[]u8, null), try signalLine(testing.allocator, "c", .{ .exited = 66 }, 0));
+}
+
+/// Runs `script` in `sh` in a process group of its own with stderr on a pipe, as `main`
+/// runs a program, and checks that once `waitThenKillGroup` returns the pipe reaches EOF
+/// within a few seconds, though the script left a `sleep` holding it open.
+fn expectGroupKilledAfter(script: []const u8) !std.process.Child.Term {
+    const io = testing.io;
+    var child = try std.process.spawn(io, .{ .argv = &.{ "/bin/sh", "-c", script }, .pgid = 0, .stderr = .pipe });
+    group.store(child.id.?, .release);
+    const pgid = child.id.?;
+    // Taken before the wait, which would close it.
+    const stderr = child.stderr.?;
+    child.stderr = null;
+    defer stderr.close(io);
+    // Without the fix, the sleep is still running here; end it so no process outlives the test.
+    defer {
+        posix.kill(-pgid, .KILL) catch {};
+        group.store(0, .release);
+    }
+    const term = try waitThenKillGroup(io, &child);
+    var buf: [256]u8 = undefined;
+    while (true) {
+        var fds = [_]posix.pollfd{.{ .fd = stderr.handle, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&fds, 5000) == 0) return error.StderrStillOpen;
+        if (try posix.read(stderr.handle, &buf) == 0) return term;
+    }
+}
+
+test "when the program is killed from outside, the rest of its group dies with it" {
+    const term = try expectGroupKilledAfter("sleep 60 & kill -KILL $$");
+    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, term);
+    try testing.expectEqual(@as(u8, 128 + 9), statusFor(term, 0));
+    const line = (try signalLine(testing.allocator, "c", term, 0)).?;
+    defer testing.allocator.free(line);
+    try testing.expectEqualStrings("time-limit: c: ended by signal 9 (SIGKILL)\n", line);
+}
+
+test "when the program exits, the rest of its group dies with it" {
+    const term = try expectGroupKilledAfter("sleep 60 & exit 3");
+    try testing.expectEqual(std.process.Child.Term{ .exited = 3 }, term);
+    try testing.expectEqual(@as(u8, 3), statusFor(term, 0));
+    try testing.expectEqual(@as(?[]u8, null), try signalLine(testing.allocator, "c", term, 0));
 }
 
 test "the exit status is the program's, or 128 plus the signal that ended it" {
