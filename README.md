@@ -2694,6 +2694,7 @@ Notes:
 
 - The result comes from the arena passed in; the failure a `ctx.fail` call describes isn't exposed.
 - Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, `metrics`, and `logger` (such as a [`LogRecorder`](#log-recorder)'s sink) to control what the activity sees; `info.activity_type` is always the activity's name. Its timeouts and `retry_policy` start out null and its `priority` zero.
+- Set `header` (built with `converter.HeaderWriter`) to give the activity the header it was "scheduled with", which `ctx.headers()` returns, and `propagators` to extract values from it before each call, as a worker runs its client's propagators: what they extract is `ctx.propagated()`. A field that doesn't decode is logged at warn and skipped, as on a worker; a propagator that runs out of memory makes the call return `error.OutOfMemory` before the activity runs. Both are borrowed.
 - `executeActivity` takes the environment by pointer (`var env`) and runs the activity on a task of its own while it waits; canceling the calling task cancels the activity, without a `cancelReason`.
 
 `cancel(reason)` cancels the running activity as a worker does, and `stopWorker()` fires the worker-stop signal:
@@ -2977,6 +2978,7 @@ Notes:
 - Workflow interceptors run as part of the workflow, again on replay, and follow the workflow rules. Query and update-validation interceptors run outside any coroutine, like their handlers, and must not block or change state.
 - Workflow and activity interceptor inputs are type-erased (`converter.EncodedValues`, a header, options), and results are encoded payloads. A client interceptor reads each request and response as its generated protobuf type.
 - Client interceptors run on any calling thread and must be thread-safe.
+- A worker's polls, task completions and activity heartbeats go through sdk-core, not the client's request path, so they never reach client interceptors, even on a worker built on that client. To see what a worker runs, use an `interceptor.Worker`.
 
 Nexus operations are intercepted on both sides. In the calling workflow, `WorkflowOutbound.executeNexusOperation` sees each `ctx.executeNexusOperation` and `executeNexusOperationByName` call as an `interceptor.NexusOperationInput`: the service, the operation, the input encoded by the payload converter, and the options, whose `endpoint` and `headers` it may change. On the handling worker, an `interceptor.Worker` that declares `interceptNexusOperation` hands out each request's `NexusOperationInbound`, around the start and the cancel of an operation, and `NexusOperationOutbound`, around the logger the handler's `ctx.logger()` returns. A signal-with-start from a workflow (`ctx.signalWithStartWorkflow`) goes to the server's system Nexus endpoint, but `executeNexusOperation` doesn't see it: `WorkflowOutbound.signalWithStartWorkflow` does, as an `interceptor.SignalWithStartInput` with the workflow type, the signal name, the options, the workflow and signal arguments, and the header the propagators wrote, which becomes the target's header.
 

@@ -123,6 +123,23 @@ test "the activity returns the propagated value, or null without one" {
     try testing.expectEqual(@as(?Values, null), try activity_env.executeActivity(ctxpropagation.SampleActivity, .{}, a));
 }
 
+test "the activity returns the value its header carries, without a server" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The header the activity is "scheduled with", as a workflow's propagators would write it.
+    var header: temporal.converter.HeaderWriter = .init(a);
+    try header.set(ctxpropagation.header_key, Values{ .key = "some key", .value = "some value" });
+
+    var env: temporal.testing.ActivityEnvironment = .init(testing.io);
+    env.header = header.header();
+    env.propagators = &.{ctxpropagation.propagator};
+    const got = try env.executeActivity(ctxpropagation.SampleActivity, .{}, a) orelse return error.TestNotPropagatedToActivity;
+    try testing.expectEqualStrings("some key", got.key);
+    try testing.expectEqualStrings("some value", got.value);
+}
+
 /// Runs `SampleActivity` and returns what it returned.
 fn activityResult(ctx: *temporal.workflow.Context) !?Values {
     return ctx.executeActivity(ctxpropagation.SampleActivity, .{ .start_to_close_timeout = .fromSeconds(10) }, .{}).get();

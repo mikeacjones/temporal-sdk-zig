@@ -1,0 +1,1 @@
+`testing.ActivityEnvironment` has `header` and `propagators` fields: the activity's `ctx.headers()` returns `header`, and before each call the propagators extract from it into `ctx.propagated()`, as a worker runs its client's propagators. See [Activity environment](https://github.com/mikeacjones/temporal-sdk-zig#activity-environment).

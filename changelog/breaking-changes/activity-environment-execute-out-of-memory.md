@@ -1,0 +1,1 @@
+`testing.ActivityEnvironment.executeActivity` and `executeActivityWith` can now return `error.OutOfMemory` for any activity, when extracting the propagated values from `header` runs out of memory; before, they added only `error.Canceled` to the activity's own errors. A test that switches exhaustively over their errors needs an `error.OutOfMemory` prong.

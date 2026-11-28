@@ -418,6 +418,7 @@ pub const TestRecorder = struct {
         r.lock();
         defer r.mutex.unlock();
         var out: std.ArrayList(Record) = .empty;
+        errdefer out.deinit(a);
         for (r.records.items) |rec| if (std.mem.eql(u8, rec.metric.definition.name, name)) try out.append(a, rec);
         return out.toOwnedSlice(a);
     }

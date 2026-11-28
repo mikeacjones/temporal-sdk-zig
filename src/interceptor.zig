@@ -616,6 +616,10 @@ pub const ClientCall = struct {
 
 /// Wraps every request a client sends (`client.Options.interceptors`). Runs on whichever
 /// thread makes the call, so it must be thread-safe.
+///
+/// A worker's polls, task completions and activity heartbeats go through sdk-core, not this
+/// client, so they never reach client interceptors, even on a worker built on the client. To
+/// see what a worker runs, use `interceptor.Worker`.
 pub const Client = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

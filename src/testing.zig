@@ -1254,10 +1254,16 @@ pub const ActivityEnvironment = struct {
     /// records. Borrowed.
     metrics: metrics_mod.Handler = .noop,
     /// Where `ctx.logger()` writes, such as a `LogRecorder`'s sink, which keeps the records for
-    /// the test to read. Messages carry the context fields a worker adds, taken from `info`. Null writes to
-    /// `std.log` with no context fields. Borrowed: it must outlive the activities it logs for,
-    /// and be thread-safe, since activities run on tasks of their own.
+    /// the test to read. Messages carry the context fields a worker adds, taken from `info`.
+    /// Null writes to `std.log` with no context fields. Borrowed: it must outlive the
+    /// activities it logs for, and be thread-safe, since activities run on tasks of their own.
     logger: ?log_mod.Sink = null,
+    /// What `ctx.headers()` returns: the header the activity was "scheduled with". Build it
+    /// with `converter.HeaderWriter`. Borrowed: it must outlive the calls.
+    header: converter.Header = .{},
+    /// Run on `header` before each activity, as a worker runs its client's propagators:
+    /// what they extract is `ctx.propagated()`. Borrowed.
+    propagators: []const propagation.ContextPropagator = &.{},
     /// Guards `running` and `worker_stopped`, which `cancel` and `stopWorker` share with the
     /// activities running from other threads.
     mutex: Io.Mutex = .init,
@@ -1337,6 +1343,11 @@ pub const ActivityEnvironment = struct {
         ctx.converter_context_.values = &ctx.propagated_;
         // As a worker does for an activity a Nexus handler started.
         if (info.nexus_context) |n| ctx.result_converter_context_ = .{ .values = &ctx.propagated_, .namespace = info.workflow_namespace, .nexus = n };
+        // As `decodeActivityStart` in worker.zig does: a field that doesn't decode is logged
+        // and skipped, and only running out of memory fails the call, before the activity runs.
+        ctx.header_ = env.header;
+        ctx.propagated_ = .init(arena);
+        try propagation.extractAll(env.propagators, arena, env.header, &ctx.propagated_, "an ActivityEnvironment activity");
         var run: Running = .{ .ctx = &ctx };
         {
             env.mutex.lockUncancelable(env.io);
@@ -1492,8 +1503,9 @@ pub const MetricsRecorder = struct {
     recorder: bridge.metric.TestRecorder,
 
     /// One recorded value: `metric.definition` (name, description, unit, kind), `value`,
-    /// and `attributes` flattened, later keys replacing earlier ones. `get(key)` returns the
-    /// value of the last attribute named `key`, as a `metrics.AttributeValue`, or null.
+    /// and `attributes`: every attribute in the order it was set, base attributes first,
+    /// duplicate keys included. `get(key)` returns the value of the last attribute named
+    /// `key`, as a `metrics.AttributeValue`, or null.
     pub const Record = bridge.metric.TestRecorder.Record;
 
     pub fn init(gpa: Allocator) MetricsRecorder {
@@ -10642,10 +10654,10 @@ test "WorkflowEnvironment.getResultWithOptions: without following runs a run han
     }
 }
 
-test "ActivityEnvironment.executeActivity adds only error.Canceled to the activity's own errors" {
+test "ActivityEnvironment.executeActivity adds only error.Canceled and error.OutOfMemory to the activity's own errors" {
     // An activity that can only fail with error.Declined: the environment's call may add
-    // error.Canceled (a canceled task), and with no logger set it has nothing to allocate,
-    // so callers that switch exhaustively over its errors still compile as before.
+    // error.Canceled (a canceled task) and error.OutOfMemory (extracting the propagated
+    // values from `header`), and nothing else.
     const S = struct {
         fn declined(_: *activity.Context, fail: bool) error{Declined}!void {
             if (fail) return error.Declined;
@@ -10658,7 +10670,7 @@ test "ActivityEnvironment.executeActivity adds only error.Canceled to the activi
     const E = @typeInfo(@TypeOf(env.executeActivity(S.Declined, .{false}, arena.allocator()))).error_union.error_set;
     const names = comptime @typeInfo(E).error_set.error_names.?;
     for (names) |name| {
-        if (!std.mem.eql(u8, name, "Declined") and !std.mem.eql(u8, name, "Canceled")) {
+        if (!std.mem.eql(u8, name, "Declined") and !std.mem.eql(u8, name, "Canceled") and !std.mem.eql(u8, name, "OutOfMemory")) {
             std.debug.print("executeActivity added error.{s} to the activity's errors\n", .{name});
             return error.TestUnexpectedError;
         }
@@ -10672,4 +10684,91 @@ test "ActivityEnvironment.executeActivity adds only error.Canceled to the activi
     const Logged = @typeInfo(@TypeOf(env.executeActivity(S.Declined, .{false}, arena.allocator()))).error_union.error_set;
     try testing.expect(Logged == E);
     try testing.expectError(error.Declined, env.executeActivity(S.Declined, .{true}, arena.allocator()));
+}
+
+test "ActivityEnvironment.header is what the activity's ctx.headers() returns" {
+    const S = struct {
+        fn readHeader(ctx: *activity.Context, name: []const u8) !?[]const u8 {
+            const field = ctx.headers().get(name) orelse return null;
+            return try converter.fromPayload([]const u8, ctx.allocator(), field);
+        }
+        const ReadHeader = activity.Def("ReadHeader", readHeader);
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var w: converter.HeaderWriter = .init(a);
+    try w.set("x-tenant", "acme");
+    var env: ActivityEnvironment = .init(testing.io);
+    env.header = w.header();
+    try testing.expectEqualStrings("acme", (try env.executeActivity(S.ReadHeader, .{"x-tenant"}, a)).?);
+    try testing.expectEqual(null, try env.executeActivity(S.ReadHeader, .{"x-other"}, a));
+}
+
+test "ActivityEnvironment.propagators extract from header into the activity's ctx.propagated()" {
+    const S = struct {
+        const tenant = propagation.key([]const u8, "x-tenant");
+        fn readTenant(ctx: *activity.Context) error{}!?[]const u8 {
+            return ctx.propagated().get(tenant);
+        }
+        const ReadTenant = activity.Def("ReadTenant", readTenant);
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var w: converter.HeaderWriter = .init(a);
+    try w.set("x-tenant", "acme");
+    var env: ActivityEnvironment = .init(testing.io);
+    env.header = w.header();
+    // Without propagators the header is there but nothing is extracted from it.
+    try testing.expectEqual(null, try env.executeActivity(S.ReadTenant, .{}, a));
+    env.propagators = &.{propagation.HeaderPropagator(S.tenant).propagator};
+    try testing.expectEqualStrings("acme", (try env.executeActivity(S.ReadTenant, .{}, a)).?);
+}
+
+test "ActivityEnvironment returns a propagator's out-of-memory before the activity runs" {
+    const S = struct {
+        var ran: bool = false;
+        fn mark(_: *activity.Context) error{}!void {
+            ran = true;
+        }
+        const Mark = activity.Def("Mark", mark);
+
+        fn inject(_: ?*anyopaque, _: Allocator, _: *const propagation.Values, _: *converter.HeaderWriter) error{OutOfMemory}!void {}
+        fn extract(_: ?*anyopaque, _: Allocator, _: converter.Header, _: *propagation.Values) converter.DecodeError!void {
+            return error.OutOfMemory;
+        }
+        const vtable: propagation.ContextPropagator.VTable = .{ .inject = inject, .extract = extract };
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    env.propagators = &.{.{ .ptr = null, .vtable = &S.vtable }};
+    S.ran = false;
+    try testing.expectError(error.OutOfMemory, env.executeActivity(S.Mark, .{}, arena.allocator()));
+    try testing.expect(!S.ran);
+    // Nothing was left linked: a later call with no propagators runs the activity.
+    try testing.expectEqual(null, env.running);
+    env.propagators = &.{};
+    try env.executeActivity(S.Mark, .{}, arena.allocator());
+    try testing.expect(S.ran);
+}
+
+test "ActivityEnvironment skips a propagator whose field doesn't decode and runs the activity" {
+    const S = struct {
+        const tenant = propagation.key(u32, "x-tenant");
+        fn readTenant(ctx: *activity.Context) error{}!?u32 {
+            return ctx.propagated().get(tenant);
+        }
+        const ReadTenant = activity.Def("ReadTenant", readTenant);
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var w: converter.HeaderWriter = .init(a);
+    try w.set("x-tenant", "not a number");
+    var env: ActivityEnvironment = .init(testing.io);
+    env.header = w.header();
+    env.propagators = &.{propagation.HeaderPropagator(S.tenant).propagator};
+    try testing.expectEqual(null, try env.executeActivity(S.ReadTenant, .{}, a));
 }
