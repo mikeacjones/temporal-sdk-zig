@@ -5319,13 +5319,17 @@ const RunWatch = struct {
         pub fn executeWorkflow(r: *Run, input: interceptor.ExecuteWorkflowInput, next: interceptor.WorkflowInbound.Next) anyerror!converter.Payload {
             const w = r.w;
             const id = try w.gpa.dupe(u8, r.ctx.info().run_id);
-            w.mutex.lockUncancelable(w.io);
-            defer w.mutex.unlock(w.io);
-            const list = if (r.ctx.isReplaying()) &w.replayed else &w.live;
-            list.append(w.gpa, id) catch |err| {
-                w.gpa.free(id);
-                return err;
-            };
+            {
+                // Released before the workflow runs: another run, such as a child, may start
+                // while this one waits.
+                w.mutex.lockUncancelable(w.io);
+                defer w.mutex.unlock(w.io);
+                const list = if (r.ctx.isReplaying()) &w.replayed else &w.live;
+                list.append(w.gpa, id) catch |err| {
+                    w.gpa.free(id);
+                    return err;
+                };
+            }
             return next.executeWorkflow(input);
         }
     };
@@ -8797,6 +8801,75 @@ test "time-skipping WorkflowEnvironment: a cron child is still pending when its 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try testing.expect(try env.executeWorkflow(ChildFixtures.CronParent, .{}, arena.allocator(), null));
+}
+
+test "time-skipping WorkflowEnvironment: a cron child runs at most once more after its parent closes" {
+    var watch: RunWatch = .{ .gpa = testing.allocator, .io = testing.io };
+    defer watch.deinit();
+    const interceptors = [_]interceptor.Worker{interceptor.Worker.from(RunWatch, &watch)};
+    const env = try WorkflowEnvironment.startTimeSkippingWithOptions(testing.allocator, testing.io, .{ .worker_interceptors = &interceptors });
+    defer env.deinit();
+    try env.registerWorkflow(ChildFixtures.CronParent);
+    try env.registerWorkflow(ChildFixtures.CronChild);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Skip to half past the hour, so neither the parent's start nor its close two hours later
+    // falls near the child's hourly schedule times.
+    const ns_per_hour: i96 = std.time.ns_per_hour;
+    const now = (try env.now()).nanoseconds;
+    try env.sleep(.fromNanoseconds(@mod(@divFloor(ns_per_hour, 2) - now, ns_per_hour)));
+
+    var parent = try env.startWorkflow(ChildFixtures.CronParent, .{}, .{});
+    defer parent.deinit();
+    try testing.expect(try env.getResult(ChildFixtures.CronParent, &parent, a, null));
+
+    // The server's record of the parent: when it closed, and its cron child's first run.
+    const parent_history = try env.client.fetchHistory(a, parent.id, parent.run_id);
+    const parent_events = parent_history.events.items;
+    const closed_at = RetryDelayFixtures.nanos(parent_events[parent_events.len - 1].event_time);
+    var child: ?proto.temporal.api.common.v1.WorkflowExecution = null;
+    for (parent_events) |event| switch (event.attributes orelse continue) {
+        .child_workflow_execution_started_event_attributes => |attrs| child = attrs.workflow_execution,
+        else => {},
+    };
+    const child_id = (child orelse return error.TestUnexpectedResult).workflow_id;
+
+    // Each cron run of the child is created when the one before it closes and waits for its
+    // schedule time; it ran if the server scheduled it a workflow task. The time-skipping
+    // server runs the first at once, so starting at half past the hour the parent's two hours
+    // cover that run and two hourly ones. A run after the close is one the server started
+    // between the close and the re-lock in `getResult`, before the parent-close policy
+    // terminated the child.
+    var before: usize = 0;
+    var after: usize = 0;
+    var run_id = child.?.run_id;
+    var runs: usize = 0;
+    while (run_id.len > 0) : (runs += 1) {
+        if (runs == 10) return error.TestUnexpectedResult;
+        var first_task: ?i96 = null;
+        var next: []const u8 = "";
+        for ((try env.client.fetchHistory(a, child_id, run_id)).events.items) |event| switch (event.attributes orelse continue) {
+            .workflow_task_scheduled_event_attributes => {
+                if (first_task == null) first_task = RetryDelayFixtures.nanos(event.event_time);
+            },
+            .workflow_execution_completed_event_attributes => |attrs| next = attrs.new_execution_run_id,
+            .workflow_execution_continued_as_new_event_attributes => |attrs| next = attrs.new_execution_run_id,
+            else => {},
+        };
+        if (first_task) |at| {
+            if (at <= closed_at) before += 1 else after += 1;
+        }
+        run_id = next;
+    }
+    try testing.expectEqual(3, before);
+    // The extra run happens (it did on every try when this test was written), but nothing
+    // promises it: it depends on when the server terminates the child.
+    try testing.expect(after <= 1);
+
+    // The worker started the parent and the child's three runs live, and at most the extra run.
+    try testing.expect(watch.count(false) >= 4 and watch.count(false) <= 5);
 }
 
 test "replay runs a workflow under its real workflow ID" {
