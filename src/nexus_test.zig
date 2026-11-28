@@ -403,7 +403,7 @@ test "nexus: a workflow-run operation completes with its workflow's result, and 
 test "nexus: a worker with only a Nexus service, in another namespace than the caller, serves its operations" {
     var handlers: Handlers = .{ .io = testing.io };
     const handler_namespace = "zig-nexus-handlers";
-    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &.{ "--namespace", handler_namespace } });
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server = .{ .extra_args = &.{ "--namespace", handler_namespace } } });
     defer env.deinit();
     try env.registerWorkflow(CallEcho);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -1021,7 +1021,7 @@ test "nexus: a request whose link isn't UTF-8 once percent-decoded starts its wo
     var dropped: DroppedLinks = .{};
     defer dropped.arena.deinit();
     var handlers: Handlers = .{ .io = testing.io };
-    var s = try Setup.start(&handlers, .{ .dev_server_extra_args = &extra_args, .logger = dropped.sink() });
+    var s = try Setup.start(&handlers, .{ .dev_server = .{ .extra_args = &extra_args }, .logger = dropped.sink() });
     defer s.deinit();
     const a = s.arena.allocator();
     // A call through the endpoint starts the environment's worker and shows it polling for
@@ -1234,11 +1234,11 @@ fn startActivitySetup(handlers: *ActivityHandlers) !Setup {
     return startActivitySetupWith(handlers, .{});
 }
 
-/// `startActivitySetup` with `options`, whose `dev_server_extra_args` it sets.
+/// `startActivitySetup` with `options`, whose `dev_server.extra_args` it sets.
 fn startActivitySetupWith(handlers: *ActivityHandlers, options: WorkflowEnvironment.Options) !Setup {
     ActivityFixtures.reset();
     var with_args = options;
-    with_args.dev_server_extra_args = &(testing_mod.DevServer.standalone_activity_args ++ testing_mod.DevServer.activity_callback_args ++ testing_mod.DevServer.signal_link_args);
+    with_args.dev_server.extra_args = &(testing_mod.DevServer.standalone_activity_args ++ testing_mod.DevServer.activity_callback_args ++ testing_mod.DevServer.signal_link_args);
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, with_args);
     errdefer env.deinit();
     inline for (.{ CallActivityService, CancelBeat, PingTarget }) |W| try env.registerWorkflow(W);
@@ -1480,7 +1480,7 @@ test "nexus: the caller's input and the backing workflow's result are coded with
     var recording: NexusRecordingCodec = .{};
     defer recording.deinit();
     const codecs = [_]converter.PayloadCodec{recording.codec()};
-    var s = try Setup.start(&handlers, .{ .codecs = &codecs, .dev_server_cli_version = testing_mod.DevServer.nexus_context_cli_version });
+    var s = try Setup.start(&handlers, .{ .codecs = &codecs, .dev_server = .{ .cli_version = testing_mod.DevServer.nexus_context_cli_version } });
     defer s.deinit();
     const a = s.arena.allocator();
     const name = try uniqueName(a, "Zig");
@@ -1517,7 +1517,7 @@ test "nexus: an activity a handler started sees the caller's context, and codes 
     var recording: NexusRecordingCodec = .{};
     defer recording.deinit();
     const codecs = [_]converter.PayloadCodec{recording.codec()};
-    var s = try startActivitySetupWith(&handlers, .{ .codecs = &codecs, .dev_server_cli_version = testing_mod.DevServer.nexus_context_cli_version });
+    var s = try startActivitySetupWith(&handlers, .{ .codecs = &codecs, .dev_server = .{ .cli_version = testing_mod.DevServer.nexus_context_cli_version } });
     defer s.deinit();
     const a = s.arena.allocator();
     const name = try uniqueName(a, "Zig");
@@ -1613,7 +1613,7 @@ fn readHistoryByEvent(c: *client_mod.Client, workflow_id: []const u8, run_id: []
 test "nexus: with a codec keyed by Nexus endpoint, the caller's and the backing workflow's histories read page by page, results read through handles, and both replay" {
     var handlers: Handlers = .{ .io = testing.io };
     const codecs = [_]converter.PayloadCodec{EndpointKeyCodec.codec()};
-    var s = try Setup.start(&handlers, .{ .codecs = &codecs, .dev_server_cli_version = testing_mod.DevServer.nexus_context_cli_version });
+    var s = try Setup.start(&handlers, .{ .codecs = &codecs, .dev_server = .{ .cli_version = testing_mod.DevServer.nexus_context_cli_version } });
     defer s.deinit();
     const a = s.arena.allocator();
     const name = try uniqueName(a, "Zig");

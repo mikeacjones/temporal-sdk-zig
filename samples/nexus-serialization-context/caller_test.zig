@@ -39,7 +39,7 @@ const codecs = [_]temporal.converter.PayloadCodec{codec.caller.codec()};
 test "the caller workflow gets every operation's reply through every endpoint, each encrypted with the endpoint's key" {
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
         .codecs = &codecs,
-        .dev_server_cli_version = temporal.testing.DevServer.nexus_context_cli_version,
+        .dev_server = .{ .cli_version = temporal.testing.DevServer.nexus_context_cli_version },
     });
     defer env.deinit();
     try caller.register(&env.worker);

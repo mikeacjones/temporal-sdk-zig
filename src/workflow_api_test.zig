@@ -882,7 +882,7 @@ const SignalWithStart = struct {
 
 fn startSignalWithStartEnv(codecs: []const converter.PayloadCodec) !*testing_ns.WorkflowEnvironment {
     const env = try testing_ns.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
-        .dev_server_extra_args = &signal_with_start_args,
+        .dev_server = .{ .extra_args = &signal_with_start_args },
         .codecs = codecs,
     });
     errdefer env.deinit();

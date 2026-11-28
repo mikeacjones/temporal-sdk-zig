@@ -18,7 +18,7 @@ const EventType = temporal.proto.temporal.api.enums.v1.EventType;
 /// link to each other.
 fn startEnvironment() !*WorkflowEnvironment {
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
-        .dev_server_extra_args = &temporal.testing.DevServer.signal_link_args,
+        .dev_server = .{ .extra_args = &temporal.testing.DevServer.signal_link_args },
     });
     errdefer env.deinit();
     try handler.register(&env.worker);

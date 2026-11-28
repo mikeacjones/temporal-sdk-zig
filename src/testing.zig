@@ -213,6 +213,27 @@ fn executable(existing_path: []const u8, version: []const u8) bridge.EphemeralSe
     return .{ .download = .{ .version = version } };
 }
 
+/// The name of the first field of the options struct `options` whose value differs from its
+/// declared default, or null when every field has its default. Strings compare by content,
+/// so a default spelled from another pointer is still the default; other slices compare by
+/// length (their defaults are empty); everything else with `==`.
+fn nonDefaultField(options: anytype) ?[]const u8 {
+    const T = @TypeOf(options);
+    const defaults: T = .{};
+    inline for (@typeInfo(T).@"struct".field_names) |name| {
+        const value = @field(options, name);
+        const default = @field(defaults, name);
+        const same = if (@TypeOf(value) == []const u8)
+            std.mem.eql(u8, value, default)
+        else switch (@typeInfo(@TypeOf(value))) {
+            .pointer => |p| if (p.size == .slice) value.len == default.len else @compileError("nonDefaultField: unsupported field " ++ name),
+            else => value == default,
+        };
+        if (!same) return name;
+    }
+    return null;
+}
+
 /// The custom search attributes a `WorkflowEnvironment` dev server registers, one of each
 /// type. The dev server has none of its own.
 pub const custom_search_attributes = [_]bridge.EphemeralServer.SearchAttribute{
@@ -367,12 +388,18 @@ pub const WorkflowEnvironment = struct {
     };
 
     pub const Options = struct {
-        /// Extra arguments for the dev server's `temporal server start-dev`, such as
-        /// `DevServer.standalone_activity_args`.
-        dev_server_extra_args: []const []const u8 = &.{},
-        /// The dev server's Temporal CLI version (`DevServer.Options.cli_version`), such as
-        /// `DevServer.nexus_context_cli_version`. Dev server only.
-        dev_server_cli_version: []const u8 = "default",
+        /// Options of the dev server `start` and `startWithOptions` run, such as
+        /// `.extra_args = &DevServer.standalone_activity_args` or
+        /// `.cli_version = DevServer.nexus_context_cli_version`. The environment registers
+        /// `custom_search_attributes` as well as `dev_server.search_attributes`, which must not
+        /// repeat their names. Borrowed: its strings and slices must outlive the environment.
+        /// `startTimeSkippingWithOptions` returns `error.InvalidOptions` unless every field has
+        /// its default.
+        dev_server: DevServer.Options = .{},
+        /// Options of the time-skipping test server `startTimeSkipping` and
+        /// `startTimeSkippingWithOptions` run. Borrowed like `dev_server`. `startWithOptions`
+        /// returns `error.InvalidOptions` unless every field has its default.
+        test_server: TestServer.Options = .{},
         /// The client's payload codecs (`client.Options.codecs`), which its worker and the
         /// replay of each finished workflow use too. Borrowed: they must outlive the
         /// environment.
@@ -409,8 +436,10 @@ pub const WorkflowEnvironment = struct {
         return create(gpa, io, .dev, .{});
     }
 
-    /// `start` with options.
+    /// `start` with options. `test_server` is for the time-skipping test server only: one
+    /// that isn't all defaults returns `error.InvalidOptions` before any server starts.
     pub fn startWithOptions(gpa: Allocator, io: Io, options: Options) !*WorkflowEnvironment {
+        try expectDefault("startWithOptions", "test_server", "startTimeSkippingWithOptions", options.test_server);
         return create(gpa, io, .dev, options);
     }
 
@@ -419,18 +448,22 @@ pub const WorkflowEnvironment = struct {
         return create(gpa, io, .time_skipping, .{});
     }
 
-    /// `startTimeSkipping` with the client's options: codecs, the failure attribute
-    /// encoding, the failure converter, a logger, propagators, worker and client interceptors, and metrics, as
-    /// `startWithOptions` takes them. `dev_server_extra_args` is for the dev server only: a
-    /// non-empty one returns `error.InvalidOptions` before any server starts.
+    /// `startTimeSkipping` with options: `test_server` for the server, and the client's
+    /// codecs, failure attribute encoding, failure converter, logger, propagators, worker and
+    /// client interceptors, and metrics, as `startWithOptions` takes them. `dev_server` is for
+    /// the dev server only: one that isn't all defaults returns `error.InvalidOptions` before
+    /// any server starts.
     pub fn startTimeSkippingWithOptions(gpa: Allocator, io: Io, options: Options) !*WorkflowEnvironment {
-        if (options.dev_server_extra_args.len > 0) {
-            log.warn("WorkflowEnvironment.startTimeSkippingWithOptions: dev_server_extra_args ({d} arguments) applies only to the dev server (startWithOptions); the time-skipping test server takes none", .{options.dev_server_extra_args.len});
-            return error.InvalidOptions;
-        }
-        if (!std.mem.eql(u8, options.dev_server_cli_version, "default"))
-            log.warn("WorkflowEnvironment.startTimeSkippingWithOptions: dev_server_cli_version \"{s}\" applies only to the dev server (startWithOptions); the time-skipping test server ignores it", .{options.dev_server_cli_version});
+        try expectDefault("startTimeSkippingWithOptions", "dev_server", "startWithOptions", options.dev_server);
         return create(gpa, io, .time_skipping, options);
+    }
+
+    /// Returns `error.InvalidOptions`, with a warning naming the first field that differs,
+    /// unless `value`, the option `option` of `function`, is all defaults.
+    fn expectDefault(comptime function: []const u8, comptime option: []const u8, comptime takes_it: []const u8, value: anytype) error{InvalidOptions}!void {
+        const field = nonDefaultField(value) orelse return;
+        log.warn("WorkflowEnvironment." ++ function ++ ": " ++ option ++ ".{s} is set, but " ++ option ++ " applies only to the server WorkflowEnvironment." ++ takes_it ++ " starts", .{field});
+        return error.InvalidOptions;
     }
 
     /// Makes an environment on the server `client` is connected to, in `client`'s namespace,
@@ -472,11 +505,16 @@ pub const WorkflowEnvironment = struct {
         env.time_lock_lost = false;
         var client_options = switch (kind) {
             .dev => blk: {
-                env.server = .{ .dev = try DevServer.start(gpa, io, .{ .search_attributes = &custom_search_attributes, .extra_args = options.dev_server_extra_args, .cli_version = options.dev_server_cli_version }) };
+                var dev_options = options.dev_server;
+                const own = options.dev_server.search_attributes;
+                const joined = if (own.len == 0) null else try std.mem.concat(gpa, bridge.EphemeralServer.SearchAttribute, &.{ &custom_search_attributes, own });
+                defer if (joined) |j| gpa.free(j);
+                dev_options.search_attributes = joined orelse &custom_search_attributes;
+                env.server = .{ .dev = try DevServer.start(gpa, io, dev_options) };
                 break :blk env.server.clientOptions();
             },
             .time_skipping => blk: {
-                env.server = .{ .time_skipping = try TestServer.start(gpa, io, .{}) };
+                env.server = .{ .time_skipping = try TestServer.start(gpa, io, options.test_server) };
                 break :blk env.server.time_skipping.clientOptions();
             },
         };
@@ -8267,7 +8305,7 @@ const StandaloneFixtures = struct {
 
 test "client: standalone activities run without a workflow; get, describe, cancel, terminate, list and count them" {
     StandaloneFixtures.reset();
-    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args });
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server = .{ .extra_args = &DevServer.standalone_activity_args } });
     defer StandaloneFixtures.stop(env);
     try env.registerActivity(StandaloneFixtures.Charge);
     try env.registerActivity(StandaloneFixtures.Hold);
@@ -8431,7 +8469,7 @@ const StandaloneContextFixtures = struct {
 
 test "client: a standalone activity's handle decodes its result and failure with the activity type it was started with" {
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
-        .dev_server_extra_args = &DevServer.standalone_activity_args,
+        .dev_server = .{ .extra_args = &DevServer.standalone_activity_args },
         .failure_converter = StandaloneContextFixtures.converter_value,
     });
     defer env.deinit();
@@ -8464,7 +8502,7 @@ test "client: a standalone activity starts with a delay, a priority and a summar
     StandaloneFixtures.reset();
     const zlib: converter.ZlibCodec = .{ .always_encode = true };
     const codecs = [_]converter.PayloadCodec{zlib.codec()};
-    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args, .codecs = &codecs });
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server = .{ .extra_args = &DevServer.standalone_activity_args }, .codecs = &codecs });
     defer StandaloneFixtures.stop(env);
     try env.registerActivity(StandaloneFixtures.Charge);
     try env.registerActivity(StandaloneFixtures.Hold);
@@ -8532,7 +8570,7 @@ test "client: a standalone activity can be paused, unpaused and deleted, and rep
     StandaloneFixtures.reset();
     const zlib: converter.ZlibCodec = .{ .always_encode = true };
     const codecs = [_]converter.PayloadCodec{zlib.codec()};
-    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args, .codecs = &codecs });
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server = .{ .extra_args = &DevServer.standalone_activity_args }, .codecs = &codecs });
     defer StandaloneFixtures.stop(env);
     try env.registerActivity(StandaloneFollowUpFixtures.Beat);
     try env.registerActivity(StandaloneFixtures.Charge);
@@ -8625,7 +8663,7 @@ test "client: ActivityHandle.delete returns once the server has removed the reco
         "--dynamic-config-value", "history.transferProcessorMaxPollRPS=1",
         "--dynamic-config-value", "history.transferProcessorMaxPollHostRPS=1",
     };
-    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &args });
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server = .{ .extra_args = &args } });
     defer env.deinit();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -8677,7 +8715,7 @@ const PauseThenCancelFixtures = struct {
 
 test "client: cancelling a standalone activity while its pause reaches the running attempt cancels it" {
     StandaloneFixtures.reset();
-    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args });
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server = .{ .extra_args = &DevServer.standalone_activity_args } });
     defer StandaloneFixtures.stop(env);
     try env.registerActivity(PauseThenCancelFixtures.Hold);
     try env.startWorker();
@@ -10039,10 +10077,107 @@ test "time-skipping env.now() after getResult is no earlier than the run's close
     }
 }
 
-test "startTimeSkippingWithOptions refuses the dev server's extra arguments" {
-    // The refusal is logged as a warning.
+test "each start refuses the other server's options before starting a server" {
+    // Each refusal is logged as a warning.
     testing.log_level = .err;
-    try testing.expectError(error.InvalidOptions, WorkflowEnvironment.startTimeSkippingWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &DevServer.standalone_activity_args }));
+    const ts = WorkflowEnvironment.startTimeSkippingWithOptions;
+    try testing.expectError(error.InvalidOptions, ts(testing.allocator, testing.io, .{ .dev_server = .{ .extra_args = &DevServer.standalone_activity_args } }));
+    // A CLI version used to be only a warning here.
+    try testing.expectError(error.InvalidOptions, ts(testing.allocator, testing.io, .{ .dev_server = .{ .cli_version = DevServer.nexus_context_cli_version } }));
+    try testing.expectError(error.InvalidOptions, ts(testing.allocator, testing.io, .{ .dev_server = .{ .port = 7233 } }));
+    const dev = WorkflowEnvironment.startWithOptions;
+    try testing.expectError(error.InvalidOptions, dev(testing.allocator, testing.io, .{ .test_server = .{ .extra_args = &.{"--enable-time-skipping"} } }));
+    try testing.expectError(error.InvalidOptions, dev(testing.allocator, testing.io, .{ .test_server = .{ .version = "v1.40.0" } }));
+    try testing.expectError(error.InvalidOptions, dev(testing.allocator, testing.io, .{ .test_server = .{ .port = 7233 } }));
+}
+
+test "server options count as default by value, strings by content" {
+    try testing.expectEqual(@as(?[]const u8, null), nonDefaultField(DevServer.Options{}));
+    try testing.expectEqual(@as(?[]const u8, null), nonDefaultField(TestServer.Options{}));
+    // The defaults spelled from other memory are still the defaults.
+    const namespace = try testing.allocator.dupe(u8, "default");
+    defer testing.allocator.free(namespace);
+    const version = try testing.allocator.dupe(u8, build_options.test_server_version);
+    defer testing.allocator.free(version);
+    try testing.expectEqual(@as(?[]const u8, null), nonDefaultField(DevServer.Options{ .namespace = namespace, .cli_version = namespace[0..] }));
+    try testing.expectEqual(@as(?[]const u8, null), nonDefaultField(TestServer.Options{ .version = version, .extra_args = &.{} }));
+
+    try testing.expectEqualStrings("namespace", nonDefaultField(DevServer.Options{ .namespace = "other" }).?);
+    try testing.expectEqualStrings("search_attributes", nonDefaultField(DevServer.Options{ .search_attributes = &custom_search_attributes }).?);
+    try testing.expectEqualStrings("ui", nonDefaultField(DevServer.Options{ .ui = true }).?);
+    try testing.expectEqualStrings("log_level", nonDefaultField(DevServer.Options{ .log_level = "warn" }).?);
+    // The first field that differs is the one named.
+    try testing.expectEqualStrings("cli_version", nonDefaultField(DevServer.Options{ .cli_version = "latest", .extra_args = &.{"x"} }).?);
+    try testing.expectEqualStrings("extra_args", nonDefaultField(DevServer.Options{ .extra_args = &.{"x"} }).?);
+    try testing.expectEqualStrings("version", nonDefaultField(TestServer.Options{ .version = "default" }).?);
+    try testing.expectEqualStrings("port", nonDefaultField(TestServer.Options{ .port = 1 }).?);
+    try testing.expectEqualStrings("existing_path", nonDefaultField(TestServer.Options{ .existing_path = "/bin/false" }).?);
+}
+
+const ServerOptionFixtures = struct {
+    /// More events than the suggestion limit the test sets, and far fewer than the dev
+    /// server's own.
+    const history_limit = 200;
+
+    /// Sleeps a millisecond at a time until the server suggests continuing as new, and returns
+    /// the history length then; 0 if the history passed `history_limit` events first.
+    fn untilSuggested(ctx: *workflow.Context) !u32 {
+        while (!ctx.continueAsNewSuggested()) {
+            if (ctx.historyLength() > history_limit) return 0;
+            try ctx.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        return ctx.historyLength();
+    }
+    const UntilSuggested = workflow.Def("UntilSuggested", untilSuggested);
+};
+
+test "startWithOptions: dev_server.extra_args set the dev server's dynamic config" {
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .dev_server = .{ .extra_args = &.{ "--dynamic-config-value", "limit.historyCount.suggestContinueAsNew=20" } },
+    });
+    defer env.deinit();
+    try env.registerWorkflow(ServerOptionFixtures.UntilSuggested);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const length = try env.executeWorkflow(ServerOptionFixtures.UntilSuggested, .{}, arena.allocator(), null);
+    // The suggestion came once the history reached the configured 20 events.
+    try testing.expect(length >= 20);
+    try testing.expect(length < ServerOptionFixtures.history_limit);
+}
+
+test "startWithOptions: dev_server.search_attributes are registered with the custom ones" {
+    const extra = [_]bridge.EphemeralServer.SearchAttribute{.{ .name = "ExtraKeywordField", .type = .Keyword }};
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server = .{ .search_attributes = &extra } });
+    defer env.deinit();
+    // Both lists are usable in a visibility query; an unregistered name fails the query.
+    for ([_][]const u8{ "ExtraKeywordField = 'x'", "CustomKeywordField = 'x'" }) |query| {
+        try testing.expectEqual(@as(u64, 0), try env.client.countWorkflows(query));
+    }
+}
+
+test "startTimeSkippingWithOptions: test_server.extra_args reach the test server" {
+    // sdk-core starts the server without this flag, so time is locked until the environment
+    // unlocks it; with it the server skips time on its own, without getResult.
+    const env = try WorkflowEnvironment.startTimeSkippingWithOptions(testing.allocator, testing.io, .{
+        .test_server = .{ .extra_args = &.{"--enable-time-skipping"} },
+    });
+    defer env.deinit();
+    try env.registerWorkflow(Fixtures.Sleeper);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const hours = 2;
+    var run = try env.startWorkflow(Fixtures.Sleeper, .{}, .{hours * std.time.s_per_hour});
+    defer run.deinit();
+    const wait: Wait = .begin(.fromMilliseconds(50));
+    var described = try env.client.describeWorkflow(a, run.id, run.run_id);
+    while (described.status == .running) {
+        try wait.again("workflow {s} to finish its {d} h sleep without getResult", .{ run.id, hours });
+        described = try env.client.describeWorkflow(a, run.id, run.run_id);
+    }
+    try testing.expectEqual(client_mod.WorkflowExecutionStatus.completed, described.status);
+    try testing.expect(described.start_time.?.durationTo(described.close_time.?).nanoseconds >= hours * std.time.ns_per_hour);
 }
 
 /// Tags every payload it encodes with the propagated key ID in its context, as an encryption

@@ -545,7 +545,7 @@ pub const SignIn = workflow.Def("sign_in", signIn);
 
 test "workflows: signal-with-start opens a guest book once, then signs it" {
     const extra_args = [_][]const u8{ "--dynamic-config-value", "history.enableSignalWithStartFromWorkflow=true" };
-    const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server_extra_args = &extra_args });
+    const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .dev_server = .{ .extra_args = &extra_args } });
     defer env.deinit();
     try env.registerWorkflow(GuestBook);
     try env.registerWorkflow(SignIn);

@@ -365,7 +365,7 @@ test "a client interceptor sees every operation's request in order, and can chan
     const interceptors = [_]interceptor.Client{interceptor.Client.from(Recording, &recording)};
     const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
         .interceptors = &interceptors,
-        .dev_server_extra_args = &testing_mod.DevServer.standalone_activity_args,
+        .dev_server = .{ .extra_args = &testing_mod.DevServer.standalone_activity_args },
     });
     defer env.deinit();
     try env.registerWorkflow(ClientFixtures.Tagged);
@@ -930,7 +930,7 @@ const SignalWithStartFixtures = struct {
         propagators: []const propagation.ContextPropagator = &.{},
     }) !*WorkflowEnvironment {
         const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
-            .dev_server_extra_args = &signal_with_start_args,
+            .dev_server = .{ .extra_args = &signal_with_start_args },
             .worker_interceptors = options.interceptors,
             .propagators = options.propagators,
         });

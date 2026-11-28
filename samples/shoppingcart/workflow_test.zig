@@ -79,39 +79,25 @@ test "update-with-start reuses the session's cart, and add and remove need an it
     try env.getResult(shoppingcart.CartWorkflow, &run, a, null);
 }
 
-fn runWorker(w: *temporal.worker.Worker) temporal.worker.Worker.RunError!void {
-    return w.run();
-}
-
 test "the cart continues as new when suggested and keeps its items" {
     // A low history threshold makes the server suggest continuing as new after a few updates.
-    var server = try temporal.testing.DevServer.start(testing.allocator, testing.io, .{
-        .extra_args = &.{ "--dynamic-config-value", "limit.historyCount.suggestContinueAsNew=20" },
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
+        .dev_server = .{ .extra_args = &.{ "--dynamic-config-value", "limit.historyCount.suggestContinueAsNew=20" } },
     });
-    defer server.stop(testing.io);
-    var client = try temporal.client.Client.connect(testing.allocator, testing.io, server.clientOptions());
-    defer client.close();
-
-    var w = try temporal.worker.Worker.init(testing.allocator, testing.io, &client, shoppingcart.task_queue, .{});
-    defer w.deinit();
-    try w.registerWorkflow(shoppingcart.CartWorkflow);
-    var running = try testing.io.concurrent(runWorker, .{&w});
-    defer {
-        w.stop();
-        running.await(testing.io) catch {};
-    }
+    defer env.deinit();
+    try env.registerWorkflow(shoppingcart.CartWorkflow);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const start: temporal.client.StartWorkflowOptions = .{ .id = "session-can", .task_queue = shoppingcart.task_queue, .id_conflict_policy = .use_existing };
+    const start: temporal.client.StartWorkflowOptions = .{ .id = "session-can", .task_queue = "", .id_conflict_policy = .use_existing };
     var first_run_id: []const u8 = "";
     var continued = false;
     var adds: i64 = 0;
     // Each update adds about five events, so 20 adds cross the threshold several times over.
     while (adds < 20) {
-        var handle = try client.updateWithStartWorkflow(shoppingcart.CartWorkflow, start, .{null}, shoppingcart.UpdateCart, .{ "add", "apple" }, .{});
+        var handle = try env.updateWithStartWorkflow(shoppingcart.CartWorkflow, start, .{null}, shoppingcart.UpdateCart, .{ "add", "apple" }, .{});
         defer handle.deinit();
         const cart = try handle.get(a);
         adds += 1;
@@ -121,12 +107,12 @@ test "the cart continues as new when suggested and keeps its items" {
     }
     try testing.expect(continued);
 
-    try client.signalWorkflow(shoppingcart.Checkout, "session-can", "", .{});
-    var run = try client.getWorkflow(void, "session-can", "");
+    try env.client.signalWorkflow(shoppingcart.Checkout, "session-can", "", .{});
+    var run = try env.client.getWorkflow(void, "session-can", "");
     defer run.deinit();
     try run.get(a);
 
-    const history = try client.fetchHistory(a, "session-can", first_run_id);
+    const history = try env.client.fetchHistory(a, "session-can", first_run_id);
     const events = history.events.items;
     try testing.expect(events[events.len - 1].attributes.? == .workflow_execution_continued_as_new_event_attributes);
 }

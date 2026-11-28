@@ -28,7 +28,7 @@ const Setup = struct {
     fn start(s: *Setup) !void {
         s.running = null;
         s.env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{
-            .dev_server_extra_args = &temporal.testing.DevServer.signal_link_args,
+            .dev_server = .{ .extra_args = &temporal.testing.DevServer.signal_link_args },
         });
         errdefer s.env.deinit();
         try caller.register(&s.env.worker);
