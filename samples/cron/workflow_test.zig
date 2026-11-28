@@ -58,7 +58,10 @@ test "an hourly cron child runs on the hour and hands each run's time to the nex
     // for the first schedule time) and later runs at the schedule's times. Starting at half
     // past the hour, the parent's two hours cover that run and the next two hourly
     // boundaries. The child can run once more after the parent returns, before the server
-    // terminates it, so later runs are left out.
+    // terminates it, so later runs are left out: see the README's time-skipping note on a cron
+    // child firing once more between a run closing and its result being read, and the SDK
+    // test "time-skipping WorkflowEnvironment: a cron child runs at most once more after its
+    // parent closes" in src/testing.zig, which reproduces that run.
     Recorder.mutex.lockUncancelable(testing.io);
     defer Recorder.mutex.unlock(testing.io);
     const end = start + 2 * ns_per_hour;

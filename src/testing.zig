@@ -882,7 +882,8 @@ pub const WorkflowEnvironment = struct {
     /// server has no call that locks together with the run's close. So `env.now()` afterwards
     /// is only guaranteed to be no earlier than the close. For the close time, use
     /// `close_time` from `env.client.describeWorkflow(arena, run.id, run.run_id)`, or
-    /// `ctx.now()` inside the workflow.
+    /// `ctx.now()` inside the workflow. A child or cron run can start in that window too: a
+    /// parent's cron child can run once more before the parent-close policy terminates it.
     pub fn getResult(
         env: *WorkflowEnvironment,
         comptime Workflow: type,

@@ -1,0 +1,1 @@
+The documentation of `testing.WorkflowEnvironment.getResult` and the README's time-skipping notes now state that on the time-skipping server a cron child, or any other pending timer, can fire once more between a run closing and its result being read, so a parent's cron child runs one more time after `executeWorkflow` returns, before the parent-close policy terminates it.
