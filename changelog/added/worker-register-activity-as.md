@@ -1,0 +1,1 @@
+`Worker.registerActivityAs(Activity, impl)` registers a test double under an activity's name on any worker, such as a second worker serving another task queue in a test, as `testing.WorkflowEnvironment.registerActivityAs` does on the environment's worker.

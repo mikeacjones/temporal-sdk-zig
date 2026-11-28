@@ -80,9 +80,9 @@ const FileWorker = struct {
     fn init(env: *temporal.testing.WorkflowEnvironment, comptime process_file: anytype, comptime delete_file: anytype) !FileWorker {
         var w = try Worker.init(testing.allocator, testing.io, &env.client, unique_task_queue, .{});
         errdefer w.deinit();
-        try w.registerActivityImpl(temporal.activity.Def(activities.DownloadFile.activity_name, Recorder.downloadFile).registered);
-        try w.registerActivityImpl(temporal.activity.Def(activities.ProcessFile.activity_name, process_file).registered);
-        try w.registerActivityImpl(temporal.activity.Def(activities.DeleteFile.activity_name, delete_file).registered);
+        try w.registerActivityAs(activities.DownloadFile, Recorder.downloadFile);
+        try w.registerActivityAs(activities.ProcessFile, process_file);
+        try w.registerActivityAs(activities.DeleteFile, delete_file);
         return .{ .worker = w };
     }
 

@@ -525,6 +525,13 @@ pub const Worker = struct {
         gop.value_ptr.* = registered;
     }
 
+    /// Registers `impl` in place of `Activity`: workflows calling `Activity` on this worker's
+    /// task queue run `impl`, which takes the same parameters. It takes `Activity`'s name, so
+    /// `Activity` itself must not be registered too (`error.AlreadyRegistered`).
+    pub fn registerActivityAs(w: *Worker, comptime Activity: type, comptime impl: anytype) RegisterActivityError!void {
+        return w.registerActivityImpl(activity.Def(Activity.activity_name, impl).registered);
+    }
+
     pub const RegisterActivityError = error{ OutOfMemory, AlreadyRegistered, ReservedActivityName };
 
     /// Registers a dynamic workflow (`temporal.workflow.DynamicDef`), which runs every
@@ -3942,6 +3949,56 @@ test "one function registered under two names runs under each" {
     const name: []const u8 = "Temporal";
     try testing.expectEqualStrings("\"Hello Temporal!\"", try invokeRegistered(&w, arena.allocator(), "Greet", .{name}));
     try testing.expectEqualStrings("\"Hello Temporal!\"", try invokeRegistered(&w, arena.allocator(), "LegacyGreet", .{name}));
+}
+
+fn greetDouble(_: *activity.Context, name: []const u8) ![]const u8 {
+    return name;
+}
+
+test "registerActivityAs runs the stand-in under the activity's name" {
+    var client: client_mod.Client = undefined; // registration never touches the client
+    var w = try Worker.init(testing.allocator, testing.io, &client, "doubles", .{});
+    defer w.deinit();
+    try w.registerActivityAs(HelloTest.Greet, greetDouble);
+    try testing.expectEqual(1, w.activities.count());
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const name: []const u8 = "Temporal";
+    try testing.expectEqualStrings("\"Temporal\"", try invokeRegistered(&w, arena.allocator(), HelloTest.Greet.activity_name, .{name}));
+}
+
+test "registerActivityAs and the real activity under one name return error.AlreadyRegistered" {
+    var client: client_mod.Client = undefined; // registration never touches the client
+    {
+        var w = try Worker.init(testing.allocator, testing.io, &client, "doubles", .{});
+        defer w.deinit();
+        try w.registerActivityAs(HelloTest.Greet, greetDouble);
+        try testing.expectError(error.AlreadyRegistered, w.registerActivity(HelloTest.Greet));
+        try testing.expectError(error.AlreadyRegistered, w.registerActivityAs(HelloTest.Greet, greetDouble));
+        try testing.expectEqual(1, w.activities.count());
+    }
+    {
+        var w = try Worker.init(testing.allocator, testing.io, &client, "doubles", .{});
+        defer w.deinit();
+        try w.registerActivity(HelloTest.Greet);
+        try testing.expectError(error.AlreadyRegistered, w.registerActivityAs(HelloTest.Greet, greetDouble));
+        try testing.expectEqual(1, w.activities.count());
+
+        // The real activity stays registered.
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const name: []const u8 = "Temporal";
+        try testing.expectEqualStrings("\"Hello Temporal!\"", try invokeRegistered(&w, arena.allocator(), HelloTest.Greet.activity_name, .{name}));
+    }
+}
+
+test "registerActivityAs rejects an activity name reserved for the SDK" {
+    var client: client_mod.Client = undefined; // registration never touches the client
+    var w = try Worker.init(testing.allocator, testing.io, &client, "doubles", .{});
+    defer w.deinit();
+    try testing.expectError(error.ReservedActivityName, w.registerActivityAs(activity.Def("__temporal_greet", HelloTest.greet), greetDouble));
+    try testing.expectEqual(0, w.activities.count());
 }
 
 test "a session worker with no session slots is rejected before it starts" {

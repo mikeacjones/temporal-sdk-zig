@@ -1664,6 +1664,7 @@ Notes:
 - Workflows call method activities as fields of the `defs` value (`greeter.greetLoudly`). `registerActivities` and `registerActivityWith` take an instance that must outlive the worker and be safe to use from several activities at once.
 - No pub declaration of the struct may depend on its own `defs(...)`: declare the result outside the struct, or it fails to compile with a dependency loop.
 - Registering a name twice returns `error.AlreadyRegistered`; names starting with `__temporal_` return `error.ReservedActivityName`.
+- `registerActivityAs(Activity, impl)` registers `impl`, which takes `Activity`'s parameters, under `Activity`'s name: a test double on a worker of its own, such as a second worker on another task queue in a test. Registering `Activity` itself as well, in either order, returns `error.AlreadyRegistered`.
 
 #### Context
 
@@ -2541,7 +2542,7 @@ test "testing: a workflow with a test double for its activity" {
 Notes:
 
 - Every workflow `executeWorkflow` or `getResult` waits for that completes, fails, is canceled, or times out is then replayed from its history, so a test also fails with `error.Nondeterminism`. A terminated run, or any other error, returns before the replay.
-- `registerActivityAs` runs a double under the activity's name; registering the activity as well returns `error.AlreadyRegistered`.
+- `registerActivityAs` runs a double under the activity's name on the environment's worker; registering the activity as well returns `error.AlreadyRegistered`. For an activity a workflow schedules on another task queue, start a `Worker` on `&env.client` for that queue and call its `registerActivityAs` (see [Activities](#activities)).
 - `startWorkflow` returns the run without waiting, for tests that signal, query, or update it before `getResult`.
 - `startWorker` starts the environment's worker and waits until it polls, for runs a test starts another way: from `env.client` or from a schedule whose action names `env.task_queue`. It does nothing once the worker runs, and returns `error.NothingRegistered` before anything is registered. Wait for such a run with `getResultByName` (or `getResult`) on `env.client.getWorkflow(...)`, which replays it like any other.
 - `createNexusEndpoint` creates a Nexus endpoint on the dev server that routes to a namespace and task queue (the environment's by default), for workflows that call [Nexus operations](#calling-operations-from-workflows); a name that exists returns `error.AlreadyExists`. `testing.createNexusEndpoint(client, name, target)` does the same through any client, for a server without an environment such as a `testing.DevServer`; its target names both the namespace, which must exist on the server, and the task queue.

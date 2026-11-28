@@ -549,7 +549,7 @@ pub const WorkflowEnvironment = struct {
     /// `impl` takes the same parameters. It takes `Activity`'s name, so `Activity` itself
     /// must not be registered too (`error.AlreadyRegistered`).
     pub fn registerActivityAs(env: *WorkflowEnvironment, comptime Activity: type, comptime impl: anytype) !void {
-        return env.worker.registerActivityImpl(activity.Def(Activity.activity_name, impl).registered);
+        return env.worker.registerActivityAs(Activity, impl);
     }
 
     /// Registers a dynamic workflow. See `Worker.registerDynamicWorkflow`.
@@ -3291,6 +3291,39 @@ test "WorkflowEnvironment runs a workflow with a test double for its activity" {
     defer arena.deinit();
     const result = try env.executeWorkflow(Fixtures.Hello, .{"Temporal"}, arena.allocator(), null);
     try testing.expectEqualStrings("Hello from the test double!", result);
+}
+
+const SecondQueueFixtures = struct {
+    const task_queue = "doubles-second-queue";
+
+    fn hello(ctx: *workflow.Context, name: []const u8) ![]const u8 {
+        const greeting = ctx.executeActivity(Fixtures.Greet, .{ .task_queue = task_queue, .start_to_close_timeout = .fromSeconds(10) }, .{name});
+        return greeting.get();
+    }
+    const Hello = workflow.Def("HelloOnSecondQueue", hello);
+
+    /// Answers with the task queue it ran on, so the test sees which worker ran it.
+    fn greetDouble(ctx: *activity.Context, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(ctx.allocator(), "double for {s} on {s}", .{ name, ctx.info().task_queue });
+    }
+};
+
+test "a workflow whose activity runs on a second worker runs the stand-in registered there" {
+    const env = try WorkflowEnvironment.start(testing.allocator, testing.io);
+    defer env.deinit();
+    try env.registerWorkflow(SecondQueueFixtures.Hello);
+    var w = try worker_mod.Worker.init(testing.allocator, testing.io, &env.client, SecondQueueFixtures.task_queue, .{});
+    defer w.deinit();
+    try w.registerActivityAs(Fixtures.Greet, SecondQueueFixtures.greetDouble);
+    var running = try testing.io.concurrent(WorkflowEnvironment.runWorker, .{&w});
+    defer {
+        w.stop();
+        running.await(testing.io) catch {};
+    }
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const result = try env.executeWorkflow(SecondQueueFixtures.Hello, .{"Temporal"}, arena.allocator(), null);
+    try testing.expectEqualStrings("double for Temporal on " ++ SecondQueueFixtures.task_queue, result);
 }
 
 test "WorkflowEnvironment runs a workflow after its first start failed with NothingRegistered" {
