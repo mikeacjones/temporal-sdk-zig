@@ -199,73 +199,60 @@ const Logfmt = struct {
 
 const testing = std.testing;
 
-/// Keeps the last record it received.
-const Recorder = struct {
-    arena: std.heap.ArenaAllocator,
-    count: usize = 0,
-    level: Level = .debug,
-    message: []const u8 = "",
-    fields: []const Field = &.{},
+const LogRecorder = @import("testing.zig").LogRecorder;
 
-    fn sink(r: *Recorder) Sink {
-        return .{ .ptr = r, .vtable = &.{ .log = record } };
-    }
-
-    fn record(ptr: ?*anyopaque, level: Level, message: []const u8, fields: []const Field) void {
-        const r: *Recorder = @ptrCast(@alignCast(ptr.?));
-        const a = r.arena.allocator();
-        r.count += 1;
-        r.level = level;
-        r.message = a.dupe(u8, message) catch "";
-        const copy = a.alloc(Field, fields.len) catch return;
-        for (fields, copy) |f, *c| c.* = .{ .key = a.dupe(u8, f.key) catch "", .value = a.dupe(u8, f.value) catch "" };
-        r.fields = copy;
-    }
-
-    fn get(r: *const Recorder, key: []const u8) ?[]const u8 {
-        for (r.fields) |f| if (std.mem.eql(u8, f.key, key)) return f.value;
-        return null;
-    }
-};
+/// The last record `r` received; its strings stay valid until `r.deinit()`.
+fn lastRecord(r: *LogRecorder) !LogRecorder.Record {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const records = try r.records(arena.allocator());
+    if (records.len == 0) return error.TestUnexpectedResult;
+    return records[records.len - 1];
+}
 
 test "the default sink renders the message and fields as logfmt" {
-    var recorder: Recorder = .{ .arena = .init(testing.allocator) };
-    defer recorder.arena.deinit();
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
     const base: Logger = .{ .sink = recorder.sink() };
-    const l = try base.with(recorder.arena.allocator(), .{ .WorkflowType = "Workflow", .WorkflowID = @as([]const u8, "wf-1") });
+    const l = try base.with(arena.allocator(), .{ .WorkflowType = "Workflow", .WorkflowID = @as([]const u8, "wf-1") });
     l.info("HelloWorld workflow started", .{ .name = @as([]const u8, "Temporal"), .count = @as(u32, 3), .note = "two words" });
 
+    const rec = try lastRecord(&recorder);
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try w.print("{s}{f}", .{ recorder.message, Logfmt{ .fields = recorder.fields } });
+    try w.print("{s}{f}", .{ rec.message, Logfmt{ .fields = rec.fields } });
     try testing.expectEqualStrings("HelloWorld workflow started name=Temporal count=3 note=\"two words\" WorkflowType=Workflow WorkflowID=wf-1", w.buffered());
 }
 
 test "with adds context fields after the call's fields and keeps the parent's" {
-    var recorder: Recorder = .{ .arena = .init(testing.allocator) };
-    defer recorder.arena.deinit();
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const parent = try (Logger{ .sink = recorder.sink() }).with(arena.allocator(), .{ .WorkflowID = "wf-1" });
     const child = try parent.with(arena.allocator(), .{ .Attempt = @as(u32, 2), .Error = error.Timeout });
 
     child.warn("retrying", .{ .after = "1s" });
-    try testing.expectEqual(Level.warn, recorder.level);
-    try testing.expectEqualStrings("retrying", recorder.message);
-    try testing.expectEqual(4, recorder.fields.len);
-    try testing.expectEqualStrings("after", recorder.fields[0].key);
-    try testing.expectEqualStrings("WorkflowID", recorder.fields[1].key);
-    try testing.expectEqualStrings("2", recorder.get("Attempt").?);
-    try testing.expectEqualStrings("Timeout", recorder.get("Error").?);
+    const warned = try lastRecord(&recorder);
+    try testing.expectEqual(Level.warn, warned.level);
+    try testing.expectEqualStrings("retrying", warned.message);
+    try testing.expectEqual(4, warned.fields.len);
+    try testing.expectEqualStrings("after", warned.fields[0].key);
+    try testing.expectEqualStrings("WorkflowID", warned.fields[1].key);
+    try testing.expectEqualStrings("2", warned.get("Attempt").?);
+    try testing.expectEqualStrings("Timeout", warned.get("Error").?);
 
     parent.err("failed", .{});
-    try testing.expectEqual(Level.err, recorder.level);
-    try testing.expectEqual(1, recorder.fields.len);
+    const failed = try lastRecord(&recorder);
+    try testing.expectEqual(Level.err, failed.level);
+    try testing.expectEqual(1, failed.fields.len);
 }
 
 test "a custom sink receives workflow context fields as separate keys, unquoted" {
-    var recorder: Recorder = .{ .arena = .init(testing.allocator) };
-    defer recorder.arena.deinit();
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const l = try (Logger{ .sink = recorder.sink() }).with(arena.allocator(), .{
@@ -274,30 +261,33 @@ test "a custom sink receives workflow context fields as separate keys, unquoted"
         .RunID = "run-1",
     });
     l.debug("started", .{ .name = "two words" });
-    try testing.expectEqual(Level.debug, recorder.level);
-    try testing.expectEqualStrings("two words", recorder.get("name").?);
-    try testing.expectEqualStrings("Greeting Workflow", recorder.get("WorkflowType").?);
-    try testing.expectEqualStrings("wf-1", recorder.get("WorkflowID").?);
-    try testing.expectEqualStrings("run-1", recorder.get("RunID").?);
+    const rec = try lastRecord(&recorder);
+    try testing.expectEqual(Level.debug, rec.level);
+    try testing.expectEqualStrings("two words", rec.get("name").?);
+    try testing.expectEqualStrings("Greeting Workflow", rec.get("WorkflowType").?);
+    try testing.expectEqualStrings("wf-1", rec.get("WorkflowID").?);
+    try testing.expectEqualStrings("run-1", rec.get("RunID").?);
 }
 
 test "a replaying logger is silent" {
-    var recorder: Recorder = .{ .arena = .init(testing.allocator) };
-    defer recorder.arena.deinit();
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
     var replaying = true;
     const l: Logger = .{ .sink = recorder.sink(), .replaying = &replaying };
     l.info("dropped", .{});
-    try testing.expectEqual(0, recorder.count);
+    try testing.expectEqual(0, recorder.count(.info, "dropped"));
     replaying = false;
     l.info("kept", .{});
-    try testing.expectEqual(1, recorder.count);
+    try testing.expectEqual(1, recorder.count(.info, "kept"));
+    try testing.expectEqual(0, recorder.count(.info, "dropped"));
 }
 
 test "values longer than the render buffer are truncated" {
-    var recorder: Recorder = .{ .arena = .init(testing.allocator) };
-    defer recorder.arena.deinit();
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
     const long: [2000]u8 = @splat('x');
     (Logger{ .sink = recorder.sink() }).info("long", .{ .a = @as([]const u8, &long), .b = "after" });
-    try testing.expectEqual(1024, recorder.get("a").?.len);
-    try testing.expectEqualStrings("", recorder.get("b").?);
+    const rec = try lastRecord(&recorder);
+    try testing.expectEqual(1024, rec.get("a").?.len);
+    try testing.expectEqualStrings("", rec.get("b").?);
 }

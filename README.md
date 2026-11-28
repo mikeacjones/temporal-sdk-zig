@@ -2693,7 +2693,7 @@ test "testing: an activity on its own" {
 Notes:
 
 - The result comes from the arena passed in; the failure a `ctx.fail` call describes isn't exposed.
-- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, `metrics`, and `logger` to control what the activity sees; `info.activity_type` is always the activity's name. Its timeouts and `retry_policy` start out null and its `priority` zero.
+- Set `info`, `heartbeat_details`, `on_heartbeat`, `client`, `metrics`, and `logger` (such as a [`LogRecorder`](#log-recorder)'s sink) to control what the activity sees; `info.activity_type` is always the activity's name. Its timeouts and `retry_policy` start out null and its `priority` zero.
 - `executeActivity` takes the environment by pointer (`var env`) and runs the activity on a task of its own while it waits; canceling the calling task cancels the activity, without a `cancelReason`.
 
 `cancel(reason)` cancels the running activity as a worker does, and `stopWorker()` fires the worker-stop signal:
@@ -2742,37 +2742,10 @@ Notes:
 - `cancel` reaches the activities running at the time, from any thread; with none running it does nothing. An activity already canceled keeps its first reason.
 - After `stopWorker`, every activity the environment runs, now or later, sees `isWorkerStopping()` true.
 
-Set `logger` to a `log.Sink` to read or silence what the activity logs through `ctx.logger()`:
+Set `logger` to a `log.Sink`, such as a [`testing.LogRecorder`](#log-recorder)'s, to read or silence what the activity logs through `ctx.logger()`:
 
 <!-- example: testing-activity-logger -->
 ```zig
-/// Keeps the levels and `ActivityID` fields of the records it gets. The activity logs from a
-/// task of its own, so the sink takes a lock.
-const Captured = struct {
-    mutex: std.Io.Mutex = .init,
-    levels: [4]temporal.log.Level = undefined,
-    ids: [4][16]u8 = undefined,
-    count: usize = 0,
-
-    fn sink(c: *Captured) temporal.log.Sink {
-        return .{ .ptr = c, .vtable = &.{ .log = record } };
-    }
-
-    fn record(ptr: ?*anyopaque, level: temporal.log.Level, _: []const u8, fields: []const temporal.log.Field) void {
-        const c: *Captured = @ptrCast(@alignCast(ptr.?));
-        c.mutex.lockUncancelable(testing.io);
-        defer c.mutex.unlock(testing.io);
-        if (c.count == c.levels.len) return;
-        c.levels[c.count] = level;
-        for (fields) |f| if (std.mem.eql(u8, f.key, "ActivityID")) {
-            // The fields are only valid during the call: copy what the test reads.
-            const n = @min(f.value.len, c.ids[0].len);
-            @memcpy(c.ids[c.count][0..n], f.value[0..n]);
-        };
-        c.count += 1;
-    }
-};
-
 fn charge(ctx: *activity.Context, amount: u32) !void {
     ctx.logger().info("charging", .{ .amount = amount });
     ctx.logger().err("card declined", .{ .amount = amount }); // through std.log, this fails the test
@@ -2781,16 +2754,18 @@ fn charge(ctx: *activity.Context, amount: u32) !void {
 test "testing: read what an activity logs" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var captured: Captured = .{};
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
     var env: ActivityEnvironment = .init(testing.io);
-    env.logger = captured.sink();
+    env.logger = recorder.sink();
     env.info.activity_id = "charge-1";
 
     try env.executeActivity(activity.Def("charge", charge), .{@as(u32, 10)}, arena.allocator());
-    try testing.expectEqual(2, captured.count);
-    try testing.expectEqual(.info, captured.levels[0]);
-    try testing.expectEqual(.err, captured.levels[1]);
-    try testing.expectEqualStrings("charge-1", captured.ids[1][0.."charge-1".len]);
+    const records = try recorder.records(arena.allocator());
+    try testing.expectEqual(2, records.len);
+    try testing.expectEqual(.info, records[0].level);
+    try testing.expectEqual(1, recorder.count(.err, "card declined"));
+    try testing.expectEqualStrings("charge-1", records[1].get("ActivityID").?);
 }
 ```
 
@@ -2798,7 +2773,7 @@ Notes:
 
 - Each record carries the context fields a worker adds: `ActivityID`, `ActivityType`, and `Attempt`, then `WorkflowType`, `WorkflowID`, and `RunID` when `info.workflow_id` isn't empty, all taken from `info`.
 - Without `logger`, the activity logs to `std.log` with no context fields, where an error-level message fails the Zig test that runs it.
-- The sink is borrowed and must outlive the activities it receives records from. It is called from the activity's task, so it must be thread-safe, and the message and fields are only valid during the call.
+- The sink is borrowed and must outlive the activities it receives records from. It is called from the activity's task, so it must be thread-safe, and the message and fields are only valid during the call. `LogRecorder` is thread-safe and copies them.
 
 #### Replaying histories
 
@@ -2825,6 +2800,46 @@ Notes:
 - `replayHistories` replays many histories and returns a result for each instead of stopping at the first failure.
 - `replayListedWorkflows(arena, client, query)` replays every run a visibility query lists, such as `WorkflowType='greeting' AND ExecutionStatus='Completed'`, through one replay worker. It pages through the listing and fetches each run's history itself, and returns a result per run with its workflow ID, run ID, and any error and message; a listing or fetch failure ends the batch with an error. Only the results are allocated from `arena`; the histories are fetched one at a time into memory the call reuses and frees, so a batch holds the results, one listing page, and about twice the largest single history. A run with no workflow task yet, such as a cron run waiting for its next fire, gets a clean result.
 - Set `workflow_id` and `initWithOptions` to the original values when the workflow's commands depend on them.
+
+#### Log recorder
+
+Workflow and activity loggers write to `std.log` by default, and Zig's test runner fails a test that logs at error level through `std.log`, even when the test's own checks pass. A test of a workflow or activity that logs an error on purpose gives the environment a `testing.LogRecorder`'s sink instead; the recorder keeps a copy of every record for the test to check:
+
+<!-- example: testing-log-recorder -->
+```zig
+fn checkout(ctx: *workflow.Context, order: u32) ![]const u8 {
+    ctx.logger().err("payment declined", .{ .order = order }); // through std.log, this fails the test
+    return "declined";
+}
+const Checkout = workflow.Def("checkout", checkout);
+
+test "testing: a workflow that logs an error" {
+    // Declared before the environment, so it outlives it.
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .logger = recorder.sink() });
+    defer env.deinit();
+    try env.registerWorkflow(Checkout);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("declined", try env.executeWorkflow(Checkout, .{7}, arena.allocator(), null));
+    // Once, though getResult replayed the run: a workflow's logger is silent during replay.
+    try testing.expectEqual(1, recorder.count(.err, "payment declined"));
+    for (try recorder.records(arena.allocator())) |rec| {
+        if (rec.level == .err) try testing.expectEqualStrings("checkout", rec.get("WorkflowType").?);
+    }
+}
+```
+
+Notes:
+
+- `WorkflowEnvironment.startWithOptions` and `startTimeSkippingWithOptions` take the sink as `.logger`; it receives the worker's workflow and activity logs and sdk-core's logs. `ActivityEnvironment` takes it as `env.logger`.
+- `records(arena)` returns the records so far, oldest first, each with its `level`, `message`, and `fields`: the call's fields, then the logger's context fields such as `WorkflowType`, `WorkflowID`, and `RunID`. `rec.get(key)` returns a field's value. The slice comes from `arena`; the strings are the recorder's and stay valid until `deinit`.
+- `count(level, message)` counts the records with that level and exactly that message.
+- A workflow's logger is silent while the workflow replays, so a message logged once is recorded once, although `getResult` replays the run.
+- The recorder is thread-safe: workflows, activities, and sdk-core log from threads of their own. It is borrowed, so declare it before the environment and `deinit` it after; it must not move once `sink()` was called. A record it can't copy for lack of memory is dropped whole and counted in `dropped`.
+- The SDK's own error logs, such as a worker's poll or shutdown failures or a lost time-skipping lock, go to `std.log` and not to the sink, so they still fail the test that causes them.
 
 #### Metrics recorder
 <!-- stub: temporal-sdk-zig-d51.11.15 -->

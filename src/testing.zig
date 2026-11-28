@@ -385,7 +385,8 @@ pub const WorkflowEnvironment = struct {
         /// the environment.
         failure_converter: ?converter.FailureConverter = null,
         /// Where the client's sdk-core logs and the worker's workflow and activity logs go
-        /// (`client.Options.logger`). Borrowed: it must outlive the environment.
+        /// (`client.Options.logger`), such as a `LogRecorder`'s sink, which lets a test log at
+        /// error level and read the records. Borrowed: it must outlive the environment.
         logger: ?log_mod.Sink = null,
         /// The client's context propagators (`client.Options.propagators`), which its worker
         /// and replays use too. Borrowed: they must outlive the environment.
@@ -1252,8 +1253,8 @@ pub const ActivityEnvironment = struct {
     /// What `ctx.metrics()` returns, such as a custom handler that keeps what the activity
     /// records. Borrowed.
     metrics: metrics_mod.Handler = .noop,
-    /// Where `ctx.logger()` writes, such as a sink that keeps the records for the test to read.
-    /// Messages carry the context fields a worker adds, taken from `info`. Null writes to
+    /// Where `ctx.logger()` writes, such as a `LogRecorder`'s sink, which keeps the records for
+    /// the test to read. Messages carry the context fields a worker adds, taken from `info`. Null writes to
     /// `std.log` with no context fields. Borrowed: it must outlive the activities it logs for,
     /// and be thread-safe, since activities run on tasks of their own.
     logger: ?log_mod.Sink = null,
@@ -1394,6 +1395,90 @@ pub const ActivityEnvironment = struct {
         env.worker_stopped = true;
         var it = env.running;
         while (it) |r| : (it = r.next) r.ctx.notifyWorkerStop();
+    }
+};
+
+/// A thread-safe `log.Sink` that keeps a copy of every record it receives, for a test to read.
+///
+/// Zig's test runner fails a test that logs at error level through `std.log`, where the
+/// default sink writes. Give the environment or client this sink instead, and a test can
+/// exercise a workflow or activity that logs at error level and check what it logged.
+pub const LogRecorder = struct {
+    io: Io,
+    mutex: Io.Mutex = .init,
+    arena: std.heap.ArenaAllocator,
+    entries: std.ArrayList(Record) = .empty,
+    /// Records lost because copying them ran out of memory.
+    dropped: usize = 0,
+
+    pub const Record = struct {
+        level: log_mod.Level,
+        message: []const u8,
+        /// The call's fields, then the logger's context fields, as the sink received them.
+        fields: []const log_mod.Field,
+
+        /// The value of the last field named `key`, or null.
+        pub fn get(rec: Record, key: []const u8) ?[]const u8 {
+            var i = rec.fields.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.mem.eql(u8, rec.fields[i].key, key)) return rec.fields[i].value;
+            }
+            return null;
+        }
+    };
+
+    pub fn init(gpa: Allocator, io: Io) LogRecorder {
+        return .{ .io = io, .arena = .init(gpa) };
+    }
+
+    /// Frees every record. No client, worker or environment may still use the sink.
+    pub fn deinit(r: *LogRecorder) void {
+        r.arena.deinit();
+        r.* = undefined;
+    }
+
+    /// Borrowed: the recorder must outlive every client, worker and environment given the
+    /// sink, and must not move after this call, since the sink holds its address.
+    pub fn sink(r: *LogRecorder) log_mod.Sink {
+        return .{ .ptr = r, .vtable = &.{ .log = write } };
+    }
+
+    /// The records so far, oldest first. The slice comes from `arena`; the strings it points
+    /// to are the recorder's and stay valid until `deinit`.
+    pub fn records(r: *LogRecorder, arena: Allocator) error{OutOfMemory}![]Record {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        return arena.dupe(Record, r.entries.items);
+    }
+
+    /// How many records so far have this level and exactly this message.
+    pub fn count(r: *LogRecorder, level: log_mod.Level, message: []const u8) usize {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        var n: usize = 0;
+        for (r.entries.items) |rec| {
+            if (rec.level == level and std.mem.eql(u8, rec.message, message)) n += 1;
+        }
+        return n;
+    }
+
+    fn write(ptr: ?*anyopaque, level: log_mod.Level, message: []const u8, fields: []const log_mod.Field) void {
+        const r: *LogRecorder = @ptrCast(@alignCast(ptr.?));
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        // A sink can't report an error, so a record that doesn't fit is dropped whole and
+        // counted; what was copied of it stays in the arena until `deinit`.
+        r.keep(level, message, fields) catch {
+            r.dropped += 1;
+        };
+    }
+
+    fn keep(r: *LogRecorder, level: log_mod.Level, message: []const u8, fields: []const log_mod.Field) error{OutOfMemory}!void {
+        const a = r.arena.allocator();
+        const copy = try a.alloc(log_mod.Field, fields.len);
+        for (fields, copy) |f, *c| c.* = .{ .key = try a.dupe(u8, f.key), .value = try a.dupe(u8, f.value) };
+        try r.entries.append(a, .{ .level = level, .message = try a.dupe(u8, message), .fields = copy });
     }
 };
 
@@ -3672,34 +3757,6 @@ test "ActivityEnvironment's info has no timeouts, retry policy or priority unles
 }
 
 const EnvironmentLogFixtures = struct {
-    /// Keeps copies of the records it gets, for a test to read.
-    const Recorder = struct {
-        arena: std.heap.ArenaAllocator,
-        mutex: Io.Mutex = .init,
-        records: std.ArrayList(Record) = .empty,
-
-        const Record = struct { level: log_mod.Level, message: []const u8, fields: []const log_mod.Field };
-
-        fn sink(r: *Recorder) log_mod.Sink {
-            return .{ .ptr = r, .vtable = &.{ .log = write } };
-        }
-
-        fn write(ptr: ?*anyopaque, level: log_mod.Level, message: []const u8, fields: []const log_mod.Field) void {
-            const r: *Recorder = @ptrCast(@alignCast(ptr.?));
-            r.mutex.lockUncancelable(testing.io);
-            defer r.mutex.unlock(testing.io);
-            const a = r.arena.allocator();
-            const copy = a.alloc(log_mod.Field, fields.len) catch @panic("out of memory");
-            for (fields, copy) |f, *c| c.* = .{ .key = a.dupe(u8, f.key) catch @panic("out of memory"), .value = a.dupe(u8, f.value) catch @panic("out of memory") };
-            r.records.append(a, .{ .level = level, .message = a.dupe(u8, message) catch @panic("out of memory"), .fields = copy }) catch @panic("out of memory");
-        }
-
-        fn field(rec: Record, key: []const u8) ?[]const u8 {
-            for (rec.fields) |f| if (std.mem.eql(u8, f.key, key)) return f.value;
-            return null;
-        }
-    };
-
     fn chatty(ctx: *activity.Context, order: u32) !void {
         ctx.logger().info("charging", .{ .order = order });
         // Through std.log this would fail the test that runs it.
@@ -3727,8 +3784,8 @@ const EnvironmentLogFixtures = struct {
 test "ActivityEnvironment.logger receives an activity's info and error logs with the worker's context fields" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var recorder: EnvironmentLogFixtures.Recorder = .{ .arena = .init(testing.allocator) };
-    defer recorder.arena.deinit();
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
     var env: ActivityEnvironment = .init(testing.io);
     env.logger = recorder.sink();
     env.info.activity_id = "act-7";
@@ -3738,36 +3795,139 @@ test "ActivityEnvironment.logger receives an activity's info and error logs with
     env.info.workflow_type = "Checkout";
 
     try env.executeActivity(EnvironmentLogFixtures.Chatty, .{@as(u32, 42)}, arena.allocator());
-    const records = recorder.records.items;
+    const records = try recorder.records(arena.allocator());
     try testing.expectEqual(2, records.len);
     try testing.expectEqual(log_mod.Level.info, records[0].level);
     try testing.expectEqualStrings("charging", records[0].message);
     try testing.expectEqual(log_mod.Level.err, records[1].level);
     try testing.expectEqualStrings("card declined", records[1].message);
-    const Rec = EnvironmentLogFixtures.Recorder;
     for (records) |rec| {
-        try testing.expectEqualStrings("42", Rec.field(rec, "order").?);
-        try testing.expectEqualStrings("act-7", Rec.field(rec, "ActivityID").?);
-        try testing.expectEqualStrings("Chatty", Rec.field(rec, "ActivityType").?);
-        try testing.expectEqualStrings("3", Rec.field(rec, "Attempt").?);
-        try testing.expectEqualStrings("Checkout", Rec.field(rec, "WorkflowType").?);
-        try testing.expectEqualStrings("wf-9", Rec.field(rec, "WorkflowID").?);
-        try testing.expectEqualStrings("run-9", Rec.field(rec, "RunID").?);
+        try testing.expectEqualStrings("42", rec.get("order").?);
+        try testing.expectEqualStrings("act-7", rec.get("ActivityID").?);
+        try testing.expectEqualStrings("Chatty", rec.get("ActivityType").?);
+        try testing.expectEqualStrings("3", rec.get("Attempt").?);
+        try testing.expectEqualStrings("Checkout", rec.get("WorkflowType").?);
+        try testing.expectEqualStrings("wf-9", rec.get("WorkflowID").?);
+        try testing.expectEqualStrings("run-9", rec.get("RunID").?);
     }
 
     // A method activity, standalone (no workflow): no empty workflow fields, as on a worker.
     env.info.workflow_id = "";
     var shop: EnvironmentLogFixtures.Shop = .{ .name = "corner" };
     try env.executeActivityWith(EnvironmentLogFixtures.shop_acts.open, &shop, .{}, arena.allocator());
-    try testing.expectEqual(3, recorder.records.items.len);
-    const rec = recorder.records.items[2];
+    const all = try recorder.records(arena.allocator());
+    try testing.expectEqual(3, all.len);
+    const rec = all[2];
     try testing.expectEqual(log_mod.Level.err, rec.level);
     try testing.expectEqualStrings("shop closed", rec.message);
-    try testing.expectEqualStrings("corner", Rec.field(rec, "shop").?);
-    try testing.expectEqualStrings("act-7", Rec.field(rec, "ActivityID").?);
-    try testing.expectEqualStrings("Shop.open", Rec.field(rec, "ActivityType").?);
-    try testing.expectEqual(null, Rec.field(rec, "WorkflowID"));
-    try testing.expectEqual(null, Rec.field(rec, "RunID"));
+    try testing.expectEqualStrings("corner", rec.get("shop").?);
+    try testing.expectEqualStrings("act-7", rec.get("ActivityID").?);
+    try testing.expectEqualStrings("Shop.open", rec.get("ActivityType").?);
+    try testing.expectEqual(null, rec.get("WorkflowID"));
+    try testing.expectEqual(null, rec.get("RunID"));
+}
+
+const LogRecorderFixtures = struct {
+    fn declined(ctx: *workflow.Context, order: u32) ![]const u8 {
+        // Through std.log this would fail the test that runs it.
+        ctx.logger().err("payment declined", .{ .order = order });
+        return "declined";
+    }
+    const Declined = workflow.Def("LogRecorderDeclined", declined);
+
+    fn declinedActivity(ctx: *activity.Context, order: u32) !void {
+        ctx.logger().err("payment declined", .{ .order = order });
+    }
+    const DeclinedActivity = activity.Def("LogRecorderDeclinedActivity", declinedActivity);
+
+    fn logMany(r: *LogRecorder, task: usize) void {
+        const l: log_mod.Logger = .{ .sink = r.sink() };
+        for (0..100) |i| l.info("tick", .{ .task = task, .i = i });
+    }
+};
+
+test "WorkflowEnvironment with a LogRecorder sink: a workflow's error log passes the test and is recorded once" {
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .logger = recorder.sink() });
+    defer env.deinit();
+    try env.registerWorkflow(LogRecorderFixtures.Declined);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("declined", try env.executeWorkflow(LogRecorderFixtures.Declined, .{7}, a, null));
+    // getResult replayed the run; the workflow's logger is silent during replay.
+    try testing.expectEqual(1, recorder.count(.err, "payment declined"));
+    for (try recorder.records(a)) |rec| {
+        if (rec.level != .err or !std.mem.eql(u8, rec.message, "payment declined")) continue;
+        try testing.expectEqualStrings("7", rec.get("order").?);
+        try testing.expectEqualStrings("LogRecorderDeclined", rec.get("WorkflowType").?);
+    }
+    try testing.expectEqual(0, recorder.dropped);
+}
+
+test "ActivityEnvironment with a LogRecorder sink: an activity's error log passes the test and is counted" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
+    var env: ActivityEnvironment = .init(testing.io);
+    env.logger = recorder.sink();
+    try env.executeActivity(LogRecorderFixtures.DeclinedActivity, .{9}, arena.allocator());
+    try testing.expectEqual(1, recorder.count(.err, "payment declined"));
+    try testing.expectEqual(0, recorder.count(.warn, "payment declined"));
+    try testing.expectEqual(0, recorder.count(.err, "payment"));
+    const records = try recorder.records(arena.allocator());
+    try testing.expectEqual(1, records.len);
+    try testing.expectEqualStrings("9", records[0].get("order").?);
+    try testing.expectEqualStrings("LogRecorderDeclinedActivity", records[0].get("ActivityType").?);
+}
+
+test "LogRecorder copies each record, and Record.get returns the last field with the key" {
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
+    var message = "changing".*;
+    var value = "first".*;
+    const fields = [_]log_mod.Field{ .{ .key = "k", .value = &value }, .{ .key = "k", .value = "second" } };
+    recorder.sink().log(.warn, &message, &fields);
+    @memset(&message, 'x');
+    @memset(&value, 'y');
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const records = try recorder.records(arena.allocator());
+    try testing.expectEqual(1, records.len);
+    try testing.expectEqualStrings("changing", records[0].message);
+    try testing.expectEqualStrings("first", records[0].fields[0].value);
+    try testing.expectEqualStrings("second", records[0].get("k").?);
+    try testing.expectEqual(null, records[0].get("missing"));
+    try testing.expectEqual(1, recorder.count(.warn, "changing"));
+}
+
+test "LogRecorder keeps every record logged from several tasks at once" {
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
+    var group: Io.Group = .init;
+    defer group.cancel(testing.io);
+    for (0..4) |task| try group.concurrent(testing.io, LogRecorderFixtures.logMany, .{ &recorder, task });
+    try group.await(testing.io);
+    try testing.expectEqual(400, recorder.count(.info, "tick"));
+    try testing.expectEqual(0, recorder.dropped);
+}
+
+test "LogRecorder drops a record it cannot copy whole, counts it, and does not leak" {
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var recorder: LogRecorder = .init(failing.allocator(), testing.io);
+    defer recorder.deinit();
+    const l: log_mod.Logger = .{ .sink = recorder.sink() };
+    l.err("lost", .{ .a = "1" });
+    l.err("lost", .{});
+    try testing.expectEqual(2, recorder.dropped);
+    try testing.expectEqual(0, recorder.count(.err, "lost"));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(0, (try recorder.records(arena.allocator())).len);
 }
 
 test "ActivityEnvironment without a logger gives the activity the default std.log logger" {
@@ -10461,8 +10621,8 @@ test "ActivityEnvironment.executeActivity adds only error.Canceled to the activi
     try env.executeActivity(S.Declined, .{false}, arena.allocator());
 
     // Setting a logger builds its context fields without allocating, so it adds nothing either.
-    var recorder: EnvironmentLogFixtures.Recorder = .{ .arena = .init(testing.allocator) };
-    defer recorder.arena.deinit();
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
     env.logger = recorder.sink();
     const Logged = @typeInfo(@TypeOf(env.executeActivity(S.Declined, .{false}, arena.allocator()))).error_union.error_set;
     try testing.expect(Logged == E);

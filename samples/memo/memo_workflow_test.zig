@@ -58,3 +58,22 @@ test "describe activity reads the upserted memo from the server" {
     try testing.expectEqualStrings("description", result[0].name);
     try testing.expectEqualStrings("Test upsert memo workflow", result[0].value.string);
 }
+
+test "workflow started without a description memo logs an error and fails" {
+    // The workflow logs at error level, which fails a Zig test through `std.log`; the
+    // recorder keeps the record instead. It must outlive the environment.
+    var recorder: temporal.testing.LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
+    const env = try temporal.testing.WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .logger = recorder.sink() });
+    defer env.deinit();
+    try env.registerWorkflow(memo.MemoWorkflow);
+    try env.registerActivityAs(memo.DescribeWorkflow, Doubles.describeWorkflow);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var failure: ?temporal.failure.Failure = null;
+    try testing.expectError(error.WorkflowFailed, env.executeWorkflow(memo.MemoWorkflow, .{}, a, &failure));
+    try testing.expect(std.mem.indexOf(u8, failure.?.message, "MissingDescriptionMemo") != null);
+    try testing.expectEqual(1, recorder.count(.err, "Get memo failed: the workflow was started without a description memo."));
+}

@@ -10,6 +10,7 @@ const testing = std.testing;
 const WorkflowEnvironment = temporal.testing.WorkflowEnvironment;
 const ActivityEnvironment = temporal.testing.ActivityEnvironment;
 const WorkflowReplayer = temporal.testing.WorkflowReplayer;
+const LogRecorder = temporal.testing.LogRecorder;
 
 fn greet(ctx: *activity.Context, name: []const u8) ![]const u8 {
     if (name.len == 0) return ctx.fail(.{ .message = "name is empty", .type = "InvalidName", .non_retryable = true });
@@ -187,33 +188,6 @@ fn isStopping(ctx: *activity.Context) !bool {
 // end-example
 
 // example: testing-activity-logger
-/// Keeps the levels and `ActivityID` fields of the records it gets. The activity logs from a
-/// task of its own, so the sink takes a lock.
-const Captured = struct {
-    mutex: std.Io.Mutex = .init,
-    levels: [4]temporal.log.Level = undefined,
-    ids: [4][16]u8 = undefined,
-    count: usize = 0,
-
-    fn sink(c: *Captured) temporal.log.Sink {
-        return .{ .ptr = c, .vtable = &.{ .log = record } };
-    }
-
-    fn record(ptr: ?*anyopaque, level: temporal.log.Level, _: []const u8, fields: []const temporal.log.Field) void {
-        const c: *Captured = @ptrCast(@alignCast(ptr.?));
-        c.mutex.lockUncancelable(testing.io);
-        defer c.mutex.unlock(testing.io);
-        if (c.count == c.levels.len) return;
-        c.levels[c.count] = level;
-        for (fields) |f| if (std.mem.eql(u8, f.key, "ActivityID")) {
-            // The fields are only valid during the call: copy what the test reads.
-            const n = @min(f.value.len, c.ids[0].len);
-            @memcpy(c.ids[c.count][0..n], f.value[0..n]);
-        };
-        c.count += 1;
-    }
-};
-
 fn charge(ctx: *activity.Context, amount: u32) !void {
     ctx.logger().info("charging", .{ .amount = amount });
     ctx.logger().err("card declined", .{ .amount = amount }); // through std.log, this fails the test
@@ -222,16 +196,44 @@ fn charge(ctx: *activity.Context, amount: u32) !void {
 test "testing: read what an activity logs" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var captured: Captured = .{};
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
     var env: ActivityEnvironment = .init(testing.io);
-    env.logger = captured.sink();
+    env.logger = recorder.sink();
     env.info.activity_id = "charge-1";
 
     try env.executeActivity(activity.Def("charge", charge), .{@as(u32, 10)}, arena.allocator());
-    try testing.expectEqual(2, captured.count);
-    try testing.expectEqual(.info, captured.levels[0]);
-    try testing.expectEqual(.err, captured.levels[1]);
-    try testing.expectEqualStrings("charge-1", captured.ids[1][0.."charge-1".len]);
+    const records = try recorder.records(arena.allocator());
+    try testing.expectEqual(2, records.len);
+    try testing.expectEqual(.info, records[0].level);
+    try testing.expectEqual(1, recorder.count(.err, "card declined"));
+    try testing.expectEqualStrings("charge-1", records[1].get("ActivityID").?);
+}
+// end-example
+
+// example: testing-log-recorder
+fn checkout(ctx: *workflow.Context, order: u32) ![]const u8 {
+    ctx.logger().err("payment declined", .{ .order = order }); // through std.log, this fails the test
+    return "declined";
+}
+const Checkout = workflow.Def("checkout", checkout);
+
+test "testing: a workflow that logs an error" {
+    // Declared before the environment, so it outlives it.
+    var recorder: LogRecorder = .init(testing.allocator, testing.io);
+    defer recorder.deinit();
+    const env = try WorkflowEnvironment.startWithOptions(testing.allocator, testing.io, .{ .logger = recorder.sink() });
+    defer env.deinit();
+    try env.registerWorkflow(Checkout);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("declined", try env.executeWorkflow(Checkout, .{7}, arena.allocator(), null));
+    // Once, though getResult replayed the run: a workflow's logger is silent during replay.
+    try testing.expectEqual(1, recorder.count(.err, "payment declined"));
+    for (try recorder.records(arena.allocator())) |rec| {
+        if (rec.level == .err) try testing.expectEqualStrings("checkout", rec.get("WorkflowType").?);
+    }
 }
 // end-example
 
