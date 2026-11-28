@@ -29,9 +29,10 @@ const wfs = proto.temporal.api.workflowservice.v1;
 const common = proto.temporal.api.common.v1;
 const log = std.log.scoped(.temporal);
 
-/// The search attribute the server sets on each workflow a schedule starts: the time the
-/// action was scheduled for (before jitter). The server truncates it to the second, so it
-/// can be up to a second before the action's `scheduled_at` in `Description.info`.
+/// The search attribute the server sets on each workflow a schedule starts: the action's
+/// nominal time, before jitter, truncated to the second. `ActionResult.scheduled_at`
+/// includes jitter, so this value can precede it by the schedule's jitter plus up to a
+/// second.
 pub const scheduled_start_time = search_attributes.key(.datetime, "TemporalScheduledStartTime");
 /// The search attribute the server sets on each workflow a schedule starts: the schedule's
 /// ID.
@@ -387,7 +388,8 @@ pub const Execution = struct {
 
 /// One action a schedule took.
 pub const ActionResult = struct {
-    /// When the action was due, before jitter.
+    /// When the action was due according to the schedule, including jitter (the proto's
+    /// `schedule_time`).
     scheduled_at: ?Io.Timestamp,
     /// When the server took it.
     taken_at: ?Io.Timestamp,
