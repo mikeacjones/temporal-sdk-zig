@@ -1971,6 +1971,7 @@ const Fixtures = struct {
 
     /// Waits until the run's history has a started timer (its first workflow task is done).
     fn waitForTimer(c: *client_mod.Client, id: []const u8, run_id: []const u8) !void {
+        const wait: Wait = .begin(.fromMilliseconds(20));
         while (true) {
             var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
             defer scratch.deinit();
@@ -1979,7 +1980,7 @@ const Fixtures = struct {
                 .timer_started_event_attributes => return,
                 else => {},
             };
-            try testing.io.sleep(.fromMilliseconds(20), .awake);
+            try wait.again("workflow {s} run {s} to start a timer", .{ id, run_id });
         }
     }
 
@@ -2625,6 +2626,7 @@ const GateFixtures = struct {
         }
         // The update must reach the workflow before the wait ends, or there would be no
         // update left running to read.
+        const wait: Wait = .begin(.fromMilliseconds(20));
         while (true) {
             var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
             defer scratch.deinit();
@@ -2633,7 +2635,7 @@ const GateFixtures = struct {
                 else => |e| return e,
             };
             if (waiting > 0) break;
-            try testing.io.sleep(.fromMilliseconds(20), .awake);
+            try wait.again("workflow {s} to be waiting on update {s}", .{ id, update_id });
         }
 
         const start = Io.Clock.awake.now(testing.io);
@@ -4165,17 +4167,19 @@ const VersionFixtures = struct {
 
     /// Waits until `h`'s latest routing change has reached its task queues.
     fn awaitRouting(h: *const client_mod.WorkerDeploymentHandle) !void {
+        const wait: Wait = .begin(.fromMilliseconds(100));
         while (true) {
             var arena: std.heap.ArenaAllocator = .init(testing.allocator);
             defer arena.deinit();
             if ((try h.describe(arena.allocator())).routing_update != .in_progress) return;
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
+            try wait.again("the routing change of deployment {s} to reach its task queues", .{h.name});
         }
     }
 
     /// Waits until the server knows version `build_id` of `h`'s deployment: its worker
     /// has polled.
     fn awaitVersion(h: *const client_mod.WorkerDeploymentHandle, build_id: []const u8) !void {
+        const wait: Wait = .begin(.fromMilliseconds(100));
         while (true) {
             var arena: std.heap.ArenaAllocator = .init(testing.allocator);
             defer arena.deinit();
@@ -4184,7 +4188,7 @@ const VersionFixtures = struct {
                 else => return err,
             };
             if (d) |desc| for (desc.versions) |v| if (std.mem.eql(u8, v.version.build_id, build_id)) return;
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
+            try wait.again("version {s} of deployment {s} to be listed", .{ build_id, h.name });
         }
     }
 
@@ -4192,6 +4196,7 @@ const VersionFixtures = struct {
     /// workflow tasks. That is necessary for the server to pin a workflow to the version on
     /// `task_queue`, not sufficient: see `awaitPinnable`.
     fn awaitPolled(h: *const client_mod.WorkerDeploymentHandle, build_id: []const u8, task_queue: []const u8) !void {
+        const wait: Wait = .begin(.fromMilliseconds(100));
         while (true) {
             var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
             defer scratch.deinit();
@@ -4203,7 +4208,7 @@ const VersionFixtures = struct {
             if (version) |v| for (v.task_queues) |q| {
                 if (q.type == .workflow and std.mem.eql(u8, q.name, task_queue)) return;
             };
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
+            try wait.again("version {s} of deployment {s} to poll task queue {s} for workflow tasks", .{ build_id, h.name, task_queue });
         }
     }
 
@@ -4214,6 +4219,7 @@ const VersionFixtures = struct {
     /// starts a workflow pinned to `version` that never runs (one-hour start delay), and
     /// terminates it once the start is accepted.
     fn awaitPinnable(c: *client_mod.Client, version: deployment_mod.Version, task_queue: []const u8) !void {
+        const wait: Wait = .begin(.fromMilliseconds(100));
         while (true) {
             var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
             defer arena_state.deinit();
@@ -4235,7 +4241,7 @@ const VersionFixtures = struct {
             }, &failure) catch |err| switch (err) {
                 // The server's own key for this refusal (ErrPinnedVersionNotInTaskQueueSubstring).
                 error.FailedPrecondition => if (std.mem.indexOf(u8, failure.?.message, "is not present in task queue") != null) {
-                    try testing.io.sleep(.fromMilliseconds(100), .awake);
+                    try wait.again("task queue {s} to accept a workflow pinned to version {s} of deployment {s}", .{ task_queue, version.build_id, version.deployment_name });
                     continue;
                 } else return err,
                 else => return err,
@@ -5414,25 +5420,10 @@ test "client: cancel ends a run canceled, after any cleanup the workflow does" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const timerStarted = struct {
-        fn wait(c: *client_mod.Client, id: []const u8, run_id: []const u8) !void {
-            while (true) {
-                var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
-                defer scratch.deinit();
-                const history = try c.fetchHistory(scratch.allocator(), id, run_id);
-                for (history.events.items) |event| switch (event.attributes orelse continue) {
-                    .timer_started_event_attributes => return,
-                    else => {},
-                };
-                try testing.io.sleep(.fromMilliseconds(20), .awake);
-            }
-        }
-    }.wait;
-
     // A workflow that doesn't catch the cancellation ends canceled at once.
     var sleeper = try env.startWorkflow(Fixtures.Sleeper, .{ .task_queue = "" }, .{std.time.s_per_hour});
     defer sleeper.deinit();
-    try timerStarted(&env.client, sleeper.id, sleeper.run_id);
+    try Fixtures.waitForTimer(&env.client, sleeper.id, sleeper.run_id);
     try env.client.cancelWorkflow(sleeper.id, "", "no longer needed");
     try testing.expectError(error.WorkflowCanceled, env.getResult(Fixtures.Sleeper, &sleeper, a, null));
     const history = try env.client.fetchHistory(a, sleeper.id, sleeper.run_id);
@@ -5449,7 +5440,7 @@ test "client: cancel ends a run canceled, after any cleanup the workflow does" {
     // A workflow that catches it runs its cleanup activity, then ends canceled.
     var cleaner = try env.startWorkflow(Fixtures.CleanUpOnCancel, .{ .task_queue = "" }, .{std.time.s_per_hour});
     defer cleaner.deinit();
-    try timerStarted(&env.client, cleaner.id, cleaner.run_id);
+    try Fixtures.waitForTimer(&env.client, cleaner.id, cleaner.run_id);
     try env.client.cancelWorkflow(cleaner.id, cleaner.run_id, "");
     try testing.expectError(error.WorkflowCanceled, env.getResult(Fixtures.CleanUpOnCancel, &cleaner, a, null));
     const cleaned = try env.client.fetchHistory(a, cleaner.id, cleaner.run_id);
@@ -7379,17 +7370,56 @@ test "search attributes set at start are read and upserted by the workflow; desc
     try testing.expectError(error.InvalidPayload, sa.get(a, search_attributes.key(.keyword, Fixtures.priority.name)));
 }
 
-/// Polls `countWorkflows(query)` until it reports `want`, for at most 30 s: visibility
-/// catches up with starts and upserts a moment later.
-fn waitForCount(c: *client_mod.Client, query: []const u8, want: u64) !void {
-    var tries: usize = 0;
-    while (try c.countWorkflows(query) != want) : (tries += 1) {
-        if (tries == 300) {
-            log.err("countWorkflows(\"{s}\") never reached {d}", .{ query, want });
-            return error.TestUnexpectedResult;
-        }
-        try testing.io.sleep(.fromMilliseconds(100), .awake);
+/// How long a condition wait in this file's tests may take.
+const wait_limit: Io.Duration = .fromSeconds(30);
+
+/// A condition wait that gives up `wait_limit` after it began, on the awake clock.
+const Wait = struct {
+    deadline: Io.Clock.Timestamp,
+    interval: Io.Duration,
+
+    fn begin(interval: Io.Duration) Wait {
+        return .{ .deadline = .fromNow(testing.io, .{ .raw = wait_limit, .clock = .awake }), .interval = interval };
     }
+
+    /// Sleeps `interval` before the next try. Once the limit has passed it logs
+    /// "timed out after 30 s waiting for " ++ what (formatted with args) with log.err
+    /// and returns error.TestUnexpectedResult.
+    fn again(w: Wait, comptime what: []const u8, args: anytype) error{ TestUnexpectedResult, Canceled }!void {
+        try testing.io.sleep(w.interval, .awake);
+        if (!w.expired()) return;
+        log.err("timed out after {d} s waiting for " ++ what, .{wait_limit.toSeconds()} ++ args);
+        return error.TestUnexpectedResult;
+    }
+
+    /// Whether `wait_limit` has passed since `begin`.
+    fn expired(w: Wait) bool {
+        return w.deadline.durationFromNow(testing.io).raw.nanoseconds <= 0;
+    }
+};
+
+test "Wait sleeps its interval between tries and expires wait_limit after it began" {
+    const fresh: Wait = .begin(.fromMilliseconds(5));
+    try testing.expect(!fresh.expired());
+    const before = Io.Clock.awake.now(testing.io);
+    try fresh.again("nothing in particular", .{});
+    try testing.expect(before.durationTo(Io.Clock.awake.now(testing.io)).nanoseconds >= 5 * std.time.ns_per_ms);
+    // The deadline is `wait_limit` out on the awake clock, give or take the time this test took.
+    const left = fresh.deadline.durationFromNow(testing.io).raw;
+    try testing.expect(left.nanoseconds <= wait_limit.nanoseconds);
+    try testing.expect(left.nanoseconds > wait_limit.nanoseconds - 10 * std.time.ns_per_s);
+    try testing.expectEqual(Io.Clock.awake, fresh.deadline.clock);
+    // A wait whose limit has passed gives up; `again` would log and return an error, which
+    // can't run here because an error log fails a test.
+    const late: Wait = .{ .deadline = .fromNow(testing.io, .{ .raw = .fromMilliseconds(-1), .clock = .awake }), .interval = fresh.interval };
+    try testing.expect(late.expired());
+}
+
+/// Polls `countWorkflows(query)` until it reports `want`, for at most `wait_limit`:
+/// visibility catches up with starts and upserts a moment later.
+fn waitForCount(c: *client_mod.Client, query: []const u8, want: u64) !void {
+    const wait: Wait = .begin(.fromMilliseconds(100));
+    while (try c.countWorkflows(query) != want) try wait.again("countWorkflows(\"{s}\") to reach {d}", .{ query, want });
 }
 
 test "client: list and count workflows by a visibility query on search attributes, a page at a time" {
@@ -7480,15 +7510,11 @@ const ScheduleFixtures = struct {
     /// Polls `describe` until the schedule has taken `want` actions, for at most 30 s, and
     /// returns that description.
     fn waitForActions(handle: *const client_mod.ScheduleHandle, arena: Allocator, want: i64) !schedule.Description {
-        var tries: usize = 0;
-        while (true) : (tries += 1) {
+        const wait: Wait = .begin(.fromMilliseconds(100));
+        while (true) {
             const d = try handle.describe(arena);
             if (d.info.action_count >= want) return d;
-            if (tries == 300) {
-                log.err("schedule {s} took {d} actions, want {d}", .{ handle.id, d.info.action_count, want });
-                return error.TestUnexpectedResult;
-            }
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
+            try wait.again("schedule {s} to take {d} actions; it took {d}", .{ handle.id, want, d.info.action_count });
         }
     }
 };
@@ -7556,10 +7582,9 @@ test "client: create, describe, update, pause, trigger, backfill, list and delet
     // The update replaces the schedule's search attributes.
     // The update replaces the schedule's search attributes once the server has applied it,
     // a moment after it returns.
-    var polls: usize = 0;
-    while (try d.search_attributes.get(a, Fixtures.priority) == null) : (polls += 1) {
-        if (polls == 300) return error.TestUnexpectedResult;
-        try testing.io.sleep(.fromMilliseconds(100), .awake);
+    const applied: Wait = .begin(.fromMilliseconds(100));
+    while (try d.search_attributes.get(a, Fixtures.priority) == null) {
+        try applied.again("schedule {s} to show its updated search attributes", .{id});
         d = try handle.describe(a);
     }
     try testing.expectEqual(@as(?i64, 2), try d.search_attributes.get(a, Fixtures.priority));
@@ -7592,16 +7617,15 @@ test "client: create, describe, update, pause, trigger, backfill, list and delet
     try testing.expectEqual(@as(usize, 2), backfilled);
 
     // Listing is eventually consistent: wait until the schedule shows up.
-    var tries: usize = 0;
-    const listed = while (true) : (tries += 1) {
+    const listing: Wait = .begin(.fromMilliseconds(100));
+    const listed = while (true) {
         var it = try env.client.listSchedules(.{ .page_size = 1 });
         defer it.deinit();
         const found = while (try it.next(a)) |entry| {
             if (std.mem.eql(u8, entry.id, id)) break entry;
         } else null;
         if (found) |entry| if (std.mem.eql(u8, entry.note, "Unpaused")) break entry;
-        if (tries == 300) return error.TestUnexpectedResult;
-        try testing.io.sleep(.fromMilliseconds(100), .awake);
+        try listing.again("schedule {s} to be listed with the note \"Unpaused\"", .{id});
     };
     try testing.expectEqualStrings("ScheduledBy", listed.workflow_type);
     try testing.expect(!listed.paused);
@@ -7673,6 +7697,7 @@ test "time-skipping WorkflowEnvironment keeps time locked until a result is awai
     defer run.deinit();
 
     // Wait for the timer to start; with time locked it must not have fired.
+    const wait: Wait = .begin(.fromMilliseconds(20));
     while (true) {
         var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
         defer scratch.deinit();
@@ -7684,7 +7709,7 @@ test "time-skipping WorkflowEnvironment keeps time locked until a result is awai
             else => {},
         };
         if (started) break;
-        try testing.io.sleep(.fromMilliseconds(20), .awake);
+        try wait.again("workflow {s} run {s} to start a timer", .{ run.id, run.run_id });
     }
     try testing.expect(start.durationTo(try env.now()).nanoseconds < std.time.ns_per_hour);
 
@@ -7896,29 +7921,8 @@ const StandaloneFixtures = struct {
     }
     const Charge = activity.Def("Charge", charge);
 
-    /// Bounds one named wait of a test.
-    const wait_limit: Io.Duration = .fromSeconds(30);
     /// Set by `stop`: the looping fixtures return, whatever happened to their cancel.
     var abandon: std.atomic.Value(bool) = .init(false);
-
-    /// A named wait that gives up `wait_limit` after it began.
-    const Wait = struct {
-        deadline: Io.Clock.Timestamp,
-        what: []const u8,
-
-        fn begin(what: []const u8) Wait {
-            return .{ .deadline = .fromNow(testing.io, .{ .raw = wait_limit, .clock = .awake }), .what = what };
-        }
-
-        /// Sleeps before the next try; once the limit has passed, logs `what` and returns
-        /// `error.Timeout` instead.
-        fn again(w: Wait) error{ Timeout, Canceled }!void {
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
-            if (w.deadline.durationFromNow(testing.io).raw.nanoseconds > 0) return;
-            log.err("timed out after {d} s waiting for {s}", .{ wait_limit.toSeconds(), w.what });
-            return error.Timeout;
-        }
-    };
 
     /// Heartbeats until it is canceled.
     fn hold(ctx: *activity.Context) !void {
@@ -7932,8 +7936,8 @@ const StandaloneFixtures = struct {
 
     /// Waits until a worker has started the activity, for at most `wait_limit`.
     fn waitUntilStarted(handle: anytype, arena: Allocator) !void {
-        const wait: Wait = .begin("the activity to start");
-        while ((try handle.describe(arena)).last_started_time == null) try wait.again();
+        const wait: Wait = .begin(.fromMilliseconds(100));
+        while ((try handle.describe(arena)).last_started_time == null) try wait.again("the activity to start", .{});
     }
 
     /// The first line of a test that runs a looping heartbeating fixture.
@@ -7954,14 +7958,8 @@ const StandaloneFixtures = struct {
     }
 
     fn waitForCount(c: *client_mod.Client, query: []const u8, want: u64) !void {
-        var tries: usize = 0;
-        while (try c.countActivities(query) != want) : (tries += 1) {
-            if (tries == 300) {
-                log.err("countActivities(\"{s}\") never reached {d}", .{ query, want });
-                return error.TestUnexpectedResult;
-            }
-            try testing.io.sleep(.fromMilliseconds(100), .awake);
-        }
+        const wait: Wait = .begin(.fromMilliseconds(100));
+        while (try c.countActivities(query) != want) try wait.again("countActivities(\"{s}\") to reach {d}", .{ query, want });
     }
 };
 
@@ -8072,17 +8070,14 @@ const StandaloneFollowUpFixtures = struct {
     }
     const Beat = activity.Def("Beat", beat);
 
-    /// Waits up to `StandaloneFixtures.wait_limit` for the activity's status to be `want`;
-    /// `what` names the wait in the log when it isn't.
+    /// Waits up to `wait_limit` for the activity's status to be `want`; `what` names the
+    /// wait in the log when it isn't.
     fn waitForStatus(handle: anytype, arena: Allocator, want: client_mod.ActivityExecutionStatus, what: []const u8) !client_mod.ActivityDescription {
-        const wait: StandaloneFixtures.Wait = .begin(what);
+        const wait: Wait = .begin(.fromMilliseconds(100));
         while (true) {
             const d = try handle.describe(arena);
             if (d.status == want) return d;
-            wait.again() catch |err| {
-                log.err("{s}: activity {s} stayed {t}, never {t}", .{ what, d.activity_id, d.status, want });
-                return err;
-            };
+            try wait.again("{s}: activity {s} is {t}, not {t}", .{ what, d.activity_id, d.status, want });
         }
     }
 };
@@ -8250,11 +8245,11 @@ test "client: a standalone activity can be paused, unpaused and deleted, and rep
     defer beat.deinit();
     errdefer beat.terminate("test failed") catch {};
     const beating = blk: {
-        const wait: StandaloneFixtures.Wait = .begin("beat's first heartbeat details to show in describe");
+        const wait: Wait = .begin(.fromMilliseconds(100));
         while (true) {
             const d = try beat.describe(a);
             if (d.heartbeat_details.len() > 0) break :blk d;
-            try wait.again();
+            try wait.again("beat's first heartbeat details to show in describe", .{});
         }
     };
     const progress = try beating.heartbeat_details.get(Progress, a, 0);
@@ -8267,11 +8262,11 @@ test "client: a standalone activity can be paused, unpaused and deleted, and rep
     const paused = try StandaloneFollowUpFixtures.waitForStatus(&beat, a, .paused, "beat to be paused after the first pause");
     // The worker ended the running attempt as a pause, not a cancellation.
     const ended = blk: {
-        const wait: StandaloneFixtures.Wait = .begin("the paused attempt's failure to show in describe");
+        const wait: Wait = .begin(.fromMilliseconds(100));
         while (true) {
             const d = try beat.describe(a);
             if (d.raw.last_failure) |f| break :blk f;
-            try wait.again();
+            try wait.again("the paused attempt's failure to show in describe", .{});
         }
     };
     const ended_type = failure_mod.applicationType(ended) orelse {
@@ -8284,12 +8279,12 @@ test "client: a standalone activity can be paused, unpaused and deleted, and rep
     try testing.expectEqual(client_mod.ActivityExecutionStatus.paused, (try beat.describe(a)).status);
     try beat.unpause(.{ .reason = "maintenance over" });
     {
-        const wait: StandaloneFixtures.Wait = .begin("beat to run a second attempt after the first unpause");
+        const wait: Wait = .begin(.fromMilliseconds(100));
         while (true) {
             const d = try beat.describe(a);
             if (d.status == .running and d.attempt > 1 and d.last_started_time != null and
                 d.last_started_time.?.nanoseconds > paused.last_started_time.?.nanoseconds) break;
-            try wait.again();
+            try wait.again("beat to run a second attempt after the first unpause", .{});
         }
     }
     // Unpausing an activity that isn't paused does nothing.
@@ -8397,8 +8392,8 @@ test "client: cancelling a standalone activity while its pause reaches the runni
     // paused has ended: the caller asked for a cancellation, so the activity must end
     // canceled, not as a failure of the attempt the pause ended.
     try held.pause("hold on");
-    const learning: StandaloneFixtures.Wait = .begin("the running attempt to learn of the pause");
-    while (!PauseThenCancelFixtures.learned.isSet()) try learning.again();
+    const learning: Wait = .begin(.fromMilliseconds(100));
+    while (!PauseThenCancelFixtures.learned.isSet()) try learning.again("the running attempt to learn of the pause", .{});
     // A failure from here on releases the attempt in `StandaloneFixtures.stop`.
     try held.cancel("no longer needed");
     PauseThenCancelFixtures.release.set(testing.io);
@@ -8903,7 +8898,8 @@ test "client: heartbeating an async activity reports its cancellation once the w
 
     // Canceling the run cancels the activity, and the workflow waits for it to report.
     try env.client.cancelWorkflow(run.id, run.run_id, "testing async activity cancellation");
-    while (!try env.client.recordActivityHeartbeat(token, @as(u32, 2))) try testing.io.sleep(.fromMilliseconds(20), .awake);
+    const wait: Wait = .begin(.fromMilliseconds(20));
+    while (!try env.client.recordActivityHeartbeat(token, @as(u32, 2))) try wait.again("a heartbeat to report activity {s} of workflow {s} canceled", .{ id.activity_id, run.id });
     try testing.expect(try env.client.recordActivityHeartbeatById(id, {}));
     try env.client.reportActivityCancellationById(id, @as([]const u8, "stopped at step 2"));
     try testing.expectError(error.WorkflowCanceled, env.getResult(AsyncFixtures.Approve, &run, a, null));
